@@ -1212,6 +1212,69 @@ impl std::fmt::Display for ErrorCode {
     }
 }
 
+/// A non-fatal compiler warning with a stable, category-scoped code.
+///
+/// Warnings use the `Wxxxx` scheme documented in `docs/ERROR_CODES.md`
+/// (`W01xx` — deprecations). They never fail compilation on their own;
+/// the CLI `--deny-warnings` flag escalates them to an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NuWarning {
+    /// Stable warning code, e.g. `"W0101"`.
+    pub code: &'static str,
+    /// Core message (no position prefix).
+    pub msg: String,
+    /// Primary source span.
+    pub span: Span,
+    /// Optional migration hint shown as a help line.
+    pub help: Option<String>,
+}
+
+impl NuWarning {
+    /// `W0101` — deprecated `catch` expression (RFC 0015).
+    pub fn deprecated_catch(span: Span) -> Self {
+        NuWarning {
+            code: "W0101",
+            msg: "use of deprecated `catch` expression".to_string(),
+            span,
+            help: Some(
+                "`catch` is deprecated by RFC 0015 and will be removed in v2.0 — \
+                 rewrite as `match expr { | Ok(x) => x, | Error(e) => ... }` \
+                 and propagate errors with `?` under a `T ! E` signature"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// `W0102` — deprecated `fail` expression (RFC 0015).
+    pub fn deprecated_fail(span: Span) -> Self {
+        NuWarning {
+            code: "W0102",
+            msg: "use of deprecated `fail` expression".to_string(),
+            span,
+            help: Some(
+                "`fail` is deprecated by RFC 0015 and will be removed in v2.0 — \
+                 use `return` with an explicit `Error(...)` value under a \
+                 `T ! E` signature"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Plain-text one-line rendering, used when no SourceMap is installed.
+    pub fn format_plain(&self) -> String {
+        let mut out = format!("warning[{}]: {}", self.code, self.msg);
+        let line = self.span.line();
+        if line > 0 {
+            let file = self.span.file().unwrap_or_else(|| "<input>".to_string());
+            out.push_str(&format!(" --> {}:{}:{}", file, line, self.span.column()));
+        }
+        if let Some(help) = &self.help {
+            out.push_str(&format!("\n  = help: {help}"));
+        }
+        out
+    }
+}
+
 /// A compiler or runtime error with structured diagnostic information.
 ///
 /// Each variant carries the core `msg` and `span` plus optional fields
@@ -1961,7 +2024,7 @@ impl NuError {
                     Some("expected a block delimited by `{ ... }`")
                 } else if msg.contains("Unexpected end of file") {
                     Some("the source file ended before the expression or declaration was complete")
-                } else if msg.contains("Expected '=>'") {
+                } else if msg.contains("Expected '=>") {
                     Some("match arms use `=>` between the pattern and body, like `case 1 => body`")
                 } else if let (Some(_), Some(_)) = (expected, found) {
                     // Generic expected/found suggestion
