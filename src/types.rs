@@ -2024,7 +2024,7 @@ impl NuError {
                     Some("expected a block delimited by `{ ... }`")
                 } else if msg.contains("Unexpected end of file") {
                     Some("the source file ended before the expression or declaration was complete")
-                } else if msg.contains("Expected '=>") {
+                } else if msg.contains("Expected '=>'") {
                     Some("match arms use `=>` between the pattern and body, like `case 1 => body`")
                 } else if let (Some(_), Some(_)) = (expected, found) {
                     // Generic expected/found suggestion
