@@ -118,6 +118,7 @@ fn main() {
                 &opts.target,
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
+                opts.deny_warnings,
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -441,6 +442,7 @@ fn main() {
             "-v" | "--verbose" => opts.verbose = true,
             "--all-errors" => opts.all_errors = true,
             "--json" => opts.json = true,
+            "--deny-warnings" => opts.deny_warnings = true,
             "--metrics-port" => {
                 if i + 1 < args.len() {
                     match args[i + 1].parse::<u16>() {
@@ -532,7 +534,7 @@ fn main() {
                     .filter(|k| levenshtein_distance(arg, k) <= 3);
                 eprint!("Error: Unknown option: {}", arg);
                 if let Some(sug) = suggestion {
-                    eprint!(". Did you mean '{}'?", sug);
+                    eprint!(". Did you mean '{}' ?", sug);
                 }
                 eprintln!();
                 eprintln!("Run with --help for usage information.");
@@ -683,6 +685,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                     ) {
+                        opts.deny_warnings,
                         print_error(&e, uc);
                     }
                 }
@@ -706,6 +709,7 @@ fn main() {
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
             ) {
+                opts.deny_warnings,
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
@@ -724,6 +728,7 @@ fn main() {
                         &opts.target,
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
+                        opts.deny_warnings,
                     )
                 },
                 n,
@@ -742,6 +747,7 @@ fn main() {
                 &opts.target,
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
+                opts.deny_warnings,
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -756,13 +762,7 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(e) = check_source(
-            &source,
-            Some(&path),
-            opts.verbose,
-            opts.all_errors,
-            &opts.with_capabilities,
-        ) {
+        if let Err(e) = check_source(&source, Some(&path), opts.verbose, opts.all_errors, &opts.with_capabilities, opts.deny_warnings) {
             let code = exit_code(&e);
             if opts.json {
                 // Machine-readable mode: the JSON report is the ONLY output on
@@ -866,6 +866,7 @@ fn main() {
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
             ) {
+                opts.deny_warnings,
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
@@ -887,6 +888,7 @@ fn main() {
                         &opts.target,
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
+                        opts.deny_warnings,
                     )
                 },
                 n,
@@ -905,6 +907,7 @@ fn main() {
                 &opts.target,
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
+                opts.deny_warnings,
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -939,6 +942,7 @@ fn main() {
             &opts.target,
             &opts.with_capabilities,
             opts.store_path.as_deref(),
+            opts.deny_warnings,
         ) {
             print_error(&e, use_color);
             std::process::exit(exit_code(&e));
@@ -997,6 +1001,8 @@ struct Options {
     /// else `.nulang/store/`. Only consulted when the program declares
     /// durable entities; other programs keep the in-memory store.
     store_path: Option<String>,
+    /// Escalate warnings (e.g. RFC 0015 deprecations) to a hard error.
+    deny_warnings: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -1029,6 +1035,7 @@ impl Default for Options {
             with_capabilities: Vec::new(),
             target: "native".to_string(),
             store_path: None,
+            deny_warnings: false,
         }
     }
 }
@@ -1086,6 +1093,7 @@ fn print_help() {
     println!("  --explain <CODE> Error code help");
     println!("  --all-errors     Report all type errors (not just the first)");
     println!("  --json           Emit machine-readable JSON diagnostics on stdout");
+    println!("  --deny-warnings  Treat warnings (e.g. RFC 0015 deprecations) as errors");
     println!("  --bench [N]      Benchmark: run N times (default 10), print timing stats");
     println!("  fmt [--check] [<file>]  Format file(s); no file → all src/**/*.nula");
     println!("  -v, --verbose    Show bytecode and AST");
@@ -1526,6 +1534,7 @@ fn run_frontend(
     file_path: Option<&str>,
     verbose: bool,
     with_capabilities: &[String],
+    deny_warnings: bool,
 ) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
     let ps = nulang::prelude_source::PRELUDE_SOURCE;
     let mut pl = Lexer::new(ps);
@@ -1538,6 +1547,26 @@ fn run_frontend(
     let tokens = lexer.lex()?;
     let mut parser = Parser::new(tokens);
     let mut ast = parser.parse_module()?;
+    // Surface non-fatal frontend warnings (e.g. RFC 0015 deprecations).
+    // Warnings never fail compilation unless --deny-warnings is passed.
+    let warnings = parser.take_warnings();
+    if !warnings.is_empty() {
+        let use_color = std::io::stderr().is_terminal();
+        for w in &warnings {
+            eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
+        }
+        if deny_warnings {
+            return Err(nulang::types::NuError::parse_error(
+                format!(
+                    "aborting due to {} warning{} (--deny-warnings)",
+                    warnings.len(),
+                    if warnings.len() == 1 { "" } else { "s" }
+                ),
+                warnings[0].span,
+            ));
+        }
+    }
+
     let pd: Vec<nulang::ast::Decl> = pa
         .decls
         .into_iter()
@@ -1690,8 +1719,10 @@ fn run_source(
     target: &str,
     with_capabilities: &[String],
     store_path: Option<&str>,
+    deny_warnings: bool,
 ) -> NuResult<()> {
-    let (ast, type_checker) = run_frontend(source, file_path, verbose, with_capabilities)?;
+    let (ast, type_checker) =
+        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
     match backend {
         #[cfg(feature = "wasm-backend")]
         "wasm" => {
@@ -2102,8 +2133,10 @@ fn check_source(
     verbose: bool,
     _all_errors: bool,
     with_capabilities: &[String],
+    deny_warnings: bool,
 ) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities)?;
+    let (_ast, _tc) =
+        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
 
     if verbose {
         println!("Effect check passed.");
@@ -2192,8 +2225,9 @@ fn compile_source_to_nbc(
     out_path: &str,
     rewrite_signals: Option<&str>,
     with_capabilities: &[String],
+    deny_warnings: bool,
 ) -> NuResult<()> {
-    let (mut ast, type_checker) = run_frontend(source, None, false, with_capabilities)?;
+    let (mut ast, type_checker) = run_frontend(source, None, false, with_capabilities, deny_warnings)?;
 
     // Optional web-framework pass: rewrite HTML for signals/actions and emit the
     // generic client-side micro-runtime. This runs after effect checking so
@@ -2438,8 +2472,9 @@ mod tests {
                 c
             }
         "#;
-        let (ast, type_checker) = run_frontend(source, None, false, &[])
-            .expect("frontend should accept the actor program");
+        let (ast, type_checker) =
+            run_frontend(source, None, false, &[], false)
+                .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
         let (_value, runtime) =
