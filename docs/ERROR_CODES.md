@@ -89,6 +89,27 @@ nulang --explain E0201   # stable category-scoped (same diagnostic)
 | `E012` | `E0302` |
 | `E013` | `E0208` |
 
+## Warning codes
+
+Non-fatal diagnostics use a parallel `Wxxxx` scheme with the same stability
+guarantee: a code, once assigned, never changes meaning. Warnings never fail
+compilation on their own; `nulang --deny-warnings` escalates any warning to
+a hard error. Warnings are carried by `NuWarning` (src/types.rs), rendered
+by `render_warning`/`format_warning` (src/diagnostic.rs) with a
+`[Wxxxx] Warning: ...` ariadne header (tty) or a
+`warning[Wxxxx]: msg --> file:line:col` plain fallback.
+
+| Range   | Category                                  |
+|---------|-------------------------------------------|
+| `W01xx` | Deprecations                              |
+
+| Code    | Meaning                                   | Replacement (RFC)        |
+|---------|-------------------------------------------|--------------------------|
+| `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
+| `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+
+See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
+
 ## Output modes
 
 - **tty**: ariadne report — `[Exxxx] Error: msg` header, `╭─[file:line:col]`
