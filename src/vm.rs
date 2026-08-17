@@ -972,28 +972,46 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .first()
                         .map(|v| resolve_value_string(constants, *v))
                         .unwrap_or_default();
-                    match ureq::get(&url).call() {
-                        Ok(response) => match response.into_string() {
-                            Ok(body) => {
-                                let bytes = body.into_bytes();
-                                match self.heap.alloc(bytes.len() + 1, HeapTypeTag::String) {
-                                    Some(ptr) => {
-                                        unsafe {
-                                            std::ptr::copy_nonoverlapping(
-                                                bytes.as_ptr(),
-                                                ptr,
-                                                bytes.len(),
-                                            );
-                                            *ptr.add(bytes.len()) = 0;
+                    #[cfg(feature = "ureq")]
+                    {
+                        match ureq::get(&url).call() {
+                            Ok(response) => match response.into_string() {
+                                Ok(body) => {
+                                    let bytes = body.into_bytes();
+                                    match self.heap.alloc(bytes.len() + 1, HeapTypeTag::String) {
+                                        Some(ptr) => {
+                                            unsafe {
+                                                std::ptr::copy_nonoverlapping(
+                                                    bytes.as_ptr(),
+                                                    ptr,
+                                                    bytes.len(),
+                                                );
+                                                *ptr.add(bytes.len()) = 0;
+                                            }
+                                            return Some(Value::ptr(ptr));
                                         }
-                                        return Some(Value::ptr(ptr));
+                                        None => return Some(Value::nil()),
                                     }
-                                    None => return Some(Value::nil()),
                                 }
-                            }
+                                Err(_) => return Some(Value::nil()),
+                            },
                             Err(_) => return Some(Value::nil()),
-                        },
-                        Err(_) => return Some(Value::nil()),
+                        }
+                    }
+                    #[cfg(not(feature = "ureq"))]
+                    {
+                        let _ = url;
+                        let msg = b"HTTP client disabled (feature 'ureq' not enabled)";
+                        match self.heap.alloc(msg.len() + 1, HeapTypeTag::String) {
+                            Some(ptr) => {
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr, msg.len());
+                                    *ptr.add(msg.len()) = 0;
+                                }
+                                return Some(Value::ptr(ptr));
+                            }
+                            None => return Some(Value::nil()),
+                        }
                     }
                 }
                 Some("post") => {
@@ -1005,28 +1023,46 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .get(1)
                         .map(|v| resolve_value_string(constants, *v))
                         .unwrap_or_default();
-                    match ureq::post(&url).send_string(&body) {
-                        Ok(response) => match response.into_string() {
-                            Ok(body) => {
-                                let bytes = body.into_bytes();
-                                match self.heap.alloc(bytes.len() + 1, HeapTypeTag::String) {
-                                    Some(ptr) => {
-                                        unsafe {
-                                            std::ptr::copy_nonoverlapping(
-                                                bytes.as_ptr(),
-                                                ptr,
-                                                bytes.len(),
-                                            );
-                                            *ptr.add(bytes.len()) = 0;
+                    #[cfg(feature = "ureq")]
+                    {
+                        match ureq::post(&url).send_string(&body) {
+                            Ok(response) => match response.into_string() {
+                                Ok(body) => {
+                                    let bytes = body.into_bytes();
+                                    match self.heap.alloc(bytes.len() + 1, HeapTypeTag::String) {
+                                        Some(ptr) => {
+                                            unsafe {
+                                                std::ptr::copy_nonoverlapping(
+                                                    bytes.as_ptr(),
+                                                    ptr,
+                                                    bytes.len(),
+                                                );
+                                                *ptr.add(bytes.len()) = 0;
+                                            }
+                                            return Some(Value::ptr(ptr));
                                         }
-                                        return Some(Value::ptr(ptr));
+                                        None => return Some(Value::nil()),
                                     }
-                                    None => return Some(Value::nil()),
                                 }
-                            }
+                                Err(_) => return Some(Value::nil()),
+                            },
                             Err(_) => return Some(Value::nil()),
-                        },
-                        Err(_) => return Some(Value::nil()),
+                        }
+                    }
+                    #[cfg(not(feature = "ureq"))]
+                    {
+                        let _ = (url, body);
+                        let msg = b"HTTP client disabled (feature 'ureq' not enabled)";
+                        match self.heap.alloc(msg.len() + 1, HeapTypeTag::String) {
+                            Some(ptr) => {
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr, msg.len());
+                                    *ptr.add(msg.len()) = 0;
+                                }
+                                return Some(Value::ptr(ptr));
+                            }
+                            None => return Some(Value::nil()),
+                        }
                     }
                 }
                 _ => return None,

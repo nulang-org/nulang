@@ -118,6 +118,7 @@ fn heartbeat_timestamp(rt: &Runtime) -> u64 {
 
 /// Enable the distributed actor system, binding to `bind_addr` for incoming
 /// connections and advertising ourselves under this address.
+#[cfg(feature = "tcp")]
 pub(crate) fn enable_distribution(
     rt: &mut Runtime,
     bind_addr: std::net::SocketAddr,
@@ -127,6 +128,22 @@ pub(crate) fn enable_distribution(
         bind_addr, tls_config,
     )?);
     enable_distribution_with_transport(rt, transport)
+}
+
+/// Enable the distributed actor system.
+///
+/// Stub used when the `tcp` feature is disabled: real TCP distribution is
+/// unavailable, so this always fails. The in-memory deterministic transport
+/// (`enable_distribution_with_transport`) still works for DST.
+#[cfg(not(feature = "tcp"))]
+pub(crate) fn enable_distribution(
+    _rt: &mut Runtime,
+    _bind_addr: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "network distribution requires the 'tcp' feature",
+    ))
 }
 
 /// Enable the distributed actor system over a caller-supplied transport

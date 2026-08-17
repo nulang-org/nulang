@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "ffi"))]
     fn test_load_libm_sqrt() {
         // SAFETY: libm.so.6 is a trusted system library.
         let lib = unsafe { NativeLibrary::open("libm.so.6") };
@@ -606,9 +606,10 @@ mod tests {
             return;
         }
         let lib = lib.unwrap();
-        // SAFETY: sqrt has the expected signature.
-        let sqrt: libloading::Symbol<extern "C" fn(f64) -> f64> =
-            unsafe { lib.resolve(b"sqrt\0").unwrap() };
+        // SAFETY: sqrt has the expected signature; `resolve` returns the
+        // pointer libloading resolved for the requested `T`.
+        let ptr = unsafe { lib.resolve::<extern "C" fn(f64) -> f64>(b"sqrt\0").unwrap() };
+        let sqrt: extern "C" fn(f64) -> f64 = unsafe { std::mem::transmute(ptr) };
         assert!((sqrt(4.0) - 2.0).abs() < 1e-12);
     }
 }
