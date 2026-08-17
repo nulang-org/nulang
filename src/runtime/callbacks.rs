@@ -1089,9 +1089,42 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         }
     }
 
+    fn alloc_arena(&mut self, size: usize, type_tag: crate::runtime::heap::TypeTag) -> Option<*mut u8> {
+        unsafe {
+            (*self.runtime)
+                .actors
+                .get_mut(&self.actor_id)?
+                .iso_arena
+                .alloc(size, type_tag)
+        }
+    }
+
+    fn reset_arena(&mut self) {
+        unsafe {
+            if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
+                actor.iso_arena.reset();
+            }
+        }
+    }
+
+    fn is_arena_ptr(&self, ptr: *const u8) -> bool {
+        unsafe {
+            (*self.runtime)
+                .actors
+                .get(&self.actor_id)
+                .map(|a| a.iso_arena.contains(ptr))
+                .unwrap_or(false)
+        }
+    }
+
     fn drop_ref(&mut self, ptr: *mut u8) {
         unsafe {
             if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
+                // Arena objects are reclaimed wholesale at activation end and
+                // are not on the heap live list: rc traffic on them is a no-op.
+                if actor.iso_arena.contains(ptr) {
+                    return;
+                }
                 // Route through ORCA so objects with outstanding foreign
                 // references are deferred instead of freed out from under
                 // other actors.
@@ -1103,6 +1136,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     fn retain_ref(&mut self, ptr: *mut u8) {
         unsafe {
             if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
+                if actor.iso_arena.contains(ptr) {
+                    return;
+                }
                 actor.orca_gc.local_ref(&actor.heap, ptr);
             }
         }
