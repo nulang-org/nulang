@@ -192,6 +192,10 @@ pub enum Expr {
         register_as: Option<String>,
         /// Remote target: `spawn@node_expr Foo(...)`.
         target_node: Option<Box<Expr>>,
+        /// Spawn-time capability grants: `spawn Foo() with [Net::TcpOut("h:p")]`.
+        /// Each entry is a canonical capability token string (e.g.
+        /// `Net::TcpOut(api.stripe.com:443)`); empty = no grants.
+        capabilities: Vec<String>,
         span: Span,
     },
     /// Message send: actor ! behavior(args)
@@ -468,7 +472,7 @@ impl CrdtType {
         }
     }
 
-    pub fn from_u8(v: u8) -> Option<CrdtType> {
+    pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(CrdtType::GCounter),
             1 => Some(CrdtType::PNCounter),
