@@ -33,11 +33,14 @@
 //!   `Switch`, ...).
 //!
 //! Reading the value is fine: arithmetic/comparison operands, `ArrLen`,
-//! `ArrLoad` / `FieldL` / `RecL` container position, storing *into* the
-//! candidate object (the container operand of `ArrStore` / `FieldS` / `RecS`
-//! — only non-aliased values may be stored, so arena objects only ever
-//! contain heap pointers or scalars), `Move` / `Load` / `Store` / `Dup` /
-//! `Swap` (tracked as aliases), `Drop`, and conditional branches.
+//! `ArrLoad` / `FieldL` / `RecL` container position, `Move` / `Load` /
+//! `Store` / `Dup` / `Swap` (tracked as aliases), `Drop`, and conditional
+//! branches.  Storing *into* the candidate object (the container operand of
+//! `ArrStore` / `FieldS` / `RecS`) is fine only when the stored register is
+//! provably pointer-free: arena container slots are not rc-held (both
+//! barriers skip), so a pointer-suspect child — computed by the module-level
+//! [`may_ptr_sets`] may-analysis — would dangle once its donor register's
+//! rc is released.  This keeps arena containers scalar-only.
 //!
 //! # Soundness notes
 //!
@@ -228,10 +231,11 @@ enum Transfer {
     Swap { a: usize, b: usize },
     /// Reads allowed; writes `kill` (removing any alias there). No escape.
     Safe { kill: Option<usize> },
-    /// Container store: reading the container operand is fine, but if the
-    /// *stored* register aliases the candidate the value escapes into
-    /// another object.
-    StoreEscape { src: usize },
+    /// Container store: if the *stored* register aliases the candidate the
+    /// value escapes into another object; if the *container* operand aliases
+    /// the candidate the stored register must be provably pointer-free
+    /// (arena container slots are not rc-held).
+    StoreEscape { container: usize, src: usize },
     /// Reads allowed; writes nothing. No escape.
     Pure,
     /// Instruction ends the activation/path; escapes iff `reg` aliases.
@@ -282,6 +286,7 @@ fn classify(instr: &Instruction) -> Transfer {
             kill: Some(instr.op3 as usize),
         },
         ArrStore | FieldS | RecS => Transfer::StoreEscape {
+            container: instr.op1 as usize,
             src: instr.op3 as usize,
         },
         // Fresh allocation sites overwrite their destination register.
@@ -340,10 +345,146 @@ fn successors(instrs: &[Instruction], i: usize) -> Option<Vec<usize>> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// May-hold-pointer analysis (module level, fixpoint over the flat stream)
+// ---------------------------------------------------------------------------
+
+/// Per-instruction in-set of registers that may hold a pointer value (heap
+/// *or* arena — the analysis deliberately does not distinguish).  Used to
+/// keep arena containers pointer-free: an arena container's slots are never
+/// rc-held (the store barriers skip retain/drop), so storing a heap pointer
+/// into one would dangle as soon as the donor register's rc is released.
+///
+/// 256 registers => four u64 words per instruction.
+type RegSet = [u64; 4];
+
+fn regset_insert(s: &mut RegSet, r: u8) {
+    s[(r / 64) as usize] |= 1u64 << (r % 64);
+}
+
+fn regset_remove(s: &mut RegSet, r: u8) {
+    s[(r / 64) as usize] &= !(1u64 << (r % 64));
+}
+
+fn regset_contains(s: &RegSet, r: u8) -> bool {
+    s[(r / 64) as usize] & (1u64 << (r % 64)) != 0
+}
+
+/// Forward may-analysis: at each instruction, which registers may hold a
+/// pointer.  Soundly over-approximates:
+///  - every allocation / load / call result is pointer-suspect;
+///  - string constants are pointers, scalar constants are not;
+///  - function-entry registers are all pointer-suspect (unknown args);
+///  - any opcode not explicitly modeled taints all three operand registers.
+fn may_ptr_sets(module: &CodeModule) -> Vec<RegSet> {
+    use OpCode::*;
+    let instrs = &module.instructions;
+    let n = instrs.len();
+    let mut in_sets: Vec<RegSet> = vec![[0; 4]; n];
+    let mut worklist: Vec<usize> = Vec::new();
+
+    // Entry points: module entry takes no arguments; every function-table
+    // target conservatively receives unknown (pointer-suspect) arguments.
+    let entry = module.entry_point.unwrap_or(0);
+    if entry < n {
+        worklist.push(entry);
+    }
+    for &off in &module.function_table {
+        let off = off as usize;
+        if off < n {
+            for r in 0..=255u8 {
+                regset_insert(&mut in_sets[off], r);
+            }
+            worklist.push(off);
+        }
+    }
+
+    while let Some(i) = worklist.pop() {
+        let instr = &instrs[i];
+        let set = in_sets[i];
+        let mut out = set;
+        match instr.opcode {
+            Load | Store | Move | Dup => {
+                if regset_contains(&set, instr.op1) {
+                    regset_insert(&mut out, instr.op2);
+                } else {
+                    regset_remove(&mut out, instr.op2);
+                }
+            }
+            Swap => {
+                let (a, b) = (regset_contains(&set, instr.op1), regset_contains(&set, instr.op2));
+                if a != b {
+                    if a {
+                        regset_remove(&mut out, instr.op1);
+                        regset_insert(&mut out, instr.op2);
+                    } else {
+                        regset_remove(&mut out, instr.op2);
+                        regset_insert(&mut out, instr.op1);
+                    }
+                }
+            }
+            Const0 | Const1 | Const2 | ConstM1 => regset_remove(&mut out, instr.op1),
+            ConstU | ConstL => {
+                let ptr_const = matches!(
+                    module.constants.get(instr.imm16() as usize),
+                    Some(crate::bytecode::Constant::String(_))
+                        | Some(crate::bytecode::Constant::TypeDescriptor(_))
+                        | Some(crate::bytecode::Constant::FunctionRef(_))
+                        | Some(crate::bytecode::Constant::BehaviorRef(_))
+                );
+                if ptr_const {
+                    regset_insert(&mut out, instr.op3);
+                } else {
+                    regset_remove(&mut out, instr.op3);
+                }
+            }
+            IAdd | ISub | IMul | IDiv | IMod | IPow | Xor | Shl | Shr | BitAnd | BitOr | FAdd
+            | FSub | FMul | FDiv | FMod | FPow | ICmpEq | ICmpLt | ICmpGt | ICmpLe | ICmpGe
+            | FCmpEq | FCmpLt | FCmpGt | SCmpEq | And | Or => regset_remove(&mut out, instr.op3),
+            FToS => regset_insert(&mut out, instr.op1),
+            ArrLen => regset_remove(&mut out, instr.op2),
+            ArrLoad | FieldL | RecL => regset_insert(&mut out, instr.op3),
+            ArrAlloc | RecMk | TupleMk => regset_insert(&mut out, instr.op2),
+            Drop => regset_remove(&mut out, instr.op1),
+            ArrStore | FieldS | RecS | JmpT | JmpF | Jmp | Nop => {}
+            Halt | Ret | RetVal | Panic => continue,
+            Call => regset_insert(&mut out, instr.op3),
+            // Unmodeled opcodes may write any operand register: taint all.
+            _ => {
+                regset_insert(&mut out, instr.op1);
+                regset_insert(&mut out, instr.op2);
+                regset_insert(&mut out, instr.op3);
+            }
+        }
+        let Some(succs) = successors(instrs, i) else {
+            continue; // malformed target: no propagation (sites reject anyway)
+        };
+        for s in succs {
+            let mut changed = false;
+            for w in 0..4 {
+                let merged = in_sets[s][w] | out[w];
+                if merged != in_sets[s][w] {
+                    in_sets[s][w] = merged;
+                    changed = true;
+                }
+            }
+            if changed {
+                worklist.push(s);
+            }
+        }
+    }
+    in_sets
+}
+
 /// Dataflow for a single allocation site: returns true when the value
 /// allocated at `pc` (destination register `dst`) is provably dead before
 /// any escape point on every path.
-fn site_qualifies(instrs: &[Instruction], pc: usize, dst: u8) -> bool {
+///
+/// `may_ptr` is the module-level pointer-suspect analysis: when the
+/// candidate is the *container* operand of a store, the stored register
+/// must be provably pointer-free, because arena containers' slots are not
+/// rc-held (a heap child would dangle once its donor register drops).
+fn site_qualifies(instrs: &[Instruction], may_ptr: &[RegSet], pc: usize, dst: u8) -> bool {
     let n = instrs.len();
     let mut in_sets: Vec<HashSet<u8>> = vec![HashSet::new(); n];
     let mut worklist: Vec<usize> = Vec::new();
@@ -390,9 +531,17 @@ fn site_qualifies(instrs: &[Instruction], pc: usize, dst: u8) -> bool {
                     out.remove(&(k as u8));
                 }
             }
-            Transfer::StoreEscape { src } => {
+            Transfer::StoreEscape { container, src } => {
                 if set.contains(&(src as u8)) {
                     return false; // stored into another object
+                }
+                if set.contains(&(container as u8))
+                    && regset_contains(&may_ptr[i], src as u8)
+                {
+                    // Arena container receiving a pointer-suspect child: the
+                    // child's rc would never be retained for this slot, so
+                    // the slot could dangle.  Keep the container on the heap.
+                    return false;
                 }
             }
             Transfer::Pure => {}
@@ -443,13 +592,14 @@ fn site_qualifies(instrs: &[Instruction], pc: usize, dst: u8) -> bool {
 /// and internal string allocations are not yet routed through the arena).
 pub fn qualifying_alloc_sites(module: &CodeModule) -> HashSet<usize> {
     let instrs = &module.instructions;
+    let may_ptr = may_ptr_sets(module);
     let mut out = HashSet::new();
     for (pc, ins) in instrs.iter().enumerate() {
         let dst = match ins.opcode {
             OpCode::ArrAlloc | OpCode::RecMk | OpCode::TupleMk => ins.op2,
             _ => continue,
         };
-        if site_qualifies(instrs, pc, dst) {
+        if site_qualifies(instrs, &may_ptr, pc, dst) {
             out.insert(pc);
         }
     }
@@ -636,10 +786,65 @@ mod tests {
             0,
         );
         let q = qualifying_alloc_sites(&m);
-        // r2 escapes; r1 is rejected too only if it is still live at an
-        // escape point — here it is dropped before Halt, so r1 qualifies.
+        // r2 escapes into r1, so its site stays on the heap.  r1 must also
+        // stay on the heap: arena container slots are not rc-held, so an
+        // arena r1 would dangle its (heap) child once r2's register drops.
         assert!(!q.contains(&1), "storing site must not qualify");
-        assert!(q.contains(&0), "container site still qualifies");
+        assert!(
+            !q.contains(&0),
+            "container receiving a pointer-suspect child must not qualify"
+        );
+    }
+
+    #[test]
+    fn rejects_nested_array_literal_container() {
+        // Regression for the differential-fuzz divergence on
+        // `let m = [[1, 2], [3]]; m[0][1] + m[1][0]` (interpreter returned 2,
+        // correct is 5): the outer array qualified for the arena while its
+        // inner-array children stayed on the heap with their retains skipped,
+        // so ORCA freed a child before the reads.
+        let m = send_module(
+            vec![
+                arr_alloc(2, 1),                        // r1 = inner [..]
+                arr_alloc(1, 2),                        // r2 = inner [..]
+                arr_alloc(2, 3),                        // r3 = outer
+                Instruction::new3(OpCode::ArrStore, 3, 0, 1), // outer[0] = r1
+                Instruction::new3(OpCode::ArrStore, 3, 0, 2), // outer[1] = r2
+                Instruction::new3(OpCode::ArrLoad, 3, 0, 4),  // r4 = outer[0]
+                Instruction::new3(OpCode::ArrLoad, 4, 1, 5),  // r5 = r4[1]
+                Instruction::new1(OpCode::Drop, 3),
+                Instruction::new1(OpCode::Drop, 4),
+                Instruction::new1(OpCode::Drop, 5),
+                Instruction::new0(OpCode::Halt),
+            ],
+            0,
+        );
+        let q = qualifying_alloc_sites(&m);
+        assert!(
+            !q.contains(&2),
+            "outer container with pointer-suspect children must stay on the heap"
+        );
+        assert!(!q.contains(&0) && !q.contains(&1), "stored children escape");
+    }
+
+    #[test]
+    fn qualifies_container_storing_scalars() {
+        // The target pattern: a scratch array built from scalar constants
+        // and consumed within the activation.  Scalar stores are rc-no-ops,
+        // so the arena container is sound.
+        let mut m = CodeModule::new("test");
+        m.constants.push(crate::bytecode::Constant::Int(7));
+        m.emit(arr_alloc(0, 1)); // r1 = array(..)
+        m.emit(Instruction::new3(OpCode::ConstU, 0, 0, 2)); // r2 = const int 7
+        m.emit(Instruction::new3(OpCode::ArrStore, 1, 0, 2)); // r1[0] = 7
+        m.emit(Instruction::new3(OpCode::ArrLoad, 1, 0, 3)); // r3 = r1[0]
+        m.emit(Instruction::new1(OpCode::Drop, 1));
+        m.emit(Instruction::new1(OpCode::Drop, 3));
+        m.emit(Instruction::new0(OpCode::Halt));
+        assert!(
+            qualifying_alloc_sites(&m).contains(&0),
+            "scalar-only scratch array should still qualify"
+        );
     }
 
     #[test]
