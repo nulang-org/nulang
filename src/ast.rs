@@ -472,7 +472,7 @@ impl CrdtType {
         }
     }
 
-    pub fn from_u8(v: u8) -> Option<Self> {
+    pub fn from_u8(v: u8) -> Option<CrdtType> {
         match v {
             0 => Some(CrdtType::GCounter),
             1 => Some(CrdtType::PNCounter),
