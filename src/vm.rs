@@ -4533,16 +4533,7 @@ impl VM {
                     })?;
                 let mut new_frame = Frame::new(Some(frame_idx), module_idx);
                 new_frame.pc = code_offset;
-                // Bounded copy: only copy registers the callee will read.
-                // local_count covers LOCAL_BASE + all callee locals, which
-                // includes the staging zone (r0..r11) where call args live.
-                let local_count = self.modules[module_idx]
-                    .function_local_counts
-                    .get(func_idx)
-                    .copied()
-                    .unwrap_or(256);
-                let copy_n = local_count.min(256);
-                new_frame.regs[..copy_n].copy_from_slice(&frame.regs[..copy_n]);
+                new_frame.regs = frame.regs;
                 new_frame.return_dst = dst;
                 new_frame.closure_env = closure_env;
                 self.frames.push(new_frame);

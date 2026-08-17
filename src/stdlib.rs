@@ -1086,6 +1086,8 @@ mod tests {
                 "Debug",
                 "FS",
                 "Array",
+                "StrBuilder",
+                "Map",
                 "Test",
                 "Int",
                 "Float",
