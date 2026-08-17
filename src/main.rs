@@ -351,6 +351,7 @@ fn main() {
                 }
             }
             "--ffi-sandbox" => opts.ffi_sandbox = true,
+            "--iso-arena" => opts.iso_arena = true,
             "--ffi-allow" => {
                 if i + 1 < args.len() {
                     opts.ffi_allow.push(args[i + 1].clone());
@@ -544,6 +545,13 @@ fn main() {
 
     // Resolve color mode once after all args are parsed.
     let use_color = color_enabled(&opts);
+    // Wave D4: --iso-arena enables the VM's per-activation arena path for
+    // every VM created in this process (the VM also honors the env var
+    // directly; set_var keeps runtimes that construct VMs internally in
+    // sync without threading a flag through every constructor).
+    if opts.iso_arena {
+        std::env::set_var("NULANG_ISO_ARENA", "1");
+    }
 
     // Apply FFI policy
     if opts.ffi_sandbox {
@@ -975,6 +983,9 @@ struct Options {
     /// Start a Prometheus-format metrics server on this port.
     metrics_port: Option<u16>,
     ffi_sandbox: bool,
+    /// Wave D4: enable the per-activation iso-arena allocation path in the
+    /// bytecode VM (same as `NULANG_ISO_ARENA=1`). Default off.
+    iso_arena: bool,
     ffi_allow: Vec<String>,
     /// Resource-capability grants for `--with=` (fs, net, os). Empty = no
     /// gate (standalone programs run with full access).
@@ -1013,6 +1024,7 @@ impl Default for Options {
             bench_count: None,
             metrics_port: None,
             ffi_sandbox: false,
+            iso_arena: false,
             ffi_allow: Vec::new(),
             with_capabilities: Vec::new(),
             target: "native".to_string(),
