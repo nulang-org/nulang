@@ -1908,12 +1908,19 @@ impl Runtime {
 
     pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {
         let actor = self.actors.get(&target_id)?;
-        let suffix = format!(".{}", behavior);
+        // Allocation-free match: `entry.name == behavior`, or
+        // `entry.name` ends with `.<behavior>` (qualified name).
+        let matches = |name: &str| {
+            name == behavior
+                || name
+                    .strip_suffix(behavior)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        };
         // Search the per-actor behavior table first (native handlers).
         if let Some(idx) = actor
             .behavior_table
             .iter()
-            .position(|entry| entry.name == behavior || entry.name.ends_with(&suffix))
+            .position(|entry| matches(&entry.name))
         {
             return Some(idx as u16);
         }
@@ -1924,7 +1931,7 @@ impl Runtime {
         module
             .behaviors
             .iter()
-            .position(|b| b.name == behavior || b.name.ends_with(&suffix))
+            .position(|b| matches(&b.name))
             .map(|idx| idx as u16)
     }
 

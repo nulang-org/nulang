@@ -945,11 +945,16 @@ fn try_lookup_content_hash(runtime: &Runtime, behavior_name: &str) -> Option<[u8
     let actor_id = runtime.current_actor?;
     let actor = runtime.actors.get(&actor_id)?;
     let module = actor.bytecode_module.as_ref()?;
-    let suffix = format!(".{}", behavior_name);
+    let matches = |name: &str| {
+        name == behavior_name
+            || name
+                .strip_suffix(behavior_name)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    };
     module
         .behaviors
         .iter()
-        .find(|b| b.name == behavior_name || b.name.ends_with(&suffix))
+        .find(|b| matches(&b.name))
         .and_then(|b| b.content_hash)
 }
 

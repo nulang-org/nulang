@@ -424,6 +424,462 @@ pub fn resolve_value_string(constants: &[Constant], value: Value) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// StrBuilder builtin — mutable, growable string buffer
+// ---------------------------------------------------------------------------
+//
+// Payload (allocated with `HeapTypeTag::Raw` — raw bytes, no Value slots):
+//   [0..8)  len: u64      — current content length in bytes
+//   [8..16) cap: u64      — allocated byte capacity
+//   [16..)  bytes         — UTF-8 content
+//
+// `push` appends in place when capacity suffices and returns the same
+// pointer; on growth it allocates a new object with doubled capacity and
+// returns the NEW pointer (the old pointer is stale after growth — callers
+// must rebind: `b = perform StrBuilder.push(b, s)`). This is a deliberately
+// mutable type, like `var` bindings; aliased builder values observe in-place
+// mutations.
+const STRBUILDER_HDR: usize = 16;
+
+pub(crate) fn strbuilder_op(
+    callbacks: &mut dyn ActorVmCallbacks,
+    constants: &[Constant],
+    op: &str,
+    regs: &[Value],
+) -> Option<Value> {
+    match op {
+        "new" => {
+            let cap: usize = 32;
+            let ptr = callbacks.alloc(STRBUILDER_HDR + cap, HeapTypeTag::Raw)?;
+            unsafe {
+                *(ptr as *mut u64) = 0; // len
+                *((ptr as *mut u64).add(1)) = cap as u64;
+            }
+            Some(Value::ptr(ptr))
+        }
+        "push" | "append" => {
+            let b = regs.first()?.as_ptr()?;
+            let s = resolve_value_string(constants, *regs.get(1)?);
+            let len = unsafe { *(b as *const u64) } as usize;
+            let cap = unsafe { *((b as *const u64).add(1)) } as usize;
+            let needed = len + s.len();
+            if needed <= cap {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        s.as_ptr(),
+                        b.add(STRBUILDER_HDR).add(len),
+                        s.len(),
+                    );
+                    *(b as *mut u64) = needed as u64;
+                }
+                Some(Value::ptr(b))
+            } else {
+                let new_cap = (cap * 2).max(needed);
+                let new_ptr = callbacks.alloc(STRBUILDER_HDR + new_cap, HeapTypeTag::Raw)?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        b.add(STRBUILDER_HDR),
+                        new_ptr.add(STRBUILDER_HDR),
+                        len,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        s.as_ptr(),
+                        new_ptr.add(STRBUILDER_HDR).add(len),
+                        s.len(),
+                    );
+                    *(new_ptr as *mut u64) = needed as u64;
+                    *((new_ptr as *mut u64).add(1)) = new_cap as u64;
+                }
+                Some(Value::ptr(new_ptr))
+            }
+        }
+        "to_string" => {
+            let b = regs.first()?.as_ptr()?;
+            let len = unsafe { *(b as *const u64) } as usize;
+            let ptr = callbacks.alloc(len + 1, HeapTypeTag::String)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(b.add(STRBUILDER_HDR), ptr, len);
+                *ptr.add(len) = 0;
+            }
+            Some(Value::ptr(ptr))
+        }
+        "len" => {
+            let b = regs.first()?.as_ptr()?;
+            Some(Value::int(unsafe { *(b as *const u64) } as i64))
+        }
+        "reset" => {
+            let b = regs.first()?.as_ptr()?;
+            unsafe {
+                *(b as *mut u64) = 0;
+            }
+            Some(Value::ptr(b))
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Map builtin — mutable hash map, open addressing over Value slots
+// ---------------------------------------------------------------------------
+//
+// Payload (allocated with `HeapTypeTag::Map`, treated as uniform Value
+// slots by the GC and heap serializer):
+//   slot 0           cap:  Int — entry capacity
+//   slot 1           used: Int — live entry count
+//   slot 2 + 3*i     entry hash (Int; 0 = empty, 1 = tombstone,
+//                                  else content-hash + 2, masked to 48 bits)
+//   slot 2 + 3*i + 1 entry key (Value)
+//   slot 2 + 3*i + 2 entry value (Value)
+//
+// Insert/remove mutate in place (mutable type, like StrBuilder); keys and
+// values are retained on insert and released on remove/overwrite/free, so
+// the ORCA reclamation protocol holds. Growth doubles capacity and rehashes
+// into a NEW object; the caller rebinds the returned pointer.
+const MAP_HDR_SLOTS: usize = 2;
+const MAP_EMPTY: i64 = 0;
+const MAP_TOMB: i64 = 1;
+
+fn map_capacity(m: *mut u8) -> usize {
+    unsafe { (*(m as *const Value)).as_int().unwrap_or(0) as usize }
+}
+
+fn map_used(m: *mut u8) -> usize {
+    unsafe { (*((m as *const Value).add(1))).as_int().unwrap_or(0) as usize }
+}
+
+fn map_set_used(m: *mut u8, used: usize) {
+    unsafe {
+        *((m as *mut Value).add(1)) = Value::int(used as i64);
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn map_value_is_string(v: Value) -> bool {
+    if v.as_string_id().is_some() {
+        return true;
+    }
+    if let Some(ptr) = v.as_ptr() {
+        // SAFETY: `ptr` is a live heap payload; the header sits one stride
+        // before it (see `ActorHeap::header_of`).
+        return unsafe { (*ActorHeap::header_of(ptr)).type_tag == HeapTypeTag::String };
+    }
+    false
+}
+
+fn map_value_hash(constants: &[Constant], v: Value) -> u64 {
+    if let Some(id) = v.as_string_id() {
+        match constants.get(id as usize) {
+            Some(Constant::String(s)) => fnv1a64(s.as_bytes()),
+            _ => 0,
+        }
+    } else if let Some(ptr) = v.as_ptr() {
+        // SAFETY: `ptr` is a live heap payload; the header sits one stride
+        // before it.
+        let tag = unsafe { (*ActorHeap::header_of(ptr)).type_tag };
+        if tag == HeapTypeTag::String {
+            // SAFETY: heap string payloads are NUL-terminated.
+            unsafe { fnv1a64(CStr::from_ptr(ptr as *const c_char).to_bytes()) }
+        } else {
+            fnv1a64(&(ptr as usize).to_le_bytes())
+        }
+    } else {
+        fnv1a64(&v.as_raw().to_le_bytes())
+    }
+}
+
+/// Equality mirroring Nulang `==`: strings compare by content, heap objects
+/// by pointer identity, scalars by raw bits.
+fn map_values_equal(a: Value, b: Value, constants: &[Constant]) -> bool {
+    let a_str = map_value_is_string(a);
+    let b_str = map_value_is_string(b);
+    if a_str && b_str {
+        return resolve_value_string(constants, a) == resolve_value_string(constants, b);
+    }
+    match (a.as_ptr(), b.as_ptr()) {
+        (Some(pa), Some(pb)) => pa == pb,
+        _ => a.as_raw() == b.as_raw(),
+    }
+}
+
+fn map_hash_code(constants: &[Constant], k: Value) -> i64 {
+    let h = map_value_hash(constants, k);
+    let code = ((h as i64).wrapping_add(2)) & 0x7FFF_FFFF_FFFF;
+    if code == MAP_EMPTY || code == MAP_TOMB {
+        2
+    } else {
+        code
+    }
+}
+
+/// Entry slot base for entry `i` (entry layout: hash, key, value).
+#[inline]
+fn map_entry_slot(i: usize) -> usize {
+    MAP_HDR_SLOTS + i * 3
+}
+
+/// Grow the map to `new_cap` entries, rehashing all live entries into a new
+/// object (retaining key/value refs). Returns the new pointer.
+fn map_grow(
+    callbacks: &mut dyn ActorVmCallbacks,
+    m: *mut u8,
+    new_cap: usize,
+) -> Option<Value> {
+    let old_cap = map_capacity(m);
+    let slots = MAP_HDR_SLOTS + new_cap * 3;
+    let new_ptr = callbacks.alloc(slots * std::mem::size_of::<Value>(), HeapTypeTag::Map)?;
+    unsafe {
+        *(new_ptr as *mut Value) = Value::int(new_cap as i64);
+        *((new_ptr as *mut Value).add(1)) = Value::int(0); // used, refilled below
+        // The bump allocator does not zero memory: initialize every entry
+        // slot to the empty marker so the GC slot-release path never sees
+        // garbage Value patterns.
+        for slot in (2..slots).map(|i| (new_ptr as *mut Value).add(i)) {
+            *slot = Value::int(MAP_EMPTY);
+        }
+        for i in 0..old_cap {
+            let base = (m as *mut Value).add(map_entry_slot(i));
+            let h = *(base as *const Value);
+            let code = h.as_int().unwrap_or(MAP_EMPTY);
+            if code == MAP_EMPTY || code == MAP_TOMB {
+                continue;
+            }
+            let k = *((base as *const Value).add(1));
+            let v = *((base as *const Value).add(2));
+            let code_v = Value::int(code);
+            let start = (code as usize) % new_cap;
+            for j in 0..new_cap {
+                let idx = (start + j) % new_cap;
+                let nbase = (new_ptr as *mut Value).add(map_entry_slot(idx));
+                let nh = *(nbase as *const Value);
+                if nh.as_int() == Some(MAP_EMPTY) {
+                    *(nbase as *mut Value) = code_v;
+                    *((nbase as *mut Value).add(1)) = k;
+                    if let Some(p) = k.as_ptr() {
+                        callbacks.retain_ref(p);
+                    }
+                    *((nbase as *mut Value).add(2)) = v;
+                    if let Some(p) = v.as_ptr() {
+                        callbacks.retain_ref(p);
+                    }
+                    break;
+                }
+            }
+        }
+        let used = map_used(m);
+        *((new_ptr as *mut Value).add(1)) = Value::int(used as i64);
+    }
+    Some(Value::ptr(new_ptr))
+}
+
+pub(crate) fn hashmap_op(
+    callbacks: &mut dyn ActorVmCallbacks,
+    constants: &[Constant],
+    op: &str,
+    regs: &[Value],
+) -> Option<Value> {
+    match op {
+        "new" => {
+            let cap: usize = 8;
+            let slots = MAP_HDR_SLOTS + cap * 3;
+            let m = callbacks.alloc(slots * std::mem::size_of::<Value>(), HeapTypeTag::Map)?;
+            unsafe {
+                *(m as *mut Value) = Value::int(cap as i64);
+                *((m as *mut Value).add(1)) = Value::int(0);
+                for slot in (2..slots).map(|i| (m as *mut Value).add(i)) {
+                    *slot = Value::int(MAP_EMPTY);
+                }
+            }
+            Some(Value::ptr(m))
+        }
+        "insert" => {
+            let m_orig = regs.first()?.as_ptr()?;
+            let k = *regs.get(1)?;
+            let v = *regs.get(2)?;
+            let code = map_hash_code(constants, k);
+            let mut m = m_orig;
+            // Grow at load factor 0.5 to keep probes short; growth returns a
+            // NEW object (the caller rebinds the returned pointer).
+            if map_used(m) + 1 > map_capacity(m) / 2 {
+                m = map_grow(callbacks, m, map_capacity(m) * 2)?.as_ptr()?;
+            }
+            let cap = map_capacity(m);
+            let used = map_used(m);
+            let start = (code as usize) % cap;
+            let mut first_tomb: Option<usize> = None;
+            for i in 0..cap {
+                let idx = (start + i) % cap;
+                let base = unsafe { (m as *mut Value).add(map_entry_slot(idx)) };
+                let h = unsafe { *(base as *const Value) };
+                let hc = h.as_int().unwrap_or(MAP_EMPTY);
+                if hc == MAP_EMPTY {
+                    let target = first_tomb.unwrap_or(idx);
+                    let tbase = unsafe { (m as *mut Value).add(map_entry_slot(target)) };
+                    unsafe {
+                        *(tbase as *mut Value) = Value::int(code);
+                        *((tbase as *mut Value).add(1)) = k;
+                        if let Some(p) = k.as_ptr() {
+                            callbacks.retain_ref(p);
+                        }
+                        *((tbase as *mut Value).add(2)) = v;
+                        if let Some(p) = v.as_ptr() {
+                            callbacks.retain_ref(p);
+                        }
+                    }
+                    map_set_used(m, used + 1);
+                    return Some(Value::ptr(m));
+                }
+                if hc == MAP_TOMB {
+                    if first_tomb.is_none() {
+                        first_tomb = Some(idx);
+                    }
+                    continue;
+                }
+                let kslot = unsafe { *((base as *const Value).add(1)) };
+                if map_values_equal(kslot, k, constants) {
+                    unsafe {
+                        let oldk = *((base as *const Value).add(1));
+                        let oldv = *((base as *const Value).add(2));
+                        if let Some(p) = oldk.as_ptr() {
+                            callbacks.drop_ref(p);
+                        }
+                        if let Some(p) = oldv.as_ptr() {
+                            callbacks.drop_ref(p);
+                        }
+                        *((base as *mut Value).add(1)) = k;
+                        if let Some(p) = k.as_ptr() {
+                            callbacks.retain_ref(p);
+                        }
+                        *((base as *mut Value).add(2)) = v;
+                        if let Some(p) = v.as_ptr() {
+                            callbacks.retain_ref(p);
+                        }
+                    }
+                    return Some(Value::ptr(m));
+                }
+            }
+            // No empty slot: reuse the first tombstone (table can't be all
+            // occupied here because growth kept load ≤ 0.5, but tombstones
+            // may consume the remainder).
+            if let Some(t) = first_tomb {
+                let tbase = unsafe { (m as *mut Value).add(map_entry_slot(t)) };
+                unsafe {
+                    *(tbase as *mut Value) = Value::int(code);
+                    *((tbase as *mut Value).add(1)) = k;
+                    if let Some(p) = k.as_ptr() {
+                        callbacks.retain_ref(p);
+                    }
+                    *((tbase as *mut Value).add(2)) = v;
+                    if let Some(p) = v.as_ptr() {
+                        callbacks.retain_ref(p);
+                    }
+                }
+                map_set_used(m, used + 1);
+                Some(Value::ptr(m))
+            } else {
+                None
+            }
+        }
+        "get" => {
+            let m = regs.first()?.as_ptr()?;
+            let k = *regs.get(1)?;
+            let cap = map_capacity(m);
+            let code = map_hash_code(constants, k);
+            let start = (code as usize) % cap;
+            for i in 0..cap {
+                let idx = (start + i) % cap;
+                let base = unsafe { (m as *mut Value).add(map_entry_slot(idx)) };
+                let h = unsafe { *(base as *const Value) };
+                let hc = h.as_int().unwrap_or(MAP_EMPTY);
+                if hc == MAP_EMPTY {
+                    break; // key absent (tombstones can't hide it: linear
+                           // probing stops only at a true empty slot)
+                }
+                if hc == MAP_TOMB {
+                    continue;
+                }
+                let kslot = unsafe { *((base as *const Value).add(1)) };
+                if map_values_equal(kslot, k, constants) {
+                    return Some(unsafe { *((base as *const Value).add(2)) });
+                }
+            }
+            Some(Value::nil())
+        }
+        "contains" => {
+            let m = regs.first()?.as_ptr()?;
+            let k = *regs.get(1)?;
+            let cap = map_capacity(m);
+            let code = map_hash_code(constants, k);
+            let start = (code as usize) % cap;
+            for i in 0..cap {
+                let idx = (start + i) % cap;
+                let base = unsafe { (m as *mut Value).add(map_entry_slot(idx)) };
+                let hc = unsafe { *(base as *const Value) }.as_int().unwrap_or(MAP_EMPTY);
+                if hc == MAP_EMPTY {
+                    break;
+                }
+                if hc == MAP_TOMB {
+                    continue;
+                }
+                let kslot = unsafe { *((base as *const Value).add(1)) };
+                if map_values_equal(kslot, k, constants) {
+                    return Some(Value::bool(true));
+                }
+            }
+            Some(Value::bool(false))
+        }
+        "remove" => {
+            let m = regs.first()?.as_ptr()?;
+            let k = *regs.get(1)?;
+            let cap = map_capacity(m);
+            let used = map_used(m);
+            let code = map_hash_code(constants, k);
+            let start = (code as usize) % cap;
+            for i in 0..cap {
+                let idx = (start + i) % cap;
+                let base = unsafe { (m as *mut Value).add(map_entry_slot(idx)) };
+                let hc = unsafe { *(base as *const Value) }.as_int().unwrap_or(MAP_EMPTY);
+                if hc == MAP_EMPTY {
+                    break;
+                }
+                if hc == MAP_TOMB {
+                    continue;
+                }
+                let kslot = unsafe { *((base as *const Value).add(1)) };
+                if map_values_equal(kslot, k, constants) {
+                    unsafe {
+                        let oldk = *((base as *const Value).add(1));
+                        let oldv = *((base as *const Value).add(2));
+                        if let Some(p) = oldk.as_ptr() {
+                            callbacks.drop_ref(p);
+                        }
+                        if let Some(p) = oldv.as_ptr() {
+                            callbacks.drop_ref(p);
+                        }
+                        *(base as *mut Value) = Value::int(MAP_TOMB);
+                    }
+                    map_set_used(m, used.saturating_sub(1));
+                    return Some(Value::ptr(m));
+                }
+            }
+            Some(Value::ptr(m))
+        }
+        "size" => {
+            let m = regs.first()?.as_ptr()?;
+            Some(Value::int(map_used(m) as i64))
+        }
+        _ => None,
+    }
+}
+
+
 impl ActorVmCallbacks for StandaloneVmCallbacks {
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
         self.heap.alloc(size, type_tag)
@@ -964,6 +1420,12 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                 }
                 _ => return None,
             }
+        }
+        if effect_name == "StrBuilder" {
+            return strbuilder_op(self, constants, op_name.unwrap_or(""), regs);
+        }
+        if effect_name == "Map" {
+            return hashmap_op(self, constants, op_name.unwrap_or(""), regs);
         }
         if effect_name == "Http" {
             match op_name {

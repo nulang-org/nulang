@@ -611,7 +611,10 @@ impl OrcaGc {
         };
 
         if owner == self.actor_id
-            && matches!(type_tag, TypeTag::Array | TypeTag::Record | TypeTag::Tuple)
+            && matches!(
+                type_tag,
+                TypeTag::Array | TypeTag::Record | TypeTag::Tuple | TypeTag::Map
+            )
         {
             let slot_count = size / std::mem::size_of::<crate::vm::Value>();
             // SAFETY: container payloads are laid out as `slot_count` Values
