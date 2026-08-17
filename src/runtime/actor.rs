@@ -181,6 +181,12 @@ pub struct Actor {
     pub mailbox: Mailbox,
     pub heap: ActorHeap,
     pub orca_gc: OrcaGc,                    // ORCA GC engine for this actor
+    /// Wave D4 per-activation bump arena for allocations proven
+    /// message-scoped by the conservative escape analysis in
+    /// [`crate::iso_arena`].  Reset in O(1) when a handler activation
+    /// completes without suspending.  Unused unless the VM's iso-arena
+    /// flag is on (`NULANG_ISO_ARENA=1` / `--iso-arena`).
+    pub iso_arena: crate::iso_arena::IsoArena,
     pub state_data: HashMap<String, Value>, // Named actor state fields
     pub state_models: HashMap<String, StateModel>, // Persistence model per field
     pub event_log: Vec<(String, Vec<Value>)>, // Emitted events for event_sourced actors
@@ -332,6 +338,7 @@ impl Actor {
                 heap
             },
             orca_gc: OrcaGc::new(id), // ORCA GC engine
+            iso_arena: crate::iso_arena::IsoArena::new(),
             state_data: HashMap::new(),
             state_models: HashMap::new(),
             event_log: Vec::new(),
