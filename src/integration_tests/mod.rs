@@ -11644,7 +11644,8 @@ match { a: 2, b: 9 } with {
             perform Map.size(m) * 100 + v1 * 10 + v2
         "#;
         // Overwrite keeps size 1; v1 = 2; after remove size 0; v2 = nil -> 0.
-        assert_int(source, 0 * 100 + 2 * 10 + 0);
+        // The source computes `Map.size(m) * 100 + v1 * 10 + v2` == 0*100 + 2*10 + 0.
+        assert_int(source, 20);
     }
 
     #[test]
