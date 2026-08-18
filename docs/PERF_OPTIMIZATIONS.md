@@ -53,6 +53,30 @@ remove/overwrite, and `TypeTag::Map` added to `free_object` slot-release.
 first-block allocation deferred — see below.)
 **Risk:** low. **Shipped.**
 
+## Considered, measured, and rejected
+
+### Lazy frame-register zeroing (`vm.rs` `step_call`)
+`Frame::new` initializes `[Value::nil(); 256]` (2 KB) on every call, and
+`Call`/`ClosureCall` are **not JIT-compilable** (only `Ret`/`RetVal` are;
+`find_compilable_region` stops at a call). So call-bound code (fib, closures,
+behavior dispatch) pays the 2 KB frame zero + the interpreter dispatch on
+every call, and never tiers up.
+
+**Measured:** microbenchmarked the frame machinery (2 KB init + push + pop ×
+2.7M) at **72 ms**; release fib(30) is **1.27 s** (~470 ns/call). The frame
+init share is **~27 ns/call (~6%)**; lazy-zeroing the used prefix would save
+~3%. To avoid the full-array init, a frame must either use `MaybeUninit`
+(UB on the never-read tail) or reuse stale-tail frames — and stale-tail
+values can be heap pointers from freed objects, which continuation
+snapshots / hibernation serialization / DAP would walk as dangling refs.
+**Rejected: ~3% in release, no safe implementation. The interpreter dispatch
+(not the frame zero) dominates call-bound code.**
+
+**The real fix is JIT-compiling `Call`** (native call ABI between compiled
+regions) — that eliminates both the frame zero and the per-instruction
+interpreter dispatch for hot calls. Large, needs its own audit. See the
+JIT-call note below.
+
 ## Considered and reverted
 
 ### ClosureCall full-frame copy (`vm.rs`, `core_vm`)
@@ -83,14 +107,29 @@ code and broke the hand-built sites; **reverted** on the audit finding.
 | **"Already scheduled" scheduler flag** | Flag lifecycle across work-stealing + cross-shard `EnqueueActor` is a stuck-flag/deadlock risk. Scheduler is already tuned (757k msg/s counting). |
 | **Per-step guard trimming** | The step-limit check is already a cached `OnceLock` + compare per step — negligible cost. Changing step-count semantics risks continuation metadata and step-limit tests. |
 
-## Pre-existing upstream issue (not on this branch)
+## Correctness fix landed on this branch
 
-`**` with a 48-bit-overflowing exponent diverges: interpreter wraps (returns
-`0`), AOT returns `nil`. Caused by the upstream revert `2f3ef93` that made
-the interpreter lenient while AOT stayed strict. Reproduces on the base
-commit — a real correctness bug (interp/AOT semantic asymmetry), out of
-scope for this perf branch (needs the 64-bit-int work or a deliberate
-interp/AOT alignment decision).
+Int `**` overflow diverged across backends: the interpreter's `step_ipow`
+wraps on 48-bit overflow, but the shared JIT/AOT helper `nulang_pow` was
+checked (returned `nil` + recorded an error). Fixed by making `nulang_pow`
+mirror `step_ipow` (wrap, negative exp → nil), and by excluding `BinOp::Pow`
+from AOT unboxed compilation (`is_all_int`) — Pow was missing from the
+nil-producing exclusion, so an all-Int fn compiled unboxed, fell through the
+unboxed binop match to the tagged helper with raw operands, and returned `0`
+for non-overflow pow. See commits `db5a4fd` + `39420ef`.
+
+## JIT-compiling `Call` (next high-impact item)
+
+`Call`/`ClosureCall` are not JIT-compilable, so hot call-graphs (fib,
+closures, recursion) never tier up and run fully interpreted
+(~470 ns/call for fib in release, of which the frame zero is ~6%). The
+high-impact fix is a native call ABI between compiled regions: stage args,
+call the callee's compiled region in the shared 256-reg buffer (caller-save),
+return through the interpreter trampoline for cold callees. This eliminates
+both the per-call frame zero and the interpreter dispatch for hot calls.
+Scope: Cranelift `call` lowering, callee-save discipline, tier-up of the
+callee region, and fallback-to-interpreter for un-compiled callees. Multi-day;
+needs its own audit.
 
 ## Measured baseline (before this branch)
 
