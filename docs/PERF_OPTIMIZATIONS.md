@@ -163,6 +163,18 @@ completion. This compiles the caller's whole body around direct calls (fib:
 arg computes, adds, branch native; recursive calls interpreted), with the
 recursion tiering up as the callee's own region compiles.
 
+**Measured: the yield-at-Call variant regresses.** A first attempt included
+direct non-suspending calls in regions and yielded to the interpreter at each
+call (no native call, no re-entrancy — correct by construction). A call-heavy
+loop regressed ~30% (2.21s → 2.86s) because the per-iteration yield/re-entry
+overhead exceeded the small native-block savings — the same trap the existing
+`STRAIGHT_LINE_MIN` guard documents. Only a re-entrant native-call helper
+(runs the non-suspending callee to completion in one step, thread-local
+save/restore, runtime reg-254 verification) delivers the win, and that is
+high-risk (frame management + nested JIT). The `may_suspend` analysis +
+direct-call peephole (the foundation) are landed and tested; the native-call
+helper is the remaining high-risk slice.
+
 ## Correctness fix landed on this branch
 
 Int `**` overflow diverged across backends: the interpreter's `step_ipow`
