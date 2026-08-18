@@ -201,6 +201,10 @@ two major versions.*
   hash lookup no longer build a `format!(".{name}")` string per send.
 - **Actor heap density** — default per-actor bump block 64 KiB → 16 KiB
   (~4× actor density, ≈64k actors/GB). Growth chaining unchanged.
+- **Int `**` overflow consistency** — interpreter, JIT, and AOT now all wrap
+  on 48-bit int-pow overflow (previously the interpreter wrapped while the
+  JIT/AOT compiled helper returned `nil` + recorded an arithmetic error). The
+  compiled helper `nulang_pow` now mirrors the interpreter's `step_ipow`.
 
 
 ### Added since 1.0.0-frozen — 2026-08-15
