@@ -3445,7 +3445,7 @@ impl VM {
         let status = loop {
             match self.step() {
                 Ok(()) => {
-                    if self.current_frame_idx.map_or(true, |f| f != caller_idx) {
+                    if self.current_frame_idx.map_or(false, |f| f != caller_idx) {
                         continue; // still inside the callee (or a nested call)
                     }
                     break 0;

@@ -610,6 +610,106 @@ fn test_jit_direct_call_loop_tiers_up() {
         "the loop region must compile around the folded direct call"
     );
 }
+
+#[test]
+fn test_jit_direct_call_recursion_stays_interpreter() {
+    // Recursive calls (fib -> fib) are in a direct-call cycle and must NOT be
+    // folded into a compiled region: the re-entrant helper consumes native
+    // stack per recursion level, so unbounded recursion would overflow it. The
+    // interpreter uses heap-allocated frames. fib must therefore stay fully
+    // interpreted and still produce the correct result.
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn fib(n: Int) -> Int {
+            if n < 2 then { n } else { fib(n - 1) + fib(n - 2) }
+        }
+        fn main() -> Int { fib(25) }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_direct_call_fib").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interp fib should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let result = jit_vm.run().expect("jit fib should run");
+    assert_eq!(
+        result.as_int(),
+        expected.as_int(),
+        "JIT fib must match the interpreter"
+    );
+    assert_eq!(expected.as_int(), Some(75025), "fib(25) is wrong");
+    assert_eq!(
+        jit_vm.jit_compiled_count(),
+        0,
+        "recursive calls must not fold (recursion-cycle gate)"
+    );
+}
+
+#[test]
+fn test_jit_direct_call_skips_suspending_callee() {
+    // A callee that may suspend (performs an effect) must NOT be folded into
+    // a compiled region — the may_suspend gate keeps it on the interpreter so
+    // suspension semantics are preserved. The program must still run correctly.
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn noisy(x: Int) -> Int {
+            perform IO.print("noise");
+            x + 1
+        }
+        fn main() -> Int {
+            var s = 0;
+            var i = 0;
+            while i < 50 {
+                s = noisy(s);
+                i = i + 1
+            };
+            s
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_direct_call_suspend").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interp should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let result = jit_vm.run().expect("jit should run");
+    assert_eq!(
+        result.as_int(),
+        expected.as_int(),
+        "a loop calling a suspending callee must match the interpreter"
+    );
+    assert_eq!(expected.as_int(), Some(50), "loop counter is wrong");
+}
 // ---------------------------------------------------------------------------
 // Extended opcode coverage: Load/Store, bitwise int ops, FNeg
 // ---------------------------------------------------------------------------
@@ -1285,6 +1385,57 @@ fn test_absent_metadata_uses_scalar_path() {
     assert!(
         vm.jit_typed_compiled_count() <= 1,
         "only the prologue may use typed path; loop body must stay scalar"
+    );
+}
+
+#[test]
+fn test_compute_recursive_classifies_cycles() {
+    // Acyclic call chains are non-recursive (safe to fold into a compiled
+    // region); self/mutual recursion is flagged so the re-entrant direct-call
+    // helper is NOT used (it consumes native stack per recursion level).
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+
+    let source = r#"
+        fn f0(x: Int) -> Int { x + 1 }
+        fn f1(x: Int) -> Int { f0(x) }
+        fn f2(x: Int) -> Int { f1(x) }
+        fn self_rec(n: Int) -> Int { if n < 1 then 0 else self_rec(n - 1) }
+        fn main() {}
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "recursive_test").expect("codegen");
+
+    let idx_of = |name: &str| -> usize {
+        let off = module
+            .debug_functions
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{} in debug_functions", name))
+            .code_offset;
+        module
+            .function_table
+            .iter()
+            .position(|&o| o == off)
+            .unwrap_or_else(|| panic!("{} offset in function_table", name))
+    };
+
+    let rec = compute_recursive(&module);
+    assert!(!rec[idx_of("f0")], "leaf f0 must be non-recursive");
+    assert!(!rec[idx_of("f1")], "f1 -> f0 chain must be non-recursive");
+    assert!(!rec[idx_of("f2")], "f2 -> f1 -> f0 chain must be non-recursive");
+    assert!(
+        rec[idx_of("self_rec")],
+        "self-recursion must be flagged recursive"
     );
 }
 
