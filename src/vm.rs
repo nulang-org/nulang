@@ -2274,6 +2274,11 @@ pub struct VM {
     jit_session: Option<Box<dyn JitBackend>>,
     /// Per-module constant pools converted to raw bits for the JIT.
     jit_constants: Vec<Vec<u64>>,
+    /// Runtime error raised by a re-entrant JIT direct call (taken from the
+    /// JIT pending-error thread-local in `try_jit_execute`; consumed by
+    /// `step` so the error surfaces as a VM error). None when the last JIT
+    /// region ran cleanly.
+    jit_pending_error: Option<String>,
     /// Local node ID reported by the `NodeId` opcode.
     node_id: u64,
     /// Migration requests recorded by the `Migrate` opcode when no runtime
@@ -2465,6 +2470,7 @@ impl VM {
                 None
             },
             jit_constants: Vec::new(),
+            jit_pending_error: None,
             node_id: 0,
             pending_migrations: Vec::new(),
             gossip_log: Vec::new(),
@@ -3163,6 +3169,10 @@ impl VM {
     fn try_jit_execute(&mut self, frame_idx: usize) -> bool {
         let module_idx = self.frames[frame_idx].module_idx;
         let pc = self.frames[frame_idx].pc;
+        // Raw pointer to self for the re-entrant direct-call helper, computed
+        // BEFORE the `&mut self.jit_session` borrow below (the VM is stable
+        // and single-threaded for the duration of this region execution).
+        let self_ptr = self as *mut VM;
         let jit = match &mut self.jit_session {
             Some(j) => j.as_mut(),
             None => return false,
@@ -3210,7 +3220,7 @@ impl VM {
         // callee on the interpreter frame stack from within a compiled region.
         // The VM is single-threaded, so a raw pointer in a thread-local is sound.
         unsafe {
-            crate::jit::runtime::set_jit_vm(self as *mut VM);
+            crate::jit::runtime::set_jit_vm(self_ptr);
         }
         let action = jit.tiered_execute_step_typed(module_idx, pc, module, &mut regs, constants);
         crate::jit::runtime::clear_jit_vm();
@@ -3224,9 +3234,11 @@ impl VM {
 
             // A re-entrant callee raised a runtime error (e.g. step-limit
             // exceeded); the compiled region exited early via its error path.
-            // Propagate BEFORE handling branch-exit/yield so the error wins.
+            // Stash it on the VM so `step` can surface it (this fn returns
+            // bool). Propagate BEFORE handling branch-exit/yield.
             if let Some(msg) = crate::jit::runtime::take_jit_pending_vm_error() {
-                return Err(NuError::runtime_error(msg));
+                self.jit_pending_error = Some(msg);
+                return true;
             }
 
             // A compiled region that exited via a branch to an outside target
@@ -3366,6 +3378,95 @@ impl VM {
 
         self.frames[frame_idx].regs[dst as usize] = result;
         Ok(())
+    }
+    /// Run a provably-non-suspending direct callee to completion on the
+    /// interpreter frame stack, from within a compiled region whose register
+    /// buffer is `regs`. Used by `nulang_jit_direct_call`. Returns 0 on
+    /// success, nonzero on error (the error is recorded in the JIT pending
+    /// error thread-local and the callee's frames are unwound back to the
+    /// caller so the outer region resumes on the correct frame).
+    ///
+    /// The callee is `!may_suspend` by construction (the compiler gates
+    /// emission on that analysis), so it never suspends mid-run.
+    ///
+    /// # Safety
+    /// `regs` must point at the 256-entry register buffer of the compiled
+    /// region that invoked this helper.
+    pub(crate) fn jit_direct_call(
+        &mut self,
+        regs: *mut u64,
+        func_idx: usize,
+        argc: usize,
+        dst: usize,
+    ) -> i64 {
+        let caller_idx = match self.current_frame_idx {
+            Some(c) => c,
+            None => {
+                crate::jit::runtime::set_jit_pending_vm_error(
+                    "JIT direct call outside a frame".to_string(),
+                );
+                return 1;
+            }
+        };
+        // The callee lives in the same module as the caller (function_table
+        // is per-module; direct calls are within-module).
+        let module_idx = self.frames[caller_idx].module_idx;
+        let code_offset = match self
+            .modules
+            .get(module_idx)
+            .and_then(|m| m.function_table.get(func_idx))
+            .copied()
+        {
+            Some(o) => o,
+            None => {
+                crate::jit::runtime::set_jit_pending_vm_error(format!(
+                    "JIT direct call: function {} not found",
+                    func_idx
+                ));
+                return 1;
+            }
+        };
+
+        // Build the callee frame with args copied from the region's regs
+        // buffer.
+        let mut frame = Frame::new(Some(caller_idx), module_idx);
+        frame.pc = code_offset;
+        let argc = argc.min(256);
+        for i in 0..argc {
+            // SAFETY: `regs` points at the compiled region's 256-entry buffer.
+            let bits = unsafe { *regs.add(i) };
+            frame.regs[i] = Value::from_bits(bits);
+        }
+        frame.return_dst = dst.min(255) as u8;
+        self.frames.push(frame);
+        self.current_frame_idx = Some(caller_idx + 1);
+
+        // Run the interpreter until the callee frame returns to the caller.
+        let status = loop {
+            match self.step() {
+                Ok(()) => {
+                    if self.current_frame_idx.map_or(true, |f| f != caller_idx) {
+                        continue; // still inside the callee (or a nested call)
+                    }
+                    break 0;
+                }
+                Err(e) => {
+                    // Callee raised. Unwind any nested frames back to the
+                    // caller so the outer region resumes on the correct frame.
+                    self.frames.truncate(caller_idx + 1);
+                    self.current_frame_idx = Some(caller_idx);
+                    crate::jit::runtime::set_jit_pending_vm_error(e.to_string());
+                    break 1;
+                }
+            }
+        };
+
+        if status == 0 && dst < 256 {
+            let ret = self.frames[caller_idx].regs[dst];
+            // SAFETY: `regs` points at the compiled region's 256-entry buffer.
+            unsafe { *regs.add(dst) = ret.to_bits() };
+        }
+        status
     }
     fn step_perform(
         &mut self,
@@ -4393,6 +4494,9 @@ impl VM {
             && self.jit_session.is_some()
             && self.try_jit_execute(frame_idx)
         {
+            if let Some(msg) = self.jit_pending_error.take() {
+                return Err(NuError::runtime_error(msg, Span::default()));
+            }
             return Ok(());
         }
 

@@ -551,6 +551,65 @@ fn test_jit_pow_loop_tiers_up() {
         "pow-loop sum is wrong"
     );
 }
+
+#[test]
+fn test_jit_direct_call_loop_tiers_up() {
+    // A hot loop calling a provably-non-suspending leaf must fold the direct
+    // call into the compiled region (`find_compilable_region_with_calls`) and
+    // run the callee via the re-entrant `nulang_jit_direct_call` helper while
+    // producing the interpreter's exact result. If the call were NOT folded
+    // (region stops at the Call), the loop body would not compile (no
+    // back-edge captured) and `jit_compiled_count` would be 0.
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn bump(x: Int) -> Int { x + 1 }
+        fn main() {
+            var s = 0;
+            var i = 0;
+            while i < 20000 {
+                s = bump(s);
+                i = i + 1
+            };
+            s
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_direct_call_test").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interp loop should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let result = jit_vm.run().expect("jit loop should run");
+    assert_eq!(
+        result.as_int(),
+        expected.as_int(),
+        "JIT direct-call loop must match the interpreter"
+    );
+    assert_eq!(
+        expected.as_int(),
+        Some(20000),
+        "loop counter is wrong"
+    );
+    assert!(
+        jit_vm.jit_compiled_count() > 0,
+        "the loop region must compile around the folded direct call"
+    );
+}
 // ---------------------------------------------------------------------------
 // Extended opcode coverage: Load/Store, bitwise int ops, FNeg
 // ---------------------------------------------------------------------------
@@ -1122,7 +1181,7 @@ fn test_typed_path_matches_scalar_path() {
     assert!(!meta.is_empty(), "int loop registers must be typed");
     let mut typed_jit = make_jit();
     let typed =
-        unsafe { typed_jit.compile_region_typed(0, 5, 7, &module.instructions, Some(&meta)) }
+        unsafe { typed_jit.compile_region_typed(0, 5, 7, &module.instructions, Some(&meta), &std::collections::HashMap::new()) }
             .expect("typed region should compile");
     assert!(
         typed_jit.is_typed_compiled(0, 5),
@@ -1149,7 +1208,7 @@ fn test_absent_metadata_uses_scalar_path() {
 
     // None metadata: compiles, but is NOT recorded as typed.
     let mut jit = make_jit();
-    let func = unsafe { jit.compile_region_typed(0, 5, 7, &module.instructions, None) }
+    let func = unsafe { jit.compile_region_typed(0, 5, 7, &module.instructions, None, &std::collections::HashMap::new()) }
         .expect("region should compile without metadata");
     assert_eq!(jit.typed_compiled_count(), 0, "no metadata -> scalar path");
     assert!(!jit.is_typed_compiled(0, 5));

@@ -716,9 +716,10 @@ pub fn compile_bytecode_region(
                 let fidx = builder.ins().iconst(types::I64, func_idx);
                 let argcv = builder.ins().iconst(types::I64, instr.op2 as i64);
                 let dstv = builder.ins().iconst(types::I64, instr.op3 as i64);
-                let status = builder
+                let status_inst = builder
                     .ins()
                     .call(helpers[&RuntimeHelper::DirectCall], &[regs_ptr, fidx, argcv, dstv]);
+                let status = builder.inst_results(status_inst)[0];
                 // On nonzero status the callee raised (e.g. step-limit); the
                 // error is already recorded in the pending-error thread-local,
                 // so exit the region and let the VM propagate it.
@@ -809,6 +810,7 @@ pub fn compile_bytecode_region(
                 | OpCode::Halt
                 | OpCode::Ret
                 | OpCode::RetVal
+                | OpCode::Call // folded direct call: emits its own brif exit
                 | OpCode::PerformDirect
         );
 

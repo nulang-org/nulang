@@ -713,6 +713,10 @@ fn compute_may_suspend(module: &crate::bytecode::CodeModule) -> Vec<bool> {
     result
 }
 
+/// Region-length scanner WITHOUT direct-call folding; used by the unit tests.
+/// The runtime path uses [`find_compilable_region_with_calls`] so direct
+/// non-suspending calls fold into regions.
+#[allow(dead_code)]
 pub(crate) fn find_compilable_region(
     offset: usize,
     instructions: &[crate::bytecode::Instruction],
