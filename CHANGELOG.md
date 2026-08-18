@@ -211,6 +211,14 @@ two major versions.*
   operands, and returned `0` for any non-overflow pow (`3 ** 3` → 0). Pow is
   now excluded from unboxed mode; `3 ** 3` → 27 and `3 ** -1` → nil on all
   backends.
+- **JIT-compiled direct calls** — hot regions now fold direct calls to
+  provably-non-suspending, non-recursive callees and run them via a
+  re-entrant helper on the interpreter frame stack, keeping the caller's
+  compiled region resident (no per-call region re-entry). Acyclic call-heavy
+  loops measured ~46% faster (debug). Recursive and effect-performing callees
+  stay on the interpreter by static analysis (`may_suspend` +
+  recursion-cycle gates). Foundation: `find_compilable_region_with_calls`,
+  `compute_may_suspend`, `compute_recursive` in `src/jit/`.
 
 
 ### Added since 1.0.0-frozen — 2026-08-15
