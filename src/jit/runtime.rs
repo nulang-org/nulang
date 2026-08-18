@@ -961,10 +961,13 @@ pub unsafe extern "C" fn nulang_str_concat(a: u64, b: u64) -> u64 {
     alloc_string_value(result)
 }
 
-/// Power operation: float pow when both operands are floats; int pow when both
-/// are ints. Integer exponentiation uses wrapping multiplication (matching the
-/// interpreter's `step_ipow`); a negative int exponent returns nil; anything
-/// else is a type error.
+/// Power operation: float pow when both operands are floats; int pow using
+/// binary exponentiation with `wrapping_mul` when both are ints — bit-for-bit
+/// the interpreter's `step_ipow`, so the 48-bit payload wraps on overflow
+/// (matching `IMul`/`IAdd` behaviour) rather than erroring. A negative int
+/// exponent returns nil (mirrors `IDiv` div-by-zero); 0 ** 0 returns 1
+/// (standard convention). Non-numeric operands coerce to 0, exactly like the
+/// interpreter's `as_int().unwrap_or(0)`.
 #[no_mangle]
 pub extern "C" fn nulang_pow(a: u64, b: u64) -> u64 {
     if is_float_raw(a) && is_float_raw(b) {
@@ -974,29 +977,28 @@ pub extern "C" fn nulang_pow(a: u64, b: u64) -> u64 {
     }
     let va = Value::from_raw(a);
     let vb = Value::from_raw(b);
-    if va.is_int() && vb.is_int() {
-        let base = va.as_int().unwrap();
-        let exp = vb.as_int().unwrap();
-        if exp < 0 {
-            return Value::nil().as_raw();
-        }
-        // Binary exponentiation with wrapping_mul, bit-for-bit the
-        // interpreter's algorithm.
-        let mut result: i64 = 1;
-        let mut base = base;
-        let mut exp = exp;
-        while exp > 0 {
-            if exp & 1 != 0 {
-                result = result.wrapping_mul(base);
-            }
-            exp >>= 1;
-            if exp > 0 {
-                base = base.wrapping_mul(base);
-            }
-        }
-        return Value::int(result).as_raw();
+    let base = va.as_int().unwrap_or(0);
+    let exp = vb.as_int().unwrap_or(0);
+    if exp < 0 {
+        return Value::nil().as_raw();
+    })
     }
-    record_arith_error(crate::vm::arith_type_error("pow", va, vb))
+    // Binary exponentiation with wrapping_mul — mirrors `step_ipow` exactly
+    // so overflow wraps (truncated to the 48-bit payload by `Value::int`)
+    // instead of recording an arithmetic error.
+    let mut result: i64 = 1;
+    let mut base = base;
+    let mut exp = exp;
+    while exp > 0 {
+        if exp & 1 != 0 {
+            result = result.wrapping_mul(base);
+        }
+        exp >>= 1;
+        if exp > 0 {
+            base = base.wrapping_mul(base);
+        }
+    }
+    Value::int(result).as_raw()
 }
 
 /// # Safety
