@@ -1318,3 +1318,83 @@ fn test_arrlen_scalar_register_destination() {
         warm_val.as_int().unwrap_or(-1)
     );
 }
+
+/// `compute_may_suspend` and `direct_call_target`: a pure recursive function
+/// is non-suspending and its direct calls are recovered; a function that
+/// performs an effect (PerformDirect) is conservatively suspending.
+#[test]
+fn test_may_suspend_analysis() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+
+    let source = r#"
+        fn fib(n: Int) -> Int {
+            if n < 2 then { n } else { fib(n - 1) + fib(n - 2) }
+        }
+        fn greeter() {
+            perform IO.print("hi")
+        }
+        fn use_fib() -> Int { fib(10) }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "may_suspend_test").expect("codegen");
+
+    // Locate each function's index by matching its debug code_offset against
+    // function_table.
+    let idx_of = |name: &str| -> usize {
+        let off = module
+            .debug_functions
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{} in debug_functions", name))
+            .code_offset;
+        module
+            .function_table
+            .iter()
+            .position(|&o| o == off)
+            .unwrap_or_else(|| panic!("{} offset in function_table", name))
+    };
+    let fib_idx = idx_of("fib");
+    let greeter_idx = idx_of("greeter");
+    let use_fib_idx = idx_of("use_fib");
+
+    let may = compute_may_suspend(&module);
+    assert_eq!(may.len(), module.function_table.len());
+    assert!(
+        !may[fib_idx],
+        "pure recursive fib must be non-suspending (native-callable)"
+    );
+    assert!(
+        !may[use_fib_idx],
+        "a direct caller of a non-suspending function must be non-suspending"
+    );
+    assert!(
+        may[greeter_idx],
+        "a function performing an effect must be conservatively suspending"
+    );
+
+    // The direct call `use_fib -> fib` must be recovered by the peephole.
+    let start = module.function_table[use_fib_idx];
+    let end = if use_fib_idx + 1 < module.function_table.len() {
+        module.function_table[use_fib_idx + 1]
+    } else {
+        module.instructions.len()
+    };
+    let call_pc = (start..end)
+        .find(|&pc| module.instructions[pc].opcode == OpCode::Call)
+        .expect("use_fib contains a Call");
+    assert_eq!(
+        direct_call_target(&module, call_pc, start),
+        Some(fib_idx),
+        "peephole must recover the direct callee fib"
+    );
+}

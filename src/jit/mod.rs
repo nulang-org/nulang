@@ -105,6 +105,13 @@ pub struct JitSession {
     /// Regions compiled through the type-directed (guard-stripped) path in
     /// `typed_compiler`, i.e. where inferred register types were available.
     typed_regions: FxHashSet<(usize, usize)>,
+    /// Per-module "may suspend" vectors (indexed by function-table index),
+    /// computed lazily from each module's bytecode: true if the function
+    /// transitively performs an effect that can suspend (or calls one).
+    /// JIT-compiled native calls are only emitted for functions with
+    /// `false` here — running a suspending callee from native code would
+    /// double-execute its pre-suspend side effects on fallback.
+    may_suspend: FxHashMap<usize, Vec<bool>>,
     /// Reusable function builder context.
     builder_context: FunctionBuilderContext,
     /// Reusable codegen context.
@@ -153,6 +160,7 @@ impl JitSession {
             hot_counts: Vec::new(),
             last_compiled_probe: None,
             typed_regions: FxHashSet::default(),
+            may_suspend: FxHashMap::default(),
             builder_context: FunctionBuilderContext::new(),
             tier2_counters: FxHashMap::default(),
             ctx,
@@ -183,6 +191,23 @@ impl JitSession {
     /// existing session).
     pub fn reset_hot_counters(&mut self) {
         self.hot_counts.clear();
+    }
+
+    /// Lazily computed per-module "may suspend" vector (indexed by
+    /// function-table index), computed from the module's bytecode. A function
+    /// with `false` here is safe to call from JIT-compiled code (no suspending
+    /// effect in its transitive call graph). Returns an empty slice when the
+    /// module index is out of range (callers treat empty as "unsafe").
+    fn may_suspend_for(
+        &mut self,
+        module_idx: usize,
+        module: &crate::bytecode::CodeModule,
+    ) -> &[bool] {
+        if !self.may_suspend.contains_key(&module_idx) {
+            let v = compute_may_suspend(module);
+            self.may_suspend.insert(module_idx, v);
+        }
+        &self.may_suspend[&module_idx]
     }
 
     /// Record one execution of an already-compiled region and attempt
@@ -488,6 +513,188 @@ pub type JitFunctionPtr = extern "C" fn(*mut u64, *const u64);
 /// 256-register snapshot/restore per iteration). Forward-only branchy code
 /// (e.g. an `if`/recursion that leads to a `Call`) keeps the straight-line
 /// boundary, which is why recursion does not regress.
+/// A direct call's callee value is staged into `FUNC_VALUE_REG` (254) by
+/// `mir_codegen` before the `Call` (a `load_constant` then the arg staging).
+/// Recover the statically-known callee of a `Call` at `pc` by scanning
+/// backward to the nearest prior write to reg 254:
+/// - a `ConstU`/`Const0/1/2` into 254 → direct call to that function index;
+/// - a `Move` (or anything else) into 254 → an indirect call (closure /
+///   runtime value) — the target is not statically known.
+/// `func_start` bounds the scan to the calling function's code. This is a
+/// hint only: compiled direct calls re-check the live value in reg 254 at
+/// run time and fall back to the interpreter on mismatch, so a stale
+/// recovery here never calls the wrong function.
+pub(crate) fn direct_call_target(
+    module: &crate::bytecode::CodeModule,
+    pc: usize,
+    func_start: usize,
+) -> Option<usize> {
+    use crate::bytecode::{Constant, OpCode};
+    const FUNC_VALUE_REG: u8 = 254;
+    let mut p = pc;
+    while p > func_start {
+        p -= 1;
+        let instr = module.instructions[p];
+        match instr.opcode {
+            OpCode::Const0 | OpCode::Const1 | OpCode::Const2 if instr.op1 == FUNC_VALUE_REG => {
+                let idx = match instr.opcode {
+                    OpCode::Const0 => 0,
+                    OpCode::Const1 => 1,
+                    _ => 2,
+                };
+                return Some(idx);
+            }
+            OpCode::ConstM1 if instr.op1 == FUNC_VALUE_REG => return None, // -1 is not a function
+            OpCode::ConstU if instr.op3 == FUNC_VALUE_REG => {
+                let pool = instr.imm16() as usize;
+                return match module.constants.get(pool) {
+                    Some(Constant::Int(i)) if *i >= 0 => Some(*i as usize),
+                    _ => None,
+                };
+            }
+            OpCode::Move if instr.op2 == FUNC_VALUE_REG => return None, // indirect
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Opcodes that can never suspend (a pure function's safe set). A function
+/// whose body contains only these, plus direct calls to other safe functions,
+/// is non-suspending and safe to call from JIT-compiled code. Everything
+/// else — effects (`Perform`/`PerformDirect`/`Handle`/`Resume`/`Unwind`),
+/// actor ops, async effects, `SignalWait`/`Receive*`, foreign calls,
+/// `SConcat`/record/closure ops — is conservatively treated as suspending.
+fn is_non_suspending_op(op: crate::bytecode::OpCode) -> bool {
+    use crate::bytecode::OpCode;
+    matches!(
+        op,
+        OpCode::Nop
+            | OpCode::Halt
+            | OpCode::Const0
+            | OpCode::Const1
+            | OpCode::Const2
+            | OpCode::ConstM1
+            | OpCode::ConstU
+            | OpCode::Load
+            | OpCode::Store
+            | OpCode::Move
+            | OpCode::Swap
+            | OpCode::Dup
+            | OpCode::IAdd
+            | OpCode::ISub
+            | OpCode::IMul
+            | OpCode::IDiv
+            | OpCode::IMod
+            | OpCode::INeg
+            | OpCode::IInc
+            | OpCode::IDec
+            | OpCode::IPow
+            | OpCode::FPow
+            | OpCode::Xor
+            | OpCode::Shl
+            | OpCode::Shr
+            | OpCode::BitAnd
+            | OpCode::BitOr
+            | OpCode::FAdd
+            | OpCode::FSub
+            | OpCode::FMul
+            | OpCode::FDiv
+            | OpCode::FNeg
+            | OpCode::ICmpEq
+            | OpCode::ICmpLt
+            | OpCode::ICmpGt
+            | OpCode::ICmpLe
+            | OpCode::ICmpGe
+            | OpCode::FCmpEq
+            | OpCode::FCmpLt
+            | OpCode::FCmpGt
+            | OpCode::Not
+            | OpCode::And
+            | OpCode::Or
+            | OpCode::Jmp
+            | OpCode::JmpT
+            | OpCode::JmpF
+            | OpCode::IToF
+            | OpCode::FToI
+            | OpCode::DbgPrint
+            | OpCode::Ret
+            | OpCode::RetVal
+            | OpCode::ArrLoad
+            | OpCode::ArrStore
+            | OpCode::ArrLen
+            | OpCode::FieldL
+    )
+}
+
+/// Compute the transitive "may suspend" vector for a module (indexed by
+/// function-table index). A function may suspend if its body contains a
+/// suspending opcode (or any opcode outside the pure whitelist), or an
+/// indirect call (unknown target), or a direct call to a may-suspend
+/// function. Fixed point over the direct-call graph recovered by
+/// `direct_call_target`.
+fn compute_may_suspend(module: &crate::bytecode::CodeModule) -> Vec<bool> {
+    use crate::bytecode::OpCode;
+    let n = module.function_table.len();
+    let mut result = vec![false; n];
+    // Directly unsafe: contains a non-whitelisted opcode (effect/actor/
+    // foreign/suspending) or an indirect call (Call/ClosureCall whose target
+    // is not a statically-recovered direct callee).
+    for i in 0..n {
+        let start = module.function_table[i];
+        let end = if i + 1 < n {
+            module.function_table[i + 1]
+        } else {
+            module.instructions.len()
+        };
+        for pc in start..end {
+            let op = module.instructions[pc].opcode;
+            if matches!(op, OpCode::Call | OpCode::ClosureCall) {
+                if direct_call_target(module, pc, start).is_none() {
+                    result[i] = true; // indirect call: unknown target
+                }
+                // direct call: leave for the fixed-point propagation
+            } else if !is_non_suspending_op(op) {
+                result[i] = true;
+                break;
+            }
+        }
+    }
+    // Propagate through the direct-call graph until stable.
+    loop {
+        let mut changed = false;
+        for i in 0..n {
+            if result[i] {
+                continue;
+            }
+            let start = module.function_table[i];
+            let end = if i + 1 < n {
+                module.function_table[i + 1]
+            } else {
+                module.instructions.len()
+            };
+            for pc in start..end {
+                if matches!(
+                    module.instructions[pc].opcode,
+                    OpCode::Call | OpCode::ClosureCall
+                ) {
+                    if let Some(callee) = direct_call_target(module, pc, start) {
+                        if callee < n && result[callee] {
+                            result[i] = true;
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    result
+}
+
 pub(crate) fn find_compilable_region(
     offset: usize,
     instructions: &[crate::bytecode::Instruction],
