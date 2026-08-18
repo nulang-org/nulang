@@ -277,6 +277,7 @@ impl JitSession {
         start_offset: usize,
         num_instrs: usize,
         instructions: &[crate::bytecode::Instruction],
+        native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
         if let Some(&(ptr, _)) = self.compiled.get(&(module_idx, start_offset)) {
@@ -294,6 +295,7 @@ impl JitSession {
             start_offset,
             num_instrs,
             instructions,
+            native_calls,
         ) {
             Ok(ptr) => {
                 self.compiled
@@ -323,6 +325,7 @@ impl JitSession {
         num_instrs: usize,
         instructions: &[crate::bytecode::Instruction],
         type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
+        native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
         if let Some(&(ptr, _)) = self.compiled.get(&(module_idx, start_offset)) {
@@ -337,7 +340,10 @@ impl JitSession {
             })
             .unwrap_or(false);
 
-        if has_known_types {
+        if has_known_types && native_calls.is_empty() {
+            // The typed compiler does not understand `Call`; a region
+            // containing a native direct call (non-empty map) must go through
+            // the scalar compiler, which handles `nulang_jit_direct_call`.
             let func_name = format!("nulang_tjit_{}_{}", module_idx, start_offset);
             if let Ok(ptr) = typed_compiler::compile_bytecode_region_typed(
                 &mut self.module,
@@ -357,7 +363,7 @@ impl JitSession {
             // Typed compilation failed: fall through to the scalar compiler.
         }
 
-        self.compile_region(module_idx, start_offset, num_instrs, instructions)
+        self.compile_region(module_idx, start_offset, num_instrs, instructions, native_calls)
     }
 
     /// Return the number of regions compiled through the type-directed path.
@@ -447,6 +453,7 @@ impl JitSession {
                 num_instrs,
                 instructions,
                 type_metadata,
+                &std::collections::HashMap::new(),
             );
         }
 
@@ -474,6 +481,7 @@ impl JitSession {
                 num_instrs,
                 instructions,
                 type_metadata,
+                &std::collections::HashMap::new(),
             ),
         }
     }
@@ -779,6 +787,109 @@ pub(crate) fn find_compilable_region(
     }
 }
 
+/// The code offset of the function containing `pc` (largest
+/// `function_table[i] <= pc`), bounding `direct_call_target`'s backward walk.
+pub(crate) fn func_start_for(module: &crate::bytecode::CodeModule, pc: usize) -> usize {
+    module
+        .function_table
+        .iter()
+        .copied()
+        .filter(|&o| o <= pc)
+        .next_back()
+        .unwrap_or(0)
+}
+
+/// If the instruction at `pc` is a `Call` of a provably-non-suspending direct
+/// callee (recoverable via `direct_call_target` and gated on `may_suspend`),
+/// return the callee's function-table index. Such a call is safe to compile
+/// into the region as a `nulang_jit_direct_call` helper invocation. Returns
+/// None for indirect calls, suspending callees, and every other opcode.
+pub(crate) fn native_direct_call(
+    module: &crate::bytecode::CodeModule,
+    pc: usize,
+    may_suspend: Option<&[bool]>,
+) -> Option<usize> {
+    use crate::bytecode::OpCode;
+    let instr = module.instructions.get(pc)?;
+    if instr.opcode != OpCode::Call {
+        return None;
+    }
+    let idx = direct_call_target(module, pc, func_start_for(module, pc))?;
+    // A suspending callee must not be run re-entrantly from a compiled
+    // region: it could suspend mid-run and be re-entered from its call start,
+    // double-executing pre-suspend side effects. Stay on the interpreter.
+    if may_suspend.is_some_and(|v| v.get(idx) == Some(&true)) {
+        return None;
+    }
+    Some(idx)
+}
+
+/// Like [`find_compilable_region`], but additionally continues past `Call`
+/// instructions whose direct callee is provably non-suspending, returning the
+/// region length and the map of (absolute pc -> direct callee func index) for
+/// the calls that were folded into the region. The caller passes this map to
+/// the scalar compiler so it can emit `nulang_jit_direct_call` at those pcs.
+pub(crate) fn find_compilable_region_with_calls(
+    offset: usize,
+    instructions: &[crate::bytecode::Instruction],
+    module: &crate::bytecode::CodeModule,
+    may_suspend: Option<&[bool]>,
+) -> (usize, std::collections::HashMap<usize, usize>) {
+    let mut native_calls = std::collections::HashMap::new();
+    let mut len = 0;
+    let mut first_branch: Option<usize> = None;
+    let mut has_back_edge = false;
+    for i in offset..instructions.len().min(offset + 500) {
+        let op = instructions[i].opcode;
+        if op == crate::bytecode::OpCode::Call {
+            match native_direct_call(module, i, may_suspend) {
+                Some(idx) => {
+                    native_calls.insert(i, idx);
+                }
+                None => break, // indirect or suspending call — region stops
+            }
+        } else if !compiler::is_opcode_compilable(op) {
+            break;
+        }
+        // Stop *before* return/halt so the VM still executes the return (frame
+        // pop) / halt itself after the JIT region.
+        if matches!(
+            op,
+            crate::bytecode::OpCode::Ret
+                | crate::bytecode::OpCode::RetVal
+                | crate::bytecode::OpCode::Halt
+        ) {
+            break;
+        }
+        let is_branch = matches!(
+            op,
+            crate::bytecode::OpCode::Jmp
+                | crate::bytecode::OpCode::JmpT
+                | crate::bytecode::OpCode::JmpF
+        );
+        if is_branch {
+            if first_branch.is_none() {
+                first_branch = Some(len);
+            }
+            let target = match op {
+                crate::bytecode::OpCode::Jmp => {
+                    (i as i64 + instructions[i].simm16() as i64) as usize
+                }
+                _ => (i as i64 + instructions[i].offset16() as i64) as usize,
+            };
+            if target >= offset && target < i {
+                has_back_edge = true;
+            }
+        }
+        len += 1;
+    }
+    if !has_back_edge && first_branch.unwrap_or(len) < STRAIGHT_LINE_MIN {
+        (0, std::collections::HashMap::new())
+    } else {
+        (len, native_calls)
+    }
+}
+
 // TieredAction is defined in `crate::backends` so the VM can reference it
 // without importing the JIT module. Re-export for backward compatibility.
 pub use crate::backends::TieredAction;
@@ -876,12 +987,24 @@ impl crate::backends::JitBackend for JitSession {
 
         // Record execution for hotness
         if self.record_and_check_hot(module_idx, pc) {
-            let region_len = find_compilable_region(pc, instructions);
+            let (region_len, native_calls) = find_compilable_region_with_calls(
+                pc,
+                instructions,
+                module,
+                Some(self.may_suspend_for(module_idx, module)),
+            );
             if region_len >= 3 {
                 let meta = typed_compiler::infer_reg_types(module, pc);
                 let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
                 if let Some(func) = unsafe {
-                    self.compile_region_typed(module_idx, pc, region_len, instructions, meta_ref)
+                    self.compile_region_typed(
+                        module_idx,
+                        pc,
+                        region_len,
+                        instructions,
+                        meta_ref,
+                        &native_calls,
+                    )
                 } {
                     func(regs.as_mut_ptr(), constants.as_ptr());
                     return crate::backends::TieredAction::RanJit;

@@ -615,6 +615,195 @@ pub fn take_jit_branch_exit_pc() -> Option<usize> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Re-entrant direct-call support (JIT-compiled `Call` of a non-suspending
+// callee). The compiled region stays resident in native code and invokes
+// `nulang_jit_direct_call`, which runs the callee on the VM's interpreter
+// frame stack to completion, then writes the result back into the region's
+// register buffer. The callee is statically gated `!may_suspend`, so it
+// never suspends mid-execution (which a re-run-from-the-call-start would
+// mishandle). This is the correctness-critical seam between native regions
+// and the interpreter.
+// ---------------------------------------------------------------------------
+
+/// The single-threaded VM currently executing a compiled region (set by
+/// `VM::step` around each `tiered_execute_step_typed` call; the VM is
+/// thread-confined, so a thread-local pointer is sound).
+thread_local! {
+    static JIT_VM: Cell<*mut crate::vm::VM> = Cell::new(std::ptr::null_mut());
+}
+
+pub unsafe fn set_jit_vm(vm: *mut crate::vm::VM) {
+    JIT_VM.with(|cell| cell.set(vm));
+}
+
+pub fn clear_jit_vm() {
+    JIT_VM.with(|cell| cell.set(std::ptr::null_mut()));
+}
+
+fn get_jit_vm() -> *mut crate::vm::VM {
+    JIT_VM.with(|cell| cell.get())
+}
+
+/// Runtime error raised while running a re-entrant callee (e.g. step-limit).
+/// The compiled region cannot unwind, so the helper records it here and
+/// returns a nonzero status; the region jumps to its exit and `VM::step`
+/// checks this slot after the region returns.
+thread_local! {
+    static JIT_PENDING_VM_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub fn set_jit_pending_vm_error(msg: String) {
+    JIT_PENDING_VM_ERROR.with(|e| *e.borrow_mut() = Some(msg));
+}
+
+pub fn take_jit_pending_vm_error() -> Option<String> {
+    JIT_PENDING_VM_ERROR.with(|e| e.borrow_mut().take())
+}
+
+/// Snapshot of the JIT thread-local state a compiled region relies on, saved
+/// around a re-entrant interpreter run and restored afterwards. Without this,
+/// the nested execution would clobber the outer region's constant pool /
+/// callbacks / safepoint / branch markers.
+struct JitThreadState {
+    constants: ConstantsPtr,
+    callbacks: CbPair,
+    safepoint: *mut u64,
+    yield_pc: u64,
+    branch_exit_pc: u64,
+    pending_error: Option<String>,
+}
+
+fn save_jit_thread_state() -> JitThreadState {
+    let (constants, callbacks) = (
+        JIT_CONSTANTS.with(|c| *c.get()),
+        JIT_CALLBACKS.with(|c| *c.get()),
+    );
+    let (safepoint, yield_pc, branch_exit_pc) = (
+        JIT_SAFEPOINT_PTR.with(|c| c.get()),
+        JIT_YIELD_PC.with(|c| c.get()),
+        JIT_BRANCH_EXIT_PC.with(|c| c.get()),
+    );
+    let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
+    JitThreadState {
+        constants,
+        callbacks,
+        safepoint,
+        yield_pc,
+        branch_exit_pc,
+        pending_error,
+    }
+}
+
+fn restore_jit_thread_state(s: JitThreadState) {
+    unsafe {
+        JIT_CONSTANTS.with(|c| *c.get() = s.constants);
+        JIT_CALLBACKS.with(|c| *c.get() = s.callbacks);
+    }
+    JIT_SAFEPOINT_PTR.with(|c| c.set(s.safepoint));
+    JIT_YIELD_PC.with(|c| c.set(s.yield_pc));
+    JIT_BRANCH_EXIT_PC.with(|c| c.set(s.branch_exit_pc));
+    AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.pending_error);
+}
+
+/// Run a provably-non-suspending callee (function-table index `func_idx`) to
+/// completion on the VM's interpreter frame stack, using the args already
+/// staged in the region's `regs[0..argc]`, then write the callee's return
+/// value into `regs[dst]`. Returns 0 on success, nonzero when the callee
+/// raised (e.g. step-limit exceeded); on error the callee's frames are
+/// unwound back to the caller so the outer region's frame accounting stays
+/// consistent.
+///
+/// # Safety
+/// `regs` must point at the 256-entry register buffer of the compiled region
+/// that invoked this helper, and `JIT_VM` must be set (a `VM` mid-`step()`).
+/// The callee is `!may_suspend` by construction (the compiler gates emission
+/// on that analysis), so it never suspends mid-run.
+#[no_mangle]
+pub extern "C" fn nulang_jit_direct_call(
+    regs: *mut u64,
+    func_idx: i64,
+    argc: i64,
+    dst: i64,
+) -> i64 {
+    use crate::vm::Frame;
+    let vm_ptr = get_jit_vm();
+    if vm_ptr.is_null() || regs.is_null() {
+        set_jit_pending_vm_error("JIT direct call with no active VM".to_string());
+        return 1;
+    }
+    let vm = unsafe { &mut *vm_ptr };
+    let saved = save_jit_thread_state();
+
+    let caller_idx = match vm.current_frame_idx {
+        Some(c) => c,
+        None => {
+            restore_jit_thread_state(saved);
+            set_jit_pending_vm_error("JIT direct call outside a frame".to_string());
+            return 1;
+        }
+    };
+
+    let (func_idx, argc, dst) = (func_idx as usize, argc as usize, dst as usize);
+    // The callee lives in the same module as the caller (function_table is
+    // per-module; direct calls are within-module).
+    let module_idx = vm.frames[caller_idx].module_idx;
+    let code_offset = match vm
+        .modules
+        .get(module_idx)
+        .and_then(|m| m.function_table.get(func_idx))
+        .copied()
+    {
+        Some(o) => o,
+        None => {
+            restore_jit_thread_state(saved);
+            set_jit_pending_vm_error(format!("JIT direct call: function {} not found", func_idx));
+            return 1;
+        }
+    };
+
+    // Build the callee frame with args copied from the region's regs buffer.
+    let mut frame = Frame::new(Some(caller_idx), module_idx);
+    frame.pc = code_offset;
+    let argc = argc.min(256);
+    for i in 0..argc {
+        let bits = unsafe { *regs.add(i) };
+        frame.regs[i] = crate::vm::Value::from_bits(bits);
+    }
+    frame.return_dst = dst.min(255) as u8;
+    vm.frames.push(frame);
+    vm.current_frame_idx = Some(caller_idx + 1);
+
+    // Run the interpreter until the callee frame returns to the caller.
+    let status = loop {
+        match vm.step() {
+            Ok(()) => {
+                if vm.current_frame_idx.map_or(true, |f| f != caller_idx) {
+                    continue; // still inside the callee (or a nested call)
+                }
+                break 0;
+            }
+            Err(e) => {
+                // Callee raised. Unwind any nested frames back to the caller
+                // so the outer region resumes on the correct frame.
+                vm.frames.truncate(caller_idx + 1);
+                vm.current_frame_idx = Some(caller_idx);
+                set_jit_pending_vm_error(e.to_string());
+                break 1;
+            }
+        }
+    };
+
+    if status == 0 && dst < 256 {
+        let ret = vm.frames[caller_idx].regs[dst];
+        unsafe { *regs.add(dst) = ret.to_bits() };
+    }
+
+    restore_jit_thread_state(saved);
+    status
+}
+
 /// Called from JIT-compiled code when the safepoint budget is exhausted.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_safepoint_yield(resume_offset: u64) -> u64 {

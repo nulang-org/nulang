@@ -3206,13 +3206,27 @@ impl VM {
         unsafe {
             crate::jit::runtime::set_jit_constants(&module.constants);
         }
+        // Thread the VM itself so the re-entrant direct-call helper can run a
+        // callee on the interpreter frame stack from within a compiled region.
+        // The VM is single-threaded, so a raw pointer in a thread-local is sound.
+        unsafe {
+            crate::jit::runtime::set_jit_vm(self as *mut VM);
+        }
         let action = jit.tiered_execute_step_typed(module_idx, pc, module, &mut regs, constants);
+        crate::jit::runtime::clear_jit_vm();
         crate::jit::runtime::clear_jit_constants();
         crate::jit::runtime::clear_jit_callbacks();
 
         if action != TieredAction::Interpret {
             for (i, bits) in regs.iter().enumerate() {
                 self.frames[frame_idx].regs[i] = Value::from_bits(*bits);
+            }
+
+            // A re-entrant callee raised a runtime error (e.g. step-limit
+            // exceeded); the compiled region exited early via its error path.
+            // Propagate BEFORE handling branch-exit/yield so the error wins.
+            if let Some(msg) = crate::jit::runtime::take_jit_pending_vm_error() {
+                return Err(NuError::runtime_error(msg));
             }
 
             // A compiled region that exited via a branch to an outside target
