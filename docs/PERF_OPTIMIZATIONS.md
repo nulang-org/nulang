@@ -159,21 +159,44 @@ target must be recovered without a new opcode.**
 
 The first slice (safe, correct, testable) is the peephole + `may_suspend`
 gate emitting a helper that runs a provably-non-suspending callee to
-completion. This compiles the caller's whole body around direct calls (fib:
-arg computes, adds, branch native; recursive calls interpreted), with the
-recursion tiering up as the callee's own region compiles.
+completion.
+
+**Implemented and verified (worktree `perf/jitcall`):** `find_compilable_
+region_with_calls` folds direct non-suspending calls into regions; the scalar
+compiler emits `nulang_jit_direct_call` at those pcs; the helper runs the
+callee on the VM interpreter frame stack re-entrantly (`JIT_VM` thread-local
+set by `try_jit_execute`, full thread-local save/restore around the nested
+run) and writes `regs[dst]`. `VM::jit_direct_call` does the frame build +
+step loop; a pending-error thread-local + `VM::jit_pending_error` surface a
+callee error (e.g. step-limit) through `step()`.
+
+**Recursion-cycle gate (required):** the re-entrant helper consumes native
+stack per recursion level (region → helper → step → nested region → …), so
+unbounded recursion overflowed the stack (a 2000-deep hot recursive float fn
+SIGABRT'd). `compute_recursive` flags functions in a direct-call cycle; a
+recursive callee is not folded and stays on the interpreter's heap frames.
+
+**Measured win (debug, quiet machine):** an acyclic call-heavy loop
+(100k × 10-deep leaf chain) dropped **2.21s → 1.20s (−46%)** by folding the
+leaf chain into the loop's compiled region. Recursion (fib) stays interpreted
+(safe); a follow-up for it is nested native calls with caller-save (below).
 
 **Measured: the yield-at-Call variant regresses.** A first attempt included
 direct non-suspending calls in regions and yielded to the interpreter at each
 call (no native call, no re-entrancy — correct by construction). A call-heavy
 loop regressed ~30% (2.21s → 2.86s) because the per-iteration yield/re-entry
 overhead exceeded the small native-block savings — the same trap the existing
-`STRAIGHT_LINE_MIN` guard documents. Only a re-entrant native-call helper
-(runs the non-suspending callee to completion in one step, thread-local
-save/restore, runtime reg-254 verification) delivers the win, and that is
-high-risk (frame management + nested JIT). The `may_suspend` analysis +
-direct-call peephole (the foundation) are landed and tested; the native-call
-helper is the remaining high-risk slice.
+`STRAIGHT_LINE_MIN` guard documents. The re-entrant native-call helper (which
+keeps the caller region resident and does NOT re-enter it per call) avoids
+that regression.
+
+**Next (for recursion / closures):** nested native calls — compile the
+callee's region and call it natively from the caller region sharing the regs
+buffer, with caller-save of live-across-call regs via a bounded liveness
+pass. This replaces the interpreter re-entry (and its per-level native stack)
+with ~2 native frames per level, making recursion JIT-compilable. The
+`may_suspend` + recursion-cycle analyses and the helper machinery are the
+foundation.
 
 ## Correctness fix landed on this branch
 
