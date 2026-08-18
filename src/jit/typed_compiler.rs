@@ -216,6 +216,42 @@ pub fn infer_reg_types(module: &CodeModule, pc: usize) -> TypeMetadata {
     meta
 }
 
+/// Recover the register-capability table for the function enclosing `pc`.
+///
+/// Unlike [`infer_reg_types`], capabilities cannot be re-derived from the
+/// instruction stream — the MIR capability analysis is erased at bytecode time
+/// (capability checks compile to `Const1(true)`). Instead, `mir_codegen` stores
+/// a per-function table (`CodeModule.function_caps` / `behavior_caps`) keyed by
+/// the function/behavior entry offset; this finds the greatest entry at or
+/// below `pc` and returns its table.
+///
+/// Returns `None` when no enclosing function has capability metadata (e.g. a
+/// function with no `val`/`linear` locals, or bytecode produced before the
+/// metadata existed) — the caller treats that as all-`Tag`, a conservative
+/// no-optimization.
+pub fn infer_reg_caps(module: &CodeModule, pc: usize) -> Option<&[u8]> {
+    let mut best: Option<(usize, &[u8])> = None;
+    for (i, &offset) in module.function_table.iter().enumerate() {
+        if offset <= pc {
+            if let Some(caps) = module.function_caps.get(i) {
+                if !caps.is_empty() && best.map_or(true, |(bo, _)| offset > bo) {
+                    best = Some((offset, caps.as_slice()));
+                }
+            }
+        }
+    }
+    for (i, behavior) in module.behaviors.iter().enumerate() {
+        if behavior.code_offset <= pc {
+            if let Some(caps) = module.behavior_caps.get(i) {
+                if !caps.is_empty() && best.map_or(true, |(bo, _)| behavior.code_offset > bo) {
+                    best = Some((behavior.code_offset, caps.as_slice()));
+                }
+            }
+        }
+    }
+    best.map(|(_, caps)| caps)
+}
+
 /// Apply one instruction's register-write effect to a type state.
 ///
 /// Only opcodes whose result type is guaranteed by the interpreter's
@@ -823,6 +859,7 @@ pub fn compile_bytecode_region_typed(
     num_instrs: usize,
     instructions: &[Instruction],
     type_metadata: Option<&TypeMetadata>,
+    cap_caps: Option<&[u8]>,
 ) -> Result<*const u8, CompileError> {
     let end_offset = (start_offset + num_instrs).min(instructions.len());
 
@@ -1524,12 +1561,17 @@ pub fn compile_bytecode_region_typed(
 
             // -- Array operations (typed): same implementation as scalar --
             OpCode::ArrLoad => {
+                let cap = cap_caps
+                    .and_then(|caps| caps.get(instr.op1 as usize))
+                    .map(|&v| crate::types::Capability::from_u8(v))
+                    .unwrap_or(crate::types::Capability::Tag);
                 emit_arr_load(
                     &mut builder,
                     regs_ptr,
                     instr.op1 as usize,
                     instr.op2 as usize,
                     instr.op3 as usize,
+                    cap,
                 );
             }
             // Everything else

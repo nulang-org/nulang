@@ -667,6 +667,16 @@ pub struct CodeModule {
     pub instructions: Vec<Instruction>,
     pub behaviors: Vec<BehaviorTableEntry>,
     pub function_table: Vec<usize>, // code offsets for named functions
+    /// Per-function register capability tables, parallel to `function_table`.
+    /// Each entry is a 256-byte table mapping register index -> `Capability`
+    /// as u8 (`Capability::Tag` = 7). Empty for functions with no `val`/`linear`
+    /// locals, or for bytecode produced before this metadata existed
+    /// (`#[serde(default)]` back-compat).
+    #[serde(default)]
+    pub function_caps: Vec<Vec<u8>>,
+    /// Per-behavior register capability tables, parallel to `behaviors`.
+    #[serde(default)]
+    pub behavior_caps: Vec<Vec<u8>>,
     pub exports: Vec<(String, usize)>, // name -> constant/function index
     /// Entry point for inline __main (None if no __main, defaults to 0 in VM)
     pub entry_point: Option<usize>,
@@ -707,6 +717,8 @@ impl CodeModule {
             instructions: Vec::new(),
             behaviors: Vec::new(),
             function_table: Vec::new(),
+            function_caps: Vec::new(),
+            behavior_caps: Vec::new(),
             exports: Vec::new(),
             entry_point: None,
             spawn_init_overrides: Vec::new(),

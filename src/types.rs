@@ -76,15 +76,16 @@ pub enum PrimitiveType {
 /// ```
 /// Subtyping: lineariso <: iso <: trn <: ref <: box, linear <: val <: box, ref <: tag, val <: tag, box <: tag
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Capability {
-    LinearIso, // Unique ownership with linear type tracking (provably consumed exactly once)
-    Linear,    // Immutable + linear-tracked + remote-sendable ("linear Val")
-    Iso,       // Unique ownership (can be sent to another actor)
-    Trn,       // Unique writer (can be recovered to iso)
-    Ref,       // Shared read/write reference
-    Val,       // Immutable shared reference (sendable)
-    Box,       // Read-only reference (any cap except tag can be read as box)
-    Tag,       // Opaque identity only (tagged pointer, no dereference)
+    LinearIso = 0, // Unique ownership with linear type tracking (provably consumed exactly once)
+    Linear = 1,    // Immutable + linear-tracked + remote-sendable ("linear Val")
+    Iso = 2,       // Unique ownership (can be sent to another actor)
+    Trn = 3,       // Unique writer (can be recovered to iso)
+    Ref = 4,       // Shared read/write reference
+    Val = 5,       // Immutable shared reference (sendable)
+    Box = 6,       // Read-only reference (any cap except tag can be read as box)
+    Tag = 7,       // Opaque identity only (tagged pointer, no dereference)
 }
 
 impl std::fmt::Display for Capability {
@@ -103,6 +104,31 @@ impl std::fmt::Display for Capability {
 }
 
 impl Capability {
+    /// Discriminant as a stable `u8`, for compact serialization in bytecode
+    /// metadata. The explicit discriminants above (`#[repr(u8)]`) fix this
+    /// mapping; do not reorder variants without updating `from_u8`.
+    #[inline]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`Capability::as_u8`]. Unknown values map to `Tag` (the
+    /// least-informative capability), so a corrupt/missing entry is always a
+    /// conservative no-optimization rather than a soundness hazard.
+    #[inline]
+    pub fn from_u8(v: u8) -> Capability {
+        match v {
+            0 => Capability::LinearIso,
+            1 => Capability::Linear,
+            2 => Capability::Iso,
+            3 => Capability::Trn,
+            4 => Capability::Ref,
+            5 => Capability::Val,
+            6 => Capability::Box,
+            _ => Capability::Tag,
+        }
+    }
+
     /// Least upper bound (join) of two capabilities.
     ///
     /// LinearIso behaves like Iso in joins, except LinearIso ⊔ LinearIso = LinearIso.

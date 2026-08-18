@@ -108,14 +108,23 @@ pub fn emit_bitcast_f64_to_i64_canonicalized(builder: &mut FunctionBuilder, val:
     builder.ins().select(is_nan, canonical, bits)
 }
 
-/// Build MemFlags for a heap operation given the source register's capability.
-/// val/box → readonly (loads can be CSE'd). iso/LinearIso → no special flags
-/// (Cranelift 0.132 needs AliasRegion for true noalias).
+/// Build MemFlags for a heap load whose source object carries capability `cap`.
+///
+/// Soundness: `readonly` permits Cranelift to CSE/reorder the load across
+/// intervening stores, so it is only valid when the object is provably
+/// immutable. Only `Val` (deeply immutable shared) and `Linear` (linear-tracked
+/// immutable "linear Val") guarantee that — a `Box` is a read-only *view* that
+/// may still alias a mutable `Ref`/`Trn` (`ref <: box`), so marking `Box` loads
+/// `readonly` would be unsound.
+///
+/// `Iso`/`LinearIso` carry true `noalias` information (unique ownership), but
+/// Cranelift 0.132 expresses aliasing through `AliasRegion`, not a simple flag
+/// — deferred.
 #[inline]
 pub fn memflags_for_capability(cap: Capability) -> MemFlags {
     let mut flags = MemFlags::new();
     match cap {
-        Capability::Val | Capability::Box => {
+        Capability::Val | Capability::Linear => {
             flags.set_readonly();
         }
         _ => {}

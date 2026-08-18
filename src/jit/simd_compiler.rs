@@ -529,6 +529,7 @@ fn fallback_to_scalar(
         num_instrs,
         instructions,
         None,
+        None,
     )
 }
 

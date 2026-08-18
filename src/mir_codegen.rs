@@ -270,12 +270,14 @@ impl MirCodegen {
         // Reserve one function-table slot per MIR function; MIR function
         // indices are function-table indices.
         self.module.function_table.resize(mir.functions.len(), 0);
+        self.module.function_caps.resize(mir.functions.len(), Vec::new());
 
         let mut main_idx = None;
         let mut user_main_idx = None;
         for (idx, func) in mir.functions.iter().enumerate() {
             let offset = self.compile_function(func)?;
             self.module.function_table[idx] = offset;
+            self.module.function_caps[idx] = function_cap_table(func);
             if func.name == "__main" {
                 main_idx = Some(idx);
             }
@@ -327,6 +329,7 @@ impl MirCodegen {
                     source_location: None,
                     parallel_branches: None,
                 });
+            self.module.behavior_caps.push(function_cap_table(func));
         }
         // Saga compensation: patch each step's compensate_offset from its
         // already-compiled compensation function's code offset.
@@ -2036,6 +2039,42 @@ fn rvalue_reads(rv: &mir::RValue, out: &mut HashSet<mir::LocalId>) {
                 out.insert(*x);
             }
         }
+    }
+}
+
+
+/// Build the bytecode JIT's per-register capability table for one function.
+///
+/// The bytecode register convention (`LOCAL_BASE = 15`) differs from the MIR/
+/// AOT metadata convention (`mir::FunctionBuilder::LOCAL_BASE = 16`): here a
+/// non-spilled MIR local `id` lives in register `LOCAL_BASE + id`, and locals
+/// at/above the spill threshold (`FUNC_VALUE_REG - LOCAL_BASE`) have no fixed
+/// register (they round-trip through the frame spill vector), so they are
+/// omitted — they default to `Tag`, a conservative no-optimization.
+///
+/// Returns a 256-byte table indexed by register, or `Vec::new()` when no local
+/// holds a `Val`/`Linear` capability (the only ones that license `readonly`
+/// loads, via `memflags_for_capability`).
+fn function_cap_table(func: &mir::Function) -> Vec<u8> {
+    use crate::types::Capability;
+    let mut caps = vec![Capability::Tag as u8; 256];
+    let spilled_threshold = FUNC_VALUE_REG as u32 - LOCAL_BASE;
+    let mut any_immutable = false;
+    for local in &func.locals {
+        if local.id.0 >= spilled_threshold {
+            continue; // spilled — no fixed register
+        }
+        let reg = (LOCAL_BASE + local.id.0) as usize;
+        let cap = local.cap;
+        caps[reg] = cap.as_u8();
+        if matches!(cap, Capability::Val | Capability::Linear) {
+            any_immutable = true;
+        }
+    }
+    if any_immutable {
+        caps
+    } else {
+        Vec::new()
     }
 }
 

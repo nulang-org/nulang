@@ -30,7 +30,9 @@ use cranelift_jit::JITModule;
 use cranelift_module::{Linkage, Module};
 
 use crate::bytecode::{Instruction, OpCode};
+use crate::cranelift_utils::memflags_for_capability;
 use crate::runtime::heap::{ActorHeap, OrcaHeader, TypeTag};
+use crate::types::Capability;
 use crate::value_layout::{PAYLOAD_MASK, TAG_INT, TAG_MASK, TAG_NIL, TAG_PTR};
 
 // ---------------------------------------------------------------------------
@@ -691,6 +693,7 @@ pub fn compile_bytecode_region(
                     instr.op1 as usize,
                     instr.op2 as usize,
                     instr.op3 as usize,
+                    Capability::Tag,
                 );
             }
             OpCode::ArrStore => {
@@ -808,7 +811,12 @@ pub(crate) fn emit_arr_load(
     arr_reg: usize,
     idx_reg: usize,
     dst: usize,
+    cap: Capability,
 ) {
+    // Capability-derived MemFlags: `val`/`linear` arrays are immutable, so
+    // their header/element loads may be CSE'd (`readonly`). Every other
+    // capability yields default (mutable) flags — conservative and correct.
+    let flags = memflags_for_capability(cap);
     // Load NaN-boxed array pointer and index.
     let arr_val = load_reg(builder, regs_ptr, arr_reg);
     let idx_val = load_reg(builder, regs_ptr, idx_reg);
@@ -848,7 +856,7 @@ pub(crate) fn emit_arr_load(
     let header = builder.ins().isub(arr_ptr, header_size);
     let type_tag = builder.ins().load(
         types::I8,
-        MemFlags::new(),
+        flags,
         header,
         std::mem::offset_of!(OrcaHeader, type_tag) as i32,
     );
@@ -863,7 +871,7 @@ pub(crate) fn emit_arr_load(
     builder.switch_to_block(bounds_blk);
     let size = builder.ins().load(
         types::I64,
-        MemFlags::new(),
+        flags,
         header,
         std::mem::offset_of!(OrcaHeader, size) as i32,
     );
@@ -884,7 +892,7 @@ pub(crate) fn emit_arr_load(
     builder.switch_to_block(load_blk);
     let offset = builder.ins().ishl_imm(idx_raw, 3);
     let addr = builder.ins().iadd(arr_ptr, offset);
-    let result = builder.ins().load(types::I64, MemFlags::new(), addr, 0);
+    let result = builder.ins().load(types::I64, flags, addr, 0);
     store_reg(builder, regs_ptr, dst, result);
     builder.ins().jump(merge_blk, &[]);
 

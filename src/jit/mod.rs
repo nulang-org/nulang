@@ -290,6 +290,7 @@ impl JitSession {
         num_instrs: usize,
         instructions: &[crate::bytecode::Instruction],
         type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
+        cap_caps: Option<&[u8]>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
         if let Some(&(ptr, _)) = self.compiled.get(&(module_idx, start_offset)) {
@@ -315,6 +316,7 @@ impl JitSession {
                 num_instrs,
                 instructions,
                 type_metadata,
+                cap_caps,
             ) {
                 self.compiled
                     .insert((module_idx, start_offset), (ptr, num_instrs));
@@ -414,6 +416,7 @@ impl JitSession {
                 num_instrs,
                 instructions,
                 type_metadata,
+                None,
             );
         }
 
@@ -441,6 +444,7 @@ impl JitSession {
                 num_instrs,
                 instructions,
                 type_metadata,
+                None,
             ),
         }
     }
@@ -651,8 +655,9 @@ impl crate::backends::JitBackend for JitSession {
             if region_len >= 3 {
                 let meta = typed_compiler::infer_reg_types(module, pc);
                 let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
+                let cap_caps = typed_compiler::infer_reg_caps(module, pc);
                 if let Some(func) = unsafe {
-                    self.compile_region_typed(module_idx, pc, region_len, instructions, meta_ref)
+                    self.compile_region_typed(module_idx, pc, region_len, instructions, meta_ref, cap_caps)
                 } {
                     func(regs.as_mut_ptr(), constants.as_ptr());
                     return crate::backends::TieredAction::RanJit;
