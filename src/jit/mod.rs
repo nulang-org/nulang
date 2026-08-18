@@ -198,6 +198,10 @@ impl JitSession {
     /// with `false` here is safe to call from JIT-compiled code (no suspending
     /// effect in its transitive call graph). Returns an empty slice when the
     /// module index is out of range (callers treat empty as "unsafe").
+    ///
+    /// Foundation for JIT-compiling direct calls (the next slice): currently
+    /// exercised by `compute_may_suspend` and its test.
+    #[allow(dead_code)]
     fn may_suspend_for(
         &mut self,
         module_idx: usize,
@@ -524,6 +528,10 @@ pub type JitFunctionPtr = extern "C" fn(*mut u64, *const u64);
 /// hint only: compiled direct calls re-check the live value in reg 254 at
 /// run time and fall back to the interpreter on mismatch, so a stale
 /// recovery here never calls the wrong function.
+///
+/// Foundation for JIT-compiling direct calls (the next slice): currently
+/// exercised by the `may_suspend` analysis and its test.
+#[allow(dead_code)]
 pub(crate) fn direct_call_target(
     module: &crate::bytecode::CodeModule,
     pc: usize,
@@ -565,6 +573,7 @@ pub(crate) fn direct_call_target(
 /// else — effects (`Perform`/`PerformDirect`/`Handle`/`Resume`/`Unwind`),
 /// actor ops, async effects, `SignalWait`/`Receive*`, foreign calls,
 /// `SConcat`/record/closure ops — is conservatively treated as suspending.
+#[allow(dead_code)]
 fn is_non_suspending_op(op: crate::bytecode::OpCode) -> bool {
     use crate::bytecode::OpCode;
     matches!(
@@ -633,6 +642,7 @@ fn is_non_suspending_op(op: crate::bytecode::OpCode) -> bool {
 /// indirect call (unknown target), or a direct call to a may-suspend
 /// function. Fixed point over the direct-call graph recovered by
 /// `direct_call_target`.
+#[allow(dead_code)]
 fn compute_may_suspend(module: &crate::bytecode::CodeModule) -> Vec<bool> {
     use crate::bytecode::OpCode;
     let n = module.function_table.len();
