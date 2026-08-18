@@ -2861,6 +2861,7 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[cfg(feature = "ureq")]
     #[test]
     fn test_cmd_deploy_missing_token() {
         let dir =
@@ -2890,6 +2891,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "ureq")]
     #[test]
     fn test_cmd_deploy_no_manifest() {
         let dir = std::env::temp_dir().join(format!(

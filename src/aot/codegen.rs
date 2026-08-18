@@ -4832,6 +4832,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ai-runtime")]
     #[test]
     #[cfg(feature = "ai-runtime")]
     fn test_aot_runtime_native_perform_async() {
