@@ -974,16 +974,18 @@ pub fn is_all_int(func: &mir::Function) -> bool {
         }
     }
     // Nil-producing / heap-object operations must stay boxed. An unboxed
-    // function tags its raw result, so a nil (div-by-zero, out-of-bounds
-    // array access) would be re-tagged as int 0, and heap objects hold tagged
-    // values the unboxed raw int path would corrupt.
+    // function tags its raw result, so a nil (div-by-zero, negative int-pow
+    // exponent, out-of-bounds array access) would be re-tagged as int 0, and
+    // heap objects hold tagged values the unboxed raw int path would corrupt.
     for block in &func.blocks {
         for stmt in &block.stmts {
             let nil_or_object = match stmt {
                 mir::Stmt::Assign { op, .. } => matches!(
                     op,
-                    mir::RValue::Binary(crate::ast::BinOp::Div | crate::ast::BinOp::Mod, ..)
-                        | mir::RValue::ArrayLit(_)
+                    mir::RValue::Binary(
+                        crate::ast::BinOp::Div | crate::ast::BinOp::Mod | crate::ast::BinOp::Pow,
+                        ..
+                    ) | mir::RValue::ArrayLit(_)
                         | mir::RValue::ArrayLoad { .. }
                         | mir::RValue::ArrayLen(_)
                         | mir::RValue::Record(_)
@@ -4594,6 +4596,43 @@ mod tests {
             crate::vm::Value::from_raw(raw).as_int(),
             Some(0),
             "int pow overflow wraps (wrapping_mul), not nil"
+        );
+    }
+
+    #[test]
+    fn test_aot_int_pow_non_overflow_and_negative_exp() {
+        // Non-overflow int pow must produce the exact value — this exercised
+        // the unboxed-compilation hazard: `Pow` was missing from the
+        // nil-producing exclusion in `is_all_int`, so an all-Int function
+        // compiled unboxed, fell through the unboxed binop match (no Pow arm)
+        // to `call_helper(nulang_pow)` with RAW operands, which were misread
+        // as floats (1.0), whose zero payload re-tagged as int 0. `3 ** 3`
+        // returned 0 instead of 27. Pow is now excluded from unboxed mode.
+        let aot = aot_compile_source(r#"fn main() -> Int { 3 ** 3 }"#);
+        let raw = aot.run().expect("native run");
+        assert_eq!(
+            crate::vm::Value::from_raw(raw).as_int(),
+            Some(27),
+            "3 ** 3 must be 27, not 0 (unboxed-pow hazard)"
+        );
+
+        // Binary-exponentiation path: 2 ** 10 = 1024.
+        let aot = aot_compile_source(r#"fn main() -> Int { 2 ** 10 }"#);
+        let raw = aot.run().expect("native run");
+        assert_eq!(
+            crate::vm::Value::from_raw(raw).as_int(),
+            Some(1024),
+            "2 ** 10 must be 1024"
+        );
+
+        // Negative exponent yields nil (mirrors IDiv div-by-zero) — boxed
+        // path must surface nil, not re-tag it as int 0.
+        let aot = aot_compile_source(r#"fn main() -> Int { 3 ** -1 }"#);
+        let raw = aot.run().expect("native run");
+        assert_eq!(
+            crate::vm::Value::from_raw(raw),
+            crate::vm::Value::nil(),
+            "3 ** -1 must be nil, not int 0"
         );
     }
 

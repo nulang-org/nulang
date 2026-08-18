@@ -203,8 +203,14 @@ two major versions.*
   (~4× actor density, ≈64k actors/GB). Growth chaining unchanged.
 - **Int `**` overflow consistency** — interpreter, JIT, and AOT now all wrap
   on 48-bit int-pow overflow (previously the interpreter wrapped while the
-  JIT/AOT compiled helper returned `nil` + recorded an arithmetic error). The
-  compiled helper `nulang_pow` now mirrors the interpreter's `step_ipow`.
+  JIT/AOT compiled helper `nulang_pow` returned `nil` + recorded an arithmetic
+  error). The compiled helper now mirrors the interpreter's `step_ipow`.
+  Also fixed the AOT unboxed-compilation hazard: `Pow` was missing from
+  `is_all_int`'s nil-producing exclusion, so an all-`Int` function compiled
+  unboxed, fell through the unboxed binop match to the tagged helper with raw
+  operands, and returned `0` for any non-overflow pow (`3 ** 3` → 0). Pow is
+  now excluded from unboxed mode; `3 ** 3` → 27 and `3 ** -1` → nil on all
+  backends.
 
 
 ### Added since 1.0.0-frozen — 2026-08-15
