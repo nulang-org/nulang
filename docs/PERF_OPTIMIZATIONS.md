@@ -107,6 +107,62 @@ code and broke the hand-built sites; **reverted** on the audit finding.
 | **"Already scheduled" scheduler flag** | Flag lifecycle across work-stealing + cross-shard `EnqueueActor` is a stuck-flag/deadlock risk. Scheduler is already tuned (757k msg/s counting). |
 | **Per-step guard trimming** | The step-limit check is already a cached `OnceLock` + compare per step — negligible cost. Changing step-count semantics risks continuation metadata and step-limit tests. |
 
+## JIT-compiling `Call` (next high-impact item — dedicated effort)
+
+`Call`/`ClosureCall` are not JIT-compilable, so hot call-graphs (fib,
+closures, recursion) never tier up and run fully interpreted (~470 ns/call
+for fib in release, of which the frame zero is ~6%). The high-impact fix is a
+native call between compiled regions so hot callees run natively.
+
+**Audit findings:**
+- Return convention: callee writes `regs[0]` (Ret) or `regs[op1]` (RetVal);
+  the interpreter copies it to the caller's `return_dst` and pops.
+- The region ABI is `extern "C" fn(regs: *mut u64, consts: *const u64)`; there
+  is no per-frame isolation in native code — a native callee sharing the regs
+  buffer clobbers the caller's live regs (needs caller-save/liveness).
+- **Suspension correctness is the blocker.** A native (or helper-run) callee
+  that suspends mid-execution must not be re-run from the call start (that
+  double-executes pre-suspend side effects). The only sound approach is a
+  static, transitive `may_suspend` gate: compile/native-call a callee only if
+  it provably never suspends (no suspending effect opcode in its transitive
+  call graph), else fall back to the interpreter (which handles suspension
+  correctly from the start).
+
+**Frozen-format constraint (discovered, do not re-violate):** adding a new
+opcode (e.g. a `CallDirect`) is an **additive format change** — a freshly
+compiled `.nbc` would carry a new opcode value under a `BYTECODE_VERSION=1`
+header, which a conforming v1 runtime rejects with `UnknownOpcode`
+(`format/nbc.rs`: the instruction stream is "coupled to the frozen opcode
+values"; `migrate.rs` is "the sole legal home for format upgrades").
+Minting an opcode requires `BYTECODE_VERSION`→2 + a `migrate` entry + an RFC
+(the language version is `1.0.0-frozen` and moves only on RFC-ratified
+change) — a governance decision, not a perf-branch one. **The direct-call
+target must be recovered without a new opcode.**
+
+**Design (no format change):**
+1. **`may_suspend` vector, VM-side (not in frozen `CodeModule`):** computed at
+   compile time from MIR (whose `RValue::Call { func: FuncRef }` distinguishes
+   direct `Index(idx)` from indirect `Local`), as a transitive fixed point
+   over the direct call graph + suspending effect opcodes. Stored per module
+   keyed by function-table index, threaded to the JIT (e.g. `jit_session`
+   side-table) so the region compiler can gate a native call on the callee.
+2. **Region-compiler peephole:** recover the direct callee from the existing
+   `load_constant(FUNC_VALUE_REG, idx)` + `Call(FUNC_VALUE_REG, argc, dst)`
+   sequence mir_codegen already emits for `FuncRef::Index` (FUNC_VALUE_REG =
+   254). When recognized and the callee is `!may_suspend`, emit a native call
+   (or a helper that runs the non-suspending callee to completion, then writes
+   the result to `regs[dst]`), preserving the caller's regs buffer. Indirect
+   (`FuncRef::Local`) and suspending callees stay on the interpreter path.
+3. Follow-up (if the native-call win warrants it): caller-save of live-across-
+   call regs via a bounded liveness pass over the compiled region, to allow
+   native callees that share the regs buffer.
+
+The first slice (safe, correct, testable) is the peephole + `may_suspend`
+gate emitting a helper that runs a provably-non-suspending callee to
+completion. This compiles the caller's whole body around direct calls (fib:
+arg computes, adds, branch native; recursive calls interpreted), with the
+recursion tiering up as the callee's own region compiles.
+
 ## Correctness fix landed on this branch
 
 Int `**` overflow diverged across backends: the interpreter's `step_ipow`
