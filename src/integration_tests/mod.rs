@@ -11632,6 +11632,7 @@ match { a: 2, b: 9 } with {
     }
 
     #[test]
+    #[allow(clippy::erasing_op)]
     fn test_map_builtin_overwrite_remove() {
         let source = r#"
             var m = perform Map.new();
