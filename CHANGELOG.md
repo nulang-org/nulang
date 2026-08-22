@@ -89,6 +89,14 @@ two major versions.*
   sorts package versions with proper semver comparison instead of
   lexicographic string sort, so `1.0.10` lists after `1.0.2`
   (`registry-worker/src/index.ts`).
+- **Registry worker semver + quota hardening** (tooling): semver
+  comparison moved to a dedicated `semver.ts` (numeric prerelease
+  identifiers, ASCII alphanumeric, numeric < alphanumeric, fewer fields <
+  more — fixes `0.10.0-alpha.10` < `alpha.9`); chunked PUTs are rejected
+  with `411` when `QUOTA_HOOK_URL` is configured so `size_bytes` is always
+  the real byte count; the Rust registry server sorts versions
+  semver-aware via `package::resolver::parse_semver` (invalid keys last,
+  deterministic). 15 new vitest unit/integration tests.
 - **Registry seed packages** (experimental; `src/registry`, `src/package`,
   `packages/`). The `nula` package manager ships a set of seed packages
   (`packages/*`) that can be published to a registry and used as
