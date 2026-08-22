@@ -47,6 +47,8 @@ two major versions.*
 
 ### Added since 1.0.0-frozen — 2026-08-14
 
+- **Playground backend** (`playground/server.py`): programs run via the bytecode VM backend with resource limits; stray `!` file removed from repo root.
+
 - **`let rec f(x) = ... in ...` works at module level.** Recursive local
   bindings already parsed in expression position; module-level entry
   failed because `parse_module_let` hit the parameter list ("Expected =")
