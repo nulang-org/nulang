@@ -47,6 +47,8 @@ two major versions.*
 
 ### Added since 1.0.0-frozen — 2026-08-15
 
+- **Durable store CLI** (`src/main.rs`, `src/runtime/spawn.rs`): `nulang run` now wires the durable store through, and durable entity state is restored on spawn (restart recovery).
+
 - **Aether borrow-semantics features (P0–P5).** Six borrows from the
   Aether→Nulang comparison, landed together:
   - **Savina-style benchmark harness** (`src/benchmarks.rs`): counting,
