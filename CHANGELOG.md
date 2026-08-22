@@ -46,6 +46,9 @@ version + migration.*
 two major versions.*
 
 ### Added since 1.0.0-frozen — 2026-08-22 (vscode extension)
+- **AOT backend error parity** (`src/aot/mod.rs`): the native AOT run path
+  now surfaces interpreter-parity runtime errors (48-bit overflow, type
+  errors from `pow`/`neg` helpers) instead of silently returning a value.
 
 - **VS Code extension 0.2.0 — language server client** (`editors/vscode/`).
   The extension now activates `nulang --lsp` over stdio and exposes the full
