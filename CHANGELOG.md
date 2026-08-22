@@ -157,6 +157,11 @@ two major versions.*
     (100k × 10-deep) 2.21s → 0.27s.
 
 ### Added since 1.0.0-frozen — 2026-08-19
+- **Iso arena allocation** (experimental; `src/iso_arena.rs`): arena-backed
+  allocation for iso data with qualifying-site analysis over the bytecode
+  (may-pointer register sets), plus `alloc_arena`/`reset_arena`/
+  `is_arena_ptr` hooks on `ActorVmCallbacks`. Arena objects are reclaimed
+  wholesale at activation end.
 
 - **RFC 0016 — Virtual Actor Auto-Hydration and Immutable Shared Object Store**
   (Experimental). Orleans-style virtual actors plus a Ray-style immutable
