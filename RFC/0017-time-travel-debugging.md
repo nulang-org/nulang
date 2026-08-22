@@ -1,4 +1,4 @@
-# RFC 0015: Time-Travel Debugging & Deterministic Replayability
+# RFC 0017: Time-Travel Debugging & Deterministic Replayability
 
 - **Status:** Draft
 - **Tier:** Experimental
