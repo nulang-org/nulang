@@ -172,6 +172,8 @@ two major versions.*
 
 ### Added since 1.0.0-frozen — 2026-08-15
 
+- **Registry worker auth hooks** (tooling; `registry-worker/src/index.ts`): package list endpoint and publish-quota hook for hosted deployments.
+
 - **Aether borrow-semantics features (P0–P5).** Six borrows from the
   Aether→Nulang comparison, landed together:
   - **Savina-style benchmark harness** (`src/benchmarks.rs`): counting,
