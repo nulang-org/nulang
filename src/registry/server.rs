@@ -15,6 +15,8 @@ use std::thread;
 use parking_lot::Mutex;
 use std::time::Duration;
 
+use crate::package::resolver::parse_semver;
+
 /// Package registry server.
 ///
 /// Storage layout under `data_dir`:
@@ -259,7 +261,7 @@ impl RegistryServer {
             .filter(|f| f.ends_with(".tar.gz"))
             .map(|f| f.trim_end_matches(".tar.gz").to_string())
             .collect();
-        versions.sort();
+        sort_versions(&mut versions);
         let payload = serde_json::json!({ "name": name, "versions": versions });
         let body = payload.to_string();
         Self::write_response(stream, 200, "application/json", body.as_bytes());
@@ -319,5 +321,42 @@ fn authorized(headers: &[(String, String)], auth_token: &Option<String>) -> bool
                     scheme.eq_ignore_ascii_case("Bearer") && token.trim() == expected
                 })
         }),
+    }
+}
+
+/// Sort versions semver-aware so `0.10.0` sorts after `0.9.0`. Keys that
+/// are not valid semver (e.g. tags published before validation, or
+/// prereleases, which the resolver cannot consume) sort after all valid
+/// versions in lexicographic order, keeping the listing deterministic.
+fn sort_versions(versions: &mut [String]) {
+    versions.sort_by(|a, b| match (parse_semver(a), parse_semver(b)) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Err(_)) => a.cmp(b),
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sort_versions_semver_aware() {
+        let mut versions = vec![
+            "0.10.0".to_string(),
+            "0.9.0".to_string(),
+            "1.0.0".to_string(),
+            "0.9.10".to_string(),
+        ];
+        sort_versions(&mut versions);
+        assert_eq!(versions, vec!["0.9.0", "0.9.10", "0.10.0", "1.0.0"]);
+    }
+
+    #[test]
+    fn test_sort_versions_invalid_last() {
+        let mut versions = vec!["latest".to_string(), "1.0.0".to_string(), "v2".to_string()];
+        sort_versions(&mut versions);
+        assert_eq!(versions, vec!["1.0.0", "latest", "v2"]);
     }
 }
