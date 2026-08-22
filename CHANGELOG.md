@@ -179,6 +179,10 @@ two major versions.*
     handles (`src/value_layout.rs`, `src/runtime/network.rs`).
 
 ### Added since 1.0.0-frozen — 2026-08-15
+- **E0208 FFI boundary diagnostic** (`src/types.rs`, `src/diagnostic.rs`):
+  capability-qualified types at the FFI boundary now report the new
+  `E013`/`E0208` error code (`FfiBoundaryViolation`) with `--explain`
+  support, replacing the generic error path (`docs/ERROR_CODES.md`).
 
 - **Aether borrow-semantics features (P0–P5).** Six borrows from the
   Aether→Nulang comparison, landed together:
