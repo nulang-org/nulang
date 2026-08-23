@@ -4278,7 +4278,13 @@ impl VM {
                 if a.is_float() {
                     frame.regs[instr.op2 as usize] = Value::float(-a.as_float().unwrap());
                 } else {
-                    frame.regs[instr.op2 as usize] = Value::int(-a.as_int().unwrap_or(0));
+                    match a.as_int() {
+                        Some(x) if x != crate::value_layout::INT48_MIN => {
+                            frame.regs[instr.op2 as usize] = Value::int(-x);
+                        }
+                        Some(x) => return Err(int_overflow_error("neg", x, 0)),
+                        None => return Err(arith_type_error("neg", a, a)),
+                    }
                 }
             }
             // IInc/IDec mirror the JIT helpers `nulang_iinc`/`nulang_idec`
