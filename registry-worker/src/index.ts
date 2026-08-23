@@ -1,3 +1,5 @@
+import { sortSemver } from './semver';
+
 export interface Env {
   BUCKET: R2Bucket;
   PUBLISH_TOKEN: string;
@@ -9,52 +11,10 @@ export interface Env {
    * Used by the NLC hosted deployment to enforce per-tenant package quotas
    * (e.g. pointed at an nlc-billing or registry-gateway endpoint).
    *
-   * Note on chunked transfers:
-   * When requests use chunked transfer encoding (where Content-Length is absent),
-   * `size_bytes` defaults to 0. Quota endpoints should account for 0 `size_bytes`
-   * or require clients to supply Content-Length for strict pre-flight quota checks.
+   * Chunked transfers (no Content-Length) are rejected with 411 when this
+   * hook is configured, so `size_bytes` is always the real byte count.
    */
   QUOTA_HOOK_URL?: string;
-}
-
-/**
- * Compare two semver strings (e.g. "0.10.0" > "0.9.0", "1.0.0" > "1.0.0-alpha").
- */
-function parseSemver(v: string) {
-  const [versionCore, ...prereleaseParts] = v.split('+')[0].split('-');
-  const prerelease = prereleaseParts.join('-');
-  const parts = versionCore.split('.').map((num) => parseInt(num, 10) || 0);
-  while (parts.length < 3) {
-    parts.push(0);
-  }
-  return {
-    major: parts[0],
-    minor: parts[1],
-    patch: parts[2],
-    prerelease,
-  };
-}
-
-export function compareSemver(a: string, b: string): number {
-  const pa = parseSemver(a);
-  const pb = parseSemver(b);
-
-  if (pa.major !== pb.major) return pa.major - pb.major;
-  if (pa.minor !== pb.minor) return pa.minor - pb.minor;
-  if (pa.patch !== pb.patch) return pa.patch - pb.patch;
-
-  // Versions without pre-release have higher precedence than versions with pre-release
-  if (!pa.prerelease && pb.prerelease) return 1;
-  if (pa.prerelease && !pb.prerelease) return -1;
-  if (pa.prerelease && pb.prerelease) {
-    return pa.prerelease.localeCompare(pb.prerelease);
-  }
-
-  return 0;
-}
-
-export function sortSemver(versions: string[]): string[] {
-  return [...versions].sort(compareSemver);
 }
 
 async function checkPublishQuota(
@@ -153,6 +113,16 @@ export default {
           return new Response('Unauthorized', { status: 401 });
         }
 
+        // Quota hooks need a byte count, which chunked transfers (no
+        // Content-Length) cannot provide pre-flight. Reject them rather than
+        // reporting size_bytes: 0 and letting the quota check be bypassed.
+        if (env.QUOTA_HOOK_URL && !request.headers.has('Content-Length')) {
+          return new Response(
+            'Length Required: Content-Length header required when quota hook is enabled',
+            { status: 411 }
+          );
+        }
+
         // Check if version already exists
         const existing = await env.BUCKET.head(key);
         if (existing) {
@@ -160,7 +130,6 @@ export default {
         }
 
         // Optional publish-quota hook (hosted deployments)
-        // Note: size_bytes will be 0 on chunked transfer requests without Content-Length
         const quotaRejection = await checkPublishQuota(
           env,
           name,
