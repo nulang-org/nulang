@@ -5,8 +5,6 @@ template: splash
 hero:
   title: Build software that <span class="hero-emphasis">heals</span>
   tagline: Learn the language, contribute to the project, and ship fault-tolerant systems with algebraic effects and row-polymorphic types.
-  image:
-    file: ../../assets/logo.svg
   actions:
     - text: Get Started
       link: /getting-started/installation/
@@ -18,37 +16,41 @@ hero:
       variant: secondary
 ---
 
-import HeroBackground from '../../components/animations/HeroBackground.astro';
 import SupervisionTree from '../../components/animations/SupervisionTree.astro';
 import DistributionDemo from '../../components/animations/DistributionDemo.astro';
 import AIPipeline from '../../components/animations/AIPipeline.astro';
 import GcDemo from '../../components/animations/GcDemo.astro';
 import ScrollReveal from '../../components/ScrollReveal.astro';
 import FeatureAccordion from '../../components/FeatureAccordion.astro';
-import GitHubStars from '../../components/GitHubStars.astro';
 
-<HeroBackground />
-
-<div class="hero-social-proof">
-  <GitHubStars />
-  <span class="hero-social-copy">Open source on GitHub · Apache 2.0</span>
-</div>
-
-<div class="hero-example">
-
-```nulang
-actor Counter {
-    state count: Int = 0
-    behavior inc() { self.count = self.count + 1 }
-    behavior get() { self.count }
-}
-let c = spawn Counter {} in {
-    send c inc()    // fire-and-forget
-    send c inc()
-    ask c get()     // synchronous request → 2
-}
-```
-
+<div class="hero-metrics">
+  <div class="metric">
+    <div class="metric-value">1558+</div>
+    <div class="metric-label">Tests</div>
+    <div class="metric-detail">Core suite, all passing</div>
+  </div>
+  <div class="metric">
+    <div class="metric-value">4</div>
+    <div class="metric-label">Backends</div>
+    <div class="metric-detail">VM, JIT, native AOT, WASM</div>
+  </div>
+  <div class="metric">
+    <div class="metric-value">135</div>
+    <div class="metric-label">Opcodes</div>
+    <div class="metric-detail">Register-based VM</div>
+  </div>
+  <div class="metric">
+    <div class="metric-value">0</div>
+    <div class="metric-label">STW pauses</div>
+    <div class="metric-detail">Per-actor garbage collection</div>
+  </div>
+  <div class="metric">
+    <div class="metric-value">
+      <a href="https://github.com/nulang-org/nulang" target="_blank" rel="noopener noreferrer" class="metric-link">5</a>
+    </div>
+    <div class="metric-label">Stars</div>
+    <div class="metric-detail">Open source · Apache 2.0</div>
+  </div>
 </div>
 
 ## Why Nulang?
@@ -117,7 +119,7 @@ Reference capabilities and per-actor garbage collection give you memory safety w
 
 ## Language Features
 
-Explore the core capabilities that make Nulang different. Expand each section to learn more.
+Explore the core capabilities that make Nulang different.
 
 <FeatureAccordion />
 
@@ -156,14 +158,17 @@ cargo build --release
 cargo run -- --repl
 ```
 
-## Support
-
-Nulang is open source under the Apache 2.0 license. If you find it valuable, consider supporting its development.
-
-<div style="margin-top:1.5rem;">
-  <a href="https://buy.stripe.com/cNidR932O6du6nK6eX1RC02" class="btn-support">
-    ♥ Support Nulang Development
-  </a>
+<div class="cta-panel bottom-cta">
+  <h2 class="cta-panel-title">Ready to build?</h2>
+  <p class="cta-panel-copy">
+    Nulang is open source under the Apache 2.0 license. Get started, contribute on GitHub, or support its ongoing development.
+  </p>
+  <div class="cta-panel-actions">
+    <a href="/getting-started/installation/" class="cta-btn cta-btn-primary">Get Started</a>
+    <a href="https://github.com/nulang-org/nulang" class="cta-btn cta-btn-ghost" target="_blank" rel="noopener noreferrer">
+      Contribute on GitHub
+    </a>
+  </div>
 </div>
 
 <ScrollReveal />

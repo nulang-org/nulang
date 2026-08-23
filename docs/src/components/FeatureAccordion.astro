@@ -1,4 +1,6 @@
 ---
+// Language-feature card grid, styled to match nulang.cloud's card pattern
+// (rounded surface card, icon chip in an orange-tinted square).
 const features = [
 	{
 		id: 'actors',
@@ -39,19 +41,14 @@ const features = [
 ];
 ---
 
-<div class="feature-accordion" role="region" aria-label="Language features">
-	{features.map((feature, index) => (
-		<details class="feature-panel" open={index === 0}>
-			<summary class="feature-panel-summary">
-				<svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon" set:html={feature.icon} />
-				<span>{feature.title}</span>
-				<svg class="feature-chevron" aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-					<polyline points="6 9 12 15 18 9" />
-				</svg>
-			</summary>
-			<div class="feature-panel-body">
-				<p>{feature.body}</p>
+<div class="feature-grid" role="list" aria-label="Language features">
+	{features.map((feature) => (
+		<div class="feature-card" role="listitem">
+			<div class="feature-icon-chip">
+				<svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon" set:html={feature.icon} />
 			</div>
-		</details>
+			<h3>{feature.title}</h3>
+			<p>{feature.body}</p>
+		</div>
 	))}
 </div>
