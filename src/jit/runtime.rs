@@ -1111,7 +1111,6 @@ pub extern "C" fn nulang_pow(a: u64, b: u64) -> u64 {
     let exp = vb.as_int().unwrap_or(0);
     if exp < 0 {
         return Value::nil().as_raw();
-    })
     }
     // Binary exponentiation with wrapping_mul — mirrors `step_ipow` exactly
     // so overflow wraps (truncated to the 48-bit payload by `Value::int`)
