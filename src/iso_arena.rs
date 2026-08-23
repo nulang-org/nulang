@@ -169,7 +169,10 @@ impl IsoArena {
         unsafe {
             // SAFETY: header_ptr points into our live block with `total`
             // bytes of room; OrcaHeader fits in the first HEADER_SIZE bytes.
-            std::ptr::write(header_ptr, OrcaHeader::new(0, type_tag, total, payload_size));
+            std::ptr::write(
+                header_ptr,
+                OrcaHeader::new(0, type_tag, total, payload_size),
+            );
         }
         self.offset += total;
         self.epoch_allocs += 1;
@@ -246,7 +249,11 @@ enum Transfer {
     /// argument registers `r0..r(argc)`; the callee cannot touch any other
     /// caller register (a fresh frame copies only `r0..argc`).  The return
     /// write to `dst` kills an alias there.
-    Call { func: usize, argc: usize, dst: usize },
+    Call {
+        func: usize,
+        argc: usize,
+        dst: usize,
+    },
 }
 
 fn classify(instr: &Instruction) -> Transfer {
@@ -412,7 +419,10 @@ fn may_ptr_sets(module: &CodeModule) -> Vec<RegSet> {
                 }
             }
             Swap => {
-                let (a, b) = (regset_contains(&set, instr.op1), regset_contains(&set, instr.op2));
+                let (a, b) = (
+                    regset_contains(&set, instr.op1),
+                    regset_contains(&set, instr.op2),
+                );
                 if a != b {
                     if a {
                         regset_remove(&mut out, instr.op1);
@@ -535,9 +545,7 @@ fn site_qualifies(instrs: &[Instruction], may_ptr: &[RegSet], pc: usize, dst: u8
                 if set.contains(&(src as u8)) {
                     return false; // stored into another object
                 }
-                if set.contains(&(container as u8))
-                    && regset_contains(&may_ptr[i], src as u8)
-                {
+                if set.contains(&(container as u8)) && regset_contains(&may_ptr[i], src as u8) {
                     // Arena container receiving a pointer-suspect child: the
                     // child's rc would never be retained for this slot, so
                     // the slot could dangle.  Keep the container on the heap.
@@ -657,8 +665,7 @@ mod tests {
             let h = &*ActorHeap::header_of(p);
             assert_eq!(h.type_tag, TypeTag::Array);
             assert_eq!(
-                h.size.saturating_sub(ActorHeap::HEADER_SIZE)
-                    / std::mem::size_of::<u64>(),
+                h.size.saturating_sub(ActorHeap::HEADER_SIZE) / std::mem::size_of::<u64>(),
                 3
             );
         }
@@ -705,7 +712,7 @@ mod tests {
         // r1 = array(r0-len); read its length; drop it; halt. r0 is an int.
         let m = send_module(
             vec![
-                arr_alloc(0, 1),            // 0: r1 = array
+                arr_alloc(0, 1),                         // 0: r1 = array
                 Instruction::new2(OpCode::ArrLen, 1, 2), // 1: r2 = len(r1)
                 Instruction::new1(OpCode::Drop, 1),      // 2: drop r1
                 Instruction::new0(OpCode::Halt),         // 3
@@ -805,9 +812,9 @@ mod tests {
         // so ORCA freed a child before the reads.
         let m = send_module(
             vec![
-                arr_alloc(2, 1),                        // r1 = inner [..]
-                arr_alloc(1, 2),                        // r2 = inner [..]
-                arr_alloc(2, 3),                        // r3 = outer
+                arr_alloc(2, 1),                              // r1 = inner [..]
+                arr_alloc(1, 2),                              // r2 = inner [..]
+                arr_alloc(2, 3),                              // r3 = outer
                 Instruction::new3(OpCode::ArrStore, 3, 0, 1), // outer[0] = r1
                 Instruction::new3(OpCode::ArrStore, 3, 0, 2), // outer[1] = r2
                 Instruction::new3(OpCode::ArrLoad, 3, 0, 4),  // r4 = outer[0]
@@ -911,12 +918,12 @@ mod tests {
         // Loop body returns the scratch array on one branch.
         let m = send_module(
             vec![
-                arr_alloc(0, 1),                         // 0
-                Instruction::new1(OpCode::Const1, 2),    // 1: r2 = true
-                jmp_f(2, 2),                           // 2: if !r2 jmp to 4
-                Instruction::new1(OpCode::RetVal, 1),    // 3: return r1 (escape)
-                Instruction::new1(OpCode::Drop, 1),      // 4
-                Instruction::new0(OpCode::Halt),         // 5
+                arr_alloc(0, 1),                      // 0
+                Instruction::new1(OpCode::Const1, 2), // 1: r2 = true
+                jmp_f(2, 2),                          // 2: if !r2 jmp to 4
+                Instruction::new1(OpCode::RetVal, 1), // 3: return r1 (escape)
+                Instruction::new1(OpCode::Drop, 1),   // 4
+                Instruction::new0(OpCode::Halt),      // 5
             ],
             0,
         );
@@ -928,14 +935,14 @@ mod tests {
         // Scratch array read inside a loop, dropped after; no escapes.
         let m = send_module(
             vec![
-                arr_alloc(0, 1),                         // 0: r1 = array
-                Instruction::new1(OpCode::Const0, 2),    // 1: r2 = 0 (counter)
-                Instruction::new2(OpCode::ArrLen, 1, 3), // 2: r3 = len(r1)
-                Instruction::new1(OpCode::IInc, 2),      // 3: r2++
+                arr_alloc(0, 1),                            // 0: r1 = array
+                Instruction::new1(OpCode::Const0, 2),       // 1: r2 = 0 (counter)
+                Instruction::new2(OpCode::ArrLen, 1, 3),    // 2: r3 = len(r1)
+                Instruction::new1(OpCode::IInc, 2),         // 3: r2++
                 Instruction::new3(OpCode::ICmpLt, 2, 3, 4), // 4: r4 = r2<r3
-                jmp_t(4, -3),                          // 5: if r4 jmp to 2
-                Instruction::new1(OpCode::Drop, 1),      // 6
-                Instruction::new0(OpCode::Halt),         // 7
+                jmp_t(4, -3),                               // 5: if r4 jmp to 2
+                Instruction::new1(OpCode::Drop, 1),         // 6
+                Instruction::new0(OpCode::Halt),            // 7
             ],
             0,
         );

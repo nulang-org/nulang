@@ -180,7 +180,7 @@ pub struct Actor {
     pub state: ActorState,
     pub mailbox: Mailbox,
     pub heap: ActorHeap,
-    pub orca_gc: OrcaGc,                    // ORCA GC engine for this actor
+    pub orca_gc: OrcaGc, // ORCA GC engine for this actor
     /// Wave D4 per-activation bump arena for allocations proven
     /// message-scoped by the conservative escape analysis in
     /// [`crate::iso_arena`].  Reset in O(1) when a handler activation

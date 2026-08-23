@@ -1089,7 +1089,11 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         }
     }
 
-    fn alloc_arena(&mut self, size: usize, type_tag: crate::runtime::heap::TypeTag) -> Option<*mut u8> {
+    fn alloc_arena(
+        &mut self,
+        size: usize,
+        type_tag: crate::runtime::heap::TypeTag,
+    ) -> Option<*mut u8> {
         unsafe {
             (*self.runtime)
                 .actors
