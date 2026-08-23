@@ -50,6 +50,7 @@ impl NuError {
                 ErrorCode::E010MatchNoArms => "E0206",
                 ErrorCode::E011StepLimitExceeded => "E0503",
                 ErrorCode::E012UnhandledEffect => "E0302",
+                ErrorCode::E013FfiBoundaryViolation => "E0208",
             });
         }
         // Fall back to a per-variant category default.

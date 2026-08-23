@@ -157,6 +157,11 @@ two major versions.*
     (100k × 10-deep) 2.21s → 0.27s.
 
 ### Added since 1.0.0-frozen — 2026-08-19
+- **Iso arena allocation** (experimental; `src/iso_arena.rs`): arena-backed
+  allocation for iso data with qualifying-site analysis over the bytecode
+  (may-pointer register sets), plus `alloc_arena`/`reset_arena`/
+  `is_arena_ptr` hooks on `ActorVmCallbacks`. Arena objects are reclaimed
+  wholesale at activation end.
 
 - **RFC 0016 — Virtual Actor Auto-Hydration and Immutable Shared Object Store**
   (Experimental). Orleans-style virtual actors plus a Ray-style immutable
@@ -179,6 +184,10 @@ two major versions.*
     handles (`src/value_layout.rs`, `src/runtime/network.rs`).
 
 ### Added since 1.0.0-frozen — 2026-08-15
+- **E0208 FFI boundary diagnostic** (`src/types.rs`, `src/diagnostic.rs`):
+  capability-qualified types at the FFI boundary now report the new
+  `E013`/`E0208` error code (`FfiBoundaryViolation`) with `--explain`
+  support, replacing the generic error path (`docs/ERROR_CODES.md`).
 
 - **Aether borrow-semantics features (P0–P5).** Six borrows from the
   Aether→Nulang comparison, landed together:
