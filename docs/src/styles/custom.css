@@ -69,6 +69,24 @@
   --sl-color-gray-3: var(--nu-text-tertiary);
 }
 
+
+/* Cap just the standalone intro paragraphs so full-width sections don't turn
+   body prose into unreadably long measure (~70ch). Section-level blocks
+   (hero, grids, benefit rows, CTA) stay full-width. */
+.sl-markdown-content > p {
+  max-width: 70ch;
+}
+/* ── Full-width landing page ── */
+/* Starlight caps `.sl-container` at `--sl-content-width` (67.5rem) on pages
+   without a sidebar, so the landing hero/metrics sit in a ~1080px column with
+   big side gutters on wide screens. The landing page uniquely carries the
+   `data-has-hero` attribute; widen the content var there so it spans
+   edge-to-edge like nulang.cloud. (Selector kept distinct from Starlight's
+   `html:not([data-has-sidebar])` so lightningcss doesn't drop it.) */
+html[data-has-hero]:not([data-has-sidebar]) {
+  --sl-content-width: 100%;
+}
+
 /* ── Typography (match nulang.cloud) ── */
 html {
   font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -83,13 +101,6 @@ html {
 
 .nu-accent-high {
   color: var(--nu-accent-high);
-}
-
-/* ── Header ── */
-.header {
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border-bottom: 1px solid var(--nu-border-subtle);
 }
 
 /* Split-color header title: blue "Nu", rest inherits text color */
@@ -113,16 +124,16 @@ html {
   overflow: hidden;
   padding: 5rem 0 4rem;
   background:
-    radial-gradient(ellipse 80% 60% at 50% -10%, rgba(75, 123, 255, 0.18), transparent 60%),
-    radial-gradient(ellipse 60% 40% at 80% 40%, rgba(243, 128, 32, 0.10), transparent 50%),
-    linear-gradient(180deg, rgba(243, 128, 32, 0.10) 0%, var(--nu-bg) 55%);
+    radial-gradient(ellipse 80% 60% at 50% -10%, rgba(243, 128, 32, 0.12), transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 40%, rgba(243, 128, 32, 0.08), transparent 50%),
+    linear-gradient(180deg, rgba(243, 128, 32, 0.06) 0%, var(--nu-bg) 55%);
 }
 
 [data-theme="light"] .hero {
   background:
-    radial-gradient(ellipse 80% 60% at 50% -10%, rgba(75, 123, 255, 0.12), transparent 60%),
-    radial-gradient(ellipse 60% 40% at 80% 40%, rgba(243, 128, 32, 0.08), transparent 50%),
-    linear-gradient(180deg, rgba(243, 128, 32, 0.08) 0%, var(--nu-bg) 55%);
+    radial-gradient(ellipse 80% 60% at 50% -10%, rgba(243, 128, 32, 0.10), transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 40%, rgba(243, 128, 32, 0.06), transparent 50%),
+    linear-gradient(180deg, rgba(243, 128, 32, 0.06) 0%, var(--nu-bg) 55%);
 }
 
 /* Subtle dot grid overlay on hero */
@@ -168,58 +179,56 @@ html {
   text-shadow: none;
 }
 
-/* ── Hero button restyling ── */
-.hero .actions {
-  gap: 1rem;
-}
-
-.hero .actions a[href*="getting-started"] {
-  background: var(--nu-accent-high);
-  color: #ffffff;
-  border: none;
+.hero-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
   border-radius: 0.75rem;
   padding: 0.875rem 1.75rem;
   font-weight: 600;
-  box-shadow: 0 4px 20px rgba(243, 128, 32, 0.25);
-  transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+  font-size: 0.9375rem;
+  text-decoration: none;
+  line-height: 1.2;
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease,
+              box-shadow 0.2s ease, transform 0.2s ease;
 }
 
-.hero .actions a[href*="getting-started"]:hover {
+.hero-action .action-icon {
+  width: 1rem;
+  height: 1rem;
+  flex-shrink: 0;
+}
+
+.hero-action.primary {
+  background: var(--nu-accent-high);
+  color: #ffffff;
+  border: 1px solid var(--nu-accent-high);
+  box-shadow: 0 4px 20px rgba(243, 128, 32, 0.25);
+}
+
+.hero-action.primary:hover {
   background: var(--nu-accent-hover);
+  border-color: var(--nu-accent-hover);
   transform: translateY(-2px);
   box-shadow: 0 6px 24px rgba(243, 128, 32, 0.35);
 }
 
-.hero .actions a[href*="nulang.cloud"] {
+.hero-action.secondary {
   background: transparent;
   color: var(--nu-text);
   border: 1px solid var(--nu-border);
-  border-radius: 0.75rem;
-  padding: 0.875rem 1.75rem;
-  font-weight: 500;
-  transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
 }
 
-.hero .actions a[href*="nulang.cloud"]:hover {
+.hero-action.secondary:hover {
   background: var(--nu-surface);
   border-color: var(--nu-accent);
   color: var(--nu-accent);
   transform: translateY(-2px);
 }
 
-.hero img {
-  width: 8rem;
-  height: 8rem;
-  margin: 0 auto 1.5rem;
-  display: block;
-  animation: logo-float 5s ease-in-out infinite;
-  filter: drop-shadow(0 0 24px rgba(75, 123, 255, 0.25));
-}
 
-@keyframes logo-float {
-  0%, 100% { transform: translateY(0) rotate(0deg); }
-  50% { transform: translateY(-8px) rotate(2deg); }
-}
+
+
 
 .hero .tagline {
   color: var(--nu-text-secondary);
@@ -290,46 +299,13 @@ html {
   50% { box-shadow: 0 0 20px 4px rgba(75, 123, 255, 0.1); }
 }
 
-/* ── Hero code example ── */
-.hero-example {
-  max-width: 44rem;
-  margin: 2.5rem auto 3.5rem;
-}
 
-.hero-example pre {
-  border-radius: 0.875rem;
-  box-shadow:
-    0 4px 24px rgba(0, 0, 0, 0.22),
-    inset 0 1px 0 rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--nu-border);
-  transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.4s ease;
-}
-
-.hero-example:hover pre {
-  transform: translateY(-3px);
-  box-shadow:
-    0 12px 36px rgba(0, 0, 0, 0.28),
-    inset 0 1px 0 rgba(255, 255, 255, 0.04),
-    0 0 0 1px rgba(75, 123, 255, 0.1);
-}
-
-@media (min-width: 50rem) {
-  .hero img {
-    width: 9rem;
-    height: 9rem;
-    margin: 0;
-  }
-
-  .hero-example {
-    margin-top: 3rem;
-    margin-bottom: 4rem;
-  }
-}
 
 /* ── Feature Cards (nulang.cloud style) ── */
 .feature-grid {
   display: grid;
   grid-template-columns: 1fr;
+  align-items: stretch;
   gap: 1.25rem;
   margin: 3rem 0;
 }
@@ -348,11 +324,15 @@ html {
 
 .feature-card {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 100%;
   padding: 1.75rem;
   border-radius: 1rem;
   border: 1px solid var(--nu-border);
-  background: linear-gradient(180deg, var(--nu-surface) 0%, var(--nu-surface-elevated) 100%);
-  transition: border-color 0.35s ease, transform 0.35s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.35s ease;
+  background: linear-gradient(180deg, var(--nu-surface) 0%, rgba(243, 128, 32, 0.025) 100%);
+  transition: border-color 0.35s ease, transform 0.35s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.35s ease, background 0.35s ease;
   overflow: hidden;
 }
 
@@ -363,9 +343,9 @@ html {
   left: 0;
   right: 0;
   height: 2px;
-  background: linear-gradient(90deg, var(--nu-blue), var(--nu-accent), var(--nu-accent-high), transparent);
+  background: linear-gradient(90deg, var(--nu-accent), var(--nu-accent-high), transparent);
   background-size: 200% 100%;
-  opacity: 0.7;
+  opacity: 0;
   transition: opacity 0.35s ease;
 }
 
@@ -375,11 +355,11 @@ html {
 }
 
 .feature-card:hover {
-  border-color: rgba(75, 123, 255, 0.4);
+  border-color: rgba(243, 128, 32, 0.4);
   transform: translateY(-6px);
   box-shadow:
     0 18px 40px rgba(0, 0, 0, 0.22),
-    0 0 0 1px rgba(75, 123, 255, 0.08);
+    0 0 0 1px rgba(243, 128, 32, 0.08);
 }
 
 .feature-card h3 {
@@ -387,26 +367,42 @@ html {
   font-weight: 600;
   margin-bottom: 0.75rem;
   color: var(--nu-text);
-  display: flex;
+}
+
+.feature-card p {
+  flex: 1;
+  font-size: 0.9375rem;
+  line-height: 1.65;
+  color: var(--nu-text-secondary);
+}
+
+.feature-icon-chip {
+  display: inline-flex;
   align-items: center;
-  gap: 0.625rem;
+  justify-content: center;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 0.75rem;
+  background: rgba(243, 128, 32, 0.10);
+  margin-bottom: 1.25rem;
+  transition: background 0.35s ease, transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.feature-card:hover .feature-icon-chip {
+  background: rgba(243, 128, 32, 0.16);
+  transform: translateY(-2px);
 }
 
 .feature-icon {
-  flex-shrink: 0;
-  color: var(--nu-blue);
+  width: 1.375rem;
+  height: 1.375rem;
+  color: var(--nu-accent);
   transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1), color 0.35s ease;
 }
 
 .feature-card:hover .feature-icon {
-  transform: scale(1.15) rotate(-4deg);
-  color: var(--nu-accent);
-}
-
-.feature-card p {
-  font-size: 0.9375rem;
-  line-height: 1.65;
-  color: var(--nu-text-secondary);
+  transform: scale(1.1) rotate(-4deg);
+  color: var(--nu-accent-high);
 }
 
 /* ── Doc prose improvements ── */
@@ -471,7 +467,7 @@ html {
 .site-footer {
   padding: 3rem 1.5rem 1.5rem;
   margin-top: 4rem;
-  background: var(--nu-surface);
+  background: linear-gradient(180deg, var(--nu-surface) 0%, rgba(243, 128, 32, 0.07) 100%);
   border-top: 1px solid var(--nu-border-subtle);
 }
 
@@ -617,7 +613,7 @@ html {
 
 .benefit-demo svg {
   width: 100%;
-  max-width: 400px;
+  max-width: 480px;
   height: auto;
 }
 
@@ -776,14 +772,10 @@ html[data-theme="light"] starlight-theme-select label::before {
 }
 
 /* ── Hero social proof ── */
-.hero-social-proof {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.75rem;
-  flex-wrap: wrap;
-  margin: -1rem auto 1.5rem;
-  max-width: 44rem;
+.hero-copy .hero-social-proof {
+  justify-content: flex-start;
+  margin: 2rem 0 0;
+  max-width: none;
 }
 
 .hero-social-copy {
@@ -802,69 +794,123 @@ html[data-theme="light"] starlight-theme-select label::before {
   opacity: 0.9;
 }
 
-.github-stars-badge img {
-  display: block;
-  height: 20px;
-  width: auto;
-}
-
-/* ── Feature accordion ── */
-.feature-accordion {
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-  margin: 2rem 0 3rem;
-}
-
-.feature-panel {
-  border: 1px solid var(--nu-border);
+/* ── Hero terminal card (matches nulang.cloud) ── */
+.hero-terminal {
   border-radius: 0.875rem;
-  background: var(--nu-surface);
   overflow: hidden;
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  border: 1px solid var(--nu-border);
+  background: #0d1117;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.24);
 }
 
-.feature-panel[open] {
-  border-color: rgba(75, 123, 255, 0.35);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
-}
-
-.feature-panel-summary {
+.hero-terminal-bar {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
-  padding: 1rem 1.25rem;
-  cursor: pointer;
-  list-style: none;
-  font-weight: 600;
-  color: var(--nu-text);
-  user-select: none;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  background: #161b22;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-.feature-panel-summary::-webkit-details-marker {
-  display: none;
+.hero-terminal-bar .t-dot {
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 9999px;
 }
 
-.feature-panel-summary .feature-chevron {
-  margin-left: auto;
-  color: var(--nu-text-tertiary);
-  transition: transform 0.2s ease;
+.hero-terminal-bar .t-red { background: #ff5f56; }
+.hero-terminal-bar .t-yellow { background: #ffbd2e; }
+.hero-terminal-bar .t-green { background: #27c93f; }
+
+.hero-terminal-bar .t-title {
+  margin-left: 0.5rem;
+  font-family: var(--__sl-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.75rem;
+  color: #8b949e;
 }
 
-.feature-panel[open] .feature-panel-summary .feature-chevron {
-  transform: rotate(180deg);
-}
-
-.feature-panel-body {
-  padding: 0 1.25rem 1.25rem 3rem;
-}
-
-.feature-panel-body p {
+.hero-terminal-code {
   margin: 0;
-  font-size: 0.9375rem;
-  line-height: 1.65;
-  color: var(--nu-text-secondary);
+  padding: 1.25rem 1.5rem;
+  overflow-x: auto;
+  font-family: var(--__sl-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.8rem;
+  line-height: 1.7;
+  color: #c9d1d9;
 }
+
+.hero-terminal-code .tok-kw   { color: #ff7b72; }
+.hero-terminal-code .tok-type { color: #79c0ff; }
+.hero-terminal-code .tok-fn   { color: #d2a8ff; }
+.hero-terminal-code .tok-id   { color: #79c0ff; }
+.hero-terminal-code .tok-num  { color: #ffa657; }
+.hero-terminal-code .tok-comment { color: #8b949e; }
+
+/* ── Metrics band ── */
+.hero-metrics {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1.5rem;
+  margin: 0 0 1rem;
+  padding: 2rem 1.5rem;
+  border-top: 1px solid var(--nu-border-subtle);
+  border-bottom: 1px solid var(--nu-border-subtle);
+  background: var(--nu-surface);
+}
+
+.hero-metrics .metric {
+  text-align: center;
+}
+
+.hero-metrics .metric-value {
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--nu-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.hero-metrics .metric-link {
+  color: inherit;
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+
+.hero-metrics .metric-link:hover {
+  color: var(--nu-accent);
+}
+
+.hero-metrics .metric-label {
+  margin-top: 0.25rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--nu-text);
+}
+
+.hero-metrics .metric-detail {
+  margin-top: 0.125rem;
+  font-size: 0.75rem;
+  color: var(--nu-text-tertiary);
+}
+
+@media (min-width: 40rem) {
+  .hero-metrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+@media (min-width: 64rem) {
+  .hero-metrics {
+    grid-template-columns: repeat(5, 1fr);
+  }
+}
+
+@media (min-width: 40rem) {
+  .hero-metrics .metric + .metric {
+    border-left: 1px solid var(--nu-border-subtle);
+  }
+}
+
+
 
 /* ── Learn & contribute grid ── */
 .learn-grid {
@@ -891,7 +937,7 @@ html[data-theme="light"] starlight-theme-select label::before {
 }
 
 .learn-card:hover {
-  border-color: rgba(75, 123, 255, 0.4);
+  border-color: rgba(243, 128, 32, 0.4);
   transform: translateY(-2px);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
 }
@@ -1084,7 +1130,109 @@ html[data-theme="light"] starlight-theme-select label::before {
   transform: translateY(-1px);
 }
 
-.contact-submit:disabled {
-  opacity: 0.7;
-  cursor: not-allowed;
+/* ── Bottom CTA panel (matches nulang.cloud "Ready to ship?") ── */
+.cta-panel,
+.bottom-cta {
+  margin: 3rem 0 1rem;
+  padding: 4rem 2rem;
+  text-align: center;
+  border-radius: 1.5rem;
+  background: var(--nu-accent-high);
+  position: relative;
+  overflow: hidden;
+}
+
+.cta-panel::after {
+  content: '';
+  position: absolute;
+  top: -6rem;
+  right: -6rem;
+  width: 18rem;
+  height: 18rem;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.12);
+  filter: blur(3rem);
+  pointer-events: none;
+}
+
+.cta-panel::before {
+  content: '';
+  position: absolute;
+  bottom: -5rem;
+  left: -5rem;
+  width: 14rem;
+  height: 14rem;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.10);
+  filter: blur(3rem);
+  pointer-events: none;
+}
+
+
+/* Starlight's markdown heading/paragraph/link rules carry higher specificity;
+   match them so the CTA panel text stays white on the orange fill. */
+.sl-markdown-content .cta-panel-title,
+.sl-markdown-content h2.cta-panel-title {
+  color: #ffffff;
+}
+
+.sl-markdown-content .cta-panel-copy {
+  color: rgba(255, 255, 255, 0.97);
+}
+
+.cta-panel-actions {
+  position: relative;
+  z-index: 1;
+  margin-top: 2rem;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.875rem;
+}
+
+.cta-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-radius: 0.75rem;
+  padding: 0.875rem 1.75rem;
+  font-weight: 600;
+  font-size: 0.9375rem;
+  text-decoration: none;
+  transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.cta-btn-primary {
+  background: #ffffff;
+  color: var(--nu-accent-high);
+}
+
+.cta-btn-primary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+.cta-btn-ghost {
+  background: rgba(255, 255, 255, 0.10);
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+}
+
+.cta-btn-ghost:hover {
+  background: rgba(255, 255, 255, 0.18);
+  transform: translateY(-2px);
+}
+.sl-markdown-content a.cta-btn-ghost {
+  color: #ffffff;
+}
+.sl-markdown-content a.cta-btn-ghost:hover {
+  color: #ffffff;
+}
+
+.sl-markdown-content a.cta-btn {
+  text-decoration: none;
+}
+.sl-markdown-content a.cta-btn:hover {
+  color: #ffffff;
+  text-decoration: none;
 }

@@ -30,6 +30,9 @@ export default defineConfig({
         Header: './src/components/Header.astro',
         Head: './src/components/Head.astro',
         SiteTitle: './src/components/SiteTitle.astro',
+        Hero: './src/components/Hero.astro',
+        ThemeProvider: './src/components/ThemeProvider.astro',
+        ThemeSelect: './src/components/ThemeSelect.astro',
       },
       editLink: {
         baseUrl: 'https://github.com/nulang-org/nulang/edit/main/docs/',
