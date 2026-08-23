@@ -641,6 +641,7 @@ fn main() {
             "E010" | "E0206" => ErrorCode::E010MatchNoArms,
             "E011" | "E0503" => ErrorCode::E011StepLimitExceeded,
             "E012" | "E0302" => ErrorCode::E012UnhandledEffect,
+            "E013" | "E0208" => ErrorCode::E013FfiBoundaryViolation,
             _ => {
                 eprintln!("Unknown: {}", c);
                 std::process::exit(1);
