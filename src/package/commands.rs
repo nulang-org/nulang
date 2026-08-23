@@ -2978,6 +2978,7 @@ app "counter" {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "ureq")]
     #[test]
     fn test_cmd_deploy_dry_run_emits_ir_and_dist() {
         let dir = std::env::temp_dir().join(format!("nulang_deploy_dryrun_{}", std::process::id()));
