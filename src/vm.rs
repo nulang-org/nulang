@@ -138,6 +138,21 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// `type_tag` tells the heap what kind of object is being allocated.
     /// Returns a pointer to the payload region, or `None` if allocation fails.
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8>;
+    /// Allocate `size` bytes on the current actor's iso arena.
+    ///
+    /// Default: no arena support (falls back to `None`); actor callbacks
+    /// that back `IsoArena` override this.
+    fn alloc_arena(&mut self, _size: usize, _type_tag: HeapTypeTag) -> Option<*mut u8> {
+        None
+    }
+
+    /// Reset the current actor's iso arena, reclaiming all arena objects.
+    fn reset_arena(&mut self) {}
+
+    /// True when `ptr` points into the current actor's iso arena.
+    fn is_arena_ptr(&self, _ptr: *const u8) -> bool {
+        false
+    }
 
     /// Drop a local reference to a heap object.
     ///
