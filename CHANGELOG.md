@@ -82,6 +82,13 @@ two major versions.*
 
 ### Added since 1.0.0-frozen — 2026-08-22
 
+- **RFC 0015 phase 1 — structured deprecation warnings**
+  (`src/diagnostic.rs`, `src/types.rs`, `src/main.rs`). `catch`/`fail` emit
+  W01xx warnings (ariadne-rendered, plain-text fallback) instead of being
+  silently accepted; warnings never fail compilation unless `--deny-warnings`
+  is passed. `docs/MIGRATION_RFC_0015.md` and `docs/ERROR_CODES.md` document
+  the codes and migration path.
+
 - **`--json` structured diagnostics** (experimental; `src/json_diagnostics.rs`,
   schema v1). `nulang --check --json`, `nula build --json`, and
   `nula test --json` emit machine-readable diagnostics (errors, warnings,
