@@ -471,7 +471,10 @@ mod tests {
             let start = offset_of(source, "catch") as u32;
             let w = NuWarning::deprecated_catch(Span::new(start, start + 5));
             let rendered = render_warning(&w, false).expect("should render with source");
-            assert!(rendered.starts_with("[W0101] Warning:"), "header: {rendered:?}");
+            assert!(
+                rendered.starts_with("[W0101] Warning:"),
+                "header: {rendered:?}"
+            );
             assert!(rendered.contains("deprecated `catch`"));
             assert!(rendered.contains("RFC 0015"), "help line: {rendered:?}");
         });

@@ -4882,8 +4882,7 @@ impl Parser {
     fn parse_catch_prefix(&mut self) -> NuResult<Expr> {
         let span = self.current_span();
         self.advance(); // consume 'catch'
-        self.warnings
-            .push(NuWarning::deprecated_catch(span));
+        self.warnings.push(NuWarning::deprecated_catch(span));
         let expr = self.parse_expr()?;
         if self.consume_if(&TokenKind::LBrace) {
             // Block form: catch expr { | pat => body, ... }

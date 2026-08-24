@@ -762,7 +762,14 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(e) = check_source(&source, Some(&path), opts.verbose, opts.all_errors, &opts.with_capabilities, opts.deny_warnings) {
+        if let Err(e) = check_source(
+            &source,
+            Some(&path),
+            opts.verbose,
+            opts.all_errors,
+            &opts.with_capabilities,
+            opts.deny_warnings,
+        ) {
             let code = exit_code(&e);
             if opts.json {
                 // Machine-readable mode: the JSON report is the ONLY output on
@@ -831,7 +838,13 @@ fn main() {
 
         // `--emit-signals`: analyze the module and write the signal graph JSON.
         if let Some(out) = opts.emit_signals.as_ref() {
-            match run_frontend(&source, Some(path), opts.verbose, &opts.with_capabilities, opts.deny_warnings) {
+            match run_frontend(
+                &source,
+                Some(path),
+                opts.verbose,
+                &opts.with_capabilities,
+                opts.deny_warnings,
+            ) {
                 Ok((ast, _)) => {
                     let mut checker = nulang::effect_checker::EffectChecker::new();
                     checker.set_resource_grants(&opts.with_capabilities);
@@ -2135,8 +2148,7 @@ fn check_source(
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (_ast, _tc) =
-        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
 
     if verbose {
         println!("Effect check passed.");
@@ -2227,7 +2239,8 @@ fn compile_source_to_nbc(
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (mut ast, type_checker) = run_frontend(source, None, false, with_capabilities, deny_warnings)?;
+    let (mut ast, type_checker) =
+        run_frontend(source, None, false, with_capabilities, deny_warnings)?;
 
     // Optional web-framework pass: rewrite HTML for signals/actions and emit the
     // generic client-side micro-runtime. This runs after effect checking so
@@ -2472,9 +2485,8 @@ mod tests {
                 c
             }
         "#;
-        let (ast, type_checker) =
-            run_frontend(source, None, false, &[], false)
-                .expect("frontend should accept the actor program");
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+            .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
         let (_value, runtime) =
