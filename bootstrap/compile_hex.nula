@@ -474,8 +474,10 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                             // bodies can refer to themselves without the placeholder being
                             // clobbered by temporaries during body compilation.
                             let vh16 = low16(vh);
+                            // Keep `ne` even though save_reg keys off elen — dropping
+                            // this binding miscompiles the host compiler's call path.
                             let ne = nr + elen;
-                            let save_reg = if ne < 56 then 200 + ne else 143 + (ne - 56);
+                            let save_reg = if elen < 56 then 200 + elen else 143 + (elen - 56);
                             let env_rec = env_push(env, vh16, save_reg);
                             let bound = comp(src, q4 + 1, len, no_left, -1, nr, env_rec, elen + 1);
                             let vr = bound >> 18;

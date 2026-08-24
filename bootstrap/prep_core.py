@@ -43,15 +43,6 @@ def balanced_split_args(args_str: str) -> list[str]:
     return args
 
 
-def curry_call(name: str, args_str: str) -> str | None:
-    args = balanced_split_args(args_str)
-    if len(args) <= 1:
-        return None
-    result = name + '(' + args[0] + ')'
-    for a in args[1:]:
-        result += '(' + a + ')'
-    return result
-
 
 def transform_perform(source: str) -> str:
     """Transform `perform Effect.name(args)` into `_perform("Effect.name")(args)`."""
@@ -137,8 +128,14 @@ def curry_call_sites(source: str) -> str:
             return full
         if len(args) <= 1:
             return full
-        c = curry_call(name, args_str)
-        return c if c else full
+        # Build the curried chain from the recursively-curried args so nested
+        # multi-arg calls (e.g. skip_ws(src, q5 + 1, len) as an argument) are
+        # curried too — curry_call(name, args_str) would wrap the raw args and
+        # leave their commas behind, which the self-compiler cannot parse.
+        c = name + '(' + curried_args[0] + ')'
+        for a in curried_args[1:]:
+            c += '(' + a + ')'
+        return c
 
     return re.sub(
         r'(\w+)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)',
