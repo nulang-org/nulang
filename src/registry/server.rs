@@ -23,7 +23,7 @@ use std::thread;
 use parking_lot::Mutex;
 #[cfg(feature = "tcp")]
 use std::time::Duration;
-
+#[cfg(feature = "tcp")]
 use crate::package::resolver::parse_semver;
 
 /// Package registry server.
@@ -338,10 +338,7 @@ fn authorized(headers: &[(String, String)], auth_token: &Option<String>) -> bool
     }
 }
 
-/// Sort versions semver-aware so `0.10.0` sorts after `0.9.0`. Keys that
-/// are not valid semver (e.g. tags published before validation, or
-/// prereleases, which the resolver cannot consume) sort after all valid
-/// versions in lexicographic order, keeping the listing deterministic.
+#[cfg(feature = "tcp")]
 fn sort_versions(versions: &mut [String]) {
     versions.sort_by(|a, b| match (parse_semver(a), parse_semver(b)) {
         (Ok(x), Ok(y)) => x.cmp(&y),
@@ -353,9 +350,11 @@ fn sort_versions(versions: &mut [String]) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "tcp")]
     use super::*;
 
     #[test]
+    #[cfg(feature = "tcp")]
     fn test_sort_versions_semver_aware() {
         let mut versions = vec![
             "0.10.0".to_string(),
@@ -368,6 +367,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tcp")]
     fn test_sort_versions_invalid_last() {
         let mut versions = vec!["latest".to_string(), "1.0.0".to_string(), "v2".to_string()];
         sort_versions(&mut versions);

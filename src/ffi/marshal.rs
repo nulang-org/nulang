@@ -419,7 +419,6 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
 
 #[cfg(test)]
 mod tests {
-    use super::super::native::NativeLibrary;
     use super::*;
     use std::ffi::CString;
 
@@ -599,6 +598,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "linux", feature = "ffi"))]
     fn test_load_libm_sqrt() {
+        use super::super::native::NativeLibrary;
         // SAFETY: libm.so.6 is a trusted system library.
         let lib = unsafe { NativeLibrary::open("libm.so.6") };
         if let Err(e) = &lib {
