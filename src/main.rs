@@ -684,8 +684,8 @@ fn main() {
                         &opts.target,
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
-                    ) {
                         opts.deny_warnings,
+                    ) {
                         print_error(&e, uc);
                     }
                 }
@@ -708,8 +708,8 @@ fn main() {
                 &out,
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
-            ) {
                 opts.deny_warnings,
+            ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
@@ -831,7 +831,7 @@ fn main() {
 
         // `--emit-signals`: analyze the module and write the signal graph JSON.
         if let Some(out) = opts.emit_signals.as_ref() {
-            match run_frontend(&source, Some(path), opts.verbose, &opts.with_capabilities) {
+            match run_frontend(&source, Some(path), opts.verbose, &opts.with_capabilities, opts.deny_warnings) {
                 Ok((ast, _)) => {
                     let mut checker = nulang::effect_checker::EffectChecker::new();
                     checker.set_resource_grants(&opts.with_capabilities);
@@ -865,8 +865,8 @@ fn main() {
                 &out,
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
-            ) {
                 opts.deny_warnings,
+            ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
