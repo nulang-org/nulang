@@ -60,6 +60,42 @@ const shouldRenderSearch =
 	</div>
 </div>
 
+  <script is:inline>
+    // Highlight "Nu" in blue and rest in accent-high to match nulang.cloud branding
+    (function highlightHeaderNu() {
+      const title = document.querySelector('.site-title');
+      if (!title || title.querySelector('.nu-blue')) return;
+
+      // Find the first text node that starts with "Nu" (may be inside a span with logo present)
+      let targetNode = null;
+      const walker = document.createTreeWalker(title, NodeFilter.SHOW_TEXT, null);
+      while (walker.nextNode()) {
+        const text = walker.currentNode.textContent || '';
+        if (/^nu/i.test(text.trim())) {
+          targetNode = walker.currentNode;
+          break;
+        }
+      }
+
+      if (!targetNode) return;
+      const text = targetNode.textContent || '';
+      const leading = text.match(/^nu/i)?.[0] || text.slice(0, 2);
+      const remainder = text.slice(leading.length);
+
+      const nuSpan = document.createElement('span');
+      nuSpan.className = 'nu-blue';
+      nuSpan.textContent = leading;
+
+      if (remainder) {
+        const restSpan = document.createElement('span');
+        restSpan.className = 'nu-accent-high';
+        restSpan.textContent = remainder;
+        targetNode.replaceWith(nuSpan, restSpan);
+      } else {
+        targetNode.replaceWith(nuSpan);
+      }
+    })();
+  </script>
 
 <style>
 	@layer starlight.core {
@@ -162,5 +198,8 @@ const shouldRenderSearch =
 				align-items: center;
 			}
 		}
+.nu-accent-high {
+  color: var(--nu-accent-high);
+}
 	}
 </style>
