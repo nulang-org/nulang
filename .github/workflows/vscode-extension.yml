@@ -86,7 +86,7 @@ jobs:
         run: npm ci
 
       - name: Cache VS Code download
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: editors/vscode/.vscode-test
           key: vscode-test-1.96.0
