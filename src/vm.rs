@@ -4612,7 +4612,10 @@ impl VM {
                     regs = format!("{}{}:{}", regs, i, v.to_string_repr());
                 }
             }
-            println!("TRACE PC{:04} {:#010x} M{} F{} | {}", pc, w, module_idx, frame_idx, regs);
+            println!(
+                "TRACE PC{:04} {:#010x} M{} F{} | {}",
+                pc, w, module_idx, frame_idx, regs
+            );
         }
 
         match instr.opcode {
