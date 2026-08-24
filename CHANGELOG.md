@@ -186,6 +186,41 @@ two major versions.*
     `TAG_OBJECT` value representation and wire-protocol support for `ObjectRef`
     handles (`src/value_layout.rs`, `src/runtime/network.rs`).
 
+### Added since 1.0.0-frozen — 2026-08-17 (perf/optimizations branch)
+
+- **`StrBuilder` builtin effect** — mutable growable string buffer
+  (`StrBuilder.new/push/to_string/len/reset`). Appends are amortized O(1) with
+  capacity doubling, converting O(n²) text assembly (the `+` concat path) to
+  O(n). Wrapped in `stdlib::string` (`builder`/`builder_push`/…). Measured
+  ~6× faster than `+` at 30 KB, widening super-linearly. (Experimental)
+- **`Map` builtin effect** — mutable open-addressed hash map
+  (`Map.new/insert/get/remove/contains/size`). String keys compare by content;
+  capacity doubles at 0.5 load; keys/values participate in ORCA reclamation.
+  Replaces the O(n) linear-scan `std.map` for keyed workloads. (Experimental)
+- **Per-send allocation removal** — `behavior_id_for` and distributed content-
+  hash lookup no longer build a `format!(".{name}")` string per send.
+- **Actor heap density** — default per-actor bump block 64 KiB → 16 KiB
+  (~4× actor density, ≈64k actors/GB). Growth chaining unchanged.
+- **Int `**` overflow consistency** — interpreter, JIT, and AOT now all wrap
+  on 48-bit int-pow overflow (previously the interpreter wrapped while the
+  JIT/AOT compiled helper `nulang_pow` returned `nil` + recorded an arithmetic
+  error). The compiled helper now mirrors the interpreter's `step_ipow`.
+  Also fixed the AOT unboxed-compilation hazard: `Pow` was missing from
+  `is_all_int`'s nil-producing exclusion, so an all-`Int` function compiled
+  unboxed, fell through the unboxed binop match to the tagged helper with raw
+  operands, and returned `0` for any non-overflow pow (`3 ** 3` → 0). Pow is
+  now excluded from unboxed mode; `3 ** 3` → 27 and `3 ** -1` → nil on all
+  backends.
+- **JIT-compiled direct calls** — hot regions now fold direct calls to
+  provably-non-suspending, non-recursive callees and run them via a
+  re-entrant helper on the interpreter frame stack, keeping the caller's
+  compiled region resident (no per-call region re-entry). Acyclic call-heavy
+  loops measured ~46% faster (debug). Recursive and effect-performing callees
+  stay on the interpreter by static analysis (`may_suspend` +
+  recursion-cycle gates). Foundation: `find_compilable_region_with_calls`,
+  `compute_may_suspend`, `compute_recursive` in `src/jit/`.
+
+
 ### Added since 1.0.0-frozen — 2026-08-15
 - **E0208 FFI boundary diagnostic** (`src/types.rs`, `src/diagnostic.rs`):
   capability-qualified types at the FFI boundary now report the new

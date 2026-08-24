@@ -1169,6 +1169,7 @@ fn emit_stdlib_docs(dir: &str) -> Result<(), String> {
 
 /// Run a distributed Nulang node: parse arguments, create a Runtime,
 /// enable distribution, join a seed cluster if requested, and run forever.
+#[cfg(feature = "tcp")]
 fn run_node_cmd(args: &[String]) -> NuResult<()> {
     let mut listen_addr = "127.0.0.1:9000".to_string();
     let mut seed_addr: Option<String> = None;
@@ -1326,6 +1327,19 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
     );
     runtime.run_distributed_node();
     Ok(())
+}
+
+/// Run a distributed Nulang node.
+///
+/// Stub used when the `tcp` feature is disabled: real TCP distribution is
+/// unavailable, so the node cannot start.
+#[cfg(not(feature = "tcp"))]
+fn run_node_cmd(_args: &[String]) -> NuResult<()> {
+    Err(NuError::RuntimeError {
+        msg: "the 'node' command requires the 'tcp' feature (build with --features tcp)"
+            .to_string(),
+        span: Span::default(),
+    })
 }
 
 fn print_error(err: &NuError, use_color: bool) {

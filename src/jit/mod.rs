@@ -105,6 +105,17 @@ pub struct JitSession {
     /// Regions compiled through the type-directed (guard-stripped) path in
     /// `typed_compiler`, i.e. where inferred register types were available.
     typed_regions: FxHashSet<(usize, usize)>,
+    /// Per-module "may suspend" vectors (indexed by function-table index),
+    /// computed lazily from each module's bytecode: true if the function
+    /// transitively performs an effect that can suspend (or calls one).
+    /// JIT-compiled native calls are only emitted for functions with
+    /// `false` here — running a suspending callee from native code would
+    /// double-execute its pre-suspend side effects on fallback.
+    may_suspend: FxHashMap<usize, Vec<bool>>,
+    /// Per module, per function: is the function part of a direct-call
+    /// recursion cycle (so it must NOT go through the re-entrant direct-call
+    /// helper, which consumes native stack per recursion level).
+    recursive: FxHashMap<usize, Vec<bool>>,
     /// Reusable function builder context.
     builder_context: FunctionBuilderContext,
     /// Reusable codegen context.
@@ -153,6 +164,8 @@ impl JitSession {
             hot_counts: Vec::new(),
             last_compiled_probe: None,
             typed_regions: FxHashSet::default(),
+            may_suspend: FxHashMap::default(),
+            recursive: FxHashMap::default(),
             builder_context: FunctionBuilderContext::new(),
             tier2_counters: FxHashMap::default(),
             ctx,
@@ -183,6 +196,39 @@ impl JitSession {
     /// existing session).
     pub fn reset_hot_counters(&mut self) {
         self.hot_counts.clear();
+    }
+
+    /// Lazily computed per-module "may suspend" vector (indexed by
+    /// function-table index), computed from the module's bytecode. A function
+    /// with `false` here is safe to call from JIT-compiled code (no suspending
+    /// effect in its transitive call graph). Returns an empty slice when the
+    /// module index is out of range (callers treat empty as "unsafe").
+    ///
+    /// Foundation for JIT-compiling direct calls (the next slice): currently
+    /// exercised by `compute_may_suspend` and its test.
+    #[allow(dead_code)]
+    fn may_suspend_for(
+        &mut self,
+        module_idx: usize,
+        module: &crate::bytecode::CodeModule,
+    ) -> &[bool] {
+        if !self.may_suspend.contains_key(&module_idx) {
+            let v = compute_may_suspend(module);
+            self.may_suspend.insert(module_idx, v);
+        }
+        &self.may_suspend[&module_idx]
+    }
+
+    fn recursive_for(
+        &mut self,
+        module_idx: usize,
+        module: &crate::bytecode::CodeModule,
+    ) -> &[bool] {
+        if !self.recursive.contains_key(&module_idx) {
+            let v = compute_recursive(module);
+            self.recursive.insert(module_idx, v);
+        }
+        &self.recursive[&module_idx]
     }
 
     /// Record one execution of an already-compiled region and attempt
@@ -248,6 +294,7 @@ impl JitSession {
         start_offset: usize,
         num_instrs: usize,
         instructions: &[crate::bytecode::Instruction],
+        native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
         if let Some(&(ptr, _)) = self.compiled.get(&(module_idx, start_offset)) {
@@ -265,6 +312,7 @@ impl JitSession {
             start_offset,
             num_instrs,
             instructions,
+            native_calls,
         ) {
             Ok(ptr) => {
                 self.compiled
@@ -294,6 +342,7 @@ impl JitSession {
         num_instrs: usize,
         instructions: &[crate::bytecode::Instruction],
         type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
+        native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
         if let Some(&(ptr, _)) = self.compiled.get(&(module_idx, start_offset)) {
@@ -308,7 +357,10 @@ impl JitSession {
             })
             .unwrap_or(false);
 
-        if has_known_types {
+        if has_known_types && native_calls.is_empty() {
+            // The typed compiler does not understand `Call`; a region
+            // containing a native direct call (non-empty map) must go through
+            // the scalar compiler, which handles `nulang_jit_direct_call`.
             let func_name = format!("nulang_tjit_{}_{}", module_idx, start_offset);
             if let Ok(ptr) = typed_compiler::compile_bytecode_region_typed(
                 &mut self.module,
@@ -328,7 +380,13 @@ impl JitSession {
             // Typed compilation failed: fall through to the scalar compiler.
         }
 
-        self.compile_region(module_idx, start_offset, num_instrs, instructions)
+        self.compile_region(
+            module_idx,
+            start_offset,
+            num_instrs,
+            instructions,
+            native_calls,
+        )
     }
 
     /// Return the number of regions compiled through the type-directed path.
@@ -418,6 +476,7 @@ impl JitSession {
                 num_instrs,
                 instructions,
                 type_metadata,
+                &std::collections::HashMap::new(),
             );
         }
 
@@ -445,6 +504,7 @@ impl JitSession {
                 num_instrs,
                 instructions,
                 type_metadata,
+                &std::collections::HashMap::new(),
             ),
         }
     }
@@ -488,6 +548,245 @@ pub type JitFunctionPtr = extern "C" fn(*mut u64, *const u64);
 /// 256-register snapshot/restore per iteration). Forward-only branchy code
 /// (e.g. an `if`/recursion that leads to a `Call`) keeps the straight-line
 /// boundary, which is why recursion does not regress.
+/// A direct call's callee value is staged into `FUNC_VALUE_REG` (254) by
+/// `mir_codegen` before the `Call` (a `load_constant` then the arg staging).
+/// Recover the statically-known callee of a `Call` at `pc` by scanning
+/// backward to the nearest prior write to reg 254:
+/// - a `ConstU`/`Const0/1/2` into 254 → direct call to that function index;
+/// - a `Move` (or anything else) into 254 → an indirect call (closure /
+///   runtime value) — the target is not statically known.
+/// `func_start` bounds the scan to the calling function's code. This is a
+/// hint only: compiled direct calls re-check the live value in reg 254 at
+/// run time and fall back to the interpreter on mismatch, so a stale
+/// recovery here never calls the wrong function.
+///
+/// Foundation for JIT-compiling direct calls (the next slice): currently
+/// exercised by the `may_suspend` analysis and its test.
+#[allow(dead_code)]
+pub(crate) fn direct_call_target(
+    module: &crate::bytecode::CodeModule,
+    pc: usize,
+    func_start: usize,
+) -> Option<usize> {
+    use crate::bytecode::{Constant, OpCode};
+    const FUNC_VALUE_REG: u8 = 254;
+    let mut p = pc;
+    while p > func_start {
+        p -= 1;
+        let instr = module.instructions[p];
+        match instr.opcode {
+            OpCode::Const0 | OpCode::Const1 | OpCode::Const2 if instr.op1 == FUNC_VALUE_REG => {
+                let idx = match instr.opcode {
+                    OpCode::Const0 => 0,
+                    OpCode::Const1 => 1,
+                    _ => 2,
+                };
+                return Some(idx);
+            }
+            OpCode::ConstM1 if instr.op1 == FUNC_VALUE_REG => return None, // -1 is not a function
+            OpCode::ConstU if instr.op3 == FUNC_VALUE_REG => {
+                let pool = instr.imm16() as usize;
+                return match module.constants.get(pool) {
+                    Some(Constant::Int(i)) if *i >= 0 => Some(*i as usize),
+                    _ => None,
+                };
+            }
+            OpCode::Move if instr.op2 == FUNC_VALUE_REG => return None, // indirect
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Opcodes that can never suspend (a pure function's safe set). A function
+/// whose body contains only these, plus direct calls to other safe functions,
+/// is non-suspending and safe to call from JIT-compiled code. Everything
+/// else — effects (`Perform`/`PerformDirect`/`Handle`/`Resume`/`Unwind`),
+/// actor ops, async effects, `SignalWait`/`Receive*`, foreign calls,
+/// `SConcat`/record/closure ops — is conservatively treated as suspending.
+#[allow(dead_code)]
+fn is_non_suspending_op(op: crate::bytecode::OpCode) -> bool {
+    use crate::bytecode::OpCode;
+    matches!(
+        op,
+        OpCode::Nop
+            | OpCode::Halt
+            | OpCode::Const0
+            | OpCode::Const1
+            | OpCode::Const2
+            | OpCode::ConstM1
+            | OpCode::ConstU
+            | OpCode::Load
+            | OpCode::Store
+            | OpCode::Move
+            | OpCode::Swap
+            | OpCode::Dup
+            | OpCode::IAdd
+            | OpCode::ISub
+            | OpCode::IMul
+            | OpCode::IDiv
+            | OpCode::IMod
+            | OpCode::INeg
+            | OpCode::IInc
+            | OpCode::IDec
+            | OpCode::IPow
+            | OpCode::FPow
+            | OpCode::Xor
+            | OpCode::Shl
+            | OpCode::Shr
+            | OpCode::BitAnd
+            | OpCode::BitOr
+            | OpCode::FAdd
+            | OpCode::FSub
+            | OpCode::FMul
+            | OpCode::FDiv
+            | OpCode::FNeg
+            | OpCode::ICmpEq
+            | OpCode::ICmpLt
+            | OpCode::ICmpGt
+            | OpCode::ICmpLe
+            | OpCode::ICmpGe
+            | OpCode::FCmpEq
+            | OpCode::FCmpLt
+            | OpCode::FCmpGt
+            | OpCode::Not
+            | OpCode::And
+            | OpCode::Or
+            | OpCode::Jmp
+            | OpCode::JmpT
+            | OpCode::JmpF
+            | OpCode::IToF
+            | OpCode::FToI
+            | OpCode::DbgPrint
+            | OpCode::Ret
+            | OpCode::RetVal
+            | OpCode::ArrLoad
+            | OpCode::ArrStore
+            | OpCode::ArrLen
+            | OpCode::FieldL
+    )
+}
+
+/// Compute the transitive "may suspend" vector for a module (indexed by
+/// function-table index). A function may suspend if its body contains a
+/// suspending opcode (or any opcode outside the pure whitelist), or an
+/// indirect call (unknown target), or a direct call to a may-suspend
+/// function. Fixed point over the direct-call graph recovered by
+/// `direct_call_target`.
+#[allow(dead_code)]
+fn compute_may_suspend(module: &crate::bytecode::CodeModule) -> Vec<bool> {
+    use crate::bytecode::OpCode;
+    let n = module.function_table.len();
+    let mut result = vec![false; n];
+    // Directly unsafe: contains a non-whitelisted opcode (effect/actor/
+    // foreign/suspending) or an indirect call (Call/ClosureCall whose target
+    // is not a statically-recovered direct callee).
+    for i in 0..n {
+        let start = module.function_table[i];
+        let end = if i + 1 < n {
+            module.function_table[i + 1]
+        } else {
+            module.instructions.len()
+        };
+        for pc in start..end {
+            let op = module.instructions[pc].opcode;
+            if matches!(op, OpCode::Call | OpCode::ClosureCall) {
+                if direct_call_target(module, pc, start).is_none() {
+                    result[i] = true; // indirect call: unknown target
+                }
+                // direct call: leave for the fixed-point propagation
+            } else if !is_non_suspending_op(op) {
+                result[i] = true;
+                break;
+            }
+        }
+    }
+    // Propagate through the direct-call graph until stable.
+    loop {
+        let mut changed = false;
+        for i in 0..n {
+            if result[i] {
+                continue;
+            }
+            let start = module.function_table[i];
+            let end = if i + 1 < n {
+                module.function_table[i + 1]
+            } else {
+                module.instructions.len()
+            };
+            for pc in start..end {
+                if matches!(
+                    module.instructions[pc].opcode,
+                    OpCode::Call | OpCode::ClosureCall
+                ) {
+                    if let Some(callee) = direct_call_target(module, pc, start) {
+                        if callee < n && result[callee] {
+                            result[i] = true;
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    result
+}
+
+/// Per function: can it transitively reach itself via direct calls (i.e. is
+/// it part of a direct-call recursion cycle)? A recursive function must NOT
+/// be run through the re-entrant direct-call helper: each helper invocation
+/// consumes native stack (compiled region -> helper -> interpreter step ->
+/// nested region -> ...), so unbounded recursion would overflow the stack.
+/// The interpreter handles recursion on heap-allocated frames; a recursive
+/// callee stays there. Computed via transitive closure over the direct-call
+/// graph (n is small — one per function).
+fn compute_recursive(module: &crate::bytecode::CodeModule) -> Vec<bool> {
+    use crate::bytecode::OpCode;
+    let n = module.function_table.len();
+    let mut reach = vec![vec![false; n]; n];
+    for i in 0..n {
+        let start = module.function_table[i];
+        let end = if i + 1 < n {
+            module.function_table[i + 1]
+        } else {
+            module.instructions.len()
+        };
+        for pc in start..end {
+            if matches!(
+                module.instructions[pc].opcode,
+                OpCode::Call | OpCode::ClosureCall
+            ) {
+                if let Some(callee) = direct_call_target(module, pc, start) {
+                    if callee < n {
+                        reach[i][callee] = true;
+                    }
+                }
+            }
+        }
+    }
+    // Floyd-Warshall transitive closure.
+    for k in 0..n {
+        for i in 0..n {
+            if reach[i][k] {
+                for j in 0..n {
+                    if reach[k][j] {
+                        reach[i][j] = true;
+                    }
+                }
+            }
+        }
+    }
+    (0..n).map(|i| reach[i][i]).collect()
+}
+
+/// Region-length scanner WITHOUT direct-call folding; used by the unit tests.
+/// The runtime path uses [`find_compilable_region_with_calls`] so direct
+/// non-suspending calls fold into regions.
+#[allow(dead_code)]
 pub(crate) fn find_compilable_region(
     offset: usize,
     instructions: &[crate::bytecode::Instruction],
@@ -559,6 +858,118 @@ pub(crate) fn find_compilable_region(
         } else {
             straight
         }
+    }
+}
+
+/// The code offset of the function containing `pc` (largest
+/// `function_table[i] <= pc`), bounding `direct_call_target`'s backward walk.
+pub(crate) fn func_start_for(module: &crate::bytecode::CodeModule, pc: usize) -> usize {
+    module
+        .function_table
+        .iter()
+        .copied()
+        .filter(|&o| o <= pc)
+        .next_back()
+        .unwrap_or(0)
+}
+
+/// If the instruction at `pc` is a `Call` of a provably-non-suspending direct
+/// callee (recoverable via `direct_call_target` and gated on `may_suspend`
+/// and on not being in a direct-call recursion cycle), return the callee's
+/// function-table index. Such a call is safe to compile into the region as a
+/// `nulang_jit_direct_call` helper invocation. Returns None for indirect
+/// calls, suspending callees, recursive callees, and every other opcode.
+pub(crate) fn native_direct_call(
+    module: &crate::bytecode::CodeModule,
+    pc: usize,
+    may_suspend: Option<&[bool]>,
+    recursive: Option<&[bool]>,
+) -> Option<usize> {
+    use crate::bytecode::OpCode;
+    let instr = module.instructions.get(pc)?;
+    if instr.opcode != OpCode::Call {
+        return None;
+    }
+    let idx = direct_call_target(module, pc, func_start_for(module, pc))?;
+    // A suspending callee must not be run re-entrantly from a compiled
+    // region: it could suspend mid-run and be re-entered from its call start,
+    // double-executing pre-suspend side effects. Stay on the interpreter.
+    if may_suspend.is_some_and(|v| v.get(idx) == Some(&true)) {
+        return None;
+    }
+    // A recursive callee must not go through the re-entrant helper either:
+    // each helper call consumes native stack, so unbounded recursion would
+    // overflow it. The interpreter uses heap-allocated frames instead.
+    if recursive.is_some_and(|v| v.get(idx) == Some(&true)) {
+        return None;
+    }
+    Some(idx)
+}
+
+/// Like [`find_compilable_region`], but additionally continues past `Call`
+/// instructions whose direct callee is provably non-suspending, returning the
+/// region length and the map of (absolute pc -> direct callee func index) for
+/// the calls that were folded into the region. The caller passes this map to
+/// the scalar compiler so it can emit `nulang_jit_direct_call` at those pcs.
+pub(crate) fn find_compilable_region_with_calls(
+    offset: usize,
+    instructions: &[crate::bytecode::Instruction],
+    module: &crate::bytecode::CodeModule,
+    may_suspend: Option<&[bool]>,
+    recursive: Option<&[bool]>,
+) -> (usize, std::collections::HashMap<usize, usize>) {
+    let mut native_calls = std::collections::HashMap::new();
+    let mut len = 0;
+    let mut first_branch: Option<usize> = None;
+    let mut has_back_edge = false;
+    for i in offset..instructions.len().min(offset + 500) {
+        let op = instructions[i].opcode;
+        if op == crate::bytecode::OpCode::Call {
+            match native_direct_call(module, i, may_suspend, recursive) {
+                Some(idx) => {
+                    native_calls.insert(i, idx);
+                }
+                None => break, // indirect / suspending / recursive call — stop
+            }
+        } else if !compiler::is_opcode_compilable(op) {
+            break;
+        }
+        // Stop *before* return/halt so the VM still executes the return (frame
+        // pop) / halt itself after the JIT region.
+        if matches!(
+            op,
+            crate::bytecode::OpCode::Ret
+                | crate::bytecode::OpCode::RetVal
+                | crate::bytecode::OpCode::Halt
+        ) {
+            break;
+        }
+        let is_branch = matches!(
+            op,
+            crate::bytecode::OpCode::Jmp
+                | crate::bytecode::OpCode::JmpT
+                | crate::bytecode::OpCode::JmpF
+        );
+        if is_branch {
+            if first_branch.is_none() {
+                first_branch = Some(len);
+            }
+            let target = match op {
+                crate::bytecode::OpCode::Jmp => {
+                    (i as i64 + instructions[i].simm16() as i64) as usize
+                }
+                _ => (i as i64 + instructions[i].offset16() as i64) as usize,
+            };
+            if target >= offset && target < i {
+                has_back_edge = true;
+            }
+        }
+        len += 1;
+    }
+    if !has_back_edge && first_branch.unwrap_or(len) < STRAIGHT_LINE_MIN {
+        (0, std::collections::HashMap::new())
+    } else {
+        (len, native_calls)
     }
 }
 
@@ -659,12 +1070,22 @@ impl crate::backends::JitBackend for JitSession {
 
         // Record execution for hotness
         if self.record_and_check_hot(module_idx, pc) {
-            let region_len = find_compilable_region(pc, instructions);
+            let ms = self.may_suspend_for(module_idx, module).to_vec();
+            let rc = self.recursive_for(module_idx, module).to_vec();
+            let (region_len, native_calls) =
+                find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
             if region_len >= 3 {
                 let meta = typed_compiler::infer_reg_types(module, pc);
                 let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
                 if let Some(func) = unsafe {
-                    self.compile_region_typed(module_idx, pc, region_len, instructions, meta_ref)
+                    self.compile_region_typed(
+                        module_idx,
+                        pc,
+                        region_len,
+                        instructions,
+                        meta_ref,
+                        &native_calls,
+                    )
                 } {
                     func(regs.as_mut_ptr(), constants.as_ptr());
                     return crate::backends::TieredAction::RanJit;

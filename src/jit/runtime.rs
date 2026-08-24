@@ -615,6 +615,136 @@ pub fn take_jit_branch_exit_pc() -> Option<usize> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Re-entrant direct-call support (JIT-compiled `Call` of a non-suspending
+// callee). The compiled region stays resident in native code and invokes
+// `nulang_jit_direct_call`, which runs the callee on the VM's interpreter
+// frame stack to completion, then writes the result back into the region's
+// register buffer. The callee is statically gated `!may_suspend`, so it
+// never suspends mid-execution (which a re-run-from-the-call-start would
+// mishandle). This is the correctness-critical seam between native regions
+// and the interpreter.
+// ---------------------------------------------------------------------------
+
+// The single-threaded VM currently executing a compiled region (set by
+// `VM::step` around each `tiered_execute_step_typed` call; the VM is
+// thread-confined, so a thread-local pointer is sound).
+thread_local! {
+    static JIT_VM: Cell<*mut crate::vm::VM> = Cell::new(std::ptr::null_mut());
+}
+
+pub unsafe fn set_jit_vm(vm: *mut crate::vm::VM) {
+    JIT_VM.with(|cell| cell.set(vm));
+}
+
+pub fn clear_jit_vm() {
+    JIT_VM.with(|cell| cell.set(std::ptr::null_mut()));
+}
+
+fn get_jit_vm() -> *mut crate::vm::VM {
+    JIT_VM.with(|cell| cell.get())
+}
+
+// Runtime error raised while running a re-entrant callee (e.g. step-limit).
+// The compiled region cannot unwind, so the helper records it here and
+// returns a nonzero status; the region jumps to its exit and `VM::step`
+// checks this slot after the region returns.
+thread_local! {
+    static JIT_PENDING_VM_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub fn set_jit_pending_vm_error(msg: String) {
+    JIT_PENDING_VM_ERROR.with(|e| *e.borrow_mut() = Some(msg));
+}
+
+pub fn take_jit_pending_vm_error() -> Option<String> {
+    JIT_PENDING_VM_ERROR.with(|e| e.borrow_mut().take())
+}
+
+/// Snapshot of the JIT thread-local state a compiled region relies on, saved
+/// around a re-entrant interpreter run and restored afterwards. Without this,
+/// the nested execution would clobber the outer region's constant pool /
+/// callbacks / safepoint / branch markers.
+struct JitThreadState {
+    vm: *mut crate::vm::VM,
+    constants: ConstantsPtr,
+    callbacks: CbPair,
+    safepoint: *mut u64,
+    yield_pc: u64,
+    branch_exit_pc: u64,
+    pending_error: Option<String>,
+}
+
+fn save_jit_thread_state() -> JitThreadState {
+    let (vm, constants, callbacks) = (
+        JIT_VM.with(|c| c.get()),
+        JIT_CONSTANTS.with(|c| unsafe { *c.get() }),
+        JIT_CALLBACKS.with(|c| unsafe { *c.get() }),
+    );
+    let (safepoint, yield_pc, branch_exit_pc) = (
+        JIT_SAFEPOINT_PTR.with(|c| c.get()),
+        JIT_YIELD_PC.with(|c| c.get()),
+        JIT_BRANCH_EXIT_PC.with(|c| c.get()),
+    );
+    let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
+    JitThreadState {
+        vm,
+        constants,
+        callbacks,
+        safepoint,
+        yield_pc,
+        branch_exit_pc,
+        pending_error,
+    }
+}
+
+fn restore_jit_thread_state(s: JitThreadState) {
+    JIT_VM.with(|c| c.set(s.vm));
+    unsafe {
+        JIT_CONSTANTS.with(|c| *c.get() = s.constants);
+        JIT_CALLBACKS.with(|c| *c.get() = s.callbacks);
+    }
+    JIT_SAFEPOINT_PTR.with(|c| c.set(s.safepoint));
+    JIT_YIELD_PC.with(|c| c.set(s.yield_pc));
+    JIT_BRANCH_EXIT_PC.with(|c| c.set(s.branch_exit_pc));
+    AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.pending_error);
+}
+
+/// Run a provably-non-suspending callee (function-table index `func_idx`) to
+/// completion on the VM's interpreter frame stack, using the args already
+/// staged in the region's `regs[0..argc]`, then write the callee's return
+/// value into `regs[dst]`. Returns 0 on success, nonzero when the callee
+/// raised (e.g. step-limit exceeded). The frame/step machinery lives in
+/// `VM::jit_direct_call` (which has access to the VM's private frame state);
+/// this wrapper only saves/restores the JIT thread-local state around the
+/// re-entrant interpreter run so the outer compiled region's constant pool /
+/// callbacks / safepoint / branch markers survive the nested execution.
+///
+/// # Safety
+/// `regs` must point at the 256-entry register buffer of the compiled region
+/// that invoked this helper, and `JIT_VM` must be set (a `VM` mid-`step()`).
+/// The callee is `!may_suspend` by construction (the compiler gates emission
+/// on that analysis), so it never suspends mid-run.
+#[no_mangle]
+pub extern "C" fn nulang_jit_direct_call(
+    regs: *mut u64,
+    func_idx: i64,
+    argc: i64,
+    dst: i64,
+) -> i64 {
+    let vm_ptr = get_jit_vm();
+    if vm_ptr.is_null() || regs.is_null() {
+        set_jit_pending_vm_error("JIT direct call with no active VM".to_string());
+        return 1;
+    }
+    let vm = unsafe { &mut *vm_ptr };
+    let saved = save_jit_thread_state();
+    let status = vm.jit_direct_call(regs, func_idx as usize, argc as usize, dst as usize);
+    restore_jit_thread_state(saved);
+    status
+}
+
 /// Called from JIT-compiled code when the safepoint budget is exhausted.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_safepoint_yield(resume_offset: u64) -> u64 {
@@ -961,10 +1091,13 @@ pub unsafe extern "C" fn nulang_str_concat(a: u64, b: u64) -> u64 {
     alloc_string_value(result)
 }
 
-/// Power operation: float pow when both operands are floats; int pow when both
-/// are ints. Integer exponentiation uses wrapping multiplication (matching the
-/// interpreter's `step_ipow`); a negative int exponent returns nil; anything
-/// else is a type error.
+/// Power operation: float pow when both operands are floats; int pow using
+/// binary exponentiation with `wrapping_mul` when both are ints — bit-for-bit
+/// the interpreter's `step_ipow`, so the 48-bit payload wraps on overflow
+/// (matching `IMul`/`IAdd` behaviour) rather than erroring. A negative int
+/// exponent returns nil (mirrors `IDiv` div-by-zero); 0 ** 0 returns 1
+/// (standard convention). Non-numeric operands coerce to 0, exactly like the
+/// interpreter's `as_int().unwrap_or(0)`.
 #[no_mangle]
 pub extern "C" fn nulang_pow(a: u64, b: u64) -> u64 {
     if is_float_raw(a) && is_float_raw(b) {
@@ -974,29 +1107,27 @@ pub extern "C" fn nulang_pow(a: u64, b: u64) -> u64 {
     }
     let va = Value::from_raw(a);
     let vb = Value::from_raw(b);
-    if va.is_int() && vb.is_int() {
-        let base = va.as_int().unwrap();
-        let exp = vb.as_int().unwrap();
-        if exp < 0 {
-            return Value::nil().as_raw();
-        }
-        // Binary exponentiation with wrapping_mul, bit-for-bit the
-        // interpreter's algorithm.
-        let mut result: i64 = 1;
-        let mut base = base;
-        let mut exp = exp;
-        while exp > 0 {
-            if exp & 1 != 0 {
-                result = result.wrapping_mul(base);
-            }
-            exp >>= 1;
-            if exp > 0 {
-                base = base.wrapping_mul(base);
-            }
-        }
-        return Value::int(result).as_raw();
+    let base = va.as_int().unwrap_or(0);
+    let exp = vb.as_int().unwrap_or(0);
+    if exp < 0 {
+        return Value::nil().as_raw();
     }
-    record_arith_error(crate::vm::arith_type_error("pow", va, vb))
+    // Binary exponentiation with wrapping_mul — mirrors `step_ipow` exactly
+    // so overflow wraps (truncated to the 48-bit payload by `Value::int`)
+    // instead of recording an arithmetic error.
+    let mut result: i64 = 1;
+    let mut base = base;
+    let mut exp = exp;
+    while exp > 0 {
+        if exp & 1 != 0 {
+            result = result.wrapping_mul(base);
+        }
+        exp >>= 1;
+        if exp > 0 {
+            base = base.wrapping_mul(base);
+        }
+    }
+    Value::int(result).as_raw()
 }
 
 /// # Safety

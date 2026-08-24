@@ -2057,6 +2057,7 @@ fn cmd_publish(registry_url: Option<String>, token: Option<String>) -> NuResult<
     Ok(())
 }
 /// Response from POST /api/v1/deploy on Nulang Cloud.
+#[cfg(feature = "ureq")]
 #[derive(serde::Deserialize)]
 struct DeployResponse {
     #[allow(dead_code)]
@@ -2067,6 +2068,7 @@ struct DeployResponse {
 
 /// `nula deploy [--wasm] [--url <url>] [--token <token>] [--adapter <kind>] [--dry-run]`
 /// — build and deploy the current package to Nulang Cloud or another adapter.
+#[cfg(feature = "ureq")]
 fn cmd_deploy(
     wasm: bool,
     cloud_url: Option<String>,
@@ -2271,6 +2273,21 @@ fn cmd_deploy(
 
     println!("Deployed! -> {} ({})", deploy.url, deploy.status);
     Ok(())
+}
+
+/// `nula deploy` — disabled without the `ureq` feature.
+#[cfg(not(feature = "ureq"))]
+fn cmd_deploy(
+    _wasm: bool,
+    _cloud_url: Option<String>,
+    _token: Option<String>,
+    _adapter: crate::web::adapters::AdapterKind,
+    _dry_run: bool,
+) -> NuResult<()> {
+    Err(NuError::PackageError {
+        msg: "cloud deploy requires the 'ureq' feature (build with --features ureq)".to_string(),
+        span: Span::default(),
+    })
 }
 
 /// List the paths stored in an in-memory gzip-compressed tarball.
@@ -2844,6 +2861,7 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[cfg(feature = "ureq")]
     #[test]
     fn test_cmd_deploy_missing_token() {
         let dir =
@@ -2873,6 +2891,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "ureq")]
     #[test]
     fn test_cmd_deploy_no_manifest() {
         let dir = std::env::temp_dir().join(format!(
@@ -2959,6 +2978,7 @@ app "counter" {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "ureq")]
     #[test]
     fn test_cmd_deploy_dry_run_emits_ir_and_dist() {
         let dir = std::env::temp_dir().join(format!("nulang_deploy_dryrun_{}", std::process::id()));

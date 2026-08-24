@@ -23,7 +23,21 @@ const IMPORT_ALLOC_IDX: u32 = 0; // function index of nulang_alloc
 
 /// Function index of `env.nulang_dispatch` — generic effect dispatch
 /// (i32, i32, i32, i32) -> i64 (result-length return).
+///
+/// Kept declared (never called by the new backend) so the import keeps index
+/// 1 and every later function index stays stable — NLC pins the compiler by
+/// git SHA and already-deployed guest modules import it by index.
+#[allow(dead_code)]
 const IMPORT_NULANG_DISPATCH: u32 = 1;
+
+/// Function index of `env.nulang_dispatch_args` — runtime-argument effect
+/// dispatch (i32 tag_ptr, i32 tag_len, i32 argv_ptr, i32 argc) -> i64.
+/// Appended last so existing function indices stay stable.
+const IMPORT_NULANG_DISPATCH_ARGS: u32 = 22;
+
+/// Maximum positional args in one `perform` on the WASM backend. Must match
+/// the `argc` guard in nulang-cloud's `host_dispatch_args`.
+const MAX_DISPATCH_ARGS: usize = 16;
 
 /// Linear-memory base of the host's effect-result ring buffer. Must match
 /// `ActorCtx::ring_buffer_base` in nulang-cloud's wasmtime-actor-pool
@@ -63,7 +77,7 @@ const IMPORT_FFI_CALL_2: u32 = 18;
 const IMPORT_FFI_CALL_3: u32 = 19;
 const IMPORT_FFI_CALL_4: u32 = 20;
 /// Number of function imports. Module-defined functions start at this index.
-const FUNC_IMPORT_COUNT: u32 = 22;
+const FUNC_IMPORT_COUNT: u32 = 23;
 
 /// Module-global indices for the guest-side actor emulation (spawn/send/
 /// ask/state/receive all run inside one WASM instance — the pool delivers
@@ -145,236 +159,15 @@ pub struct WasmBackend {
     /// Param counts of `Module::behaviors`, by behavior index — the mailbox
     /// drain needs each behavior's arity to build its call.
     behavior_param_counts: Vec<usize>,
+    /// Offset (in the data segment, base 0) of the module-wide scratch region
+    /// where the guest marshals runtime effect args before calling
+    /// `nulang_dispatch_args`. `MAX_DISPATCH_ARGS * 8` zero bytes reserved at
+    /// the end of `string_data`.
+    argv_scratch_off: u32,
     /// Number of plain (non-behavior) module functions — behaviors are
     /// compiled after them, so a behavior's wasm index =
     /// FUNC_IMPORT_COUNT + module_function_count + behavior_idx.
     module_function_count: usize,
-}
-
-/// Resolve a MIR local to its defining constant, if it is assigned exactly
-/// once from `RValue::Const`. Used to pre-compute effect-dispatch JSON at
-/// compile time — the WASM backend requires constant effect args (dynamic
-/// args are a loud compile error, not a silent nil).
-fn resolve_const(func: &mir::Function, local: mir::LocalId) -> Option<crate::bytecode::Constant> {
-    use crate::mir::Stmt;
-    let mut found = None;
-    for block in &func.blocks {
-        for stmt in &block.stmts {
-            if let Stmt::Assign { dst, op } = stmt {
-                if *dst == local {
-                    // Multiple assignments (a `var` mutated along the way)
-                    // mean the value is not a compile-time constant.
-                    if found.is_some() {
-                        return None;
-                    }
-                    if let RValue::Const(c) = op {
-                        found = Some(c.clone());
-                    } else {
-                        return None;
-                    }
-                }
-            }
-        }
-    }
-    found
-}
-
-/// JSON-encode one constant for an effect-dispatch payload.
-fn json_arg(c: &crate::bytecode::Constant) -> Option<String> {
-    use crate::bytecode::Constant;
-    match c {
-        Constant::Int(n) => Some(n.to_string()),
-        Constant::Float(f) => {
-            let mut s = f.to_string();
-            // JSON requires a float-looking literal; Rust prints 42.0 as
-            // "42", which is a valid JSON int but the WRONG type.
-            if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-                s.push_str(".0");
-            }
-            Some(s)
-        }
-        Constant::Bool(true) => Some("true".into()),
-        Constant::Bool(false) => Some("false".into()),
-        Constant::String(s) => Some(json_quote(s)),
-        Constant::Nil | Constant::Unit => Some("null".into()),
-        _ => None, // TypeDescriptor, FunctionRef, BehaviorRef
-    }
-}
-
-/// JSON-quote a string (escape `"`, `\`, and control characters).
-fn json_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// How the guest parses a `nulang_dispatch` result out of the ring buffer.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum DispatchResultShape {
-    /// The result IS the JSON value (int/string/bool/null) — the generic
-    /// handler contract (handlers return JSON Nulang values directly).
-    JsonValue,
-    /// The result is a JSON object; extract the named field's value. Used
-    /// by pool builtins whose handlers return envelope objects (e.g. the
-    /// inference handler's `{"content": "...", ...}` response).
-    JsonField(&'static str),
-    /// The result is discarded entirely (e.g. fire-and-forget writes).
-    /// Returns nil without parsing the ring buffer.
-    Discard,
-}
-
-/// A nulang language effect mapped to a pool EffectId + envelope.
-struct PoolEffectContract {
-    /// The exact EffectId the pool's `HandlerRegistry` serves.
-    tag: &'static str,
-    /// The JSON payload the pool handler expects (built from constant args).
-    payload: String,
-    /// How to parse the handler's JSON response.
-    shape: DispatchResultShape,
-}
-
-/// JSON-quote a constant string arg (`None` when the arg is not a string
-/// constant — dynamic args are rejected earlier in the pre-scan).
-fn const_str_arg(consts: &[crate::bytecode::Constant], idx: usize) -> Option<String> {
-    match consts.get(idx) {
-        Some(crate::bytecode::Constant::String(s)) => Some(json_quote(s)),
-        _ => None,
-    }
-}
-
-/// A constant int arg as a JSON number literal.
-fn const_int_arg(consts: &[crate::bytecode::Constant], idx: usize) -> Option<String> {
-    match consts.get(idx) {
-        Some(crate::bytecode::Constant::Int(n)) => Some(n.to_string()),
-        _ => None,
-    }
-}
-
-/// nulang builtin effects with a KNOWN nulang-cloud pool contract. These
-/// bypass the generic dotted-tag + positional-array contract so nulang
-/// programs can call the platform's built-in handlers by their language
-/// names (`perform Inference.ask("...")` → `nulang:inference/inference`
-/// with the chat envelope). Effects not listed here keep the generic
-/// contract (programs target handler-registered dotted tags directly).
-///
-/// The storage/queue/http builtins target the pool's STRING-contract tags
-/// (`nulang:storage/string` etc.) — the language-facing adapter handlers
-/// registered alongside the byte-contract WIT handlers in nulang-cloud's
-/// dev-server emulator. The nulang value type for these domains is the
-/// string, so the adapter speaks strings where the WIT world speaks bytes.
-fn pool_effect_contract(
-    effect: &str,
-    op: &str,
-    consts: &[crate::bytecode::Constant],
-) -> Option<PoolEffectContract> {
-    use crate::bytecode::Constant;
-    match (effect, op) {
-        ("Inference", "ask") => {
-            // `perform Inference.ask(prompt)` → nulang:inference/inference
-            // with the chat envelope; the handler replies with
-            // `{"content": "...", ...}` — extract `content`.
-            let prompt = match consts.first() {
-                Some(Constant::String(s)) => s.clone(),
-                _ => return None,
-            };
-            Some(PoolEffectContract {
-                tag: "nulang:inference/inference",
-                payload: format!(
-                    "{{\"operation\":\"chat\",\"messages\":[{{\"role\":\"user\",\"content\":{}}}]}}",
-                    json_quote(&prompt)
-                ),
-                shape: DispatchResultShape::JsonField("content"),
-            })
-        }
-        ("Storage", "write") => {
-            // Storage.write(key, value) → string-contract storage handler.
-            let key = const_str_arg(consts, 0)?;
-            let value = const_str_arg(consts, 1)?;
-            Some(PoolEffectContract {
-                tag: "nulang:storage/string",
-                payload: format!(r#"{{"operation":"Write","key":{key},"value":{value}}}"#),
-                shape: DispatchResultShape::Discard,
-            })
-        }
-        ("Storage", "read") => {
-            // Storage.read(key) → String; the handler replies with
-            // `{"found": bool, "value": "..."}` — extract `value` (empty
-            // string when the key is absent).
-            let key = const_str_arg(consts, 0)?;
-            Some(PoolEffectContract {
-                tag: "nulang:storage/string",
-                payload: format!(r#"{{"operation":"Read","key":{key}}}"#),
-                shape: DispatchResultShape::JsonField("value"),
-            })
-        }
-        ("Storage", "delete") => {
-            let key = const_str_arg(consts, 0)?;
-            Some(PoolEffectContract {
-                tag: "nulang:storage/string",
-                payload: format!(r#"{{"operation":"Delete","key":{key}}}"#),
-                shape: DispatchResultShape::Discard,
-            })
-        }
-        ("Queue", "push") => {
-            // Queue.push(queue, message) → string-contract queue handler.
-            // (`send` is a reserved word in the nulang parser, so the
-            // language surface uses `push`; the handler envelope op is
-            // still `Send`.)
-            let name = const_str_arg(consts, 0)?;
-            let message = const_str_arg(consts, 1)?;
-            Some(PoolEffectContract {
-                tag: "nulang:queue/string",
-                payload: format!(
-                    r#"{{"operation":"Send","queue_name":{name},"message":{message}}}"#
-                ),
-                shape: DispatchResultShape::Discard,
-            })
-        }
-        ("Queue", "pop") => {
-            // Queue.pop(queue) → String; the handler replies with
-            // `{"message": "..."}` (empty string when the queue is empty).
-            let name = const_str_arg(consts, 0)?;
-            Some(PoolEffectContract {
-                tag: "nulang:queue/string",
-                payload: format!(r#"{{"operation":"Receive","queue_name":{name}}}"#),
-                shape: DispatchResultShape::JsonField("message"),
-            })
-        }
-        ("Http", "get") => {
-            // Http.get(url) → String body; the handler replies with
-            // `{"status": u16, "body": "..."}` — extract `body`.
-            let url = const_str_arg(consts, 0)?;
-            Some(PoolEffectContract {
-                tag: "nulang:http/string",
-                payload: format!(r#"{{"url":{url},"method":"GET","headers":{{}},"body":""}}"#),
-                shape: DispatchResultShape::JsonField("body"),
-            })
-        }
-        ("Timer", "sleep") => {
-            // Timer.sleep(ms) → nulang:timer/timer (the pool's timer
-            // handler); the result is discarded (nulang's sleep yields
-            // unit).
-            let ms = const_int_arg(consts, 0)?;
-            Some(PoolEffectContract {
-                tag: "nulang:timer/timer",
-                payload: format!(r#"{{"ms":{ms}}}"#),
-                shape: DispatchResultShape::Discard,
-            })
-        }
-        _ => None,
-    }
 }
 
 impl WasmBackend {
@@ -438,6 +231,7 @@ impl WasmBackend {
             state_field_map: HashMap::new(),
             actor_state_defaults: HashMap::new(),
             behavior_param_counts: Vec::new(),
+            argv_scratch_off: 0,
             module_function_count: 0,
         }
     }
@@ -599,7 +393,7 @@ impl WasmBackend {
                             RValue::Perform {
                                 effect, op, args, ..
                             } => {
-                                self.intern_effect_dispatch(effect, op, args, func)?;
+                                self.intern_effect_dispatch(effect, op, args)?;
                             }
                             RValue::PerformAsync {
                                 effect_op, args, ..
@@ -607,7 +401,7 @@ impl WasmBackend {
                                 let (effect, op) = effect_op
                                     .split_once('.')
                                     .unwrap_or((effect_op.as_str(), ""));
-                                self.intern_effect_dispatch(effect, op, args, func)?;
+                                self.intern_effect_dispatch(effect, op, args)?;
                             }
                             _ => {}
                         }
@@ -638,6 +432,36 @@ impl WasmBackend {
         // Rebuild imports with correct type indices now that types are
         // finalized.
         self.rebuild_imports();
+
+        // Reserve the module-wide argv scratch region: `MAX_DISPATCH_ARGS` i64
+        // slots at the end of the data segment (base 0). A single shared
+        // scratch is safe because MIR `Perform` operands are already-computed
+        // locals — no dispatch's argument evaluation can run between another
+        // dispatch's stores and its call. This must happen unconditionally so
+        // the offset is stable even for modules with no string constants, and
+        // BEFORE function compilation (compile_perform reads the offset to
+        // emit arg stores). All string interning has completed by now (the
+        // pre-scan + FFI pre-intern run above), so the scratch lands after
+        // every interned string.
+        self.argv_scratch_off = self.string_data.len() as u32;
+        self.string_data
+            .resize(self.string_data.len() + MAX_DISPATCH_ARGS * 8, 0);
+
+        // Guard the region NLC reserves for the effect-result ring buffer:
+        // data + scratch must never reach it. Today a program with enough
+        // string constants silently corrupts the ring buffer; fail loudly
+        // instead.
+        if self.string_data.len() > RING_BUFFER_BASE as usize {
+            let data_len = self.string_data.len() - MAX_DISPATCH_ARGS * 8;
+            return Err(crate::types::NuError::VMError {
+                msg: format!(
+                    "WASM backend: module data ({data_len} bytes) plus dispatch \
+                     scratch overruns the host ring buffer at 0x{RING_BUFFER_BASE:X}; \
+                     reduce string constants"
+                ),
+                span: crate::types::Span::default(),
+            });
+        }
 
         // Compile functions.
         for (idx, func) in mir.functions.iter().enumerate() {
@@ -714,16 +538,10 @@ impl WasmBackend {
     }
 
     /// Pre-scan interning for a dispatchable effect (`Perform` or the async
-    /// variant): validates constant args, computes the tag + JSON payload
-    /// (pool-builtin envelope or generic positional array), and interns both
-    /// so compile_rvalue can look them up by content.
-    fn intern_effect_dispatch(
-        &mut self,
-        effect: &str,
-        op: &str,
-        args: &[LocalId],
-        func: &mir::Function,
-    ) -> NuResult<()> {
+    /// variant): interns the dotted effect path (`"Storage.write"`). The host
+    /// owns the EffectId + request envelope mapping; the compiler emits only
+    /// what it knows (the tag + runtime-marshalled positional args).
+    fn intern_effect_dispatch(&mut self, effect: &str, op: &str, args: &[LocalId]) -> NuResult<()> {
         let dispatchable = !matches!(
             (effect, op),
             ("IO", "print") | ("IO", "println") | ("IO", "read") | ("Array", "length")
@@ -731,35 +549,18 @@ impl WasmBackend {
         if !dispatchable {
             return Ok(());
         }
-        let consts = args
-            .iter()
-            .map(|l| resolve_const(func, *l))
-            .collect::<Option<Vec<_>>>();
-        let Some(consts) = consts else {
-            return Err(crate::types::NuError::VMError {
-                msg: format!(
-                    "WASM backend: effect {effect}.{op} requires constant \
-                     args (dynamic effect args are not yet supported in \
-                     the WASM backend)"
+        if args.len() > MAX_DISPATCH_ARGS {
+            return Err(crate::types::NuError::type_error(
+                format!(
+                    "WASM backend: effect {effect}.{op} has {} args; at most \
+                     {MAX_DISPATCH_ARGS} are supported",
+                    args.len()
                 ),
-                span: crate::types::Span::default(),
-            });
-        };
-        let encoded = consts.iter().map(json_arg).collect::<Option<Vec<_>>>();
-        let Some(encoded) = encoded else {
-            return Err(crate::types::NuError::VMError {
-                msg: format!(
-                    "WASM backend: effect {effect}.{op} has an arg that \
-                     is not JSON-encodable (int/float/bool/string/nil only)"
-                ),
-                span: crate::types::Span::default(),
-            });
-        };
-        let (tag, payload) = pool_effect_contract(effect, op, &consts)
-            .map(|c| (c.tag.to_string(), c.payload))
-            .unwrap_or_else(|| (format!("{effect}.{op}"), format!("[{}]", encoded.join(","))));
+                crate::types::Span::default(),
+            ));
+        }
+        let tag = format!("{effect}.{op}");
         self.intern_string(&tag);
-        self.intern_string(&payload);
         Ok(())
     }
 
@@ -816,8 +617,15 @@ impl WasmBackend {
         imports.import("env", "ffi_call_2", EntityType::Function(ffi2));
         imports.import("env", "ffi_call_3", EntityType::Function(ffi3));
         imports.import("env", "ffi_call_4", EntityType::Function(ffi4));
-        // Keep this new import at the end so existing function indices stay stable.
+        // Keep these new imports at the end so existing function indices stay stable.
         imports.import("env", "arith_fneg", EntityType::Function(TY_I64_TO_I64));
+        // Runtime-argument effect dispatch: same (i32,i32,i32,i32) -> i64
+        // signature as nulang_dispatch, so ensure_type returns the cached type.
+        imports.import(
+            "env",
+            "nulang_dispatch_args",
+            EntityType::Function(ty_dispatch),
+        );
         self.imports = imports;
     }
 
@@ -2419,53 +2227,43 @@ impl WasmBackend {
                 }
             }
             _ => {
-                // Generic effect dispatch: `perform Effect.op(args)` →
-                // `nulang_dispatch(tag_ptr, tag_len, payload_ptr, payload_len)`
-                // where the tag is the dotted "Effect.op" path (or a pool
-                // builtin's EffectId, see `pool_effect_contract`) and the
-                // payload is a compile-time JSON value built from the args
-                // (both interned in the pre-scan). The host writes the result
-                // to the ring buffer and returns its length; the read-back
-                // parses a JSON int/string/bool/null into a tagged Nulang
-                // value.
-                let consts = args
-                    .iter()
-                    .map(|l| resolve_const(func, *l))
-                    .collect::<Option<Vec<_>>>()
-                    .expect("pre-scan guaranteed constant effect args");
-                let (tag, payload, shape) = match pool_effect_contract(effect, op, &consts) {
-                    Some(c) => (c.tag.to_string(), c.payload, c.shape),
-                    None => {
-                        let encoded = consts
-                            .iter()
-                            .map(json_arg)
-                            .collect::<Option<Vec<_>>>()
-                            .expect("pre-scan guaranteed JSON-encodable effect args");
-                        (
-                            format!("{effect}.{op}"),
-                            format!("[{}]", encoded.join(",")),
-                            DispatchResultShape::JsonValue,
-                        )
-                    }
-                };
+                // Runtime-argument effect dispatch: `perform Effect.op(args)`
+                // → `nulang_dispatch_args(tag_ptr, tag_len, argv_ptr, argc)`.
+                // The guest emits only the dotted effect path plus a positional
+                // array of tagged Nulang values; the host resolves the EffectId
+                // + request envelope and writes the single JSON result to the
+                // ring buffer. Args are marshalled into the module-wide argv
+                // scratch (they are already-computed locals, so no dispatch's
+                // argument evaluation can run between our stores and the call).
+                // The tag is interned in the pre-scan.
+                let tag = format!("{effect}.{op}");
                 let (tag_off, tag_len) = self.interned.get(&tag).copied().unwrap_or((0, 0));
-                let (pay_off, pay_len) = self.interned.get(&payload).copied().unwrap_or((0, 0));
-
+                let scratch = self.argv_scratch_off;
+                for (i, arg) in args.iter().enumerate() {
+                    body.instruction(&Instruction::I32Const((scratch + i as u32 * 8) as i32));
+                    body.instruction(&Instruction::LocalGet(self.mir_local(arg, func)));
+                    body.instruction(&Instruction::I64Store(MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                }
                 body.instruction(&Instruction::I32Const(tag_off as i32));
                 body.instruction(&Instruction::I32Const(tag_len as i32));
-                body.instruction(&Instruction::I32Const(pay_off as i32));
-                body.instruction(&Instruction::I32Const(pay_len as i32));
-                body.instruction(&Instruction::Call(IMPORT_NULANG_DISPATCH));
-                self.compile_dispatch_readback(body, shape);
+                body.instruction(&Instruction::I32Const(scratch as i32));
+                body.instruction(&Instruction::I32Const(args.len() as i32));
+                body.instruction(&Instruction::Call(IMPORT_NULANG_DISPATCH_ARGS));
+                self.compile_dispatch_readback(body);
             }
         }
     }
 
-    /// Emit the dispatch-result read-back: the `nulang_dispatch` call left
-    /// the result LENGTH (i64) on the stack; 0 means no result (nil).
-    /// `Discard` shapes skip the ring buffer entirely and yield nil. For a
-    /// non-zero length the result is a JSON value at [`RING_BUFFER_BASE`]
-    /// in linear memory. Parses:
+    /// Emit the dispatch-result read-back: the `nulang_dispatch_args` call
+    /// left the result LENGTH (i64) on the stack; 0 means no result (nil).
+    /// For a non-zero length the result is a single plain JSON value
+    /// (int/string/bool/null) at [`RING_BUFFER_BASE`] — the host has already
+    /// applied any response unwrapping, so the guest read-back has exactly one
+    /// shape. Parses:
     /// - `"..."`   → string (content copied to a bump-allocated buffer)
     /// - `true`    → bool true
     /// - `false`   → bool false
@@ -2473,149 +2271,11 @@ impl WasmBackend {
     /// - integer   → int (decimal parse; non-integer JSON falls back to nil)
     /// - anything else → nil (defensive)
     ///
-    /// Scratch locals (all transient within this emission): 252 = result
-    /// length / int accumulator, 253 = first byte / content length / sign,
-    /// 254 = string dest ptr / int accumulator, 255 = loop index.
-    /// Locate a JSON object field's value inside the ring-buffer result:
-    /// sets 250 = value-start byte offset (relative to `base`) and
-    /// 252 = the value's byte length (including its surrounding quotes for
-    /// a string value). 250 = -1 / 252 = 0 when the field is absent.
-    ///
-    /// v1 limitation: the value must be a JSON string whose content contains
-    /// no unescaped `"` (the pool builtins this serves — e.g. the inference
-    /// chat response's `content` — are plain strings).
-    fn emit_field_locate(&self, body: &mut Function, field: &str, base: i32, mem0: &MemArg) {
-        let pat: Vec<u8> = format!("\"{field}\":").bytes().collect();
-        assert!(
-            field.is_ascii(),
-            "field extraction requires an ASCII field name"
-        );
-        // 250 = value start (-1 = not found); 255 = scan index i.
-        body.instruction(&Instruction::I64Const(-1));
-        body.instruction(&Instruction::LocalSet(250));
-        body.instruction(&Instruction::I64Const(0));
-        body.instruction(&Instruction::LocalSet(255));
-        body.instruction(&Instruction::Block(BlockType::Empty)); // exit (depth 1)
-        body.instruction(&Instruction::Loop(BlockType::Empty)); // depth 0
-                                                                // i >= L → exit
-        body.instruction(&Instruction::LocalGet(255));
-        body.instruction(&Instruction::LocalGet(252));
-        body.instruction(&Instruction::I64GeU);
-        body.instruction(&Instruction::BrIf(1));
-        // addr = base + i (held as i64; wrapped before each load below)
-        body.instruction(&Instruction::I32Const(base));
-        body.instruction(&Instruction::LocalGet(255));
-        body.instruction(&Instruction::I32WrapI64);
-        body.instruction(&Instruction::I32Add);
-        body.instruction(&Instruction::I64ExtendI32U);
-        body.instruction(&Instruction::LocalSet(254));
-        // pattern match: mem[addr + k] == pat[k] for all k (&& chain)
-        for (k, &b) in pat.iter().enumerate() {
-            body.instruction(&Instruction::LocalGet(254));
-            body.instruction(&Instruction::I32WrapI64);
-            body.instruction(&Instruction::I32Load8U(MemArg {
-                offset: k as u64,
-                align: 0,
-                memory_index: 0,
-            }));
-            body.instruction(&Instruction::I32Const(b as i32));
-            body.instruction(&Instruction::I32Eq);
-            if k > 0 {
-                body.instruction(&Instruction::I32And);
-            }
-        }
-        body.instruction(&Instruction::If(BlockType::Empty));
-        // value_start = i + pat.len()
-        body.instruction(&Instruction::LocalGet(255));
-        body.instruction(&Instruction::I64Const(pat.len() as i64));
-        body.instruction(&Instruction::I64Add);
-        body.instruction(&Instruction::LocalSet(250));
-        // require mem[base + value_start] == '"'
-        body.instruction(&Instruction::I32Const(base));
-        body.instruction(&Instruction::LocalGet(250));
-        body.instruction(&Instruction::I32WrapI64);
-        body.instruction(&Instruction::I32Add);
-        body.instruction(&Instruction::I32Load8U(*mem0));
-        body.instruction(&Instruction::I32Const(0x22));
-        body.instruction(&Instruction::I32Eq);
-        body.instruction(&Instruction::If(BlockType::Empty));
-        // find the closing quote: j (253) from value_start+1
-        body.instruction(&Instruction::LocalGet(250));
-        body.instruction(&Instruction::I64Const(1));
-        body.instruction(&Instruction::I64Add);
-        body.instruction(&Instruction::LocalSet(253));
-        body.instruction(&Instruction::Block(BlockType::Empty)); // close-exit (depth 1)
-        body.instruction(&Instruction::Loop(BlockType::Empty)); // depth 0
-                                                                // j >= L → no closing quote: treat as not found and exit the scan.
-                                                                // NOTE: this br is INSIDE the `if` below, and wasm `if` pushes a
-                                                                // branch label — so exiting the close BLOCK is depth 2 here
-                                                                // (if=0, loop=1, block=2).
-        body.instruction(&Instruction::LocalGet(253));
-        body.instruction(&Instruction::LocalGet(252));
-        body.instruction(&Instruction::I64GeU);
-        body.instruction(&Instruction::If(BlockType::Empty));
-        // no closing quote: treat as not found
-        body.instruction(&Instruction::I64Const(-1));
-        body.instruction(&Instruction::LocalSet(250));
-        body.instruction(&Instruction::Br(2));
-        body.instruction(&Instruction::End);
-        // mem[base + j] == '"' → L' = j - value_start + 1; break
-        body.instruction(&Instruction::I32Const(base));
-        body.instruction(&Instruction::LocalGet(253));
-        body.instruction(&Instruction::I32WrapI64);
-        body.instruction(&Instruction::I32Add);
-        body.instruction(&Instruction::I32Load8U(*mem0));
-        body.instruction(&Instruction::I32Const(0x22));
-        body.instruction(&Instruction::I32Eq);
-        body.instruction(&Instruction::If(BlockType::Empty));
-        body.instruction(&Instruction::LocalGet(253));
-        body.instruction(&Instruction::LocalGet(250));
-        body.instruction(&Instruction::I64Sub);
-        body.instruction(&Instruction::I64Const(1));
-        body.instruction(&Instruction::I64Add);
-        body.instruction(&Instruction::LocalSet(252));
-        body.instruction(&Instruction::Br(2));
-        body.instruction(&Instruction::End);
-        // j++
-        body.instruction(&Instruction::LocalGet(253));
-        body.instruction(&Instruction::I64Const(1));
-        body.instruction(&Instruction::I64Add);
-        body.instruction(&Instruction::LocalSet(253));
-        body.instruction(&Instruction::Br(0));
-        body.instruction(&Instruction::End); // end Loop
-        body.instruction(&Instruction::End); // end Block
-        body.instruction(&Instruction::Else);
-        // mem[value_start] != '"' — not a string field value: not found
-        body.instruction(&Instruction::I64Const(-1));
-        body.instruction(&Instruction::LocalSet(250));
-        body.instruction(&Instruction::End);
-        // if value_start >= 0 → found → exit outer scan
-        body.instruction(&Instruction::LocalGet(250));
-        body.instruction(&Instruction::I64Const(0));
-        body.instruction(&Instruction::I64GeS);
-        body.instruction(&Instruction::If(BlockType::Empty));
-        body.instruction(&Instruction::Br(1)); // exit outer
-        body.instruction(&Instruction::End);
-        body.instruction(&Instruction::End); // end pattern-match If
-                                             // i++
-        body.instruction(&Instruction::LocalGet(255));
-        body.instruction(&Instruction::I64Const(1));
-        body.instruction(&Instruction::I64Add);
-        body.instruction(&Instruction::LocalSet(255));
-        body.instruction(&Instruction::Br(0));
-        body.instruction(&Instruction::End); // end Loop
-        body.instruction(&Instruction::End); // end Block
-                                             // not found (250 < 0) → 252 = 0 (nil)
-        body.instruction(&Instruction::LocalGet(250));
-        body.instruction(&Instruction::I64Const(0));
-        body.instruction(&Instruction::I64LtS);
-        body.instruction(&Instruction::If(BlockType::Empty));
-        body.instruction(&Instruction::I64Const(0));
-        body.instruction(&Instruction::LocalSet(252));
-        body.instruction(&Instruction::End);
-    }
-
-    fn compile_dispatch_readback(&self, body: &mut Function, shape: DispatchResultShape) {
+    /// Scratch locals (all transient within this emission): 250 = value-start
+    /// byte offset, 252 = result length / int accumulator, 253 = first byte /
+    /// content length / sign, 254 = string dest ptr / int accumulator, 255 =
+    /// loop index.
+    fn compile_dispatch_readback(&self, body: &mut Function) {
         use wasm_encoder::{BlockType, MemArg, ValType};
         let mem0 = MemArg {
             offset: 0,
@@ -2629,28 +2289,10 @@ impl WasmBackend {
 
         // 252 = result length L (i64). If L == 0 → nil.
         body.instruction(&Instruction::LocalSet(252));
-        // Discard shapes never read the ring buffer: consume the length
-        // (above) and yield nil.
-        if shape == DispatchResultShape::Discard {
-            body.instruction(&Instruction::I64Const(value_layout::TAG_NIL as i64));
-            return;
-        }
-        // For JsonField results, locate the field's JSON value first:
-        // 253 = value-start byte offset (0 for a plain JSON value),
-        // 252 = the value's byte length (0 = field not found → nil).
-        match shape {
-            DispatchResultShape::JsonValue => {
-                body.instruction(&Instruction::I64Const(0));
-                body.instruction(&Instruction::LocalSet(250));
-            }
-            DispatchResultShape::JsonField(field) => {
-                self.emit_field_locate(body, field, base, &mem0);
-            }
-            // Discard short-circuits before this match (see above).
-            DispatchResultShape::Discard => {
-                unreachable!("Discard is handled before the read-back match")
-            }
-        }
+        // The result is a single plain JSON value; 250 = value-start byte
+        // offset (0 = the whole result).
+        body.instruction(&Instruction::I64Const(0));
+        body.instruction(&Instruction::LocalSet(250));
         body.instruction(&Instruction::LocalGet(252));
         body.instruction(&Instruction::I64Eqz);
         body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
@@ -3499,13 +3141,42 @@ mod tests {
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
-    fn test_effect_dispatch_dynamic_args_rejected() {
-        // Dynamic (non-constant) effect args are a loud compile error, not
-        // a silent nil.
-        let err = compile_source(r#"let x = 1 + 2; perform Test.echo(x)"#).unwrap_err();
+    fn test_effect_dispatch_dynamic_args_marshalled() {
+        // Runtime (non-constant) effect args must now compile and marshal into
+        // a positional argv array: `let x = 1 + 2; perform Test.echo(x, "k")`
+        // dispatches tag "Test.echo" with payload [3,"k"].
+        let (value, last) = run_source_with_dispatch(
+            r#"let x = 1 + 2; perform Test.echo(x, "k")"#,
+            Some(br#""ok""#.to_vec()),
+        )
+        .expect("run");
+        let (tag, payload) = last.expect("dispatch must have been called");
+        assert_eq!(tag, b"Test.echo", "tag is the dotted effect path");
+        assert_eq!(
+            payload, br#"[3,"k"]"#,
+            "runtime args marshal into a positional JSON array"
+        );
+        assert_eq!(
+            value.as_raw() as u64 & crate::value_layout::TAG_MASK,
+            crate::value_layout::TAG_STRING,
+            "JSON string result must parse to a string value"
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_effect_dispatch_too_many_args_rejected() {
+        // More than MAX_DISPATCH_ARGS positional args are a loud compile
+        // error, not a silent truncation.
+        let args = (0..17)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let src = format!("perform Test.echo({args})");
+        let err = compile_source(&src).unwrap_err();
         assert!(
-            err.to_string().contains("constant args"),
-            "compile error must explain the constant-args requirement: {err}"
+            err.to_string().contains("at most 16"),
+            "compile error must explain the arg cap: {err}"
         );
     }
 
@@ -3636,113 +3307,91 @@ mod tests {
         );
     }
 
-    // ── Pool builtin tag mapping (nulang:… EffectIds) ──────────────
+    // ── Language effect tag mapping (dotted path → host envelope) ──
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_inference_ask_maps_to_pool_builtin() {
-        // `perform Inference.ask("hi there")` maps to the pool's
-        // `nulang:inference/inference` EffectId with the chat envelope; the
-        // handler's `{"content": ...}` response yields the reply string.
-        let response = br#"{"content":"hello back","model":"m","provider":"p","input_tokens":1,"output_tokens":1,"finish_reason":null,"cached":false,"latency_ms":5,"fallback_used":false}"#;
+        // `perform Inference.ask("hi there")` emits the dotted effect path
+        // plus a positional argv array; the host resolves the EffectId +
+        // chat envelope and unwraps the handler's `{"content": ...}`
+        // response, so the guest read-back sees the plain reply string.
         let wasm = compile_source(r#"perform Inference.ask("hi there")"#).expect("compile");
         let mut rt = crate::wasm_runtime::WasmRuntime::new(&wasm, None).unwrap();
-        rt.set_dispatch_result(Some(response.to_vec()));
+        rt.set_dispatch_result(Some(br#""hello back""#.to_vec()));
         let value = rt.run().expect("run");
         let (tag, payload) = rt
             .take_last_dispatch()
             .expect("dispatch must have been called");
-        assert_eq!(tag, b"nulang:inference/inference", "pool EffectId tag");
-        assert_eq!(
-            payload, br#"{"operation":"chat","messages":[{"role":"user","content":"hi there"}]}"#,
-            "chat envelope payload"
-        );
-        // The `content` field must be extracted and returned as a Nulang
-        // string.
+        assert_eq!(tag, b"Inference.ask", "dotted language effect path");
+        assert_eq!(payload, br#"["hi there"]"#, "positional argv array");
         assert_eq!(
             rt.string_value(&value).as_deref(),
             Some("hello back"),
-            "content field must be extracted from the response object"
+            "plain JSON string result parses to a Nulang string"
         );
     }
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_storage_read_maps_to_pool_builtin() {
-        // `perform Storage.read(key)` maps to the pool's string-contract
-        // storage tag; the handler's `{"found":..., "value": "..."}`
-        // response yields the stored string.
+        // `perform Storage.read(key)` emits the dotted path + argv; the host
+        // resolves the string-contract storage EffectId and unwraps the
+        // handler's `{"found":..., "value": "..."}` response to the plain
+        // stored string.
         let (value, last) = run_source_with_dispatch(
             r#"perform Storage.read("greeting")"#,
-            Some(br#"{"found":true,"value":"hello"}"#.to_vec()),
+            Some(br#""hello""#.to_vec()),
         )
         .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"nulang:storage/string", "string-contract storage tag");
-        assert_eq!(
-            payload, br#"{"operation":"Read","key":"greeting"}"#,
-            "read envelope payload"
-        );
+        assert_eq!(tag, b"Storage.read", "dotted language effect path");
+        assert_eq!(payload, br#"["greeting"]"#, "positional argv array");
         assert!(
             value.is_string(),
-            "value field must be extracted from the response object as a string"
+            "plain JSON string result parses to a Nulang string"
         );
     }
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_storage_write_maps_to_pool_builtin() {
-        // `perform Storage.write(key, value)` — fire-and-forget: the
-        // handler's `{"ok":true}` response is discarded → nil.
-        let (value, last) = run_source_with_dispatch(
-            r#"perform Storage.write("greeting", "hello")"#,
-            Some(br#"{"ok":true}"#.to_vec()),
-        )
-        .expect("run");
+        // `perform Storage.write(key, value)` — the host's Discard shape
+        // returns length 0 → nil.
+        let (value, last) =
+            run_source_with_dispatch(r#"perform Storage.write("greeting", "hello")"#, None)
+                .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"nulang:storage/string", "string-contract storage tag");
-        assert_eq!(
-            payload, br#"{"operation":"Write","key":"greeting","value":"hello"}"#,
-            "write envelope payload"
-        );
-        assert!(value.is_nil(), "write result must be discarded → nil");
+        assert_eq!(tag, b"Storage.write", "dotted language effect path");
+        assert_eq!(payload, br#"["greeting","hello"]"#, "positional argv array");
+        assert!(value.is_nil(), "discarded write result must be nil");
     }
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_queue_receive_maps_to_pool_builtin() {
-        let (value, last) = run_source_with_dispatch(
-            r#"perform Queue.pop("orders")"#,
-            Some(br#"{"message":"m1","count":1}"#.to_vec()),
-        )
-        .expect("run");
+        let (value, last) =
+            run_source_with_dispatch(r#"perform Queue.pop("orders")"#, Some(br#""m1""#.to_vec()))
+                .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"nulang:queue/string", "string-contract queue tag");
-        assert_eq!(
-            payload, br#"{"operation":"Receive","queue_name":"orders"}"#,
-            "receive envelope payload"
-        );
+        assert_eq!(tag, b"Queue.pop", "dotted language effect path");
+        assert_eq!(payload, br#"["orders"]"#, "positional argv array");
         assert!(
             value.is_string(),
-            "message field must be extracted from the response object as a string"
+            "plain JSON string result parses to a Nulang string"
         );
     }
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_queue_send_maps_to_pool_builtin() {
-        let (value, last) = run_source_with_dispatch(
-            r#"perform Queue.push("orders", "hello")"#,
-            Some(br#"{"ok":true}"#.to_vec()),
-        )
-        .expect("run");
+        let (value, last) =
+            run_source_with_dispatch(r#"perform Queue.push("orders", "hello")"#, None)
+                .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"nulang:queue/string", "string-contract queue tag");
-        assert_eq!(
-            payload, br#"{"operation":"Send","queue_name":"orders","message":"hello"}"#,
-            "send envelope payload"
-        );
-        assert!(value.is_nil(), "send result must be discarded → nil");
+        assert_eq!(tag, b"Queue.push", "dotted language effect path");
+        assert_eq!(payload, br#"["orders","hello"]"#, "positional argv array");
+        assert!(value.is_nil(), "discarded send result must be nil");
     }
 
     #[test]
@@ -3750,35 +3399,32 @@ mod tests {
     fn test_wasm_http_get_maps_to_pool_builtin() {
         let (value, last) = run_source_with_dispatch(
             r#"perform Http.get("https://example.com/")"#,
-            Some(br#"{"status":200,"body":"<html>ok</html>"}"#.to_vec()),
+            Some(br#""<html>ok</html>""#.to_vec()),
         )
         .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"nulang:http/string", "string-contract http tag");
+        assert_eq!(tag, b"Http.get", "dotted language effect path");
         assert_eq!(
-            payload, br#"{"url":"https://example.com/","method":"GET","headers":{},"body":""}"#,
-            "http get envelope payload"
+            payload, br#"["https://example.com/"]"#,
+            "positional argv array"
         );
         assert!(
             value.is_string(),
-            "body field must be extracted from the response object as a string"
+            "plain JSON string result parses to a Nulang string"
         );
     }
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_timer_sleep_maps_to_pool_builtin() {
-        // `perform Timer.sleep(ms)` lowers to PerformAsync; the pool's
-        // timer handler responds `{"scheduled":true}` — discarded → nil.
-        let (value, last) = run_source_with_dispatch(
-            r#"perform Timer.sleep(1000)"#,
-            Some(br#"{"scheduled":true}"#.to_vec()),
-        )
-        .expect("run");
+        // `perform Timer.sleep(ms)` lowers to PerformAsync; the host's
+        // Discard shape returns length 0 → nil.
+        let (value, last) =
+            run_source_with_dispatch(r#"perform Timer.sleep(1000)"#, None).expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"nulang:timer/timer", "pool timer tag");
-        assert_eq!(payload, br#"{"ms":1000}"#, "timer envelope payload");
-        assert!(value.is_nil(), "sleep result must be discarded → nil");
+        assert_eq!(tag, b"Timer.sleep", "dotted language effect path");
+        assert_eq!(payload, br#"[1000]"#, "positional argv array");
+        assert!(value.is_nil(), "discarded sleep result must be nil");
     }
 
     #[test]

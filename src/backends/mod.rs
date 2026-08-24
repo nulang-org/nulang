@@ -559,6 +559,7 @@ mod tests {
         accepts_persistence(&store);
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn test_transport_is_network_transport() {
         fn check_blanket<T: crate::runtime::NetworkTransport>() {

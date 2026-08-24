@@ -5,14 +5,23 @@
 //! `crate::runtime::http_server`). Shutdown is controlled by an
 //! `AtomicBool` flag; `stop()` sets it and joins the listener thread.
 
+#[cfg(feature = "tcp")]
 use std::io::{Read, Write};
+#[cfg(feature = "tcp")]
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "tcp")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(feature = "tcp")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "tcp")]
 use std::sync::Arc;
+#[cfg(feature = "tcp")]
 use std::thread;
 
+#[cfg(feature = "tcp")]
 use parking_lot::Mutex;
+#[cfg(feature = "tcp")]
 use std::time::Duration;
 
 use crate::package::resolver::parse_semver;
@@ -28,6 +37,7 @@ use crate::package::resolver::parse_semver;
 ///
 /// The listener handle lives behind a `Mutex` so that `start(&self)` and
 /// `stop(&self)` can manage the background thread through shared references.
+#[cfg(feature = "tcp")]
 pub struct RegistryServer {
     data_dir: PathBuf,
     auth_token: Option<String>,
@@ -35,6 +45,7 @@ pub struct RegistryServer {
     handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
+#[cfg(feature = "tcp")]
 impl RegistryServer {
     /// Maximum accepted tarball size (64 MiB).
     const MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
@@ -293,6 +304,7 @@ impl RegistryServer {
     }
 }
 
+#[cfg(feature = "tcp")]
 impl Drop for RegistryServer {
     fn drop(&mut self) {
         self.stop();
@@ -302,6 +314,7 @@ impl Drop for RegistryServer {
 /// Validate a package name/version path segment: rejects empty segments,
 /// `.`/`..`, and anything outside `[A-Za-z0-9._-]`, which blocks path
 /// traversal and absolute paths before they reach the filesystem.
+#[cfg(feature = "tcp")]
 fn valid_segment(s: &str) -> bool {
     !s.is_empty()
         && s != "."
@@ -312,6 +325,7 @@ fn valid_segment(s: &str) -> bool {
 
 /// Check `Authorization: Bearer <token>` against the configured token.
 /// When no token is configured, all requests are authorized.
+#[cfg(feature = "tcp")]
 fn authorized(headers: &[(String, String)], auth_token: &Option<String>) -> bool {
     match auth_token {
         None => true,
@@ -358,5 +372,39 @@ mod tests {
         let mut versions = vec!["latest".to_string(), "1.0.0".to_string(), "v2".to_string()];
         sort_versions(&mut versions);
         assert_eq!(versions, vec!["1.0.0", "latest", "v2"]);
+    }
+}
+
+#[cfg(not(feature = "tcp"))]
+#[allow(dead_code)] // fields kept for API parity; never read without `tcp`
+pub struct RegistryServer {
+    data_dir: PathBuf,
+    auth_token: Option<String>,
+}
+
+#[cfg(not(feature = "tcp"))]
+impl RegistryServer {
+    pub fn new(data_dir: PathBuf, auth_token: Option<String>) -> Self {
+        RegistryServer {
+            data_dir,
+            auth_token,
+        }
+    }
+
+    /// Stub: the `tcp` feature is disabled, so the server cannot start.
+    pub fn start(&self, _bind_addr: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "registry server disabled (feature 'tcp' not enabled)",
+        ))
+    }
+
+    pub fn stop(&self) {}
+}
+
+#[cfg(not(feature = "tcp"))]
+impl Drop for RegistryServer {
+    fn drop(&mut self) {
+        self.stop();
     }
 }

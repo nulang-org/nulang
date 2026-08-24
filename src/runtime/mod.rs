@@ -1908,12 +1908,19 @@ impl Runtime {
 
     pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {
         let actor = self.actors.get(&target_id)?;
-        let suffix = format!(".{}", behavior);
+        // Allocation-free match: `entry.name == behavior`, or
+        // `entry.name` ends with `.<behavior>` (qualified name).
+        let matches = |name: &str| {
+            name == behavior
+                || name
+                    .strip_suffix(behavior)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        };
         // Search the per-actor behavior table first (native handlers).
         if let Some(idx) = actor
             .behavior_table
             .iter()
-            .position(|entry| entry.name == behavior || entry.name.ends_with(&suffix))
+            .position(|entry| matches(&entry.name))
         {
             return Some(idx as u16);
         }
@@ -1924,7 +1931,7 @@ impl Runtime {
         module
             .behaviors
             .iter()
-            .position(|b| b.name == behavior || b.name.ends_with(&suffix))
+            .position(|b| matches(&b.name))
             .map(|idx| idx as u16)
     }
 
@@ -6007,12 +6014,22 @@ impl Runtime {
             crate::observability::publish_otlp_metrics(&snap);
         }
     }
+    #[cfg(feature = "tcp")]
     pub fn enable_distribution(
         &mut self,
         bind_addr: std::net::SocketAddr,
         tls_config: crate::runtime::network::TlsConfig,
     ) -> std::io::Result<()> {
         distribution::enable_distribution(self, bind_addr, tls_config)
+    }
+
+    /// Enable the distributed actor system over TCP.
+    ///
+    /// Stub used when the `tcp` feature is disabled: real TCP distribution
+    /// is unavailable, so this always fails.
+    #[cfg(not(feature = "tcp"))]
+    pub fn enable_distribution(&mut self, bind_addr: std::net::SocketAddr) -> std::io::Result<()> {
+        distribution::enable_distribution(self, bind_addr)
     }
 
     /// Enable distribution over a caller-supplied transport (DST: the

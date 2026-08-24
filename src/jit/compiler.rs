@@ -136,6 +136,18 @@ pub(crate) fn make_void_reg4_sig<M: Module>(module: &M) -> Signature {
     sig
 }
 
+/// `(*mut u64 regs, i64 func_idx, i64 argc, i64 dst) -> i64` for
+/// `nulang_jit_direct_call` (returns a nonzero status on runtime error).
+pub(crate) fn make_direct_call_sig<M: Module>(module: &M) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::I64)); // regs ptr
+    sig.params.push(AbiParam::new(types::I64)); // func_idx
+    sig.params.push(AbiParam::new(types::I64)); // argc
+    sig.params.push(AbiParam::new(types::I64)); // dst
+    sig.returns.push(AbiParam::new(types::I64)); // status
+    sig
+}
+
 // ---------------------------------------------------------------------------
 // Runtime Helper Registration
 // ---------------------------------------------------------------------------
@@ -198,6 +210,14 @@ pub(crate) fn emit_yield_pc(
 }
 
 /// Compile a bytecode region to a native function.
+///
+/// `native_calls` maps absolute pcs of `Call` instructions (within the
+/// region) to their direct, provably-non-suspending callee's function-table
+/// index. Those calls are compiled as `nulang_jit_direct_call` helper
+/// invocations (the region stays resident in native code while the callee
+/// runs on the interpreter frame stack). Any other `Call` in the region is a
+/// compile error — `find_compilable_region_with_calls` only accepts regions
+/// whose `Call` sites are all in this map.
 pub fn compile_bytecode_region(
     module: &mut JITModule,
     builder_context: &mut FunctionBuilderContext,
@@ -206,6 +226,7 @@ pub fn compile_bytecode_region(
     start_offset: usize,
     num_instrs: usize,
     instructions: &[Instruction],
+    native_calls: &HashMap<usize, usize>,
 ) -> Result<*const u8, CompileError> {
     ctx.clear();
 
@@ -679,6 +700,38 @@ pub fn compile_bytecode_region(
                 RuntimeHelper::FToI,
             ),
 
+            OpCode::Call => {
+                // A direct, provably-non-suspending call (recovered by
+                // `find_compilable_region_with_calls`): run the callee to
+                // completion via the re-entrant `nulang_jit_direct_call`
+                // helper while this region stays resident in native code.
+                let func_idx = match native_calls.get(&pc) {
+                    Some(&idx) => idx as i64,
+                    None => {
+                        return Err(CompileError::Internal(
+                            "Call in compiled region without a native-call entry".into(),
+                        ))
+                    }
+                };
+                let fidx = builder.ins().iconst(types::I64, func_idx);
+                let argcv = builder.ins().iconst(types::I64, instr.op2 as i64);
+                let dstv = builder.ins().iconst(types::I64, instr.op3 as i64);
+                let status_inst = builder.ins().call(
+                    helpers[&RuntimeHelper::DirectCall],
+                    &[regs_ptr, fidx, argcv, dstv],
+                );
+                let status = builder.inst_results(status_inst)[0];
+                // On nonzero status the callee raised (e.g. step-limit); the
+                // error is already recorded in the pending-error thread-local,
+                // so exit the region and let the VM propagate it.
+                let zero = builder.ins().iconst(types::I64, 0);
+                let is_err = builder.ins().icmp(IntCC::NotEqual, status, zero);
+                let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                builder
+                    .ins()
+                    .brif(is_err, return_block, &[], fallthrough, &[]);
+            }
+
             OpCode::Ret | OpCode::RetVal => {
                 builder.ins().jump(return_block, &[]);
             }
@@ -760,6 +813,7 @@ pub fn compile_bytecode_region(
                 | OpCode::Halt
                 | OpCode::Ret
                 | OpCode::RetVal
+                | OpCode::Call // folded direct call: emits its own brif exit
                 | OpCode::PerformDirect
         );
 

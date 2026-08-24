@@ -333,7 +333,7 @@ impl Actor {
             state: ActorState::Created,
             mailbox: Mailbox::new(mailbox_cap),
             heap: {
-                let mut heap = ActorHeap::new(64 * 1024); // 64KB initial heap
+                let mut heap = ActorHeap::new(16 * 1024); // 16KB initial heap (density: ~64k actors/GB)
                 heap.set_actor_id(id);
                 heap
             },

@@ -945,11 +945,16 @@ fn try_lookup_content_hash(runtime: &Runtime, behavior_name: &str) -> Option<[u8
     let actor_id = runtime.current_actor?;
     let actor = runtime.actors.get(&actor_id)?;
     let module = actor.bytecode_module.as_ref()?;
-    let suffix = format!(".{}", behavior_name);
+    let matches = |name: &str| {
+        name == behavior_name
+            || name
+                .strip_suffix(behavior_name)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    };
     module
         .behaviors
         .iter()
-        .find(|b| b.name == behavior_name || b.name.ends_with(&suffix))
+        .find(|b| matches(&b.name))
         .and_then(|b| b.content_hash)
 }
 
@@ -2246,6 +2251,7 @@ mod tests {
 
     // -- 12. DistributedRuntime trait compiles -------------------------------
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn test_distributed_trait_exists() {
         // This test just verifies that the trait and wrapper type compile.
@@ -2367,6 +2373,7 @@ mod tests {
 
     // -- 17. End-to-end: remote send dispatches the named behavior ---------
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn test_remote_send_dispatches_named_behavior() {
         use std::time::{Duration, Instant};
@@ -2622,6 +2629,7 @@ mod tests {
         assert!(!intern_wire_strings(&mut rt, bare, &mut payload3, &table));
     }
 
+    #[cfg(feature = "tcp")]
     /// End-to-end regression: a string payload sent from node A must arrive
     /// on node B with its CONTENT intact — interned into the receiving
     /// actor's module pool — even though the receiver's pool holds a

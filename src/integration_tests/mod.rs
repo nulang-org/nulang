@@ -10674,6 +10674,7 @@ match { a: 2, b: 9 } with {
         );
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn test_http_serve_roundtrip() {
         use std::io::{Read, Write};
@@ -10722,6 +10723,7 @@ match { a: 2, b: 9 } with {
     /// a server failed. The standalone callbacks now host the server
     /// directly (StandaloneVmCallbacks::perform_builtin_effect_in_module),
     /// mirroring the runtime-backed path.
+    #[cfg(feature = "tcp")]
     #[test]
     fn test_http_serve_standalone() {
         use std::io::{Read, Write};
@@ -11519,8 +11521,149 @@ match { a: 2, b: 9 } with {
     }
 
     // -----------------------------------------------------------------------
-    // Tuple field access: positional field access with numeric indices (t.0, t.1, ...)
+    // StrBuilder builtin: mutable growable string buffer
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strbuilder_basic() {
+        assert_int(
+            "let b = perform StrBuilder.new() in perform StrBuilder.len(b)",
+            0,
+        );
+        assert_int(
+            "let b = perform StrBuilder.new() in \
+             let b2 = perform StrBuilder.push(b, \"hi\") in perform StrBuilder.len(b2)",
+            2,
+        );
+        assert_string(
+            "let b = perform StrBuilder.new() in \
+             let b2 = perform StrBuilder.push(b, \"hi\") in perform StrBuilder.to_string(b2)",
+            "hi",
+        );
+    }
+
+    #[test]
+    fn test_strbuilder_growth() {
+        // 10k appends of 3 bytes: crosses several capacity doublings and
+        // exercises the reallocation path; amortized O(n) total.
+        let source = r#"
+            var b = perform StrBuilder.new();
+            var i = 0;
+            while i < 10000 {
+                b = perform StrBuilder.push(b, "abc");
+                i = i + 1
+            };
+            perform StrBuilder.len(b)
+        "#;
+        assert_int(source, 30000);
+    }
+
+    #[test]
+    fn test_strbuilder_content_roundtrip() {
+        let source = r#"
+            var b = perform StrBuilder.new();
+            b = perform StrBuilder.push(b, "Hello, ");
+            b = perform StrBuilder.push(b, "Nulang");
+            b = perform StrBuilder.push(b, "!");
+            perform StrBuilder.to_string(b)
+        "#;
+        assert_string(source, "Hello, Nulang!");
+    }
+
+    #[test]
+    fn test_strbuilder_reset() {
+        assert_int(
+            "let b = perform StrBuilder.new() in \
+             let b2 = perform StrBuilder.push(b, \"abc\") in \
+             let b3 = perform StrBuilder.reset(b2) in perform StrBuilder.len(b3)",
+            0,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Map builtin: mutable hash map with content-based string keys
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_builtin_basic() {
+        assert_int("let m = perform Map.new() in perform Map.size(m)", 0);
+        assert_int(
+            "let m = perform Map.new() in \
+             let m2 = perform Map.insert(m, \"a\", 1) in perform Map.size(m2)",
+            1,
+        );
+        assert_int(
+            "let m = perform Map.new() in \
+             let m2 = perform Map.insert(m, \"a\", 1) in perform Map.get(m2, \"a\")",
+            1,
+        );
+        assert_bool(
+            "let m = perform Map.new() in \
+             let m2 = perform Map.insert(m, \"a\", 1) in perform Map.contains(m2, \"b\")",
+            false,
+        );
+    }
+
+    #[test]
+    fn test_map_builtin_mixed_keys() {
+        // Int keys and string keys coexist; string keys compare by content.
+        let source = r#"
+            var m = perform Map.new();
+            m = perform Map.insert(m, "alpha", 1);
+            m = perform Map.insert(m, 42, "answer");
+            perform Map.get(m, 42)
+        "#;
+        assert_string(source, "answer");
+        assert_int(
+            "let m = perform Map.new() in \
+             let m2 = perform Map.insert(m, 7, 100) in perform Map.get(m2, 7)",
+            100,
+        );
+    }
+
+    #[test]
+    fn test_map_builtin_content_keys() {
+        // Keys built by concatenation must match literal keys (different
+        // constant-pool ids, same content).
+        assert_int(
+            "let m = perform Map.new() in \
+             let m2 = perform Map.insert(m, \"hello\", 7) in \
+             perform Map.get(m2, \"he\" + \"llo\")",
+            7,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::erasing_op)]
+    fn test_map_builtin_overwrite_remove() {
+        let source = r#"
+            var m = perform Map.new();
+            m = perform Map.insert(m, "k", 1);
+            m = perform Map.insert(m, "k", 2);
+            let v1 = perform Map.get(m, "k");
+            m = perform Map.remove(m, "k");
+            let v2 = perform Map.get(m, "k");
+            perform Map.size(m) * 100 + v1 * 10 + v2
+        "#;
+        // Overwrite keeps size 1; v1 = 2; after remove size 0; v2 = nil -> 0.
+        // The source computes `Map.size(m) * 100 + v1 * 10 + v2` == 0*100 + 2*10 + 0.
+        assert_int(source, 20);
+    }
+
+    #[test]
+    fn test_map_builtin_growth() {
+        // 60 inserts forces several capacity doublings (load factor 0.5).
+        let source = r#"
+            var m = perform Map.new();
+            var i = 0;
+            while i < 60 {
+                m = perform Map.insert(m, "key" + perform Int.to_string(i), i);
+                i = i + 1
+            };
+            perform Map.get(m, "key30") * 100 + perform Map.size(m)
+        "#;
+        assert_int(source, 30 * 100 + 60);
+    }
 
     #[test]
     fn test_tuple_field_access_basic() {

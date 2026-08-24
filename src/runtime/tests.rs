@@ -3461,6 +3461,7 @@ fn generate_test_leaf(name: &str, ca_key: &KeyPair, _ca_cert_pem: &[u8]) -> (Vec
     (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
 }
 
+#[cfg(feature = "tcp")]
 /// Start a distributed runtime with MutualTLS enabled, bound to an ephemeral port.
 fn start_mutual_tls_node(ca_cert_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Runtime {
     let mut rt = Runtime::new();
@@ -3477,6 +3478,7 @@ fn start_mutual_tls_node(ca_cert_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) ->
     rt
 }
 
+#[cfg(feature = "tcp")]
 /// Start a distributed-enabled runtime bound to an ephemeral loopback port.
 fn start_distributed_node() -> Runtime {
     let mut rt = Runtime::new();
@@ -3488,6 +3490,7 @@ fn start_distributed_node() -> Runtime {
     rt
 }
 
+#[cfg(feature = "tcp")]
 /// Node-death recovery (PLAN.md Phase 5 deliverable 7, parts a+b): when a
 /// peer node is declared `Failed`, the local runtime must (a) invalidate
 /// its `RemoteActorCache` entries so sends fail fast instead of
@@ -3626,6 +3629,7 @@ fn shutdown_nodes(nodes: &mut [&mut Runtime]) {
     }
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_three_node_cluster_membership_converges() {
     let mut rt_a = start_distributed_node();
@@ -3706,6 +3710,7 @@ fn test_three_node_cluster_membership_converges() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b, &mut rt_c]);
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_three_node_remote_actor_message_delivery() {
     let mut rt_a = start_distributed_node();
@@ -3783,6 +3788,7 @@ fn test_three_node_remote_actor_message_delivery() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b, &mut rt_c]);
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_actor_migration_between_two_nodes() {
     use crate::bytecode::{ActorMeta, BehaviorTableEntry, CodeModule, Constant};
@@ -4079,6 +4085,7 @@ fn pump_until_addresses_converge(
     }
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite for distribution): a first,
 /// real step -- not the full "10^3 seeds across 5 topologies" target,
 /// but a genuine fault-injection test against real `Runtime` instances
@@ -4202,6 +4209,7 @@ fn test_three_node_cluster_survives_hard_node_failure_and_rejoin() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b, &mut rt_c2]);
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite) rolling-restart follow-up.
 /// `test_three_node_cluster_survives_hard_node_failure_and_rejoin` proved a
 /// single hard node failure is detected and the survivors keep operating
@@ -4363,6 +4371,7 @@ fn test_three_node_cluster_survives_rolling_restart_of_every_node() {
     shutdown_nodes(&mut [&mut rt_c2, &mut rt_b2, &mut rt_a2]);
 }
 
+#[cfg(feature = "tcp")]
 /// Start a distributed node with a virtual clock installed AFTER
 /// distribution is enabled (the cluster's real-time stamps predate the
 /// clock base, so `Instant::duration_since` never underflows). All time
@@ -4418,6 +4427,7 @@ fn active_views_converged(nodes: &[&Runtime], ids: &[NodeId]) -> bool {
     })
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite): split-brain — two mutually
 /// invisible healthy sub-clusters, NOT one node dying. Three real
 /// `Runtime`s over real loopback TCP, driven by per-node virtual clocks
@@ -4576,6 +4586,7 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b, &mut rt_c]);
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite): asymmetric partition — A sees
 /// B but B can't see A. Only A's outbound packets to B are dropped, so B
 /// stops hearing A and must mark A `Failed` through the real failure
@@ -4710,6 +4721,7 @@ fn test_three_node_cluster_asymmetric_partition_detects_and_heals() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite): 5-node split-brain, the
 /// "5-node topologies" item. Five real `Runtime`s over real loopback
 /// TCP, split {A,B} | {C,D,E} via transport-level packet drops. Asserts
@@ -4857,6 +4869,7 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     shutdown_nodes(&mut nodes.iter_mut().collect::<Vec<_>>());
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite): split-brain RESOLVER behavior
 /// end-to-end — the `StaticQuorumResolver` down-self path through the
 /// REAL runtime, not the cluster-sim unit tests. Three real `Runtime`s
@@ -5073,6 +5086,7 @@ fn test_three_node_cluster_static_quorum_downs_minority() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b, &mut rt_c]);
 }
 
+#[cfg(feature = "tcp")]
 /// End-to-end coverage of PLAN.md Phase 5 deliverable 7 parts (a)+(b)
 /// through the REAL failure-detection path, not a direct call to
 /// `handle_node_failed`. A local actor on survivor A monitors a remote
@@ -5181,6 +5195,7 @@ fn test_node_death_delivers_down_to_local_watcher_via_failure_detector() {
     shutdown_nodes(&mut [&mut rt_a]);
 }
 
+#[cfg(feature = "tcp")]
 /// The self-healing path (Phase 5 deliverable 2): when a node goes quiet,
 /// the survivor's failure detector marks it Failed and the cluster probe
 /// re-establishes contact — once the quiet node processes again, the probe
@@ -5240,6 +5255,7 @@ fn test_probe_rejoins_quiet_node_without_explicit_join() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// Content hash mismatch triggers bytecode fetch; the retry queue holds
 /// the message until the FetchBehaviorResponse arrives, then delivers it.
 #[test]
@@ -5352,6 +5368,7 @@ fn test_message_retry_after_bytecode_fetch() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// Gossip relay convergence: three nodes seeded only as a chain
 /// (B joins A, C joins B — C never contacts A directly) must still
 /// converge to a full membership view via gossip relayed by B.
@@ -5418,6 +5435,7 @@ fn remote_spawn_store_handler(actor: &mut Actor, args: &[Value]) {
     actor.set_state_field("received", Value::int(n));
 }
 
+#[cfg(feature = "tcp")]
 /// Remote spawn delivery: node A issues a SpawnRequest for a behavior
 /// registered on node B, receives the new actor's id via SpawnResponse,
 /// and can then address the spawned actor by name.
@@ -5554,6 +5572,7 @@ fn test_remote_spawn_request_delivery() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// RFC-0007 cross-node routing by BARE actor-ref value: after a remote
 /// spawn, `send`/`ask` addressing the spawned actor by its plain id (the
 /// only thing an actor-ref Value carries) must route over the wire —
@@ -5649,6 +5668,7 @@ fn test_remote_ref_send_by_bare_id_routes_wire() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// RFC-0007 placeholder queue: a message sent to the spawn@node
 /// placeholder BEFORE the SpawnResponse arrives is queued in wire form
 /// and flushed to the real actor id on arrival — no message loss in the
@@ -5770,6 +5790,7 @@ fn test_remote_ref_pending_spawn_queue_flushes() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// RFC-0007 collision guard: `fresh_actor_id` starts at 1 on EVERY node,
 /// so a remote actor id can numerically equal a local actor's id. Local
 /// actors must win the routing decision — a bare-id send to a colliding
@@ -5832,6 +5853,7 @@ fn test_crdt_sync_round_schedule() {
     ));
 }
 
+#[cfg(feature = "tcp")]
 /// `sync_crdts` is a no-op that does not count rounds when distribution
 /// is disabled; once enabled, every call counts exactly one round.
 #[test]
@@ -5850,6 +5872,7 @@ fn test_sync_crdts_round_counting() {
     shutdown_nodes(&mut [&mut rt]);
 }
 
+#[cfg(feature = "tcp")]
 /// End-to-end: CRDT changes propagate between two clustered nodes through
 /// `sync_crdts`, across both the initial full-state round (which creates
 /// the entry on the receiver) and subsequent delta rounds.
@@ -5938,6 +5961,7 @@ fn test_crypto_provider_hash_bytes() {
     );
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_mutual_tls_connect_and_verify() {
     // Two nodes with the same CA can establish a TLS connection, verify
@@ -5970,6 +5994,7 @@ fn test_mutual_tls_connect_and_verify() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_mutual_tls_cluster_converges() {
     // Two mTLS nodes with the same CA converge via heartbeats.
@@ -5995,6 +6020,7 @@ fn test_mutual_tls_cluster_converges() {
     pump_until_converged(&mut [&mut rt_a, &mut rt_b], 2, Duration::from_secs(15));
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
+#[cfg(feature = "tcp")]
 #[test]
 fn test_mutual_tls_rejects_cert_identity_mismatch() {
     let (ca_pem, ca_key) = generate_test_ca();
@@ -6036,6 +6062,7 @@ fn test_mutual_tls_rejects_cert_identity_mismatch() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_mutual_tls_rejects_plaintext_peer() {
     let (ca_pem, ca_key) = generate_test_ca();
