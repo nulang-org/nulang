@@ -540,12 +540,10 @@ fn host_neg(_caller: Caller<'_, HostState>, a: i64) -> Result<i64, Error> {
         // else is a type error.
         let v = crate::vm::Value::from_raw(a);
         match v.as_int() {
-            Some(x) if x != crate::value_layout::INT48_MIN => {
-                Ok(value_layout::tag_int(-x) as i64)
-            }
-            Some(x) => Err(Error::msg(error_message(
-                crate::vm::int_overflow_error("neg", x, 0),
-            ))),
+            Some(x) if x != crate::value_layout::INT48_MIN => Ok(value_layout::tag_int(-x) as i64),
+            Some(x) => Err(Error::msg(error_message(crate::vm::int_overflow_error(
+                "neg", x, 0,
+            )))),
             None => Err(Error::msg(error_message(crate::vm::arith_type_error(
                 "neg", v, v,
             )))),
