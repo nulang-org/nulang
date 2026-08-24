@@ -20,11 +20,11 @@ use std::sync::Arc;
 use std::thread;
 
 #[cfg(feature = "tcp")]
+use crate::package::resolver::parse_semver;
+#[cfg(feature = "tcp")]
 use parking_lot::Mutex;
 #[cfg(feature = "tcp")]
 use std::time::Duration;
-#[cfg(feature = "tcp")]
-use crate::package::resolver::parse_semver;
 
 /// Package registry server.
 ///
