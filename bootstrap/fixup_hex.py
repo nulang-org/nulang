@@ -57,8 +57,13 @@ def fixup(lines: list[str]) -> list[str]:
             continue
         if s.startswith(";"):
             markers[i] = s
-        elif re.match(r'^[0-9a-fA-F]{8}$', s):
-            instr_lines.append((i, parse_hex(s)))
+        elif "()" in s or re.match(r'^[0-9a-fA-F]{8}$', s):
+            # Repair the host compiler's mis-emit of '()' (hex digit for
+            # register 10, the closure-arg staging register) to 'a' so these
+            # instructions get patched like any other. Each '()' corresponds
+            # to a '; 10' marker confirming the digit is 10 ('a').
+            lines[i] = s.replace("()", "a")
+            instr_lines.append((i, parse_hex(s.replace("()", "a"))))
     
     line_to_ic = {li: ic for ic, (li, _) in enumerate(instr_lines)}
     

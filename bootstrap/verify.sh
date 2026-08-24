@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-NULANG="${NULANG_BIN:-cargo run --quiet --}"
+NULANG="${NULANG_BIN:-cargo run --quiet --bin nulang --}"
 
 echo "=== Bootstrap Core verification ==="
 
@@ -100,6 +100,16 @@ add(double(3))
 EOF
 expect_mf bootstrap/pipeline_multi_fn.nula "7"
 rm -f bootstrap/pipeline_multi_fn.nula bootstrap/pipeline_mf.nbc
+
+# 7. Stage 2 self-compile oracle (prep_core → compile_hex → self.nbc).
+# Disabled until let-chain depth is below the host limit (~21 bindings).
+# self_compile() {
+#     python3 bootstrap/prep_core.py < bootstrap/compile_hex.nula |
+#         $NULANG bootstrap/compile_hex.nula 2>/dev/null |
+#         python3 bootstrap/fixup_hex.py |
+#         python3 bootstrap/hex2nbc.py > bootstrap/self_compile.nbc 2>/dev/null
+# }
+# ...
 
 echo ""
 echo "=== All bootstrap checks passed ==="

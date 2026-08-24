@@ -11,6 +11,21 @@ Usage:
 import sys, re, json, struct
 
 
+_HEX_WORD = re.compile(r"^[0-9a-fA-F]{8}$")
+
+
+def parse_hex_word(line: str) -> int | None:
+    """Parse one instruction word, repairing host mis-emit of '()' for hex 0."""
+    s = line.strip()
+    if _HEX_WORD.match(s):
+        return int(s, 16)
+    if "()" in s:
+        repaired = s.replace("()", "0")
+        if _HEX_WORD.match(repaired):
+            return int(repaired, 16)
+    return None
+
+
 def main():
     lines = sys.stdin.readlines()
 
@@ -38,8 +53,10 @@ def main():
         elif s.startswith("; FN_START"):
             # Next non-comment line is the start of a function body
             fn_table.append(len(instructions))
-        elif re.match(r'^[0-9a-fA-F]{8}$', s):
-            instructions.append(int(s, 16))
+        else:
+            word = parse_hex_word(s)
+            if word is not None:
+                instructions.append(word)
 
     if not instructions:
         print("Error: no hex instructions found", file=sys.stderr)

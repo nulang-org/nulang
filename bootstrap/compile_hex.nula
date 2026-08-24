@@ -15,6 +15,11 @@ fn low8(x: Int) -> Int {
     x - q * 0x100
 }
 
+fn low4(x: Int) -> Int {
+    let q = x / 16;
+    x - q * 16
+}
+
 fn low6(x: Int) -> Int {
     let q = x / 0x40;
     x - q * 0x40
@@ -30,9 +35,99 @@ fn bit17(x: Int) -> Int {
 //   closures fn(x) => body, function application f(arg).
 // Environment is stored as a string of 4-byte records (code points 0-63, 6 bits each).
 // Each binding encodes 24 bits: hash (16 bits) + reg (8 bits).
+
+fn hex_digit(n: Int) -> String {
+    if n < 10 then perform Int.to_string(n)
+    else if n == 10 then "a" else if n == 11 then "b"
+    else if n == 12 then "c" else if n == 13 then "d"
+    else if n == 14 then "e" else "f"
+}
+
+fn remark(msg: String) {
+    perform IO.print("; " + msg)
+}
+
+fn emit_hex(w: Int) {
+    perform IO.print("" +
+        hex_digit(low4(w / 0x10000000)) +
+        hex_digit(low4(w / 0x1000000)) +
+        hex_digit(low4(w / 0x100000)) +
+        hex_digit(low4(w / 0x10000)) +
+        hex_digit(low4(w / 0x1000)) +
+        hex_digit(low4(w / 0x100)) +
+        hex_digit(low4(w / 0x10)) +
+        hex_digit(low4(w))
+    )
+}
+
+// Encode instruction: opcode<<24 | op1<<16 | op2<<8 | op3
+
+fn instr(opcode: Int, op1: Int, op2: Int, op3: Int) -> Int {
+    (opcode << 24) + (op1 << 16) + (op2 << 8) + op3
+}
+
+fn emit_word(opcode: Int, op1: Int, op2: Int, op3: Int) -> Int {
+    let w = instr(opcode, op1, op2, op3);
+    emit_hex(w);
+    0
+}
+
+fn env_decode(env: String, i: Int) -> Int {
+    let b0 = perform String.charAt(env, i) - 1;
+    let b1 = perform String.charAt(env, i + 1) - 1;
+    let b2 = perform String.charAt(env, i + 2) - 1;
+    let b3 = perform String.charAt(env, i + 3) - 1;
+    (b0 << 18) + (b1 << 12) + (b2 << 6) + b3
+}
+
+// Scan env entries oldest→newest and emit Move+CapStore for each capture.
+// Returns the next slot index.
+
+fn emit_cap_step(closure_reg: Int, slot: Int, is_store: Int) -> Int {
+    let cap_reg = 11 + slot;
+    if is_store != 0 then emit_word(0x62, closure_reg, slot, cap_reg)
+    else emit_word(0x61, slot, cap_reg, 0)
+}
+
+fn emit_fnend_step(reg: Int, slot: Int, closure_reg: Int) -> Int {
+    let cap_dst = 11 + slot;
+    emit_word(0x12, reg, cap_dst, 0);
+    emit_word(0x62, closure_reg, slot, cap_dst)
+}
+// Recursively emit CapLoad (is_store=0) or CapStore (is_store!=0)
+// for capture slots [slot..count-1].
+
+fn emit_caps(closure_reg: Int, count: Int, slot: Int, is_store: Int) -> Int {
+    if slot >= count then 0
+    else {
+        emit_cap_step(closure_reg, slot, is_store);
+        emit_caps(closure_reg, count, slot + 1, is_store)
+    }
+}
+
+fn emit_fnend_caps(env: String, elen: Int, idx: Int, slot: Int, closure_reg: Int) -> Int {
+    if idx >= elen then slot
+    else {
+        let v = env_decode(env, idx * 4);
+        let reg = low8(v);
+        let is_cap = reg >= 100 and reg < 128;
+        if is_cap then {
+            emit_fnend_step(reg, slot, closure_reg);
+            emit_fnend_caps(env, elen, idx + 1, slot + 1, closure_reg)
+        } else {
+            emit_fnend_caps(env, elen, idx + 1, slot, closure_reg)
+        }
+    }
+}
+
+// Returns (result_reg << 18) | pos.  The bool bit is (1<<17).
+
 fn is_digit(c: Int) -> Bool { c >= 48 and c <= 57 }
+
 fn is_alpha(c: Int) -> Bool { (c >= 65 and c <= 90) or (c >= 97 and c <= 122) }
+
 fn is_alphanum(c: Int) -> Bool { is_alpha(c) or is_digit(c) or c == 95 }
+
 fn is_space(c: Int) -> Bool { c == 32 or c == 10 or c == 13 or c == 9 }
 
 fn skip_ws(src: String, pos: Int, len: Int) -> Int {
@@ -81,6 +176,7 @@ fn read_string_end(src: String, pos: Int, len: Int) -> Int {
 
 // Environment stored as a string of 4-byte records (code points 0-63, 6 bits each).
 // Each binding encodes 24 bits: hash (16 bits) + reg (8 bits).
+
 fn env_push(env: String, h: Int, reg: Int) -> String {
     let v = ((low16(h)) << 8) + (low8(reg));
     let c0 = (low6((v >> 18))) + 1;
@@ -94,16 +190,10 @@ fn env_push(env: String, h: Int, reg: Int) -> String {
         perform String.from_char(c3)
 }
 
-
 fn env_lookup(env: String, elen: Int, h: Int) -> Int {
     if elen <= 0 then 0
     else {
-        let i = (elen - 1) * 4;
-        let b0 = perform String.charAt(env, i) - 1;
-        let b1 = perform String.charAt(env, i + 1) - 1;
-        let b2 = perform String.charAt(env, i + 2) - 1;
-        let b3 = perform String.charAt(env, i + 3) - 1;
-        let v = (b0 << 18) + (b1 << 12) + (b2 << 6) + b3;
+        let v = env_decode(env, (elen - 1) * 4);
         let hh = low16((v >> 8));
         let reg = low8(v);
         if hh == (low16(h)) then reg
@@ -112,15 +202,11 @@ fn env_lookup(env: String, elen: Int, h: Int) -> Int {
 }
 
 // Count capture-worthy entries in the env (registers 100-127 or 11-19).
+
 fn count_captures(env: String, elen: Int) -> Int {
     if elen <= 0 then 0
     else {
-        let i = (elen - 1) * 4;
-        let b0 = perform String.charAt(env, i) - 1;
-        let b1 = perform String.charAt(env, i + 1) - 1;
-        let b2 = perform String.charAt(env, i + 2) - 1;
-        let b3 = perform String.charAt(env, i + 3) - 1;
-        let v = (b0 << 18) + (b1 << 12) + (b2 << 6) + b3;
+        let v = env_decode(env, (elen - 1) * 4);
         let reg = low8(v);
         let is_cap = reg >= 100 and reg < 128;
         let rest = count_captures(env, elen - 1);
@@ -132,15 +218,11 @@ fn count_captures(env: String, elen: Int) -> Int {
 // Processes entries oldest→newest (idx 0→elen-1).  For each captured
 // entry, appends an env_push mapping the same hash to r(11+slot).
 // Returns the augmented env; the capture count is in emit order.
+
 fn remap_captures(env: String, elen: Int, idx: Int, slot: Int) -> String {
     if idx >= elen then env
     else {
-        let i = idx * 4;
-        let b0 = perform String.charAt(env, i) - 1;
-        let b1 = perform String.charAt(env, i + 1) - 1;
-        let b2 = perform String.charAt(env, i + 2) - 1;
-        let b3 = perform String.charAt(env, i + 3) - 1;
-        let v = (b0 << 18) + (b1 << 12) + (b2 << 6) + b3;
+        let v = env_decode(env, idx * 4);
         let hh = low16((v >> 8));
         let reg = low8(v);
         let is_cap = reg >= 100 and reg < 128;
@@ -152,7 +234,6 @@ fn remap_captures(env: String, elen: Int, idx: Int, slot: Int) -> String {
         }
     }
 }
-
 
 fn prec_of(c: Int) -> Int {
     if c == 43 then 2 else if c == 45 then 2
@@ -193,76 +274,153 @@ fn parse_shift(src: String, p: Int, len: Int) -> Int {
 }
 
 // Convert nybble (0-15) to hex char
-fn hex_digit(n: Int) -> String {
-    if n < 10 then perform Int.to_string(n)
-    else if n == 10 then "a" else if n == 11 then "b"
-    else if n == 12 then "c" else if n == 13 then "d"
-    else if n == 14 then "e" else "f"
+
+fn skip_fn_type(src: String, pos: Int, len: Int) -> Int {
+    let q5_raw = skip_ws(src, pos, len);
+    if q5_raw < len then {
+        let c_colon = perform String.charAt(src, q5_raw);
+        if c_colon == 58 then {
+            let after_colon = skip_ws(src, q5_raw + 1, len);
+            let type_id = read_ident(src, after_colon, len, 0);
+            low16(type_id)
+        } else { q5_raw }
+    } else { q5_raw }
 }
 
-fn remark(msg: String) {
-    perform IO.print("; " + msg)
+fn comp_fn_closure(comp_rec, src: String, q6: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, ph: Int, p: Int) -> Int {
+    if q6 + 1 < len then {
+        let c3 = perform String.charAt(src, q6);
+        let c4 = perform String.charAt(src, q6 + 1);
+        if c3 == 61 and c4 == 62 then {
+            remark("Jmp -> fn_end");
+            emit_word(0x50, 0, 0, 0);
+            remark("FN_START");
+            let param_save = 100 + elen;
+            emit_word(0x12, 10, param_save, 0);
+            let env_remapped = remap_captures(env, elen, 0, 0);
+            let capture_count = (perform String.length(env_remapped) - perform String.length(env)) / 4;
+            let env2 = if capture_count > 0 then {
+                env_push(env_remapped, low16(ph), param_save)
+            } else {
+                env_push(env, low16(ph), param_save)
+            };
+            let elen2 = elen + capture_count + 1;
+            let _ = emit_caps(0, capture_count, 0, 0);
+            emit_word(0x12, param_save, 11 + capture_count, 0);
+            let body = comp_rec(src, q6 + 2, len, no_left, -1, 8, env2, elen2);
+            let body_reg = body >> 18;
+            let body_end = low17(body);
+            emit_word(0x12, body_reg, 0, 0);
+            emit_word(0x57, 0, 0, 0);
+            remark("fn_end:");
+            let closure_reg = nr;
+            emit_word(0x60, 0xFF, 0xFF, closure_reg);
+            let _ = emit_caps(closure_reg, capture_count, 0, 1);
+            (closure_reg << 18) + body_end
+        } else (nr << 18) + p
+    } else (nr << 18) + p
 }
 
-fn emit_hex(w: Int) {
-    perform IO.print("" +
-        hex_digit((w >> 28) & 0xF) +
-        hex_digit((w >> 24) & 0xF) +
-        hex_digit((w >> 20) & 0xF) +
-        hex_digit((w >> 16) & 0xF) +
-        hex_digit((w >> 12) & 0xF) +
-        hex_digit((w >> 8) & 0xF) +
-        hex_digit((w >> 4) & 0xF) +
-        hex_digit(w & 0xF)
-    )
+fn comp_fn_parse(comp_rec, src: String, pos: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, p: Int, q: Int) -> Int {
+    let q2 = skip_ws(src, q, len);
+    if q2 < len then {
+        let c1 = perform String.charAt(src, q2);
+        if c1 == 40 then {
+            let q3 = skip_ws(src, q2 + 1, len);
+            let param_id = read_ident(src, q3, len, 0);
+            let ph = param_id >> 16;
+            let q4 = low16(param_id);
+            let q5 = skip_fn_type(src, q4, len);
+            if q5 < len then {
+                let c2 = perform String.charAt(src, q5);
+                if c2 == 41 then {
+                    let q6 = skip_ws(src, q5 + 1, len);
+                    comp_fn_closure(comp_rec, src, q6, len, nr, env, elen, no_left, ph, p)
+                } else (nr << 18) + p
+            } else (nr << 18) + p
+        } else (nr << 18) + p
+    } else (nr << 18) + p
 }
 
-// Encode instruction: opcode<<24 | op1<<16 | op2<<8 | op3
-fn instr(opcode: Int, op1: Int, op2: Int, op3: Int) -> Int {
-    (opcode << 24) + (op1 << 16) + (op2 << 8) + op3
-}
-// Recursively emit CapLoad (is_store=0) or CapStore (is_store!=0)
-// for capture slots [slot..count-1].
-fn emit_caps(closure_reg: Int, count: Int, slot: Int, is_store: Int) -> Int {
-    if slot >= count then 0
-    else {
-        let cap_reg = 11 + slot;
-        if is_store != 0 then {
-            emit_hex(instr(0x62, closure_reg, slot, cap_reg))
-        } else {
-            emit_hex(instr(0x61, slot, cap_reg, 0))
-        };
-        emit_caps(closure_reg, count, slot + 1, is_store)
-    }
+fn nperform_finish(src: String, eff_start: Int, len: Int, dst: Int, end_pos: Int) -> Int {
+    let eff_name = read_string(src, eff_start, len, "");
+    let quote = perform String.from_char(34);
+    remark("const " + quote + eff_name + quote);
+    emit_word(0x90, 0, 0, dst);
+    (dst << 18) + end_pos
 }
 
-// Scan env entries oldest→newest and emit Move+CapStore for each capture.
-// Returns the next slot index.
-fn emit_fnend_caps(env: String, elen: Int, idx: Int, slot: Int, closure_reg: Int) -> Int {
-    if idx >= elen then slot
-    else {
-        let i = idx * 4;
-        let b0 = perform String.charAt(env, i) - 1;
-        let b1 = perform String.charAt(env, i + 1) - 1;
-        let b2 = perform String.charAt(env, i + 2) - 1;
-        let b3 = perform String.charAt(env, i + 3) - 1;
-        let v = (b0 << 18) + (b1 << 12) + (b2 << 6) + b3;
-        let reg = low8(v);
-        let is_cap = reg >= 100 and reg < 128;
-        if is_cap then {
-            let cap_dst = 11 + slot;
-            emit_hex(instr(0x12, reg, cap_dst, 0));
-            emit_hex(instr(0x62, closure_reg, slot, cap_dst));
-            emit_fnend_caps(env, elen, idx + 1, slot + 1, closure_reg)
-        } else {
-            emit_fnend_caps(env, elen, idx + 1, slot, closure_reg)
-        }
-    }
+fn comp_nperform_body(comp_rec, src: String, eff_start: Int, q5: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, p: Int) -> Int {
+    if q5 < len then {
+        let c3 = perform String.charAt(src, q5);
+        let dst = nr;
+        if c3 == 41 then {
+            nperform_finish(src, eff_start, len, dst, skip_ws(src, q5 + 1, len))
+        } else if c3 == 44 then {
+            let no_left_np = 268435456 * 4096;
+            let p0 = skip_ws(src, q5 + 1, len);
+            let inner0 = comp_rec(src, p0, len, no_left_np, 0, nr + 1, env, elen);
+            let r0 = inner0 >> 18;
+            let e0 = low17(inner0);
+            emit_word(0x12, r0, 0, 0);
+            let ap0 = skip_ws(src, e0, len);
+            if ap0 < len then {
+                let cp0 = perform String.charAt(src, ap0);
+                if cp0 == 41 then {
+                    nperform_finish(src, eff_start, len, dst, skip_ws(src, ap0 + 1, len))
+                } else if cp0 == 44 then {
+                    let p1 = skip_ws(src, ap0 + 1, len);
+                    let inner1 = comp_rec(src, p1, len, no_left_np, 0, nr + 11, env, elen);
+                    let r1 = inner1 >> 18;
+                    let e1 = low17(inner1);
+                    emit_word(0x12, r1, 1, 0);
+                    let ap1 = skip_ws(src, e1, len);
+                    if ap1 < len then {
+                        let cp1 = perform String.charAt(src, ap1);
+                        if cp1 == 41 then {
+                            nperform_finish(src, eff_start, len, dst, skip_ws(src, ap1 + 1, len))
+                        } else if cp1 == 44 then {
+                            let p2 = skip_ws(src, ap1 + 1, len);
+                            let inner2 = comp_rec(src, p2, len, no_left_np, 0, nr + 21, env, elen);
+                            let r2 = inner2 >> 18;
+                            let e2 = low17(inner2);
+                            emit_word(0x12, r2, 2, 0);
+                            let ap2 = skip_ws(src, e2, len);
+                            if ap2 < len then {
+                                let cp2 = perform String.charAt(src, ap2);
+                                if cp2 == 41 then {
+                                    nperform_finish(src, eff_start, len, dst, skip_ws(src, ap2 + 1, len))
+                                } else (nr << 18) + p
+                            } else (nr << 18) + p
+                        } else (nr << 18) + p
+                    } else (nr << 18) + p
+                } else (nr << 18) + p
+            } else (nr << 18) + p
+        } else (nr << 18) + p
+    } else (nr << 18) + p
 }
 
-// Returns (result_reg << 18) | pos.  The bool bit is (1<<17).
+fn comp_nperform_parse(comp_rec, src: String, pos: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, p: Int, q: Int) -> Int {
+    let q2 = skip_ws(src, q, len);
+    if q2 < len then {
+        let c1 = perform String.charAt(src, q2);
+        if c1 == 40 then {
+            let q3 = skip_ws(src, q2 + 1, len);
+            if q3 < len then {
+                let c2 = perform String.charAt(src, q3);
+                if c2 == 34 then {
+                    let eff_start = q3 + 1;
+                    let q4 = read_string_end(src, q3 + 1, len);
+                    let q5 = skip_ws(src, q4, len);
+                    comp_nperform_body(comp_rec, src, eff_start, q5, len, nr, env, elen, no_left, p)
+                } else (nr << 18) + p
+            } else (nr << 18) + p
+        } else (nr << 18) + p
+    } else (nr << 18) + p
+}
+
 fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env: String, elen: Int) -> Int {
-    let no_left = 1 << 40;
+    let no_left = 268435456 * 4096;
     let pair = if left == no_left then {
         let p = skip_ws(src, pos, len);
         if p >= len then (nr << 18) + p
@@ -272,13 +430,13 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                 let packed = read_int(src, p, len, 0);
                 let num = packed >> 16;
                 let q = low16(packed);
-                if num == 0 then emit_hex(instr(0x03, nr, 0, 0))
-                else if num == 1 then emit_hex(instr(0x04, nr, 0, 0))
-                else if num == 2 then emit_hex(instr(0x05, nr, 0, 0))
-                else if num == -1 then emit_hex(instr(0x06, nr, 0, 0))
+                if num == 0 then emit_word(0x03, nr, 0, 0)
+                else if num == 1 then emit_word(0x04, nr, 0, 0)
+                else if num == 2 then emit_word(0x05, nr, 0, 0)
+                else if num == -1 then emit_word(0x06, nr, 0, 0)
                 else {
                     remark("const " + perform Int.to_string(num));
-                    emit_hex(instr(0x07, 0, 0, nr))
+                    emit_word(0x07, 0, 0, nr)
                 };
                 (nr << 18) + q
             } else if c == 40 then {
@@ -296,7 +454,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                 let q = read_string_end(src, p + 1, len);
                 let quote = perform String.from_char(34);
                 remark("const " + quote + s + quote);
-                emit_hex(instr(0x07, 0, 0, nr));
+                emit_word(0x07, 0, 0, nr);
                 (nr << 18) + q
             } else if is_alpha(c) then {
                 let ident = read_ident(src, p, len, 0);
@@ -316,12 +474,13 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                             // bodies can refer to themselves without the placeholder being
                             // clobbered by temporaries during body compilation.
                             let vh16 = low16(vh);
-                            let save_reg = low8(200 + nr + elen);
+                            let ne = nr + elen;
+                            let save_reg = if ne < 56 then 200 + ne else 143 + (ne - 56);
                             let env_rec = env_push(env, vh16, save_reg);
                             let bound = comp(src, q4 + 1, len, no_left, -1, nr, env_rec, elen + 1);
                             let vr = bound >> 18;
                             let vp = low17(bound);
-                            emit_hex(instr(0x12, vr, save_reg, 0));
+                            emit_word(0x12, vr, save_reg, 0);
                             let vp2 = skip_ws(src, vp, len);
                             if vp2 + 1 < len then {
                                 let ci = perform String.charAt(src, vp2);
@@ -335,73 +494,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     } else (nr << 18) + p
                 } else if h == 620 then {
                     // fn
-                    let q2 = skip_ws(src, q, len);
-                    if q2 < len then {
-                        let c1 = perform String.charAt(src, q2);
-                        if c1 == 40 then {
-                            let q3 = skip_ws(src, q2 + 1, len);
-                            let param_id = read_ident(src, q3, len, 0);
-                            let ph = param_id >> 16;
-                            let q4 = low16(param_id);
-                            let q5_raw = skip_ws(src, q4, len);
-                            let q5 = if q5_raw < len then {
-                                let c_colon = perform String.charAt(src, q5_raw);
-                                if c_colon == 58 then {
-                                    let after_colon = skip_ws(src, q5_raw + 1, len);
-                                    let type_id = read_ident(src, after_colon, len, 0);
-                                    low16(type_id)
-                                } else { q5_raw }
-                            } else { q5_raw };
-                            if q5 < len then {
-                                let c2 = perform String.charAt(src, q5);
-                                if c2 == 41 then {
-                                    let q6 = skip_ws(src, q5 + 1, len);
-                                    if q6 + 1 < len then {
-                                        let c3 = perform String.charAt(src, q6);
-                                        let c4 = perform String.charAt(src, q6 + 1);
-                                        if c3 == 61 and c4 == 62 then {
-                                            remark("Jmp -> fn_end");
-                                            emit_hex(instr(0x50, 0, 0, 0));
-                                            remark("FN_START");
-                                            // Keep the parameter in a stable register well above temporaries.
-                                            // Arguments are passed in r10 by the caller; copy them to a
-                                            // save slot so r10 can be reused for subsequent calls without
-                                            // losing the parameter value.
-                                            let param_save = 100 + elen;
-                                            emit_hex(instr(0x12, 10, param_save, 0));
-                                            // Multi-capture: scan all env entries for captured
-                                            // variables (registers 100-127 from outer params, or
-                                            // 11-19 from previous captures).  Each capture gets
-                                            // its own slot and register r(11+slot).
-                                            let capture_count = count_captures(env, elen);
-                                            let env_remapped = remap_captures(env, elen, 0, 0);
-                                            let env2 = if capture_count > 0 then {
-                                                env_push(env_remapped, low16(ph), param_save)
-                                            } else {
-                                                env_push(env, low16(ph), param_save)
-                                            };
-                                            let elen2 = elen + capture_count + 1;
-                                            let _ = emit_caps(0, capture_count, 0, 0);
-                                            // Forward the current parameter to the next
-                                            // capture register so nested closures can store
-                                            // it via CapStore without a separate Move.
-                                            emit_hex(instr(0x12, param_save, 11 + capture_count, 0));
-                                            let body = comp(src, q6 + 2, len, no_left, -1, 8, env2, elen2);
-                                            let body_reg = body >> 18;
-                                            let body_end = low17(body);
-                                            emit_hex(instr(0x12, body_reg, 0, 0));
-                                            emit_hex(instr(0x57, 0, 0, 0));
-                                            remark("fn_end:");
-                                            let closure_reg = nr;
-                                            emit_hex(instr(0x60, 0xFF, 0xFF, closure_reg));
-                                            let _ = emit_caps(closure_reg, capture_count, 0, 1);
-                                            (closure_reg << 18) + body_end
-                                        } else (nr << 18) + p
-                                    } else (nr << 18) + p
-                                } else (nr << 18) + p
-                            } else (nr << 18) + p
-                        } else (nr << 18) + p
-                    } else (nr << 18) + p
+                    comp_fn_parse(comp, src, pos, len, nr, env, elen, no_left, p, q)
                 } else if h == 627 then {
                     // if
                     let cond = comp(src, q, len, no_left, -1, nr, env, elen);
@@ -418,33 +511,33 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                         remark("if");
                         if lb == 0 then {
                             remark("truthiness: check int 0");
-                            emit_hex(instr(0x03, 7, 0, 0));
+                            emit_word(0x03, 7, 0, 0);
                             let tmp = cnext + 1;
-                            emit_hex(instr(0x40, cr, 7, tmp));
-                            emit_hex(instr(0x49, tmp, tmp, 0));
+                            emit_word(0x40, cr, 7, tmp);
+                            emit_word(0x49, tmp, tmp, 0);
                             remark("JmpF -> else");
-                            emit_hex(instr(0x52, tmp, 0, 0));
+                            emit_word(0x52, tmp, 0, 0);
                             remark("truthiness: check bool false");
                             let bf = tmp + 1;
-                            emit_hex(instr(0x04, bf, 0, 0));
+                            emit_word(0x04, bf, 0, 0);
                             let bfc = bf + 1;
-                            emit_hex(instr(0x40, 7, bf, bfc));
+                            emit_word(0x40, 7, bf, bfc);
                             let bfck = bfc + 1;
-                            emit_hex(instr(0x40, cr, bfc, bfck));
-                            emit_hex(instr(0x49, bfck, bfck, 0));
+                            emit_word(0x40, cr, bfc, bfck);
+                            emit_word(0x49, bfck, bfck, 0);
                             remark("JmpF -> else");
-                            emit_hex(instr(0x52, bfck, 0, 0))
+                            emit_word(0x52, bfck, 0, 0)
                         } else {
                             remark("JmpF -> else");
-                            emit_hex(instr(0x52, cr, 0, 0))
+                            emit_word(0x52, cr, 0, 0)
                         };
                         remark("then:");
                         let then_body = comp(src, tp, len, no_left, -1, cnext, env, elen);
                         let tr = then_body >> 18;
                         let tbp = low17(then_body);
-                        emit_hex(instr(0x12, tr, result_reg, 0));
+                        emit_word(0x12, tr, result_reg, 0);
                         remark("Jmp -> end");
-                        emit_hex(instr(0x50, 0, 0, 0));
+                        emit_word(0x50, 0, 0, 0);
                         remark("else:");
                         let tbp2 = skip_ws(src, tbp, len);
                         let else_id = read_ident(src, tbp2, len, 0);
@@ -454,18 +547,18 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                             let else_body = comp(src, ep, len, no_left, -1, cnext, env, elen);
                             let er = else_body >> 18;
                             let ebp = low17(else_body);
-                            emit_hex(instr(0x12, er, result_reg, 0));
+                            emit_word(0x12, er, result_reg, 0);
                             remark("end:");
                             (result_reg << 18) + ebp
                         } else (nr << 18) + p
                     } else (nr << 18) + p
                 } else if h == 18036 then {
                     // true
-                    emit_hex(instr(0x04, nr, 0, 0));
+                    emit_word(0x04, nr, 0, 0);
                     (nr << 18) + q
                 } else if h == 13715 then {
                     // false (low16 of hash 79251)
-                    emit_hex(instr(0x03, nr, 0, 0));
+                    emit_word(0x03, nr, 0, 0);
                     (nr << 18) + q
                 } else if h == 3421 then {
                     // not
@@ -473,101 +566,18 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     let iv = inner >> 18;
                     let ip = low17(inner);
                     let dr = nr + 1;
-                    emit_hex(instr(0x03, dr, 0, 0));
+                    emit_word(0x03, dr, 0, 0);
                     let dr2 = nr + 2;
-                    emit_hex(instr(0x40, iv, dr, dr2));
+                    emit_word(0x40, iv, dr, dr2);
                     (dr2 << 18) + (1 << 17) + ip
                 } else if h == 64461 then {
                     // nperform("effect.name" [, arg1 [, arg2 [, arg3]]])
-                    let q2 = skip_ws(src, q, len);
-                    if q2 < len then {
-                        let c1 = perform String.charAt(src, q2);
-                        if c1 == 40 then {
-                            let q3 = skip_ws(src, q2 + 1, len);
-                            if q3 < len then {
-                                let c2 = perform String.charAt(src, q3);
-                                if c2 == 34 then {
-                                    let eff_start = q3 + 1;
-                                    let q4 = read_string_end(src, q3 + 1, len);
-                                    let q5 = skip_ws(src, q4, len);
-                                    if q5 < len then {
-                                        let c3 = perform String.charAt(src, q5);
-                                        let dst = nr;
-                                        if c3 == 41 then {
-                                            // No arguments
-                                            let eff_name = read_string(src, eff_start, len, "");
-                                            let quote = perform String.from_char(34);
-                                            remark("const " + quote + eff_name + quote);
-                                            emit_hex(instr(0x90, 0, 0, dst));
-                                            (dst << 18) + skip_ws(src, q5 + 1, len)
-                                        } else if c3 == 44 then {
-                                            // One or more arguments
-                                            let no_left_np = 1 << 40;
-                                            let p0 = skip_ws(src, q5 + 1, len);
-                                            let inner0 = comp(src, p0, len, no_left_np, 0, nr + 1, env, elen);
-                                            let r0 = inner0 >> 18;
-                                            let e0 = low17(inner0);
-                                            emit_hex(instr(0x12, r0, 0, 0));
-                                            let ap0 = skip_ws(src, e0, len);
-                                            if ap0 < len then {
-                                                let cp0 = perform String.charAt(src, ap0);
-                                                if cp0 == 41 then {
-                                                    // Exactly one argument
-                                                    let eff_name = read_string(src, eff_start, len, "");
-                                                    let quote = perform String.from_char(34);
-                                                    remark("const " + quote + eff_name + quote);
-                                                    emit_hex(instr(0x90, 0, 0, dst));
-                                                    (dst << 18) + skip_ws(src, ap0 + 1, len)
-                                                } else if cp0 == 44 then {
-                                                    // Two or more arguments
-                                                    let p1 = skip_ws(src, ap0 + 1, len);
-                                                    let inner1 = comp(src, p1, len, no_left_np, 0, nr + 11, env, elen);
-                                                    let r1 = inner1 >> 18;
-                                                    let e1 = low17(inner1);
-                                                    emit_hex(instr(0x12, r1, 1, 0));
-                                                    let ap1 = skip_ws(src, e1, len);
-                                                    if ap1 < len then {
-                                                        let cp1 = perform String.charAt(src, ap1);
-                                                        if cp1 == 41 then {
-                                                            // Exactly two arguments
-                                                            let eff_name = read_string(src, eff_start, len, "");
-                                                            let quote = perform String.from_char(34);
-                                                            remark("const " + quote + eff_name + quote);
-                                                            emit_hex(instr(0x90, 0, 0, dst));
-                                                            (dst << 18) + skip_ws(src, ap1 + 1, len)
-                                                        } else if cp1 == 44 then {
-                                                            // Three arguments
-                                                            let p2 = skip_ws(src, ap1 + 1, len);
-                                                            let inner2 = comp(src, p2, len, no_left_np, 0, nr + 21, env, elen);
-                                                            let r2 = inner2 >> 18;
-                                                            let e2 = low17(inner2);
-                                                            emit_hex(instr(0x12, r2, 2, 0));
-                                                            let ap2 = skip_ws(src, e2, len);
-                                                            if ap2 < len then {
-                                                                let cp2 = perform String.charAt(src, ap2);
-                                                                if cp2 == 41 then {
-                                                                    let eff_name = read_string(src, eff_start, len, "");
-                                                                    let quote = perform String.from_char(34);
-                                                                    remark("const " + quote + eff_name + quote);
-                                                                    emit_hex(instr(0x90, 0, 0, dst));
-                                                                    (dst << 18) + skip_ws(src, ap2 + 1, len)
-                                                                } else (nr << 18) + p
-                                                            } else (nr << 18) + p
-                                                        } else (nr << 18) + p
-                                                    } else (nr << 18) + p
-                                                } else (nr << 18) + p
-                                            } else (nr << 18) + p
-                                        } else (nr << 18) + p
-                                    } else (nr << 18) + p
-                                } else (nr << 18) + p
-                            } else (nr << 18) + p
-                        } else (nr << 18) + p
-                    } else (nr << 18) + p
+                    comp_nperform_parse(comp, src, pos, len, nr, env, elen, no_left, p, q)
                 } else {
                     let reg = env_lookup(env, elen, low16(h));
                     if reg == 0 then (nr << 18) + p
                     else {
-                        emit_hex(instr(0x12, reg, nr, 0));
+                        emit_word(0x12, reg, nr, 0);
                         (nr << 18) + q
                     }
                 }
@@ -587,8 +597,9 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
     else {
         let c = perform String.charAt(src, p);
         if c == 40 then {
-            let save_reg = low8(150 + nr + elen);
-            emit_hex(instr(0x12, lr, save_reg, 0));
+            let ne = nr + elen;
+            let save_reg = if ne < 56 then 150 + ne else 93 + (ne - 56);
+            emit_word(0x12, lr, save_reg, 0);
             let arg = comp(src, p + 1, len, no_left, -1, nr + 1, env, elen);
             let arg_end = low17(arg);
             let ap = skip_ws(src, arg_end, len);
@@ -600,11 +611,11 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     let has_arg = arg_end != p + 1;
                     if has_arg then {
                         let arg_reg = arg >> 18;
-                        emit_hex(instr(0x12, arg_reg, 10, 0))
-                    } else { };
+                        emit_word(0x12, arg_reg, 10, 0)
+                    } else 0;
                     let dst = nr;
                     let argc = if has_arg then 1 else 0;
-                    emit_hex(instr(0x64, save_reg, argc, dst));
+                    emit_word(0x64, save_reg, argc, dst);
                     comp(src, ap + 1, len, dst, min_prec, dst + 1, env, elen)
                 } else pair
             } else pair
@@ -619,7 +630,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     let dr = nr + 2;
                     let rr = rhs >> 18;
                     let rp = low17(rhs);
-                    emit_hex(instr(sop, lr, rr, dr));
+                    emit_word(sop, lr, rr, dr);
                     comp(src, rp, len, dr + (1 << 39), min_prec, dr + 1, env, elen)
                 }
             } else {
@@ -634,10 +645,10 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                         let rr = rhs >> 18;
                         let rp = low17(rhs);
                         if cop == 0xFF then {
-                            emit_hex(instr(0x40, lr, rr, dr));
-                            emit_hex(instr(0x49, dr, dr, 0))
+                            emit_word(0x40, lr, rr, dr);
+                            emit_word(0x49, dr, dr, 0)
                         } else {
-                            emit_hex(instr(cop, lr, rr, dr))
+                            emit_word(cop, lr, rr, dr)
                         };
                         comp(src, rp, len, dr + (1 << 39), min_prec, dr + 1, env, elen)
                     }
@@ -652,15 +663,15 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     let lb = bit17(pair);
                     remark("and");
                     if lb == 0 then {
-                        emit_hex(instr(0x03, 7, 0, 0));
+                        emit_word(0x03, 7, 0, 0);
                         let tmp = nr + 1;
-                        emit_hex(instr(0x40, lr, 7, tmp));
-                        emit_hex(instr(0x49, tmp, tmp, 0));
+                        emit_word(0x40, lr, 7, tmp);
+                        emit_word(0x49, tmp, tmp, 0);
                         remark("JmpF -> and_end");
-                        emit_hex(instr(0x52, tmp, 0, 0))
+                        emit_word(0x52, tmp, 0, 0)
                     } else {
                         remark("JmpF -> and_end");
-                        emit_hex(instr(0x52, lr, 0, 0))
+                        emit_word(0x52, lr, 0, 0)
                     };
                     let rhs = comp(src, q, len, no_left, 0, nr + 1, env, elen);
                     let rr = rhs >> 18;
@@ -673,20 +684,20 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     let lb = bit17(pair);
                     remark("or");
                     if lb == 0 then {
-                        emit_hex(instr(0x03, 7, 0, 0));
+                        emit_word(0x03, 7, 0, 0);
                         let tmp = nr + 1;
-                        emit_hex(instr(0x40, lr, 7, tmp));
-                        emit_hex(instr(0x49, tmp, tmp, 0));
+                        emit_word(0x40, lr, 7, tmp);
+                        emit_word(0x49, tmp, tmp, 0);
                         remark("JmpF -> or_right");
-                        emit_hex(instr(0x52, tmp, 0, 0))
+                        emit_word(0x52, tmp, 0, 0)
                     } else {
                         remark("JmpF -> or_right");
-                        emit_hex(instr(0x52, lr, 0, 0))
+                        emit_word(0x52, lr, 0, 0)
                     };
                     let dr = nr + 2;
-                    emit_hex(instr(0x04, dr, 0, 0));
+                    emit_word(0x04, dr, 0, 0);
                     remark("Jmp -> or_end");
-                    emit_hex(instr(0x50, 0, 0, 0));
+                    emit_word(0x50, 0, 0, 0);
                     remark("or_right:");
                     let rhs = comp(src, q, len, no_left, 0, dr + 1, env, elen);
                     let rr = rhs >> 18;
@@ -704,7 +715,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                 let rr = rhs >> 18;
                 let rp = low17(rhs);
                 let dr = nr + 2;
-                emit_hex(instr(opcode, lr, rr, dr));
+                emit_word(opcode, lr, rr, dr);
                 comp(src, rp, len, dr, min_prec, dr + 1, env, elen)
             }
         }
@@ -716,8 +727,8 @@ fn compile(src: String) {
     perform IO.print("; " + src);
     let result = comp(src, 0, len, 1 << 40, -1, 8, "", 0);
     let reg = result >> 18;
-    emit_hex(instr(0x12, reg, 0, 0));
-    emit_hex(instr(0x01, 0, 0, 0));
+    emit_word(0x12, reg, 0, 0);
+    emit_word(0x01, 0, 0, 0);
     perform IO.print("; result in r" + perform Int.to_string(result >> 18))
 }
 

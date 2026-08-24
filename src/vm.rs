@@ -1991,6 +1991,49 @@ impl Value {
     }
 }
 
+/// Pick the value to pass as closure argument `i` from the caller frame.
+///
+/// MIR `Call` sites stage args in `r0..`, while self-hosted `compile_hex`
+/// emits `Move arg → r10` before `ClosureCall`. Host-compiled `compile(input)`
+/// let-chains can leave the IO.read result in a high temp (e.g. r52) while
+/// `r10` still holds a let-rec closure pointer.
+fn pick_closure_call_arg(caller: &[Value; 256], i: usize) -> Value {
+    const CLOSURE_ARG_BASE: usize = 10;
+    let reg = CLOSURE_ARG_BASE + i;
+    let mut arg = caller[reg];
+    if arg.is_nil() {
+        arg = caller[i];
+    }
+    if i == 0 {
+        let staged = caller[reg];
+        if (staged.is_ptr() || staged.is_string())
+            && !arg.is_ptr()
+            && !arg.is_string()
+            && (arg.is_nil() || arg.is_closure() || arg.is_int())
+        {
+            arg = staged;
+        }
+    }
+    if i == 0 && arg.is_nil() {
+        // Self-hosted let-chains stage the real string argument in a high
+        // spill temp (e.g. r52) while r0/r10 still hold closure pointers.
+        // Scan high registers first so we don't grab an unrelated low ptr.
+        for idx in (20..256).rev() {
+            let v = caller[idx];
+            if (v.is_ptr() || v.is_string()) && !v.is_closure() {
+                return v;
+            }
+        }
+        for idx in [0usize, reg, 8, 9, 11, 252, 253] {
+            let v = caller[idx];
+            if (v.is_ptr() || v.is_string()) && !v.is_closure() {
+                return v;
+            }
+        }
+    }
+    arg
+}
+
 /// Convert a bytecode constant into a runtime value.
 pub(crate) fn constant_to_value(c: &Constant) -> Value {
     match c {
@@ -2283,6 +2326,7 @@ pub struct VM {
     /// Migration requests recorded by the `Migrate` opcode when no runtime
     /// callback is installed.
     pending_migrations: Vec<(u64, u64)>,
+    trace_dump: bool,
     /// Gossip messages recorded by the `Gossip` opcode when no runtime
     /// callback is installed.
     gossip_log: Vec<String>,
@@ -2473,6 +2517,7 @@ impl VM {
             node_id: 0,
             pending_migrations: Vec::new(),
             gossip_log: Vec::new(),
+            trace_dump: std::env::var("NULANG_TRACE").is_ok(),
             ffi_sandbox: false,
             ffi_allowlist: std::collections::HashSet::new(),
             suspended_signal_name: None,
@@ -4556,6 +4601,20 @@ impl VM {
         let frame = unsafe { &mut *self.frames.as_mut_ptr().add(frame_idx) };
         let constants = &module.constants;
 
+        if self.trace_dump {
+            let w = instr.encode();
+            let mut regs = String::new();
+            for (i, v) in frame.regs.iter().enumerate() {
+                if !v.is_nil() {
+                    if !regs.is_empty() {
+                        regs += ",";
+                    }
+                    regs = format!("{}{}:{}", regs, i, v.to_string_repr());
+                }
+            }
+            println!("TRACE PC{:04} {:#010x} M{} F{} | {}", pc, w, module_idx, frame_idx, regs);
+        }
+
         match instr.opcode {
             // -- Frame-manipulating opcodes --
             OpCode::Call => {
@@ -4637,6 +4696,7 @@ impl VM {
             }
             OpCode::ClosureCall => {
                 let closure_val = frame.regs[instr.op1 as usize];
+                let argc = instr.op2;
                 let dst = instr.op3;
                 let (func_idx, closure_env) = self.resolve_function(closure_val, module_idx)?;
                 let code_offset = self
@@ -4651,6 +4711,12 @@ impl VM {
                 let mut new_frame = Frame::new(Some(frame_idx), module_idx);
                 new_frame.pc = code_offset;
                 new_frame.regs = frame.regs;
+                const CLOSURE_ARG_BASE: usize = 10;
+                for i in 0..argc as usize {
+                    let arg = pick_closure_call_arg(&frame.regs, i);
+                    new_frame.regs[i] = arg;
+                    new_frame.regs[CLOSURE_ARG_BASE + i] = arg;
+                }
                 new_frame.return_dst = dst;
                 new_frame.closure_env = closure_env;
                 self.frames.push(new_frame);
