@@ -716,9 +716,10 @@ pub fn compile_bytecode_region(
                 let fidx = builder.ins().iconst(types::I64, func_idx);
                 let argcv = builder.ins().iconst(types::I64, instr.op2 as i64);
                 let dstv = builder.ins().iconst(types::I64, instr.op3 as i64);
-                let status_inst = builder
-                    .ins()
-                    .call(helpers[&RuntimeHelper::DirectCall], &[regs_ptr, fidx, argcv, dstv]);
+                let status_inst = builder.ins().call(
+                    helpers[&RuntimeHelper::DirectCall],
+                    &[regs_ptr, fidx, argcv, dstv],
+                );
                 let status = builder.inst_results(status_inst)[0];
                 // On nonzero status the callee raised (e.g. step-limit); the
                 // error is already recorded in the pending-error thread-local,
@@ -726,7 +727,9 @@ pub fn compile_bytecode_region(
                 let zero = builder.ins().iconst(types::I64, 0);
                 let is_err = builder.ins().icmp(IntCC::NotEqual, status, zero);
                 let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
-                builder.ins().brif(is_err, return_block, &[], fallthrough, &[]);
+                builder
+                    .ins()
+                    .brif(is_err, return_block, &[], fallthrough, &[]);
             }
 
             OpCode::Ret | OpCode::RetVal => {

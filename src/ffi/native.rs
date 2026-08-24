@@ -83,9 +83,7 @@ impl NativeLibrary {
     /// The caller must ensure the symbol actually has the requested type.
     #[cfg(not(feature = "ffi"))]
     pub unsafe fn resolve<T>(&self, _symbol: &[u8]) -> Result<*const c_void, String> {
-        Err(
-            "FFI dynamic library loading disabled (feature 'ffi' not enabled)".to_string(),
-        )
+        Err("FFI dynamic library loading disabled (feature 'ffi' not enabled)".to_string())
     }
 }
 

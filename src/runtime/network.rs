@@ -37,9 +37,9 @@ use std::net::SocketAddr;
 #[cfg(feature = "tcp")]
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
 #[cfg(feature = "tcp")]
 use std::sync::Mutex;
+use std::sync::{mpsc, Arc};
 #[cfg(feature = "tcp")]
 use std::thread::{self, JoinHandle};
 #[cfg(feature = "tcp")]
@@ -3767,8 +3767,8 @@ mod tls_provider {
     use parking_lot::Mutex;
     use rustls::{ClientConfig, ServerConfig};
     use std::io;
-#[cfg(feature = "tcp")]
-use std::io::{Read, Write};
+    #[cfg(feature = "tcp")]
+    use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::Arc;
 

@@ -385,7 +385,10 @@ pub struct RegistryServer {
 #[cfg(not(feature = "tcp"))]
 impl RegistryServer {
     pub fn new(data_dir: PathBuf, auth_token: Option<String>) -> Self {
-        RegistryServer { data_dir, auth_token }
+        RegistryServer {
+            data_dir,
+            auth_token,
+        }
     }
 
     /// Stub: the `tcp` feature is disabled, so the server cannot start.

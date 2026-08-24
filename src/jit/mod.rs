@@ -380,7 +380,13 @@ impl JitSession {
             // Typed compilation failed: fall through to the scalar compiler.
         }
 
-        self.compile_region(module_idx, start_offset, num_instrs, instructions, native_calls)
+        self.compile_region(
+            module_idx,
+            start_offset,
+            num_instrs,
+            instructions,
+            native_calls,
+        )
     }
 
     /// Return the number of regions compiled through the type-directed path.
@@ -1066,13 +1072,8 @@ impl crate::backends::JitBackend for JitSession {
         if self.record_and_check_hot(module_idx, pc) {
             let ms = self.may_suspend_for(module_idx, module).to_vec();
             let rc = self.recursive_for(module_idx, module).to_vec();
-            let (region_len, native_calls) = find_compilable_region_with_calls(
-                pc,
-                instructions,
-                module,
-                Some(&ms),
-                Some(&rc),
-            );
+            let (region_len, native_calls) =
+                find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
             if region_len >= 3 {
                 let meta = typed_compiler::infer_reg_types(module, pc);
                 let meta_ref = if meta.is_empty() { None } else { Some(&meta) };

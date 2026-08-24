@@ -174,7 +174,8 @@ fn test_compiled_region_len_recorded() {
     let len = find_compilable_region(0, &instructions);
     assert_eq!(len, STRAIGHT_LINE_MIN);
     assert_eq!(jit.compiled_region_len(0, 0), None, "not compiled yet");
-    let ptr = unsafe { jit.compile_region(0, 0, len, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, len, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
     assert_eq!(jit.compiled_region_len(0, 0), Some(len));
     assert_eq!(
@@ -209,7 +210,8 @@ fn test_jit_compile_empty_region() {
         Instruction::new0(OpCode::Nop),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -220,7 +222,8 @@ fn test_jit_compile_int_add() {
         Instruction::new3(OpCode::IAdd, 0, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -236,7 +239,8 @@ fn test_jit_compile_integer_loop() {
         Instruction::new2(OpCode::JmpT, 2, 0xFC),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 7, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 7, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -250,7 +254,8 @@ fn test_jit_compile_float_ops() {
         Instruction::new3(OpCode::FDiv, 4, 1, 5),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 5, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 5, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -265,7 +270,8 @@ fn test_jit_compile_comparisons() {
         Instruction::new3(OpCode::ICmpGe, 0, 1, 14),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 6, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 6, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -278,7 +284,8 @@ fn test_jit_compile_logic() {
         Instruction::new3(OpCode::Or, 0, 1, 3),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -290,7 +297,8 @@ fn test_jit_compile_conversions() {
         Instruction::new2(OpCode::FToI, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -303,7 +311,8 @@ fn test_jit_compile_register_moves() {
         Instruction::new2(OpCode::Swap, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -316,7 +325,8 @@ fn test_jit_compile_jmp_unconditional() {
         Instruction::new0(OpCode::Nop),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -329,7 +339,8 @@ fn test_jit_compile_jmp_conditional() {
         Instruction::new0(OpCode::Nop),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -371,7 +382,15 @@ fn test_jit_compile_all_mvp_opcodes() {
         Instruction::new2(OpCode::FToI, 1, 51),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, instructions.len(), &instructions, &std::collections::HashMap::new()) };
+    let ptr = unsafe {
+        jit.compile_region(
+            0,
+            0,
+            instructions.len(),
+            &instructions,
+            &std::collections::HashMap::new(),
+        )
+    };
     assert!(ptr.is_some());
 }
 
@@ -384,7 +403,8 @@ fn test_jit_compile_rejects_unsupported_opcode() {
         Instruction::new3(OpCode::ISub, 0, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 1, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 1, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -600,11 +620,7 @@ fn test_jit_direct_call_loop_tiers_up() {
         expected.as_int(),
         "JIT direct-call loop must match the interpreter"
     );
-    assert_eq!(
-        expected.as_int(),
-        Some(20000),
-        "loop counter is wrong"
-    );
+    assert_eq!(expected.as_int(), Some(20000), "loop counter is wrong");
     assert!(
         jit_vm.jit_compiled_count() > 0,
         "the loop region must compile around the folded direct call"
@@ -725,7 +741,8 @@ fn test_jit_compile_bitwise_ops() {
         Instruction::new3(OpCode::BitOr, 5, 1, 6),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 6, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 6, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -736,7 +753,8 @@ fn test_jit_compile_fneg() {
         Instruction::new3(OpCode::FNeg, 0, 0, 1),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -749,7 +767,8 @@ fn test_jit_compile_pow() {
         Instruction::new3(OpCode::FPow, 3, 4, 5),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some(), "IPow/FPow region must JIT-compile");
 }
 
@@ -761,7 +780,8 @@ fn test_jit_compile_load_store() {
         Instruction::new2(OpCode::Store, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -782,8 +802,9 @@ fn test_jit_execute_bitwise_ops() {
         Instruction::new3(OpCode::Xor, 14, 15, 16), // r16 = float ^ int -> 0 ^ 7
         Instruction::new0(OpCode::Halt),
     ];
-    let func = unsafe { jit.compile_region(0, 0, 8, &instructions, &std::collections::HashMap::new()) }
-        .expect("bitwise region should compile");
+    let func =
+        unsafe { jit.compile_region(0, 0, 8, &instructions, &std::collections::HashMap::new()) }
+            .expect("bitwise region should compile");
     let consts: [u64; 0] = [];
     let mut regs = [0u64; 256];
     regs[0] = Value::int(0b1100).as_raw();
@@ -820,7 +841,8 @@ fn test_jit_execute_fneg() {
         Instruction::new0(OpCode::Halt),
     ];
     let func =
-        unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) }.expect("FNeg region should compile");
+        unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) }
+            .expect("FNeg region should compile");
     let consts: [u64; 0] = [];
     let mut regs = [0u64; 256];
     regs[0] = Value::float(2.5).as_raw();
@@ -842,8 +864,9 @@ fn test_jit_execute_load_store() {
         Instruction::new2(OpCode::Store, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let func = unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) }
-        .expect("Load/Store region should compile");
+    let func =
+        unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) }
+            .expect("Load/Store region should compile");
     let consts: [u64; 0] = [];
     let mut regs = [0u64; 256];
     regs[0] = Value::int(42).as_raw();
@@ -918,8 +941,16 @@ fn test_jit_bitwise_loop_matches_interpreter() {
     // 2. JIT-compiled loop body: compile the pc 5..=12 region and drive it
     //    from Rust, replicating the JmpT back-edge via r5.
     let mut jit = make_jit();
-    let func = unsafe { jit.compile_region(0, 5, 8, &module.instructions, &std::collections::HashMap::new()) }
-        .expect("loop body region should compile");
+    let func = unsafe {
+        jit.compile_region(
+            0,
+            5,
+            8,
+            &module.instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("loop body region should compile");
     let consts: Vec<u64> = module
         .constants
         .iter()
@@ -993,8 +1024,10 @@ fn test_jit_iinc_idec_match_interpreter() {
         };
         let mut jit = make_jit();
         let instructions = vec![Instruction::new1(op, 0), Instruction::new0(OpCode::Halt)];
-        let func = unsafe { jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new()) }
-            .expect("IInc/IDec region should compile");
+        let func = unsafe {
+            jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new())
+        }
+        .expect("IInc/IDec region should compile");
         let consts: [u64; 0] = [];
         let mut regs = [0u64; 256];
         regs[0] = input_raw;
@@ -1272,17 +1305,33 @@ fn test_typed_path_matches_scalar_path() {
 
     // Scalar path.
     let mut scalar_jit = make_jit();
-    let scalar = unsafe { scalar_jit.compile_region(0, 5, 7, &module.instructions, &std::collections::HashMap::new()) }
-        .expect("scalar region should compile");
+    let scalar = unsafe {
+        scalar_jit.compile_region(
+            0,
+            5,
+            7,
+            &module.instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("scalar region should compile");
     let scalar_regs = run_region(scalar);
 
     // Typed path.
     let meta = infer_reg_types(&module, 5);
     assert!(!meta.is_empty(), "int loop registers must be typed");
     let mut typed_jit = make_jit();
-    let typed =
-        unsafe { typed_jit.compile_region_typed(0, 5, 7, &module.instructions, Some(&meta), &std::collections::HashMap::new()) }
-            .expect("typed region should compile");
+    let typed = unsafe {
+        typed_jit.compile_region_typed(
+            0,
+            5,
+            7,
+            &module.instructions,
+            Some(&meta),
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("typed region should compile");
     assert!(
         typed_jit.is_typed_compiled(0, 5),
         "region with proven types must use the guard-stripped compiler"
@@ -1308,8 +1357,17 @@ fn test_absent_metadata_uses_scalar_path() {
 
     // None metadata: compiles, but is NOT recorded as typed.
     let mut jit = make_jit();
-    let func = unsafe { jit.compile_region_typed(0, 5, 7, &module.instructions, None, &std::collections::HashMap::new()) }
-        .expect("region should compile without metadata");
+    let func = unsafe {
+        jit.compile_region_typed(
+            0,
+            5,
+            7,
+            &module.instructions,
+            None,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("region should compile without metadata");
     assert_eq!(jit.typed_compiled_count(), 0, "no metadata -> scalar path");
     assert!(!jit.is_typed_compiled(0, 5));
 
@@ -1432,7 +1490,10 @@ fn test_compute_recursive_classifies_cycles() {
     let rec = compute_recursive(&module);
     assert!(!rec[idx_of("f0")], "leaf f0 must be non-recursive");
     assert!(!rec[idx_of("f1")], "f1 -> f0 chain must be non-recursive");
-    assert!(!rec[idx_of("f2")], "f2 -> f1 -> f0 chain must be non-recursive");
+    assert!(
+        !rec[idx_of("f2")],
+        "f2 -> f1 -> f0 chain must be non-recursive"
+    );
     assert!(
         rec[idx_of("self_rec")],
         "self-recursion must be flagged recursive"

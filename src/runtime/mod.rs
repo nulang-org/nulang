@@ -6028,10 +6028,7 @@ impl Runtime {
     /// Stub used when the `tcp` feature is disabled: real TCP distribution
     /// is unavailable, so this always fails.
     #[cfg(not(feature = "tcp"))]
-    pub fn enable_distribution(
-        &mut self,
-        bind_addr: std::net::SocketAddr,
-    ) -> std::io::Result<()> {
+    pub fn enable_distribution(&mut self, bind_addr: std::net::SocketAddr) -> std::io::Result<()> {
         distribution::enable_distribution(self, bind_addr)
     }
 

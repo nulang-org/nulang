@@ -541,12 +541,7 @@ impl WasmBackend {
     /// variant): interns the dotted effect path (`"Storage.write"`). The host
     /// owns the EffectId + request envelope mapping; the compiler emits only
     /// what it knows (the tag + runtime-marshalled positional args).
-    fn intern_effect_dispatch(
-        &mut self,
-        effect: &str,
-        op: &str,
-        args: &[LocalId],
-    ) -> NuResult<()> {
+    fn intern_effect_dispatch(&mut self, effect: &str, op: &str, args: &[LocalId]) -> NuResult<()> {
         let dispatchable = !matches!(
             (effect, op),
             ("IO", "print") | ("IO", "println") | ("IO", "read") | ("Array", "length")
@@ -2245,9 +2240,7 @@ impl WasmBackend {
                 let (tag_off, tag_len) = self.interned.get(&tag).copied().unwrap_or((0, 0));
                 let scratch = self.argv_scratch_off;
                 for (i, arg) in args.iter().enumerate() {
-                    body.instruction(&Instruction::I32Const(
-                        (scratch + i as u32 * 8) as i32,
-                    ));
+                    body.instruction(&Instruction::I32Const((scratch + i as u32 * 8) as i32));
                     body.instruction(&Instruction::LocalGet(self.mir_local(arg, func)));
                     body.instruction(&Instruction::I64Store(MemArg {
                         offset: 0,
@@ -3160,8 +3153,7 @@ mod tests {
         let (tag, payload) = last.expect("dispatch must have been called");
         assert_eq!(tag, b"Test.echo", "tag is the dotted effect path");
         assert_eq!(
-            payload,
-            br#"[3,"k"]"#,
+            payload, br#"[3,"k"]"#,
             "runtime args marshal into a positional JSON array"
         );
         assert_eq!(
@@ -3176,7 +3168,10 @@ mod tests {
     fn test_effect_dispatch_too_many_args_rejected() {
         // More than MAX_DISPATCH_ARGS positional args are a loud compile
         // error, not a silent truncation.
-        let args = (0..17).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        let args = (0..17)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         let src = format!("perform Test.echo({args})");
         let err = compile_source(&src).unwrap_err();
         assert!(
@@ -3363,28 +3358,21 @@ mod tests {
     fn test_wasm_storage_write_maps_to_pool_builtin() {
         // `perform Storage.write(key, value)` — the host's Discard shape
         // returns length 0 → nil.
-        let (value, last) = run_source_with_dispatch(
-            r#"perform Storage.write("greeting", "hello")"#,
-            None,
-        )
-        .expect("run");
+        let (value, last) =
+            run_source_with_dispatch(r#"perform Storage.write("greeting", "hello")"#, None)
+                .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
         assert_eq!(tag, b"Storage.write", "dotted language effect path");
-        assert_eq!(
-            payload, br#"["greeting","hello"]"#,
-            "positional argv array"
-        );
+        assert_eq!(payload, br#"["greeting","hello"]"#, "positional argv array");
         assert!(value.is_nil(), "discarded write result must be nil");
     }
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_queue_receive_maps_to_pool_builtin() {
-        let (value, last) = run_source_with_dispatch(
-            r#"perform Queue.pop("orders")"#,
-            Some(br#""m1""#.to_vec()),
-        )
-        .expect("run");
+        let (value, last) =
+            run_source_with_dispatch(r#"perform Queue.pop("orders")"#, Some(br#""m1""#.to_vec()))
+                .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
         assert_eq!(tag, b"Queue.pop", "dotted language effect path");
         assert_eq!(payload, br#"["orders"]"#, "positional argv array");
@@ -3397,17 +3385,12 @@ mod tests {
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_queue_send_maps_to_pool_builtin() {
-        let (value, last) = run_source_with_dispatch(
-            r#"perform Queue.push("orders", "hello")"#,
-            None,
-        )
-        .expect("run");
+        let (value, last) =
+            run_source_with_dispatch(r#"perform Queue.push("orders", "hello")"#, None)
+                .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
         assert_eq!(tag, b"Queue.push", "dotted language effect path");
-        assert_eq!(
-            payload, br#"["orders","hello"]"#,
-            "positional argv array"
-        );
+        assert_eq!(payload, br#"["orders","hello"]"#, "positional argv array");
         assert!(value.is_nil(), "discarded send result must be nil");
     }
 
@@ -3436,8 +3419,8 @@ mod tests {
     fn test_wasm_timer_sleep_maps_to_pool_builtin() {
         // `perform Timer.sleep(ms)` lowers to PerformAsync; the host's
         // Discard shape returns length 0 → nil.
-        let (value, last) = run_source_with_dispatch(r#"perform Timer.sleep(1000)"#, None)
-            .expect("run");
+        let (value, last) =
+            run_source_with_dispatch(r#"perform Timer.sleep(1000)"#, None).expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
         assert_eq!(tag, b"Timer.sleep", "dotted language effect path");
         assert_eq!(payload, br#"[1000]"#, "positional argv array");
