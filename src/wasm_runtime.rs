@@ -225,10 +225,18 @@ impl WasmRuntime {
     }
 
     pub fn run(&mut self) -> NuResult<crate::vm::Value> {
-        let raw = self
-            .init_func
-            .call(&mut self.store, ())
-            .map_err(map_wasmtime_err)?;
+        let raw = self.init_func.call(&mut self.store, ()).map_err(|e| {
+            // Host functions report interpreter-parity runtime errors (type
+            // errors, 48-bit overflow) via `Error::msg`; wasmtime wraps them
+            // in a trap whose Display only shows a backtrace. Downcast to
+            // the original message and surface it as a RuntimeError so the
+            // WASM backend agrees with the interpreter/JIT/AOT.
+            if let Some(msg) = e.downcast_ref::<String>() {
+                NuError::runtime_error(msg.clone(), Span::default())
+            } else {
+                map_wasmtime_err(e)
+            }
+        })?;
         Ok(crate::vm::Value::from_raw(raw as u64))
     }
 
@@ -527,10 +535,19 @@ fn host_neg(_caller: Caller<'_, HostState>, a: i64) -> Result<i64, Error> {
         // tag range, so canonicalize the result.
         Ok(value_layout::float_bits(-f64::from_bits(a)) as i64)
     } else {
-        // Non-float operand → treat as int via `as_int().unwrap_or(0)`,
-        // matching the interpreter (negating a tuple/array yields 0, not a
-        // corrupted pointer payload).
-        Ok(value_layout::tag_int(-crate::jit::runtime::as_int_or_zero(a)) as i64)
+        // Match the interpreter's INeg (and the JIT helper `nulang_ineg`):
+        // ints negate with a 48-bit overflow check at INT48_MIN; anything
+        // else is a type error.
+        let v = crate::vm::Value::from_raw(a);
+        match v.as_int() {
+            Some(x) if x != crate::value_layout::INT48_MIN => Ok(value_layout::tag_int(-x) as i64),
+            Some(x) => Err(Error::msg(error_message(crate::vm::int_overflow_error(
+                "neg", x, 0,
+            )))),
+            None => Err(Error::msg(error_message(crate::vm::arith_type_error(
+                "neg", v, v,
+            )))),
+        }
     }
 }
 
@@ -789,6 +806,17 @@ fn get_memory(caller: &mut Caller<'_, HostState>) -> Result<Memory, Error> {
 }
 
 // ── Error mapping ────────────────────────────────────────────────────
+
+/// Extract the raw message from a `NuError::RuntimeError` (the message
+/// without the "Runtime error at L:C:" Display prefix). Host functions use
+/// this so the error re-wrapped by `WasmRuntime::run` matches the
+/// interpreter's error text exactly.
+fn error_message(e: NuError) -> String {
+    match e {
+        NuError::RuntimeError { msg, .. } => msg,
+        other => other.to_string(),
+    }
+}
 
 fn map_wasmtime_err(e: impl std::fmt::Display) -> NuError {
     NuError::VMError {

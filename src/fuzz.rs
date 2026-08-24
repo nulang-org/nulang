@@ -567,10 +567,29 @@ pub(crate) fn is_safely_comparable(v: crate::vm::Value) -> bool {
 #[allow(dead_code)]
 pub(crate) fn normalize_error(msg: &str) -> String {
     if msg.contains("Step limit exceeded") {
-        "step limit exceeded".to_string()
-    } else {
-        msg.to_string()
+        return "step limit exceeded".to_string();
     }
+    // `Value::to_string_repr` renders heap pointers as `#Value(<addr>)`;
+    // the address differs between interpreter/JIT/AOT runs (separate
+    // heaps), so strip it for comparison — the tag is what matters.
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(start) = rest.find("#Value(") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "#Value(".len()..];
+        match after.find(')') {
+            Some(end) => {
+                out.push_str("#Value(ptr)");
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str("#Value(ptr)");
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Differentially execute one compiled mutant: interpreter (cold) vs JIT
