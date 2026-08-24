@@ -15,7 +15,7 @@
 
 use ariadne::{Color, Config, Label, Report, ReportKind, Source};
 
-use crate::types::{current_source_text, source_map_file, ErrorCode, NuError, Span};
+use crate::types::{current_source_text, source_map_file, ErrorCode, NuError, NuWarning, Span};
 
 impl NuError {
     /// Return the stable, category-scoped diagnostic code for this error.
@@ -115,6 +115,50 @@ pub fn render(err: &NuError, use_color: bool) -> Option<String> {
         NuError::Suspended(_) => None,
         _ => render_single(err, use_color),
     }
+}
+
+/// Render a [`NuWarning`] as an `ariadne` source-snippet warning report.
+///
+/// Returns `None` when no thread-local source is installed; callers should
+/// fall back to [`NuWarning::format_plain`].
+pub fn render_warning(warning: &NuWarning, use_color: bool) -> Option<String> {
+    let source = current_source_text()?;
+    if source.is_empty() {
+        return None;
+    }
+    let span = warning.span;
+    let file = source_map_file().unwrap_or_else(|| "<input>".to_string());
+
+    let len = source.len();
+    let start = (span.start as usize).min(len);
+    let end = (span.end as usize).min(len).max(start);
+    let range = start..end;
+
+    let mut builder = Report::build(ReportKind::Warning, file.as_str(), start)
+        .with_config(Config::default().with_color(use_color))
+        .with_message(&warning.msg)
+        .with_code(warning.code)
+        .with_label(
+            Label::new((file.as_str(), range))
+                .with_message(&warning.msg)
+                .with_color(Color::Yellow),
+        );
+    if let Some(help) = &warning.help {
+        builder = builder.with_help(help);
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    builder
+        .finish()
+        .write((file.as_str(), Source::from(source)), &mut out)
+        .ok()?;
+    String::from_utf8(out).ok()
+}
+
+/// Format a [`NuWarning`] for display: ariadne snippet when a source map is
+/// installed, otherwise the plain one-line form.
+pub fn format_warning(warning: &NuWarning, use_color: bool) -> String {
+    render_warning(warning, use_color).unwrap_or_else(|| warning.format_plain())
 }
 
 /// Render a single (non-`Multiple`) error.
@@ -416,6 +460,42 @@ mod tests {
     fn test_render_suspended_returns_none() {
         let err = NuError::Suspended(crate::types::VmSuspension::ReceiveWait);
         assert!(render(&err, false).is_none());
+    }
+
+    // -- warnings (RFC 0015 deprecations) -----------------------------------
+
+    #[test]
+    fn test_render_warning_snapshot() {
+        let source = "let port = catch parse_port(env) 8080\n";
+        with_source(source, || {
+            let start = offset_of(source, "catch") as u32;
+            let w = NuWarning::deprecated_catch(Span::new(start, start + 5));
+            let rendered = render_warning(&w, false).expect("should render with source");
+            assert!(
+                rendered.starts_with("[W0101] Warning:"),
+                "header: {rendered:?}"
+            );
+            assert!(rendered.contains("deprecated `catch`"));
+            assert!(rendered.contains("RFC 0015"), "help line: {rendered:?}");
+        });
+    }
+
+    #[test]
+    fn test_format_warning_plain_fallback_without_source() {
+        clear_source_map();
+        let w = NuWarning::deprecated_fail(Span::new(0, 4));
+        let plain = format_warning(&w, false);
+        assert_eq!(
+            plain,
+            "warning[W0102]: use of deprecated `fail` expression\n  = help: `fail` is deprecated by RFC 0015 and will be removed in v2.0 — use `return` with an explicit `Error(...)` value under a `T ! E` signature"
+        );
+    }
+
+    #[test]
+    fn test_render_warning_returns_none_without_source_map() {
+        clear_source_map();
+        let w = NuWarning::deprecated_catch(Span::default());
+        assert!(render_warning(&w, false).is_none());
     }
 
     #[test]

@@ -2572,6 +2572,7 @@ mod tests {
     use super::super::crdt_manager::{CrdtId, CrdtType};
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    #[cfg(feature = "tcp")]
     use std::thread::sleep;
 
     // ------------------------------------------------------------------

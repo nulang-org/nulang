@@ -8,6 +8,7 @@ use crate::bytecode::{ActorMeta, CodeModule, Constant};
 use crate::runtime::gc::OrcaGc;
 use crate::runtime::heap::{ActorHeap, TypeTag};
 use crate::vm::{Frame, Value};
+#[cfg(feature = "tcp")]
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -3422,13 +3423,17 @@ fn test_pipeline_runtime_api() {
 // Multi-Node Distributed Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tcp")]
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+#[cfg(feature = "tcp")]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(feature = "tcp")]
 use std::thread::sleep;
 
 /// Shared CertificateParams for the test CA — used by both generate_test_ca
 /// and generate_test_leaf so leaf certificates are correctly signed without
 /// needing the `x509-parser` feature to re-parse PEM.
+#[cfg(feature = "tcp")]
 fn ca_cert_params() -> CertificateParams {
     let mut params = CertificateParams::new(vec![]).expect("ca params");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -3437,6 +3442,7 @@ fn ca_cert_params() -> CertificateParams {
 }
 
 /// Generate a self-signed CA certificate and key (PEM-encoded).
+#[cfg(feature = "tcp")]
 fn generate_test_ca() -> (Vec<u8>, KeyPair) {
     let params = ca_cert_params();
     let key = KeyPair::generate().expect("key gen");
@@ -3451,6 +3457,7 @@ fn generate_test_ca() -> (Vec<u8>, KeyPair) {
 /// the CA params needed for signing are reconstructed from `ca_cert_params()`
 /// because rcgen's `Issuer::from_ca_cert_pem` requires the optional
 /// `x509-parser` feature.
+#[cfg(feature = "tcp")]
 fn generate_test_leaf(name: &str, ca_key: &KeyPair, _ca_cert_pem: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let ca_params = ca_cert_params();
     let params = CertificateParams::new(vec![name.to_string(), "localhost".to_string()])
@@ -3593,6 +3600,7 @@ fn test_node_failed_invalidates_cache_and_delivers_down() {
 /// deadline (30 s): convergence is normally sub-second, but under heavy
 /// CPU load the real-TCP handshake and heartbeat cadence can degrade by
 /// an order of magnitude.
+#[cfg(feature = "tcp")]
 fn pump_until_converged(nodes: &mut [&mut Runtime], expected: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -3621,6 +3629,7 @@ fn pump_until_converged(nodes: &mut [&mut Runtime], expected: usize, timeout: Du
 }
 
 /// Shut down the transports of the given nodes.
+#[cfg(feature = "tcp")]
 fn shutdown_nodes(nodes: &mut [&mut Runtime]) {
     for rt in nodes.iter_mut() {
         if let Some(mut transport) = rt.distributed.transport.take() {
@@ -4005,6 +4014,7 @@ fn test_actor_migration_between_two_nodes() {
 /// clock), so callers should budget for `DEFAULT_HEARTBEAT_TIMEOUT` +
 /// `DEFAULT_SUSPICION_DURATION` (2s + 5s at the time of writing) plus
 /// margin.
+#[cfg(feature = "tcp")]
 fn pump_until_peer_failed(nodes: &mut [&mut Runtime], dead: NodeId, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -4047,6 +4057,7 @@ fn pump_until_peer_failed(nodes: &mut [&mut Runtime], dead: NodeId, timeout: Dur
 /// incarnation (see `merge_membership_from_sender`). Tests that route a
 /// remote message to a non-seed node must wait for this, or `send_distributed`
 /// dials a dead source port and silently drops the message.
+#[cfg(feature = "tcp")]
 fn pump_until_addresses_converge(
     nodes: &mut [&mut Runtime],
     listen: &[(NodeId, SocketAddr)],
@@ -4388,6 +4399,7 @@ fn start_virtual_clock_node() -> Runtime {
 /// processing on each (cluster tick + packet delivery). Advancing first
 /// means the tick sees the new virtual time, so heartbeats, suspicion
 /// transitions, failure detection, and probes all fire on schedule.
+#[cfg(feature = "tcp")]
 fn advance_all(nodes: &mut [&mut Runtime], step: Duration) {
     for rt in nodes.iter_mut() {
         rt.advance_time(step);
@@ -4404,6 +4416,7 @@ fn advance_all(nodes: &mut [&mut Runtime], step: Duration) {
 }
 
 /// The status of `node` in `rt`'s cluster view, if known.
+#[cfg(feature = "tcp")]
 fn cluster_status(rt: &Runtime, node: NodeId) -> Option<NodeStatus> {
     rt.distributed
         .cluster
@@ -4418,6 +4431,7 @@ fn cluster_status(rt: &Runtime, node: NodeId) -> Option<NodeStatus> {
 /// convergence condition. Membership (gossip) converges in ~1 s virtual,
 /// but active views fill only through the 5 s repair cycle + reciprocal
 /// heartbeat confirmation.
+#[cfg(feature = "tcp")]
 fn active_views_converged(nodes: &[&Runtime], ids: &[NodeId]) -> bool {
     nodes.iter().all(|rt| {
         let c = rt.distributed.cluster.as_ref().unwrap();
@@ -5430,6 +5444,7 @@ fn test_three_node_gossip_converges_chain_seeded() {
 
 /// Handler for the remotely-spawnable behavior used by
 /// `test_remote_spawn_request_delivery`.
+#[cfg(feature = "tcp")]
 fn remote_spawn_store_handler(actor: &mut Actor, args: &[Value]) {
     let n = args.get(0).and_then(|v| v.as_int()).unwrap_or(-1);
     actor.set_state_field("received", Value::int(n));

@@ -6,7 +6,8 @@
 use crate::ast::*;
 use crate::lexer::{Token, TokenKind};
 use crate::types::{
-    Capability, Effect, EffectRow, NuError, NuResult, PrimitiveType, Region, Span, Type, TypeVar,
+    Capability, Effect, EffectRow, NuError, NuResult, NuWarning, PrimitiveType, Region, Span, Type,
+    TypeVar,
 };
 use std::sync::OnceLock;
 type FxHashMap<K, V> =
@@ -111,6 +112,10 @@ pub struct Parser {
     /// Accumulated parse errors from error-recovery. Callers that want
     /// all errors (not just the first) call `consumed_diagnostics()`.
     diagnostics: Vec<NuError>,
+    /// Non-fatal warnings collected during parsing (e.g. RFC 0015
+    /// `catch`/`fail` deprecations). Callers surface these with
+    /// `take_warnings()`.
+    warnings: Vec<NuWarning>,
     /// Cache of types imported from other modules, populated lazily when
     /// a type name isn't found in the local token stream. Each entry holds
     /// the declaration's type-parameter variables followed by the resolved
@@ -147,6 +152,7 @@ impl Parser {
             imported_type_cache: FxHashMap::default(),
             handler_registry: FxHashMap::default(),
             diagnostics: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -703,6 +709,13 @@ impl Parser {
     /// parsing. After this call, the diagnostics buffer is empty.
     pub fn consumed_diagnostics(&mut self) -> Vec<NuError> {
         std::mem::take(&mut self.diagnostics)
+    }
+
+    /// Consume and return all non-fatal warnings accumulated during parsing
+    /// (e.g. RFC 0015 `catch`/`fail` deprecations). After this call, the
+    /// warnings buffer is empty.
+    pub fn take_warnings(&mut self) -> Vec<NuWarning> {
+        std::mem::take(&mut self.warnings)
     }
 
     // === Declarations ===
@@ -3006,6 +3019,7 @@ impl Parser {
             // Desugars to match expr { Ok(x) => x, Error(_) => fallback }
             if self.consume_if(&TokenKind::Catch) {
                 let span = self.current_span();
+                self.warnings.push(NuWarning::deprecated_catch(span));
                 if self.consume_if(&TokenKind::LBrace) {
                     // Block form: expr catch { | pat => body, ... }
                     let mut arms = Vec::new();
@@ -3413,8 +3427,10 @@ impl Parser {
                         }
                     }
                     TokenKind::Fail => {
+                        let fspan = self.current_span();
                         self.advance();
                         // fail is sugar for return; same semantics
+                        self.warnings.push(NuWarning::deprecated_fail(fspan));
                         if self.is_expr_start() {
                             let val = self.parse_expr()?;
                             Ok(Expr::Return(Some(Box::new(val)), self.current_span()))
@@ -4866,6 +4882,7 @@ impl Parser {
     fn parse_catch_prefix(&mut self) -> NuResult<Expr> {
         let span = self.current_span();
         self.advance(); // consume 'catch'
+        self.warnings.push(NuWarning::deprecated_catch(span));
         let expr = self.parse_expr()?;
         if self.consume_if(&TokenKind::LBrace) {
             // Block form: catch expr { | pat => body, ... }

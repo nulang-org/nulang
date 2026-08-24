@@ -2291,6 +2291,7 @@ fn cmd_deploy(
 }
 
 /// List the paths stored in an in-memory gzip-compressed tarball.
+#[cfg(feature = "ureq")]
 fn list_tarball_contents(tarball: &[u8]) -> Vec<String> {
     let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(tarball));
     let mut ar = tar::Archive::new(gz);
