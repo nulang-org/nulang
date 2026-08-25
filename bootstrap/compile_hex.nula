@@ -275,6 +275,18 @@ fn parse_shift(src: String, p: Int, len: Int) -> Int {
 
 // Convert nybble (0-15) to hex char
 
+// Arrow-fn bodies and parenthesized let-chains can leave the parse position on
+// `)`; skip so the following `in` continuation is recognized.
+fn skip_close_parens(src: String, pos: Int, len: Int) -> Int {
+    let p = skip_ws(src, pos, len);
+    if p >= len then p
+    else {
+        let c = perform String.charAt(src, p);
+        if c == 41 then skip_close_parens(src, p + 1, len)
+        else p
+    }
+}
+
 fn skip_fn_type(src: String, pos: Int, len: Int) -> Int {
     let q5_raw = skip_ws(src, pos, len);
     if q5_raw < len then {
@@ -483,7 +495,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                             let vr = bound >> 18;
                             let vp = low17(bound);
                             emit_word(0x12, vr, save_reg, 0);
-                            let vp2 = skip_ws(src, vp, len);
+                            let vp2 = skip_close_parens(src, vp, len);
                             if vp2 + 1 < len then {
                                 let ci = perform String.charAt(src, vp2);
                                 let cn = perform String.charAt(src, vp2 + 1);

@@ -101,47 +101,59 @@ def transform_perform(source: str) -> str:
     return out
 
 
+def _curry_call_match(source: str, name: str, args_str: str, start: int, end: int) -> str:
+    """Curry one call site if appropriate; otherwise return the original text."""
+    KEYWORDS = {'then', 'else', 'if', 'let', 'in', 'fn', 'and', 'or', 'not'}
+    before = source[max(0, start - 10):start]
+    after = source[end:end + 20]
+    args = balanced_split_args(args_str)
+    curried_args = [curry_call_sites(a) for a in args]
+    if name in KEYWORDS:
+        return name + '(' + ', '.join(curried_args) + ')'
+    if name == 'nperform':
+        return 'nperform(' + ', '.join(curried_args) + ')'
+    if start > 0 and source[start - 1] == '.':
+        return source[start:end]
+    if re.search(r'\bfn\s+$', before) and re.match(r'\s*(?:=>|->|\{)', after):
+        return source[start:end]
+    if len(args) <= 1:
+        return source[start:end]
+    c = name + '(' + curried_args[0] + ')'
+    for a in curried_args[1:]:
+        c += '(' + a + ')'
+    return c
+
+
 def curry_call_sites(source: str) -> str:
     """Curry function calls with multiple arguments, but not `fn` definitions or nperform."""
-    KEYWORDS = {'then', 'else', 'if', 'let', 'in', 'fn', 'and', 'or', 'not'}
-    def repl(match: re.Match) -> str:
-        name = match.group(1)
-        args_str = match.group(2)
-        full = match.group(0)
-        before = source[max(0, match.start() - 10):match.start()]
-        after = source[match.end():match.end() + 20]
-        # Recursively curry all arguments so inner multi-arg calls
-        # (e.g. inside `then(...)`) are also curried.
-        args = balanced_split_args(args_str)
-        curried_args = [curry_call_sites(a) for a in args]
-        # Skip keywords.
-        if name in KEYWORDS:
-            return name + '(' + ', '.join(curried_args) + ')'
-        # nperform effect calls are parsed specially by compile_hex, but their
-        # arguments may still contain multi-arg function calls that need currying.
-        if name == 'nperform':
-            return 'nperform(' + ', '.join(curried_args) + ')'
-        # Skip qualified names (String.charAt) and function definitions.
-        if match.start() > 0 and source[match.start() - 1] == '.':
-            return full
-        if re.search(r'\bfn\s+$', before) and re.match(r'\s*(?:=>|->|\{)', after):
-            return full
-        if len(args) <= 1:
-            return full
-        # Build the curried chain from the recursively-curried args so nested
-        # multi-arg calls (e.g. skip_ws(src, q5 + 1, len) as an argument) are
-        # curried too — curry_call(name, args_str) would wrap the raw args and
-        # leave their commas behind, which the self-compiler cannot parse.
-        c = name + '(' + curried_args[0] + ')'
-        for a in curried_args[1:]:
-            c += '(' + a + ')'
-        return c
-
-    return re.sub(
-        r'(\w+)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)',
-        repl,
-        source
-    )
+    result = []
+    i = 0
+    n = len(source)
+    while i < n:
+        m = re.match(r'\w+', source[i:])
+        if m and i + m.end() < n and source[i + m.end()] == '(':
+            name = m.group(0)
+            j = i + m.end() + 1
+            depth = 1
+            in_str = False
+            while j < n and depth > 0:
+                ch = source[j]
+                if ch == '"':
+                    in_str = not in_str
+                elif not in_str:
+                    if ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth -= 1
+                j += 1
+            if depth == 0:
+                args_str = source[i + m.end() + 1:j - 1]
+                result.append(_curry_call_match(source, name, args_str, i, j))
+                i = j
+                continue
+        result.append(source[i])
+        i += 1
+    return ''.join(result)
 
 
 def strip_type_annotations(params_str: str) -> str:
