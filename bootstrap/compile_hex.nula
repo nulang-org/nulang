@@ -515,7 +515,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     let cr = cond >> 18;
                     let cp = low17(cond);
                     let cnext = nr + 1;
-                    let cp2 = skip_ws(src, cp, len);
+                    let cp2 = skip_close_parens(src, cp, len);
                     let then_id = read_ident(src, cp2, len, 0);
                     let th = then_id >> 16;
                     let tp = low16(then_id);
@@ -553,7 +553,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                         remark("Jmp -> end");
                         emit_word(0x50, 0, 0, 0);
                         remark("else:");
-                        let tbp2 = skip_ws(src, tbp, len);
+                        let tbp2 = skip_close_parens(src, tbp, len);
                         let else_id = read_ident(src, tbp2, len, 0);
                         let eh = else_id >> 16;
                         let ep = low16(else_id);
@@ -564,8 +564,8 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                             emit_word(0x12, er, result_reg, 0);
                             remark("end:");
                             (result_reg << 18) + ebp
-                        } else (nr << 18) + p
-                    } else (nr << 18) + p
+                        } else (nr << 18) + tbp2
+                    } else (nr << 18) + cp2
                 } else if h == 18036 then {
                     // true
                     emit_word(0x04, nr, 0, 0);
@@ -589,7 +589,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     comp_nperform_parse(comp, src, pos, len, nr, env, elen, no_left, p, q)
                 } else {
                     let reg = env_lookup(env, elen, low16(h));
-                    if reg == 0 then (nr << 18) + p
+                    if reg == 0 then (nr << 18) + q
                     else {
                         emit_word(0x12, reg, nr, 0);
                         (nr << 18) + q

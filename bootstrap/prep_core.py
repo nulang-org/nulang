@@ -178,7 +178,7 @@ def curry_fn_definition(name: str, params: list[str], body: str) -> str:
     if not params:
         return f'{name} = fn() => {body}'
     result = body
-    for p in params[1:]:
+    for p in reversed(params[1:]):
         result = f'fn({p}) => {result}'
     result = f'{name} = fn({params[0]}) => {result}'
     return result
@@ -252,7 +252,9 @@ def _flatten_block_body(body: str) -> str:
     # Merge `else` continuations.
     merged = []
     for part in parts:
-        if merged and re.match(r'else\b', part):
+        if merged and merged[-1].rstrip().endswith('+'):
+            merged[-1] = merged[-1] + ' ' + part
+        elif merged and re.match(r'else\b', part):
             merged[-1] = merged[-1] + ' ' + part
         else:
             merged.append(part)
