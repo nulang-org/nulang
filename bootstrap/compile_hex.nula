@@ -67,8 +67,7 @@ fn instr(opcode: Int, op1: Int, op2: Int, op3: Int) -> Int {
 }
 
 fn emit_word(opcode: Int, op1: Int, op2: Int, op3: Int) -> Int {
-    let w = instr(opcode, op1, op2, op3);
-    emit_hex(w);
+    emit_hex(opcode * 0x1000000 + op1 * 0x10000 + op2 * 0x100 + op3);
     0
 }
 
@@ -362,7 +361,53 @@ fn nperform_finish(src: String, eff_start: Int, len: Int, dst: Int, end_pos: Int
     (dst << 18) + end_pos
 }
 
-fn comp_nperform_body(comp_rec, src: String, eff_start: Int, q5: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, p: Int) -> Int {
+fn emit_mov_and_skip(src: String, pos: Int, len: Int, reg: Int, slot: Int) -> Int {
+    emit_word(0x12, reg, slot, 0);
+    skip_ws(src, pos, len)
+}
+
+fn np_after2(comp_rec, src: String, eff_start: Int, len: Int, nr: Int, env: String, elen: Int, no_left_np: Int, p: Int, dst: Int, ap2: Int) -> Int {
+    if ap2 < len then {
+        let cp2 = perform String.charAt(src, ap2);
+        if cp2 == 41 then {
+            nperform_finish(src, eff_start, len, dst, skip_ws(src, ap2 + 1, len))
+        } else (nr << 18) + p
+    } else (nr << 18) + p
+}
+
+fn np_after1(comp_rec, src: String, eff_start: Int, len: Int, nr: Int, env: String, elen: Int, no_left_np: Int, p: Int, dst: Int, ap1: Int) -> Int {
+    if ap1 < len then {
+        let cp1 = perform String.charAt(src, ap1);
+        if cp1 == 41 then {
+            nperform_finish(src, eff_start, len, dst, skip_ws(src, ap1 + 1, len))
+        } else if cp1 == 44 then {
+            let p2 = skip_ws(src, ap1 + 1, len);
+            let inner2 = comp_rec(src, p2, len, no_left_np, 0, nr + 21, env, elen);
+            let r2 = inner2 >> 18;
+            let e2 = low17(inner2);
+            let ap2 = emit_mov_and_skip(src, e2, len, r2, 2);
+            np_after2(comp_rec, src, eff_start, len, nr, env, elen, no_left_np, p, dst, ap2)
+        } else (nr << 18) + p
+    } else (nr << 18) + p
+}
+
+fn np_after0(comp_rec, src: String, eff_start: Int, len: Int, nr: Int, env: String, elen: Int, no_left_np: Int, p: Int, dst: Int, ap0: Int) -> Int {
+    if ap0 < len then {
+        let cp0 = perform String.charAt(src, ap0);
+        if cp0 == 41 then {
+            nperform_finish(src, eff_start, len, dst, skip_ws(src, ap0 + 1, len))
+        } else if cp0 == 44 then {
+            let p1 = skip_ws(src, ap0 + 1, len);
+            let inner1 = comp_rec(src, p1, len, no_left_np, 0, nr + 11, env, elen);
+            let r1 = inner1 >> 18;
+            let e1 = low17(inner1);
+            let ap1 = emit_mov_and_skip(src, e1, len, r1, 1);
+            np_after1(comp_rec, src, eff_start, len, nr, env, elen, no_left_np, p, dst, ap1)
+        } else (nr << 18) + p
+    } else (nr << 18) + p
+}
+
+fn np_body(comp_rec, src: String, eff_start: Int, q5: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, p: Int) -> Int {
     if q5 < len then {
         let c3 = perform String.charAt(src, q5);
         let dst = nr;
@@ -374,45 +419,13 @@ fn comp_nperform_body(comp_rec, src: String, eff_start: Int, q5: Int, len: Int, 
             let inner0 = comp_rec(src, p0, len, no_left_np, 0, nr + 1, env, elen);
             let r0 = inner0 >> 18;
             let e0 = low17(inner0);
-            emit_word(0x12, r0, 0, 0);
-            let ap0 = skip_ws(src, e0, len);
-            if ap0 < len then {
-                let cp0 = perform String.charAt(src, ap0);
-                if cp0 == 41 then {
-                    nperform_finish(src, eff_start, len, dst, skip_ws(src, ap0 + 1, len))
-                } else if cp0 == 44 then {
-                    let p1 = skip_ws(src, ap0 + 1, len);
-                    let inner1 = comp_rec(src, p1, len, no_left_np, 0, nr + 11, env, elen);
-                    let r1 = inner1 >> 18;
-                    let e1 = low17(inner1);
-                    emit_word(0x12, r1, 1, 0);
-                    let ap1 = skip_ws(src, e1, len);
-                    if ap1 < len then {
-                        let cp1 = perform String.charAt(src, ap1);
-                        if cp1 == 41 then {
-                            nperform_finish(src, eff_start, len, dst, skip_ws(src, ap1 + 1, len))
-                        } else if cp1 == 44 then {
-                            let p2 = skip_ws(src, ap1 + 1, len);
-                            let inner2 = comp_rec(src, p2, len, no_left_np, 0, nr + 21, env, elen);
-                            let r2 = inner2 >> 18;
-                            let e2 = low17(inner2);
-                            emit_word(0x12, r2, 2, 0);
-                            let ap2 = skip_ws(src, e2, len);
-                            if ap2 < len then {
-                                let cp2 = perform String.charAt(src, ap2);
-                                if cp2 == 41 then {
-                                    nperform_finish(src, eff_start, len, dst, skip_ws(src, ap2 + 1, len))
-                                } else (nr << 18) + p
-                            } else (nr << 18) + p
-                        } else (nr << 18) + p
-                    } else (nr << 18) + p
-                } else (nr << 18) + p
-            } else (nr << 18) + p
+            let ap0 = emit_mov_and_skip(src, e0, len, r0, 0);
+            np_after0(comp_rec, src, eff_start, len, nr, env, elen, no_left_np, p, dst, ap0)
         } else (nr << 18) + p
     } else (nr << 18) + p
 }
 
-fn comp_nperform_parse(comp_rec, src: String, pos: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, p: Int, q: Int) -> Int {
+fn np_parse(comp_rec, src: String, pos: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, p: Int, q: Int) -> Int {
     let q2 = skip_ws(src, q, len);
     if q2 < len then {
         let c1 = perform String.charAt(src, q2);
@@ -424,7 +437,7 @@ fn comp_nperform_parse(comp_rec, src: String, pos: Int, len: Int, nr: Int, env: 
                     let eff_start = q3 + 1;
                     let q4 = read_string_end(src, q3 + 1, len);
                     let q5 = skip_ws(src, q4, len);
-                    comp_nperform_body(comp_rec, src, eff_start, q5, len, nr, env, elen, no_left, p)
+                    np_body(comp_rec, src, eff_start, q5, len, nr, env, elen, no_left, p)
                 } else (nr << 18) + p
             } else (nr << 18) + p
         } else (nr << 18) + p
@@ -586,7 +599,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     (dr2 << 18) + (1 << 17) + ip
                 } else if h == 64461 then {
                     // nperform("effect.name" [, arg1 [, arg2 [, arg3]]])
-                    comp_nperform_parse(comp, src, pos, len, nr, env, elen, no_left, p, q)
+                    np_parse(comp, src, pos, len, nr, env, elen, no_left, p, q)
                 } else {
                     let reg = env_lookup(env, elen, low16(h));
                     if reg == 0 then (nr << 18) + q
