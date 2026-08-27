@@ -7,16 +7,22 @@ const links = [
 		icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
 	},
 	{
+		href: '/tutorial/',
+		label: 'Tutorial',
+		external: false,
+		icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+	},
+	{
+		href: '/blog/',
+		label: 'Blog',
+		external: false,
+		icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+	},
+	{
 		href: 'https://www.nulang.cloud',
 		label: 'Cloud',
 		external: true,
 		icon: '<path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>',
-	},
-	{
-		href: '/contact/',
-		label: 'Contact',
-		external: false,
-		icon: '<path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>',
 	},
 	{
 		href: 'https://github.com/nulang-org/nulang',
@@ -56,6 +62,12 @@ const links = [
 				{link.label}
 			</a>
 		))}
+		<a href="/getting-started/installation/" class="mobile-nav-link">
+			<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+			</svg>
+			Get Started
+		</a>
 	</nav>
 </div>
 

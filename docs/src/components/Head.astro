@@ -6,7 +6,6 @@ const site = 'https://nulang.org';
 const isHome = Astro.url.pathname === '/' || entry.data.template === 'splash';
 const canonical = new URL(Astro.url.pathname, site).href;
 
-// Breadcrumbs from the URL path (skip on homepage).
 const segments = Astro.url.pathname.split('/').filter(Boolean);
 const titleCase = (s: string) =>
   s.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
@@ -87,6 +86,6 @@ const jsonld = JSON.stringify({ '@context': 'https://schema.org', '@graph': grap
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link
-  href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+  href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
   rel="stylesheet"
 />
