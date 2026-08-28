@@ -299,7 +299,6 @@ jobs:
       - name: Collect results
         run: |
           python3 scripts/collect_bench_results.py \
-            --criterion-dir target/criterion \
             --out "benchmarks/$(git rev-parse --short HEAD).json"
 
       - name: Check for regressions
