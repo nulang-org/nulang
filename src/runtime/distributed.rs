@@ -1126,10 +1126,12 @@ pub fn process_network_packets(
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::CrdtSync { ops } => {
-                if let Some(manager) = &mut runtime.crdt_manager {
+                if let Some(mut manager) = runtime.crdt_manager.take() {
                     for op in ops.iter() {
                         manager.apply_op(op.clone());
                     }
+                    manager.push_to_actors(runtime);
+                    runtime.crdt_manager = Some(manager);
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
@@ -1137,10 +1139,12 @@ pub fn process_network_packets(
                 // Delta ops merge into entries this node already holds;
                 // full-state-tagged ops behave exactly like CrdtSync above
                 // (including entry creation on first sight).
-                if let Some(manager) = &mut runtime.crdt_manager {
+                if let Some(mut manager) = runtime.crdt_manager.take() {
                     for op in ops.iter() {
                         manager.apply_delta_op(op.clone());
                     }
+                    manager.push_to_actors(runtime);
+                    runtime.crdt_manager = Some(manager);
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
@@ -1326,8 +1330,10 @@ pub fn process_network_packets(
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::CrdtOp { op } => {
-                if let Some(manager) = &mut runtime.crdt_manager {
+                if let Some(mut manager) = runtime.crdt_manager.take() {
                     manager.apply_op(op);
+                    manager.push_to_actors(runtime);
+                    runtime.crdt_manager = Some(manager);
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }

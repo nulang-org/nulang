@@ -1078,6 +1078,57 @@ pub struct AstModule {
     pub decls: Vec<Decl>,
 }
 
+impl Expr {
+    /// Return the source span attached to this expression.
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::Literal(_, s) => *s,
+            Expr::FString(_, s) => *s,
+            Expr::Var(_, s) => *s,
+            Expr::Lambda { span, .. } => *span,
+            Expr::App { span, .. } => *span,
+            Expr::Let { span, .. } => *span,
+            Expr::LetRec { span, .. } => *span,
+            Expr::If { span, .. } => *span,
+            Expr::Match { span, .. } => *span,
+            Expr::Block { span, .. } => *span,
+            Expr::Par { span, .. } => *span,
+            Expr::Tuple(_, s) => *s,
+            Expr::Record(_, s) => *s,
+            Expr::FieldAccess { span, .. } => *span,
+            Expr::Array(_, s) => *s,
+            Expr::Index { span, .. } => *span,
+            Expr::RecordUpdate { span, .. } => *span,
+            Expr::Binary { span, .. } => *span,
+            Expr::Unary { span, .. } => *span,
+            Expr::Assign { span, .. } => *span,
+            Expr::Spawn { span, .. } => *span,
+            Expr::Send { span, .. } => *span,
+            Expr::Ask { span, .. } => *span,
+            Expr::Receive { span, .. } => *span,
+            Expr::SelfRef(s) => *s,
+            Expr::Emit { span, .. } => *span,
+            Expr::Perform { span, .. } => *span,
+            Expr::GrainRef { span, .. } => *span,
+            Expr::Resume { span, .. } => *span,
+            Expr::Handle { span, .. } => *span,
+            Expr::Migrate { span, .. } => *span,
+            Expr::CapAnnotate { span, .. } => *span,
+            Expr::TypeAnnotate { span, .. } => *span,
+            Expr::Pipe { span, .. } => *span,
+            Expr::For { span, .. } => *span,
+            Expr::While { span, .. } => *span,
+            Expr::Return(_, s) => *s,
+            Expr::Break(_, s) => *s,
+            Expr::Consume { span, .. } => *span,
+            Expr::Recover { span, .. } => *span,
+            Expr::Defer { span, .. } => *span,
+            Expr::Hide { span, .. } | Expr::Seal { span, .. } => *span,
+            Expr::Panic(_, span) => *span,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2824,6 +2824,7 @@ fn compile_rvalue(
                     crate::ffi::marshal::CType::CStr => 3,
                     crate::ffi::marshal::CType::VoidPtr => 4,
                     crate::ffi::marshal::CType::Unit => 5,
+                    crate::ffi::marshal::CType::Value => 6,
                 }
             };
             let mut sig: u64 = ctype_tag(ret);
