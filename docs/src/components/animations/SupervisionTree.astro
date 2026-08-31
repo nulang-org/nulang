@@ -76,7 +76,16 @@
       setTimeout(crashCycle, 2500 + Math.random() * 2000);
     }
 
-    setTimeout(crashCycle, 1500);
+    const svg = actors[0].closest('svg');
+    if (!svg) return;
+
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) {
+        setTimeout(crashCycle, 1200);
+        observer.disconnect();
+      }
+    }, { threshold: 0.25 });
+    observer.observe(svg);
   }
 
   if (document.readyState === 'loading') {

@@ -1,9 +1,0 @@
-fn f(x: Int) -> Int {
-  let lam = fn() {
-    let y = 1 :cap lineariso
-    let a = y
-    let b = y
-    2
-  }
-  42
-}

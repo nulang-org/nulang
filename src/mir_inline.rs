@@ -710,6 +710,7 @@ fn remap_rvalue(rv: &RValue, remap: &FxHashMap<LocalId, LocalId>) -> RValue {
             behavior_idx,
             init,
             target_node,
+            capabilities,
         } => RValue::Spawn {
             behavior_idx: *behavior_idx,
             init: init
@@ -717,6 +718,7 @@ fn remap_rvalue(rv: &RValue, remap: &FxHashMap<LocalId, LocalId>) -> RValue {
                 .map(|(n, rv)| (n.clone(), remap_rvalue(rv, remap)))
                 .collect(),
             target_node: target_node.map(|n| remap_local(n, remap)),
+            capabilities: capabilities.clone(),
         },
         RValue::Send {
             actor,

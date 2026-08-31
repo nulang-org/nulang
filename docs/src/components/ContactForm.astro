@@ -1,0 +1,111 @@
+---
+const turnstileSiteKey = '0x4AAAAAAEYgutYVrXLZ2ywd';
+---
+
+<section class="contact-form-section" aria-labelledby="contact-form-heading">
+  <h2 id="contact-form-heading">Send us a message</h2>
+  <p class="contact-form-lead">
+    Questions about Nulang, the docs, or contributing? Fill out the form below and we will get back to you.
+    You can also email <a href="mailto:support@nulang.org">support@nulang.org</a> directly.
+  </p>
+
+  <form id="contact-form" class="contact-form" novalidate>
+    <div class="contact-field">
+      <label for="contact-name">Name</label>
+      <input id="contact-name" name="name" type="text" autocomplete="name" required maxlength="120" />
+    </div>
+
+    <div class="contact-field">
+      <label for="contact-email">Email</label>
+      <input id="contact-email" name="email" type="email" autocomplete="email" required maxlength="254" />
+    </div>
+
+    <div class="contact-field">
+      <label for="contact-subject">Subject</label>
+      <input id="contact-subject" name="subject" type="text" required maxlength="200" />
+    </div>
+
+    <div class="contact-field">
+      <label for="contact-message">Message</label>
+      <textarea id="contact-message" name="message" rows="6" required maxlength="5000"></textarea>
+    </div>
+
+    <div
+      class="cf-turnstile"
+      data-sitekey={turnstileSiteKey}
+      data-action="turnstile-spin-v2"
+      data-theme="auto"
+    ></div>
+
+    <p id="contact-status" class="contact-status" role="status" aria-live="polite"></p>
+
+    <button type="submit" class="contact-submit" id="contact-submit">Send message</button>
+  </form>
+</section>
+
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+
+<script>
+  const form = document.getElementById('contact-form');
+  const statusEl = document.getElementById('contact-status');
+  const submitBtn = document.getElementById('contact-submit');
+
+  if (form instanceof HTMLFormElement && statusEl instanceof HTMLElement && submitBtn instanceof HTMLButtonElement) {
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      statusEl.textContent = '';
+      statusEl.className = 'contact-status';
+
+      const formData = new FormData(form);
+      const turnstileToken = formData.get('cf-turnstile-response');
+      if (typeof turnstileToken !== 'string' || !turnstileToken) {
+        statusEl.textContent = 'Please complete the bot check.';
+        statusEl.classList.add('is-error');
+        return;
+      }
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Sending...';
+
+      try {
+        const response = await fetch('/api/contact', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: formData.get('name'),
+            email: formData.get('email'),
+            subject: formData.get('subject'),
+            message: formData.get('message'),
+            turnstileToken,
+          }),
+        });
+
+        const result = (await response.json()) as { ok?: boolean; error?: string };
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || 'Unable to send message.');
+        }
+
+        form.reset();
+        if (window.turnstile) {
+          window.turnstile.reset();
+        }
+        statusEl.textContent = 'Message sent. We will reply as soon as we can.';
+        statusEl.classList.add('is-success');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unable to send message.';
+        statusEl.textContent = message;
+        statusEl.classList.add('is-error');
+        if (window.turnstile) {
+          window.turnstile.reset();
+        }
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Send message';
+      }
+    });
+  }
+</script>
+
+<script is:inline>
+  window.turnstile = window.turnstile || undefined;
+</script>

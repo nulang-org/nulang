@@ -1,0 +1,11 @@
+import stdlib::web::html
+import stdlib::web::types
+
+component Card(title: String) {
+    <div class="card"><h2>{title}</h2><slot /></div>
+}
+
+fn main() {
+    let h = <Card title="Components"><p>Hello from slot</p></Card>
+    perform IO.print(h)
+}

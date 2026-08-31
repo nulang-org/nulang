@@ -1,0 +1,105 @@
+// Tests for collections-ext — ordered map and priority queue.
+// NOTE: `==` is identity equality for composite values (variants, tuples,
+// arrays), so Option results are compared via match-based helpers.
+
+import lib
+import stdlib::test
+
+fn expect_some_eq(o, expected, msg) {
+  match o {
+    Some(v) => assert(v == expected, perform String.concat("value mismatch at: ", msg)),
+    None => assert(false, perform String.concat("expected Some, got None at: ", msg)),
+  }
+}
+
+fn expect_none(o, msg) {
+  match o {
+    Some(_) => assert(false, "expected None, got Some"),
+    None => assert(true, msg),
+  }
+}
+
+fn expect_some(o, msg) {
+  match o {
+    Some(_) => assert(true, msg),
+    None => assert(false, perform String.concat("expected Some, got None at: ", msg)),
+  }
+}
+
+fn main() {
+  // ── ordered map basics ───────────────────────────────────────────────
+  var m = om_new();
+  assert(om_is_empty(m), "new map is empty")
+  m = om_insert("banana", 2, m);
+  m = om_insert("apple", 1, m);
+  m = om_insert("cherry", 3, m);
+  assert_eq(om_size(m), 3)
+  assert(om_contains("apple", m), "contains apple")
+  assert(!om_contains("durian", m), "no durian")
+  expect_some_eq(om_get("banana", m), 2, "get banana")
+  expect_none(om_get("durian", m), "get missing")
+
+  // ── keys stay sorted regardless of insertion order ───────────────────
+  let ks = om_keys(m);
+  assert_eq(perform Array.length(ks), 3)
+  assert(ks[0] == "apple", "keys sorted: apple first")
+  assert(ks[1] == "banana", "keys sorted: banana second")
+  assert(ks[2] == "cherry", "keys sorted: cherry third")
+  let vs = om_values(m);
+  assert_eq(vs[0], 1)
+  assert_eq(vs[2], 3)
+
+  // ── overwrite keeps position and size ────────────────────────────────
+  let m2 = om_insert("banana", 22, m);
+  assert_eq(om_size(m2), 3)
+  expect_some_eq(om_get("banana", m2), 22, "overwrite banana")
+  expect_some_eq(om_get("banana", m), 2, "old snapshot unchanged")
+
+  // ── remove ───────────────────────────────────────────────────────────
+  let m3 = om_remove("banana", m);
+  assert_eq(om_size(m3), 2)
+  assert(!om_contains("banana", m3), "banana removed")
+  assert_eq(om_size(om_remove("durian", m)), 3)
+  assert_eq(om_size(om_remove("x", om_new())), 0)
+
+  // ── priority queue: ascending priority order ─────────────────────────
+  var q = pq_new();
+  assert(pq_is_empty(q), "new pq empty")
+  q = pq_push(5, "five", q);
+  q = pq_push(1, "one", q);
+  q = pq_push(3, "three", q);
+  q = pq_push(2, "two", q);
+  q = pq_push(4, "four", q);
+  assert_eq(pq_size(q), 5)
+  expect_some_eq(pq_peek(q), "one", "peek smallest")
+  expect_some_eq(pq_peek_priority(q), 1, "peek priority 1")
+
+  var order = "";
+  var rest = q;
+  var i = 0;
+  while i < 5 {
+    let p = pq_pop(rest);
+    match p.0 {
+      Some(v) => { order = perform String.concat(order, v) },
+      None => unit,
+    };
+    rest = p.1;
+    i = i + 1
+  };
+  assert(order == "onetwothreefourfive", "pop in priority order")
+  assert(pq_is_empty(rest), "pq drained")
+  let empty_pop = pq_pop(pq_new());
+  expect_none(empty_pop.0, "pop empty pq is None")
+  expect_none(pq_peek(pq_new()), "peek empty pq is None")
+
+  // ── duplicate priorities pop all entries ─────────────────────────────
+  var q2 = pq_push(1, "a", pq_new());
+  q2 = pq_push(1, "b", q2);
+  let d1 = pq_pop(q2);
+  let d2 = pq_pop(d1.1);
+  expect_some(d1.0, "dup 1 pops")
+  expect_some(d2.0, "dup 2 pops")
+  assert(pq_is_empty(d2.1), "dups drained")
+
+  perform IO.print("ordered-map / priority-queue tests passed")
+}

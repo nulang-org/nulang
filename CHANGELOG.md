@@ -45,7 +45,194 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Added since 1.0.0-frozen — 2026-08-22 (vscode extension)
+- **AOT backend error parity** (`src/aot/mod.rs`): the native AOT run path
+  now surfaces interpreter-parity runtime errors (48-bit overflow, type
+  errors from `pow`/`neg` helpers) instead of silently returning a value.
+
+- **VS Code extension 0.2.0 — language server client** (`editors/vscode/`).
+  The extension now activates `nulang --lsp` over stdio and exposes the full
+  server surface: diagnostics, hover, go-to-definition, references, document
+  symbols, rename, signature help, formatting, semantic tokens, code actions,
+  inlay hints, completion, code lens, and document links. New commands:
+  **Nulang: Compile** (`--emit-nbc`), **Run**, **Type Check** (`--check`),
+  **Restart Language Server**. New `nulang.path` setting (explicit setting >
+  `NULANG_PATH` > `PATH`). Integration test suite drives a real VS Code
+  instance against the real server (language registration, diagnostics on
+  open, hover).
+- **TextMate grammar extracted to `nulang-org/nulang-syntax`** — the grammar
+  (`source.nulang`) now lives in its own repo (tagged `v0.1.0`) and is
+  consumed by the extension as an npm dependency; single source of truth for
+  GitHub linguist submission and other TextMate-compatible editors.
+- **Publishing pipeline** — `.github/workflows/vscode-extension.yml` builds
+  and packages the `.vsix` on PR/main, runs the integration tests, and
+  publishes to the VS Code Marketplace and Open VSX on `ext-v*` tags
+  (secrets: `VSCE_PAT`, `OVSX_TOKEN`).
+- **LSP server stdout purity** (`src/main.rs`, `src/observability.rs`) —
+  tracing now writes to stderr, never stdout. `nulang --lsp` previously
+  interleaved tower-lsp's error logs into the JSON-RPC stdout stream,
+  corrupting framing for every LSP client (any unimplemented request
+  produced a non-framed `ERROR ...` line on stdout).
+- **LSP: removed false `diagnosticProvider` advertisement**
+  (`src/lsp/mod.rs`) — pull diagnostics (`textDocument/diagnostic`) are not
+  implemented; advertising them made clients (VS Code's
+  vscode-languageclient) send requests that failed with MethodNotFound and
+  triggered the stdout corruption above. Diagnostics remain push-only via
+  `publishDiagnostics`.
+
+### Added since 1.0.0-frozen — 2026-08-22
+
+- **RFC 0015 phase 1 — structured deprecation warnings**
+  (`src/diagnostic.rs`, `src/types.rs`, `src/main.rs`). `catch`/`fail` emit
+  W01xx warnings (ariadne-rendered, plain-text fallback) instead of being
+  silently accepted; warnings never fail compilation unless `--deny-warnings`
+  is passed. `docs/MIGRATION_RFC_0015.md` and `docs/ERROR_CODES.md` document
+  the codes and migration path.
+
+- **`--json` structured diagnostics** (experimental; `src/json_diagnostics.rs`,
+  schema v1). `nulang --check --json`, `nula build --json`, and
+  `nula test --json` emit machine-readable diagnostics (errors, warnings,
+  spans with line/column) on stdout while progress stays on stderr; without
+  the flag, human output is byte-identical. `tests/cli_json.rs` covers the
+  schema.
+- **Registry worker version ordering** (tooling): the registry worker now
+  sorts package versions with proper semver comparison instead of
+  lexicographic string sort, so `1.0.10` lists after `1.0.2`
+  (`registry-worker/src/index.ts`).
+- **Registry worker semver + quota hardening** (tooling): semver
+  comparison moved to a dedicated `semver.ts` (numeric prerelease
+  identifiers, ASCII alphanumeric, numeric < alphanumeric, fewer fields <
+  more — fixes `0.10.0-alpha.10` < `alpha.9`); chunked PUTs are rejected
+  with `411` when `QUOTA_HOOK_URL` is configured so `size_bytes` is always
+  the real byte count; the Rust registry server sorts versions
+  semver-aware via `package::resolver::parse_semver` (invalid keys last,
+  deterministic). 15 new vitest unit/integration tests.
+- **Registry seed packages** (experimental; `src/registry`, `src/package`,
+  `packages/`). The `nula` package manager ships a set of seed packages
+  (`packages/*`) that can be published to a registry and used as
+  dependencies:
+  - `nula registry seed` installs/registers the seed packages with the
+    configured registry (`src/registry/seed.rs`).
+  - Bare module imports (`import lib`) resolve against the package's own
+    `src/` directory when not found next to the importing file
+    (`src/resolver.rs`), so `tests/*.nula` can import the package's modules
+    under `nula test`.
+  - `--with` capability grants are honored in the `--emit-nbc` path
+    (`src/main.rs`), matching `--check`/`--eval`.
+  - Seed packages declare no capabilities and run under default-deny.
+
+### Added since 1.0.0-frozen — 2026-08-21
+
+- **Full-stack web framework** (experimental; `src/web`, `src/runtime`,
+  `src/package`, `src/stdlib/web`). Adds language support, compiler pipeline,
+  and runtime for web applications:
+  - `signal name: Type = init` declarations for reactive state
+    (`src/parser.rs`, `src/ast.rs`, `src/web/reactivity.rs`).
+  - JSX/HTML expression parsing (`<tag attr={expr}>...</tag>`), desugared to
+    `el("tag", attrs, children)` with `text("...")` nodes; reserved keywords
+    may be used as tag/attribute names.
+  - `@nulang/*` package namespace and module graph resolution
+    (`src/web/modules.rs`, `src/web/ir.rs`, `src/package/manifest.rs`).
+  - `nula build --web` IR generation with capability, middleware, route
+    placement, and cloud-config extraction (`src/package/commands.rs`).
+  - Server runtime with SSR, HTML host routing, redirects, and reactive signal
+    hydration (`src/runtime/http_server.rs`, `src/runtime/callbacks.rs`).
+  - Adaptive VM optimizer: cached frame/constant references and inlined hot
+    frame opcodes (`Call`, `TailCall`, `Ret`, `RetVal`, `ClosureCall`) in
+    `src/vm.rs`.
+  - Web standard library modules (`src/stdlib/web/{host,html,realtime,types}.nula`),
+    example apps (`examples/{docs-web,hello-web,chat-web}`), shared packages
+    (`packages/nulang-auth`), and 18 conformance tests
+    (`conformance/behavior/web_*`).
+- **Windows x86_64 release binary** (tooling): the release workflow now
+  builds `nulang-windows-x86_64.tar.gz` on `windows-latest`
+  (`x86_64-pc-windows-msvc`). `build.rs` gates its libpython symlink
+  workaround to `cfg(unix)` (the API does not exist on Windows; pyo3
+  links the Python import lib directly there). No OpenSSL needed on
+  Windows — `native-tls` uses SChannel. `src/main.rs` gates the
+  `--bench` stdout/stderr fd redirection (`dup`/`dup2`/`/dev/null`) to
+  `cfg(unix)` with a no-op fallback on Windows.
+- **VM call-path performance work** (interpreter + JIT tiering):
+  - Per-function register counts (`CodeModule.function_local_counts`,
+    `src/bytecode.rs`, `src/mir_codegen.rs`): parallel to `function_table`,
+    populated with `LOCAL_BASE + locals.len()`; `#[serde(default)]` keeps old
+    `.nbc` artifacts deserializing unchanged.
+  - `ClosureCall` now copies only the callee's register range instead of all
+    256 caller registers (`src/vm.rs`); `Call` already copied only `argc`.
+  - Step-limit check batched to every 64 steps instead of every step
+    (`src/vm.rs`) — safety limit semantics unchanged (overshoot ≤63 steps).
+  - JIT probe cache (`last_compiled_probe`, `src/jit/mod.rs`): skips the
+    compiled-region HashMap lookup for sequential execution in hot loops.
+  - Measured (release, x86_64): fib(30) 16.81s → 0.56s, call-chain
+    (100k × 10-deep) 2.21s → 0.27s.
+
+### Added since 1.0.0-frozen — 2026-08-19
+- **Iso arena allocation** (experimental; `src/iso_arena.rs`): arena-backed
+  allocation for iso data with qualifying-site analysis over the bytecode
+  (may-pointer register sets), plus `alloc_arena`/`reset_arena`/
+  `is_arena_ptr` hooks on `ActorVmCallbacks`. Arena objects are reclaimed
+  wholesale at activation end.
+
+- **RFC 0016 — Virtual Actor Auto-Hydration and Immutable Shared Object Store**
+  (Experimental). Orleans-style virtual actors plus a Ray-style immutable
+  object store for large `val` payloads:
+  - `virtual entity Name(key: Type) { ... }` declares a grain type; messages
+    to `Grain("Name", key)` hydrate the actor on demand
+    (`src/parser.rs`, `src/ast.rs`, `src/typechecker.rs`,
+    `src/runtime/grain.rs`, `src/runtime/mod.rs`).
+  - `Runtime::resolve_or_hydrate_grain` loads snapshots, replays journals, and
+    enqueues the grain; `Runtime::dehydrate_idle_grains` persists and
+    hibernates idle grains; `Runtime::evict_hibernated_grains` reclaims
+    memory while keeping grains addressable.
+  - Built-in `Grain.ref`, `Grain.prewarm`, `Grain.pin`, `Grain.unpin` effects
+    (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`).
+  - Cross-shard grain routing (`stable_id % shard_count`) with identity carried
+    in `CrossShardMsg::DeliverMessage` so owner shards hydrate on first
+    delivery (`src/runtime/mod.rs`, `src/runtime/distributed.rs`).
+  - Per-shard immutable object store (`src/runtime/object_store.rs`) with
+    `TAG_OBJECT` value representation and wire-protocol support for `ObjectRef`
+    handles (`src/value_layout.rs`, `src/runtime/network.rs`).
+
+### Added since 1.0.0-frozen — 2026-08-17 (perf/optimizations branch)
+
+- **`StrBuilder` builtin effect** — mutable growable string buffer
+  (`StrBuilder.new/push/to_string/len/reset`). Appends are amortized O(1) with
+  capacity doubling, converting O(n²) text assembly (the `+` concat path) to
+  O(n). Wrapped in `stdlib::string` (`builder`/`builder_push`/…). Measured
+  ~6× faster than `+` at 30 KB, widening super-linearly. (Experimental)
+- **`Map` builtin effect** — mutable open-addressed hash map
+  (`Map.new/insert/get/remove/contains/size`). String keys compare by content;
+  capacity doubles at 0.5 load; keys/values participate in ORCA reclamation.
+  Replaces the O(n) linear-scan `std.map` for keyed workloads. (Experimental)
+- **Per-send allocation removal** — `behavior_id_for` and distributed content-
+  hash lookup no longer build a `format!(".{name}")` string per send.
+- **Actor heap density** — default per-actor bump block 64 KiB → 16 KiB
+  (~4× actor density, ≈64k actors/GB). Growth chaining unchanged.
+- **Int `**` overflow consistency** — interpreter, JIT, and AOT now all wrap
+  on 48-bit int-pow overflow (previously the interpreter wrapped while the
+  JIT/AOT compiled helper `nulang_pow` returned `nil` + recorded an arithmetic
+  error). The compiled helper now mirrors the interpreter's `step_ipow`.
+  Also fixed the AOT unboxed-compilation hazard: `Pow` was missing from
+  `is_all_int`'s nil-producing exclusion, so an all-`Int` function compiled
+  unboxed, fell through the unboxed binop match to the tagged helper with raw
+  operands, and returned `0` for any non-overflow pow (`3 ** 3` → 0). Pow is
+  now excluded from unboxed mode; `3 ** 3` → 27 and `3 ** -1` → nil on all
+  backends.
+- **JIT-compiled direct calls** — hot regions now fold direct calls to
+  provably-non-suspending, non-recursive callees and run them via a
+  re-entrant helper on the interpreter frame stack, keeping the caller's
+  compiled region resident (no per-call region re-entry). Acyclic call-heavy
+  loops measured ~46% faster (debug). Recursive and effect-performing callees
+  stay on the interpreter by static analysis (`may_suspend` +
+  recursion-cycle gates). Foundation: `find_compilable_region_with_calls`,
+  `compute_may_suspend`, `compute_recursive` in `src/jit/`.
+
+
 ### Added since 1.0.0-frozen — 2026-08-15
+- **E0208 FFI boundary diagnostic** (`src/types.rs`, `src/diagnostic.rs`):
+  capability-qualified types at the FFI boundary now report the new
+  `E013`/`E0208` error code (`FfiBoundaryViolation`) with `--explain`
+  support, replacing the generic error path (`docs/ERROR_CODES.md`).
 
 - **Aether borrow-semantics features (P0–P5).** Six borrows from the
   Aether→Nulang comparison, landed together:

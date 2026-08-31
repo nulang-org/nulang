@@ -8,8 +8,8 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
     use crate::runtime::{
-        ActorSnapshot, EventEntry, JournalEntry, MemoryStore, PersistenceStore, Runtime,
-        RuntimeVmCallbacks, WorkflowEvent,
+        grain_actor_id, ActorSnapshot, DehydratePolicy, EventEntry, GrainId, JournalEntry,
+        MemoryStore, PersistenceStore, Runtime, RuntimeVmCallbacks, WorkflowEvent,
     };
     use crate::typechecker::TypeChecker;
     use crate::types::NuError;
@@ -203,6 +203,7 @@ mod tests {
     ) -> Result<(Value, Type), NuError> {
         let (module, module_type) = compile_source(source)?;
 
+        runtime.borrow_mut().register_module_grains(&module);
         let mut vm = VM::new();
         vm.load_module(module);
         vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(runtime)));
@@ -2638,6 +2639,541 @@ match { a: 2, b: 9 } with {
             Some(3),
             "counter should keep incrementing correctly after two \
              recovery cycles"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual actor (grain) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_grain_hydrates_on_first_send() {
+        let source = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+                behavior get() { self.count }
+            }
+            0
+        "#;
+
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().register_module_grains(&module);
+
+        let grain_id = GrainId::new("Counter", "alpha");
+        let stable_id = grain_actor_id(&grain_id);
+        assert!(
+            !rt.borrow().actors.contains_key(&stable_id),
+            "grain should not be resident before first send"
+        );
+
+        rt.borrow_mut()
+            .send_to_grain(grain_id.clone(), "inc", vec![], 0);
+        rt.borrow_mut().run_scheduler();
+
+        let rt_ref = rt.borrow();
+        let actor = rt_ref.actors.get(&stable_id).expect("grain should hydrate");
+        assert_eq!(
+            actor.get_state_field("count").and_then(|v| v.as_int()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_grain_state_persists_across_runtime_restart() {
+        let source = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+                behavior get() { self.count }
+            }
+            0
+        "#;
+
+        let store = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let grain_id = GrainId::new("Counter", "beta");
+        let stable_id = grain_actor_id(&grain_id);
+
+        // First runtime: hydrate, send two incs.
+        let rt1 = Rc::new(RefCell::new(Runtime::new()));
+        rt1.borrow_mut().persistence = Box::new(store.clone());
+        rt1.borrow_mut().register_module_grains(&module);
+        rt1.borrow_mut()
+            .send_to_grain(grain_id.clone(), "inc", vec![], 0);
+        rt1.borrow_mut()
+            .send_to_grain(grain_id.clone(), "inc", vec![], 0);
+        rt1.borrow_mut().run_scheduler();
+        assert_eq!(
+            rt1.borrow()
+                .actors
+                .get(&stable_id)
+                .unwrap()
+                .get_state_field("count")
+                .and_then(|v| v.as_int()),
+            Some(2)
+        );
+
+        // Second runtime: same store, no explicit spawn; sending re-hydrates from snapshot.
+        let rt2 = Rc::new(RefCell::new(Runtime::new()));
+        rt2.borrow_mut().persistence = Box::new(store.clone());
+        rt2.borrow_mut().register_module_grains(&module);
+        assert!(!rt2.borrow().actors.contains_key(&stable_id));
+        rt2.borrow_mut()
+            .send_to_grain(grain_id.clone(), "inc", vec![], 0);
+        rt2.borrow_mut().run_scheduler();
+        assert_eq!(
+            rt2.borrow()
+                .actors
+                .get(&stable_id)
+                .unwrap()
+                .get_state_field("count")
+                .and_then(|v| v.as_int()),
+            Some(3),
+            "grain state must survive runtime restart"
+        );
+    }
+
+    #[test]
+    fn test_grain_dehydrates_and_rehydrates() {
+        let source = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+                behavior get() { self.count }
+            }
+            0
+        "#;
+
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().register_module_grains(&module);
+        // Make dehydration immediate once the scan runs.
+        rt.borrow_mut()
+            .grain_registry
+            .get_mut("Counter")
+            .unwrap()
+            .dehydrate_policy = DehydratePolicy {
+            idle_ms: 0,
+            allow_dehydrate: true,
+        };
+
+        let grain_id = GrainId::new("Counter", "gamma");
+        let stable_id = grain_actor_id(&grain_id);
+
+        rt.borrow_mut()
+            .send_to_grain(grain_id.clone(), "inc", vec![], 0);
+        rt.borrow_mut().run_scheduler();
+        assert_eq!(
+            rt.borrow()
+                .actors
+                .get(&stable_id)
+                .unwrap()
+                .get_state_field("count")
+                .and_then(|v| v.as_int()),
+            Some(1)
+        );
+
+        // Manually trigger the dehydration scan. In production this is driven
+        // by the scheduler every DEHYDRATE_CHECK_INTERVAL ticks.
+        rt.borrow_mut().dehydrate_idle_grains();
+
+        {
+            let rt_ref = rt.borrow();
+            let actor = rt_ref.actors.get(&stable_id).expect("grain still resident");
+            assert!(
+                actor.is_hibernated(),
+                "idle grain with empty mailbox should dehydrate"
+            );
+        }
+
+        // Sending to a hibernated grain wakes it and processes the message.
+        rt.borrow_mut()
+            .send_to_grain(grain_id.clone(), "inc", vec![], 0);
+        rt.borrow_mut().run_scheduler();
+        {
+            let rt_ref = rt.borrow();
+            let actor = rt_ref.actors.get(&stable_id).unwrap();
+            assert!(!actor.is_hibernated(), "grain should wake from hibernation");
+            assert_eq!(
+                actor.get_state_field("count").and_then(|v| v.as_int()),
+                Some(2)
+            );
+        }
+    }
+
+    #[test]
+    fn test_pinned_grain_skips_dehydration() {
+        let source = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+                behavior get() { self.count }
+            }
+            0
+        "#;
+
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().register_module_grains(&module);
+        rt.borrow_mut()
+            .grain_registry
+            .get_mut("Counter")
+            .unwrap()
+            .dehydrate_policy = DehydratePolicy {
+            idle_ms: 0,
+            allow_dehydrate: true,
+        };
+
+        let grain_id = GrainId::new("Counter", "delta");
+        let stable_id = grain_actor_id(&grain_id);
+
+        rt.borrow_mut()
+            .send_to_grain(grain_id.clone(), "inc", vec![], 0);
+        rt.borrow_mut().run_scheduler();
+        rt.borrow_mut().actors.get_mut(&stable_id).unwrap().pin();
+
+        rt.borrow_mut().dehydrate_idle_grains();
+
+        {
+            let rt_ref = rt.borrow();
+            let actor = rt_ref.actors.get(&stable_id).unwrap();
+            assert!(!actor.is_hibernated(), "pinned grain should not dehydrate");
+        }
+    }
+
+    #[test]
+    fn test_grain_eviction_reclaims_memory_and_rehydrates() {
+        let source = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+                behavior get() { self.count }
+            }
+            0
+        "#;
+
+        let store = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(store.clone());
+        rt.borrow_mut().register_module_grains(&module);
+        rt.borrow_mut()
+            .grain_registry
+            .get_mut("Counter")
+            .unwrap()
+            .dehydrate_policy = DehydratePolicy {
+            idle_ms: 0,
+            allow_dehydrate: true,
+        };
+
+        let grain_id = GrainId::new("Counter", "epsilon");
+        let stable_id = grain_actor_id(&grain_id);
+
+        rt.borrow_mut()
+            .send_to_grain(grain_id.clone(), "inc", vec![], 0);
+        rt.borrow_mut().run_scheduler();
+        assert_eq!(
+            rt.borrow()
+                .actors
+                .get(&stable_id)
+                .unwrap()
+                .get_state_field("count")
+                .and_then(|v| v.as_int()),
+            Some(1)
+        );
+
+        // Hibernate, then evict the resident actor to reclaim memory.
+        rt.borrow_mut().dehydrate_idle_grains();
+        {
+            let rt_ref = rt.borrow();
+            let actor = rt_ref
+                .actors
+                .get(&stable_id)
+                .expect("grain still resident before eviction");
+            assert!(
+                actor.is_hibernated(),
+                "grain should be hibernated before eviction"
+            );
+        }
+
+        let evicted = rt.borrow_mut().evict_hibernated_grains(None);
+        assert_eq!(evicted, 1, "one hibernated grain should be evicted");
+
+        {
+            let rt_ref = rt.borrow();
+            assert!(
+                !rt_ref.actors.contains_key(&stable_id),
+                "evicted grain should be removed from actors"
+            );
+            assert!(
+                !rt_ref.grain_residents.contains_key(&grain_id),
+                "evicted grain should be removed from grain_residents"
+            );
+            assert!(
+                rt_ref.grain_actor_ids.contains_key(&stable_id),
+                "stable grain mapping must survive eviction so sends can re-hydrate"
+            );
+        }
+
+        // Sending again re-hydrates from the persisted snapshot and processes the message.
+        rt.borrow_mut()
+            .send_to_grain(grain_id.clone(), "inc", vec![], 0);
+        rt.borrow_mut().run_scheduler();
+        {
+            let rt_ref = rt.borrow();
+            let actor = rt_ref
+                .actors
+                .get(&stable_id)
+                .expect("grain should re-hydrate");
+            assert!(
+                !actor.is_hibernated(),
+                "grain should be active after re-hydration"
+            );
+            assert_eq!(
+                actor.get_state_field("count").and_then(|v| v.as_int()),
+                Some(2),
+                "evicted grain state must be restored from snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn test_evicted_grain_rehydrates_on_send_message_by_id() {
+        let source = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+            0
+        "#;
+
+        let store = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(store.clone());
+        rt.borrow_mut().register_module_grains(&module);
+        rt.borrow_mut()
+            .grain_registry
+            .get_mut("Counter")
+            .unwrap()
+            .dehydrate_policy = DehydratePolicy {
+            idle_ms: 0,
+            allow_dehydrate: true,
+        };
+
+        let grain_id = GrainId::new("Counter", "zeta");
+        let stable_id = grain_actor_id(&grain_id);
+
+        rt.borrow_mut()
+            .send_to_grain(grain_id.clone(), "inc", vec![], 0);
+        rt.borrow_mut().run_scheduler();
+        let behavior_id = rt.borrow().behavior_id_for(stable_id, "inc").unwrap();
+
+        rt.borrow_mut().dehydrate_idle_grains();
+        rt.borrow_mut().evict_hibernated_grains(None);
+        assert!(!rt.borrow().actors.contains_key(&stable_id));
+
+        // send_message_by_id should detect the evicted grain and re-hydrate.
+        rt.borrow_mut()
+            .send_message_by_id(stable_id, behavior_id, &[]);
+        rt.borrow_mut().run_scheduler();
+        assert_eq!(
+            rt.borrow()
+                .actors
+                .get(&stable_id)
+                .unwrap()
+                .get_state_field("count")
+                .and_then(|v| v.as_int()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_eviction_respects_pin_and_max_limit() {
+        let source = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+            0
+        "#;
+
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().register_module_grains(&module);
+        rt.borrow_mut()
+            .grain_registry
+            .get_mut("Counter")
+            .unwrap()
+            .dehydrate_policy = DehydratePolicy {
+            idle_ms: 0,
+            allow_dehydrate: true,
+        };
+
+        let g1 = GrainId::new("Counter", "one");
+        let g2 = GrainId::new("Counter", "two");
+        let s1 = grain_actor_id(&g1);
+        let s2 = grain_actor_id(&g2);
+
+        rt.borrow_mut().send_to_grain(g1.clone(), "inc", vec![], 0);
+        rt.borrow_mut().send_to_grain(g2.clone(), "inc", vec![], 0);
+        rt.borrow_mut().run_scheduler();
+
+        // Pin g1 so it cannot be evicted.
+        rt.borrow_mut().actors.get_mut(&s1).unwrap().pin();
+
+        rt.borrow_mut().dehydrate_idle_grains();
+        assert!(
+            !rt.borrow().actors.get(&s1).unwrap().is_hibernated(),
+            "pinned grain should not be hibernated"
+        );
+        assert!(rt.borrow().actors.get(&s2).unwrap().is_hibernated());
+
+        // max_evict=1 should evict only g2 (g1 is pinned).
+        let evicted = rt.borrow_mut().evict_hibernated_grains(Some(1));
+        assert_eq!(evicted, 1);
+        assert!(
+            rt.borrow().actors.contains_key(&s1),
+            "pinned grain must remain resident"
+        );
+        assert!(
+            !rt.borrow().actors.contains_key(&s2),
+            "unpinned grain should be evicted"
+        );
+    }
+
+    #[test]
+    fn test_perform_grain_ref_returns_stable_actor_id() {
+        let source = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+            }
+            perform Grain.ref("Counter", "k1")
+        "#;
+
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        let (value, _ty) = run_source_with_runtime(source, rt.clone()).unwrap();
+
+        let expected_id = grain_actor_id(&GrainId::new("Counter", "k1"));
+        assert_eq!(value.as_actor_id(), Some(expected_id));
+    }
+
+    #[test]
+    fn test_perform_grain_ref_after_prewarm_sends() {
+        let source = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+            perform Grain.prewarm("Counter", "k1");
+            let c = perform Grain.ref("Counter", "k1") in {
+                send c inc();
+                0
+            }
+        "#;
+
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        let _ = run_source_with_runtime(source, rt.clone()).unwrap();
+        rt.borrow_mut().run_scheduler();
+
+        let stable_id = grain_actor_id(&GrainId::new("Counter", "k1"));
+        let rt_ref = rt.borrow();
+        let actor = rt_ref.actors.get(&stable_id).expect("grain should hydrate");
+        assert_eq!(
+            actor.get_state_field("count").and_then(|v| v.as_int()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_perform_grain_prewarm_hydrates_grain() {
+        let source = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+            perform Grain.prewarm("Counter", "k2")
+        "#;
+
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        let _ = run_source_with_runtime(source, rt.clone()).unwrap();
+
+        let stable_id = grain_actor_id(&GrainId::new("Counter", "k2"));
+        assert!(
+            rt.borrow().actors.contains_key(&stable_id),
+            "perform Grain.prewarm should hydrate the grain"
+        );
+    }
+
+    #[test]
+    fn test_perform_grain_pin_unpin() {
+        let source_pin = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+            perform Grain.prewarm("Counter", "k3");
+            perform Grain.pin("Counter", "k3");
+            0
+        "#;
+
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        let _ = run_source_with_runtime(source_pin, rt.clone()).unwrap();
+
+        let stable_id = grain_actor_id(&GrainId::new("Counter", "k3"));
+        assert!(
+            rt.borrow().actors.get(&stable_id).unwrap().pinned,
+            "perform Grain.pin should set the pinned flag"
+        );
+
+        let source_unpin = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+            }
+            perform Grain.unpin("Counter", "k3");
+            0
+        "#;
+        let _ = run_source_with_runtime(source_unpin, rt.clone()).unwrap();
+        assert!(
+            !rt.borrow().actors.get(&stable_id).unwrap().pinned,
+            "perform Grain.unpin should clear the pinned flag"
+        );
+    }
+
+    #[test]
+    fn test_grain_ref_expression() {
+        let source = r#"
+            virtual entity Counter(key: String) {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+            let c = Grain("Counter", "k1") in {
+                send c inc();
+                send c inc();
+                c
+            }
+        "#;
+
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        let (value, _ty) = run_source_with_runtime(source, rt.clone()).unwrap();
+
+        let grain_id = GrainId::new("Counter", "k1");
+        let stable_id = grain_actor_id(&grain_id);
+        assert_eq!(
+            value.as_actor_id(),
+            Some(stable_id),
+            "Grain(...) should return the stable actor id"
+        );
+
+        rt.borrow_mut().run_scheduler();
+        let rt_ref = rt.borrow();
+        let actor = rt_ref.actors.get(&stable_id).expect("grain should hydrate");
+        assert_eq!(
+            actor.get_state_field("count").and_then(|v| v.as_int()),
+            Some(2),
+            "two inc messages should increment the grain counter"
         );
     }
 
@@ -9563,6 +10099,7 @@ match { a: 2, b: 9 } with {
                     behavior_idx: 0,
                     init: vec![],
                     target_node: Some(node),
+                    capabilities: vec![],
                 },
             );
             builder.terminate(crate::mir::Terminator::Return(Some(out)));
@@ -10137,6 +10674,7 @@ match { a: 2, b: 9 } with {
         );
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn test_http_serve_roundtrip() {
         use std::io::{Read, Write};
@@ -10185,6 +10723,7 @@ match { a: 2, b: 9 } with {
     /// a server failed. The standalone callbacks now host the server
     /// directly (StandaloneVmCallbacks::perform_builtin_effect_in_module),
     /// mirroring the runtime-backed path.
+    #[cfg(feature = "tcp")]
     #[test]
     fn test_http_serve_standalone() {
         use std::io::{Read, Write};
@@ -10982,8 +11521,149 @@ match { a: 2, b: 9 } with {
     }
 
     // -----------------------------------------------------------------------
-    // Tuple field access: positional field access with numeric indices (t.0, t.1, ...)
+    // StrBuilder builtin: mutable growable string buffer
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strbuilder_basic() {
+        assert_int(
+            "let b = perform StrBuilder.new() in perform StrBuilder.len(b)",
+            0,
+        );
+        assert_int(
+            "let b = perform StrBuilder.new() in \
+             let b2 = perform StrBuilder.push(b, \"hi\") in perform StrBuilder.len(b2)",
+            2,
+        );
+        assert_string(
+            "let b = perform StrBuilder.new() in \
+             let b2 = perform StrBuilder.push(b, \"hi\") in perform StrBuilder.to_string(b2)",
+            "hi",
+        );
+    }
+
+    #[test]
+    fn test_strbuilder_growth() {
+        // 10k appends of 3 bytes: crosses several capacity doublings and
+        // exercises the reallocation path; amortized O(n) total.
+        let source = r#"
+            var b = perform StrBuilder.new();
+            var i = 0;
+            while i < 10000 {
+                b = perform StrBuilder.push(b, "abc");
+                i = i + 1
+            };
+            perform StrBuilder.len(b)
+        "#;
+        assert_int(source, 30000);
+    }
+
+    #[test]
+    fn test_strbuilder_content_roundtrip() {
+        let source = r#"
+            var b = perform StrBuilder.new();
+            b = perform StrBuilder.push(b, "Hello, ");
+            b = perform StrBuilder.push(b, "Nulang");
+            b = perform StrBuilder.push(b, "!");
+            perform StrBuilder.to_string(b)
+        "#;
+        assert_string(source, "Hello, Nulang!");
+    }
+
+    #[test]
+    fn test_strbuilder_reset() {
+        assert_int(
+            "let b = perform StrBuilder.new() in \
+             let b2 = perform StrBuilder.push(b, \"abc\") in \
+             let b3 = perform StrBuilder.reset(b2) in perform StrBuilder.len(b3)",
+            0,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Map builtin: mutable hash map with content-based string keys
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_builtin_basic() {
+        assert_int("let m = perform Map.new() in perform Map.size(m)", 0);
+        assert_int(
+            "let m = perform Map.new() in \
+             let m2 = perform Map.insert(m, \"a\", 1) in perform Map.size(m2)",
+            1,
+        );
+        assert_int(
+            "let m = perform Map.new() in \
+             let m2 = perform Map.insert(m, \"a\", 1) in perform Map.get(m2, \"a\")",
+            1,
+        );
+        assert_bool(
+            "let m = perform Map.new() in \
+             let m2 = perform Map.insert(m, \"a\", 1) in perform Map.contains(m2, \"b\")",
+            false,
+        );
+    }
+
+    #[test]
+    fn test_map_builtin_mixed_keys() {
+        // Int keys and string keys coexist; string keys compare by content.
+        let source = r#"
+            var m = perform Map.new();
+            m = perform Map.insert(m, "alpha", 1);
+            m = perform Map.insert(m, 42, "answer");
+            perform Map.get(m, 42)
+        "#;
+        assert_string(source, "answer");
+        assert_int(
+            "let m = perform Map.new() in \
+             let m2 = perform Map.insert(m, 7, 100) in perform Map.get(m2, 7)",
+            100,
+        );
+    }
+
+    #[test]
+    fn test_map_builtin_content_keys() {
+        // Keys built by concatenation must match literal keys (different
+        // constant-pool ids, same content).
+        assert_int(
+            "let m = perform Map.new() in \
+             let m2 = perform Map.insert(m, \"hello\", 7) in \
+             perform Map.get(m2, \"he\" + \"llo\")",
+            7,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::erasing_op)]
+    fn test_map_builtin_overwrite_remove() {
+        let source = r#"
+            var m = perform Map.new();
+            m = perform Map.insert(m, "k", 1);
+            m = perform Map.insert(m, "k", 2);
+            let v1 = perform Map.get(m, "k");
+            m = perform Map.remove(m, "k");
+            let v2 = perform Map.get(m, "k");
+            perform Map.size(m) * 100 + v1 * 10 + v2
+        "#;
+        // Overwrite keeps size 1; v1 = 2; after remove size 0; v2 = nil -> 0.
+        // The source computes `Map.size(m) * 100 + v1 * 10 + v2` == 0*100 + 2*10 + 0.
+        assert_int(source, 20);
+    }
+
+    #[test]
+    fn test_map_builtin_growth() {
+        // 60 inserts forces several capacity doublings (load factor 0.5).
+        let source = r#"
+            var m = perform Map.new();
+            var i = 0;
+            while i < 60 {
+                m = perform Map.insert(m, "key" + perform Int.to_string(i), i);
+                i = i + 1
+            };
+            perform Map.get(m, "key30") * 100 + perform Map.size(m)
+        "#;
+        assert_int(source, 30 * 100 + 60);
+    }
 
     #[test]
     fn test_tuple_field_access_basic() {
@@ -11098,9 +11778,8 @@ match { a: 2, b: 9 } with {
         ast.decls = pd;
 
         // 4. Resolve imports (stdlib::json, stdlib::datetime, etc.)
-        let base_dir = path.parent().unwrap_or(Path::new("."));
         let mut visited = HashSet::new();
-        crate::resolver::resolve_imports(&mut ast, base_dir, &mut visited)?;
+        crate::resolver::resolve_imports(&mut ast, path, &mut visited)?;
 
         // 5. Type check
         let mut type_checker = TypeChecker::new();

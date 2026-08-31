@@ -1,0 +1,66 @@
+// Tests for http-client — pure parts only: url_encode, build_query, and
+// the request builder. `send` performs the Http effect and needs a runtime
+// host, so it is not exercised here.
+
+import lib
+import stdlib::test
+
+// `==` is identity equality for variants, so Options are checked via match.
+fn expect_some_str(o, expected, msg) {
+  match o {
+    Some(v) => assert(v == expected, msg),
+    None => assert(false, "expected Some, got None"),
+  }
+}
+
+fn expect_none(o, msg) {
+  match o {
+    Some(_) => assert(false, "expected None, got Some"),
+    None => assert(true, msg),
+  }
+}
+
+fn main() {
+  // ── url_encode ───────────────────────────────────────────────────────
+  assert(url_encode("abcXYZ019") == "abcXYZ019", "unreserved pass through")
+  assert(url_encode("-_.~") == "-_.~", "punctuation unreserved")
+  assert(url_encode("a b") == "a+b", "space becomes plus")
+  assert(url_encode("a&b=c") == "a%26b%3Dc", "reserved chars encoded")
+  assert(url_encode("100%") == "100%25", "percent encoded")
+  assert(url_encode("") == "", "empty string")
+  assert(url_encode("a/b?c") == "a%2Fb%3Fc", "slash and question mark")
+
+  // ── build_query ──────────────────────────────────────────────────────
+  assert(build_query([]) == "", "empty query")
+  assert(build_query([("q", "nu lang")]) == "q=nu+lang", "single param")
+  assert(build_query([("a", "1"), ("b", "2")]) == "a=1&b=2", "two params")
+  assert(build_query([("k&", "v=")]) == "k%26=v%3D", "params encoded")
+
+  // ── request builder ──────────────────────────────────────────────────
+  let r1 = get_request("https://api.example.com", "/search");
+  assert(r1.method == "GET", "get method")
+  assert(request_url(r1) == "https://api.example.com/search", "url without query")
+
+  // params keep insertion order: innermost call adds its param first
+  let r2 = with_query_param("page", "1",
+           with_query_param("q", "nu lang",
+           get_request("https://api.example.com", "/search")));
+  assert(request_url(r2) == "https://api.example.com/search?q=nu+lang&page=1",
+      "url with query")
+
+  let r3 = with_header("Accept", "application/json",
+           with_header("X-Token", "s3cret", r1));
+  assert_eq(perform Array.length(r3.headers), 2)
+  expect_some_str(header_value("Accept", r3), "application/json", "header lookup")
+  expect_some_str(header_value("X-Token", r3), "s3cret", "second header")
+  expect_none(header_value("Missing", r3), "missing header")
+  // builder is immutable: r1 still has no headers
+  assert_eq(perform Array.length(r1.headers), 0)
+
+  let r4 = with_body("{}", post_request("https://api.example.com", "/items", ""));
+  assert(r4.method == "POST", "post method")
+  assert(r4.body == "{}", "body replaced")
+  assert(request_url(r4) == "https://api.example.com/items", "post url")
+
+  perform IO.print("http-client builder tests passed")
+}

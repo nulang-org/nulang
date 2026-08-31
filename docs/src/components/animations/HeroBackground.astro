@@ -3,7 +3,7 @@
 
 <div aria-hidden="true"></div>
 
-<script>
+<script is:inline>
   function initHeroBackground() {
     const hero = document.querySelector('.hero');
     if (!hero) return;
@@ -17,48 +17,80 @@
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
+    let width = 0;
+    let height = 0;
+    let dpr = 1;
+
     function resize() {
-      const dpr = window.devicePixelRatio || 1;
-      const w = hero.clientWidth;
-      const h = hero.clientHeight;
-      canvas.width = w * dpr;
-      canvas.height = h * dpr;
-      canvas.style.width = w + 'px';
-      canvas.style.height = h + 'px';
+      dpr = window.devicePixelRatio || 1;
+      width = hero.clientWidth;
+      height = hero.clientHeight;
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      canvas.style.width = width + 'px';
+      canvas.style.height = height + 'px';
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
     resize();
     window.addEventListener('resize', resize);
 
-    const accent = getComputedStyle(document.documentElement).getPropertyValue('--sl-color-accent').trim() || '#3b82f6';
+    const accent = getComputedStyle(document.documentElement).getPropertyValue('--sl-color-accent').trim() || '#f38020';
+    const blue = getComputedStyle(document.documentElement).getPropertyValue('--nu-blue').trim() || '#4b7bff';
+    const surface = getComputedStyle(document.documentElement).getPropertyValue('--nu-surface').trim() || '#141416';
 
-    const W = () => hero.clientWidth;
-    const H = () => hero.clientHeight;
-
-    const particleCount = 60;
+    const particleCount = reducedMotion ? 30 : 65;
     const particles = Array.from({ length: particleCount }, () => ({
-      x: Math.random() * W(),
-      y: Math.random() * H(),
-      vx: (Math.random() - 0.5) * 0.6,
-      vy: (Math.random() - 0.5) * 0.6,
-      r: 1.5 + Math.random() * 1.5,
+      x: Math.random() * width,
+      y: Math.random() * height,
+      vx: (Math.random() - 0.5) * 0.28,
+      vy: (Math.random() - 0.5) * 0.28,
+      r: 1.1 + Math.random() * 2.0,
+      pulse: Math.random() * Math.PI * 2,
+      color: Math.random() > 0.7 ? blue : accent,
     }));
 
+    let mouseX = width / 2;
+    let mouseY = height / 2;
+    let targetMouseX = mouseX;
+    let targetMouseY = mouseY;
+
+    if (!reducedMotion) {
+      hero.addEventListener('mousemove', (e) => {
+        const rect = hero.getBoundingClientRect();
+        targetMouseX = e.clientX - rect.left;
+        targetMouseY = e.clientY - rect.top;
+      }, { passive: true });
+    }
+
     function draw() {
-      const w = W();
-      const h = H();
-      ctx.clearRect(0, 0, w, h);
+      ctx.clearRect(0, 0, width, height);
+
+      // Subtle radial glow behind content
+      const gradient = ctx.createRadialGradient(
+        width * 0.5, height * 0.35, 0,
+        width * 0.5, height * 0.35, width * 0.65
+      );
+      gradient.addColorStop(0, blue + '12');
+      gradient.addColorStop(0.45, accent + '08');
+      gradient.addColorStop(1, 'transparent');
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, width, height);
 
       // connections
+      let connections = 0;
+      const maxConnections = reducedMotion ? 80 : 160;
       for (let i = 0; i < particles.length; i++) {
+        if (connections >= maxConnections) break;
         for (let j = i + 1; j < particles.length; j++) {
+          if (connections >= maxConnections) break;
           const dx = particles[i].x - particles[j].x;
           const dy = particles[i].y - particles[j].y;
           const dist = Math.sqrt(dx * dx + dy * dy);
-          if (dist < 130) {
-            ctx.globalAlpha = (1 - dist / 130) * 0.25;
-            ctx.strokeStyle = accent;
+          if (dist < 160) {
+            connections++;
+            ctx.globalAlpha = (1 - dist / 160) * 0.16;
+            ctx.strokeStyle = particles[i].color === blue || particles[j].color === blue ? blue : accent;
             ctx.lineWidth = 0.5;
             ctx.beginPath();
             ctx.moveTo(particles[i].x, particles[i].y);
@@ -70,30 +102,46 @@
 
       // particles
       for (const p of particles) {
-        ctx.globalAlpha = 0.4;
-        ctx.fillStyle = accent;
+        const pulse = 0.5 + 0.5 * Math.sin(p.pulse);
+        ctx.globalAlpha = 0.22 + pulse * 0.22;
+        ctx.fillStyle = p.color;
         ctx.beginPath();
-        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, p.r * (0.9 + pulse * 0.25), 0, Math.PI * 2);
         ctx.fill();
       }
       ctx.globalAlpha = 1;
     }
 
-    function update() {
-      const w = W();
-      const h = H();
+    function update(time) {
+      mouseX += (targetMouseX - mouseX) * 0.04;
+      mouseY += (targetMouseY - mouseY) * 0.04;
+
       for (const p of particles) {
+        // Gentle parallax drift toward mouse
+        const dx = mouseX - p.x;
+        const dy = mouseY - p.y;
+        const dist = Math.sqrt(dx * dx + dy * dy) + 1;
+        p.vx += (dx / dist) * 0.0008;
+        p.vy += (dy / dist) * 0.0008;
+
+        // Dampen to keep speeds sane
+        p.vx *= 0.999;
+        p.vy *= 0.999;
+
         p.x += p.vx;
         p.y += p.vy;
-        if (p.x < 0 || p.x > w) p.vx *= -1;
-        if (p.y < 0 || p.y > h) p.vy *= -1;
-        p.x = Math.max(0, Math.min(w, p.x));
-        p.y = Math.max(0, Math.min(h, p.y));
+
+        if (p.x < 0) { p.x = 0; p.vx *= -1; }
+        if (p.x > width) { p.x = width; p.vx *= -1; }
+        if (p.y < 0) { p.y = 0; p.vy *= -1; }
+        if (p.y > height) { p.y = height; p.vy *= -1; }
+
+        p.pulse += 0.02;
       }
     }
 
-    function loop() {
-      update();
+    function loop(time) {
+      update(time);
       draw();
       requestAnimationFrame(loop);
     }
@@ -101,7 +149,7 @@
     if (reducedMotion) {
       draw();
     } else {
-      loop();
+      loop(0);
     }
   }
 

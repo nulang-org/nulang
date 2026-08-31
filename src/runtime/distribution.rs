@@ -26,6 +26,7 @@ pub(crate) struct PendingSpawnMessage {
     pub behavior_name: String,
     pub payload: Vec<Value>,
     pub string_table: Vec<String>,
+    pub object_table: Vec<(u64, Vec<u8>)>,
     pub sender: u64,
     pub trace_id: Option<String>,
 }
@@ -57,6 +58,22 @@ pub(crate) fn queue_spawn_message(
             return;
         }
     };
+    let (payload, object_table) = match distributed::resolve_wire_objects(rt, &payload) {
+        Some(resolved) => resolved,
+        None => {
+            warn!(
+                "nulang-net: dropping message to spawn placeholder {}: object ref not found in local store",
+                request_id
+            );
+            let sender = rt.current_actor.unwrap_or(0);
+            crate::runtime::distributed::notify_delivery_failed(
+                rt,
+                sender,
+                "object ref unresolvable",
+            );
+            return;
+        }
+    };
     let sender = rt.current_actor.unwrap_or(0);
     let trace_id = rt.current_trace.as_ref().map(|t| t.to_traceparent());
     rt.pending_spawn_messages
@@ -66,6 +83,7 @@ pub(crate) fn queue_spawn_message(
             behavior_name: behavior.to_string(),
             payload,
             string_table,
+            object_table,
             sender,
             trace_id,
         });
@@ -100,6 +118,7 @@ fn heartbeat_timestamp(rt: &Runtime) -> u64 {
 
 /// Enable the distributed actor system, binding to `bind_addr` for incoming
 /// connections and advertising ourselves under this address.
+#[cfg(feature = "tcp")]
 pub(crate) fn enable_distribution(
     rt: &mut Runtime,
     bind_addr: std::net::SocketAddr,
@@ -109,6 +128,22 @@ pub(crate) fn enable_distribution(
         bind_addr, tls_config,
     )?);
     enable_distribution_with_transport(rt, transport)
+}
+
+/// Enable the distributed actor system.
+///
+/// Stub used when the `tcp` feature is disabled: real TCP distribution is
+/// unavailable, so this always fails. The in-memory deterministic transport
+/// (`enable_distribution_with_transport`) still works for DST.
+#[cfg(not(feature = "tcp"))]
+pub(crate) fn enable_distribution(
+    _rt: &mut Runtime,
+    _bind_addr: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "network distribution requires the 'tcp' feature",
+    ))
 }
 
 /// Enable the distributed actor system over a caller-supplied transport
@@ -417,20 +452,17 @@ pub(crate) fn handle_node_removed(rt: &mut Runtime, node: NodeId) {
             continue;
         }
         if let Some(replica) = rt.shadow_replicas.remove(&entry.actor_id) {
-            let ok = rt.receive_migrated_actor(
-                entry.actor_id,
-                replica.nbc_bytes,
-                replica.snapshot_json,
-            );
+            let ok =
+                rt.receive_migrated_actor(entry.actor_id, replica.nbc_bytes, replica.snapshot_json);
             if ok {
                 // Bump the activation epoch and re-announce so a
                 // resurrected old node self-demotes its stale copy (§5).
-                let new_epoch =
-                    rt.distributed
-                        .cluster
-                        .as_mut()
-                        .map(|c| c.bump_directory_epoch(entry.actor_id, local))
-                        .unwrap_or(entry.epoch.saturating_add(1));
+                let new_epoch = rt
+                    .distributed
+                    .cluster
+                    .as_mut()
+                    .map(|c| c.bump_directory_epoch(entry.actor_id, local))
+                    .unwrap_or(entry.epoch.saturating_add(1));
                 rt.respawn_opted.insert(entry.actor_id, new_epoch);
                 // Forward in-flight messages sent to the old location to
                 // the re-spawned actor (same TTL mechanism as migration).

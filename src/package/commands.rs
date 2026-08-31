@@ -8,6 +8,11 @@ use crate::package::lockfile::{Lockfile, LOCKFILE_FILE};
 use crate::package::manifest::{Dependency, DependencyDetail, Manifest, MANIFEST_FILE};
 use crate::package::resolver::resolve;
 use crate::types::{NuError, NuResult, Span};
+use crate::web::modules::{ModuleRegistry, ModuleSpec};
+
+use crate::bytecode::CodeModule;
+use crate::runtime::{render_route_handler, WebDevServer};
+use crate::vm::VM;
 
 use crate::registry::RegistryClient;
 
@@ -36,6 +41,12 @@ fn package_root() -> NuResult<PathBuf> {
 
 /// Dispatch a `nula` invocation (`args` excludes the leading `nula`).
 pub fn run(args: &[String]) -> NuResult<()> {
+    // Module-contributed subcommands (`@nulang/auth enable`, etc.) take
+    // precedence over built-in commands so modules can extend the CLI.
+    if let Some(result) = try_module_subcommand(args) {
+        return result;
+    }
+
     match args.first().map(String::as_str) {
         Some("new") => {
             let mut template: Option<&str> = None;
@@ -64,12 +75,27 @@ pub fn run(args: &[String]) -> NuResult<()> {
             cmd_new(path_arg, template)
         }
         Some("init") => cmd_init(),
-        Some("build") => cmd_build(),
+        Some("build") => {
+            let web = args.get(1).map(String::as_str) == Some("--web");
+            if web {
+                cmd_build_web()
+            } else {
+                let json = args[1..].iter().any(|a| a == "--json");
+                if args.len() > 1 && !json {
+                    return Err(NuError::PackageError {
+                        msg: format!("unknown flag '{}' for nula build", args[1]),
+                        span: Span::default(),
+                    });
+                }
+                cmd_build(json)
+            }
+        }
         Some("build-wasm") => cmd_build_wasm(),
         Some("test") => {
             let mut filter: Option<&str> = None;
             let mut verbose = false;
             let mut watch = false;
+            let mut json = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -81,6 +107,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
                     }
                     "--verbose" | "-v" => verbose = true,
                     "--watch" | "-w" => watch = true,
+                    "--json" => json = true,
                     other => {
                         return Err(NuError::PackageError {
                             msg: format!("unknown flag '{}' for nula test", other),
@@ -93,7 +120,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
             if watch {
                 cmd_test_watch(filter, verbose)
             } else {
-                cmd_test(filter, verbose)
+                cmd_test(filter, verbose, json)
             }
         }
         Some("run") => {
@@ -104,6 +131,31 @@ pub fn run(args: &[String]) -> NuResult<()> {
             }
         }
         Some("watch") => cmd_run_watch(),
+        Some("dev") => {
+            let mut port: Option<u16> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--port" => {
+                        i += 1;
+                        if i < args.len() {
+                            port = Some(args[i].parse().map_err(|_| NuError::PackageError {
+                                msg: format!("invalid port '{}'", args[i]),
+                                span: Span::default(),
+                            })?);
+                        }
+                    }
+                    other => {
+                        return Err(NuError::PackageError {
+                            msg: format!("unexpected argument '{}' for nula dev", other),
+                            span: Span::default(),
+                        });
+                    }
+                }
+                i += 1;
+            }
+            cmd_dev(port)
+        }
         Some("add") => {
             let name = args.get(1);
             let mut path: Option<String> = None;
@@ -178,6 +230,8 @@ pub fn run(args: &[String]) -> NuResult<()> {
             let mut token: Option<String> = None;
             let mut url: Option<String> = None;
             let mut wasm = false;
+            let mut adapter: Option<String> = None;
+            let mut dry_run = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -190,6 +244,11 @@ pub fn run(args: &[String]) -> NuResult<()> {
                         if i < args.len() { url = Some(args[i].clone()); }
                     }
                     "--wasm" => wasm = true,
+                    "--adapter" => {
+                        i += 1;
+                        if i < args.len() { adapter = Some(args[i].clone()); }
+                    }
+                    "--dry-run" => dry_run = true,
                     other => return Err(NuError::PackageError {
                         msg: format!("unknown flag '{}' for nula deploy", other),
                         span: Span::default()
@@ -197,7 +256,11 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 }
                 i += 1;
             }
-            cmd_deploy(wasm, url, token)
+            let adapter = adapter
+                .as_deref()
+                .and_then(crate::web::adapters::AdapterKind::from_str)
+                .unwrap_or(crate::web::adapters::AdapterKind::NulangCloud);
+            cmd_deploy(wasm, url, token, adapter, dry_run)
         }
 
         Some(other) => Err(NuError::PackageError {
@@ -242,6 +305,59 @@ fn print_usage() {
     println!("  list          List resolved dependencies from Nulang.lock");
     println!("  clean         Remove build artifacts (.nula/dist/)");
     println!("  doc [--open]  Generate Markdown API docs (docs/api.md)");
+}
+
+/// If `args` matches a registered `@nulang/*` module subcommand, run it.
+fn try_module_subcommand(args: &[String]) -> Option<NuResult<()>> {
+    let registry = ModuleRegistry::builtin();
+    let cmd = args.join(" ");
+    for (module, spec) in &registry.modules {
+        if spec.cli_subcommands.iter().any(|s| s == &cmd) {
+            return Some(run_module_subcommand(module, spec, args));
+        }
+    }
+    None
+}
+
+/// Execute a module-specific CLI subcommand.
+fn run_module_subcommand(module: &str, spec: &ModuleSpec, args: &[String]) -> NuResult<()> {
+    match module {
+        "@nulang/auth" => run_auth_enable(args),
+        _ => {
+            println!("{} subcommand '{}' registered.", module, args.join(" "));
+            println!("Capabilities: {:?}", spec.capabilities);
+            println!("Cloud config keys: {:?}", spec.cloud_config_keys);
+            Ok(())
+        }
+    }
+}
+
+/// `nulang nula auth enable` — enable the @nulang/auth module for the
+/// current package. Currently this prints the required setup steps; in the
+/// future it will also scaffold the session actor and update the manifest.
+fn run_auth_enable(_args: &[String]) -> NuResult<()> {
+    let root = package_root()?;
+    let manifest_path = root.join(MANIFEST_FILE);
+
+    let already_depends = if manifest_path.exists() {
+        let content =
+            std::fs::read_to_string(&manifest_path).map_err(|e| NuError::PackageError {
+                msg: format!("cannot read {}: {}", manifest_path.display(), e),
+                span: Span::default(),
+            })?;
+        content.contains("nulang-auth")
+    } else {
+        false
+    };
+
+    if !already_depends {
+        println!("Add @nulang/auth to your Nulang.toml [dependencies], for example:");
+        println!("  nulang-auth = {{ path = \"packages/nulang-auth\" }}");
+    } else {
+        println!("@nulang/auth is already a dependency.");
+    }
+    println!("Set the cloud config key AUTH_COOKIE_SECRET on deploy.");
+    Ok(())
 }
 
 /// `nula new <name> [--template <name>]`: scaffold a package directory.
@@ -354,6 +470,24 @@ fn scaffold_package(dir: &Path, name: &str, template: &str) -> NuResult<()> {
         msg: format!("cannot write {}: {}", manifest_path.display(), e),
         span: Span::default(),
     })?;
+    if template == "web" {
+        let mut web_manifest =
+            std::fs::read_to_string(&manifest_path).map_err(|e| NuError::PackageError {
+                msg: format!("cannot read {}: {}", manifest_path.display(), e),
+                span: Span::default(),
+            })?;
+        web_manifest
+            .push_str("[web]\nport = 8787\nstatic_dir = \"public\"\noutput_dir = \"dist\"\n");
+        std::fs::write(&manifest_path, web_manifest).map_err(|e| NuError::PackageError {
+            msg: format!(
+                "cannot write web section to {}: {}",
+                manifest_path.display(),
+                e
+            ),
+            span: Span::default(),
+        })?;
+    }
+
     for (rel_path, content) in template_files(template) {
         let dest = dir.join(rel_path);
         if let Some(parent) = dest.parent() {
@@ -432,7 +566,196 @@ fn template_files(name: &str) -> Vec<(&'static str, &'static str)> {
         "web" => vec![
             (
                 "src/main.nula",
-                "// Web template — HTTP client via the built-in `Http` effect.\n//\n// Demonstrates: `Http.get`, `Http.post`, and JSON payloads.\n//\n// Run with: nula run\n// Requires network access.\n\nfn main() {\n  perform IO.print(\"HTTP client demo\")\n  perform IO.print(\"---\")\n\n  // GET a public endpoint and print how many bytes came back.\n  let url = \"https://httpbin.org/get\"\n  let resp = perform Http.get(url)\n  perform IO.print(\"GET \" + url)\n  perform IO.print(\"  received \" + perform Int.to_string(perform String.length(resp)) + \" bytes\")\n\n  // POST a JSON body and receive the echoed response.\n  let body = \"{\\\"language\\\": \\\"Nulang\\\", \\\"features\\\": [\\\"actors\\\", \\\"effects\\\"]}\"\n  let posted = perform Http.post(\"https://httpbin.org/post\", body)\n  perform IO.print(\"POST JSON body\")\n  perform IO.print(\"  received \" + perform Int.to_string(perform String.length(posted)) + \" bytes\")\n\n  perform IO.print(\"---\")\n  perform IO.print(\"HTTP demo complete!\")\n}\n",
+                r#"// Nulang Web app — a compiler-first full-stack Todo list.
+//
+// Run with: `nula dev` (development server) or `nula build --web` (SSG).
+//
+// The server renders the initial HTML and handles form POSTs with an
+// ephemeral in-memory store. The generated `app.client.js` intercepts
+// form submissions so the page updates without a full reload when JS is
+// enabled.
+
+import stdlib::web::html
+import stdlib::web::types
+import stdlib::web::host
+import stdlib::json
+
+fn get_todos() -> [JsonValue] {
+    let raw = kv_get("todos")
+    if raw == "" then { [] }
+    else {
+        match parse(raw) {
+            JsonArray(items) => items
+            _ => []
+        }
+    }
+}
+
+fn set_todos(todos) {
+    kv_set("todos", stringify(JsonArray(todos)))
+}
+
+fn next_id() -> Int {
+    let raw = kv_get("todo_counter")
+    let n = if raw == "" then { 0 } else { perform String.to_int(raw) }
+    kv_set("todo_counter", perform Int.to_string(n + 1))
+    n + 1
+}
+
+fn add_todo(title) {
+    let id = next_id()
+    let todos = get_todos()
+    let todo = JsonObject([
+        ("id", JsonNumber(perform Int.to_float(id))),
+        ("title", JsonString(title)),
+        ("done", JsonBool(false))
+    ])
+    set_todos(perform Array.push(todos, todo))
+}
+
+fn toggle_todo(id_str) {
+    let id = perform String.to_int(id_str)
+    let todos = get_todos()
+    var updated = []
+    for todo in todos {
+        let tid = perform Float.to_int(get_number(todo, "id", 0.0))
+        if tid == id then {
+            let title = get_string(todo, "title", "")
+            let done = get_bool(todo, "done", false)
+            updated = perform Array.push(updated, JsonObject([
+                ("id", JsonNumber(perform Int.to_float(tid))),
+                ("title", JsonString(title)),
+                ("done", JsonBool(!done))
+            ]))
+        } else {
+            updated = perform Array.push(updated, todo)
+        }
+    }
+    set_todos(updated)
+}
+
+fn delete_todo(id_str) {
+    let id = perform String.to_int(id_str)
+    let todos = get_todos()
+    var updated = []
+    for todo in todos {
+        let tid = perform Float.to_int(get_number(todo, "id", 0.0))
+        if tid != id then {
+            updated = perform Array.push(updated, todo)
+        } else {}
+    }
+    set_todos(updated)
+}
+
+fn render_todos() -> Html {
+    let todos = get_todos()
+    var rows = []
+    for todo in todos {
+        let id = perform Float.to_int(get_number(todo, "id", 0.0))
+        let id_str = perform Int.to_string(id)
+        let title = get_string(todo, "title", "")
+        let done = get_bool(todo, "done", false)
+        let label = if done then perform String.concat(title, " (done)") else title
+        let row = el("li", [("class", if done then text("done") else text(""))], [
+            el("span", [], [text(label)]),
+            el("form", [("action", text("/")), ("data-action", text("toggle_todo")), ("data-action-placement", text("server")), ("method", text("POST"))], [
+                el("input", [("type", text("hidden")), ("name", text("id")), ("value", text(id_str))], []),
+                el("button", [("type", text("submit"))], [text(if done then "Undo" else "Done")])
+            ]),
+            el("form", [("action", text("/")), ("data-action", text("delete_todo")), ("data-action-placement", text("server")), ("method", text("POST"))], [
+                el("input", [("type", text("hidden")), ("name", text("id")), ("value", text(id_str))], []),
+                el("button", [("type", text("submit"))], [text("Delete")])
+            ])
+        ])
+        rows = perform Array.push(rows, row)
+    }
+    el("ul", [("class", text("todos"))], rows)
+}
+
+fn home() -> Html {
+    if request_method() == "POST" then {
+        let action = form_value("__nulang_action")
+        if action == "add_todo" then {
+            let title = form_value("title")
+            if title != "" then { add_todo(title) } else {}
+        } else if action == "toggle_todo" then {
+            toggle_todo(form_value("id"))
+        } else if action == "delete_todo" then {
+            delete_todo(form_value("id"))
+        } else {}
+    } else {}
+    document(
+        head([
+            title("Nulang Todo"),
+            el("link", [("rel", text("stylesheet")), ("href", text("style.css"))], [])
+        ]),
+        body([
+            el("h1", [], [text("Nulang Todo")]),
+            el("form", [("action", text("/")), ("data-action", text("add_todo")), ("data-action-placement", text("server")), ("method", text("POST"))], [
+                el("input", [("type", text("text")), ("name", text("title")), ("placeholder", text("New todo..."))], []),
+                el("button", [("type", text("submit"))], [text("Add")])
+            ]),
+            render_todos()
+        ])
+    )
+}
+
+app "todos" {
+    route "GET" "/" -> home
+    route "POST" "/" -> home
+}
+"#,
+            ),
+            (
+                "public/style.css",
+                r#"body {
+  font-family: system-ui, sans-serif;
+  max-width: 40rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+  line-height: 1.5;
+}
+
+h1 { color: #1a1a1a; }
+
+form {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+input[type="text"] {
+  flex: 1;
+  padding: 0.4rem;
+}
+
+button {
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+}
+
+.todos {
+  list-style: none;
+  padding: 0;
+}
+
+.todos li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  border-bottom: 1px solid #ddd;
+}
+
+.todos li.done span {
+  text-decoration: line-through;
+  color: #666;
+}
+
+.todos li form {
+  margin: 0;
+}
+"#,
             ),
         ],
         _ => unreachable!(),
@@ -531,12 +854,68 @@ fn prepare_package() -> NuResult<PathBuf> {
     Ok(entry)
 }
 
+/// `--with <cap>` argument pairs for the current package's declared
+/// `[package] capabilities` (empty when none are declared or the manifest
+/// can't be loaded). Lets packages that perform gated resource effects
+/// (e.g. `Http` → `net`) pass the default-deny capability check by
+/// declaring their requirements in `Nulang.toml`.
+fn capability_args() -> Vec<String> {
+    let root = match package_root() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    match Manifest::load(&root) {
+        Ok(m) => m
+            .package
+            .capabilities
+            .iter()
+            .flat_map(|c| ["--with".to_string(), c.clone()])
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Run the current `nulang` executable with `args`, inheriting stdio.
 fn nulang_exe(args: &[&str]) -> NuResult<()> {
-    let exe = std::env::current_exe().map_err(|e| NuError::PackageError {
-        msg: format!("cannot locate nulang executable: {}", e),
-        span: Span::default(),
-    })?;
+    // When running inside `cargo test`, the current executable is the test
+    // harness, not the CLI binary. `CARGO_BIN_EXE_nulang` points to the real
+    // binary when cargo builds it alongside integration tests; for unit tests
+    // we fall back to `target/<profile>/nulang` next to the deps directory.
+    let current_exe = std::env::current_exe().ok();
+    let exe = std::env::var_os("CARGO_BIN_EXE_nulang")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            current_exe.as_ref().and_then(|p| {
+                p.parent()
+                    .and_then(|deps| deps.parent())
+                    .map(|profile| profile.join("nulang"))
+                    .filter(|candidate| candidate.is_file())
+            })
+        })
+        .or_else(|| {
+            // Coverage runs (`cargo llvm-cov`) use a separate target dir
+            // that has no standalone binary next to the test harness.
+            // Resolve the repo's configured target dir via cargo metadata
+            // (same approach as conformance/run.py) and use its debug bin.
+            let out = std::process::Command::new("cargo")
+                .args(["metadata", "--format-version", "1", "--no-deps"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let meta: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+            let td = meta.get("target_directory")?.as_str()?;
+            let candidate = std::path::Path::new(td).join("debug").join("nulang");
+            candidate.is_file().then_some(candidate)
+        })
+        .or_else(|| current_exe.clone())
+        .ok_or_else(|| NuError::PackageError {
+            msg: "cannot locate nulang executable".to_string(),
+            span: Span::default(),
+        })?;
     let mut cmd = Command::new(&exe);
     cmd.args(args);
     // Auto-detect the stdlib directory relative to the executable so
@@ -546,9 +925,32 @@ fn nulang_exe(args: &[&str]) -> NuResult<()> {
             let candidate = exe_dir.join("stdlib");
             if candidate.is_dir() {
                 cmd.env("NULANG_STDLIB", &candidate);
+            } else {
+                // Development fallback: when running the freshly-built `nula`
+                // binary from the source tree, stdlib lives at src/stdlib/.
+                let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join("stdlib");
+                if dev.is_dir() {
+                    cmd.env("NULANG_STDLIB", &dev);
+                }
             }
         }
     }
+
+    // Build a module path from the current lockfile so that
+    // `import @nulang/foo` resolves to the dependency's source directory.
+    let mut module_path = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
+    if let Some(computed) = build_module_path() {
+        if !module_path.is_empty() {
+            module_path.push(';');
+        }
+        module_path.push_str(&computed);
+    }
+    if !module_path.is_empty() {
+        cmd.env("NULANG_MODULE_PATH", &module_path);
+    }
+
     let status = cmd.status().map_err(|e| NuError::PackageError {
         msg: format!("failed to run nulang ({}): {}", exe.display(), e),
         span: Span::default(),
@@ -562,10 +964,48 @@ fn nulang_exe(args: &[&str]) -> NuResult<()> {
     Ok(())
 }
 
+/// Build a NULANG_MODULE_PATH string from the current lockfile, mapping each
+/// resolved dependency's source directory to an `@nulang/<name>` import.
+fn build_module_path() -> Option<String> {
+    let root = package_root().ok()?;
+    let lockfile = Lockfile::load(&root).ok()?;
+    let mut entries = Vec::new();
+    for pkg in &lockfile.package {
+        let src_dir = match pkg.source.as_str() {
+            s if s.starts_with("path+") => std::path::PathBuf::from(&s[5..]).join("src"),
+            s if s.starts_with("git+") => {
+                root.join(".nula").join("git").join(&pkg.name).join("src")
+            }
+            s if s.starts_with("reg+") => root
+                .join(".nula")
+                .join("registry")
+                .join(format!("{}-{}", pkg.name, pkg.version))
+                .join("src"),
+            _ => continue,
+        };
+        if src_dir.is_dir() {
+            let import_name = if pkg.name.starts_with("nulang-") {
+                &pkg.name["nulang-".len()..]
+            } else {
+                &pkg.name[..]
+            };
+            entries.push(format!("@nulang/{}={}", import_name, src_dir.display()));
+            if import_name != pkg.name {
+                entries.push(format!("@nulang/{}={}", pkg.name, src_dir.display()));
+            }
+        }
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries.join(";"))
+    }
+}
+
 /// `nula build`: resolve dependencies, write the lockfile, type-check entry.
 /// `nula build`: resolve dependencies, write the lockfile, type-check and
 /// compile to a .nbc artifact in .nula/dist/.
-fn cmd_build() -> NuResult<()> {
+fn cmd_build(json: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -576,6 +1016,10 @@ fn cmd_build() -> NuResult<()> {
 
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
+
+    if json {
+        return cmd_build_json(&root, &name, &entry_str);
+    }
 
     let dist_dir = root.join(".nula").join("dist");
     std::fs::create_dir_all(&dist_dir).map_err(|e| NuError::PackageError {
@@ -588,11 +1032,118 @@ fn cmd_build() -> NuResult<()> {
 
     eprintln!("Building {}...", name);
     eprintln!("  Type-checking {}...", entry.display());
-    nulang_exe(&["--check", &entry_str])?;
+    let caps = capability_args();
+    let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
+    nulang_exe(&[&["--check", &entry_str], &cap_refs[..]].concat())?;
     eprintln!("  Compiling {} to .nbc...", name);
-    nulang_exe(&["--emit-nbc", "--out", &nbc_path_str, &entry_str])?;
+    nulang_exe(
+        &[
+            &["--emit-nbc", "--out", &nbc_path_str, &entry_str],
+            &cap_refs[..],
+        ]
+        .concat(),
+    )?;
     println!("Build succeeded.");
     Ok(())
+}
+
+/// `nula build --json`: machine-readable build report. The JSON report is
+/// the only output on stdout; progress stays on stderr. Type-check
+/// diagnostics are produced by the child `nulang --check --json` invocation
+/// and forwarded (re-wrapped as `command: "build"`) so consumers see one
+/// schema.
+fn cmd_build_json(root: &Path, name: &str, entry_str: &str) -> NuResult<()> {
+    use crate::json_diagnostics::{diagnostic_from_message, JsonReport, SCHEMA_VERSION};
+
+    // Step 1: type-check with JSON diagnostics, capturing the child's stdout.
+    eprintln!("Building {}...", name);
+    eprintln!("  Type-checking {}...", entry_str);
+    let check = nulang_exe_output(&["--json", "--check", entry_str])?;
+    if !check.status.success() {
+        let stdout = String::from_utf8_lossy(&check.stdout);
+        // Forward the child's structured diagnostics when parseable; fall
+        // back to a single opaque error otherwise.
+        let report = match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+            Ok(v) if v["diagnostics"].is_array() => serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "command": "build",
+                "file": entry_str,
+                "ok": false,
+                "diagnostics": v["diagnostics"],
+            })
+            .to_string(),
+            _ => JsonReport::new(
+                "build",
+                Some(entry_str.to_string()),
+                vec![diagnostic_from_message(format!(
+                    "nulang --check exited with {}",
+                    check.status
+                ))],
+            )
+            .to_json_string(),
+        };
+        println!("{}", report.trim_end());
+        return Err(NuError::PackageError {
+            msg: format!("type check failed for {}", entry_str),
+            span: Span::default(),
+        });
+    }
+
+    // Step 2: compile to .nbc (stdout captured so only JSON reaches stdout).
+    let dist_dir = root.join(".nula").join("dist");
+    std::fs::create_dir_all(&dist_dir).map_err(|e| NuError::PackageError {
+        msg: format!("cannot create {}: {}", dist_dir.display(), e),
+        span: Span::default(),
+    })?;
+    let nbc_path = dist_dir.join(format!("{}.nbc", name));
+    let nbc_path_str = nbc_path.to_string_lossy().into_owned();
+    eprintln!("  Compiling {} to .nbc...", name);
+    let compile = nulang_exe_output(&["--emit-nbc", "--out", &nbc_path_str, entry_str])?;
+    if !compile.status.success() {
+        let stderr = String::from_utf8_lossy(&compile.stderr).trim().to_string();
+        let report = JsonReport::new(
+            "build",
+            Some(entry_str.to_string()),
+            vec![diagnostic_from_message(format!(
+                "nulang --emit-nbc exited with {}: {}",
+                compile.status, stderr
+            ))],
+        );
+        print!("{}", report.to_json_string());
+        return Err(NuError::PackageError {
+            msg: format!("compilation failed for {}", entry_str),
+            span: Span::default(),
+        });
+    }
+
+    let report = JsonReport::new("build", Some(entry_str.to_string()), Vec::new());
+    print!("{}", report.to_json_string());
+    Ok(())
+}
+
+/// Run the nulang exe with piped stdout/stderr, returning the full output.
+/// Used by `--json` modes where child output must not reach our stdout.
+fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
+    let exe = std::env::current_exe().map_err(|e| NuError::PackageError {
+        msg: format!("cannot locate nulang executable: {}", e),
+        span: Span::default(),
+    })?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(args);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    if std::env::var_os("NULANG_STDLIB").is_none() {
+        if let Some(exe_dir) = exe.parent() {
+            let candidate = exe_dir.join("stdlib");
+            if candidate.is_dir() {
+                cmd.env("NULANG_STDLIB", &candidate);
+            }
+        }
+    }
+    cmd.output().map_err(|e| NuError::PackageError {
+        msg: format!("failed to run nulang ({}): {}", exe.display(), e),
+        span: Span::default(),
+    })
 }
 
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
@@ -630,7 +1181,9 @@ fn cmd_run() -> NuResult<()> {
     eprintln!("Building and running...");
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
-    nulang_exe(&[&entry_str])
+    let caps = capability_args();
+    let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
+    nulang_exe(&[&[entry_str.as_str()], &cap_refs[..]].concat())
 }
 
 /// `nula run --watch` (or `nula watch`): build, run, and re-run when source
@@ -694,6 +1247,336 @@ fn collect_mtimes_recursive(dir: &Path, out: &mut Vec<(PathBuf, std::time::Syste
     }
 }
 
+/// `nula build --web`: static-site build. Compile the entry point, run it to
+/// collect `Web.route` registrations, render each static handler to an HTML
+/// file, and copy the static directory into the output directory.
+fn cmd_build_web() -> NuResult<()> {
+    let root = package_root()?;
+    let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
+        msg: format!("failed to load {}: {}", MANIFEST_FILE, e),
+        span: Span::default(),
+    })?;
+    let entry = prepare_package()?;
+    let entry_str = entry.to_string_lossy().into_owned();
+
+    let build_dir = root.join(".nula");
+    std::fs::create_dir_all(&build_dir).map_err(|e| NuError::PackageError {
+        msg: format!("cannot create {}: {}", build_dir.display(), e),
+        span: Span::default(),
+    })?;
+    let nbc_path = build_dir.join("build.nbc");
+    let nbc_path_str = nbc_path.to_string_lossy().into_owned();
+
+    let output_dir = root.join(&manifest.web.output_dir);
+    std::fs::create_dir_all(&output_dir).map_err(|e| NuError::PackageError {
+        msg: format!("cannot create {}: {}", output_dir.display(), e),
+        span: Span::default(),
+    })?;
+
+    let client_js_path = output_dir.join("app.client.js");
+    let client_js_path_str = client_js_path.to_string_lossy().into_owned();
+
+    eprintln!("Building {} (web)...", manifest.package.name);
+    eprintln!("  Compiling {}...", entry.display());
+    nulang_exe(&[
+        "--emit-nbc",
+        "--out",
+        &nbc_path_str,
+        "--rewrite-signals",
+        &client_js_path_str,
+        &entry_str,
+    ])?;
+
+    let bytes = std::fs::read(&nbc_path).map_err(|e| NuError::PackageError {
+        msg: format!("cannot read {}: {}", nbc_path.display(), e),
+        span: Span::default(),
+    })?;
+    let artifact = CodeModule::from_nbc(&bytes).map_err(|e| NuError::PackageError {
+        msg: format!("cannot decode {}: {}", nbc_path.display(), e),
+        span: Span::default(),
+    })?;
+
+    let mut vm = VM::new();
+    vm.load_module(artifact.module);
+    vm.run().map_err(|e| NuError::PackageError {
+        msg: format!("runtime error in {}: {}", entry.display(), e),
+        span: Span::default(),
+    })?;
+    let routes = vm.take_web_routes();
+
+    eprintln!("  Rendering {} route(s)...", routes.len());
+    for route in &routes {
+        let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
+            .ok_or_else(|| NuError::PackageError {
+                msg: format!("failed to render route {:?} {}", route.method, route.path),
+                span: Span::default(),
+            })?;
+        let html = crate::web::reactivity::inject_client_runtime_script(&html);
+        let out_file = route_path_to_output_file(&route.path);
+        let dest = output_dir.join(&out_file);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
+                msg: format!("cannot create {}: {}", parent.display(), e),
+                span: Span::default(),
+            })?;
+        }
+        std::fs::write(&dest, html).map_err(|e| NuError::PackageError {
+            msg: format!("cannot write {}: {}", dest.display(), e),
+            span: Span::default(),
+        })?;
+        eprintln!("    {} -> {}", route.path, dest.display());
+    }
+
+    let static_dir = root.join(&manifest.web.static_dir);
+    if static_dir.is_dir() {
+        copy_dir_contents(&static_dir, &output_dir)?;
+    }
+
+    // Emit compile-time signal graph if the entry uses `signal` declarations.
+    let signals_path = output_dir.join("app.signals.json");
+    nulang_exe(&[
+        "--emit-signals",
+        &signals_path.to_string_lossy(),
+        &entry_str,
+    ])?;
+
+    // Generate deployment IR consumed by adapters and Nulang Cloud.
+    let src_root = root.join("src");
+    let ir = crate::web::ir::generate_deployment_ir(
+        &routes,
+        Some(&signals_path),
+        &src_root,
+        &manifest.budgets,
+    );
+    let ir_path = output_dir.join("nulang-app.ir.json");
+    let ir_json = ir.to_json();
+    std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
+        msg: format!("cannot write {}: {}", ir_path.display(), e),
+        span: Span::default(),
+    })?;
+    eprintln!("  Wrote {}", ir_path.display());
+
+    // Enforce performance budgets declared in Nulang.toml.
+    if let Err(violations) = crate::web::budget::check_initial_js_budget(
+        &output_dir,
+        manifest.budgets.initial_js_max_bytes(),
+    ) {
+        let mut lines = vec!["performance budget exceeded:".to_string()];
+        for v in &violations {
+            lines.push(format!(
+                "  {} is {} bytes (budget {} bytes)",
+                v.file, v.size, v.budget
+            ));
+        }
+        return Err(NuError::PackageError {
+            msg: lines.join("\n"),
+            span: Span::default(),
+        });
+    }
+
+    println!("Web build succeeded: {}", output_dir.display());
+    Ok(())
+}
+
+fn route_path_to_output_file(path: &str) -> PathBuf {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        PathBuf::from("index.html")
+    } else {
+        PathBuf::from(trimmed).join("index.html")
+    }
+}
+
+fn copy_dir_contents(src: &Path, dst: &Path) -> NuResult<()> {
+    for entry in std::fs::read_dir(src)
+        .map_err(|e| NuError::PackageError {
+            msg: format!("cannot read {}: {}", src.display(), e),
+            span: Span::default(),
+        })?
+        .flatten()
+    {
+        let path = entry.path();
+        let dest = dst.join(path.file_name().unwrap_or(path.as_os_str()));
+        if path.is_dir() {
+            std::fs::create_dir_all(&dest).map_err(|e| NuError::PackageError {
+                msg: format!("cannot create {}: {}", dest.display(), e),
+                span: Span::default(),
+            })?;
+            copy_dir_contents(&path, &dest)?;
+        } else {
+            std::fs::copy(&path, &dest).map_err(|e| NuError::PackageError {
+                msg: format!(
+                    "cannot copy {} to {}: {}",
+                    path.display(),
+                    dest.display(),
+                    e
+                ),
+                span: Span::default(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// `nula dev`: compile the entry point, collect `Web.route` registrations,
+/// then start a dev HTTP server on the configured port. Routes are dispatched
+/// to their handler functions; unmatched paths fall back to static files.
+fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
+    let root = package_root()?;
+    let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
+        msg: format!("failed to load {}: {}", MANIFEST_FILE, e),
+        span: Span::default(),
+    })?;
+    let port = port_override.unwrap_or(manifest.web.port);
+
+    let entry = prepare_package()?;
+    let entry_str = entry.to_string_lossy().into_owned();
+
+    let dev_dir = root.join(".nula");
+    std::fs::create_dir_all(&dev_dir).map_err(|e| NuError::PackageError {
+        msg: format!("cannot create {}: {}", dev_dir.display(), e),
+        span: Span::default(),
+    })?;
+    let nbc_path = dev_dir.join("dev.nbc");
+    let nbc_path_str = nbc_path.to_string_lossy().into_owned();
+
+    let static_dir = root.join(&manifest.web.static_dir);
+
+    // Emit the compile-time signal graph and client micro-runtime for the dev
+    // server too. Dynamic routes won't read them, but client-side progressive
+    // enhancement and the static fallback both need them in the output dir.
+    let output_dir = root.join(&manifest.web.output_dir);
+    std::fs::create_dir_all(&output_dir).map_err(|e| NuError::PackageError {
+        msg: format!("cannot create {}: {}", output_dir.display(), e),
+        span: Span::default(),
+    })?;
+
+    let signals_path = output_dir.join("app.signals.json");
+    let client_js_path = output_dir.join("app.client.js");
+
+    eprintln!("Compiling {} for dev...", entry.display());
+    nulang_exe(&[
+        "--emit-nbc",
+        "--out",
+        &nbc_path_str,
+        "--rewrite-signals",
+        &client_js_path.to_string_lossy(),
+        &entry_str,
+    ])?;
+
+    let bytes = std::fs::read(&nbc_path).map_err(|e| NuError::PackageError {
+        msg: format!("cannot read {}: {}", nbc_path.display(), e),
+        span: Span::default(),
+    })?;
+    let artifact = CodeModule::from_nbc(&bytes).map_err(|e| NuError::PackageError {
+        msg: format!("cannot decode {}: {}", nbc_path.display(), e),
+        span: Span::default(),
+    })?;
+
+    let mut vm = VM::new();
+    vm.load_module(artifact.module);
+    vm.run().map_err(|e| NuError::PackageError {
+        msg: format!("runtime error in {}: {}", entry.display(), e),
+        span: Span::default(),
+    })?;
+    let routes = vm.take_web_routes();
+
+    nulang_exe(&[
+        "--emit-signals",
+        &signals_path.to_string_lossy(),
+        &entry_str,
+    ])?;
+
+    if routes.is_empty() {
+        cmd_build_web()?;
+        let output_dir = root.join(&manifest.web.output_dir);
+        let addr = format!("127.0.0.1:{}", port);
+        let listener = std::net::TcpListener::bind(&addr).map_err(|e| NuError::PackageError {
+            msg: format!("cannot bind dev server to {}: {}", addr, e),
+            span: Span::default(),
+        })?;
+        println!("Serving static files at http://{}/", addr);
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let root = output_dir.clone();
+                    std::thread::spawn(move || {
+                        serve_static_file(stream, &root);
+                    });
+                }
+                Err(e) => eprintln!("connection error: {}", e),
+            }
+        }
+        Ok(())
+    } else {
+        let server = WebDevServer::bind(port, Some(static_dir), Some(output_dir.clone()), routes)
+            .map_err(|e| NuError::PackageError {
+            msg: format!("cannot bind dev server: {}", e),
+            span: Span::default(),
+        })?;
+        let actual_port = server.port;
+        println!("Dev server listening on http://127.0.0.1:{}/", actual_port);
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+fn serve_static_file(mut stream: std::net::TcpStream, root: &Path) {
+    use std::io::{BufRead, BufReader, Write};
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return;
+    }
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    let path = parts.get(1).unwrap_or(&"/").trim_start_matches('/');
+    let file_path = if path.is_empty() {
+        root.join("index.html")
+    } else {
+        root.join(path)
+    };
+    let (status, content_type, body) = if file_path.is_file() {
+        match std::fs::read(&file_path) {
+            Ok(data) => ("200 OK", guess_content_type(&file_path), data),
+            Err(_) => (
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"Not found".to_vec(),
+            ),
+        }
+    } else {
+        (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            b"Not found".to_vec(),
+        )
+    };
+    let response = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        content_type,
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.write_all(&body);
+}
+
+fn guess_content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("wasm") => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
 /// `nula test [--filter <substr>] [--verbose|-v]`: discover and run `.nula`
 /// test files under the package's `tests/` directory, reporting pass/fail.
 ///
@@ -705,7 +1588,7 @@ fn collect_mtimes_recursive(dir: &Path, out: &mut Vec<(PathBuf, std::time::Syste
 /// With `--verbose` (or `-v`): prints each test file name before execution,
 /// shows ✓ PASS / ✗ FAIL per file, and displays error messages for failures.
 /// Default (non-verbose) output is clean and greppable.
-fn cmd_test(filter: Option<&str>, verbose: bool) -> NuResult<()> {
+fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
     eprintln!("Preparing package...");
     let _entry = prepare_package()?;
     let tests_dir = package_root()?.join("tests");
@@ -725,7 +1608,13 @@ fn cmd_test(filter: Option<&str>, verbose: bool) -> NuResult<()> {
     };
     test_files.sort();
     if test_files.is_empty() {
-        println!("No tests found in {}", tests_dir.display());
+        if json {
+            let mut report = crate::json_diagnostics::JsonReport::new("test", None, Vec::new());
+            report.tests = Some(Vec::new());
+            print!("{}", report.to_json_string());
+        } else {
+            println!("No tests found in {}", tests_dir.display());
+        }
         return Ok(());
     }
 
@@ -787,17 +1676,45 @@ fn cmd_test(filter: Option<&str>, verbose: bool) -> NuResult<()> {
     eprintln!("running {} tests", tests.len());
     let mut passed = 0;
     let mut failed = 0;
+    let mut json_results: Vec<crate::json_diagnostics::JsonTestResult> = Vec::new();
 
     for test in &tests {
         let file_str = test.file_to_run.to_string_lossy().into_owned();
-        match run_test_file(&file_str) {
+        let started = std::time::Instant::now();
+        // In --json mode the child's stdout is captured (discarded) so the
+        // JSON report is the only thing on our stdout.
+        let outcome = if json {
+            run_test_file_captured(&file_str)
+        } else {
+            run_test_file(&file_str)
+        };
+        let duration_ms = started.elapsed().as_millis() as u64;
+        match outcome {
             Ok(()) => {
                 passed += 1;
-                println!("test {} ... ok", test.display);
+                if json {
+                    json_results.push(crate::json_diagnostics::JsonTestResult {
+                        name: test.display.clone(),
+                        status: "ok".to_string(),
+                        duration_ms,
+                        diagnostics: Vec::new(),
+                    });
+                } else {
+                    println!("test {} ... ok", test.display);
+                }
             }
             Err(stderr_output) => {
                 failed += 1;
-                if verbose {
+                if json {
+                    json_results.push(crate::json_diagnostics::JsonTestResult {
+                        name: test.display.clone(),
+                        status: "failed".to_string(),
+                        duration_ms,
+                        diagnostics: vec![crate::json_diagnostics::diagnostic_from_message(
+                            stderr_output.trim().to_string(),
+                        )],
+                    });
+                } else if verbose {
                     println!("test {} ... FAILED", test.display);
                     for line in stderr_output.lines() {
                         println!("   {}", line);
@@ -818,6 +1735,23 @@ fn cmd_test(filter: Option<&str>, verbose: bool) -> NuResult<()> {
     }
     let _ = std::fs::remove_dir(&temp_dir);
 
+    if json {
+        let diagnostics = json_results
+            .iter()
+            .flat_map(|t| t.diagnostics.clone())
+            .collect();
+        let mut report = crate::json_diagnostics::JsonReport::new("test", None, diagnostics);
+        report.tests = Some(json_results);
+        print!("{}", report.to_json_string());
+        if failed > 0 {
+            return Err(NuError::PackageError {
+                msg: format!("{} test(s) failed", failed),
+                span: Span::default(),
+            });
+        }
+        return Ok(());
+    }
+
     println!("\ntest result: {} passed; {} failed", passed, failed);
     if failed > 0 {
         return Err(NuError::PackageError {
@@ -834,7 +1768,7 @@ fn cmd_test_watch(filter: Option<&str>, verbose: bool) -> NuResult<()> {
     let root = package_root()?;
 
     // Initial run
-    let _ = cmd_test(filter, verbose);
+    let _ = cmd_test(filter, verbose, false);
 
     // Collect initial mtimes for all .nula files under src/ and tests/
     let src_dir = root.join("src");
@@ -853,7 +1787,7 @@ fn cmd_test_watch(filter: Option<&str>, verbose: bool) -> NuResult<()> {
             // Clear screen
             print!("\x1B[2J\x1B[H");
             eprintln!("re-running tests...");
-            let _ = cmd_test(filter, verbose);
+            let _ = cmd_test(filter, verbose, false);
         }
     }
 }
@@ -910,17 +1844,41 @@ fn strip_main_function(source: &str) -> String {
 /// Run a test file via `nulang`, capturing stderr so error messages appear
 /// after the test name (avoiding interleaved output).
 /// Returns `Ok(())` on success, `Err(stderr_string)` on failure.
+/// Like [`run_test_file`], but captures (discards) the child's stdout so the
+/// parent's stdout stays clean for `--json` output.
+fn run_test_file_captured(file_path: &str) -> Result<(), String> {
+    run_test_file_impl(file_path, false)
+}
+
 fn run_test_file(file_path: &str) -> Result<(), String> {
+    run_test_file_impl(file_path, true)
+}
+
+fn run_test_file_impl(file_path: &str, inherit_stdout: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate nulang: {}", e))?;
     let mut cmd = Command::new(&exe);
     cmd.arg(file_path);
-    cmd.stdout(std::process::Stdio::inherit());
+    cmd.args(capability_args());
+    if inherit_stdout {
+        cmd.stdout(std::process::Stdio::inherit());
+    } else {
+        cmd.stdout(std::process::Stdio::piped());
+    }
     cmd.stderr(std::process::Stdio::piped());
     if std::env::var_os("NULANG_STDLIB").is_none() {
         if let Some(exe_dir) = exe.parent() {
             let candidate = exe_dir.join("stdlib");
             if candidate.is_dir() {
                 cmd.env("NULANG_STDLIB", &candidate);
+            } else {
+                // Development fallback: when running the freshly-built `nula`
+                // binary from the source tree, stdlib lives at src/stdlib/.
+                let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join("stdlib");
+                if dev.is_dir() {
+                    cmd.env("NULANG_STDLIB", &dev);
+                }
             }
         }
     }
@@ -1099,6 +2057,7 @@ fn cmd_publish(registry_url: Option<String>, token: Option<String>) -> NuResult<
     Ok(())
 }
 /// Response from POST /api/v1/deploy on Nulang Cloud.
+#[cfg(feature = "ureq")]
 #[derive(serde::Deserialize)]
 struct DeployResponse {
     #[allow(dead_code)]
@@ -1107,9 +2066,16 @@ struct DeployResponse {
     status: String,
 }
 
-/// `nula deploy [--wasm] [--url <url>] [--token <token>]` — build and deploy
-/// the current package to Nulang Cloud.
-fn cmd_deploy(wasm: bool, cloud_url: Option<String>, token: Option<String>) -> NuResult<()> {
+/// `nula deploy [--wasm] [--url <url>] [--token <token>] [--adapter <kind>] [--dry-run]`
+/// — build and deploy the current package to Nulang Cloud or another adapter.
+#[cfg(feature = "ureq")]
+fn cmd_deploy(
+    wasm: bool,
+    cloud_url: Option<String>,
+    token: Option<String>,
+    adapter: crate::web::adapters::AdapterKind,
+    dry_run: bool,
+) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     if !manifest_path.exists() {
@@ -1124,58 +2090,85 @@ fn cmd_deploy(wasm: bool, cloud_url: Option<String>, token: Option<String>) -> N
     })?;
     let name = manifest.package.name.clone();
 
-    // Resolve dependencies, write lockfile, get entry point.
-    let entry = prepare_package()?;
-    let entry_str = entry.to_string_lossy().into_owned();
+    // Build the web output so dist/ contains the IR and static assets.
+    cmd_build_web()?;
 
-    // Resolve auth token: --token flag > NULANG_CLOUD_TOKEN env var.
-    let token = token
-        .or_else(|| std::env::var("NULANG_CLOUD_TOKEN").ok())
-        .ok_or_else(|| NuError::PackageError {
-            msg: "Set NULANG_CLOUD_TOKEN or pass --token".to_string(),
+    let dist_dir = root.join(&manifest.web.output_dir);
+
+    // Generate adapter-specific files in dist/.
+    let ir_path = dist_dir.join("nulang-app.ir.json");
+    let ir: crate::web::ir::DeploymentIr = if ir_path.exists() {
+        let s = std::fs::read_to_string(&ir_path).map_err(|e| NuError::PackageError {
+            msg: format!("cannot read {}: {}", ir_path.display(), e),
             span: Span::default(),
         })?;
-
-    // Resolve cloud URL: --url flag > NULANG_CLOUD_URL env var > default.
-    let cloud_url = cloud_url
-        .or_else(|| std::env::var("NULANG_CLOUD_URL").ok())
-        .unwrap_or_else(|| "https://deploy.nulang.cloud".to_string());
+        serde_json::from_str(&s).unwrap_or_default()
+    } else {
+        crate::web::ir::DeploymentIr {
+            version: 1,
+            routes: Vec::new(),
+            signals: serde_json::Value::Object(Default::default()),
+            capabilities: Vec::new(),
+            budgets: Default::default(),
+            middleware: Vec::new(),
+            cloud_config: Vec::new(),
+        }
+    };
+    match adapter {
+        crate::web::adapters::AdapterKind::NulangCloud => {}
+        crate::web::adapters::AdapterKind::StaticHost => {
+            crate::web::adapters::static_host::generate_files(&dist_dir, &ir).map_err(|e| {
+                NuError::PackageError {
+                    msg: format!("cannot generate static-host files: {}", e),
+                    span: Span::default(),
+                }
+            })?;
+        }
+        crate::web::adapters::AdapterKind::Docker => {
+            crate::web::adapters::docker::generate_files(&dist_dir).map_err(|e| {
+                NuError::PackageError {
+                    msg: format!("cannot generate docker files: {}", e),
+                    span: Span::default(),
+                }
+            })?;
+        }
+    }
 
     // Build artifacts into .nula/dist/.
-    let dist_dir = root.join(".nula").join("dist");
-    std::fs::create_dir_all(&dist_dir).map_err(|e| NuError::PackageError {
-        msg: format!("cannot create {}: {}", dist_dir.display(), e),
+    let nula_dist = root.join(".nula").join("dist");
+    std::fs::create_dir_all(&nula_dist).map_err(|e| NuError::PackageError {
+        msg: format!("cannot create {}: {}", nula_dist.display(), e),
         span: Span::default(),
     })?;
 
     // Always build .nbc (native bytecode tier).
-    let nbc_path = dist_dir.join(format!("{}.nbc", name));
+    let entry = prepare_package()?;
+    let entry_str = entry.to_string_lossy().into_owned();
+    let nbc_path = nula_dist.join(format!("{}.nbc", name));
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
     eprintln!("Compiling {} to .nbc...", name);
     nulang_exe(&["--emit-nbc", "--out", &nbc_path_str, &entry_str])?;
 
     // Optionally build .wasm + .cwasm (WASM tier).
     if wasm {
-        let wasm_path = dist_dir.join(format!("{}.wasm", name));
+        let wasm_path = nula_dist.join(format!("{}.wasm", name));
         let wasm_path_str = wasm_path.to_string_lossy().into_owned();
         eprintln!("Compiling {} to .wasm + .cwasm...", name);
         nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
     }
 
-    // Bundle into .tar.gz: .nula/dist/ contents + Nulang.toml + Nulang.lock.
+    // Bundle into .tar.gz: .nula/dist/ contents + dist/** + Nulang.toml + Nulang.lock.
     let mut tarball = Vec::new();
     {
         let gz = flate2::write::GzEncoder::new(&mut tarball, flate2::Compression::default());
         let mut ar = tar::Builder::new(gz);
 
-        // Add Nulang.toml
         ar.append_path_with_name(&manifest_path, "Nulang.toml")
             .map_err(|e| NuError::PackageError {
                 msg: format!("cannot package {}: {}", MANIFEST_FILE, e),
                 span: Span::default(),
             })?;
 
-        // Add Nulang.lock
         let lock_path = root.join(LOCKFILE_FILE);
         if lock_path.exists() {
             ar.append_path_with_name(&lock_path, LOCKFILE_FILE)
@@ -1185,36 +2178,20 @@ fn cmd_deploy(wasm: bool, cloud_url: Option<String>, token: Option<String>) -> N
                 })?;
         }
 
-        // Add dist/ artifacts individually.
-        for artifact in &[&nbc_path] {
-            if artifact.exists() {
-                let archive_name = format!(
-                    ".nula/dist/{}",
-                    artifact.file_name().unwrap().to_string_lossy()
-                );
-                ar.append_path_with_name(artifact, &archive_name)
-                    .map_err(|e| NuError::PackageError {
-                        msg: format!("cannot package artifact: {}", e),
-                        span: Span::default(),
-                    })?;
-            }
+        if dist_dir.is_dir() {
+            ar.append_dir_all("dist", &dist_dir)
+                .map_err(|e| NuError::PackageError {
+                    msg: format!("cannot package {}: {}", dist_dir.display(), e),
+                    span: Span::default(),
+                })?;
         }
-        if wasm {
-            let wasm_path = dist_dir.join(format!("{}.wasm", name));
-            let cwasm_path = dist_dir.join(format!("{}.cwasm", name));
-            for artifact in &[&wasm_path, &cwasm_path] {
-                if artifact.exists() {
-                    let archive_name = format!(
-                        ".nula/dist/{}",
-                        artifact.file_name().unwrap().to_string_lossy()
-                    );
-                    ar.append_path_with_name(artifact, &archive_name)
-                        .map_err(|e| NuError::PackageError {
-                            msg: format!("cannot package artifact: {}", e),
-                            span: Span::default(),
-                        })?;
-                }
-            }
+
+        if nula_dist.is_dir() {
+            ar.append_dir_all(".nula/dist", &nula_dist)
+                .map_err(|e| NuError::PackageError {
+                    msg: format!("cannot package {}: {}", nula_dist.display(), e),
+                    span: Span::default(),
+                })?;
         }
 
         let gz = ar.into_inner().map_err(|e| NuError::PackageError {
@@ -1227,9 +2204,40 @@ fn cmd_deploy(wasm: bool, cloud_url: Option<String>, token: Option<String>) -> N
         })?;
     }
 
+    if dry_run {
+        let contents = list_tarball_contents(&tarball);
+        println!("Dry-run deploy ({}) — tarball entries:", adapter.as_str());
+        for entry in &contents {
+            println!("  {}", entry);
+        }
+        if !ir.cloud_config.is_empty() {
+            println!("Required cloud config:");
+            for entry in &ir.cloud_config {
+                println!("  {} (required by {})", entry.key, entry.required_by);
+            }
+        }
+        println!(
+            "Dry-run: would deploy {} bytes (adapter: {})",
+            tarball.len(),
+            adapter.as_str()
+        );
+        return Ok(());
+    }
+
+    // Token required for actual deploy.
+    let token = token
+        .or_else(|| std::env::var("NULANG_CLOUD_TOKEN").ok())
+        .ok_or_else(|| NuError::PackageError {
+            msg: "Set NULANG_CLOUD_TOKEN or pass --token".to_string(),
+            span: Span::default(),
+        })?;
+
+    let cloud_url = cloud_url
+        .or_else(|| std::env::var("NULANG_CLOUD_URL").ok())
+        .unwrap_or_else(|| "https://deploy.nulang.cloud".to_string());
+
     eprintln!("Deploying {} to {} ...", name, cloud_url);
 
-    // POST /api/v1/deploy with Bearer token.
     let url = format!("{}/api/v1/deploy", cloud_url.trim_end_matches('/'));
     let response: ureq::Response = ureq::post(&url)
         .set("Authorization", &format!("Bearer {}", token))
@@ -1265,6 +2273,38 @@ fn cmd_deploy(wasm: bool, cloud_url: Option<String>, token: Option<String>) -> N
 
     println!("Deployed! -> {} ({})", deploy.url, deploy.status);
     Ok(())
+}
+
+/// `nula deploy` — disabled without the `ureq` feature.
+#[cfg(not(feature = "ureq"))]
+fn cmd_deploy(
+    _wasm: bool,
+    _cloud_url: Option<String>,
+    _token: Option<String>,
+    _adapter: crate::web::adapters::AdapterKind,
+    _dry_run: bool,
+) -> NuResult<()> {
+    Err(NuError::PackageError {
+        msg: "cloud deploy requires the 'ureq' feature (build with --features ureq)".to_string(),
+        span: Span::default(),
+    })
+}
+
+/// List the paths stored in an in-memory gzip-compressed tarball.
+#[cfg(feature = "ureq")]
+fn list_tarball_contents(tarball: &[u8]) -> Vec<String> {
+    let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(tarball));
+    let mut ar = tar::Archive::new(gz);
+    let entries = match ar.entries() {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    entries
+        .filter_map(|e| {
+            let e = e.ok()?;
+            Some(e.path().ok()?.display().to_string())
+        })
+        .collect()
 }
 
 /// Recursively add a directory tree to a tar builder.
@@ -1534,7 +2574,7 @@ mod tests {
             );
             let src = std::fs::read_to_string(&main).expect("read main.nula");
             assert!(
-                src.contains("main"),
+                src.contains("main") || src.contains("app "),
                 "template '{}' main.nula must define an entry point",
                 name
             );
@@ -1595,7 +2635,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
 
-        let result = cmd_test(None, false);
+        let result = cmd_test(None, false, false);
         assert!(result.is_err(), "test outside package should fail");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1822,6 +2862,7 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[cfg(feature = "ureq")]
     #[test]
     fn test_cmd_deploy_missing_token() {
         let dir =
@@ -1832,7 +2873,13 @@ mod tests {
 
         scaffold_package(&dir, "deploy-test", "default").expect("scaffold should succeed");
 
-        let result = cmd_deploy(false, None, None);
+        let result = cmd_deploy(
+            false,
+            None,
+            None,
+            crate::web::adapters::AdapterKind::NulangCloud,
+            false,
+        );
         assert!(result.is_err(), "deploy without token should fail");
         if let Err(NuError::PackageError { msg, .. }) = result {
             assert!(
@@ -1845,6 +2892,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "ureq")]
     #[test]
     fn test_cmd_deploy_no_manifest() {
         let dir = std::env::temp_dir().join(format!(
@@ -1859,6 +2907,8 @@ mod tests {
             false,
             Some("http://127.0.0.1:9".to_string()),
             Some("t".to_string()),
+            crate::web::adapters::AdapterKind::NulangCloud,
+            false,
         );
         assert!(result.is_err(), "deploy without manifest should fail");
         if let Err(NuError::PackageError { msg, .. }) = result {
@@ -1870,5 +2920,109 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_build_web_signal_hydration() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_build_web_signal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Scaffold a minimal web package and overwrite the entry with a signal example.
+        scaffold_package(&dir, "signal-app", "web").expect("web scaffold should succeed");
+        let main = dir.join("src/main.nula");
+        std::fs::write(
+            &main,
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("0")
+
+fn add() {}
+
+fn home() -> Html {
+    <div class="card">
+        <button action={add}>Add</button>
+        <span>{count}</span>
+    </div>
+}
+
+app "counter" {
+    route "GET" "/" -> home
+}
+"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("web build should succeed");
+
+        let html =
+            std::fs::read_to_string(dir.join("dist/index.html")).expect("index.html should exist");
+        assert!(
+            html.contains(r#"<script src="/app.client.js"></script>"#),
+            "script tag missing"
+        );
+        assert!(html.contains("data-action="), "data-action missing");
+        assert!(
+            html.contains("data-action-placement="),
+            "data-action-placement missing"
+        );
+        assert!(html.contains("data-signal="), "data-signal missing");
+
+        let js = std::fs::read_to_string(dir.join("dist/app.client.js"))
+            .expect("app.client.js should exist");
+        assert!(js.contains("window.nulang"), "nulang global missing");
+        assert!(js.contains("hydrate"), "hydrate missing");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "ureq")]
+    #[test]
+    fn test_cmd_deploy_dry_run_emits_ir_and_dist() {
+        let dir = std::env::temp_dir().join(format!("nulang_deploy_dryrun_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        scaffold_package(&dir, "dryrun-app", "web").expect("web scaffold should succeed");
+
+        let _guard = ChangeDir::new(&dir);
+        let result = cmd_deploy(
+            false,
+            None,
+            None,
+            crate::web::adapters::AdapterKind::NulangCloud,
+            true,
+        );
+        assert!(
+            result.is_ok(),
+            "dry-run deploy should succeed: {:?}",
+            result.err()
+        );
+
+        assert!(
+            dir.join("dist/nulang-app.ir.json").exists(),
+            "IR file should be emitted"
+        );
+        let ir = std::fs::read_to_string(dir.join("dist/nulang-app.ir.json")).unwrap();
+        assert!(ir.contains("\"version\": 1"), "IR should contain version");
+        assert!(ir.contains("routes"), "IR should contain routes");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_module_subcommand_dispatch_auth_enable() {
+        let result = try_module_subcommand(&["auth".to_string(), "enable".to_string()]);
+        assert!(
+            result.is_some(),
+            "auth enable should be recognized as a module subcommand"
+        );
+        assert!(result.unwrap().is_ok(), "auth enable should succeed");
+
+        // Unknown subcommands should not be intercepted.
+        assert!(try_module_subcommand(&["unknown".to_string()]).is_none());
     }
 }

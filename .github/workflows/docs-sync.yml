@@ -1,6 +1,13 @@
 name: Docs Sync
 
+# Regenerate derived docs (stdlib reference + API reference) whenever the
+# compiler, standard library, examples, docs source, or this workflow change
+# on the main branch. The updated docs are committed back to main, the Astro
+# site is built to verify the result, and DeepWiki is pinged to encourage
+# re-indexing. Cloudflare Pages then redeploys https://nulang.org from main.
+
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -11,9 +18,13 @@ on:
       - 'docs/**'
       - '.github/workflows/docs-sync.yml'
 
+concurrency:
+  group: docs-sync-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   sync-docs:
-    name: Sync Standard Library Docs
+    name: Regenerate and sync docs
     runs-on: ubuntu-latest
     permissions:
       contents: write       # Required for auto-committing doc changes
@@ -44,6 +55,15 @@ jobs:
       - name: Generate docs
         run: node scripts/generate-docs.js
 
+      - name: Build Astro site
+        run: |
+          cd docs
+          pnpm install --frozen-lockfile
+          pnpm run build
+        # Deployment is handled by the Cloudflare Pages Git integration,
+        # which triggers on every push to main. This step validates the build
+        # before any generated docs are committed.
+
       - name: Commit and push changes
         run: |
           git config user.name "github-actions[bot]"
@@ -56,10 +76,13 @@ jobs:
             git push
           fi
 
-      - name: Build Astro site
+      - name: Ping DeepWiki to refresh index
+        # Best-effort request to encourage DeepWiki to re-index the repo docs.
+        # DeepWiki does not publish a guaranteed refresh endpoint, so this step
+        # is allowed to fail without failing the workflow.
         run: |
-          cd docs
-          pnpm install
-          pnpm run build
-        # Deployment is handled by the Cloudflare Pages Git integration,
-        # which triggers on every push to main. This step validates the build.
+          curl -fsSL --max-time 30 --retry 2 --retry-delay 5 \
+            -H "Accept: text/html" \
+            "https://deepwiki.com/nulang-org/nulang" \
+            -o /dev/null || true
+        continue-on-error: true

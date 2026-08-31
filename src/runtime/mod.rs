@@ -20,7 +20,9 @@ pub use heap_serialize::*;
 mod cluster;
 mod distributed;
 mod distributed_context;
+mod grain;
 mod network;
+mod object_store;
 mod orca_cycle;
 mod supervision;
 mod supervisor;
@@ -66,11 +68,13 @@ pub use crdt_manager::*;
 pub use crdt_reg::{LWWRegister, MVRegister, RGAElement, RGA};
 pub use distributed::*;
 pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
+pub use grain::*;
 pub use heap::*;
-pub use http_server::HttpServerState;
+pub use http_server::{render_route_handler, HttpServerState, WebDevServer, WebRoute};
 pub use mailbox::*;
 pub use network::NetworkTransport;
 pub use network::*;
+pub use object_store::*;
 pub use orca_cycle::*;
 pub use persistence::*;
 pub use process_groups::*;
@@ -79,7 +83,7 @@ pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
 
-use crate::types::{ExitReason, VmSuspension};
+use crate::types::{ExitReason, NuError, Span, VmSuspension};
 use crate::vm::Value;
 
 #[cfg(feature = "ai-runtime")]
@@ -134,6 +138,10 @@ fn bytecode_step_placeholder(_actor: &mut Actor, _args: &[Value]) {}
 /// its last pre-suspend checkpoint and the re-executed `LLM.ask` starts
 /// a fresh background call.
 const LLM_SUSPEND_MARKER: &str = "__llm_ask_pending__";
+
+/// How often (in scheduler ticks) the runtime scans resident grain actors for
+/// dehydration.
+const DEHYDRATE_CHECK_INTERVAL: u64 = 50;
 
 /// Choose the `waiting_signal` value for a freshly captured suspension:
 /// the awaited signal's name for a signal wait, or the reserved LLM
@@ -196,13 +204,28 @@ fn actor_exit_reason(value: Option<&Value>, constants: &[crate::bytecode::Consta
 /// local to each shard.
 #[derive(Debug)]
 enum CrossShardMsg {
-    /// Deliver a message to an actor on the target shard.
+    /// Deliver a message to an actor on the target shard.  For grain targets
+    /// the `grain_id` is included so the receiving shard can hydrate a grain
+    /// that has never been resident there.
     DeliverMessage {
         target_id: u64,
         behavior_id: u16,
         payload: Vec<Value>,
         sender: u64,
         trace_id: Option<String>,
+        grain_id: Option<GrainId>,
+    },
+    /// Deliver a message whose payload contains object-store refs.  The bytes
+    /// are copied because each shard owns a separate `ObjectStore`.
+    DeliverMessageWithObjects {
+        target_id: u64,
+        behavior_id: u16,
+        payload: Vec<Value>,
+        /// Object ids referenced in `payload` and their byte contents.
+        objects: Vec<(crate::runtime::object_store::ObjectId, Vec<u8>)>,
+        sender: u64,
+        trace_id: Option<String>,
+        grain_id: Option<GrainId>,
     },
     /// Enqueue an actor on the target shard (wake from idle/waiting).
     EnqueueActor {
@@ -299,6 +322,16 @@ pub struct Runtime {
 
     // Persistence engine (v0.7)
     pub persistence: Box<dyn PersistenceStore>,
+    // Immutable shared object store for large `val` buffers.
+    pub object_store: ObjectStore,
+    // Virtual actor (grain) type registry and resident mapping.
+    pub grain_registry: GrainRegistry,
+    pub grain_residents: HashMap<GrainId, u64>,
+    pub actor_grain_id: HashMap<u64, GrainId>,
+    // Known grain actor ids -> GrainId, populated when a grain is first
+    // hydrated.  Used to wake/dehydrate resident grains and to re-hydrate
+    // a grain addressed by its stable actor id.
+    pub grain_actor_ids: HashMap<u64, GrainId>,
 
     // VM used to execute bytecode behavior handlers.
     vm: Option<crate::vm::VM>,
@@ -345,7 +378,7 @@ pub struct Runtime {
     /// Keyed by content hash; drained when the matching FetchBehaviorResponse
     /// arrives and the module is cached.
     pub(crate) pending_fetched_messages:
-        HashMap<[u8; 32], Vec<(u64, String, Message, Vec<String>)>>,
+        HashMap<[u8; 32], Vec<(u64, String, Message, Vec<String>, Vec<(u64, Vec<u8>)>)>>,
     // Pipelines and debates (v0.9 AI Runtime) - extracted into a registry so
     // the god-object shrinks and the subsystems can evolve independently.
     #[cfg(feature = "ai-runtime")]
@@ -514,6 +547,11 @@ impl Runtime {
             process_groups: ProcessGroups::new(),
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
+            object_store: ObjectStore::new(),
+            grain_registry: GrainRegistry::new(),
+            grain_residents: HashMap::new(),
+            actor_grain_id: HashMap::new(),
+            grain_actor_ids: HashMap::new(),
             vm: None,
             #[cfg(feature = "ai-runtime")]
             llm: llm::LlmState::new(),
@@ -739,6 +777,40 @@ impl Runtime {
         compensation_offsets: Vec<Option<usize>>,
     ) {
         spawn::register_recovery_module(self, actor_id, module, offsets, compensation_offsets)
+    }
+
+    /// Register all `virtual entity` types declared in `module` with the
+    /// grain registry so they can be hydrated on demand.  Safe to call
+    /// multiple times for the same module (later calls are no-ops).
+    pub fn register_module_grains(&mut self, module: &crate::bytecode::CodeModule) {
+        for meta in &module.actor_metadata {
+            if !meta.is_virtual {
+                continue;
+            }
+            if self.grain_registry.contains(&meta.name) {
+                continue;
+            }
+            let default_models: Vec<(String, StateModel)> = meta
+                .state_models
+                .iter()
+                .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+                .collect();
+            let bytecode_offsets =
+                crate::runtime::spawn::bytecode_offsets_for(module, meta.is_workflow);
+            let compensation_offsets: Vec<Option<usize>> = meta
+                .behavior_indices
+                .iter()
+                .map(|&i| module.behaviors[i].compensate_offset)
+                .collect();
+            let grain_type = GrainType {
+                module: module.clone(),
+                default_models,
+                bytecode_offsets,
+                compensation_offsets,
+                dehydrate_policy: DehydratePolicy::default(),
+            };
+            self.grain_registry.register(meta.name.clone(), grain_type);
+        }
     }
 
     /// Install an LLM client for `perform LLM.ask(...)` calls.
@@ -1172,7 +1244,36 @@ impl Runtime {
         payload: Vec<Value>,
         sender: u64,
         trace_id: Option<String>,
+        grain_id: Option<GrainId>,
     ) {
+        // If the target is a known grain identity but not currently resident,
+        // hydrate it before delivering the message. The `grain_id` carried on
+        // grain cross-shard messages handles first-time hydration; the local
+        // index handles re-hydration after eviction.
+        if !self.actors.contains_key(&target_id) {
+            let grain_id_to_hydrate =
+                grain_id.or_else(|| self.grain_actor_ids.get(&target_id).cloned());
+            if let Some(grain_id) = grain_id_to_hydrate {
+                if let Err(e) = self.resolve_or_hydrate_grain(grain_id) {
+                    warn!(
+                        "nulang-grain: failed to hydrate grain actor {} on cross-shard delivery: {}",
+                        target_id, e
+                    );
+                    self.route_to_dlq(
+                        &Message {
+                            behavior_id,
+                            payload: Arc::new(Vec::new()),
+                            sender,
+                            priority: MessagePriority::System,
+                            trace_id: None,
+                        },
+                        "grain hydration failed (cross-shard)",
+                    );
+                    return;
+                }
+            }
+        }
+
         let msg = Message {
             behavior_id,
             payload: Arc::new(payload),
@@ -1247,6 +1348,7 @@ impl Runtime {
                     payload,
                     sender,
                     trace_id,
+                    grain_id,
                 } => {
                     self.deliver_cross_shard_message(
                         target_id,
@@ -1254,6 +1356,42 @@ impl Runtime {
                         payload,
                         sender,
                         trace_id,
+                        grain_id,
+                    );
+                }
+                CrossShardMsg::DeliverMessageWithObjects {
+                    target_id,
+                    behavior_id,
+                    mut payload,
+                    objects,
+                    sender,
+                    trace_id,
+                    grain_id,
+                } => {
+                    // Insert each object into the local store and rewrite the
+                    // payload so that object ids refer to local entries.
+                    let mut id_map: std::collections::HashMap<
+                        crate::runtime::object_store::ObjectId,
+                        crate::runtime::object_store::ObjectId,
+                    > = std::collections::HashMap::with_capacity(objects.len());
+                    for (original_id, bytes) in objects {
+                        let local_id = self.object_store.put(bytes.into_boxed_slice());
+                        id_map.insert(original_id, local_id);
+                    }
+                    for value in &mut payload {
+                        if let Some(id) = value.as_object_id() {
+                            if let Some(&local_id) = id_map.get(&id) {
+                                *value = Value::object(local_id);
+                            }
+                        }
+                    }
+                    self.deliver_cross_shard_message(
+                        target_id,
+                        behavior_id,
+                        payload,
+                        sender,
+                        trace_id,
+                        grain_id,
                     );
                 }
                 CrossShardMsg::EnqueueActor { actor_id, priority } => {
@@ -1770,12 +1908,19 @@ impl Runtime {
 
     pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {
         let actor = self.actors.get(&target_id)?;
-        let suffix = format!(".{}", behavior);
+        // Allocation-free match: `entry.name == behavior`, or
+        // `entry.name` ends with `.<behavior>` (qualified name).
+        let matches = |name: &str| {
+            name == behavior
+                || name
+                    .strip_suffix(behavior)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        };
         // Search the per-actor behavior table first (native handlers).
         if let Some(idx) = actor
             .behavior_table
             .iter()
-            .position(|entry| entry.name == behavior || entry.name.ends_with(&suffix))
+            .position(|entry| matches(&entry.name))
         {
             return Some(idx as u16);
         }
@@ -1786,9 +1931,194 @@ impl Runtime {
         module
             .behaviors
             .iter()
-            .position(|b| b.name == behavior || b.name.ends_with(&suffix))
+            .position(|b| matches(&b.name))
             .map(|idx| idx as u16)
     }
+
+    /// Resolve a behavior name to a numeric id using the registered grain
+    /// type's module. This lets `send_to_grain` route across shards before the
+    /// target actor has been hydrated on the local shard.
+    fn resolve_grain_behavior_id(&self, grain_id: &GrainId, behavior_name: &str) -> Option<u16> {
+        let grain_type = self.grain_registry.get(&grain_id.grain_type)?;
+        let suffix = format!(".{}", behavior_name);
+        grain_type
+            .module
+            .behaviors
+            .iter()
+            .position(|b| b.name == behavior_name || b.name.ends_with(&suffix))
+            .map(|idx| idx as u16)
+    }
+
+    /// Send a message to an actor owned by another shard. Validates that the
+    /// payload contains only value types (object-store refs are copied to the
+    /// target shard's store). Returns `true` if the message was accepted for
+    /// delivery, `false` if it was dropped because the payload contained a heap
+    /// pointer, actor ref, or closure.
+    fn send_cross_shard_message(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: Vec<Value>,
+        out_trace: Option<String>,
+        grain_id: Option<GrainId>,
+    ) -> bool {
+        let target_shard = (target_id % self.shard_count as u64) as u16;
+        for arg in &args {
+            if arg.is_ptr() || arg.is_actor_ref() || arg.is_closure() {
+                tracing::warn!(
+                    "nulang-shard: dropping cross-shard message to actor {}: \
+                     payload contains heap pointer / actor ref / closure",
+                    target_id
+                );
+                return false;
+            }
+        }
+        let tx = self.cross_shard_tx.as_ref().unwrap();
+        let object_refs: Vec<crate::runtime::object_store::ObjectId> =
+            args.iter().filter_map(|v| v.as_object_id()).collect();
+        if object_refs.is_empty() {
+            let _ = tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
+                target_id,
+                behavior_id,
+                payload: args,
+                sender: self.current_actor.unwrap_or(0),
+                trace_id: out_trace,
+                grain_id,
+            });
+        } else {
+            let mut objects = Vec::with_capacity(object_refs.len());
+            for id in object_refs {
+                if let Some(entry) = self.object_store.get(id) {
+                    objects.push((id, entry.as_bytes().to_vec()));
+                }
+            }
+            let _ = tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessageWithObjects {
+                target_id,
+                behavior_id,
+                payload: args,
+                objects,
+                sender: self.current_actor.unwrap_or(0),
+                trace_id: out_trace,
+                grain_id,
+            });
+        }
+        true
+    }
+
+    /// Send a message to a virtual actor (grain) identified by its stable
+    /// `(grain_type, key)`. Hydrates the grain if it is not currently resident.
+    /// In a sharded runtime, the grain's stable actor id determines the owning
+    /// shard (`stable_id % shard_count`); messages are routed to that shard
+    /// without hydrating locally.
+    pub fn send_to_grain(
+        &mut self,
+        grain_id: GrainId,
+        behavior_name: &str,
+        args: Vec<Value>,
+        sender: u64,
+    ) {
+        let stable_id = grain_actor_id(&grain_id);
+
+        // Cross-shard routing: if the grain's stable id belongs to another
+        // shard, resolve the behavior id from the grain type metadata and
+        // forward the message without hydrating on this shard.
+        if self.shard_count > 1 {
+            let owner_shard = (stable_id % self.shard_count as u64) as u16;
+            if owner_shard != self.shard_idx {
+                let Some(behavior_id) = self.resolve_grain_behavior_id(&grain_id, behavior_name)
+                else {
+                    warn!(
+                        "nulang-grain: unknown behavior {} for grain {}",
+                        behavior_name,
+                        grain_id.actor_name()
+                    );
+                    return;
+                };
+                let prev = self.current_actor;
+                if sender != 0 {
+                    self.current_actor = Some(sender);
+                }
+                let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
+                self.send_cross_shard_message(
+                    stable_id,
+                    behavior_id,
+                    args,
+                    out_trace,
+                    Some(grain_id.clone()),
+                );
+                self.current_actor = prev;
+                return;
+            }
+        }
+
+        let actor_id = match self.resolve_or_hydrate_grain(grain_id.clone()) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(
+                    "nulang-grain: failed to resolve grain {}: {}",
+                    grain_id.actor_name(),
+                    e
+                );
+                return;
+            }
+        };
+        let Some(behavior_id) = self.behavior_id_for(actor_id, behavior_name) else {
+            warn!(
+                "nulang-grain: unknown behavior {} for grain {}",
+                behavior_name,
+                grain_id.actor_name()
+            );
+            return;
+        };
+        let prev = self.current_actor;
+        if sender != 0 {
+            self.current_actor = Some(sender);
+        }
+        self.send_message_by_id(actor_id, behavior_id, &args);
+        self.current_actor = prev;
+    }
+
+    /// Send a message to a grain that is known to live on a specific remote
+    /// node. This is the explicit cross-node routing path: the caller supplies
+    /// the target node because the local runtime has no directory mapping from
+    /// grain identity to hosting node in the MVP.
+    ///
+    /// If the grain happens to be resident locally (e.g. in single-node tests),
+    /// delivery falls back to the local path.
+    pub fn send_to_grain_on_node(
+        &mut self,
+        grain_id: GrainId,
+        target_node: NodeId,
+        behavior_name: &str,
+        args: Vec<Value>,
+        sender: u64,
+    ) {
+        let stable_id = grain_actor_id(&grain_id);
+        let prev = self.current_actor;
+        if sender != 0 {
+            self.current_actor = Some(sender);
+        }
+
+        if self.actors.contains_key(&stable_id) {
+            let Some(behavior_id) = self.behavior_id_for(stable_id, behavior_name) else {
+                warn!(
+                    "nulang-grain: unknown behavior {} for local grain {}",
+                    behavior_name,
+                    grain_id.actor_name()
+                );
+                self.current_actor = prev;
+                return;
+            };
+            self.send_message_by_id(stable_id, behavior_id, &args);
+            self.current_actor = prev;
+            return;
+        }
+
+        let target = ActorAddress::remote(target_node, stable_id);
+        self.send_distributed(target, behavior_name, &args);
+        self.current_actor = prev;
+    }
+
     #[tracing::instrument(level = "trace", skip(self, args))]
     pub fn send_message_by_id(&mut self, target_id: u64, behavior_id: u16, args: &[Value]) {
         // Stamp the outgoing message with the current handler's trace span (if
@@ -1846,35 +2176,95 @@ impl Runtime {
             return;
         }
         // Cross-shard routing: if the target actor lives on another shard,
-        // validate the payload (no heap pointers - ORCA is per-shard) and
-        // send via the cross-shard channel. The receiving shard delivers it
+        // forward via the cross-shard channel. The receiving shard delivers it
         // through `deliver_cross_shard_message`.
         if self.shard_count > 1 {
             let target_shard = (target_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
-                // Reject payloads that carry heap pointers, actor refs, or
-                // closures - same restriction as the NUL0 wire protocol.
-                for arg in args {
-                    if arg.is_ptr() || arg.is_actor_ref() || arg.is_closure() {
-                        tracing::warn!(
-                            "nulang-shard: dropping cross-shard message to actor {}: \
-                             payload contains heap pointer / actor ref / closure",
-                            target_id
-                        );
-                        return;
-                    }
-                }
-                let tx = self.cross_shard_tx.as_ref().unwrap();
-                let _ = tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
+                self.send_cross_shard_message(
                     target_id,
                     behavior_id,
-                    payload: args.to_vec(),
-                    sender: self.current_actor.unwrap_or(0),
-                    trace_id: out_trace.clone(),
-                });
+                    args.to_vec(),
+                    out_trace.clone(),
+                    None,
+                );
                 return;
             }
         }
+        // Grain hydration: a resident grain actor that is hibernated should be
+        // woken before the new message is delivered.
+        if self.actor_grain_id.contains_key(&target_id) {
+            if let Some(actor) = self.actors.get_mut(&target_id) {
+                if actor.is_hibernated() {
+                    if let Some(vm) = self.vm.as_mut() {
+                        if let Err(e) = actor.wake_from_hibernation(vm) {
+                            warn!(
+                                "nulang-grain: failed to wake hibernated grain actor {}: {}",
+                                target_id, e
+                            );
+                        }
+                    } else {
+                        warn!(
+                            "nulang-grain: cannot wake hibernated grain actor {}: no VM",
+                            target_id
+                        );
+                    }
+                }
+            }
+        }
+
+        // If the target is a known grain identity but is not currently
+        // resident, hydrate it and retry local delivery once.
+        if !self.actors.contains_key(&target_id) {
+            if let Some(grain_id) = self.grain_actor_ids.get(&target_id).cloned() {
+                if let Err(e) = self.resolve_or_hydrate_grain(grain_id) {
+                    warn!(
+                        "nulang-grain: failed to hydrate grain actor {}: {}",
+                        target_id, e
+                    );
+                    self.route_to_dlq(
+                        &Message {
+                            behavior_id,
+                            payload: Arc::new(args.to_vec()),
+                            sender: self.current_actor.unwrap_or(0),
+                            priority: MessagePriority::System,
+                            trace_id: out_trace.clone(),
+                        },
+                        "grain hydration failed",
+                    );
+                    return;
+                }
+                if self.actors.contains_key(&target_id) {
+                    self.deliver_local_message(target_id, behavior_id, args, out_trace);
+                } else {
+                    self.route_to_dlq(
+                        &Message {
+                            behavior_id,
+                            payload: Arc::new(args.to_vec()),
+                            sender: self.current_actor.unwrap_or(0),
+                            priority: MessagePriority::System,
+                            trace_id: out_trace.clone(),
+                        },
+                        "grain hydration failed",
+                    );
+                }
+                return;
+            }
+        }
+
+        self.deliver_local_message(target_id, behavior_id, args, out_trace);
+    }
+
+    /// Deliver a message to a local actor's mailbox, track cross-actor
+    /// references, and wake a receive-wait if necessary.
+    #[tracing::instrument(level = "trace", skip(self, args))]
+    fn deliver_local_message(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+        out_trace: Option<String>,
+    ) {
         let msg = Message {
             behavior_id,
             payload: Arc::new(args.to_vec()),
@@ -1886,7 +2276,10 @@ impl Runtime {
             actor
                 .flight_recorder
                 .record(self.current_actor.unwrap_or(0), behavior_id, args);
-            if let Err(_dropped) = actor.mailbox.push_local(msg) {
+            if actor.mailbox.push_local(msg).is_ok() {
+                // Activity resets the dehydration idle timer.
+                actor.idle_ms = 0;
+            } else {
                 // Mailbox is full (capacity > 0). Route to DLQ with a simple notification.
                 self.route_to_dlq(
                     &Message {
@@ -2234,6 +2627,9 @@ impl Runtime {
                 // whose local and foreign counts have already reached zero.
                 self.process_deferred_all();
             }
+            if ticks % DEHYDRATE_CHECK_INTERVAL == 0 {
+                self.dehydrate_idle_grains();
+            }
         }
         // Deliver pending foreign-ref decrements and run cycle detection only
         // once the run queue has drained. Receiver-side holds now keep
@@ -2365,6 +2761,9 @@ impl Runtime {
                         // scenarios exercise the same GC cadence.
                         self.process_deferred_all();
                     }
+                    if steps % DEHYDRATE_CHECK_INTERVAL == 0 {
+                        self.dehydrate_idle_grains();
+                    }
                 }
                 None => {
                     // No actor is ready. With a virtual clock installed and
@@ -2403,8 +2802,237 @@ impl Runtime {
                         self.advance_time(delta);
                     }
                     steps += 1;
+                    if steps % DEHYDRATE_CHECK_INTERVAL == 0 {
+                        self.dehydrate_idle_grains();
+                    }
                 }
             }
+        }
+    }
+
+    /// Best-effort module hash for an actor, used to tag hibernation state.
+    /// Falls back to an all-zero hash when no type hash is available.
+    fn actor_module_hash(&self, actor_id: u64) -> [u8; 32] {
+        self.actors
+            .get(&actor_id)
+            .and_then(|a| a.bytecode_module.as_ref())
+            .and_then(|m| m.actor_metadata.iter().find_map(|m| m.type_hash))
+            .unwrap_or([0u8; 32])
+    }
+
+    /// Build a serializable snapshot of an actor's durable state without
+    /// updating the actor's own sequence/dirty tracking.
+    fn build_actor_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        let mut state = std::collections::HashMap::new();
+        let waiting_signal = {
+            let actor = self.actors.get(&actor_id)?;
+            for (name, value) in &actor.state_data {
+                let model = actor
+                    .state_models
+                    .get(name)
+                    .copied()
+                    .unwrap_or(StateModel::Local);
+                if model == StateModel::Durable || model.is_crdt() {
+                    let persisted = if name == "semantic_memory" || name == "procedural_memory" {
+                        #[cfg(feature = "ai-runtime")]
+                        {
+                            self.vm_value_to_string_in_actor(value, actor)
+                                .map(PersistedValue::String)
+                                .unwrap_or_else(|| {
+                                    PersistedValue::from_value_resolved(
+                                        value,
+                                        actor.bytecode_module.as_ref(),
+                                    )
+                                })
+                        }
+                        #[cfg(not(feature = "ai-runtime"))]
+                        {
+                            PersistedValue::from_value_resolved(
+                                value,
+                                actor.bytecode_module.as_ref(),
+                            )
+                        }
+                    } else {
+                        PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
+                    };
+                    state.insert(name.clone(), persisted);
+                }
+            }
+            actor.waiting_signal.clone()
+        };
+        let sequence = self.next_sequence(actor_id);
+        let crdt_snapshot = self.crdt_manager.as_ref().map(|m| {
+            m.snapshot()
+                .into_iter()
+                .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
+                .collect()
+        });
+        Some(ActorSnapshot {
+            actor_id,
+            sequence,
+            state,
+            waiting_signal,
+            crdt_snapshot,
+        })
+    }
+
+    /// Scan resident grain actors and hibernate any that have been idle long
+    /// enough according to their grain type's DehydratePolicy.
+    pub(crate) fn dehydrate_idle_grains(&mut self) {
+        let candidates: Vec<(u64, GrainId)> = self
+            .actor_grain_id
+            .iter()
+            .map(|(&id, g)| (id, g.clone()))
+            .collect();
+        for (actor_id, grain_id) in candidates {
+            let (may_dehydrate, policy_idle_ms) = {
+                let Some(actor) = self.actors.get(&actor_id) else {
+                    continue;
+                };
+                if actor.pinned || actor.is_hibernated() || actor.is_mid_execution() {
+                    continue;
+                }
+                if !actor.mailbox.is_empty() {
+                    continue;
+                }
+                let Some(grain_type) = self.grain_registry.get(&grain_id.grain_type) else {
+                    continue;
+                };
+                let policy = grain_type.dehydrate_policy;
+                if !policy.allow_dehydrate {
+                    continue;
+                }
+                (true, policy.idle_ms)
+            };
+            if !may_dehydrate {
+                continue;
+            }
+
+            {
+                let Some(actor) = self.actors.get_mut(&actor_id) else {
+                    continue;
+                };
+                actor.idle_ms += DEHYDRATE_CHECK_INTERVAL;
+                if actor.idle_ms < policy_idle_ms {
+                    continue;
+                }
+            }
+
+            // Persist a snapshot of durable state before hibernating.
+            let Some(snapshot) = self.build_actor_snapshot(actor_id) else {
+                continue;
+            };
+            let sequence = snapshot.sequence;
+            if let Err(e) = self.persistence.save_snapshot(snapshot) {
+                warn!(
+                    "nulang-grain: failed to save snapshot before dehydrating actor {}: {}",
+                    actor_id, e
+                );
+                continue;
+            }
+
+            // Keep actor.sequence/dirty_fields consistent with the persisted snapshot.
+            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                actor.sequence = sequence;
+                actor.dirty_fields.clear();
+            }
+
+            // Hibernate the actor. Its entry stays in `self.actors` so it
+            // remains addressable and will be woken on the next send.
+            let module_hash = self.actor_module_hash(actor_id);
+            if self.vm.is_none() {
+                self.vm = Some(crate::vm::VM::new());
+            }
+            let vm = self.vm.as_mut().unwrap();
+            let hibernated = if let Some(actor) = self.actors.get_mut(&actor_id) {
+                match actor.hibernate(vm, &module_hash) {
+                    Ok(_) => true,
+                    Err(ref e) if e == "No active frame" => {
+                        // Idle grain with no in-flight behavior: record a
+                        // state-only hibernation marker so the next send wakes
+                        // it and starts a fresh behavior.
+                        actor.hibernation_state = Some(crate::runtime::actor::HibernationState {
+                            continuation_bytes: Vec::new(),
+                            module_hash,
+                            hibernated_at_ms: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64,
+                            state_fields: actor.state_data.clone(),
+                        });
+                        true
+                    }
+                    Err(e) => {
+                        warn!(
+                            "nulang-grain: failed to hibernate actor {}: {}",
+                            actor_id, e
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if hibernated {
+                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                    actor.idle_ms = 0;
+                }
+            }
+        }
+    }
+
+    /// Evict hibernated grain actors that have empty mailboxes and are not pinned.
+    ///
+    /// Eviction removes the actor from `self.actors` to reclaim heap memory while
+    /// keeping the stable identity mapping in `grain_actor_ids`/`actor_grain_id`.
+    /// The `grain_residents` entry is removed so that the next send re-hydrates
+    /// the grain from its snapshot (or fresh type metadata). Pinned grains and
+    /// grains with non-empty mailboxes are never evicted.
+    ///
+    /// Returns the number of actors evicted.
+    pub fn evict_hibernated_grains(&mut self, max_evict: Option<usize>) -> usize {
+        let candidates: Vec<(u64, GrainId)> = self
+            .actor_grain_id
+            .iter()
+            .filter_map(|(&actor_id, grain_id)| {
+                let actor = self.actors.get(&actor_id)?;
+                if actor.is_hibernated() && !actor.pinned && actor.mailbox.is_empty() {
+                    Some((actor_id, grain_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut evicted = 0;
+        for (actor_id, grain_id) in candidates {
+            if let Some(max) = max_evict {
+                if evicted >= max {
+                    break;
+                }
+            }
+            // Remove the resident actor. Keep grain_actor_ids/actor_grain_id so
+            // subsequent sends addressed by stable id still recognize the grain.
+            self.actors.remove(&actor_id);
+            self.grain_residents.remove(&grain_id);
+            evicted += 1;
+            tracing::debug!("nulang-grain: evicted hibernated actor {}", actor_id);
+        }
+        evicted
+    }
+
+    /// Heuristic memory-pressure hook: evict hibernated grains when the number
+    /// of hibernated grain actors exceeds a threshold.
+    ///
+    /// This is a coarse-grained operator safety valve; production deployments
+    /// will typically want to feed real RSS metrics into this decision.
+    pub fn maybe_evict_under_pressure(&mut self) -> usize {
+        const HIBERNATED_THRESHOLD: usize = 1000;
+        let hibernated_count = self.actors.values().filter(|a| a.is_hibernated()).count();
+        if hibernated_count > HIBERNATED_THRESHOLD {
+            self.evict_hibernated_grains(None)
+        } else {
+            0
         }
     }
 
@@ -2427,6 +3055,15 @@ impl Runtime {
     /// receiver's `OrcaGc` and released by [`release_held_foreign_refs`].
     fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value]) {
         for value in payload {
+            if let Some(id) = value.as_object_id() {
+                // Object-store ref: increment the node-local refcount and
+                // record the hold on the receiving actor.
+                self.object_store.clone_ref(id);
+                if let Some(receiver) = self.actors.get_mut(&receiver_id) {
+                    receiver.held_objects.insert(id);
+                }
+                continue;
+            }
             let Some(ptr) = value.as_ptr() else { continue };
             if ptr.is_null() {
                 continue;
@@ -2464,6 +3101,11 @@ impl Runtime {
             Some(actor) => actor.orca_gc.take_held_refs(),
             None => return,
         };
+        let object_ids: std::collections::HashSet<crate::runtime::object_store::ObjectId> =
+            match self.actors.get_mut(&actor_id) {
+                Some(actor) => std::mem::take(&mut actor.held_objects),
+                None => std::collections::HashSet::new(),
+            };
         for (owner_id, header) in holds {
             if let Some(owner) = self.actors.get_mut(&owner_id) {
                 owner.orca_gc.process_foreign_op(
@@ -2481,6 +3123,7 @@ impl Runtime {
                 unsafe { (*header).foreign_count -= 1 };
             }
         }
+        self.object_store.drop_refs(&object_ids);
         self.reclaim_retired_heaps();
     }
 
@@ -2577,6 +3220,10 @@ impl Runtime {
             }
         };
         let should_requeue = if let Some(msg) = msg_opt {
+            // Message delivery counts as activity for dehydration.
+            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                actor.idle_ms = 0;
+            }
             let behavior_idx = msg.behavior_id as usize;
 
             // ORCA receiver protocol: hold every heap pointer in the
@@ -3770,7 +4417,8 @@ impl Runtime {
                 idx
             } else {
                 let idx = vm.modules.len();
-                vm.load_module(module);
+                vm.load_module(module.clone());
+                (*self_ptr).register_module_grains(&module);
                 if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                     actor.bytecode_module_idx = Some(idx);
                 }
@@ -4314,6 +4962,107 @@ impl Runtime {
         actor
     }
 
+    /// Resolve a virtual actor (grain) identity to a resident actor id,
+    /// hydrating it from persistence if necessary.
+    ///
+    /// Returns the actor id on success.  If the grain type is unknown or the
+    /// snapshot exists but cannot be restored, returns an error.
+    pub fn resolve_or_hydrate_grain(&mut self, grain_id: GrainId) -> Result<u64, NuError> {
+        if let Some(&id) = self.grain_residents.get(&grain_id) {
+            return Ok(id);
+        }
+
+        let grain_type = self
+            .grain_registry
+            .get(&grain_id.grain_type)
+            .ok_or_else(|| NuError::RuntimeError {
+                msg: format!("unknown virtual actor type: {}", grain_id.grain_type),
+                span: Span::new(0, 0),
+            })?
+            .clone();
+
+        let stable_actor_id = grain_actor_id(&grain_id);
+
+        // Register the recovery module so checkpoint/replay know the bytecode.
+        self.register_recovery_module(
+            stable_actor_id,
+            grain_type.module.clone(),
+            grain_type.bytecode_offsets.clone(),
+            grain_type.compensation_offsets.clone(),
+        );
+
+        let snapshot = self.persistence.load_snapshot(stable_actor_id);
+
+        let actor = if let Some(ref snap) = snapshot {
+            Self::restore_actor_from_snapshot(
+                stable_actor_id,
+                &grain_type.module,
+                snap,
+                false,
+                false,
+            )
+        } else {
+            let mut actor = Actor::new(stable_actor_id, grain_id.actor_name(), 0);
+            actor.persistent = true;
+            actor.bytecode_module = Some(grain_type.module.clone());
+            actor.bytecode_offsets = grain_type.bytecode_offsets.clone();
+            actor.compensation_offsets = grain_type.compensation_offsets.clone();
+            actor.state_models = grain_type
+                .default_models
+                .iter()
+                .map(|(name, model)| (name.clone(), *model))
+                .collect();
+            // Fill declared initial values.
+            for (name, c) in grain_type
+                .module
+                .actor_metadata
+                .iter()
+                .flat_map(|m| &m.state_defaults)
+            {
+                let v = match c {
+                    crate::bytecode::Constant::String(s) => actor.allocate_string(&s),
+                    other => crate::vm::constant_to_value(&other),
+                };
+                actor.set_state_field(name, v);
+            }
+            actor
+        };
+
+        // Track the grain identity.
+        self.actors.insert(stable_actor_id, actor);
+        self.grain_residents
+            .insert(grain_id.clone(), stable_actor_id);
+        self.actor_grain_id
+            .insert(stable_actor_id, grain_id.clone());
+        self.grain_actor_ids.insert(stable_actor_id, grain_id);
+
+        // Replay message journal entries that arrived after the snapshot.
+        if let Some(ref snap) = snapshot {
+            let journal = self.persistence.read_journal(stable_actor_id);
+            for entry in journal.iter().filter(|e| e.sequence > snap.sequence) {
+                let behavior_idx = entry.behavior_id as usize;
+                let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
+                if self.has_native_handler(stable_actor_id, behavior_idx) {
+                    // Native handlers cannot be resolved until the actor is in
+                    // `self.actors`, so we only support bytecode grains here.
+                    continue;
+                }
+                if self.has_bytecode_handler(stable_actor_id, behavior_idx) {
+                    self.current_actor = Some(stable_actor_id);
+                    let _ = self.run_bytecode_behavior(stable_actor_id, behavior_idx, &payload);
+                    self.current_actor = None;
+                    if let Some(actor) = self.actors.get_mut(&stable_actor_id) {
+                        actor.sequence = entry.sequence;
+                    }
+                }
+            }
+        }
+
+        self.enqueue_actor(stable_actor_id);
+
+        Ok(stable_actor_id)
+    }
+
     /// Receive a migrated actor from another node.
     ///
     /// Deserializes the NBC bytecode module and durable state snapshot sent
@@ -4637,6 +5386,94 @@ impl Runtime {
         }
     }
 
+    /// Dispatch a built-in `Grain.*` effect performed from bytecode.
+    ///
+    /// - `ref`: returns the stable actor id for `(grain_type, key)`.
+    /// - `prewarm`: hydrates the grain if not resident; returns unit on
+    ///   success, nil on failure.
+    /// - `pin` / `unpin`: hydrates the grain and sets/clears the pinned flag.
+    ///
+    /// Returns `None` for unknown op names so the caller can fall through
+    /// to other built-in handlers.
+    fn perform_grain_builtin(
+        &mut self,
+        op_name: Option<&str>,
+        constants: &[crate::bytecode::Constant],
+        regs: &[Value],
+    ) -> Option<Value> {
+        let string_arg = |idx: usize| -> Option<String> {
+            let id = regs.get(idx)?.as_string_id()?;
+            match constants.get(id as usize) {
+                Some(crate::bytecode::Constant::String(s)) => Some(s.clone()),
+                _ => None,
+            }
+        };
+        let grain_type = string_arg(0)?;
+        let key_value = regs.get(1)?;
+        let key = if let Some(n) = key_value.as_int() {
+            n.to_string()
+        } else if let Some(s) = string_arg(1) {
+            s
+        } else {
+            return Some(Value::nil());
+        };
+        let grain_id = GrainId::new(grain_type, key);
+        match op_name {
+            Some("ref") => {
+                let stable_id = grain_actor_id(&grain_id);
+                // Register the stable id -> GrainId mapping so sends to this
+                // reference can hydrate the grain on first use, even though the
+                // actor itself is not materialised yet.
+                self.grain_actor_ids.insert(stable_id, grain_id);
+                Some(Value::actor_ref(stable_id))
+            }
+            Some("prewarm") => match self.resolve_or_hydrate_grain(grain_id.clone()) {
+                Ok(_) => Some(Value::unit()),
+                Err(e) => {
+                    warn!(
+                        "nulang-grain: prewarm failed for {}: {}",
+                        grain_id.actor_name(),
+                        e
+                    );
+                    Some(Value::nil())
+                }
+            },
+            Some("pin") => match self.resolve_or_hydrate_grain(grain_id.clone()) {
+                Ok(actor_id) => {
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        actor.pin();
+                    }
+                    Some(Value::unit())
+                }
+                Err(e) => {
+                    warn!(
+                        "nulang-grain: pin failed for {}: {}",
+                        grain_id.actor_name(),
+                        e
+                    );
+                    Some(Value::nil())
+                }
+            },
+            Some("unpin") => match self.resolve_or_hydrate_grain(grain_id.clone()) {
+                Ok(actor_id) => {
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        actor.unpin();
+                    }
+                    Some(Value::unit())
+                }
+                Err(e) => {
+                    warn!(
+                        "nulang-grain: unpin failed for {}: {}",
+                        grain_id.actor_name(),
+                        e
+                    );
+                    Some(Value::nil())
+                }
+            },
+            _ => None,
+        }
+    }
+
     /// Dispatch a built-in `Python.*` effect performed from bytecode.
     /// Returns `None` for unknown op names so the caller can fall through
     /// to other built-in handlers.
@@ -4871,11 +5708,7 @@ impl Runtime {
             actor.set_state_field(field, value);
         }
 
-        Some(if op == "read" {
-            value
-        } else {
-            Value::unit()
-        })
+        Some(if op == "read" { value } else { Value::unit() })
     }
 
     /// Resolve an actor type by name to the `(module, behavior_idx)` pair
@@ -5089,6 +5922,53 @@ impl Runtime {
             })
             .collect();
 
+        // Supervision tree topology.
+        let supervisors = self
+            .supervisors
+            .iter()
+            .map(|(id, sup)| SupervisorMetric {
+                id: *id,
+                name: sup.name.clone(),
+                strategy: format!("{:?}", sup.strategy),
+                parent: sup.parent,
+                children: sup
+                    .children
+                    .iter()
+                    .map(|(spec, actor_id)| SupervisorChildMetric {
+                        actor_id: *actor_id,
+                        spec_id: spec.id.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        // CRDT replication state. `CrdtEntry` is not PartialEq, so an entry
+        // counts as an unsynced delta when its serialized state differs from
+        // the sync base (i.e. changes generated since the last delta sync).
+        let crdt = match &self.crdt_manager {
+            Some(m) => {
+                let unsynced_deltas = m
+                    .entries
+                    .iter()
+                    .filter(|(id, e)| {
+                        m.sync_base.get(id).map(|b| b.payload_bytes()) != Some(e.payload_bytes())
+                    })
+                    .count();
+                CrdtMetric {
+                    node_id: m.node_id,
+                    entries: m.entries.len(),
+                    ops_synced: m.ops_synced,
+                    unsynced_deltas,
+                }
+            }
+            None => CrdtMetric {
+                node_id: 0,
+                entries: 0,
+                ops_synced: 0,
+                unsynced_deltas: 0,
+            },
+        };
+
         MetricsSnapshot {
             actors_live: self.actor_count() as u64,
             actors_mailboxes: mailboxes,
@@ -5096,7 +5976,15 @@ impl Runtime {
             scheduler,
             gc,
             resolver,
+            supervisors,
+            crdt,
         }
+    }
+
+    /// Render the runtime's supervision tree and CRDT state as ASCII text
+    /// for a terminal topology view.
+    pub fn render_topology(&self) -> String {
+        self.metrics_snapshot().render_topology_text()
     }
 
     /// Start a Prometheus-format metrics server on the given port.
@@ -5126,12 +6014,22 @@ impl Runtime {
             crate::observability::publish_otlp_metrics(&snap);
         }
     }
+    #[cfg(feature = "tcp")]
     pub fn enable_distribution(
         &mut self,
         bind_addr: std::net::SocketAddr,
         tls_config: crate::runtime::network::TlsConfig,
     ) -> std::io::Result<()> {
         distribution::enable_distribution(self, bind_addr, tls_config)
+    }
+
+    /// Enable the distributed actor system over TCP.
+    ///
+    /// Stub used when the `tcp` feature is disabled: real TCP distribution
+    /// is unavailable, so this always fails.
+    #[cfg(not(feature = "tcp"))]
+    pub fn enable_distribution(&mut self, bind_addr: std::net::SocketAddr) -> std::io::Result<()> {
+        distribution::enable_distribution(self, bind_addr)
     }
 
     /// Enable distribution over a caller-supplied transport (DST: the
@@ -5318,8 +6216,11 @@ impl Runtime {
             .actors
             .get(&actor_id)
             .and_then(|a| a.bytecode_module.clone())
-            .or_else(|| self.recovery_modules.get(&actor_id).map(|(m, _, _)| m.clone()))
-        {
+            .or_else(|| {
+                self.recovery_modules
+                    .get(&actor_id)
+                    .map(|(m, _, _)| m.clone())
+            }) {
             Some(m) => m,
             None => return,
         };
@@ -5421,11 +6322,7 @@ impl Runtime {
 /// re-spawn time (each survivor computes whether it is the shadow), so the
 /// node that holds the replica is the node that re-spawns — no leader
 /// election, exactly one re-spawn per actor.
-pub(crate) fn shadow_for(
-    cluster: &ClusterState,
-    home: NodeId,
-    _actor_id: u64,
-) -> Option<NodeId> {
+pub(crate) fn shadow_for(cluster: &ClusterState, home: NodeId, _actor_id: u64) -> Option<NodeId> {
     cluster
         .all_members()
         .iter()
@@ -5466,6 +6363,11 @@ pub struct MetricsSnapshot {
     pub scheduler: SchedulerStats,
     pub gc: GcStats,
     pub resolver: ResolverStats,
+    /// Supervision tree topology: one entry per supervisor, with its parent
+    /// link and children. Parent links reconstruct the tree.
+    pub supervisors: Vec<SupervisorMetric>,
+    /// CRDT replication state.
+    pub crdt: CrdtMetric,
 }
 
 /// Per-actor mailbox depth for the metrics snapshot.
@@ -5473,6 +6375,41 @@ pub struct MetricsSnapshot {
 pub struct ActorMailboxMetric {
     pub actor_id: u64,
     pub depth: usize,
+}
+
+/// One supervisor in the topology snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SupervisorMetric {
+    pub id: u64,
+    pub name: String,
+    /// `RestartStrategy` variant name (OneForOne, OneForAll, RestForOne,
+    /// SimpleOneForOne).
+    pub strategy: String,
+    /// Parent supervisor actor id, if this supervisor is itself supervised.
+    pub parent: Option<u64>,
+    pub children: Vec<SupervisorChildMetric>,
+}
+
+/// A supervised child actor.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SupervisorChildMetric {
+    pub actor_id: u64,
+    /// `ChildSpec.id` — stable across restarts (the actor id changes).
+    pub spec_id: String,
+}
+
+/// CRDT replication state.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrdtMetric {
+    pub node_id: u64,
+    /// Number of live CRDT entries (replicas).
+    pub entries: usize,
+    /// Total CRDT ops shipped.
+    pub ops_synced: u64,
+    /// Entries whose state differs from the last-synced base — changes not
+    /// yet replicated. Computed by serializing and comparing (CrdtEntry is
+    /// not PartialEq).
+    pub unsynced_deltas: usize,
 }
 
 /// True when the given 1-based sync round should ship full state.

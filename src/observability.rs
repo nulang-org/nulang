@@ -139,7 +139,11 @@ pub fn init_tracing(service_name: &str) -> Result<(), String> {
     }
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
-    let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
+    // stderr, never stdout: `--lsp` must keep stdout pure JSON-RPC framing,
+    // and CLI logs must not pollute piped program output.
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_writer(std::io::stderr);
     // Use the configured SDK provider when available; otherwise fall back to
     // a no-op SDK provider so terminal logging still works and spans are
     // dropped (the layer requires a `PreSampledTracer`).
@@ -188,6 +192,11 @@ pub struct MetricsExporter {
     resolver_failed: opentelemetry::metrics::Counter<u64>,
     resolver_cache_hits: opentelemetry::metrics::Counter<u64>,
     resolver_cache_misses: opentelemetry::metrics::Counter<u64>,
+    supervisors_total: opentelemetry::metrics::Gauge<u64>,
+    supervisor_children: opentelemetry::metrics::Gauge<u64>,
+    crdt_entries: opentelemetry::metrics::Gauge<u64>,
+    crdt_ops_synced: opentelemetry::metrics::Gauge<u64>,
+    crdt_unsynced_deltas: opentelemetry::metrics::Gauge<u64>,
     /// Previous snapshot, used to compute deltas for counter metrics.
     prev: parking_lot::Mutex<Option<crate::runtime::MetricsSnapshot>>,
 }
@@ -216,6 +225,11 @@ impl MetricsExporter {
             resolver_failed: meter.u64_counter("nulang.resolver.failed").init(),
             resolver_cache_hits: meter.u64_counter("nulang.resolver.cache.hits").init(),
             resolver_cache_misses: meter.u64_counter("nulang.resolver.cache.misses").init(),
+            supervisors_total: meter.u64_gauge("nulang.supervisors.total").init(),
+            supervisor_children: meter.u64_gauge("nulang.supervisor.children").init(),
+            crdt_entries: meter.u64_gauge("nulang.crdt.entries").init(),
+            crdt_ops_synced: meter.u64_gauge("nulang.crdt.ops.synced").init(),
+            crdt_unsynced_deltas: meter.u64_gauge("nulang.crdt.unsynced.deltas").init(),
             prev: parking_lot::Mutex::new(None),
         }
     }
@@ -329,6 +343,20 @@ impl MetricsExporter {
             r.cache_misses,
             p_r.map(|p| p.cache_misses),
         );
+
+        self.supervisors_total
+            .record(snap.supervisors.len() as u64, &[]);
+        for s in &snap.supervisors {
+            self.supervisor_children.record(
+                s.children.len() as u64,
+                &[opentelemetry::KeyValue::new("supervisor_id", s.id as i64)],
+            );
+        }
+        let c = &snap.crdt;
+        self.crdt_entries.record(c.entries as u64, &[]);
+        self.crdt_ops_synced.record(c.ops_synced, &[]);
+        self.crdt_unsynced_deltas
+            .record(c.unsynced_deltas as u64, &[]);
 
         drop(prev);
         *self.prev.lock() = Some(snap.clone());

@@ -1657,18 +1657,42 @@ mod tests {
         mgr.register_actor_field(2, "gs", CrdtType::GSet, crate::vm::Value::nil());
         mgr.register_actor_field(3, "ors", CrdtType::ORSet, crate::vm::Value::nil());
 
-        assert_eq!(mgr.apply_field_op(1, "pn", "increment", None), Some(CrdtValue::Int(1)));
-        assert_eq!(mgr.apply_field_op(1, "pn", "decrement", None), Some(CrdtValue::Int(0)));
-        assert_eq!(mgr.apply_field_op(1, "pn", "decrement", None), Some(CrdtValue::Int(-1)));
+        assert_eq!(
+            mgr.apply_field_op(1, "pn", "increment", None),
+            Some(CrdtValue::Int(1))
+        );
+        assert_eq!(
+            mgr.apply_field_op(1, "pn", "decrement", None),
+            Some(CrdtValue::Int(0))
+        );
+        assert_eq!(
+            mgr.apply_field_op(1, "pn", "decrement", None),
+            Some(CrdtValue::Int(-1))
+        );
 
-        assert_eq!(mgr.apply_field_op(2, "gs", "add", Some("a")), Some(CrdtValue::Int(1)));
-        assert_eq!(mgr.apply_field_op(2, "gs", "add", Some("b")), Some(CrdtValue::Int(2)));
+        assert_eq!(
+            mgr.apply_field_op(2, "gs", "add", Some("a")),
+            Some(CrdtValue::Int(1))
+        );
+        assert_eq!(
+            mgr.apply_field_op(2, "gs", "add", Some("b")),
+            Some(CrdtValue::Int(2))
+        );
         // remove is outside the gset operation set.
         assert_eq!(mgr.apply_field_op(2, "gs", "remove", Some("a")), None);
 
-        assert_eq!(mgr.apply_field_op(3, "ors", "add", Some("a")), Some(CrdtValue::Int(1)));
-        assert_eq!(mgr.apply_field_op(3, "ors", "add", Some("b")), Some(CrdtValue::Int(2)));
-        assert_eq!(mgr.apply_field_op(3, "ors", "remove", Some("a")), Some(CrdtValue::Int(1)));
+        assert_eq!(
+            mgr.apply_field_op(3, "ors", "add", Some("a")),
+            Some(CrdtValue::Int(1))
+        );
+        assert_eq!(
+            mgr.apply_field_op(3, "ors", "add", Some("b")),
+            Some(CrdtValue::Int(2))
+        );
+        assert_eq!(
+            mgr.apply_field_op(3, "ors", "remove", Some("a")),
+            Some(CrdtValue::Int(1))
+        );
         // add without an item argument is rejected.
         assert_eq!(mgr.apply_field_op(3, "ors", "add", None), None);
     }
@@ -1690,8 +1714,14 @@ mod tests {
         // increment is outside the lwwregister operation set.
         assert_eq!(mgr.apply_field_op(1, "lww", "increment", None), None);
 
-        assert_eq!(mgr.apply_field_op(2, "mv", "set", Some("v")), Some(CrdtValue::Int(1)));
-        assert_eq!(mgr.apply_field_op(2, "mv", "read", None), Some(CrdtValue::Int(1)));
+        assert_eq!(
+            mgr.apply_field_op(2, "mv", "set", Some("v")),
+            Some(CrdtValue::Int(1))
+        );
+        assert_eq!(
+            mgr.apply_field_op(2, "mv", "read", None),
+            Some(CrdtValue::Int(1))
+        );
         // decrement is outside the mvregister operation set.
         assert_eq!(mgr.apply_field_op(2, "mv", "decrement", None), None);
     }

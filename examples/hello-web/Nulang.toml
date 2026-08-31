@@ -1,0 +1,8 @@
+[package]
+name = "hello-web"
+version = "0.1.0"
+
+[web]
+port = 3000
+static_dir = "static"
+output_dir = "dist"

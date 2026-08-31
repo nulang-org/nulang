@@ -1,0 +1,45 @@
+// Tests for json-ext — schema validation.
+
+import lib
+import stdlib::test
+
+fn main() {
+  // ── empty schema accepts everything ──────────────────────────────────
+  assert(validate(parse("{}"), parse("42")), "empty schema accepts number")
+  assert(validate(parse("{}"), JsonNull), "empty schema accepts null")
+
+  // ── primitive type checks ────────────────────────────────────────────
+  let s_string = parse("{\"type\": \"string\"}")
+  assert(validate(s_string, JsonString("ok")), "string schema accepts string")
+  assert(!validate(s_string, JsonNumber(1.0)), "string schema rejects number")
+  assert(validate(parse("{\"type\": \"number\"}"), parse("3.5")), "number schema")
+  assert(!validate(parse("{\"type\": \"number\"}"), JsonBool(true)), "number rejects bool")
+  assert(validate(parse("{\"type\": \"bool\"}"), JsonBool(false)), "bool schema")
+  assert(validate(parse("{\"type\": \"null\"}"), JsonNull), "null schema")
+  assert(!validate(parse("{\"type\": \"null\"}"), JsonBool(false)), "null rejects false")
+
+  // ── enum ─────────────────────────────────────────────────────────────
+  let s_color = parse("{\"enum\": [\"red\", \"green\"]}")
+  assert(validate(s_color, JsonString("red")), "enum member accepted")
+  assert(!validate(s_color, JsonString("blue")), "enum non-member rejected")
+
+  // ── arrays with items ────────────────────────────────────────────────
+  let s_ints = parse("{\"type\": \"array\", \"items\": {\"type\": \"number\"}}")
+  assert(validate(s_ints, parse("[1, 2, 3]")), "number array accepted")
+  assert(!validate(s_ints, parse("[1, \"x\"]")), "mixed array rejected")
+  assert(validate(s_ints, parse("[]")), "empty array accepted")
+  assert(validate(parse("{\"type\": \"array\"}"), parse("[1, \"x\"]")), "array without items accepts anything")
+
+  // ── objects: required + properties ───────────────────────────────────
+  let s_user = parse("{\"type\": \"object\", \"required\": [\"name\"], \"properties\": {\"name\": {\"type\": \"string\"}, \"age\": {\"type\": \"number\"}}}")
+  assert(validate(s_user, parse("{\"name\": \"ada\", \"age\": 36}")), "valid user accepted")
+  assert(validate(s_user, parse("{\"name\": \"ada\"}")), "optional field may be absent")
+  assert(!validate(s_user, parse("{\"age\": 36}")), "missing required field rejected")
+  assert(!validate(s_user, parse("{\"name\": 7}")), "wrong field type rejected")
+  assert(validate(s_user, parse("{\"name\": \"ada\", \"extra\": true}")), "extra fields allowed")
+
+  // ── nested schemas ───────────────────────────────────────────────────
+  let s_nested = parse("{\"type\": \"object\", \"properties\": {\"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}}")
+  assert(validate(s_nested, parse("{\"tags\": [\"a\", \"b\"]}")), "nested valid")
+  assert(!validate(s_nested, parse("{\"tags\": [\"a\", 1]}")), "nested invalid item")
+}

@@ -55,3 +55,4 @@ src/jit/mir_compiler.rs
 # Agent tooling state
 .agents/
 .devin/
+.nula/

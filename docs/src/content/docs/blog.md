@@ -84,7 +84,7 @@ Every decade brings new AI models, new cloud providers, and new orchestration fr
 - **Reference capabilities** prevent data races without a GC or borrow checker.
 - **Durable state** means your program's execution survives the machine it runs on.
 
-Nulang freezes these primitives in a [Frozen Core](https://github.com/dporkka/nulang/blob/main/GOVERNANCE.md) and builds everything else — AI, cloud services, billing, multi-tenancy — as evolvable layers.
+Nulang freezes these primitives in a [Frozen Core](https://github.com/nulang-org/nulang/blob/main/GOVERNANCE.md) and builds everything else — AI, cloud services, billing, multi-tenancy — as evolvable layers.
 
 ---
 
@@ -109,4 +109,4 @@ Nulang freezes these primitives in a [Frozen Core](https://github.com/dporkka/nu
 
 [Install Nulang](/getting-started/installation/) and follow the [Quick Start](/getting-started/quick-start/) guide to write your first actor.
 
-The [source code is on GitHub](https://github.com/dporkka/nulang) under the Apache 2.0 license.
+The [source code is on GitHub](https://github.com/nulang-org/nulang) under the Apache 2.0 license.

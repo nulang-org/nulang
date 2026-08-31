@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nulang.org/spec/agent/v1/domain.schema.json",
+  "title": "NLAP v1 Domain",
+  "type": "object",
+  "properties": {
+    "goal": {
+      "$ref": "#/$defs/goal"
+    },
+    "task": {
+      "$ref": "#/$defs/task"
+    },
+    "conversation": {
+      "$ref": "#/$defs/conversation"
+    }
+  },
+  "$defs": {
+    "goal": {
+      "type": "object",
+      "required": [
+        "id",
+        "project_id",
+        "intent",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "conversation_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "intent": {
+          "type": "string"
+        },
+        "desired_state": {
+          "type": "object"
+        },
+        "constraints": {
+          "type": "object"
+        },
+        "success_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "budget_usd": {
+          "type": "number"
+        },
+        "deadline": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "status": {
+          "enum": [
+            "created",
+            "running",
+            "blocked",
+            "verifying",
+            "completed",
+            "cancelled"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "task": {
+      "type": "object",
+      "required": [
+        "id",
+        "goal_id",
+        "manager",
+        "description",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "goal_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "parent_task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "manager": {
+          "enum": [
+            "engineering",
+            "research",
+            "operations",
+            "data",
+            "voice"
+          ]
+        },
+        "description": {
+          "type": "string"
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "budget_usd": {
+          "type": "number"
+        },
+        "timeout": {
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "created",
+            "ready",
+            "assigned",
+            "running",
+            "blocked",
+            "verifying",
+            "failed",
+            "completed",
+            "cancelled"
+          ]
+        },
+        "assigned_agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "conversation": {
+      "type": "object",
+      "required": [
+        "id",
+        "project_id",
+        "messages"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "director_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "active_goal_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "role",
+              "content"
+            ],
+            "properties": {
+              "role": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "timestamp": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
+          }
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

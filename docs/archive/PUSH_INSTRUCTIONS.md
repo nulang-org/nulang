@@ -12,7 +12,7 @@ git push origin main
 ## Current State
 
 - Branch: `main`
-- Remote: `https://github.com/dporkka/nulang.git`
+- Remote: `https://github.com/nulang-org/nulang.git`
 - Build: `cargo build` succeeds
 - Tests: `cargo test` succeeds (508 unit tests pass)
 

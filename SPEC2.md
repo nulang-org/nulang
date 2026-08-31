@@ -1194,7 +1194,7 @@ These relationships enable safe capability transitions. For example, a function 
 The Pony-style capability *upgrade* — constructing an `iso` or `val` reference from an expression that internally uses only `iso`, `trn`, `val`, or `tag` references, so the result's capability is stronger than its free variables would normally permit — is **reserved as future surface**. That semantics requires tracking the capabilities of all captured free variables, which the current implementation does not do. The planned form:
 
 ```nulang
-// Planned — capability-upgrade semantics not yet implemented
+// fragment — Planned capability-upgrade semantics not yet implemented
 let immutable_tree: &val Tree[Int] = recover {
   Tree.Node { left: Tree.Leaf, value: 42, right: Tree.Leaf }
 }
@@ -1399,6 +1399,7 @@ the other three are parse errors, not effect dispatch.
 The compiler infers effect rows automatically. A function's effect row is the union of all effects performed in its body, plus the effects of any functions it calls.
 
 ```nulang
+// fragment — effect-row inference examples; FS.read needs capability file
 // Effect row inferred as {IO}
 fn inferred() {
   perform IO.print("Hello")

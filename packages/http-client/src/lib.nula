@@ -1,0 +1,127 @@
+// http-client — request builder, percent-encoding, and query-string helpers
+// over the built-in `Http` effect.
+// Consume with: `import lib` from any file in the package.
+// Requests are plain records: {method, base, path, headers, params, body}.
+// Only `send` performs the Http effect; everything else is pure.
+
+// ── Percent-encoding ──────────────────────────────────────────────────────
+
+/// Two uppercase hex digits for a byte value 0-255.
+fn hex_byte(b) {
+    let hi = b / 16;
+    let lo = b - hi * 16;
+    let h = if hi < 10 then { perform String.from_char(hi + 48) }
+            else { perform String.from_char(hi + 55) };
+    let l = if lo < 10 then { perform String.from_char(lo + 48) }
+            else { perform String.from_char(lo + 55) };
+    perform String.concat(h, l)
+}
+
+/// True when `c` (a char code) is an unreserved URL character:
+/// A-Z a-z 0-9 or one of - _ . ~
+fn is_unreserved(c) {
+    (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+    || (c >= 48 && c <= 57)
+    || c == 45 || c == 95 || c == 46 || c == 126
+}
+
+/// Percent-encode a string for use in a URL query component.
+/// Unreserved characters pass through; space becomes `+`; every other
+/// character becomes %XX. (ASCII input is encoded byte-for-byte.)
+pub fn url_encode(s) {
+    var out = "";
+    let n = perform String.length(s);
+    var i = 0;
+    while i < n {
+        let c = perform String.charAt(s, i);
+        if is_unreserved(c) then {
+            out = perform String.concat(out, perform String.from_char(c))
+        }
+        else if c == 32 then { out = perform String.concat(out, "+") }
+        else { out = perform String.concat(out, perform String.concat("%", hex_byte(c))) };
+        i = i + 1
+    };
+    out
+}
+
+// ── Query strings ─────────────────────────────────────────────────────────
+
+/// Build a query string ("k1=v1&k2=v2") from (key, value) pairs.
+/// Keys and values are percent-encoded.
+pub fn build_query(params) {
+    var out = "";
+    var i = 0;
+    let n = perform Array.length(params);
+    while i < n {
+        let p = params[i];
+        if i > 0 then { out = perform String.concat(out, "&") } else {};
+        out = perform String.concat(out, url_encode(p.0));
+        out = perform String.concat(out, "=");
+        out = perform String.concat(out, url_encode(p.1));
+        i = i + 1
+    };
+    out
+}
+
+// ── Request builder ───────────────────────────────────────────────────────
+
+/// A GET request for base + path, no headers, params, or body.
+pub fn get_request(base, path) {
+    {method: "GET", base: base, path: path, headers: [], params: [], body: ""}
+}
+
+/// A POST request for base + path with a body, no headers or params.
+pub fn post_request(base, path, body) {
+    {method: "POST", base: base, path: path, headers: [], params: [], body: body}
+}
+
+/// Add a header. Headers are (name, value) pairs, kept in insertion order.
+pub fn with_header(name, value, req) {
+    {method: req.method, base: req.base, path: req.path,
+     headers: perform Array.push(req.headers, (name, value)),
+     params: req.params, body: req.body}
+}
+
+/// Add a query parameter (encoded later by request_url).
+pub fn with_query_param(k, v, req) {
+    {method: req.method, base: req.base, path: req.path,
+     headers: req.headers,
+     params: perform Array.push(req.params, (k, v)),
+     body: req.body}
+}
+
+/// Replace the request body.
+pub fn with_body(body, req) {
+    {method: req.method, base: req.base, path: req.path,
+     headers: req.headers, params: req.params, body: body}
+}
+
+/// The full request URL: base + path (+ ?query when params are present).
+pub fn request_url(req) {
+    let u = perform String.concat(req.base, req.path);
+    if perform Array.length(req.params) == 0 then { u }
+    else {
+        perform String.concat(u, perform String.concat("?", build_query(req.params)))
+    }
+}
+
+/// Look up a header value by name, or None when absent.
+pub fn header_value(name, req) {
+    var found = None;
+    for h in req.headers {
+        if h.0 == name then { found = Some(h.1) } else {}
+    };
+    found
+}
+
+// ── Sending ───────────────────────────────────────────────────────────────
+
+/// Send the request via the built-in Http effect and return the response
+/// body. Requires a runtime host (not available in the standalone VM).
+pub fn send_request(req) -> String ! {Http, String, Array} {
+    if req.method == "POST" then {
+        perform Http.post(request_url(req), req.body)
+    } else {
+        perform Http.get(request_url(req))
+    }
+}

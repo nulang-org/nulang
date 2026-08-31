@@ -1,0 +1,47 @@
+// Tests for test-utils — exercises every expectation on its success path.
+// (Failure paths abort the process by design, like stdlib assertions.)
+
+import lib
+import stdlib::test
+
+fn main() {
+  // ── booleans ─────────────────────────────────────────────────────────
+  expect_true(1 + 1 == 2, "arithmetic")
+  expect_false(1 > 2, "inequality")
+
+  // ── equality ─────────────────────────────────────────────────────────
+  expect_eq_int(2 + 3, 5)
+  expect_ne_int(2 + 3, 6)
+  expect_eq_str("a" + "b", "ab")
+  expect_eq_bool(true, 1 == 1)
+  expect_float_near(10.0 / 4.0, 2.5, 0.0001)
+  expect_float_near(0.1 + 0.2, 0.3, 0.0001)
+
+  // ── ordering ─────────────────────────────────────────────────────────
+  expect_gt(5, 3)
+  expect_lt(3, 5)
+  expect_between(4, 1, 10)
+  expect_between(1, 1, 10)
+
+  // ── Option / Result ──────────────────────────────────────────────────
+  expect_some(Some(1))
+  expect_none(None)
+  assert_eq(expect_some_value(Some(42)), 42)
+  expect_ok(Ok(1))
+  expect_err(Error("boom"))
+
+  // ── collections ──────────────────────────────────────────────────────
+  expect_eq_list_int([1, 2, 3], [1, 2, 3])
+  expect_eq_list_int([], [])
+  expect_contains("hello world", "lo wo")
+  expect_contains("abc", "a")
+
+  // ── table-driven fixture helper ──────────────────────────────────────
+  let squares = [(1, 1), (2, 4), (3, 9), (4, 16)];
+  for_each(squares, fn(c: (Int, Int)) {
+    expect_eq_int(c.0 * c.0, c.1)
+  })
+
+  // ── stdlib assertions still available alongside ──────────────────────
+  assert(true, "stdlib assert composes with expect_*")
+}

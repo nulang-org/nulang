@@ -1,0 +1,5 @@
+{
+  "exit_code": 0,
+  "stdout": "<div class=\"card\"><h2>Hello JSX</h2><p>Welcome to Nulang Web.</p></div>",
+  "stderr": ""
+}

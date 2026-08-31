@@ -1,0 +1,8 @@
+[package]
+name = "json-ext"
+version = "0.1.0"
+entry = "src/lib.nula"
+language = "1.0.0"
+
+[dependencies]
+json = { path = "../json" }

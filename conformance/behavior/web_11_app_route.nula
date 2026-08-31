@@ -1,0 +1,11 @@
+import stdlib::web::html
+import stdlib::web::types
+
+app "hello" {
+    route "GET" "/" -> home
+}
+
+@placement(static)
+fn home() -> Html {
+    text("ok")
+}

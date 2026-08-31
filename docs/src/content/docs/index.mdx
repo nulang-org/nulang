@@ -3,181 +3,213 @@ title: Nulang
 description: A distributed, actor-based programming language with algebraic effects and row-polymorphic types.
 template: splash
 hero:
-  tagline: Build fault-tolerant distributed systems with the elegance of algebraic effects and row-polymorphic types.
-  image:
-    file: ../../assets/logo.svg
+  title: Build software that <span class="hero-emphasis">doesn't crash.</span>
+  tagline: Nulang is a distributed, actor-based programming language for durable applications with built-in AI primitives. Ship fault-tolerant systems with less infrastructure plumbing.
   actions:
     - text: Get Started
       link: /getting-started/installation/
       icon: right-arrow
       variant: primary
-    - text: Nulang Cloud
-      link: https://www.nulang.cloud
-      icon: external
+    - text: Try the Playground
+      link: /getting-started/quick-start/
+      icon: right-arrow
       variant: secondary
 ---
 
-import HeroBackground from '../../components/animations/HeroBackground.astro';
 import SupervisionTree from '../../components/animations/SupervisionTree.astro';
 import DistributionDemo from '../../components/animations/DistributionDemo.astro';
 import AIPipeline from '../../components/animations/AIPipeline.astro';
 import GcDemo from '../../components/animations/GcDemo.astro';
+import ScrollReveal from '../../components/ScrollReveal.astro';
+import FeatureGrid from '../../components/FeatureGrid.astro';
+import Steps from '../../components/Steps.astro';
+import TerminalCard from '../../components/TerminalCard.astro';
+import MetricsBand from '../../components/MetricsBand.astro';
 
-<div class="hero-example">
+<MetricsBand />
 
-```nulang
-actor Counter {
-    state count: Int = 0
-    behavior inc() { self.count = self.count + 1 }
-    behavior get() { self.count }
-}
-let c = spawn Counter {} in {
-    send c inc()    // fire-and-forget
-    send c inc()
-    ask c get()     // synchronous request → 2
-}
-```
+<div class="nu-section">
+  <div class="nu-container">
+    <div class="nu-section-header">
+      <h2>Everything you need to ship</h2>
+      <p class="nu-section-subhead">A complete language for distributed systems, not a piecemeal collection of tools.</p>
+    </div>
 
-</div>
-
-## Why Nulang?
-
-Building reliable distributed systems today usually means stitching together actors, queues, databases, workflow engines, and observability tools. Nulang integrates those capabilities into the language itself so you can focus on your application logic instead of infrastructure plumbing.
-
-<div class="benefit-row">
-  <div class="benefit-text">
-
-### Build software that heals
-
-Nulang's actor model and supervision trees mean failures are isolated and restarted automatically. A bad message or a crashing service doesn't take down the whole system. Durable workflows checkpoint state at each step and use saga compensation to roll back safely when a step fails — your program survives node restarts.
-
-  </div>
-  <div class="benefit-demo">
-
-<SupervisionTree />
-
-  </div>
-</div>
-
-<div class="benefit-row benefit-row-reverse">
-  <div class="benefit-text">
-
-### Distribute without rewriting
-
-Actors communicate through location-transparent messages. Move a service from one node to many, and the code stays the same.
-
-  </div>
-  <div class="benefit-demo">
-
-<DistributionDemo />
-
+    <div class="pillars-grid">
+      <div class="pillar-card">
+        <div class="feature-icon-chip">
+          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+          </svg>
+        </div>
+        <h3>Durable actors</h3>
+        <p>Failures are isolated and restarted automatically. Supervision trees, durable workflows, and saga compensation keep your program running through crashes and restarts.</p>
+      </div>
+      <div class="pillar-card">
+        <div class="feature-icon-chip">
+          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+          </svg>
+        </div>
+        <h3>Built-in AI primitives</h3>
+        <p>Perform LLM calls as algebraic effects, wire up agent pipelines, debates, and supervisor teams with episodic, semantic, and procedural memory.</p>
+      </div>
+      <div class="pillar-card">
+        <div class="feature-icon-chip">
+          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon">
+            <circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/>
+          </svg>
+        </div>
+        <h3>Location-transparent distribution</h3>
+        <p>Move a service from one node to many without rewriting code. Actors communicate through messages, with automatic clustering and CRDT state replication.</p>
+      </div>
+    </div>
   </div>
 </div>
 
-<div class="benefit-row">
-  <div class="benefit-text">
+<div class="nu-section" style="padding-top: 0;">
+  <div class="nu-container">
+    <div class="nu-section-header">
+      <h2>From zero to running in three commands</h2>
+      <p class="nu-section-subhead">Clone, build, and start experimenting. No YAML, no infrastructure.</p>
+    </div>
 
-### Ship AI agents with memory
-
-Build AI agents with the nulang-ai library — LLM integrations, episodic/semantic/procedural memory, pipelines, debates, and supervisor teams.
-
-  </div>
-  <div class="benefit-demo">
-
-<AIPipeline />
-
+    <Steps />
   </div>
 </div>
 
-<div class="benefit-row benefit-row-reverse">
-  <div class="benefit-text">
+<div class="nu-section">
+  <div class="nu-container">
+    <div class="durable-row">
+      <div class="benefit-text">
+        <h2>Durable by default</h2>
+        <p>Every external operation — messages, effects, timers — is part of the actor's execution log. If an actor crashes mid-flight, it replays from the last checkpoint and picks up exactly where it left off.</p>
+        <ul class="durable-checklist">
+          <li>
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            Automatic state checkpointing on effect boundaries
+          </li>
+          <li>
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            Saga compensation for safe rollbacks
+          </li>
+          <li>
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            Survives VM crashes, host failures, and restarts
+          </li>
+          <li>
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            Human approval workflows that wait for days if needed
+          </li>
+        </ul>
+      </div>
+      <div class="benefit-demo">
+        <TerminalCard title="nulang deploy" code={`$ nulang deploy counter.nula
 
-### Stay safe and fast
+Building actor...
+Compiling to WASM...  ✓
+Optimizing with PGO...  ✓
+Provisioning runtime...  ✓
 
-Reference capabilities and per-actor garbage collection give you memory safety without global stop-the-world pauses, while the JIT and native AOT backends keep hot paths fast.
+Deployed!
+https://my-app.nulang.cloud
 
-  </div>
-  <div class="benefit-demo">
-
-<GcDemo />
-
-  </div>
-</div>
-
-## Open Source
-
-Nulang is open source and licensed under the Apache 2.0 license. The source code, issue tracker, and contribution workflow live on GitHub.
-
-<a href="https://github.com/dporkka/nulang/blob/main/LICENSE" class="btn-license">
-  View Apache 2.0 License
-</a>
-
-<div class="feature-grid">
-  <div class="feature-card">
-    <h3><svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></svg>Distributed Actors</h3>
-    <p>Location-transparent actors with BEAM/OTP primitives — spawn, link, monitor, supervise. Automatic clustering with gossip membership and CRDT state replication.</p>
-  </div>
-  <div class="feature-card">
-    <h3><svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>Algebraic Effects</h3>
-    <p>Koka-inspired row-polymorphic effects with compile-time checking. Handle, perform, resume — algebraic effect handlers compose freely without monad transformers.</p>
-  </div>
-  <div class="feature-card">
-    <h3><svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>Row-Polymorphic Types</h3>
-    <p>Full Hindley-Milner type inference with row polymorphism for both records and effects. Pony-inspired reference capabilities (iso, trn, ref, val, box, tag) enforced at compile time.</p>
-  </div>
-  <div class="feature-card">
-    <h3><svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>BEAM/OTP Primitives</h3>
-    <p>Supervision trees (one_for_one, one_for_all, rest_for_one, simple_one_for_one), process groups, named registration, and exit trapping — battle-tested fault tolerance patterns.</p>
-  </div>
-  <div class="feature-card">
-    <h3><svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>WASM Backend</h3>
-    <p>Compile to WebAssembly with full MIR→WASM translation. Run in Wasmtime with 4GiB guard pages, SIMD support, and AOT compilation for near-native performance.</p>
-  </div>
-  <div class="feature-card">
-    <h3><svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>AI Runtime</h3>
-    <p>Built-in LLM integration with provider-agnostic API (OpenAI, Ollama). Agent pipelines, debate teams, supervisor hierarchies, and episodic/semantic/procedural memory.</p>
+Cold start: 42ms
+Status: healthy`} />
+      </div>
+    </div>
   </div>
 </div>
 
-```nulang
-// A simple counter actor
-actor Counter {
-    state count: Int = 0
+<div class="nu-section">
+  <div class="nu-container">
+    <div class="nu-section-header">
+      <h2>Language Features</h2>
+      <p class="nu-section-subhead">Explore the core capabilities that make Nulang different.</p>
+    </div>
 
-    behavior inc() {
-        self.count = self.count + 1
-    }
-
-    behavior get() { self.count }
-}
-
-// Spawn and use it
-let counter = spawn Counter {} in {
-    send counter inc()   // fire-and-forget
-    send counter inc()
-    ask counter get()    // 2
-}
-```
-
-## Installation
-
-```bash
-# Clone and build from source
-git clone https://github.com/dporkka/nulang.git
-cd nulang
-cargo build --release
-
-# Start the REPL
-cargo run -- --repl
-```
-
-## Support
-
-Nulang is open source under the Apache 2.0 license. If you find it valuable, consider supporting its development.
-
-<div style="margin-top:1.5rem;">
-  <a href="https://buy.stripe.com/cNidR932O6du6nK6eX1RC02" class="btn-support">
-    ♥ Support Nulang Development
-  </a>
+    <FeatureGrid />
+  </div>
 </div>
 
+<div class="nu-section" style="padding-top: 0;">
+  <div class="nu-container">
+    <h2>Learn & Contribute</h2>
+    <p>Nulang.org is the home for the <strong>language</strong> — documentation, tutorials, and the open-source community. When you’re ready to deploy actors to production, head to Nulang Cloud.</p>
+
+    <div class="learn-grid">
+      <a href="/getting-started/installation/" class="learn-card">
+        <h3>Read the docs</h3>
+        <p>Installation, syntax, types, and the standard library.</p>
+      </a>
+      <a href="/tutorial/" class="learn-card">
+        <h3>Follow the tutorial</h3>
+        <p>Build your first actor-based program step by step.</p>
+      </a>
+      <a href="https://github.com/nulang-org/nulang" class="learn-card" target="_blank" rel="noopener noreferrer">
+        <h3>Contribute on GitHub</h3>
+        <p>Issues, discussions, and pull requests welcome.</p>
+      </a>
+      <a href="https://www.nulang.cloud" class="learn-card learn-card-accent" target="_blank" rel="noopener noreferrer">
+        <h3>Deploy on Nulang Cloud</h3>
+        <p>Durable actors, AI gateway, and global edge deployment.</p>
+      </a>
+    </div>
+  </div>
+</div>
+
+<div class="nu-section support-section" style="padding-bottom: 0;">
+  <div class="nu-container">
+    <div class="nu-section-header">
+      <h2>Support Nulang</h2>
+      <p class="nu-section-subhead">The language is free and open source. Help us keep building the future of durable software.</p>
+    </div>
+    <div class="support-grid">
+      <a href="https://github.com/nulang-org/nulang" class="support-card" target="_blank" rel="noopener noreferrer">
+        <div class="support-icon">
+          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"/>
+            <path d="M9 18c-4.51 2-5-2-7-2"/>
+          </svg>
+        </div>
+        <h3>Contribute on GitHub</h3>
+        <p>Issues, discussions, and pull requests are welcome. Star the repo to show your support.</p>
+      </a>
+      <a href="https://buy.stripe.com/cNidR932O6du6nK6eX1RC02" class="support-card support-card-accent" target="_blank" rel="noopener noreferrer">
+        <div class="support-icon">
+          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/>
+          </svg>
+        </div>
+        <h3>Sponsor development</h3>
+        <p>Back the project financially and get priority support, roadmap input, and recognition.</p>
+      </a>
+      <a href="https://www.nulang.cloud" class="support-card" target="_blank" rel="noopener noreferrer">
+        <div class="support-icon">
+          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/>
+            <path d="M2 12h20"/>
+          </svg>
+        </div>
+        <h3>Deploy on Nulang Cloud</h3>
+        <p>Production hosting for durable actors, AI agents, and global edge deployment.</p>
+      </a>
+    </div>
+  </div>
+</div>
+
+<div class="cta-panel bottom-cta">
+  <h2 class="cta-panel-title">Ready to ship?</h2>
+  <p class="cta-panel-copy">
+    Nulang is open source under the Apache 2.0 license. Get started, contribute on GitHub, or support its ongoing development.
+  </p>
+  <div class="cta-panel-actions">
+    <a href="/getting-started/installation/" class="cta-btn cta-btn-primary">Get Started</a>
+    <a href="https://github.com/nulang-org/nulang" class="cta-btn cta-btn-ghost" target="_blank" rel="noopener noreferrer">
+      Contribute on GitHub
+    </a>
+  </div>
+</div>
+
+<ScrollReveal />

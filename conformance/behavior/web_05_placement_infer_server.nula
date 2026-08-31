@@ -1,0 +1,5 @@
+fn route_handler() -> Unit ! {Request} {}
+
+fn main() {
+    perform IO.print("ok")
+}

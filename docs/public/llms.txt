@@ -21,7 +21,7 @@ Nulang is a systems language with static types, algebraic effects, and actor-bas
 
 ## Quick Install
 ```bash
-git clone https://github.com/dporkka/nulang.git
+git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
 cargo run -- --repl
@@ -63,6 +63,6 @@ let counter = spawn Counter {} in {
 - Every doc page has a clean Markdown twin at the same path + `.md` (e.g. https://nulang.org/language/types.md).
 
 ## Links
-- [GitHub](https://github.com/dporkka/nulang): Source code, issues, contributions.
+- [GitHub](https://github.com/nulang-org/nulang): Source code, issues, contributions.
 - [Nulang Cloud](https://www.nulang.cloud): Hosted runtime platform.
-- [License](https://github.com/dporkka/nulang/blob/main/LICENSE): Apache 2.0.
+- [License](https://github.com/nulang-org/nulang/blob/main/LICENSE): Apache 2.0.

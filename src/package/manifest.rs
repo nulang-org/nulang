@@ -32,6 +32,20 @@ pub struct Manifest {
     pub package: PackageSection,
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
+    #[serde(default)]
+    pub web: WebSection,
+    #[serde(default)]
+    pub budgets: BudgetsSection,
+}
+
+impl Default for WebSection {
+    fn default() -> Self {
+        Self {
+            port: default_web_port(),
+            static_dir: default_static_dir(),
+            output_dir: default_output_dir(),
+        }
+    }
 }
 
 /// The `[package]` section.
@@ -48,6 +62,13 @@ pub struct PackageSection {
     pub registry: Option<String>,
     #[serde(default)]
     pub language: Option<String>,
+    /// Resource capabilities the package needs (e.g. `["net"]` for the
+    /// `Http` effect). Forwarded to the compiler as `--with <cap>` by
+    /// `nula build`, `nula test`, and `nula run`, so packages performing
+    /// gated effects (Net, ...) can declare their requirements instead of
+    /// failing the default-deny capability check.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 fn default_entry() -> String {
@@ -63,6 +84,78 @@ pub enum Dependency {
     Version(String),
     /// `foo = { path = "../foo" }` or `foo = { git = "...", ... }`.
     Detailed(DependencyDetail),
+}
+
+/// The `[web]` section of a Nulang Web manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WebSection {
+    /// Port for the `nula dev` server. Defaults to 8080.
+    #[serde(default = "default_web_port")]
+    pub port: u16,
+    /// Directory with static assets, relative to the package root.
+    #[serde(default = "default_static_dir")]
+    pub static_dir: String,
+    /// Directory where `nula build --web` emits the static site.
+    #[serde(default = "default_output_dir")]
+    pub output_dir: String,
+}
+
+fn default_web_port() -> u16 {
+    8080
+}
+
+fn default_static_dir() -> String {
+    "static".to_string()
+}
+
+fn default_output_dir() -> String {
+    "dist".to_string()
+}
+
+/// The `[budgets]` section of a Nulang Web manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BudgetsSection {
+    /// Maximum initial JavaScript transfer size, e.g. "20KB" or "1.5MB".
+    #[serde(default)]
+    pub initial_js: Option<String>,
+    /// Largest Contentful Paint target, e.g. "1.5s".
+    #[serde(default)]
+    pub lcp: Option<String>,
+}
+
+impl BudgetsSection {
+    /// Parse `initial_js` into a byte budget if declared.
+    pub fn initial_js_max_bytes(&self) -> Option<usize> {
+        self.initial_js.as_ref().and_then(|s| parse_size(s))
+    }
+
+    /// Parse `lcp` into a seconds target if declared.
+    pub fn lcp_seconds(&self) -> Option<f64> {
+        self.lcp.as_ref().and_then(|s| {
+            s.trim()
+                .split('s')
+                .next()
+                .map(|v| v.trim())
+                .and_then(|v| v.parse().ok())
+        })
+    }
+}
+
+fn parse_size(s: &str) -> Option<usize> {
+    let s = s.trim().replace(' ', "");
+    let num_end = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+    let num: f64 = s[..num_end].parse().ok()?;
+    let unit = s[num_end..].trim().to_uppercase();
+    let mult = match unit.as_str() {
+        "" | "B" => 1.0,
+        "KB" | "K" => 1024.0,
+        "MB" | "M" => 1024.0 * 1024.0,
+        "GB" | "G" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((num * mult) as usize)
 }
 
 /// Table form of a dependency: a local path, a git URL, or both refined by a
@@ -195,5 +288,64 @@ mod tests {
     fn test_manifest_parse_invalid_toml_fails() {
         let err = Manifest::parse("not [valid toml").expect_err("garbage should not parse");
         assert!(matches!(err, NuError::PackageError { msg: _, span: _ }));
+    }
+
+    #[test]
+    fn test_manifest_parse_web_defaults() {
+        let source = r#"
+            [package]
+            name = "hello-web"
+            version = "0.1.0"
+        "#;
+        let manifest = Manifest::parse(source).expect("manifest should parse");
+        assert_eq!(manifest.web.port, 8080);
+        assert_eq!(manifest.web.static_dir, "static");
+        assert_eq!(manifest.web.output_dir, "dist");
+    }
+
+    #[test]
+    fn test_manifest_parse_web_overrides() {
+        let source = r#"
+            [package]
+            name = "hello-web"
+            version = "0.1.0"
+
+            [web]
+            port = 3000
+            static_dir = "public"
+            output_dir = "site"
+        "#;
+        let manifest = Manifest::parse(source).expect("manifest should parse");
+        assert_eq!(manifest.web.port, 3000);
+        assert_eq!(manifest.web.static_dir, "public");
+        assert_eq!(manifest.web.output_dir, "site");
+    }
+
+    #[test]
+    fn test_manifest_parse_budgets() {
+        let source = r#"
+            [package]
+            name = "hello-web"
+            version = "0.1.0"
+
+            [budgets]
+            initial_js = "20KB"
+            lcp = "1.5s"
+        "#;
+        let manifest = Manifest::parse(source).expect("manifest should parse");
+        assert_eq!(manifest.budgets.initial_js_max_bytes(), Some(20 * 1024));
+        assert_eq!(manifest.budgets.lcp_seconds(), Some(1.5));
+    }
+
+    #[test]
+    fn test_manifest_parse_budgets_default() {
+        let source = r#"
+            [package]
+            name = "hello-web"
+            version = "0.1.0"
+        "#;
+        let manifest = Manifest::parse(source).expect("manifest should parse");
+        assert_eq!(manifest.budgets.initial_js_max_bytes(), None);
+        assert_eq!(manifest.budgets.lcp_seconds(), None);
     }
 }

@@ -1017,8 +1017,7 @@ mod tests {
         use crate::runtime::{ClusterConfig, SplitBrainConfig};
         use std::time::Duration;
 
-        let mut cluster =
-            DeterministicCluster::new(&[addr(9201), addr(9202), addr(9203)], 7);
+        let mut cluster = DeterministicCluster::new(&[addr(9201), addr(9202), addr(9203)], 7);
         // A short confirmation window keeps the test from waiting the
         // default 60 s (failure detection itself is 2 s + 5 s).
         let config = ClusterConfig {
@@ -1035,10 +1034,14 @@ mod tests {
         let counter = spawn_respawnable_counter(&mut cluster.node_mut(0));
         // Two checkpoints within one activation: the shadow must retain the
         // LATEST replica (41, then 51), not the first.
-        cluster.node_mut(0).send_message(counter, "inc", &[Value::int(41)]);
+        cluster
+            .node_mut(0)
+            .send_message(counter, "inc", &[Value::int(41)]);
         cluster.run_rounds(1);
         cluster.node_mut(0).checkpoint_actor(counter);
-        cluster.node_mut(0).send_message(counter, "inc", &[Value::int(10)]);
+        cluster
+            .node_mut(0)
+            .send_message(counter, "inc", &[Value::int(10)]);
         cluster.run_rounds(1);
         cluster.node_mut(0).checkpoint_actor(counter);
         assert_eq!(counter_value(&cluster, 0, counter), 51);
@@ -1088,7 +1091,9 @@ mod tests {
         cluster.run_rounds(20);
 
         let counter = spawn_respawnable_counter(&mut cluster.node_mut(0));
-        cluster.node_mut(0).send_message(counter, "inc", &[Value::int(7)]);
+        cluster
+            .node_mut(0)
+            .send_message(counter, "inc", &[Value::int(7)]);
         cluster.run_rounds(1);
         cluster.node_mut(0).checkpoint_actor(counter);
         cluster.run_rounds(20);
@@ -1151,7 +1156,11 @@ mod tests {
         );
         // The forwarding entry must point at the replacement node, not self.
         assert_eq!(
-            cluster.node(0).migrated_actors.get(&counter).map(|(n, _)| *n),
+            cluster
+                .node(0)
+                .migrated_actors
+                .get(&counter)
+                .map(|(n, _)| *n),
             Some(other_node),
             "self-demote must forward sends to the directory's replacement node"
         );

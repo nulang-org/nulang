@@ -1,6 +1,0 @@
-fn f(x: Int) -> Int {
-  let y = 1 :cap lineariso
-  let a = y
-  let b = y
-  42
-}

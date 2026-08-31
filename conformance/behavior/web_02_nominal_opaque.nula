@@ -1,0 +1,5 @@
+import stdlib::web::types
+
+fn bad(h: Html) -> String { h }
+
+fn main() {}

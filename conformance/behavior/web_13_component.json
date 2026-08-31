@@ -1,0 +1,5 @@
+{
+  "exit_code": 0,
+  "stdout": "<div class=\"card\"><h2>Components</h2><p>Hello from slot</p></div>",
+  "stderr": ""
+}

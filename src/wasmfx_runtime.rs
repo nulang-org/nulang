@@ -355,6 +355,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_run_float() {
         let wasm = compile_expr("3.14");
         let mut runtime = WasmFxRuntime::new(&wasm).expect("instantiate");

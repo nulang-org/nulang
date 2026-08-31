@@ -60,7 +60,7 @@ feature-gated. Some documented rough edges exist (e.g. misaddressed `send`
 currently falls back to behavior 0 — see SPEC2 §8.5; CRDT state is Rust-level
 only). The full spec (SPEC2.md) annotates what is verified vs. planned.
 
-Repo: https://github.com/dporkka/nulang — spec, examples (17 verified
+Repo: https://github.com/nulang-org/nulang — spec, examples (17 verified
 programs), and the conformance suite are in-tree.
 
 Design questions I'd love this subreddit's take on:

@@ -1,0 +1,11 @@
+body {
+    font-family: system-ui, sans-serif;
+    max-width: 600px;
+    margin: 40px auto;
+    padding: 0 20px;
+    color: #222;
+}
+
+h1 {
+    color: #3b82f6;
+}

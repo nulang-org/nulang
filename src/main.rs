@@ -7,6 +7,7 @@
 //!   nulang --check <FILE>
 //!   nulang --lsp
 //!   nulang --dap [FILE]
+//!   nulang agent <init|run|chat|goals|graph>
 //!   nulang nula <new|build|build-wasm|test|run|add|remove|publish|deploy|watch|doc>
 //!   nulang fmt [--check] [<file>]
 //!
@@ -50,6 +51,7 @@ use nulang::vm::VM;
 use std::io::IsTerminal;
 use std::io::Read;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -70,7 +72,14 @@ fn main() {
                 use tracing_subscriber::{fmt, EnvFilter};
                 let env_filter =
                     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-                fmt().with_env_filter(env_filter).with_target(false).init();
+                // stderr, never stdout: `--lsp` must keep stdout pure
+                // JSON-RPC framing, and CLI logs must not pollute piped
+                // program output.
+                fmt()
+                    .with_env_filter(env_filter)
+                    .with_target(false)
+                    .with_writer(std::io::stderr)
+                    .init();
             }
         }
     }
@@ -79,7 +88,13 @@ fn main() {
         use tracing_subscriber::{fmt, EnvFilter};
         let env_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-        fmt().with_env_filter(env_filter).with_target(false).init();
+        // stderr, never stdout: `--lsp` must keep stdout pure JSON-RPC
+        // framing, and CLI logs must not pollute piped program output.
+        fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .init();
     }
 
     let args: Vec<String> = std::env::args().collect();
@@ -100,7 +115,10 @@ fn main() {
                 &opts.backend,
                 opts.out_file.as_deref(),
                 opts.metrics_port,
-                &opts.target, &opts.with_capabilities, opts.store_path.as_deref(),
+                &opts.target,
+                &opts.with_capabilities,
+                opts.store_path.as_deref(),
+                opts.deny_warnings,
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -225,6 +243,22 @@ fn main() {
         return;
     }
 
+    if args[1] == "agent" {
+        #[cfg(feature = "ai-runtime")]
+        {
+            if let Err(e) = nulang::agent::commands::run(&args[2..]) {
+                print_error(&e, true);
+                std::process::exit(exit_code(&e));
+            }
+            return;
+        }
+        #[cfg(not(feature = "ai-runtime"))]
+        {
+            eprintln!("error: `nulang agent` requires the ai-runtime feature");
+            std::process::exit(1);
+        }
+    }
+
     if args[1] == "nula" {
         if let Err(e) = nulang::package::commands::run(&args[2..]) {
             print_error(&e, true);
@@ -318,6 +352,7 @@ fn main() {
                 }
             }
             "--ffi-sandbox" => opts.ffi_sandbox = true,
+            "--iso-arena" => opts.iso_arena = true,
             "--ffi-allow" => {
                 if i + 1 < args.len() {
                     opts.ffi_allow.push(args[i + 1].clone());
@@ -337,7 +372,9 @@ fn main() {
                     }
                     i += 1;
                 } else {
-                    eprintln!("Error: --with requires a comma-separated capability list (fs,net,os)");
+                    eprintln!(
+                        "Error: --with requires a comma-separated capability list (fs,net,os)"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -354,6 +391,24 @@ fn main() {
                     i += 1;
                 } else {
                     eprintln!("Error: --emit-stdlib-docs requires a directory argument");
+                    std::process::exit(1);
+                }
+            }
+            "--emit-signals" => {
+                if i + 1 < args.len() {
+                    opts.emit_signals = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --emit-signals requires a file path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--rewrite-signals" => {
+                if i + 1 < args.len() {
+                    opts.rewrite_signals = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --rewrite-signals requires a file path argument");
                     std::process::exit(1);
                 }
             }
@@ -386,6 +441,8 @@ fn main() {
             }
             "-v" | "--verbose" => opts.verbose = true,
             "--all-errors" => opts.all_errors = true,
+            "--json" => opts.json = true,
+            "--deny-warnings" => opts.deny_warnings = true,
             "--metrics-port" => {
                 if i + 1 < args.len() {
                     match args[i + 1].parse::<u16>() {
@@ -395,7 +452,6 @@ fn main() {
                             std::process::exit(1);
                         }
                     }
-                    i += 1;
                 } else {
                     eprintln!("Error: --metrics-port requires a port number");
                     std::process::exit(1);
@@ -456,12 +512,15 @@ fn main() {
                     "--emit-nbc",
                     "--verify",
                     "--bench",
+                    "--json",
                     "--store",
                     "--version",
                     "--verbose",
                     "--color",
                     "--help",
                     "--emit-stdlib-docs",
+                    "--emit-signals",
+                    "--rewrite-signals",
                     "-r",
                     "-e",
                     "-c",
@@ -488,6 +547,13 @@ fn main() {
 
     // Resolve color mode once after all args are parsed.
     let use_color = color_enabled(&opts);
+    // Wave D4: --iso-arena enables the VM's per-activation arena path for
+    // every VM created in this process (the VM also honors the env var
+    // directly; set_var keeps runtimes that construct VMs internally in
+    // sync without threading a flag through every constructor).
+    if opts.iso_arena {
+        std::env::set_var("NULANG_ISO_ARENA", "1");
+    }
 
     // Apply FFI policy
     if opts.ffi_sandbox {
@@ -585,6 +651,7 @@ fn main() {
             "E010" | "E0206" => ErrorCode::E010MatchNoArms,
             "E011" | "E0503" => ErrorCode::E011StepLimitExceeded,
             "E012" | "E0302" => ErrorCode::E012UnhandledEffect,
+            "E013" | "E0208" => ErrorCode::E013FfiBoundaryViolation,
             _ => {
                 eprintln!("Unknown: {}", c);
                 std::process::exit(1);
@@ -607,7 +674,18 @@ fn main() {
                 lm = cm;
                 eprintln!("\n--- {} ---", p);
                 if let Ok(s) = std::fs::read_to_string(&p) {
-                    if let Err(e) = run_source(&s, Some(&p), v, &b, None, None, &opts.target, &opts.with_capabilities, opts.store_path.as_deref()) {
+                    if let Err(e) = run_source(
+                        &s,
+                        Some(&p),
+                        v,
+                        &b,
+                        None,
+                        None,
+                        &opts.target,
+                        &opts.with_capabilities,
+                        opts.store_path.as_deref(),
+                        opts.deny_warnings,
+                    ) {
                         print_error(&e, uc);
                     }
                 }
@@ -625,7 +703,13 @@ fn main() {
                 .out_file
                 .clone()
                 .unwrap_or_else(|| "out.nbc".to_string());
-            if let Err(e) = compile_source_to_nbc(&code, &out) {
+            if let Err(e) = compile_source_to_nbc(
+                &code,
+                &out,
+                opts.rewrite_signals.as_deref(),
+                &opts.with_capabilities,
+                opts.deny_warnings,
+            ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
@@ -641,7 +725,10 @@ fn main() {
                         &opts.backend,
                         opts.out_file.as_deref(),
                         opts.metrics_port,
-                        &opts.target, &opts.with_capabilities, opts.store_path.as_deref(),
+                        &opts.target,
+                        &opts.with_capabilities,
+                        opts.store_path.as_deref(),
+                        opts.deny_warnings,
                     )
                 },
                 n,
@@ -657,7 +744,10 @@ fn main() {
                 &opts.backend,
                 opts.out_file.as_deref(),
                 opts.metrics_port,
-                &opts.target, &opts.with_capabilities, opts.store_path.as_deref(),
+                &opts.target,
+                &opts.with_capabilities,
+                opts.store_path.as_deref(),
+                opts.deny_warnings,
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -672,9 +762,34 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(e) = check_source(&source, Some(&path), opts.verbose, opts.all_errors, &opts.with_capabilities) {
+        if let Err(e) = check_source(
+            &source,
+            Some(&path),
+            opts.verbose,
+            opts.all_errors,
+            &opts.with_capabilities,
+            opts.deny_warnings,
+        ) {
             let code = exit_code(&e);
-            if opts.all_errors {
+            if opts.json {
+                // Machine-readable mode: the JSON report is the ONLY output on
+                // stdout; nothing human-rendered is printed.
+                let diags = if opts.all_errors {
+                    let all = collect_all_frontend_errors(&source, Some(&path));
+                    if all.is_empty() {
+                        nulang::json_diagnostics::diagnostics_from_error(&e)
+                    } else {
+                        all.iter()
+                            .flat_map(nulang::json_diagnostics::diagnostics_from_error)
+                            .collect()
+                    }
+                } else {
+                    nulang::json_diagnostics::diagnostics_from_error(&e)
+                };
+                let report =
+                    nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
+                print!("{}", report.to_json_string());
+            } else if opts.all_errors {
                 let all = collect_all_frontend_errors(&source, Some(&path));
                 if all.is_empty() {
                     print_error(&e, use_color);
@@ -688,7 +803,13 @@ fn main() {
             }
             std::process::exit(code);
         }
-        println!("Type check passed.");
+        if opts.json {
+            let report =
+                nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), Vec::new());
+            print!("{}", report.to_json_string());
+        } else {
+            println!("Type check passed.");
+        }
         return;
     }
 
@@ -715,6 +836,33 @@ fn main() {
             }
         };
 
+        // `--emit-signals`: analyze the module and write the signal graph JSON.
+        if let Some(out) = opts.emit_signals.as_ref() {
+            match run_frontend(
+                &source,
+                Some(path),
+                opts.verbose,
+                &opts.with_capabilities,
+                opts.deny_warnings,
+            ) {
+                Ok((ast, _)) => {
+                    let mut checker = nulang::effect_checker::EffectChecker::new();
+                    checker.set_resource_grants(&opts.with_capabilities);
+                    let _ = checker.check_module(&ast.decls);
+                    let graph = nulang::web::reactivity::analyze_module(&ast, Some(&checker));
+                    if let Err(e) = std::fs::write(out, graph.to_json()) {
+                        eprintln!("Error: Cannot write signal graph '{}': {}", out, e);
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    print_error(&e, use_color);
+                    std::process::exit(exit_code(&e));
+                }
+            }
+            return;
+        }
+
         // `--emit-nbc`: compile to a `.nbc` artifact and write it, don't run.
         if opts.emit_nbc {
             let out = opts.out_file.clone().unwrap_or_else(|| {
@@ -725,7 +873,13 @@ fn main() {
                     format!("{path}.nbc")
                 }
             });
-            if let Err(e) = compile_source_to_nbc(&source, &out) {
+            if let Err(e) = compile_source_to_nbc(
+                &source,
+                &out,
+                opts.rewrite_signals.as_deref(),
+                &opts.with_capabilities,
+                opts.deny_warnings,
+            ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
@@ -744,7 +898,10 @@ fn main() {
                         backend,
                         out_file,
                         opts.metrics_port,
-                        &opts.target, &opts.with_capabilities, opts.store_path.as_deref(),
+                        &opts.target,
+                        &opts.with_capabilities,
+                        opts.store_path.as_deref(),
+                        opts.deny_warnings,
                     )
                 },
                 n,
@@ -760,7 +917,10 @@ fn main() {
                 &opts.backend,
                 opts.out_file.as_deref(),
                 opts.metrics_port,
-                &opts.target, &opts.with_capabilities, opts.store_path.as_deref(),
+                &opts.target,
+                &opts.with_capabilities,
+                opts.store_path.as_deref(),
+                opts.deny_warnings,
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -792,7 +952,10 @@ fn main() {
             &opts.backend,
             opts.out_file.as_deref(),
             opts.metrics_port,
-            &opts.target, &opts.with_capabilities, opts.store_path.as_deref(),
+            &opts.target,
+            &opts.with_capabilities,
+            opts.store_path.as_deref(),
+            opts.deny_warnings,
         ) {
             print_error(&e, use_color);
             std::process::exit(exit_code(&e));
@@ -820,16 +983,26 @@ struct Options {
     verify_source: Option<String>,
     /// Output directory for --emit-stdlib-docs.
     emit_stdlib_docs: Option<String>,
+    /// Output file for the compile-time signal graph (`.nula/dist/app.signals.json`).
+    emit_signals: Option<String>,
+    /// Output file for the client-side signal micro-runtime (`.nula/dist/app.client.js`).
+    rewrite_signals: Option<String>,
     /// Color mode: "auto" (default), "always", or "never".
     color: String,
     init: Option<String>,
     watch: Option<String>,
     explain: Option<String>,
     all_errors: bool,
+    /// Emit machine-readable JSON diagnostics on stdout (see
+    /// `nulang::json_diagnostics` for the schema).
+    json: bool,
     bench_count: Option<usize>,
     /// Start a Prometheus-format metrics server on this port.
     metrics_port: Option<u16>,
     ffi_sandbox: bool,
+    /// Wave D4: enable the per-activation iso-arena allocation path in the
+    /// bytecode VM (same as `NULANG_ISO_ARENA=1`). Default off.
+    iso_arena: bool,
     ffi_allow: Vec<String>,
     /// Resource-capability grants for `--with=` (fs, net, os). Empty = no
     /// gate (standalone programs run with full access).
@@ -841,6 +1014,8 @@ struct Options {
     /// else `.nulang/store/`. Only consulted when the program declares
     /// durable entities; other programs keep the in-memory store.
     store_path: Option<String>,
+    /// Escalate warnings (e.g. RFC 0015 deprecations) to a hard error.
+    deny_warnings: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -857,18 +1032,23 @@ impl Default for Options {
             emit_nbc: false,
             verify_source: None,
             emit_stdlib_docs: None,
+            emit_signals: None,
+            rewrite_signals: None,
             color: "auto".to_string(),
             init: None,
             watch: None,
             explain: None,
             all_errors: false,
+            json: false,
             bench_count: None,
             metrics_port: None,
             ffi_sandbox: false,
+            iso_arena: false,
             ffi_allow: Vec::new(),
             with_capabilities: Vec::new(),
             target: "native".to_string(),
             store_path: None,
+            deny_warnings: false,
         }
     }
 }
@@ -925,10 +1105,14 @@ fn print_help() {
     println!("  --watch <file>   Re-run on changes");
     println!("  --explain <CODE> Error code help");
     println!("  --all-errors     Report all type errors (not just the first)");
+    println!("  --json           Emit machine-readable JSON diagnostics on stdout");
+    println!("  --deny-warnings  Treat warnings (e.g. RFC 0015 deprecations) as errors");
     println!("  --bench [N]      Benchmark: run N times (default 10), print timing stats");
     println!("  fmt [--check] [<file>]  Format file(s); no file → all src/**/*.nula");
     println!("  -v, --verbose    Show bytecode and AST");
     println!("  --metrics-port <N>  Start Prometheus metrics server on port N");
+    println!("  --emit-signals <file> Emit signal graph JSON for the web framework");
+    println!("  --rewrite-signals <file> Rewrite HTML for signals and emit client JS");
     println!("  --store <dir>    Durable store directory for programs declaring durable");
     println!("                   entities (default: $NULANG_STORE_PATH or .nulang/store/)");
     println!("  --color auto|always|never  Colorize error output (default: auto)");
@@ -1006,6 +1190,7 @@ fn emit_stdlib_docs(dir: &str) -> Result<(), String> {
 
 /// Run a distributed Nulang node: parse arguments, create a Runtime,
 /// enable distribution, join a seed cluster if requested, and run forever.
+#[cfg(feature = "tcp")]
 fn run_node_cmd(args: &[String]) -> NuResult<()> {
     let mut listen_addr = "127.0.0.1:9000".to_string();
     let mut seed_addr: Option<String> = None;
@@ -1014,7 +1199,6 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
     let mut tls_key: Option<String> = None;
     let mut tls_ca: Option<String> = None;
     let mut plaintext = false;
-
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1166,6 +1350,19 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
     Ok(())
 }
 
+/// Run a distributed Nulang node.
+///
+/// Stub used when the `tcp` feature is disabled: real TCP distribution is
+/// unavailable, so the node cannot start.
+#[cfg(not(feature = "tcp"))]
+fn run_node_cmd(_args: &[String]) -> NuResult<()> {
+    Err(NuError::RuntimeError {
+        msg: "the 'node' command requires the 'tcp' feature (build with --features tcp)"
+            .to_string(),
+        span: Span::default(),
+    })
+}
+
 fn print_error(err: &NuError, use_color: bool) {
     // Prefer the ariadne-based renderer (source snippet with carets/labels,
     // notes, and a stable `Error[Exxxx]` code). It returns `None` when no
@@ -1219,6 +1416,7 @@ fn exit_code(err: &NuError) -> i32 {
 
 /// Redirect stdout and stderr to /dev/null.
 /// Returns saved file descriptors for later restoration.
+#[cfg(unix)]
 fn suppress_stdout_stderr() -> (i32, i32) {
     extern "C" {
         fn dup(oldfd: i32) -> i32;
@@ -1241,6 +1439,7 @@ fn suppress_stdout_stderr() -> (i32, i32) {
     (saved_out, saved_err)
 }
 
+#[cfg(unix)]
 fn restore_stdout_stderr(saved_out: i32, saved_err: i32) {
     extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
@@ -1259,6 +1458,15 @@ fn restore_stdout_stderr(saved_out: i32, saved_err: i32) {
         }
     }
 }
+
+/// Windows: no fd redirection — benchmark runs keep visible output.
+#[cfg(not(unix))]
+fn suppress_stdout_stderr() -> (i32, i32) {
+    (0, 0)
+}
+
+#[cfg(not(unix))]
+fn restore_stdout_stderr(_saved_out: i32, _saved_err: i32) {}
 
 fn format_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs_f64();
@@ -1339,6 +1547,7 @@ fn run_frontend(
     file_path: Option<&str>,
     verbose: bool,
     with_capabilities: &[String],
+    deny_warnings: bool,
 ) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
     let ps = nulang::prelude_source::PRELUDE_SOURCE;
     let mut pl = Lexer::new(ps);
@@ -1351,20 +1560,50 @@ fn run_frontend(
     let tokens = lexer.lex()?;
     let mut parser = Parser::new(tokens);
     let mut ast = parser.parse_module()?;
-    let mut pd: Vec<nulang::ast::Decl> = pa
+    // Surface non-fatal frontend warnings (e.g. RFC 0015 deprecations).
+    // Warnings never fail compilation unless --deny-warnings is passed.
+    let warnings = parser.take_warnings();
+    if !warnings.is_empty() {
+        let use_color = std::io::stderr().is_terminal();
+        for w in &warnings {
+            eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
+        }
+        if deny_warnings {
+            return Err(nulang::types::NuError::parse_error(
+                format!(
+                    "aborting due to {} warning{} (--deny-warnings)",
+                    warnings.len(),
+                    if warnings.len() == 1 { "" } else { "s" }
+                ),
+                warnings[0].span,
+            ));
+        }
+    }
+
+    let pd: Vec<nulang::ast::Decl> = pa
         .decls
         .into_iter()
         .filter(|d| matches!(d, nulang::ast::Decl::VariantType { .. }))
         .collect();
-    pd.append(&mut ast.decls);
-    ast.decls = pd;
 
     // 2b. Resolve imports — load and merge declarations from imported files.
-    let base_dir = std::path::Path::new(file_path.unwrap_or("."))
-        .parent()
-        .unwrap_or(std::path::Path::new("."));
-    let mut visited = std::collections::HashSet::new();
-    nulang::resolver::resolve_imports(&mut ast, base_dir, &mut visited)?;
+    let mut stack = std::collections::HashSet::new();
+    nulang::resolver::resolve_imports(
+        &mut ast,
+        std::path::Path::new(file_path.unwrap_or(".")),
+        &mut stack,
+    )?;
+
+    // Prepend the prelude AFTER import resolution. `resolve_imports`
+    // prepends imported declarations in front of `ast.decls`, so injecting
+    // the prelude beforehand would leave imported function bodies ahead of
+    // the `Option`/`Result` variant-type declarations — and the typechecker
+    // binds variant constructors in declaration order, so an imported
+    // function constructing `Ok`/`Some` would fail with
+    // "Unbound variable: 'Ok'".
+    let mut pd = pd;
+    pd.append(&mut ast.decls);
+    ast.decls = pd;
     if verbose {
         println!("=== AST ===");
         println!("{:#?}", ast);
@@ -1392,6 +1631,26 @@ fn run_frontend(
     effect_checker.check_module(&ast.decls)?;
     for msg in &effect_checker.diagnostics {
         eprintln!("{}", msg);
+    }
+
+    // 4b. Web route parameter check. For every static `perform Web.route(...)`
+    // call, verify that the handler reads exactly the parameters declared in
+    // the path. This is conservative: unresolved handlers are skipped.
+    let route_diagnostics = nulang::web::route_check::check_module(&ast);
+    for diag in &route_diagnostics {
+        eprintln!("route check: {}", diag.message);
+    }
+    if !route_diagnostics.is_empty() {
+        return Err(NuError::TypeError {
+            msg: format!(
+                "{} route parameter mismatch(es) detected; see diagnostics above",
+                route_diagnostics.len()
+            ),
+            span: Span::default(),
+            expected_type: None,
+            found_type: None,
+            similar_names: None,
+        });
     }
 
     // 5. Capability analysis over the same body set.
@@ -1473,8 +1732,10 @@ fn run_source(
     target: &str,
     with_capabilities: &[String],
     store_path: Option<&str>,
+    deny_warnings: bool,
 ) -> NuResult<()> {
-    let (ast, type_checker) = run_frontend(source, file_path, verbose, with_capabilities)?;
+    let (ast, type_checker) =
+        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
     match backend {
         #[cfg(feature = "wasm-backend")]
         "wasm" => {
@@ -1702,6 +1963,7 @@ fn run_source(
                         Ok(json) => eprintln!("[metrics] {}", json),
                         Err(_) => eprintln!("[metrics] <serialization error>"),
                     }
+                    eprintln!("{}", rt.render_topology());
                 }
                 value
             } else {
@@ -1810,8 +2072,12 @@ fn run_with_runtime(
                 install_file_store(shard, dir)?;
             }
         }
+        for shard in &mut shards {
+            shard.register_module_grains(&m);
+        }
         let remaining = shards.split_off(1);
-        let shard_0 = shards.pop().unwrap();
+        let mut shard_0 = shards.pop().unwrap();
+        shard_0.register_module_grains(&m);
 
         let runtime = std::rc::Rc::new(std::cell::RefCell::new(shard_0));
         let mut vm = VM::new();
@@ -1858,6 +2124,7 @@ fn run_with_runtime(
         if let Some(dir) = store_dir {
             install_file_store(&mut runtime.borrow_mut(), dir)?;
         }
+        runtime.borrow_mut().register_module_grains(&m);
         let mut vm = VM::new();
         vm.load_module(m);
         vm.set_actor_callbacks(Box::new(nulang::runtime::RuntimeVmCallbacks::new(
@@ -1879,8 +2146,9 @@ fn check_source(
     verbose: bool,
     _all_errors: bool,
     with_capabilities: &[String],
+    deny_warnings: bool,
 ) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities)?;
+    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
 
     if verbose {
         println!("Effect check passed.");
@@ -1899,13 +2167,13 @@ fn check_source(
 fn collect_all_frontend_errors(source: &str, file_path: Option<&str>) -> Vec<NuError> {
     use nulang::effect_checker::flatten_decls;
     // Lex + parse (fail fast; we need a parseable module to collect type errors).
-    let (mut ast, base_dir) = match parse_frontend(source, file_path) {
+    let (mut ast, _base_dir) = match parse_frontend(source, file_path) {
         Ok(pair) => pair,
         Err(e) => return vec![e],
     };
     if let Err(e) = nulang::resolver::resolve_imports(
         &mut ast,
-        &base_dir,
+        std::path::Path::new(file_path.unwrap_or(".")),
         &mut std::collections::HashSet::new(),
     ) {
         return vec![e];
@@ -1964,8 +2232,32 @@ fn compile_with_new_pipeline(
 /// The BLAKE3 hash of the source is recorded in the artifact header so a later
 /// `--verify` run can confirm the artifact came from this exact source
 /// (supply-chain integrity). Does not execute the module.
-fn compile_source_to_nbc(source: &str, out_path: &str) -> NuResult<()> {
-    let (ast, type_checker) = run_frontend(source, None, false, &[])?;
+fn compile_source_to_nbc(
+    source: &str,
+    out_path: &str,
+    rewrite_signals: Option<&str>,
+    with_capabilities: &[String],
+    deny_warnings: bool,
+) -> NuResult<()> {
+    let (mut ast, type_checker) =
+        run_frontend(source, None, false, with_capabilities, deny_warnings)?;
+
+    // Optional web-framework pass: rewrite HTML for signals/actions and emit the
+    // generic client-side micro-runtime. This runs after effect checking so
+    // action placements are known.
+    if let Some(client_js_path) = rewrite_signals {
+        let mut effect_checker = EffectChecker::new();
+        effect_checker.check_module(&ast.decls)?;
+        for msg in &effect_checker.diagnostics {
+            eprintln!("{}", msg);
+        }
+        nulang::web::reactivity::rewrite_module(&mut ast, Some(&effect_checker));
+        let client_js = nulang::web::reactivity::generate_client_runtime();
+        std::fs::write(client_js_path, client_js).map_err(|e| nulang::types::NuError::VMError {
+            msg: format!("failed to write {}: {}", client_js_path, e),
+            span: Span::default(),
+        })?;
+    }
     let m = compile_with_new_pipeline(&ast, "main", &type_checker)?;
     let source_hash = blake3::hash(source.as_bytes());
     let bytes =
@@ -2193,8 +2485,8 @@ mod tests {
                 c
             }
         "#;
-        let (ast, type_checker) =
-            run_frontend(source, None, false, &[]).expect("frontend should accept the actor program");
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+            .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
         let (_value, runtime) =

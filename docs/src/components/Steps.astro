@@ -1,0 +1,38 @@
+---
+// Three-step "from zero to running" section styled to match nulang.cloud.
+const steps = [
+	{
+		step: '1',
+		icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+		title: 'Clone the repo',
+		description: 'Get the source from GitHub and enter the project directory.',
+	},
+	{
+		step: '2',
+		icon: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+		title: 'Build the compiler',
+		description: 'Compile the Rust toolchain and runtime in release mode.',
+	},
+	{
+		step: '3',
+		icon: '<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>',
+		title: 'Start the REPL',
+		description: 'Run nulang interactively and start writing your first actor.',
+	},
+];
+---
+
+<div class="steps-grid">
+	{steps.map((s, i) => (
+		<div class="step-card">
+			<div class="step-connector" aria-hidden="true" class:list={[{ 'is-last': i === steps.length - 1 }]}>
+				{i < steps.length - 1 && <div class="step-line" />}
+			</div>
+			<div class="step-icon-chip">
+				<svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" set:html={s.icon} />
+			</div>
+			<h3>{s.title}</h3>
+			<p>{s.description}</p>
+		</div>
+	))}
+</div>

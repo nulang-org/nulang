@@ -1,0 +1,12 @@
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("7")
+
+fn home() -> Html {
+    <div class="card"><span>{count}</span></div>
+}
+
+fn main() {
+    perform IO.print(home())
+}

@@ -1,0 +1,130 @@
+// datetime-ext — parsing, formatting, arithmetic, and calendar helpers
+// extending the stdlib `datetime` module.
+// Consume with: `import lib` (re-exports stdlib::datetime).
+//
+// Conversions use Howard Hinnant's civil-from-days algorithms on the
+// proleptic Gregorian calendar. Accurate for years >= 1 (all divisions are
+// of non-negative values in that range).
+
+import stdlib::datetime
+
+// ── Calendar helpers ───────────────────────────────────────────────────────
+
+/// True when `y` is a leap year (Gregorian).
+pub fn is_leap_year(y: Int) -> Bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Number of days in the given month of the given year (month is 1-based).
+pub fn days_in_month(year: Int, month: Int) -> Int {
+    if month == 2 then { if is_leap_year(year) then 29 else 28 }
+    else if month == 4 || month == 6 || month == 9 || month == 11 then { 30 }
+    else if month >= 1 && month <= 12 then { 31 }
+    else { 0 }
+}
+
+/// Days since 1970-01-01 for the civil date (y, m, d). Negative for dates
+/// before the epoch. Valid for y >= 1.
+pub fn days_from_civil(y: Int, m: Int, d: Int) -> Int {
+    let y2 = if m <= 2 then { y - 1 } else { y };
+    let era = y2 / 400;
+    let yoe = y2 - era * 400;                                   // [0, 399]
+    let mp = if m > 2 then { m - 3 } else { m + 9 };            // Mar=0..Jan=10
+    let doy = (153 * mp + 2) / 5 + d - 1;                       // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;            // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// Civil date (year, month, day) for a day count since 1970-01-01.
+/// Returns an (Int, Int, Int) tuple. Valid for results with year >= 1.
+pub fn civil_from_days(z: Int) -> (Int, Int, Int) {
+    let z2 = z + 719468;
+    let era = z2 / 146097;
+    let doe = z2 - era * 146097;                                // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;                               // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 then { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (if m <= 2 then { 1 } else { 0 });
+    (y, m, d)
+}
+
+/// Day of week for a DateTime: 0 = Sunday, ..., 6 = Saturday.
+pub fn day_of_week(dt: DateTime) -> Int {
+    // 1970-01-01 was a Thursday (4).
+    let days = days_from_civil(dt.year, dt.month, dt.day);
+    var dow = (days + 4) % 7;
+    if dow < 0 then { dow = dow + 7 } else {};
+    dow
+}
+
+// ── Arithmetic ─────────────────────────────────────────────────────────────
+
+/// Add (or subtract, when negative) whole days to a DateTime.
+/// Time-of-day fields are preserved.
+pub fn add_days(dt: DateTime, n: Int) -> DateTime {
+    let total = days_from_civil(dt.year, dt.month, dt.day) + n;
+    let ymd = civil_from_days(total);
+    { year: ymd.0, month: ymd.1, day: ymd.2,
+      hour: dt.hour, minute: dt.minute, second: dt.second }
+}
+
+/// Whole days from `a` to `b` (positive when b is after a); time-of-day
+/// fields are ignored.
+pub fn days_between(a: DateTime, b: DateTime) -> Int {
+    days_from_civil(b.year, b.month, b.day) - days_from_civil(a.year, a.month, a.day)
+}
+
+/// -1 when a < b, 0 when equal, 1 when a > b (full field comparison).
+pub fn compare(a: DateTime, b: DateTime) -> Int {
+    let ka = (((((a.year * 100 + a.month) * 100 + a.day) * 100 + a.hour) * 100 + a.minute) * 100 + a.second);
+    let kb = (((((b.year * 100 + b.month) * 100 + b.day) * 100 + b.hour) * 100 + b.minute) * 100 + b.second);
+    if ka < kb then { -1 } else if ka > kb then { 1 } else { 0 }
+}
+
+// ── Formatting ─────────────────────────────────────────────────────────────
+
+/// Render an Int zero-padded to `width` (for 2- and 4-digit fields).
+pub fn pad_int(x: Int, width: Int) -> String {
+    var s = perform Int.to_string(x);
+    while perform String.length(s) < width {
+        s = perform String.concat("0", s)
+    };
+    s
+}
+
+/// Format as ISO 8601 date: "YYYY-MM-DD".
+pub fn to_iso_date(dt: DateTime) -> String {
+    pad_int(dt.year, 4) + "-" + pad_int(dt.month, 2) + "-" + pad_int(dt.day, 2)
+}
+
+/// Format as ISO 8601 datetime: "YYYY-MM-DDThh:mm:ss".
+pub fn to_iso(dt: DateTime) -> String {
+    to_iso_date(dt)
+    + "T" + pad_int(dt.hour, 2)
+    + ":" + pad_int(dt.minute, 2)
+    + ":" + pad_int(dt.second, 2)
+}
+
+// ── Parsing ────────────────────────────────────────────────────────────────
+
+/// Parse an ISO 8601 datetime "YYYY-MM-DDThh:mm:ss" (a space is accepted
+/// instead of "T"). Missing time fields default to 0.
+/// Short or malformed input yields best-effort zeros; combine with
+/// `is_valid` to reject bad input.
+pub fn from_iso(s: String) -> DateTime {
+    let n = perform String.length(s);
+    let pick = fn(start, count) {
+        if start + count <= n then {
+            perform String.to_int(perform String.substring(s, start, count))
+        } else { 0 }
+    };
+    { year: pick(0, 4), month: pick(5, 2), day: pick(8, 2),
+      hour: pick(11, 2), minute: pick(14, 2), second: pick(17, 2) }
+}
+
+/// Parse an ISO 8601 date "YYYY-MM-DD" at midnight.
+pub fn from_iso_date(s: String) -> DateTime {
+    from_iso(s)
+}

@@ -1,0 +1,121 @@
+---
+title: Language Server & Tooling
+description: The Nulang language server (nulang --lsp), editor integrations, syntax grammar, formatter, and debug adapter.
+---
+
+Nulang ships a built-in language server implementing the Language Server
+Protocol (LSP) over stdio, plus a TextMate grammar, a formatter, and a debug
+adapter. Point any LSP-capable editor at `nulang --lsp` for `.nula` files.
+
+## Language Server
+
+Start the server with:
+
+```bash
+nulang --lsp
+```
+
+It speaks LSP over stdin/stdout (Content-Length framed JSON-RPC). The server
+is included in default builds (the `lsp` cargo feature, on by default).
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| Diagnostics | Parse/type/effect/capability errors, pushed on open and save |
+| Hover | Function signatures, effects, types, doc comments |
+| Go to Definition | All declaration types |
+| References | Find all usages of a symbol |
+| Document Symbols | Structured outline (functions, actors, behaviors, …) |
+| Rename | With prepareRename |
+| Signature Help | Parameter hints while typing |
+| Formatting | Indentation-based code formatting |
+| Semantic Tokens | Editor-side syntax highlighting |
+| Code Actions | Quick fixes (add type annotations) |
+| Inlay Hints | Inferred types, capabilities, effect rows, return types |
+| Completion | Keywords, effects, capabilities, functions (triggers `.` and `::`) |
+| Code Lens | Reference counts on top-level declarations |
+| Document Links | Clickable import paths to stdlib/files |
+
+### Requirements
+
+The `nulang` binary must be reachable from your editor's LSP client. The
+server keeps stdout pure JSON-RPC — all logging goes to stderr — so any
+client that spawns `nulang --lsp` works without special handling.
+
+## VS Code
+
+The [Nulang extension](https://github.com/nulang-org/nulang/tree/main/editors/vscode)
+provides syntax highlighting plus the full language server surface
+(diagnostics, hover, go-to-definition, references, rename, completion,
+signature help, inlay hints, formatting, and more).
+
+See [Editor Setup](/getting-started/editor-setup/) for installation and
+configuration, including the `nulang.path` setting.
+
+## Other Editors
+
+Any editor with LSP client support can talk to `nulang --lsp` over stdio:
+
+- **Neovim** — `nvim-lspconfig`:
+  ```lua
+  vim.api.nvim_create_autocmd('FileType', {
+    pattern = 'nula',
+    callback = function()
+      vim.lsp.start({ name = 'nulang', cmd = { 'nulang', '--lsp' } })
+    end,
+  })
+  ```
+- **Emacs** — `lsp-mode` or `eglot`:
+  ```elisp
+  (add-to-list 'eglot-server-programs '(nula-mode . ("nulang" "--lsp")))
+  ```
+- **Helix** — add to `languages.toml`:
+  ```toml
+  [[language]]
+  name = "nulang"
+  scope = "source.nulang"
+  file-types = ["nula"]
+  language-server = { command = "nulang", args = ["--lsp"] }
+  ```
+- **Zed** — add to `settings.json`:
+  ```json
+  {
+    "languages": {
+      "Nulang": {
+        "language_servers": ["nulang-lsp"]
+      }
+    },
+    "lsp": {
+      "nulang-lsp": { "binary": { "path": "nulang", "arguments": ["--lsp"] } }
+    }
+  }
+  ```
+
+## Syntax Highlighting
+
+The TextMate grammar (`source.nulang`) lives in its own repository,
+[nulang-org/nulang-syntax](https://github.com/nulang-org/nulang-syntax), and
+is consumed by the VS Code extension. Any TextMate-compatible editor
+(Sublime Text, TextMate, …) can load
+`syntaxes/nulang.tmLanguage.json` directly.
+
+## Formatter
+
+```bash
+nulang fmt [--check] [<file>]
+```
+
+Formats a file in place (or checks formatting with `--check`). The language
+server exposes the same formatter via `textDocument/formatting`.
+
+## Debug Adapter
+
+```bash
+nulang --dap
+```
+
+Speaks the Debug Adapter Protocol over stdio (the same Content-Length framing
+as the LSP), so editors such as VS Code can debug `.nula` programs: source
+breakpoints, continue/step-in/step-over/step-out, pause, stack traces, scope
+and local-variable inspection, and `evaluate`.

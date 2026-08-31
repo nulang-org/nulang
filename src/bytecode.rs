@@ -554,6 +554,10 @@ pub struct ActorMeta {
     /// True if from organization (RFC 0009).
     #[serde(default)]
     pub is_organization: bool,
+    /// True if declared as `virtual entity` (RFC 0016 virtual actor
+    /// auto-hydration).
+    #[serde(default)]
+    pub is_virtual: bool,
     /// Tool schemas exposed to this agent actor.
     pub tools: Vec<ToolSchema>,
     /// Semantic-memory vector dimensions, if configured for this agent.
@@ -594,6 +598,7 @@ impl ActorMeta {
             is_workflow: false,
             is_agent: false,
             is_organization: false,
+            is_virtual: false,
             tools: Vec::new(),
             semantic_memory_dimensions: None,
             procedural_memory_namespace: None,
@@ -667,6 +672,12 @@ pub struct CodeModule {
     pub instructions: Vec<Instruction>,
     pub behaviors: Vec<BehaviorTableEntry>,
     pub function_table: Vec<usize>, // code offsets for named functions
+    /// Local register count for each function in `function_table`.
+    /// Parallel array: `function_local_counts[i]` = highest register index + 1
+    /// used by `function_table[i]`. Used by the VM to limit register copies.
+    /// `#[serde(default)]` — old `.nbc` artifacts deserialize without it.
+    #[serde(default)]
+    pub function_local_counts: Vec<usize>,
     pub exports: Vec<(String, usize)>, // name -> constant/function index
     /// Entry point for inline __main (None if no __main, defaults to 0 in VM)
     pub entry_point: Option<usize>,
@@ -707,6 +718,7 @@ impl CodeModule {
             instructions: Vec::new(),
             behaviors: Vec::new(),
             function_table: Vec::new(),
+            function_local_counts: Vec::new(),
             exports: Vec::new(),
             entry_point: None,
             spawn_init_overrides: Vec::new(),

@@ -1,0 +1,25 @@
+[package]
+name = "nulang-ai-local"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Local-first NuLang Agent Runtime with SQLite persistence"
+
+[dependencies]
+nulang-ai-core = { path = "../nulang-ai-core" }
+nulang-ai-protocol = { path = "../nulang-ai-protocol" }
+nulang-ai-director = { path = "../nulang-ai-director" }
+nulang-ai-manager = { path = "../nulang-ai-manager" }
+nulang-ai-worker = { path = "../nulang-ai-worker" }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+toml = "0.8"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[lib]
+name = "nulang_ai_local"
+path = "src/lib.rs"

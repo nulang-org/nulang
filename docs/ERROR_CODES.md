@@ -39,6 +39,7 @@ suspension is not an error, and each child of `Multiple` has its own code.
 | `E0204` | Record field not found                    | `TypeError`        |
 | `E0205` | Wrong number of arguments                 | `TypeError`        |
 | `E0206` | Match expression with no arms             | `ParseError`/`TypeError` |
+| `E0208` | Capability-qualified type at FFI boundary | `TypeError`        |
 | `E0300` | Effect error (generic)                    | `EffectError`      |
 | `E0301` | Missing effect in declared effect row     | `EffectError`      |
 | `E0302` | Unhandled effect (no handler installed)   | `EffectError`/runtime |
@@ -54,7 +55,7 @@ suspension is not an error, and each child of `Multiple` has its own code.
 | `E0901` | Feature not yet implemented               | `NotYetImplemented`|
 | `E0902` | Package manager error                     | `PackageError`     |
 
-Fine-grained codes (`E0103`, `E0201`–`E0206`, `E0301`/`E0302`,
+Fine-grained codes (`E0103`, `E0201`–`E0206`, `E0208`, `E0301`/`E0302`,
 `E0401`/`E0402`, `E0503`) are selected via `NuError::error_code()`, which
 prefers structured payload fields (expected/found types, similar-name
 suggestions, missing effects, capability explanations) over message-pattern
@@ -63,7 +64,7 @@ heuristics. Everything else falls back to the per-variant generic code
 
 ## Legacy flat codes and `--explain`
 
-The original flat scheme (`E001`–`E012`, enum `ErrorCode` in src/types.rs)
+The original flat scheme (`E001`–`E013`, enum `ErrorCode` in src/types.rs)
 remains for backwards compatibility. `nulang --explain <CODE>` accepts both
 schemes:
 
@@ -86,6 +87,28 @@ nulang --explain E0201   # stable category-scoped (same diagnostic)
 | `E010` | `E0206` |
 | `E011` | `E0503` |
 | `E012` | `E0302` |
+| `E013` | `E0208` |
+
+## Warning codes
+
+Non-fatal diagnostics use a parallel `Wxxxx` scheme with the same stability
+guarantee: a code, once assigned, never changes meaning. Warnings never fail
+compilation on their own; `nulang --deny-warnings` escalates any warning to
+a hard error. Warnings are carried by `NuWarning` (src/types.rs), rendered
+by `render_warning`/`format_warning` (src/diagnostic.rs) with a
+`[Wxxxx] Warning: ...` ariadne header (tty) or a
+`warning[Wxxxx]: msg --> file:line:col` plain fallback.
+
+| Range   | Category                                  |
+|---------|-------------------------------------------|
+| `W01xx` | Deprecations                              |
+
+| Code    | Meaning                                   | Replacement (RFC)        |
+|---------|-------------------------------------------|--------------------------|
+| `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
+| `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+
+See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
 ## Output modes
 

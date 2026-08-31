@@ -31,9 +31,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::runtime::{
-    EventEntry, JournalEntry, JsonFileStore, PersistedValue, PersistenceStore,
-};
+use crate::runtime::{EventEntry, JournalEntry, JsonFileStore, PersistedValue, PersistenceStore};
 
 /// State of one durable entity reconstructed as of `sequence`.
 #[derive(Debug, Clone)]
@@ -57,11 +55,7 @@ pub struct RewoundState {
 
 /// Reconstruct the state of `actor_id` as of message `target_seq`:
 /// snapshot overlay + replay of events `1..=target_seq` (recorded values).
-pub fn rewind_entity(
-    store: &dyn PersistenceStore,
-    actor_id: u64,
-    target_seq: u64,
-) -> RewoundState {
+pub fn rewind_entity(store: &dyn PersistenceStore, actor_id: u64, target_seq: u64) -> RewoundState {
     let latest = store.latest_sequence(actor_id);
     let target = target_seq.min(latest);
 

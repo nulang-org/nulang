@@ -1,0 +1,5 @@
+signal count: Int = 42
+
+fn main() {
+    perform IO.print(count)
+}

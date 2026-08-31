@@ -541,6 +541,13 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             fmt_expr(out, value, indent, had_unhandled);
             out.push('\n');
         }
+        Decl::Signal { name, ty, init, .. } => {
+            out.push_str(&format!("{}signal {}", sp, name));
+            out.push_str(&format!(": {}", fmt_type(ty)));
+            out.push_str(" = ");
+            fmt_expr(out, init, indent, had_unhandled);
+            out.push('\n');
+        }
         Decl::Given {
             name, ty, value, ..
         } => {
@@ -750,6 +757,13 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
                 }
                 fmt_expr(out, a, indent, had_unhandled);
             }
+            out.push(')');
+        }
+        Expr::GrainRef {
+            grain_type, key, ..
+        } => {
+            out.push_str(&format!("Grain(\"{}\", ", grain_type));
+            fmt_expr(out, key, indent, had_unhandled);
             out.push(')');
         }
         Expr::Pipe { left, right, .. } => {

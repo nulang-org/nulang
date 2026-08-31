@@ -1,0 +1,64 @@
+// Tests for collections-ext — deque behavior.
+// NOTE: `==` is identity equality for composite values (variants, tuples,
+// arrays), so Option results are compared via match-based helpers.
+
+import lib
+import stdlib::test
+
+fn expect_some_eq(o, expected, msg) {
+  match o {
+    Some(v) => assert(v == expected, msg),
+    None => assert(false, "expected Some, got None"),
+  }
+}
+
+fn expect_none(o, msg) {
+  match o {
+    Some(_) => assert(false, "expected None, got Some"),
+    None => assert(true, msg),
+  }
+}
+
+fn main() {
+  // ── empty deque ──────────────────────────────────────────────────────
+  assert(dq_is_empty(dq_new()), "new deque is empty")
+  assert_eq(dq_size(dq_new()), 0)
+  expect_none(dq_peek_front(dq_new()), "peek front empty is None")
+  expect_none(dq_peek_back(dq_new()), "peek back empty is None")
+  let p0 = dq_pop_front(dq_new());
+  expect_none(p0.0, "pop front empty is None")
+  let p1 = dq_pop_back(dq_new());
+  expect_none(p1.0, "pop back empty is None")
+
+  // ── push / peek at both ends ─────────────────────────────────────────
+  let d1 = dq_push_back(dq_new(), 2);
+  let d2 = dq_push_front(d1, 1);
+  let d3 = dq_push_back(d2, 3);
+  assert_eq(dq_size(d3), 3)
+  assert(!dq_is_empty(d3), "deque not empty")
+  expect_some_eq(dq_peek_front(d3), 1, "peek front 1")
+  expect_some_eq(dq_peek_back(d3), 3, "peek back 3")
+
+  // ── pop order ────────────────────────────────────────────────────────
+  let f = dq_pop_front(d3);
+  expect_some_eq(f.0, 1, "pop front returns 1")
+  let b = dq_pop_back(f.1);
+  expect_some_eq(b.0, 3, "pop back returns 3")
+  let last = dq_pop_front(b.1);
+  expect_some_eq(last.0, 2, "last remaining is 2")
+  assert(dq_is_empty(last.1), "deque drained")
+
+  // ── front-only usage (stack-like from the left) ──────────────────────
+  var s = dq_new();
+  s = dq_push_front(s, 1);
+  s = dq_push_front(s, 2);
+  s = dq_push_front(s, 3);
+  let a = dq_pop_front(s);
+  expect_some_eq(a.0, 3, "LIFO from front")
+  let arr = dq_to_array(a.1);
+  assert_eq(perform Array.length(arr), 2)
+  assert_eq(arr[0], 2)
+  assert_eq(arr[1], 1)
+
+  perform IO.print("deque tests passed")
+}

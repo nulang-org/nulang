@@ -1,0 +1,64 @@
+// Tests for string-ext — slugify, truncate, padding, case, templates.
+
+import lib
+import stdlib::test
+
+fn main() {
+  // ── slugify ──────────────────────────────────────────────────────────
+  assert(slugify("Hello, World!") == "hello-world", "slugify basic")
+  assert(slugify("  spaces  everywhere  ") == "spaces-everywhere", "slugify trims")
+  assert(slugify("Already-Good-123") == "already-good-123", "slugify keeps digits/dashes")
+  assert(slugify("a---b") == "a-b", "slugify collapses dashes")
+  assert(slugify("") == "", "slugify empty")
+  assert(slugify("!!!") == "", "slugify all-punctuation")
+
+  // ── truncate ─────────────────────────────────────────────────────────
+  assert(truncate("abc", 5) == "abc", "truncate no-op")
+  assert(truncate("abcdef", 5) == "ab...", "truncate with ellipsis")
+  assert(truncate("abcdef", 3) == "abc", "truncate tiny width")
+  assert(truncate("", 2) == "", "truncate empty")
+
+  // ── padding ──────────────────────────────────────────────────────────
+  assert(pad_left("7", 3, "0") == "007", "pad_left zeros")
+  assert(pad_right("7", 3, "0") == "700", "pad_right zeros")
+  assert(pad_left("toolong", 3, "0") == "toolong", "pad no-op when wider")
+  assert(center("ab", 6, "-") == "--ab--", "center even")
+  assert(center("ab", 5, "-") == "-ab--", "center odd")
+
+  // ── capitalize / is_numeric ──────────────────────────────────────────
+  assert(capitalize("hello") == "Hello", "capitalize lower")
+  assert(capitalize("Hello") == "Hello", "capitalize upper")
+  assert(capitalize("") == "", "capitalize empty")
+  assert(is_numeric("12345"), "is_numeric true")
+  assert(!is_numeric("12a"), "is_numeric false")
+  assert(!is_numeric(""), "is_numeric empty")
+
+  // ── template ─────────────────────────────────────────────────────────
+  assert(
+    template("Hello, {{who}}!", [("who", "world")]) == "Hello, world!",
+    "template single")
+  assert(
+    template("{{a}} + {{b}} = {{c}}", [("a", "1"), ("b", "2"), ("c", "3")]) == "1 + 2 = 3",
+    "template multiple")
+  assert(
+    template("{{ a }} spaced", [("a", "x")]) == "x spaced",
+    "template trims key whitespace")
+  assert(
+    template("keep {{unknown}}", []) == "keep {{unknown}}",
+    "template keeps unknown keys")
+  assert(
+    template("no placeholders", [("a", "x")]) == "no placeholders",
+    "template no-op")
+  assert(
+    template("{{unterminated", [("unterminated", "x")]) == "{{unterminated",
+    "template unterminated left alone")
+
+  // ── indent_lines ─────────────────────────────────────────────────────
+  assert(
+    indent_lines("a\nb", "  ") == "  a\n  b",
+    "indent_lines two lines")
+
+  // ── stdlib re-exports still work through this module ─────────────────
+  assert(to_upper("ab") == "AB", "stdlib to_upper available")
+  assert(repeat("ab", 2) == "abab", "stdlib repeat available")
+}

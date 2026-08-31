@@ -10,7 +10,7 @@ Nulang is written in Rust. The fastest way to get started is to build from
 source:
 
 ```bash
-git clone https://github.com/dporkka/nulang.git
+git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
 ```
@@ -23,7 +23,7 @@ ln -s "$(pwd)/target/release/nulang" ~/.local/bin/nulang
 ```
 
 Prebuilt binaries are available on the [GitHub Releases
-page](https://github.com/dporkka/nulang/releases) for Linux (x86_64, aarch64)
+page](https://github.com/nulang-org/nulang/releases) for Linux (x86_64, aarch64)
 and macOS (x86_64, aarch64).
 
 Verify your installation:

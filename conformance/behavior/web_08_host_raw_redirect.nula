@@ -1,0 +1,6 @@
+import stdlib::web::host
+
+fn main() {
+    let r = redirect("/other")
+    perform IO.print(r)
+}

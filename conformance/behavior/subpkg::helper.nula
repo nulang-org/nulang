@@ -1,3 +1,0 @@
-fn helper_value() -> Int {
-    99
-}

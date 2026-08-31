@@ -46,7 +46,7 @@
 
     const maxFill = 176;
 
-    function updateBar(heap: { el: Element; fill: number; rate: number; collecting: boolean }) {
+    function updateBar(heap) {
       const height = heap.fill * maxFill;
       heap.el.setAttribute('height', String(height));
       heap.el.setAttribute('y', String(210 - height));
@@ -76,7 +76,16 @@
       requestAnimationFrame(loop);
     }
 
-    requestAnimationFrame(loop);
+    const svg = fills[0].closest('svg');
+    if (!svg) return;
+
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) {
+        requestAnimationFrame(loop);
+        observer.disconnect();
+      }
+    }, { threshold: 0.25 });
+    observer.observe(svg);
   }
 
   if (document.readyState === 'loading') {

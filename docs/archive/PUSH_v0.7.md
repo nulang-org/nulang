@@ -9,7 +9,7 @@ Stats: 15 files changed, 7,091 insertions(+), 31 deletions(-)
 
 ```bash
 cd /mnt/agents/output/nulang-impl
-git remote set-url origin https://YOUR_TOKEN@github.com/dporkka/nulang.git
+git remote set-url origin https://YOUR_TOKEN@github.com/nulang-org/nulang.git
 git push origin main
 ```
 

@@ -1,0 +1,12 @@
+import stdlib::web::html
+import stdlib::web::types
+
+fn greet() -> Html {
+    let name = param("name")
+    let slug = param("slug")
+    el("h1", [], [text(name), text(slug)])
+}
+
+fn web_main() {
+    perform Web.route("GET", "/hello/:name", greet)
+}

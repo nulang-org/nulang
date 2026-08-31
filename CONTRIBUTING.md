@@ -6,7 +6,7 @@ expect rough edges, and expect breaking changes before v1.0.
 ## Build from source
 
 ```bash
-git clone https://github.com/dporkka/nulang.git
+git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
 ```
@@ -60,7 +60,7 @@ under the correct tier.
 
 ## Questions?
 
-- **Ask / discuss:** [GitHub Discussions](https://github.com/dporkka/nulang/discussions)
-- **Bugs & features:** [open an issue](https://github.com/dporkka/nulang/issues/new/choose)
+- **Ask / discuss:** [GitHub Discussions](https://github.com/nulang-org/nulang/discussions)
+- **Bugs & features:** [open an issue](https://github.com/nulang-org/nulang/issues/new/choose)
 
 By participating you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).

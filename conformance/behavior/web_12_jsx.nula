@@ -1,0 +1,11 @@
+import stdlib::web::html
+import stdlib::web::types
+
+fn main() {
+    let title = "Hello JSX"
+    let h = <div class="card">
+        <h2>{title}</h2>
+        <p>Welcome to Nulang Web.</p>
+    </div>
+    perform IO.print(h)
+}

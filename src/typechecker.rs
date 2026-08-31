@@ -278,7 +278,17 @@ fn mgu(t1: &Type, t2: &Type, span: Span) -> NuResult<Substitution> {
     {
         return Ok(vec![]);
     }
-    if t1 == t2 || (t1.is_ground() && t2.is_ground() && t1.to_ntir().hash() == t2.to_ntir().hash())
+    if t1 == t2 {
+        return Ok(vec![]);
+    }
+    // NTIR erases opaque nominal wrappers to their underlying type, so two
+    // ground types that differ only by opacity must not short-circuit here.
+    // Let the Type::Nominal cases below enforce the opacity contract.
+    if !matches!(t1, Type::Nominal { .. })
+        && !matches!(t2, Type::Nominal { .. })
+        && t1.is_ground()
+        && t2.is_ground()
+        && t1.to_ntir().hash() == t2.to_ntir().hash()
     {
         return Ok(vec![]);
     }
@@ -328,31 +338,36 @@ fn mgu(t1: &Type, t2: &Type, span: Span) -> NuResult<Substitution> {
             Ok(compose_subst(&s2, &s1))
         }
 
-        // `opaque type X = Y` currently provides ZERO type-level opacity:
-        // `X` unifies transparently with `Y` (and anything `Y` unifies
-        // with) everywhere, with no distinction between "inside the
-        // defining module" and "outside" — there is no enforcement at all
-        // today, not even a partial/best-effort form. The `opaque` keyword
-        // is accepted at parse time and carried through the AST/HIR
-        // (`Type::Nominal`) but is presently equivalent to a plain
-        // `type X = Y` alias.
-        //
-        // Not documented in SPEC2.md or any public-facing doc as a working
-        // feature (verified 2026-08-01) — this is not a truth-in-advertising
-        // gap, just an incomplete Experimental-tier feature. Real opacity
-        // requires module-defining-scope tracking that does not exist
-        // anywhere in TypeChecker today (mgu has no notion of "which module
-        // is currently being checked"), which is real design + implementation
-        // work, not a one-line fix — see the "Future" line above for the
-        // target shape. Tracked as a real gap; do not read the presence of
-        // `Type::Nominal` as evidence opacity is enforced.
-        //
-        // Future: transparent inside the defining module, opaque outside it.
-        (Type::Nominal { name, underlying }, other)
-        | (other, Type::Nominal { name, underlying }) => {
-            let _ = (name, span);
-            mgu(underlying, other, span)
+        // Opaque nominal types: `opaque type X = Y` is distinct from Y.
+        // Two nominal types unify only when they have the same name; their
+        // underlying types are then unified to catch parameter mismatches.
+        // A nominal type never unifies with its underlying type, a primitive,
+        // or any other shape directly — explicit conversion functions must
+        // bridge. (Future: allow transparent unification inside the defining
+        // module once TypeChecker tracks per-module scope.)
+        (
+            Type::Nominal {
+                name: n1,
+                underlying: u1,
+            },
+            Type::Nominal {
+                name: n2,
+                underlying: u2,
+            },
+        ) => {
+            if n1 == n2 {
+                mgu(u1, u2, span)
+            } else {
+                Err(NuError::type_mismatch(
+                    format!("opaque type {}", n1),
+                    format!("opaque type {}", n2),
+                    span,
+                ))
+            }
         }
+        (Type::Nominal { name, .. }, other) | (other, Type::Nominal { name, .. }) => Err(
+            NuError::type_mismatch(format!("opaque type {}", name), format!("{}", other), span),
+        ),
 
         // Tuples
         (Type::Tuple(ts1), Type::Tuple(ts2)) => {
@@ -1089,7 +1104,7 @@ impl TypeChecker {
                     let dict_name = format!("_impl_{}_{}", class_name, for_type);
                     ctx.bind(dict_name, final_ty.clone(), Capability::Ref, false);
                 }
-                Decl::LetBinding { name, .. } => {
+                Decl::LetBinding { name, .. } | Decl::Signal { name, .. } => {
                     self.inferred_decl_types
                         .insert(name.clone(), final_ty.clone());
                     let gen_ty = self.do_generalize(&ctx, &final_ty);
@@ -1349,7 +1364,12 @@ impl TypeChecker {
                     let _ = mgu(&req_ty, &Type::bool(), *span)?;
                 }
                 let mut ensures_ctx = new_ctx.clone();
-                ensures_ctx.bind("result".to_string(), body_ty.clone(), Capability::Ref, false);
+                ensures_ctx.bind(
+                    "result".to_string(),
+                    body_ty.clone(),
+                    Capability::Ref,
+                    false,
+                );
                 for ens in ensures {
                     let (_s, ens_ty) = self.infer_expr(&ensures_ctx, ens)?;
                     let _ = mgu(&ens_ty, &Type::bool(), *span)?;
@@ -1508,6 +1528,13 @@ impl TypeChecker {
                 } else {
                     s1
                 };
+                let final_ty = apply_subst(&val_ty, &s1);
+                Ok((s1, final_ty))
+            }
+            Decl::Signal { init, ty, span, .. } => {
+                let (s1, val_ty) = self.infer_expr(ctx, init)?;
+                let s_ann = mgu(&apply_subst(&val_ty, &s1), ty, *span)?;
+                let s1 = compose_subst(&s_ann, &s1);
                 let final_ty = apply_subst(&val_ty, &s1);
                 Ok((s1, final_ty))
             }
@@ -1709,6 +1736,17 @@ impl TypeChecker {
 
             // Self reference
             Expr::SelfRef(_) => Ok((vec![], Type::Var(TypeVar::fresh()))),
+
+            // Virtual actor reference: Grain("Type", key).
+            // The key expression is checked; the whole expression has actor type.
+            Expr::GrainRef { key, .. } => {
+                let (subst, _key_ty) = self.infer_expr(ctx, key)?;
+                let actor_ty = Type::Actor {
+                    state: Box::new(Type::Var(TypeVar::fresh())),
+                    behavior: Box::new(Type::Var(TypeVar::fresh())),
+                };
+                Ok((subst, actor_ty))
+            }
 
             // Perform effect
             Expr::Perform {
@@ -4439,6 +4477,33 @@ mod tests {
     }
 
     #[test]
+    fn test_mgu_opaque_nominal_rejects_underlying() {
+        let html = Type::Nominal {
+            name: "Html".to_string(),
+            underlying: Box::new(Type::string()),
+        };
+        let s = Type::string();
+        assert!(
+            mgu(&html, &s, sp()).is_err(),
+            "Html should not unify with String"
+        );
+    }
+
+    #[test]
+    fn test_mgu_opaque_nominal_accepts_same_name() {
+        let html1 = Type::Nominal {
+            name: "Html".to_string(),
+            underlying: Box::new(Type::string()),
+        };
+        let html2 = Type::Nominal {
+            name: "Html".to_string(),
+            underlying: Box::new(Type::string()),
+        };
+        let s = mgu(&html1, &html2, sp()).unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
     fn test_occurs_check() {
         let v = TypeVar(1);
         let t = Type::Function {
@@ -5126,9 +5191,15 @@ mod tests {
     fn test_hide_and_seal_scope_directives() {
         // `hide` blocks the named identifiers from resolution.
         let ok = check_src("let secret = 1 in hide secret { 42 }");
-        assert!(ok.is_ok(), "hide must allow a body that avoids the hidden name");
+        assert!(
+            ok.is_ok(),
+            "hide must allow a body that avoids the hidden name"
+        );
         let bad = check_src("let secret = 1 in hide secret { secret }");
-        assert!(bad.is_err(), "referencing a hidden name must be an unbound-variable error");
+        assert!(
+            bad.is_err(),
+            "referencing a hidden name must be an unbound-variable error"
+        );
 
         // `seal except` whitelists the named identifiers, hiding the rest.
         let ok = check_src("let a = 1 in let b = 2 in seal except a { a }");

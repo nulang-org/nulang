@@ -263,3 +263,34 @@ pub fn is_lower(s: String) -> Bool {
     };
     true
 }
+
+// ── String builder (amortized O(n) text assembly) ─────────────────────────
+//
+// The StrBuilder effect provides a mutable growable buffer. Appending is
+// amortized O(1) with capacity doubling, unlike `String.concat` which is
+// O(n) per call. The builder is mutable: rebind the returned value
+// (`b = perform StrBuilder.push(b, s)`), since growth may return a new
+// pointer.
+
+/// Create an empty string builder.
+pub fn builder() { perform StrBuilder.new() }
+
+/// Append a string to the builder (amortized O(1)).
+pub fn builder_push(b, s) { perform StrBuilder.push(b, s) }
+
+/// Materialize the builder contents as an immutable string.
+pub fn builder_to_string(b) { perform StrBuilder.to_string(b) }
+
+/// Number of bytes currently in the builder.
+pub fn builder_len(b) { perform StrBuilder.len(b) }
+
+/// Clear the builder (capacity retained).
+pub fn builder_reset(b) { perform StrBuilder.reset(b) }
+
+/// Build a string by applying `f` to a fresh builder and materializing.
+/// `f` receives the builder and returns the (possibly grown) builder.
+pub fn build(f) {
+    var b = perform StrBuilder.new();
+    b = f(b);
+    perform StrBuilder.to_string(b)
+}

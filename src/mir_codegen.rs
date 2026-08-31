@@ -270,12 +270,16 @@ impl MirCodegen {
         // Reserve one function-table slot per MIR function; MIR function
         // indices are function-table indices.
         self.module.function_table.resize(mir.functions.len(), 0);
+        self.module
+            .function_local_counts
+            .resize(mir.functions.len(), 0);
 
         let mut main_idx = None;
         let mut user_main_idx = None;
         for (idx, func) in mir.functions.iter().enumerate() {
             let offset = self.compile_function(func)?;
             self.module.function_table[idx] = offset;
+            self.module.function_local_counts[idx] = LOCAL_BASE as usize + func.locals.len();
             if func.name == "__main" {
                 main_idx = Some(idx);
             }
@@ -1067,6 +1071,7 @@ impl MirCodegen {
                 behavior_idx,
                 init,
                 target_node,
+                capabilities: _,
             } => {
                 if let Some(node) = target_node {
                     let node_reg = self.local_reg(*node);
@@ -2903,6 +2908,7 @@ mod tests {
                 ret: crate::types::Type::unit(),
                 effect: crate::types::EffectRow::empty(),
                 cap: crate::types::Capability::Ref,
+                placement: None,
                 body: {
                     let mut b = crate::hir::Body::new();
                     b.push(crate::hir::Stmt::Let {
@@ -2946,6 +2952,7 @@ mod tests {
             ret: crate::types::Type::int(),
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
+            placement: None,
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
@@ -2976,6 +2983,7 @@ mod tests {
             ret: crate::types::Type::int(),
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
+            placement: None,
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
@@ -3140,6 +3148,44 @@ mod tests {
             main.locals
         );
         crate::types::clear_source_map();
+    }
+
+    #[test]
+    fn test_function_local_counts_populated() {
+        // function_local_counts must be parallel to function_table, populated
+        // with LOCAL_BASE + locals.len() per function (mirroring
+        // BehaviorTableEntry.local_count).
+        let source = "fn add(a: Int, b: Int) -> Int { let s = a + b; s }";
+        let module = compile_mir_source(source).unwrap();
+        assert_eq!(
+            module.function_local_counts.len(),
+            module.function_table.len(),
+            "function_local_counts must be parallel to function_table"
+        );
+        for &count in &module.function_local_counts {
+            assert!(
+                count >= LOCAL_BASE as usize && count <= 256,
+                "local count {} out of range [LOCAL_BASE, 256]",
+                count
+            );
+        }
+        // The `add` function (2 params + 1 local = 3 locals) gets
+        // LOCAL_BASE + 3, matching its debug_functions locals entry.
+        let add = module
+            .debug_functions
+            .iter()
+            .find(|df| df.name == "add")
+            .expect("expected an add debug entry");
+        let add_idx = module
+            .function_table
+            .iter()
+            .position(|&off| off == add.code_offset)
+            .expect("add code offset must be in function_table");
+        assert_eq!(
+            module.function_local_counts[add_idx],
+            LOCAL_BASE as usize + add.locals.len(),
+            "function_local_counts must mirror debug locals"
+        );
     }
 
     #[test]

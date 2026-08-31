@@ -6,7 +6,7 @@
     "strict": true,
     "preserveConstEnums": true,
     "module": "es2022",
-    "moduleResolution": "es2022",
+    "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
     "esModuleInterop": true,

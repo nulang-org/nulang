@@ -1,0 +1,7 @@
+[package]
+name = "docs-web"
+version = "0.1.0"
+entry = "src/main.nula"
+
+[dependencies]
+nulang-auth = { path = "../../packages/nulang-auth" }

@@ -8,7 +8,7 @@
     "dev": "astro dev",
     "start": "astro dev",
     "build": "astro build",
-    "prebuild": "npm run generate-og",
+    "prebuild": "pnpm run generate-og",
     "generate-og": "node scripts/generate-og-image.mjs",
     "preview": "astro preview"
   },
