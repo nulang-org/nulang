@@ -2738,10 +2738,7 @@ impl Parser {
             let ret = self.parse_type()?;
             if crate::ffi::marshal::nulang_type_to_ffi_type(&ret).is_none() {
                 return Err(NuError::parse_error(
-                    format!(
-                        "Extern function '{}' has unsupported FFI return type",
-                        name
-                    ),
+                    format!("Extern function '{}' has unsupported FFI return type", name),
                     func_span,
                 ));
             }
