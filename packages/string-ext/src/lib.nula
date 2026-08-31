@@ -1,0 +1,175 @@
+// string-ext — slugify, truncate, padding, and template interpolation on
+// top of the stdlib `string` module.
+// Consume with: `import lib` (re-exports all of stdlib::string).
+
+import stdlib::string
+
+/// Convert a string to a URL-safe slug: lowercase ASCII, alphanumeric
+/// runs kept, everything else collapsed to single dashes, no leading or
+/// trailing dash.
+///
+///   slugify("Hello, World!") == "hello-world"
+pub fn slugify(s: String) -> String {
+    var out = "";
+    var last_dash = true;   // suppress leading dashes
+    var i = 0;
+    let n = perform String.length(s);
+    while i < n {
+        let c = perform String.charAt(s, i);
+        if c >= 65 && c <= 90 then {
+            out = perform String.concat(out, perform String.from_char(c + 32));
+            last_dash = false
+        }
+        else if c >= 97 && c <= 122 || c >= 48 && c <= 57 then {
+            out = perform String.concat(out, perform String.from_char(c));
+            last_dash = false
+        }
+        else if !last_dash then {
+            out = perform String.concat(out, "-");
+            last_dash = true
+        }
+        else {};
+        i = i + 1
+    };
+    // strip trailing dash
+    let m = perform String.length(out);
+    if m > 0 && perform String.charAt(out, m - 1) == 45 then {
+        perform String.substring(out, 0, m - 1)
+    } else { out }
+}
+
+/// Truncate `s` to at most `max` characters, appending "..." when cut.
+/// `max` counts the ellipsis: truncate("abcdef", 5) == "ab...".
+pub fn truncate(s: String, max: Int) -> String {
+    let n = perform String.length(s);
+    if n <= max then { s }
+    else if max <= 3 then { perform String.substring(s, 0, max) }
+    else { perform String.concat(perform String.substring(s, 0, max - 3), "...") }
+}
+
+/// Left-pad `s` with `pad` (a single character) to `width`.
+pub fn pad_left(s: String, width: Int, pad: String) -> String {
+    var out = s;
+    while perform String.length(out) < width {
+        out = perform String.concat(pad, out)
+    };
+    out
+}
+
+/// Right-pad `s` with `pad` (a single character) to `width`.
+pub fn pad_right(s: String, width: Int, pad: String) -> String {
+    var out = s;
+    while perform String.length(out) < width {
+        out = perform String.concat(out, pad)
+    };
+    out
+}
+
+/// Center `s` in a field of `width`, padding with `pad` on both sides
+/// (extra character goes on the right).
+pub fn center(s: String, width: Int, pad: String) -> String {
+    let n = perform String.length(s);
+    if n >= width then { s }
+    else {
+        let total = width - n;
+        let left = total / 2;
+        let right = total - left;
+        perform String.concat(repeat(pad, left), perform String.concat(s, repeat(pad, right)))
+    }
+}
+
+/// Capitalize the first ASCII letter of `s`.
+pub fn capitalize(s: String) -> String {
+    let n = perform String.length(s);
+    if n == 0 then { s }
+    else {
+        let c = perform String.charAt(s, 0);
+        if c >= 97 && c <= 122 then {
+            perform String.concat(
+                perform String.from_char(c - 32),
+                perform String.substring(s, 1, n - 1))
+        } else { s }
+    }
+}
+
+/// True when every character is an ASCII digit (empty string → false).
+pub fn is_numeric(s: String) -> Bool {
+    let n = perform String.length(s);
+    if n == 0 then { return false } else {};
+    var i = 0;
+    while i < n {
+        let c = perform String.charAt(s, i);
+        if c < 48 || c > 57 then { return false } else {};
+        i = i + 1
+    };
+    true
+}
+
+/// Interpolate `{{key}}` placeholders in `tmpl` from `vars`, a list of
+/// (key, value) string pairs. Unknown keys are left untouched.
+///
+///   template("Hello, {{who}}!", [("who", "world")]) == "Hello, world!"
+pub fn template(tmpl: String, vars: [(String, String)]) -> String {
+    var out = "";
+    var i = 0;
+    let n = perform String.length(tmpl);
+    while i < n {
+        let c = perform String.charAt(tmpl, i);
+        // detect "{{"
+        if c == 123 && i + 1 < n && perform String.charAt(tmpl, i + 1) == 123 then {
+            // scan for closing "}}"
+            var j = i + 2;
+            var closed = false;
+            while j + 1 < n && !closed {
+                if perform String.charAt(tmpl, j) == 125 && perform String.charAt(tmpl, j + 1) == 125 then {
+                    closed = true
+                } else { j = j + 1 }
+            };
+            if closed then {
+                let key = trim(perform String.substring(tmpl, i + 2, j - i - 2));
+                // look up key in vars
+                var k = 0;
+                var found = false;
+                var replacement = "";
+                let m = perform Array.length(vars);
+                while k < m {
+                    let pair = vars[k];
+                    if pair.0 == key then {
+                        found = true;
+                        replacement = pair.1
+                    } else {};
+                    k = k + 1
+                };
+                if found then {
+                    out = perform String.concat(out, replacement)
+                } else {
+                    // leave unknown placeholders untouched
+                    out = perform String.concat(out, perform String.substring(tmpl, i, j + 2 - i))
+                };
+                i = j + 2
+            } else {
+                out = perform String.concat(out, perform String.substring(tmpl, i, 1));
+                i = i + 1
+            }
+        } else {
+            out = perform String.concat(out, perform String.substring(tmpl, i, 1));
+            i = i + 1
+        }
+    };
+    out
+}
+
+/// Indent every line of `s` by `prefix`.
+pub fn indent_lines(s: String, prefix: String) -> String {
+    let lines = split(s, "\n");
+    var out = "";
+    var i = 0;
+    let n = perform Array.length(lines);
+    while i < n {
+        if i > 0 then { out = perform String.concat(out, "\n") } else {};
+        out = perform String.concat(out, prefix);
+        out = perform String.concat(out, lines[i]);
+        i = i + 1
+    };
+    out
+}

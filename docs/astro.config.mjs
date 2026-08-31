@@ -29,9 +29,13 @@ export default defineConfig({
         Footer: './src/components/Footer.astro',
         Header: './src/components/Header.astro',
         Head: './src/components/Head.astro',
+        SiteTitle: './src/components/SiteTitle.astro',
+        Hero: './src/components/Hero.astro',
+        ThemeProvider: './src/components/ThemeProvider.astro',
+        ThemeSelect: './src/components/ThemeSelect.astro',
       },
       editLink: {
-        baseUrl: 'https://github.com/dporkka/nulang/edit/main/docs/',
+        baseUrl: 'https://github.com/nulang-org/nulang/edit/main/docs/',
       },
       // Pagefind search (built-in with Starlight)
       // To migrate to Algolia, replace with:
@@ -50,6 +54,13 @@ export default defineConfig({
             { label: 'Installation', link: 'getting-started/installation/' },
             { label: 'Quick Start', link: 'getting-started/quick-start/' },
             { label: 'Editor Setup', link: 'getting-started/editor-setup/' },
+          ],
+        },
+        {
+          label: 'Tooling',
+          collapsed: true,
+          items: [
+            { label: 'Language Server & Tooling', link: 'tooling/language-server/' },
           ],
         },
         {
@@ -114,11 +125,11 @@ export default defineConfig({
           label: 'Reference',
           collapsed: true,
           items: [
-            { label: 'API Reference', link: 'https://github.com/dporkka/nulang/blob/main/docs/api.md' },
-            { label: 'Changelog', link: 'https://github.com/dporkka/nulang/blob/main/CHANGELOG.md' },
-            { label: 'Governance', link: 'https://github.com/dporkka/nulang/blob/main/GOVERNANCE.md' },
-            { label: 'RFCs', link: 'https://github.com/dporkka/nulang/tree/main/RFC' },
-            { label: 'Language Spec', link: 'https://github.com/dporkka/nulang/blob/main/SPEC2.md' },
+            { label: 'API Reference', link: 'https://github.com/nulang-org/nulang/blob/main/docs/api.md' },
+            { label: 'Changelog', link: 'https://github.com/nulang-org/nulang/blob/main/CHANGELOG.md' },
+            { label: 'Governance', link: 'https://github.com/nulang-org/nulang/blob/main/GOVERNANCE.md' },
+            { label: 'RFCs', link: 'https://github.com/nulang-org/nulang/tree/main/RFC' },
+            { label: 'Language Spec', link: 'https://github.com/nulang-org/nulang/blob/main/SPEC2.md' },
           ],
         },
         {
@@ -127,11 +138,12 @@ export default defineConfig({
           items: [
             { label: 'Terms of Service', link: 'terms/' },
             { label: 'Privacy Policy', link: 'privacy/' },
+            { label: 'Contact', link: 'contact/' },
           ],
         },
       ],
       social: [
-        { icon: 'github', label: 'GitHub', href: 'https://github.com/dporkka/nulang' },
+        { icon: 'github', label: 'GitHub', href: 'https://github.com/nulang-org/nulang' },
       ],
     }),
     tailwindcss(),

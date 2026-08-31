@@ -1,0 +1,159 @@
+// result-ext — combinators for Option/Result pipelines, extending the
+// stdlib `option` and `result` modules.
+// Consume with: `import lib` from any file in the package.
+// The Option and Result types (Some/None/Ok/Error) come from the prelude,
+// so no imports are needed.
+
+// ── Result combinators ─────────────────────────────────────────────────────
+
+/// Bind: chain a Result-returning function onto a Result.
+pub fn and_then(r, f) {
+    match r {
+        Ok(x) => f(x),
+        Error(e) => Error(e),
+    }
+}
+
+/// Recover: replace an Error with the Result produced by `f(e)`.
+pub fn or_else(r, f) {
+    match r {
+        Ok(x) => Ok(x),
+        Error(e) => f(e),
+    }
+}
+
+/// Map a function over the error channel of a Result.
+pub fn map_err(r, f) {
+    match r {
+        Ok(x) => Ok(x),
+        Error(e) => Error(f(e)),
+    }
+}
+
+/// Combine two Results with a binary function; the first Error wins.
+pub fn map2(f, ra, rb) {
+    match ra {
+        Ok(a) => match rb {
+            Ok(b) => Ok(f(a, b)),
+            Error(e) => Error(e),
+        },
+        Error(e) => Error(e),
+    }
+}
+
+/// Unwrap a Result, falling back to `default` on Error.
+pub fn unwrap_or(r, default) {
+    match r {
+        Ok(x) => x,
+        Error(_) => default,
+    }
+}
+
+/// Turn a list of Results into a Result of a list (first Error wins).
+pub fn sequence(rs) {
+    var out = [];
+    var i = 0;
+    let n = perform Array.length(rs);
+    while i < n {
+        match rs[i] {
+            Ok(x) => { out = perform Array.push(out, x) },
+            Error(e) => return Error(e),
+        };
+        i = i + 1
+    };
+    Ok(out)
+}
+
+/// Map each element through a Result-returning function, collecting
+/// successes (first Error wins).
+pub fn traverse(f, xs) {
+    var out = [];
+    var i = 0;
+    let n = perform Array.length(xs);
+    while i < n {
+        match f(xs[i]) {
+            Ok(x) => { out = perform Array.push(out, x) },
+            Error(e) => return Error(e),
+        };
+        i = i + 1
+    };
+    Ok(out)
+}
+
+// ── Option/Result interop ──────────────────────────────────────────────────
+
+/// Promote an Option to a Result, using `err` when None.
+pub fn ok_or(opt, err) {
+    match opt {
+        Some(x) => Ok(x),
+        None => Error(err),
+    }
+}
+
+/// Demote a Result to an Option, discarding the error.
+pub fn to_option(r) {
+    match r {
+        Ok(x) => Some(x),
+        Error(_) => None,
+    }
+}
+
+// ── Option combinators ─────────────────────────────────────────────────────
+
+/// Bind over Option (flat-map).
+pub fn option_and_then(opt, f) {
+    match opt {
+        Some(x) => f(x),
+        None => None,
+    }
+}
+
+/// Combine two Options with a binary function; None if either is None.
+pub fn option_map2(f, oa, ob) {
+    match oa {
+        Some(a) => match ob {
+            Some(b) => Some(f(a, b)),
+            None => None,
+        },
+        None => None,
+    }
+}
+
+/// Turn a list of Options into an Option of a list (None if any is None).
+pub fn option_sequence(opts) {
+    var out = [];
+    var i = 0;
+    let n = perform Array.length(opts);
+    while i < n {
+        match opts[i] {
+            Some(x) => { out = perform Array.push(out, x) },
+            None => return None,
+        };
+        i = i + 1
+    };
+    Some(out)
+}
+
+/// Map each element through an Option-returning function, collecting
+/// successes (None if any call yields None).
+pub fn option_traverse(f, xs) {
+    var out = [];
+    var i = 0;
+    let n = perform Array.length(xs);
+    while i < n {
+        match f(xs[i]) {
+            Some(x) => { out = perform Array.push(out, x) },
+            None => return None,
+        };
+        i = i + 1
+    };
+    Some(out)
+}
+
+/// Unwrap an Option, falling back to `default` on None.
+pub fn option_unwrap_or(opt, default) {
+    match opt {
+        Some(x) => x,
+        None => default,
+    }
+}

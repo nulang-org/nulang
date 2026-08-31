@@ -1,0 +1,63 @@
+// Tests for json package — parsing.
+// Run via `nula test` from packages/json (whole-file test: exits non-zero on failure).
+
+import lib
+import stdlib::test
+
+fn main() {
+  // ── scalars ──────────────────────────────────────────────────────────
+  match parse("null") {
+    JsonNull => unit,
+    _ => fail_with("null should parse to JsonNull"),
+  }
+  match parse("true") {
+    JsonBool(b) => assert(b, "true should parse to JsonBool(true)"),
+    _ => fail_with("true should parse to JsonBool"),
+  }
+  match parse("false") {
+    JsonBool(b) => assert(!b, "false should parse to JsonBool(false)"),
+    _ => fail_with("false should parse to JsonBool"),
+  }
+  match parse("42") {
+    JsonNumber(n) => assert(n == 42.0, "42 should parse to JsonNumber(42.0)"),
+    _ => fail_with("42 should parse to JsonNumber"),
+  }
+  match parse("-3.5") {
+    JsonNumber(n) => assert(n == -3.5, "-3.5 should parse to JsonNumber(-3.5)"),
+    _ => fail_with("-3.5 should parse to JsonNumber"),
+  }
+  match parse("1e3") {
+    JsonNumber(n) => assert(n == 1000.0, "1e3 should parse to JsonNumber(1000.0)"),
+    _ => fail_with("1e3 should parse to JsonNumber"),
+  }
+  match parse("\"hello\"") {
+    JsonString(s) => assert(s == "hello", "string value mismatch"),
+    _ => fail_with("\"hello\" should parse to JsonString"),
+  }
+
+  // ── escapes ──────────────────────────────────────────────────────────
+  match parse("\"a\\nb\"") {
+    JsonString(s) => assert(s == "a\nb", "newline escape mismatch"),
+    _ => fail_with("escaped string should parse to JsonString"),
+  }
+  match parse("\"a\\\"b\"") {
+    JsonString(s) => assert(s == "a\"b", "quote escape mismatch"),
+    _ => fail_with("quote escape should parse to JsonString"),
+  }
+  match parse("\"\\u0041\"") {
+    JsonString(s) => assert(s == "A", "unicode escape mismatch"),
+    _ => fail_with("unicode escape should parse to JsonString"),
+  }
+
+  // ── whitespace tolerance ─────────────────────────────────────────────
+  match parse("  [ 1 , 2 ]  ") {
+    JsonArray(items) => assert_eq(perform Array.length(items), 2),
+    _ => fail_with("whitespace-padded array should parse"),
+  }
+
+  // ── empty input ──────────────────────────────────────────────────────
+  match parse("") {
+    JsonNull => unit,
+    _ => fail_with("empty input should parse to JsonNull"),
+  }
+}

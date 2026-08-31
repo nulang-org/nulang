@@ -1,8 +1,8 @@
 {
   "name": "nulang",
   "displayName": "Nulang",
-  "description": "Nulang language support for VS Code — syntax highlighting, language essentials, and snippets",
-  "version": "0.1.0",
+  "description": "Nulang language support for VS Code — syntax highlighting, language server (diagnostics, hover, goto-definition, completion, rename, formatting), and snippets",
+  "version": "0.2.0",
   "publisher": "nulang",
   "license": "Apache-2.0",
   "engines": {
@@ -10,6 +10,7 @@
   },
   "categories": [
     "Programming Languages",
+    "Linters",
     "Snippets"
   ],
   "keywords": [
@@ -21,13 +22,17 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/dporkka/nulang.git",
+    "url": "https://github.com/nulang-org/nulang.git",
     "directory": "editors/vscode"
   },
   "bugs": {
-    "url": "https://github.com/dporkka/nulang/issues"
+    "url": "https://github.com/nulang-org/nulang/issues"
   },
-  "homepage": "https://github.com/dporkka/nulang",
+  "homepage": "https://github.com/nulang-org/nulang",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:nulang"
+  ],
   "contributes": {
     "languages": [
       {
@@ -47,7 +52,7 @@
       {
         "language": "nulang",
         "scopeName": "source.nulang",
-        "path": "./syntaxes/nulang.tmLanguage.json"
+        "path": "./node_modules/nulang-syntax/syntaxes/nulang.tmLanguage.json"
       }
     ],
     "snippets": [
@@ -55,6 +60,58 @@
         "language": "nulang",
         "path": "./snippets/nulang.json"
       }
-    ]
+    ],
+    "commands": [
+      {
+        "command": "nulang.compile",
+        "title": "Nulang: Compile"
+      },
+      {
+        "command": "nulang.run",
+        "title": "Nulang: Run"
+      },
+      {
+        "command": "nulang.typeCheck",
+        "title": "Nulang: Type Check"
+      },
+      {
+        "command": "nulang.restartServer",
+        "title": "Nulang: Restart Language Server"
+      }
+    ],
+    "configuration": {
+      "title": "Nulang",
+      "properties": {
+        "nulang.path": {
+          "type": "string",
+          "default": "nulang",
+          "description": "Path to the nulang binary. Defaults to 'nulang' on PATH; the NULANG_PATH environment variable is used when this setting is not explicitly set."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "test": "npm run compile && node ./out/test/runTest.js",
+    "publish:marketplace": "vsce publish",
+    "publish:openvsx": "ovsx publish"
+  },
+  "dependencies": {
+    "nulang-syntax": "github:nulang-org/nulang-syntax#v0.1.0",
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.7",
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^2.4.1",
+    "@vscode/vsce": "^3.2.1",
+    "glob": "^10.4.5",
+    "mocha": "^10.7.0",
+    "ovsx": "^0.10.1",
+    "typescript": "^5.5.4"
   }
 }

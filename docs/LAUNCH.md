@@ -60,7 +60,7 @@ out the rest.
 ## Getting started
 
 ```bash
-git clone https://github.com/dporkka/nulang.git
+git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
 ./target/release/nulang --eval 'perform IO.print("Hello, Nulang!")'
@@ -88,8 +88,8 @@ landing now are the ones that need to be right the first time.
 
 ## Links
 
-- [GitHub](https://github.com/dporkka/nulang)
+- [GitHub](https://github.com/nulang-org/nulang)
 - [Website](https://nulang.org)
-- [Getting Started](https://github.com/dporkka/nulang/blob/main/docs/GETTING_STARTED.md)
-- [Tutorial](https://github.com/dporkka/nulang/blob/main/docs/TUTORIAL.md)
-- [Specification](https://github.com/dporkka/nulang/blob/main/SPEC2.md)
+- [Getting Started](https://github.com/nulang-org/nulang/blob/main/docs/GETTING_STARTED.md)
+- [Tutorial](https://github.com/nulang-org/nulang/blob/main/docs/TUTORIAL.md)
+- [Specification](https://github.com/nulang-org/nulang/blob/main/SPEC2.md)

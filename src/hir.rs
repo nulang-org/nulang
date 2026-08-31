@@ -106,6 +106,8 @@ pub struct FunctionDef {
     pub cap: Capability,
     pub body: Body,
     pub public: bool,
+    /// Web framework compile-time placement hint (None = infer from effect row).
+    pub placement: Option<crate::types::Placement>,
     pub span: Span,
 }
 
@@ -135,6 +137,9 @@ pub struct ActorDef {
     /// memory-behavior names and implement them directly instead of running
     /// their placeholder bytecode bodies.
     pub is_agent: bool,
+    /// True if declared as `virtual entity` (RFC 0016 virtual actor
+    /// auto-hydration).
+    pub virtual_: bool,
     pub tools: Vec<crate::tool_schema::ToolSchema>,
     pub semantic_memory_dimensions: Option<usize>,
     pub procedural_memory_namespace: Option<String>,
@@ -623,6 +628,7 @@ mod tests {
             cap: Capability::Ref,
             body: Body::default(),
             public: true,
+            placement: None,
             span: Span::default(),
         };
         assert_eq!(def.name, "f");
@@ -644,6 +650,7 @@ mod tests {
             is_workflow: false,
             is_organization: false,
             is_agent: false,
+            virtual_: false,
             tools: vec![],
             semantic_memory_dimensions: None,
             procedural_memory_namespace: None,

@@ -1,14 +1,75 @@
 <div aria-hidden="true" style="display:none"></div>
 
-<script>
-  // Scroll-triggered entrance animations for benefit rows and callout
-  function initScrollAnimations() {
+<script is:inline>
+  (function initScrollAnimations() {
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    if (reducedMotion) {
-      document.querySelectorAll('.benefit-row, .benefit-callout').forEach(el => el.classList.add('visible'));
-      return;
+
+    // Highlight "Nu" in any heading/text node inside the given container
+    function highlightNu(container, selector) {
+      const el = selector ? container.querySelector(selector) : container;
+      if (!el || el.querySelector('.nu-blue')) return;
+      const textNode = Array.from(el.childNodes).find(n => n.nodeType === Node.TEXT_NODE);
+      if (!textNode) return;
+      const text = textNode.textContent || '';
+      const match = text.match(/^nu/i);
+      if (!match) return;
+      const nu = document.createElement('span');
+      nu.className = 'nu-blue';
+      nu.textContent = match[0];
+      textNode.replaceWith(nu, document.createTextNode(text.slice(match[0].length)));
     }
-    const elements = document.querySelectorAll('.benefit-row, .benefit-callout');
+
+    // Elements that should fade up on scroll
+    const selectors = [
+      '.benefit-row',
+      '.benefit-callout',
+      '.feature-card',
+      '.pillar-card',
+      '.support-card',
+      '.metric',
+      '.hero > h1',
+      '.hero .tagline',
+      '.hero .actions',
+      '.hero-example',
+      '.sl-markdown-content > h2',
+      '.sl-markdown-content > h3',
+      '.nu-section-header',
+      '.btn-license',
+      '.btn-support'
+    ];
+
+    const elements = Array.from(document.querySelectorAll(selectors.join(',')));
+    if (elements.length === 0) return;
+
+    // Apply base reveal class and directional hints
+    elements.forEach((el) => {
+      if (reducedMotion) {
+        el.classList.add('visible');
+        return;
+      }
+
+      // Hero elements get a subtle scale fade; side-by-side benefit demos slide in
+      let revealClass = 'reveal';
+      if (el.classList.contains('feature-card') || el.classList.contains('pillar-card') || el.classList.contains('support-card')) {
+        revealClass = 'reveal-scale';
+      } else if (el.closest('.benefit-row') && el.classList.contains('benefit-text')) {
+        revealClass = el.closest('.benefit-row-reverse') ? 'reveal-right' : 'reveal-left';
+      } else if (el.closest('.benefit-row') && el.classList.contains('benefit-demo')) {
+        revealClass = el.closest('.benefit-row-reverse') ? 'reveal-left' : 'reveal-right';
+      } else if (el.matches('.hero > h1, .hero .tagline, .hero .actions, .hero-example')) {
+        revealClass = 'reveal-scale';
+      }
+
+      el.classList.add(revealClass);
+      // Stagger siblings within the same container
+      const group = el.parentElement;
+      const siblings = group ? Array.from(group.children).filter(c => c === el || elements.includes(c)) : [];
+      const groupIndex = siblings.indexOf(el);
+      el.style.transitionDelay = `${Math.min(groupIndex, 6) * 90}ms`;
+    });
+
+    if (reducedMotion) return;
+
     const observer = new IntersectionObserver((entries) => {
       entries.forEach(entry => {
         if (entry.isIntersecting) {
@@ -16,17 +77,39 @@
           observer.unobserve(entry.target);
         }
       });
-    }, { threshold: 0.1 });
+    }, { threshold: 0.12, rootMargin: '0px 0px -48px 0px' });
+
     elements.forEach(el => observer.observe(el));
-    // Also reveal any elements already in the viewport on load
-    setTimeout(() => {
+
+    // Reveal any elements already in the viewport on load
+    function revealVisible() {
       elements.forEach(el => {
         const rect = el.getBoundingClientRect();
-        if (rect.top < window.innerHeight && rect.bottom > 0) {
+        if (rect.top < window.innerHeight * 0.92 && rect.bottom > 0) {
           el.classList.add('visible');
           observer.unobserve(el);
         }
       });
-    }, 100);
-  }
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', revealVisible);
+    } else {
+      revealVisible();
+    }
+
+    // Highlight "Nu" in the hero title once it exists
+    function highlightHeroNu() {
+      highlightNu(document, '.hero h1');
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', highlightHeroNu);
+    } else {
+      highlightHeroNu();
+    }
+    // Retry after a short delay in case Starlight hydrates the title later
+    setTimeout(highlightHeroNu, 50);
+    setTimeout(highlightHeroNu, 250);
+  })();
 </script>

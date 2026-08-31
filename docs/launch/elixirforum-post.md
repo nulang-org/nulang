@@ -80,7 +80,7 @@ The two big departures from the BEAM:
   declarative in-language supervision syntax is planned. What would you want
   it to look like?
 
-Repo: https://github.com/dporkka/nulang (Apache-2.0). Spec in SPEC2.md,
+Repo: https://github.com/nulang-org/nulang (Apache-2.0). Spec in SPEC2.md,
 BEAM-primitive notes in BEAM_PRIMITIVES.md, 17 verified examples in
 `examples/` including a supervisor tree and a chat room.
 

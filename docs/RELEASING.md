@@ -38,12 +38,12 @@ creates a GitHub Release with:
 
 ## 4. Verify the release
 
-- Open https://github.com/dporkka/nulang/releases and confirm all 8 files
+- Open https://github.com/nulang-org/nulang/releases and confirm all 8 files
   (4 tarballs + 4 checksums) are attached.
 - Smoke-test one artifact:
 
   ```bash
-  curl -LO https://github.com/dporkka/nulang/releases/download/v0.2.0/nulang-linux-x86_64.tar.gz
+  curl -LO https://github.com/nulang-org/nulang/releases/download/v0.2.0/nulang-linux-x86_64.tar.gz
   sha256sum -c nulang-linux-x86_64.tar.gz.sha256
   tar xzf nulang-linux-x86_64.tar.gz
   ./nulang --version   # must print the version you just tagged

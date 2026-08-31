@@ -101,13 +101,34 @@ const INT_SPECIALS: &[i64] = &[
 /// Float literals: signed zero (NaN-canonicalization and sign-bit handling
 /// must agree across backends), common decimals, and large magnitudes.
 const FLOAT_SPECIALS: &[&str] = &[
-    "0.0", "-0.0", "1.0", "-1.0", "0.5", "1.5", "-2.5", "3.14", "0.1", "0.2",
-    "2.0", "10.0", "123456.789", "-98765.4321", "1000000000.5",
+    "0.0",
+    "-0.0",
+    "1.0",
+    "-1.0",
+    "0.5",
+    "1.5",
+    "-2.5",
+    "3.14",
+    "0.1",
+    "0.2",
+    "2.0",
+    "10.0",
+    "123456.789",
+    "-98765.4321",
+    "1000000000.5",
 ];
 
 const STR_SPECIALS: &[&str] = &[
-    "\"\"", "\"a\"", "\"b\"", "\"hello\"", "\"xyz\"", "\"0\"", "\"-1\"",
-    "\"foo bar\"", "\"aBc\"", "\"  \"",
+    "\"\"",
+    "\"a\"",
+    "\"b\"",
+    "\"hello\"",
+    "\"xyz\"",
+    "\"0\"",
+    "\"-1\"",
+    "\"foo bar\"",
+    "\"aBc\"",
+    "\"  \"",
 ];
 
 impl Gen {
@@ -116,10 +137,7 @@ impl Gen {
             // Mix the seed so adjacent seeds diverge (a plain `seed | C`
             // ORs away the low bit — seeds 0 and 1 would collide), and
             // avoid the all-zero xorshift sink state.
-            rng: XorShift64(
-                seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ 0xA5A5_5A5A_D3C3_B4A5,
-            ),
+            rng: XorShift64(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A_D3C3_B4A5),
             out: String::new(),
             ints: Vec::new(),
             floats: Vec::new(),
@@ -391,7 +409,12 @@ impl Gen {
             12 => {
                 let a = self.expr(Ty::Int, depth);
                 let b = self.expr(Ty::Int, depth);
-                format!("({{x: {}, y: {}}}.{})", a, b, if self.chance(50) { "x" } else { "y" })
+                format!(
+                    "({{x: {}, y: {}}}.{})",
+                    a,
+                    b,
+                    if self.chance(50) { "x" } else { "y" }
+                )
             }
             // variable or literal fallback
             _ => {
@@ -519,7 +542,11 @@ impl Gen {
                 self.expr(Ty::Str, depth)
             ),
             // string + int coercion (past backend bug class)
-            3 => format!("({} + {})", self.expr(Ty::Str, depth), self.expr(Ty::Int, depth)),
+            3 => format!(
+                "({} + {})",
+                self.expr(Ty::Str, depth),
+                self.expr(Ty::Int, depth)
+            ),
             4 => format!(
                 "(if {} then {} else {})",
                 self.cond(depth),
@@ -562,8 +589,9 @@ impl Gen {
             // int array literal
             5 | 6 => {
                 let len = self.range(1, 6);
-                let elems: Vec<String> =
-                    (0..len).map(|_| self.expr(Ty::Int, depth.saturating_sub(1))).collect();
+                let elems: Vec<String> = (0..len)
+                    .map(|_| self.expr(Ty::Int, depth.saturating_sub(1)))
+                    .collect();
                 let name = self.fresh_name("a");
                 self.out
                     .push_str(&format!("let {} = [{}]\n", name, elems.join(", ")));
@@ -675,8 +703,7 @@ impl Gen {
             // for-in loop over a small literal array
             10 => {
                 let len = self.range(1, 5);
-                let elems: Vec<String> =
-                    (0..len).map(|_| self.expr(Ty::Int, 1)).collect();
+                let elems: Vec<String> = (0..len).map(|_| self.expr(Ty::Int, 1)).collect();
                 let acc = self.fresh_name("fa");
                 let x = self.fresh_name("x");
                 let res = self.fresh_name("i");
@@ -853,7 +880,11 @@ pub fn run_campaign(
                 if verbose {
                     eprintln!(
                         "{} seed={:#x}: {}",
-                        if known { "KNOWN-OVERFLOW" } else { "DIVERGENCE" },
+                        if known {
+                            "KNOWN-OVERFLOW"
+                        } else {
+                            "DIVERGENCE"
+                        },
                         seed,
                         message
                     );
@@ -933,8 +964,8 @@ mod tests {
     }
 
     /// CI smoke test: 50 fixed seeds, interpreter vs forced-JIT vs AOT all
-    /// agree. Runs as part of the default `cargo test` suite; the heavier
-    /// campaigns run via scripts/difffuzz.sh.
+    /// agree. Runs as part of the default `cargo test` suite (both debug and
+    /// release); the heavier campaigns run via scripts/difffuzz.sh.
     #[test]
     fn differential_smoke_50_seeds() {
         let stats = run_campaign(0xD1FF_0000, 50, None, None, false);

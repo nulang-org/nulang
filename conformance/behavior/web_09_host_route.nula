@@ -1,0 +1,11 @@
+import stdlib::web::host
+import stdlib::web::types
+
+fn route_handler() -> Html {
+    text("ok")
+}
+
+fn main() {
+    route("/", route_handler)
+    perform IO.print("registered")
+}

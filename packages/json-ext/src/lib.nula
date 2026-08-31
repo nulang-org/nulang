@@ -1,0 +1,329 @@
+// json-ext — JSON Schema-flavored validation and pretty-printing on top of
+// the official `json` package.
+// Consume with: `import lib` from any file in the package.
+// Built on the stdlib `json` module (the `json` seed package is a
+// standalone port of the same code; the path dependency in Nulang.toml
+// exercises cross-package resolution).
+
+import stdlib::json
+
+/// A string of `n` space characters (used for indentation).
+pub fn spaces(n: Int) -> String {
+    var out = "";
+    var i = 0;
+    while i < n {
+        out = perform String.concat(out, " ");
+        i = i + 1
+    };
+    out
+}
+
+/// The JSON type name of a value: "null", "bool", "number", "string",
+/// "array", or "object".
+pub fn type_of(v) {
+    match v {
+        JsonNull => "null",
+        JsonBool(_) => "bool",
+        JsonNumber(_) => "number",
+        JsonString(_) => "string",
+        JsonArray(_) => "array",
+        JsonObject(_) => "object",
+    }
+}
+
+/// Structural equality on JSON values. Object field order matters
+/// (fields are compared pairwise, as produced by `parse`).
+pub fn json_eq(a, b) {
+    let rec eq = fn(x, y) {
+        match x {
+            JsonNull => match y {
+                JsonNull => true,
+                _ => false,
+            },
+            JsonBool(p) => match y {
+                JsonBool(q) => p == q,
+                _ => false,
+            },
+            JsonNumber(p) => match y {
+                JsonNumber(q) => p == q,
+                _ => false,
+            },
+            JsonString(p) => match y {
+                JsonString(q) => p == q,
+                _ => false,
+            },
+            JsonArray(xs) => match y {
+                JsonArray(ys) => {
+                    if perform Array.length(xs) != perform Array.length(ys) then { false }
+                    else {
+                        var i = 0;
+                        var same = true;
+                        let n = perform Array.length(xs);
+                        while i < n {
+                            if !eq(xs[i], ys[i]) then { same = false } else {};
+                            i = i + 1
+                        };
+                        same
+                    }
+                },
+                _ => false,
+            },
+            JsonObject(xs) => match y {
+                JsonObject(ys) => {
+                    if perform Array.length(xs) != perform Array.length(ys) then { false }
+                    else {
+                        var i = 0;
+                        var same = true;
+                        let n = perform Array.length(xs);
+                        while i < n {
+                            let f = xs[i];
+                            let g = ys[i];
+                            if f.0 != g.0 then { same = false }
+                            else if !eq(f.1, g.1) then { same = false }
+                            else {};
+                            i = i + 1
+                        };
+                        same
+                    }
+                },
+                _ => false,
+            },
+        }
+    };
+    eq(a, b)
+}
+
+/// Element-wise equality for JSON arrays.
+pub fn array_eq(xs, ys) {
+    if perform Array.length(xs) != perform Array.length(ys) then { false }
+    else {
+        var i = 0;
+        var same = true;
+        let n = perform Array.length(xs);
+        while i < n {
+            if !json_eq(xs[i], ys[i]) then { same = false } else {};
+            i = i + 1
+        };
+        same
+    }
+}
+
+/// Pairwise equality for object field lists.
+pub fn fields_eq(xs, ys) {
+    if perform Array.length(xs) != perform Array.length(ys) then { false }
+    else {
+        var i = 0;
+        var same = true;
+        let n = perform Array.length(xs);
+        while i < n {
+            let p = xs[i];
+            let q = ys[i];
+            if p.0 != q.0 then { same = false }
+            else if !json_eq(p.1, q.1) then { same = false }
+            else {};
+            i = i + 1
+        };
+        same
+    }
+}
+
+/// Pretty-print at the given indent depth (2 spaces per level).
+/// (Recursion goes through an internal `let rec` closure: a self-recursive
+/// `pub fn` annotated with an imported variant type trips a typechecker
+/// stack overflow — see the `let rec go` pattern in stdlib `json`.)
+pub fn pretty_at(v, depth) {
+    let rec go = fn(x, d) {
+        match x {
+            JsonArray(items) => {
+                let n = perform Array.length(items);
+                if n == 0 then { "[]" }
+                else {
+                    let inner_pad = spaces(d * 2 + 2);
+                    let outer_pad = spaces(d * 2);
+                    var out = "[\n";
+                    var i = 0;
+                    while i < n {
+                        if i > 0 then { out = perform String.concat(out, ",\n") } else {};
+                        out = perform String.concat(out, inner_pad);
+                        out = perform String.concat(out, go(items[i], d + 1));
+                        i = i + 1
+                    };
+                    out = perform String.concat(out, "\n");
+                    out = perform String.concat(out, outer_pad);
+                    perform String.concat(out, "]")
+                }
+            },
+            JsonObject(fields) => {
+                let n = perform Array.length(fields);
+                if n == 0 then { "{}" }
+                else {
+                    let inner_pad = spaces(d * 2 + 2);
+                    let outer_pad = spaces(d * 2);
+                    var out = "{\n";
+                    var i = 0;
+                    while i < n {
+                        if i > 0 then { out = perform String.concat(out, ",\n") } else {};
+                        let pair = fields[i];
+                        out = perform String.concat(out, inner_pad);
+                        out = perform String.concat(out, stringify(JsonString(pair.0)));
+                        out = perform String.concat(out, ": ");
+                        out = perform String.concat(out, go(pair.1, d + 1));
+                        i = i + 1
+                    };
+                    out = perform String.concat(out, "\n");
+                    out = perform String.concat(out, outer_pad);
+                    perform String.concat(out, "}")
+                }
+            },
+            _ => stringify(x),
+        }
+    };
+    go(v, depth)
+}
+
+/// Pretty-print a JSON value with two-space indentation.
+pub fn pretty(v) {
+    pretty_at(v, 0)
+}
+
+/// Look up a field in a schema object, returning JsonNull when absent.
+fn schema_field(schema, key) {
+    match schema {
+        JsonObject(fields) => {
+            var i = 0;
+            var found = JsonNull;
+            let n = perform Array.length(fields);
+            while i < n {
+                let pair = fields[i];
+                if pair.0 == key then { found = pair.1 } else {};
+                i = i + 1
+            };
+            found
+        },
+        _ => JsonNull,
+    }
+}
+
+/// True when `v` occurs (by structural equality) in `items`.
+fn member_of(v, items) {
+    var i = 0;
+    var found = false;
+    let n = perform Array.length(items);
+    while i < n {
+        if json_eq(v, items[i]) then { found = true } else {};
+        i = i + 1
+    };
+    found
+}
+
+/// True when `obj` has a field named `key`.
+fn has_field(obj, key) {
+    match obj {
+        JsonObject(fields) => {
+            var i = 0;
+            var found = false;
+            let n = perform Array.length(fields);
+            while i < n {
+                let pair = fields[i];
+                if pair.0 == key then { found = true } else {};
+                i = i + 1
+            };
+            found
+        },
+        _ => false,
+    }
+}
+
+/// Validate `value` against a small JSON-Schema-flavored schema.
+///
+/// Supported keywords (schemas are plain JSON objects):
+///   {"type": "object", "required": [...], "properties": {k: schema}}
+///   {"type": "array", "items": schema}
+///   {"type": "string" | "number" | "bool" | "null"}
+///   {"enum": [v1, v2, ...]}        — structural membership
+/// An empty schema `{}` accepts everything.
+pub fn validate(schema, value) {
+    // Recursion via `let rec` closure (see pretty_at for why).
+    let rec check = fn(scm, v) {
+    let ty = get_string(scm, "type", "");
+    if ty != "" then {
+        if type_of(v) != ty then { return false } else {}
+    } else {};
+
+    // enum: structural membership
+    match schema_field(scm, "enum") {
+        JsonArray(choices) => {
+            if !member_of(v, choices) then { return false } else {}
+        },
+        _ => unit,
+    };
+
+    if ty == "object" then {
+        // required: every listed key must be present
+        match schema_field(scm, "required") {
+            JsonArray(keys) => {
+                var i = 0;
+                let n = perform Array.length(keys);
+                while i < n {
+                    match keys[i] {
+                        JsonString(k) => {
+                            if !has_field(v, k) then { return false } else {}
+                        },
+                        _ => unit,
+                    };
+                    i = i + 1
+                }
+            },
+            _ => unit,
+        };
+        // properties: validate each present field against its subschema
+        match schema_field(scm, "properties") {
+            JsonObject(props) => {
+                var i = 0;
+                let n = perform Array.length(props);
+                while i < n {
+                    let prop = props[i];
+                    match v {
+                        JsonObject(vfields) => {
+                            var j = 0;
+                            let m = perform Array.length(vfields);
+                            while j < m {
+                                let field = vfields[j];
+                                if field.0 == prop.0 then {
+                                    if !check(prop.1, field.1) then { return false } else {}
+                                } else {};
+                                j = j + 1
+                            }
+                        },
+                        _ => unit,
+                    };
+                    i = i + 1
+                }
+            },
+            _ => unit,
+        };
+        true
+    }
+    else if ty == "array" then {
+        match schema_field(scm, "items") {
+            JsonNull => true,
+            item_schema => {
+                match v {
+                    JsonArray(items) => {
+                        var i = 0;
+                        let n = perform Array.length(items);
+                        while i < n {
+                            if !check(item_schema, items[i]) then { return false } else {};
+                            i = i + 1
+                        };
+                        true
+                    },
+                    _ => false,
+                }
+            },
+        }
+    }
+    else { true }
+    };
+    check(schema, value)
+}

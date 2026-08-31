@@ -1,5 +1,0 @@
-fn g(x: Int) -> Int {
-  let a = x
-  let b = x
-  42
-}

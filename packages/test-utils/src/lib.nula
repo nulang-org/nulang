@@ -1,0 +1,164 @@
+// test-utils — assertions, fixtures, and helpers beyond the built-in
+// `Test` effect / stdlib `test` module.
+// Consume with: `import lib` from any file in the package. All `expect_*`
+// helpers abort the test (runtime error) on failure, like the stdlib
+// assertions. Option/Result constructors come from the prelude.
+
+// ── Boolean expectations ───────────────────────────────────────────────────
+
+/// Expect a condition to be true.
+pub fn expect_true(cond: Bool, msg: String) {
+    perform Test.assert(cond, msg)
+}
+
+/// Expect a condition to be false.
+pub fn expect_false(cond: Bool, msg: String) {
+    perform Test.assert(!cond, "expected false: " + msg)
+}
+
+// ── Equality expectations ──────────────────────────────────────────────────
+
+/// Expect two integers to be equal.
+pub fn expect_eq_int(actual: Int, expected: Int) {
+    perform Test.assert(actual == expected,
+        "expected " + perform Int.to_string(expected)
+        + ", got " + perform Int.to_string(actual))
+}
+
+/// Expect two integers to differ.
+pub fn expect_ne_int(actual: Int, unexpected: Int) {
+    perform Test.assert(actual != unexpected,
+        "expected anything but " + perform Int.to_string(unexpected))
+}
+
+/// Expect two strings to be equal.
+pub fn expect_eq_str(actual: String, expected: String) {
+    perform Test.assert(actual == expected,
+        "expected \"" + expected + "\", got \"" + actual + "\"")
+}
+
+/// Expect two booleans to be equal.
+pub fn expect_eq_bool(actual: Bool, expected: Bool) {
+    perform Test.assert(actual == expected, "boolean mismatch")
+}
+
+/// Expect two floats to be within `eps` of each other.
+pub fn expect_float_near(actual: Float, expected: Float, eps: Float) {
+    let diff = if actual > expected then { actual - expected } else { expected - actual };
+    perform Test.assert(diff <= eps,
+        "floats differ by more than epsilon: " + perform Float.to_string(actual)
+        + " vs " + perform Float.to_string(expected))
+}
+
+// ── Ordering expectations ──────────────────────────────────────────────────
+
+/// Expect `a > b`.
+pub fn expect_gt(a: Int, b: Int) {
+    perform Test.assert(a > b,
+        perform Int.to_string(a) + " should be > " + perform Int.to_string(b))
+}
+
+/// Expect `a < b`.
+pub fn expect_lt(a: Int, b: Int) {
+    perform Test.assert(a < b,
+        perform Int.to_string(a) + " should be < " + perform Int.to_string(b))
+}
+
+/// Expect `lo <= x <= hi`.
+pub fn expect_between(x: Int, lo: Int, hi: Int) {
+    perform Test.assert(lo <= x && x <= hi,
+        perform Int.to_string(x) + " should be in ["
+        + perform Int.to_string(lo) + ", " + perform Int.to_string(hi) + "]")
+}
+
+// ── Option / Result expectations ───────────────────────────────────────────
+
+/// Expect an Option to be Some.
+pub fn expect_some(opt) {
+    match opt {
+        Some(_) => unit,
+        None => perform Test.assert(false, "expected Some, got None"),
+    }
+}
+
+/// Expect an Option to be None.
+pub fn expect_none(opt) {
+    match opt {
+        Some(_) => perform Test.assert(false, "expected None, got Some"),
+        None => unit,
+    }
+}
+
+/// Expect an Option to be Some and return its value.
+pub fn expect_some_value(opt) {
+    match opt {
+        Some(x) => x,
+        None => perform Test.assert(false, "expected Some, got None"),
+    }
+}
+
+/// Expect a Result to be Ok.
+pub fn expect_ok(r) {
+    match r {
+        Ok(_) => unit,
+        Error(_) => perform Test.assert(false, "expected Ok, got Error"),
+    }
+}
+
+/// Expect a Result to be Error.
+pub fn expect_err(r) {
+    match r {
+        Ok(_) => perform Test.assert(false, "expected Error, got Ok"),
+        Error(_) => unit,
+    }
+}
+
+// ── Collection expectations ────────────────────────────────────────────────
+
+/// Expect two integer lists to be element-wise equal.
+pub fn expect_eq_list_int(actual: [Int], expected: [Int]) {
+    let an = perform Array.length(actual);
+    let en = perform Array.length(expected);
+    perform Test.assert(an == en,
+        "list lengths differ: " + perform Int.to_string(an)
+        + " vs " + perform Int.to_string(en));
+    var i = 0;
+    while i < an {
+        perform Test.assert(actual[i] == expected[i],
+            "lists differ at index " + perform Int.to_string(i));
+        i = i + 1
+    }
+}
+
+/// Expect `haystack` to contain the substring `needle`.
+pub fn expect_contains(haystack: String, needle: String) {
+    let hlen = perform String.length(haystack);
+    let nlen = perform String.length(needle);
+    var found = false;
+    var i = 0;
+    while i + nlen <= hlen {
+        if perform String.substring(haystack, i, nlen) == needle then { found = true } else {};
+        i = i + 1
+    };
+    perform Test.assert(found,
+        "\"" + haystack + "\" should contain \"" + needle + "\"")
+}
+
+// ── Fixtures ───────────────────────────────────────────────────────────────
+
+/// Run `f` for every case in `cases` (a list of inputs). Great for
+/// table-driven tests: `for_each(cases, fn(c) { expect_...(f(c)) })`.
+pub fn for_each(cases, f) {
+    var i = 0;
+    let n = perform Array.length(cases);
+    while i < n {
+        f(cases[i]);
+        i = i + 1
+    }
+}
+
+/// Fail unconditionally with a labeled phase — useful for marking
+/// unreachable branches in tests.
+pub fn unreachable(msg: String) {
+    perform Test.assert(false, "unreachable: " + msg)
+}

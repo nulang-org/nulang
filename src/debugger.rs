@@ -17,7 +17,9 @@
 //!   - evaluate        — evaluate an expression in current scope
 
 use std::collections::HashMap;
+#[cfg(feature = "tcp")]
 use std::io::{BufRead, BufReader, Write};
+#[cfg(feature = "tcp")]
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
@@ -67,11 +69,13 @@ impl DebugState {
 }
 
 /// A DAP server that handles debug protocol messages.
+#[cfg(feature = "tcp")]
 pub struct DapServer {
     pub state: Arc<Mutex<DebugState>>,
     listener: TcpListener,
 }
 
+#[cfg(feature = "tcp")]
 impl DapServer {
     /// Create a new DAP server listening on the given address.
     pub fn new(addr: &str) -> std::io::Result<Self> {
@@ -202,5 +206,30 @@ mod tests {
         }
         let bps = state.lock().unwrap();
         assert_eq!(bps.breakpoints.len(), 1);
+    }
+}
+
+
+#[cfg(not(feature = "tcp"))]
+pub struct DapServer {
+    pub state: Arc<Mutex<DebugState>>,
+}
+
+#[cfg(not(feature = "tcp"))]
+impl DapServer {
+    /// Stub: the `tcp` feature is disabled, so no DAP listener can start.
+    pub fn new(_addr: &str) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "debug server disabled (feature 'tcp' not enabled)",
+        ))
+    }
+
+    pub fn default() -> std::io::Result<Self> {
+        Self::new("127.0.0.1:9234")
+    }
+
+    pub fn serve(&self) -> std::io::Result<()> {
+        Ok(())
     }
 }

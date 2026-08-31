@@ -40,10 +40,13 @@
 //! To test the adapter in-process without a real editor, drive
 //! [`run_dap_server_io`] with byte buffers and assert on the framed output.
 
+pub mod rewind;
+
 use crate::bytecode::{CodeModule, OpCode};
 use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
+use crate::runtime::PersistenceStore;
 use crate::typechecker::TypeChecker;
 use crate::types::NuResult;
 use crate::vm::{DebugAction, DebugContext, DebugHook, Value, VM};
@@ -231,21 +234,27 @@ fn compile_source(source: &str, file_path: Option<&str>, name: &str) -> NuResult
     let tokens = lexer.lex()?;
     let mut parser = Parser::new(tokens);
     let mut ast = parser.parse_module()?;
-    let mut pd: Vec<crate::ast::Decl> = pa
+    let pd: Vec<crate::ast::Decl> = pa
         .decls
         .into_iter()
         .filter(|d| matches!(d, crate::ast::Decl::VariantType { .. }))
         .collect();
-    pd.append(&mut ast.decls);
-    ast.decls = pd;
 
     // 2. Import resolution.
-    let base_dir = Path::new(file_path.unwrap_or("."))
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
     let mut visited = HashSet::new();
-    crate::resolver::resolve_imports(&mut ast, &base_dir, &mut visited)?;
+    crate::resolver::resolve_imports(
+        &mut ast,
+        std::path::Path::new(file_path.unwrap_or(".")),
+        &mut visited,
+    )?;
+
+    // Prepend the prelude AFTER import resolution (see main::run_frontend):
+    // `resolve_imports` prepends imported declarations, and the typechecker
+    // binds variant constructors in declaration order, so the prelude's
+    // `Option`/`Result` declarations must come first in the final AST.
+    let mut pd = pd;
+    pd.append(&mut ast.decls);
+    ast.decls = pd;
 
     // 3. Type check.
     let mut type_checker = TypeChecker::new();
@@ -604,14 +613,91 @@ fn respond<W: Write>(
     write_message(writer, &msg);
 }
 
-fn capabilities() -> Json {
+fn capabilities(rewind: &RewindSession) -> Json {
     json!({
         "supportsConfigurationDoneRequest": true,
         "supportsEvaluate": true,
         "supportsTerminateRequest": true,
         "supportTerminateDebuggee": true,
-        "supportsRestartRequest": false
+        "supportsRestartRequest": false,
+        // Time-travel rewind (Wave E3): only advertised when the durable
+        // store is enabled — with the in-memory store there is nothing to
+        // rewind. Dev/staging only.
+        "supportsReverseContinueRequest": rewind.store_enabled(),
+        "supportsStepBack": rewind.store_enabled()
     })
+}
+
+// ---------------------------------------------------------------------------
+// Time-travel rewind session state (see `rewind` module)
+// ---------------------------------------------------------------------------
+
+/// Server-side state for reverse-continue / step-back over durable entities.
+struct RewindSession {
+    /// Durable store directory; `None` = store not enabled (rewind gated off).
+    store_dir: Option<std::path::PathBuf>,
+    /// Current rewind position per entity (actor id -> sequence). Absent =
+    /// positioned at the latest message.
+    positions: std::collections::HashMap<u64, u64>,
+}
+
+impl RewindSession {
+    fn new(store_dir: Option<std::path::PathBuf>) -> Self {
+        RewindSession {
+            store_dir,
+            positions: std::collections::HashMap::new(),
+        }
+    }
+
+    fn store_enabled(&self) -> bool {
+        self.store_dir.is_some()
+    }
+
+    fn open_store(&self) -> Option<crate::runtime::JsonFileStore> {
+        self.store_dir.as_deref().and_then(rewind::open_store_at)
+    }
+
+    /// Rewind entity `actor_id` to message `target_seq` and remember the
+    /// position so `stepBack` / `nulangStepForward` are relative to it.
+    fn rewind_to(&mut self, actor_id: u64, target_seq: u64) -> Result<Json, String> {
+        let store = self.open_store().ok_or_else(|| {
+            "rewind requires a durable store ($NULANG_STORE_PATH or .nulang/store/)".to_string()
+        })?;
+        let state = rewind::rewind_entity(&store, actor_id, target_seq);
+        self.positions.insert(actor_id, state.sequence);
+        Ok(state.to_json())
+    }
+
+    /// Step back one message from the current position (default: latest).
+    fn step_back(&mut self, actor_id: u64) -> Result<Json, String> {
+        let store = self.open_store().ok_or_else(|| {
+            "rewind requires a durable store ($NULANG_STORE_PATH or .nulang/store/)".to_string()
+        })?;
+        let current = self
+            .positions
+            .get(&actor_id)
+            .copied()
+            .unwrap_or_else(|| store.latest_sequence(actor_id));
+        let state = rewind::rewind_entity(&store, actor_id, current.saturating_sub(1));
+        self.positions.insert(actor_id, state.sequence);
+        Ok(state.to_json())
+    }
+
+    /// Step forward one message from the current rewound position: replays
+    /// the recorded events for the next sequence number.
+    fn step_forward(&mut self, actor_id: u64) -> Result<Json, String> {
+        let store = self.open_store().ok_or_else(|| {
+            "rewind requires a durable store ($NULANG_STORE_PATH or .nulang/store/)".to_string()
+        })?;
+        let current = self
+            .positions
+            .get(&actor_id)
+            .copied()
+            .unwrap_or_else(|| store.latest_sequence(actor_id));
+        let state = rewind::rewind_entity(&store, actor_id, current.saturating_add(1));
+        self.positions.insert(actor_id, state.sequence);
+        Ok(state.to_json())
+    }
 }
 
 /// Ask the debuggee thread for a paused-state snapshot, waiting up to 2s so
@@ -662,9 +748,10 @@ fn handle_request<W: Write>(
     cmd_tx: &Sender<DebugCommand>,
     cmd_rx: &Receiver<DebugCommand>,
     event_tx: &Sender<DebugEvent>,
+    rewind: &mut RewindSession,
 ) {
     match command {
-        "initialize" => respond(writer, seq, request_seq, command, Ok(capabilities())),
+        "initialize" => respond(writer, seq, request_seq, command, Ok(capabilities(rewind))),
         "launch" => {
             let program = args
                 .get("program")
@@ -793,6 +880,33 @@ fn handle_request<W: Write>(
         "pause" => {
             control.lock().pause_requested = true;
             respond(writer, seq, request_seq, command, Ok(json!({})));
+        }
+        // --- Time-travel rewind (Wave E3, dev/staging; gated on the durable
+        // store). These operate on persisted entity state, not the live
+        // standalone-VM debuggee. Extension arguments: `actorId` (u64),
+        // `targetSequence` (u64, reverseContinue only).
+        "reverseContinue" => {
+            let actor_id = args.get("actorId").and_then(|v| v.as_u64());
+            let target = args.get("targetSequence").and_then(|v| v.as_u64());
+            let result = match (actor_id, target) {
+                (Some(a), Some(t)) => rewind.rewind_to(a, t),
+                _ => Err("reverseContinue requires \"actorId\" and \"targetSequence\"".to_string()),
+            };
+            respond(writer, seq, request_seq, command, result);
+        }
+        "stepBack" => {
+            let result = match args.get("actorId").and_then(|v| v.as_u64()) {
+                Some(a) => rewind.step_back(a),
+                None => Err("stepBack requires \"actorId\"".to_string()),
+            };
+            respond(writer, seq, request_seq, command, result);
+        }
+        "nulangStepForward" => {
+            let result = match args.get("actorId").and_then(|v| v.as_u64()) {
+                Some(a) => rewind.step_forward(a),
+                None => Err("nulangStepForward requires \"actorId\"".to_string()),
+            };
+            respond(writer, seq, request_seq, command, result);
         }
         "stackTrace" => match request_snapshot(cmd_tx) {
             Ok(snap) => {
@@ -1002,6 +1116,22 @@ where
     R: BufRead + Send + 'static,
     W: Write,
 {
+    // Store resolution mirrors the CLI: NULANG_STORE_PATH, else
+    // .nulang/store/ when it exists. Tests use `run_dap_server_io_with_store`.
+    run_dap_server_io_with_store(reader, writer, rewind::resolve_store_dir())
+}
+
+/// Like [`run_dap_server_io`] but with an explicit durable store directory
+/// override (`Some` enables time-travel rewind against that store; `None`
+/// disables rewind regardless of the environment).
+pub fn run_dap_server_io_with_store<R, W>(
+    reader: R,
+    writer: W,
+    store_dir: Option<std::path::PathBuf>,
+) where
+    R: BufRead + Send + 'static,
+    W: Write,
+{
     let (msg_tx, msg_rx): (Sender<Json>, Receiver<Json>) = crossbeam::channel::unbounded();
     let reader_thread = std::thread::spawn(move || {
         let mut r = reader;
@@ -1018,6 +1148,7 @@ where
         crossbeam::channel::unbounded();
 
     let control = Arc::new(Mutex::new(ControlState::new()));
+    let mut rewind = RewindSession::new(store_dir);
     let mut module: Option<Arc<CodeModule>> = None;
     let mut debuggee: Option<std::thread::JoinHandle<()>> = None;
     let mut seq: i64 = 0;
@@ -1044,7 +1175,7 @@ where
                         let request_seq = msg.get("seq").and_then(|v| v.as_i64()).unwrap_or(0);
                         let command = msg.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let args = msg.get("arguments").cloned().unwrap_or(Json::Null);
-                        handle_request(&mut writer, &mut seq, request_seq, &command, &args, &control, &mut debuggee, &mut module, &cmd_tx, &cmd_rx, &event_tx);
+                        handle_request(&mut writer, &mut seq, request_seq, &command, &args, &control, &mut debuggee, &mut module, &cmd_tx, &cmd_rx, &event_tx, &mut rewind);
                     }
                     Err(_) => {
                         // Client disconnected. Drain debuggee events until it
@@ -1321,5 +1452,157 @@ pub(crate) mod tests {
             .find(|m| m["command"] == "evaluate" && m["type"] == "response");
         let ev = ev.expect("expected an evaluate response");
         assert_eq!(ev["body"]["result"], "1");
+    }
+
+    // ---------------------------------------------------------------------
+    // Time-travel rewind (Wave E3)
+    // ---------------------------------------------------------------------
+
+    /// Like `run_session`, but with an explicit durable-store override:
+    /// `Some(dir)` enables rewind against `dir`, `None` disables it.
+    fn run_session_with_store(
+        source: &str,
+        script: &[Json],
+        store_dir: Option<std::path::PathBuf>,
+    ) -> Vec<Json> {
+        let path = write_prog(source);
+        let prog = path.to_string_lossy().to_string();
+        let script: Vec<Json> = script
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                if m.get("command").and_then(|c| c.as_str()) == Some("launch") {
+                    if let Some(p) = m.pointer_mut("/arguments/program") {
+                        *p = Json::String(prog.clone());
+                    }
+                }
+                m
+            })
+            .collect();
+        let mut input = Vec::new();
+        for m in &script {
+            send(&mut input, m);
+        }
+        let mut output = Vec::new();
+        let reader = std::io::Cursor::new(input);
+        run_dap_server_io_with_store(std::io::BufReader::new(reader), &mut output, store_dir);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        parse_output(&output)
+    }
+
+    /// Create a temp store dir holding entity 7 with a snapshot at seq 2
+    /// (count=10) and events 3..=5 (count=11,12,13); returns the dir.
+    fn write_store() -> std::path::PathBuf {
+        use crate::runtime::{
+            ActorSnapshot, EventEntry, JournalEntry, JsonFileStore, PersistedValue,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("nulang-dap-store-{}-{}", std::process::id(), n));
+        let mut store = JsonFileStore::new(&dir).unwrap();
+        let mut snap = ActorSnapshot::default();
+        snap.actor_id = 7;
+        snap.sequence = 2;
+        snap.state
+            .insert("count".to_string(), PersistedValue::Int(10));
+        store.save_snapshot(snap).unwrap();
+        for (s, v) in [(3u64, 11i64), (4, 12), (5, 13)] {
+            store
+                .append_event(
+                    7,
+                    EventEntry {
+                        sequence: s,
+                        field_name: "count".to_string(),
+                        event_name: "Incremented".to_string(),
+                        args: vec![],
+                        value: PersistedValue::Int(v),
+                    },
+                )
+                .unwrap();
+            store
+                .append_journal(
+                    7,
+                    JournalEntry {
+                        sequence: s,
+                        behavior_id: 0,
+                        payload: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn test_rewind_gated_off_without_store() {
+        // With no durable store, rewind is not advertised and requests fail.
+        let script = vec![
+            req(1, "initialize", json!({})),
+            req(
+                2,
+                "reverseContinue",
+                json!({ "actorId": 7, "targetSequence": 3 }),
+            ),
+        ];
+        let msgs = run_session_with_store("let x = 1 in x", &script, None);
+        let init = &msgs[0];
+        assert_eq!(init["body"]["supportsReverseContinueRequest"], false);
+        let rc = msgs
+            .iter()
+            .find(|m| m["command"] == "reverseContinue")
+            .expect("expected a reverseContinue response");
+        assert_eq!(rc["success"], false, "expected failure, got {:#?}", rc);
+    }
+
+    #[test]
+    fn test_reverse_continue_step_back_and_forward() {
+        let dir = write_store();
+        let script = vec![
+            req(1, "initialize", json!({})),
+            // Rewind entity 7 to message #3 -> count = 11.
+            req(
+                2,
+                "reverseContinue",
+                json!({ "actorId": 7, "targetSequence": 3 }),
+            ),
+            // Step back to #2 -> snapshot value count = 10.
+            req(3, "stepBack", json!({ "actorId": 7 })),
+            // Step forward twice: #3 (11), then #4 (12).
+            req(4, "nulangStepForward", json!({ "actorId": 7 })),
+            req(5, "nulangStepForward", json!({ "actorId": 7 })),
+        ];
+        let msgs = run_session_with_store("let x = 1 in x", &script, Some(dir.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let init = &msgs[0];
+        assert_eq!(init["body"]["supportsReverseContinueRequest"], true);
+        assert_eq!(init["body"]["supportsStepBack"], true);
+
+        let resp = |seq: i64, cmd: &str| -> &Json {
+            msgs.iter()
+                .find(|m| m["command"] == cmd && m["type"] == "response" && m["request_seq"] == seq)
+                .unwrap_or_else(|| {
+                    panic!("expected {} response for seq {}, got {:#?}", cmd, seq, msgs)
+                })
+        };
+        let rc = resp(2, "reverseContinue");
+        assert_eq!(rc["success"], true, "got {:#?}", rc);
+        assert_eq!(rc["body"]["sequence"], 3);
+        assert_eq!(rc["body"]["latestSequence"], 5);
+        assert_eq!(rc["body"]["state"]["count"], 11);
+        assert_eq!(rc["body"]["journal"].as_array().unwrap().len(), 1);
+
+        let sb = resp(3, "stepBack");
+        assert_eq!(sb["body"]["sequence"], 2);
+        assert_eq!(sb["body"]["state"]["count"], 10);
+
+        let f1 = resp(4, "nulangStepForward");
+        assert_eq!(f1["body"]["sequence"], 3);
+        assert_eq!(f1["body"]["state"]["count"], 11);
+        let f2 = resp(5, "nulangStepForward");
+        assert_eq!(f2["body"]["sequence"], 4);
+        assert_eq!(f2["body"]["state"]["count"], 12);
     }
 }

@@ -1,0 +1,404 @@
+// Nulang standard library — JSON encoding and decoding.
+// Package: `json` (official seed package, registry tier: Experimental).
+// Standalone port of `src/stdlib/json.nula` — proves stdlib extraction works.
+// Consume with: `import lib` (or via `nula add json`).
+// NOTE: JsonNumber stores a Float. String.to_float and Float.to_string
+// primitives are now available in the VM, enabling numeric conversion
+// while preserving reasonable fidelity for round-tripping.
+
+/// Represents a parsed JSON value.
+pub type JsonValue =
+    | JsonNull
+    | JsonBool(Bool)
+    | JsonNumber(Float)   // Numeric value parsed via String.to_float
+    | JsonString(String)
+    | JsonArray([JsonValue])
+    | JsonObject([(String, JsonValue)])
+
+/// Parse a JSON string into a JsonValue.
+///
+/// Pure-Nulang recursive-descent parser. Handles all JSON value types:
+/// null, true, false, numbers (int/float/scientific), strings (with
+/// \", \\, \/, \b, \f, \n, \r, \t, \uXXXX escapes), arrays, and
+/// nested objects.
+///
+/// Trailing whitespace and extra content after the first value are
+/// ignored. Empty or whitespace-only input returns JsonNull.
+///
+/// Example (verified by `scripts/verify_doc_examples.sh`):
+/// ```nulang
+/// // Round-trip a JSON object through parse + stringify.
+/// import stdlib::json
+///
+/// fn main() {
+///     let v = parse("{\"a\": 1, \"b\": [true, null]}")
+///     let s = stringify(v)
+///     perform IO.print("round-trip: " + s)
+/// }
+/// ```
+pub fn parse(json: String) -> JsonValue {
+    let len = perform String.length(json);
+
+    // ── whitespace ────────────────────────────────────────────────────
+
+    let skip_ws = fn(p) {
+        var cp = p;
+        while cp < len {
+            let c = perform String.charAt(json, cp);
+            if c == 32 || c == 9 || c == 10 || c == 13 then { cp = cp + 1 }
+            else { return cp }
+        };
+        cp
+    };
+
+    // ── string ────────────────────────────────────────────────────────
+
+    let parse_string = fn(p) {
+        var cp = p + 1;  // skip opening "
+        var result = "";
+        var done = false;
+        while !done && cp < len {
+            let c = perform String.charAt(json, cp);
+            if c == 34 then {  // closing "
+                cp = cp + 1;
+                done = true
+            }
+            else if c == 92 then {  // backslash
+                cp = cp + 1;  // advance past backslash
+                if cp < len then {
+                    let esc = perform String.charAt(json, cp);
+                    if esc == 34 then { result = perform String.concat(result, "\"") }
+                    else if esc == 92 then { result = perform String.concat(result, "\\") }
+                    else if esc == 47 then { result = perform String.concat(result, "/") }
+                    else if esc == 98 then { result = perform String.concat(result, perform String.from_char(8)) }
+                    else if esc == 102 then { result = perform String.concat(result, perform String.from_char(12)) }
+                    else if esc == 110 then { result = perform String.concat(result, "\n") }
+                    else if esc == 114 then { result = perform String.concat(result, "\r") }
+                    else if esc == 116 then { result = perform String.concat(result, "\t") }
+                    else if esc == 117 then {
+                        cp = cp + 1;
+                        var hex_val = 0;
+                        var hi = 0;
+                        while hi < 4 && cp < len {
+                            let hc = perform String.charAt(json, cp);
+                            var d = 0;
+                            if hc >= 48 && hc <= 57 then { d = hc - 48 }
+                            else if hc >= 65 && hc <= 70 then { d = hc - 55 }
+                            else if hc >= 97 && hc <= 102 then { d = hc - 87 }
+                            else {};
+                            hex_val = hex_val * 16 + d;
+                            cp = cp + 1;
+                            hi = hi + 1
+                        };
+                        result = perform String.concat(result, perform String.from_char(hex_val))
+                    }
+                    else {
+                        // unknown escape — emit the raw char after backslash
+                        result = perform String.concat(result, perform String.substring(json, cp, 1))
+                    };
+                    cp = cp + 1  // advance past the escaped char
+                } else {}
+            }
+            else {
+                result = perform String.concat(result, perform String.substring(json, cp, 1));
+                cp = cp + 1
+            }
+        };
+        {value: result, pos: cp}
+    };
+
+    // ── number ────────────────────────────────────────────────────────
+
+    let parse_number = fn(p) {
+        var cp = p;
+        let start = cp;
+        // optional minus
+        if cp < len then {
+            let fc = perform String.charAt(json, cp);
+            if fc == 45 then { cp = cp + 1 } else {}
+        } else {};
+        // integer digits
+        while cp < len {
+            let c = perform String.charAt(json, cp);
+            if c >= 48 && c <= 57 then { cp = cp + 1 } else { break }
+        };
+        // optional fractional part
+        if cp < len then {
+            let c = perform String.charAt(json, cp);
+            if c == 46 then {
+                cp = cp + 1;
+                while cp < len {
+                    let fc = perform String.charAt(json, cp);
+                    if fc >= 48 && fc <= 57 then { cp = cp + 1 } else { break }
+                }
+            } else {}
+        } else {};
+        // optional exponent (e/E [+-]? digits)
+        if cp < len then {
+            let c = perform String.charAt(json, cp);
+            if c == 101 || c == 69 then {
+                cp = cp + 1;
+                if cp < len then {
+                    let sc = perform String.charAt(json, cp);
+                    if sc == 43 || sc == 45 then { cp = cp + 1 } else {}
+                } else {};
+                while cp < len {
+                    let dc = perform String.charAt(json, cp);
+                    if dc >= 48 && dc <= 57 then { cp = cp + 1 } else { break }
+                }
+            } else {}
+        } else {};
+        {value: perform String.substring(json, start, cp - start), pos: cp}
+    };
+
+    // ── value ─────────────────────────────────────────────────────────
+
+    let rec parse_value = fn(p) {
+        var cp = skip_ws(p);
+        if cp >= len then { {value: JsonNull, pos: cp} }
+        else {
+            let c = perform String.charAt(json, cp);
+            if c == 34 then {  // string
+                let sr = parse_string(cp);
+                {value: JsonString(sr.value), pos: sr.pos}
+            }
+            else if c == 116 then {  // true
+                {value: JsonBool(true), pos: cp + 4}
+            }
+            else if c == 102 then {  // false
+                {value: JsonBool(false), pos: cp + 5}
+            }
+            else if c == 110 then {  // null
+                {value: JsonNull, pos: cp + 4}
+            }
+            else if c == 91 then {  // array
+                cp = skip_ws(cp + 1);
+                var items = [];
+                if cp < len then {
+                    let nc = perform String.charAt(json, cp);
+                    if nc == 93 then { {value: JsonArray(items), pos: cp + 1} }
+                    else {
+                        var done = false;
+                        var arr_pos = cp;
+                        var arr_items = items;
+                        while !done {
+                            let vr = parse_value(arr_pos);
+                            arr_items = perform Array.push(arr_items, vr.value);
+                            arr_pos = skip_ws(vr.pos);
+                            if arr_pos < len then {
+                                let sep = perform String.charAt(json, arr_pos);
+                                if sep == 44 then { arr_pos = skip_ws(arr_pos + 1) }
+                                else if sep == 93 then { arr_pos = arr_pos + 1; done = true }
+                                else { done = true }
+                            } else { done = true }
+                        };
+                        {value: JsonArray(arr_items), pos: arr_pos}
+                    }
+                } else { {value: JsonArray(items), pos: cp} }
+            }
+            else if c == 123 then {  // object
+                cp = skip_ws(cp + 1);
+                var fields = [];
+                if cp < len then {
+                    let nc = perform String.charAt(json, cp);
+                    if nc == 125 then { {value: JsonObject(fields), pos: cp + 1} }
+                    else {
+                        var done = false;
+                        var obj_pos = cp;
+                        var obj_fields = fields;
+                        while !done {
+                            let kr = parse_string(obj_pos);
+                            obj_pos = skip_ws(kr.pos);
+                            if obj_pos < len then {
+                                let colon = perform String.charAt(json, obj_pos);
+                                if colon == 58 then { obj_pos = obj_pos + 1 } else {}
+                            } else {};
+                            let vr = parse_value(obj_pos);
+                            obj_fields = perform Array.push(obj_fields, (kr.value, vr.value));
+                            obj_pos = skip_ws(vr.pos);
+                            if obj_pos < len then {
+                                let sep = perform String.charAt(json, obj_pos);
+                                if sep == 44 then { obj_pos = skip_ws(obj_pos + 1) }
+                                else if sep == 125 then { obj_pos = obj_pos + 1; done = true }
+                                else { done = true }
+                            } else { done = true }
+                        };
+                        {value: JsonObject(obj_fields), pos: obj_pos}
+                    }
+                } else { {value: JsonObject(fields), pos: cp} }
+            }
+            else {  // number
+                let nr = parse_number(cp);
+                {value: JsonNumber(perform String.to_float(nr.value)), pos: nr.pos}
+            }
+        }
+    };
+
+    let r = parse_value(0);
+    r.value
+}
+
+/// Convert a JsonValue back to a JSON string.
+///
+/// Full fidelity for all types including nested arrays and objects.
+/// Numbers are emitted exactly as parsed (raw text).
+/// Strings are escaped for valid JSON output: \", \\, \n, \r, \t,
+/// \b, \f, and control characters (0x00–0x1F) as \u00XX.
+pub fn stringify(value: JsonValue) -> String {
+    // ── hex digit helper ──────────────────────────────────────────────
+
+    let hex_char = fn(d) {
+        if d < 10 then { perform String.from_char(d + 48) }
+        else { perform String.from_char(d + 87) }
+    };
+
+    // ── string escape helper ──────────────────────────────────────────
+
+    let esc_string = fn(s) {
+        var result = "\"";
+        var i = 0;
+        let slen = perform String.length(s);
+        while i < slen {
+            let c = perform String.charAt(s, i);
+            if c == 34 then {  // "
+                result = perform String.concat(result, "\\\"")
+            }
+            else if c == 92 then {  // \
+                result = perform String.concat(result, "\\\\")
+            }
+            else if c == 10 then {  // \n
+                result = perform String.concat(result, "\\n")
+            }
+            else if c == 13 then {  // \r
+                result = perform String.concat(result, "\\r")
+            }
+            else if c == 9 then {  // \t
+                result = perform String.concat(result, "\\t")
+            }
+            else if c == 8 then {  // \b
+                result = perform String.concat(result, "\\b")
+            }
+            else if c == 12 then {  // \f
+                result = perform String.concat(result, "\\f")
+            }
+            else if c < 32 then {  // other control char → \u00XX
+                let hi = c / 16;
+                let lo = c % 16;
+                result = perform String.concat(result, "\\u00");
+                result = perform String.concat(result, hex_char(hi));
+                result = perform String.concat(result, hex_char(lo))
+            }
+            else {
+                result = perform String.concat(result, perform String.substring(s, i, 1))
+            };
+            i = i + 1
+        };
+        perform String.concat(result, "\"")
+    };
+
+    // ── recursive value stringify ─────────────────────────────────────
+
+    let rec go = fn(v) {
+        match v {
+            JsonNull => "null",
+            JsonBool(b) => if b then "true" else "false",
+            JsonNumber(f) => perform Float.to_string(f),
+            JsonString(s) => esc_string(s),
+            JsonArray(items) => {
+                var result = "[";
+                var i = 0;
+                let alen = perform Array.length(items);
+                while i < alen {
+                    if i > 0 then { result = perform String.concat(result, ",") } else {};
+                    result = perform String.concat(result, go(items[i]));
+                    i = i + 1
+                };
+                perform String.concat(result, "]")
+            },
+            JsonObject(fields) => {
+                var result = "{";
+                var i = 0;
+                let olen = perform Array.length(fields);
+                while i < olen {
+                    if i > 0 then { result = perform String.concat(result, ",") } else {};
+                    let pair = fields[i];
+                    result = perform String.concat(result, esc_string(pair.0));
+                    result = perform String.concat(result, ":");
+                    result = perform String.concat(result, go(pair.1));
+                    i = i + 1
+                };
+                perform String.concat(result, "}")
+            }
+        }
+    };
+
+    go(value)
+}
+
+
+/// Get a string field from a JSON object, or return a default.
+pub fn get_string(obj: JsonValue, key: String, default: String) -> String {
+    match obj {
+        JsonObject(fields) => {
+            var i = 0;
+            var len = perform Array.length(fields);
+            while i < len {
+                let pair = fields[i];
+                if pair.0 == key then {
+                    match pair.1 {
+                        JsonString(s) => return s,
+                        _ => return default,
+                    }
+                } else { };
+                i = i + 1
+            };
+            default
+        },
+        _ => default,
+    }
+}
+
+/// Get a number field from a JSON object, or return a default.
+/// Returns the parsed Float value.
+pub fn get_number(obj: JsonValue, key: String, default: Float) -> Float {
+    match obj {
+        JsonObject(fields) => {
+            var i = 0;
+            var len = perform Array.length(fields);
+            while i < len {
+                let pair = fields[i];
+                if pair.0 == key then {
+                    match pair.1 {
+                        JsonNumber(n) => return n,
+                        _ => return default,
+                    }
+                } else { };
+                i = i + 1
+            };
+            default
+        },
+        _ => default,
+    }
+}
+
+/// Get a bool field from a JSON object, or return a default.
+pub fn get_bool(obj: JsonValue, key: String, default: Bool) -> Bool {
+    match obj {
+        JsonObject(fields) => {
+            var i = 0;
+            var len = perform Array.length(fields);
+            while i < len {
+                let pair = fields[i];
+                if pair.0 == key then {
+                    match pair.1 {
+                        JsonBool(b) => return b,
+                        _ => return default,
+                    }
+                } else { };
+                i = i + 1
+            };
+            default
+        },
+        _ => default,
+    }
+}

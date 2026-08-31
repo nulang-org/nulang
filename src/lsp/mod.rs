@@ -6,7 +6,7 @@
 //!
 //! | Feature | Description |
 //! |---------|-------------|
-//! | `textDocument/diagnostic` | Parse/type/effect/capability diagnostics |
+//! | `textDocument/publishDiagnostics` (push) | Parse/type/effect/capability diagnostics |
 //! | `textDocument/hover` | Function signatures, effects, types, doc comments |
 //! | `textDocument/definition` | Go to definition for all declaration types |
 //! | `textDocument/references` | Find all usages of a symbol |
@@ -158,14 +158,12 @@ impl LanguageServer for NulangLanguageServer {
                         })),
                     },
                 )),
-                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
-                    DiagnosticOptions {
-                        identifier: Some("nulang".to_string()),
-                        inter_file_dependencies: false,
-                        workspace_diagnostics: false,
-                        work_done_progress_options: WorkDoneProgressOptions::default(),
-                    },
-                )),
+                // No `diagnostic_provider`: pull diagnostics
+                // (`textDocument/diagnostic`) are NOT implemented, and
+                // advertising them makes clients send requests that fail
+                // with MethodNotFound (and, worse, tower-lsp logs that
+                // failure to stdout, corrupting the JSON-RPC framing).
+                // Diagnostics are push-only via `publishDiagnostics`.
                 ..ServerCapabilities::default()
             },
             ..InitializeResult::default()
@@ -1953,6 +1951,9 @@ impl NulangLanguageServer {
                     Self::extract_expr_types(a, source, map);
                 }
             }
+            Expr::GrainRef { key, .. } => {
+                Self::extract_expr_types(key, source, map);
+            }
             Expr::Handle { body, handlers, .. } => {
                 Self::extract_expr_types(body, source, map);
                 for h in handlers {
@@ -2365,6 +2366,18 @@ impl<'a> InlayHintEngine<'a> {
                                 });
                             }
                         }
+                    }
+                }
+                crate::ast::Decl::Signal { name, span, .. } => {
+                    if let Some(ty) = tc.inferred_decl_types.get(name) {
+                        let line = span.line().saturating_sub(1) as u32;
+                        let col = (span.column() + name.len()) as u32;
+                        annotations.push(TypeAnnotation {
+                            line,
+                            character: col,
+                            label: format!(": {}", type_to_string(ty)),
+                            kind: AnnotationKind::Type,
+                        });
                     }
                 }
                 crate::ast::Decl::LetBinding {

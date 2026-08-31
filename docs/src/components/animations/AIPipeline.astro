@@ -44,7 +44,6 @@
     if (stages.length === 0) return;
 
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    if (reducedMotion) return;
 
     const svgNS = 'http://www.w3.org/2000/svg';
     const stageCenters = [
@@ -75,7 +74,7 @@
       stages[0].classList.add('active');
       setTimeout(() => stages[0].classList.remove('active'), 300);
 
-      function animate(now: number) {
+      function animate(now) {
         const legElapsed = now - legStart;
         const legProgress = Math.min(legElapsed / legDuration, 1);
 
@@ -113,7 +112,25 @@
       requestAnimationFrame(animate);
     }
 
-    setInterval(spawnParticle, 2500);
+    function start() {
+      spawnParticle();
+      setInterval(spawnParticle, 2500);
+    }
+
+    if (reducedMotion) {
+      // Static preview: highlight middle stage
+      stages[2]?.classList.add('active');
+      return;
+    }
+
+    if (!svg) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) {
+        start();
+        observer.disconnect();
+      }
+    }, { threshold: 0.25 });
+    observer.observe(svg);
   }
 
   if (document.readyState === 'loading') {

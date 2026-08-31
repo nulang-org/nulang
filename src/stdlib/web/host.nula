@@ -1,0 +1,112 @@
+// Nulang Web framework — built-in host effect operations.
+// Import: `import stdlib::web`
+//
+// The `Web` effect is the runtime host for the compiler-first web framework.
+// Wrapper functions also declare the placement effects (`Request`, `Render`,
+// `Respond`) so the compiler can infer placements.
+
+import stdlib::web::types
+
+/// Register a request handler for the given path.
+/// Inferred placement: server (because it performs `Request`).
+pub fn route(path: String, h) -> Unit ! {Web, Request} {
+    perform Web.route("GET", path, h)
+}
+
+/// Register a request handler for the given method and path.
+/// Inferred placement: server (because it performs `Request`).
+pub fn route_method(method: String, path: String, h) -> Unit ! {Web, Request} {
+    perform Web.route(method, path, h)
+}
+
+/// Construct an HTML element from a tag name, attributes, and children.
+/// Inferred placement: static (because it only performs `Render` or `Web`).
+pub fn element(name: String, attrs, children: [Html]) -> Html ! {Web, Render} {
+    // unchanged
+    perform Web.html(name, attrs, children)
+}
+
+/// Escape a string and wrap it as an `Html` text node.
+pub fn text(s: String) -> Html ! {Web, Render} {
+    perform Web.text(s)
+}
+
+/// Wrap a raw string as an `Html` value without escaping.
+pub fn raw(s: String) -> Html ! {Web, Render} {
+    perform Web.raw(s)
+}
+
+/// Produce a redirect response to the given URL.
+pub fn redirect(url: String) -> Html ! {Web, Respond} {
+    perform Web.redirect(url)
+}
+
+/// Serve the contents of a static file as an HTML response.
+pub fn serve_static(path: String) -> Html ! {Web, Request} {
+    perform Web.serve_static(path)
+}
+
+/// Read the body of the current HTTP request.
+pub fn read_body() -> String ! {Web, Request} {
+    perform Web.read_body()
+}
+
+/// Get a route parameter from the current HTTP request.
+pub fn param(name: String) -> String ! {Web, Request} {
+    perform Web.param(name)
+}
+
+/// Get a request header from the current HTTP request.
+pub fn header(name: String) -> String ! {Web, Request} {
+    perform Web.header(name)
+}
+
+/// Get a cookie value from the current HTTP request by name.
+pub fn cookie(name: String) -> String ! {Web, Request} {
+    perform Web.cookie(name)
+}
+
+/// Get the HTTP method of the current request.
+pub fn request_method() -> String ! {Web, Request} {
+    perform Web.method()
+}
+
+/// Parse the URL-encoded body of the current request into (name, value) pairs.
+pub fn form_fields() -> [(String, String)] ! {Web, Request} {
+    perform Web.form()
+}
+
+/// Get a single value from the URL-encoded body of the current request.
+pub fn form_value(name: String) -> String ! {Web, Request} {
+    perform Web.form_value(name)
+}
+
+/// Get a value from the ephemeral in-memory web store.
+pub fn kv_get(key: String) -> String ! {Web, Request} {
+    perform Web.kv_get(key)
+}
+
+/// Set a value in the ephemeral in-memory web store.
+pub fn kv_set(key: String, value: String) -> Unit ! {Web, Request} {
+    perform Web.kv_set(key, value)
+}
+
+/// Delete a value from the ephemeral in-memory web store.
+pub fn kv_delete(key: String) -> Unit ! {Web, Request} {
+    perform Web.kv_delete(key)
+}
+
+/// Return all key/value pairs in the ephemeral in-memory web store.
+pub fn kv_all() -> [(String, String)] ! {Web, Request} {
+    perform Web.kv_all()
+}
+
+/// Set a response cookie.
+pub fn set_cookie(name: String, value: String) -> Unit ! {Web, Respond} {
+    perform Web.set_cookie(name, value)
+}
+
+/// Clear a response cookie.
+pub fn clear_cookie(name: String) -> Unit ! {Web, Respond} {
+    perform Web.clear_cookie(name)
+}

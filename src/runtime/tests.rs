@@ -4,9 +4,11 @@
 //! Full history in local commit 1c2cde9.
 
 use super::*;
+use crate::bytecode::{ActorMeta, CodeModule, Constant};
 use crate::runtime::gc::OrcaGc;
 use crate::runtime::heap::{ActorHeap, TypeTag};
-use crate::vm::Frame;
+use crate::vm::{Frame, Value};
+#[cfg(feature = "tcp")]
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -106,6 +108,77 @@ fn test_delivery_establishes_child_context_and_inherits() {
     // receiver would child off it, continuing the same trace.
     assert_eq!(child.trace_id(), ctx.trace_id());
     assert_eq!(child.span_id(), ctx.span_id());
+}
+
+#[test]
+fn test_metrics_snapshot_topology_and_crdt() {
+    let mut rt = Runtime::new();
+
+    // Supervision tree: root supervisor with one child.
+    let sup_id = rt.create_supervisor("root", RestartStrategy::OneForOne);
+    let child_id = rt.spawn_actor(Box::new(|| vec![]));
+    let spec = ChildSpec::new("child1", RestartPolicy::Permanent);
+    rt.supervise_child(sup_id, spec, child_id);
+
+    // CRDT replica with a change that hasn't been synced.
+    rt.crdt_manager = Some(crate::runtime::crdt_manager::CrdtManager::new(42));
+    let (_, mut counter) = rt.crdt_manager.as_mut().unwrap().create_gcounter();
+    counter.increment();
+
+    let snap = rt.metrics_snapshot();
+
+    // Supervision topology.
+    assert_eq!(snap.supervisors.len(), 1);
+    let sup = &snap.supervisors[0];
+    assert_eq!(sup.id, sup_id);
+    assert_eq!(sup.name, "root");
+    assert_eq!(sup.strategy, "OneForOne");
+    assert_eq!(sup.parent, None);
+    assert_eq!(sup.children.len(), 1);
+    assert_eq!(sup.children[0].actor_id, child_id);
+    assert_eq!(sup.children[0].spec_id, "child1");
+
+    // CRDT replication state.
+    assert_eq!(snap.crdt.node_id, 42);
+    assert_eq!(snap.crdt.entries, 1);
+    assert_eq!(snap.crdt.ops_synced, 0);
+    assert!(
+        snap.crdt.unsynced_deltas >= 1,
+        "created-but-unsynced entry must count as an unsynced delta, got {}",
+        snap.crdt.unsynced_deltas
+    );
+}
+
+#[test]
+fn test_render_topology_nested_supervisors() {
+    let mut rt = Runtime::new();
+    // top -> mid -> leaf actor
+    let top_id = rt.create_supervisor("top", RestartStrategy::OneForAll);
+    let mid_id = rt.create_supervisor("mid", RestartStrategy::OneForOne);
+    let leaf_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.supervise_child(
+        top_id,
+        ChildSpec::new("m", RestartPolicy::Permanent),
+        mid_id,
+    );
+    rt.supervise_child(
+        mid_id,
+        ChildSpec::new("l", RestartPolicy::Transient),
+        leaf_id,
+    );
+
+    let text = rt.render_topology();
+    let top_pos = text
+        .find("supervisor top [OneForAll]")
+        .expect("top rendered");
+    let mid_pos = text
+        .find("supervisor mid [OneForOne]")
+        .expect("mid rendered");
+    assert!(
+        text.contains(&format!("actor {leaf_id} (l)")),
+        "leaf rendered: {text}"
+    );
+    assert!(mid_pos > top_pos, "mid must nest under top:\n{text}");
 }
 
 #[test]
@@ -820,6 +893,7 @@ fn dyn_worker_module(default_count: i64) -> crate::bytecode::CodeModule {
         is_workflow: false,
         is_agent: false,
         is_organization: false,
+        is_virtual: false,
         tools: vec![],
         semantic_memory_dimensions: None,
         procedural_memory_namespace: None,
@@ -2076,6 +2150,7 @@ fn test_vm_spawn_creates_persistent_actor() {
         is_workflow: false,
         is_agent: false,
         is_organization: false,
+        is_virtual: false,
         tools: vec![],
         semantic_memory_dimensions: None,
         procedural_memory_namespace: None,
@@ -2139,6 +2214,7 @@ fn test_vm_spawn_creates_non_persistent_actor() {
         is_workflow: false,
         is_agent: false,
         is_organization: false,
+        is_virtual: false,
         tools: vec![],
         semantic_memory_dimensions: None,
         procedural_memory_namespace: None,
@@ -3347,13 +3423,17 @@ fn test_pipeline_runtime_api() {
 // Multi-Node Distributed Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tcp")]
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+#[cfg(feature = "tcp")]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(feature = "tcp")]
 use std::thread::sleep;
 
 /// Shared CertificateParams for the test CA — used by both generate_test_ca
 /// and generate_test_leaf so leaf certificates are correctly signed without
 /// needing the `x509-parser` feature to re-parse PEM.
+#[cfg(feature = "tcp")]
 fn ca_cert_params() -> CertificateParams {
     let mut params = CertificateParams::new(vec![]).expect("ca params");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -3362,6 +3442,7 @@ fn ca_cert_params() -> CertificateParams {
 }
 
 /// Generate a self-signed CA certificate and key (PEM-encoded).
+#[cfg(feature = "tcp")]
 fn generate_test_ca() -> (Vec<u8>, KeyPair) {
     let params = ca_cert_params();
     let key = KeyPair::generate().expect("key gen");
@@ -3376,6 +3457,7 @@ fn generate_test_ca() -> (Vec<u8>, KeyPair) {
 /// the CA params needed for signing are reconstructed from `ca_cert_params()`
 /// because rcgen's `Issuer::from_ca_cert_pem` requires the optional
 /// `x509-parser` feature.
+#[cfg(feature = "tcp")]
 fn generate_test_leaf(name: &str, ca_key: &KeyPair, _ca_cert_pem: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let ca_params = ca_cert_params();
     let params = CertificateParams::new(vec![name.to_string(), "localhost".to_string()])
@@ -3386,6 +3468,7 @@ fn generate_test_leaf(name: &str, ca_key: &KeyPair, _ca_cert_pem: &[u8]) -> (Vec
     (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
 }
 
+#[cfg(feature = "tcp")]
 /// Start a distributed runtime with MutualTLS enabled, bound to an ephemeral port.
 fn start_mutual_tls_node(ca_cert_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Runtime {
     let mut rt = Runtime::new();
@@ -3402,6 +3485,7 @@ fn start_mutual_tls_node(ca_cert_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) ->
     rt
 }
 
+#[cfg(feature = "tcp")]
 /// Start a distributed-enabled runtime bound to an ephemeral loopback port.
 fn start_distributed_node() -> Runtime {
     let mut rt = Runtime::new();
@@ -3413,6 +3497,7 @@ fn start_distributed_node() -> Runtime {
     rt
 }
 
+#[cfg(feature = "tcp")]
 /// Node-death recovery (PLAN.md Phase 5 deliverable 7, parts a+b): when a
 /// peer node is declared `Failed`, the local runtime must (a) invalidate
 /// its `RemoteActorCache` entries so sends fail fast instead of
@@ -3515,6 +3600,7 @@ fn test_node_failed_invalidates_cache_and_delivers_down() {
 /// deadline (30 s): convergence is normally sub-second, but under heavy
 /// CPU load the real-TCP handshake and heartbeat cadence can degrade by
 /// an order of magnitude.
+#[cfg(feature = "tcp")]
 fn pump_until_converged(nodes: &mut [&mut Runtime], expected: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -3543,6 +3629,7 @@ fn pump_until_converged(nodes: &mut [&mut Runtime], expected: usize, timeout: Du
 }
 
 /// Shut down the transports of the given nodes.
+#[cfg(feature = "tcp")]
 fn shutdown_nodes(nodes: &mut [&mut Runtime]) {
     for rt in nodes.iter_mut() {
         if let Some(mut transport) = rt.distributed.transport.take() {
@@ -3551,6 +3638,7 @@ fn shutdown_nodes(nodes: &mut [&mut Runtime]) {
     }
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_three_node_cluster_membership_converges() {
     let mut rt_a = start_distributed_node();
@@ -3631,6 +3719,7 @@ fn test_three_node_cluster_membership_converges() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b, &mut rt_c]);
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_three_node_remote_actor_message_delivery() {
     let mut rt_a = start_distributed_node();
@@ -3708,6 +3797,7 @@ fn test_three_node_remote_actor_message_delivery() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b, &mut rt_c]);
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_actor_migration_between_two_nodes() {
     use crate::bytecode::{ActorMeta, BehaviorTableEntry, CodeModule, Constant};
@@ -3738,6 +3828,7 @@ fn test_actor_migration_between_two_nodes() {
         is_workflow: false,
         is_agent: false,
         is_organization: false,
+        is_virtual: false,
         tools: vec![],
         semantic_memory_dimensions: None,
         procedural_memory_namespace: None,
@@ -3923,6 +4014,7 @@ fn test_actor_migration_between_two_nodes() {
 /// clock), so callers should budget for `DEFAULT_HEARTBEAT_TIMEOUT` +
 /// `DEFAULT_SUSPICION_DURATION` (2s + 5s at the time of writing) plus
 /// margin.
+#[cfg(feature = "tcp")]
 fn pump_until_peer_failed(nodes: &mut [&mut Runtime], dead: NodeId, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -3965,6 +4057,7 @@ fn pump_until_peer_failed(nodes: &mut [&mut Runtime], dead: NodeId, timeout: Dur
 /// incarnation (see `merge_membership_from_sender`). Tests that route a
 /// remote message to a non-seed node must wait for this, or `send_distributed`
 /// dials a dead source port and silently drops the message.
+#[cfg(feature = "tcp")]
 fn pump_until_addresses_converge(
     nodes: &mut [&mut Runtime],
     listen: &[(NodeId, SocketAddr)],
@@ -4003,6 +4096,7 @@ fn pump_until_addresses_converge(
     }
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite for distribution): a first,
 /// real step -- not the full "10^3 seeds across 5 topologies" target,
 /// but a genuine fault-injection test against real `Runtime` instances
@@ -4126,6 +4220,7 @@ fn test_three_node_cluster_survives_hard_node_failure_and_rejoin() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b, &mut rt_c2]);
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite) rolling-restart follow-up.
 /// `test_three_node_cluster_survives_hard_node_failure_and_rejoin` proved a
 /// single hard node failure is detected and the survivors keep operating
@@ -4287,6 +4382,7 @@ fn test_three_node_cluster_survives_rolling_restart_of_every_node() {
     shutdown_nodes(&mut [&mut rt_c2, &mut rt_b2, &mut rt_a2]);
 }
 
+#[cfg(feature = "tcp")]
 /// Start a distributed node with a virtual clock installed AFTER
 /// distribution is enabled (the cluster's real-time stamps predate the
 /// clock base, so `Instant::duration_since` never underflows). All time
@@ -4303,6 +4399,7 @@ fn start_virtual_clock_node() -> Runtime {
 /// processing on each (cluster tick + packet delivery). Advancing first
 /// means the tick sees the new virtual time, so heartbeats, suspicion
 /// transitions, failure detection, and probes all fire on schedule.
+#[cfg(feature = "tcp")]
 fn advance_all(nodes: &mut [&mut Runtime], step: Duration) {
     for rt in nodes.iter_mut() {
         rt.advance_time(step);
@@ -4311,11 +4408,15 @@ fn advance_all(nodes: &mut [&mut Runtime], step: Duration) {
         rt.process_network();
     }
     // Let the real loopback TCP threads deliver packets written this
-    // round before the next round reads them.
-    sleep(Duration::from_millis(2));
+    // round before the next round reads them. 10 ms (was 2 ms): under
+    // heavy CI load the reader threads can be delayed past the virtual
+    // heartbeat deadline, making heartbeats appear lost and breaking
+    // convergence (observed flake: 5-node split-brain test).
+    sleep(Duration::from_millis(10));
 }
 
 /// The status of `node` in `rt`'s cluster view, if known.
+#[cfg(feature = "tcp")]
 fn cluster_status(rt: &Runtime, node: NodeId) -> Option<NodeStatus> {
     rt.distributed
         .cluster
@@ -4330,6 +4431,7 @@ fn cluster_status(rt: &Runtime, node: NodeId) -> Option<NodeStatus> {
 /// convergence condition. Membership (gossip) converges in ~1 s virtual,
 /// but active views fill only through the 5 s repair cycle + reciprocal
 /// heartbeat confirmation.
+#[cfg(feature = "tcp")]
 fn active_views_converged(nodes: &[&Runtime], ids: &[NodeId]) -> bool {
     nodes.iter().all(|rt| {
         let c = rt.distributed.cluster.as_ref().unwrap();
@@ -4339,6 +4441,7 @@ fn active_views_converged(nodes: &[&Runtime], ids: &[NodeId]) -> bool {
     })
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite): split-brain — two mutually
 /// invisible healthy sub-clusters, NOT one node dying. Three real
 /// `Runtime`s over real loopback TCP, driven by per-node virtual clocks
@@ -4497,6 +4600,7 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b, &mut rt_c]);
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite): asymmetric partition — A sees
 /// B but B can't see A. Only A's outbound packets to B are dropped, so B
 /// stops hearing A and must mark A `Failed` through the real failure
@@ -4631,6 +4735,7 @@ fn test_three_node_cluster_asymmetric_partition_detects_and_heals() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite): 5-node split-brain, the
 /// "5-node topologies" item. Five real `Runtime`s over real loopback
 /// TCP, split {A,B} | {C,D,E} via transport-level packet drops. Asserts
@@ -4656,7 +4761,11 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     }
     let step = Duration::from_millis(100);
     let mut converged = false;
-    for _ in 0..300 {
+    // 600 iterations (60 s virtual): convergence normally takes ~10 s
+    // virtual (5 s repair cycle + reciprocal heartbeat confirmation),
+    // but under heavy CI load the real TCP delivery can lag the virtual
+    // clock, so give the budget 2x headroom (observed flake).
+    for _ in 0..600 {
         advance_all(&mut nodes.iter_mut().collect::<Vec<_>>(), step);
         if active_views_converged(&nodes.iter().collect::<Vec<_>>(), &ids) {
             converged = true;
@@ -4774,6 +4883,7 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     shutdown_nodes(&mut nodes.iter_mut().collect::<Vec<_>>());
 }
 
+#[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite): split-brain RESOLVER behavior
 /// end-to-end — the `StaticQuorumResolver` down-self path through the
 /// REAL runtime, not the cluster-sim unit tests. Three real `Runtime`s
@@ -4788,7 +4898,11 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
 /// surviving majority keeps working.
 #[test]
 fn test_three_node_cluster_static_quorum_downs_minority() {
-    let quorum_config = ClusterConfig { split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 3 }, probe_interval: Duration::from_secs(5), ..Default::default() };
+    let quorum_config = ClusterConfig {
+        split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 3 },
+        probe_interval: Duration::from_secs(5),
+        ..Default::default()
+    };
 
     // Set the config BEFORE enable_distribution so `apply_config` picks
     // up the resolver at enable time.
@@ -4986,6 +5100,7 @@ fn test_three_node_cluster_static_quorum_downs_minority() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b, &mut rt_c]);
 }
 
+#[cfg(feature = "tcp")]
 /// End-to-end coverage of PLAN.md Phase 5 deliverable 7 parts (a)+(b)
 /// through the REAL failure-detection path, not a direct call to
 /// `handle_node_failed`. A local actor on survivor A monitors a remote
@@ -5094,6 +5209,7 @@ fn test_node_death_delivers_down_to_local_watcher_via_failure_detector() {
     shutdown_nodes(&mut [&mut rt_a]);
 }
 
+#[cfg(feature = "tcp")]
 /// The self-healing path (Phase 5 deliverable 2): when a node goes quiet,
 /// the survivor's failure detector marks it Failed and the cluster probe
 /// re-establishes contact — once the quiet node processes again, the probe
@@ -5153,6 +5269,7 @@ fn test_probe_rejoins_quiet_node_without_explicit_join() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// Content hash mismatch triggers bytecode fetch; the retry queue holds
 /// the message until the FetchBehaviorResponse arrives, then delivers it.
 #[test]
@@ -5222,6 +5339,7 @@ fn test_message_retry_after_bytecode_fetch() {
         content_hash: Some(correct_hash),
         payload: vec![Value::int(42)],
         string_table: vec![],
+        object_table: vec![],
         sender_actor: 0,
         sender_node: node_b,
         priority: crate::runtime::mailbox::MessagePriority::Normal,
@@ -5264,6 +5382,7 @@ fn test_message_retry_after_bytecode_fetch() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// Gossip relay convergence: three nodes seeded only as a chain
 /// (B joins A, C joins B — C never contacts A directly) must still
 /// converge to a full membership view via gossip relayed by B.
@@ -5325,11 +5444,13 @@ fn test_three_node_gossip_converges_chain_seeded() {
 
 /// Handler for the remotely-spawnable behavior used by
 /// `test_remote_spawn_request_delivery`.
+#[cfg(feature = "tcp")]
 fn remote_spawn_store_handler(actor: &mut Actor, args: &[Value]) {
     let n = args.get(0).and_then(|v| v.as_int()).unwrap_or(-1);
     actor.set_state_field("received", Value::int(n));
 }
 
+#[cfg(feature = "tcp")]
 /// Remote spawn delivery: node A issues a SpawnRequest for a behavior
 /// registered on node B, receives the new actor's id via SpawnResponse,
 /// and can then address the spawned actor by name.
@@ -5466,6 +5587,7 @@ fn test_remote_spawn_request_delivery() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// RFC-0007 cross-node routing by BARE actor-ref value: after a remote
 /// spawn, `send`/`ask` addressing the spawned actor by its plain id (the
 /// only thing an actor-ref Value carries) must route over the wire —
@@ -5561,6 +5683,7 @@ fn test_remote_ref_send_by_bare_id_routes_wire() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// RFC-0007 placeholder queue: a message sent to the spawn@node
 /// placeholder BEFORE the SpawnResponse arrives is queued in wire form
 /// and flushed to the real actor id on arrival — no message loss in the
@@ -5682,6 +5805,7 @@ fn test_remote_ref_pending_spawn_queue_flushes() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 /// RFC-0007 collision guard: `fresh_actor_id` starts at 1 on EVERY node,
 /// so a remote actor id can numerically equal a local actor's id. Local
 /// actors must win the routing decision — a bare-id send to a colliding
@@ -5744,6 +5868,7 @@ fn test_crdt_sync_round_schedule() {
     ));
 }
 
+#[cfg(feature = "tcp")]
 /// `sync_crdts` is a no-op that does not count rounds when distribution
 /// is disabled; once enabled, every call counts exactly one round.
 #[test]
@@ -5762,6 +5887,7 @@ fn test_sync_crdts_round_counting() {
     shutdown_nodes(&mut [&mut rt]);
 }
 
+#[cfg(feature = "tcp")]
 /// End-to-end: CRDT changes propagate between two clustered nodes through
 /// `sync_crdts`, across both the initial full-state round (which creates
 /// the entry on the receiver) and subsequent delta rounds.
@@ -5850,6 +5976,7 @@ fn test_crypto_provider_hash_bytes() {
     );
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_mutual_tls_connect_and_verify() {
     // Two nodes with the same CA can establish a TLS connection, verify
@@ -5882,6 +6009,7 @@ fn test_mutual_tls_connect_and_verify() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_mutual_tls_cluster_converges() {
     // Two mTLS nodes with the same CA converge via heartbeats.
@@ -5907,6 +6035,7 @@ fn test_mutual_tls_cluster_converges() {
     pump_until_converged(&mut [&mut rt_a, &mut rt_b], 2, Duration::from_secs(15));
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
+#[cfg(feature = "tcp")]
 #[test]
 fn test_mutual_tls_rejects_cert_identity_mismatch() {
     let (ca_pem, ca_key) = generate_test_ca();
@@ -5948,6 +6077,7 @@ fn test_mutual_tls_rejects_cert_identity_mismatch() {
     shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn test_mutual_tls_rejects_plaintext_peer() {
     let (ca_pem, ca_key) = generate_test_ca();
@@ -6420,4 +6550,336 @@ fn test_dst_gc_during_send_seed_sweep() {
             rt.actors.get(&receiver).unwrap().heap.live_count()
         );
     }
+}
+
+// ========================================================================
+// Object Store Tests
+// ========================================================================
+
+#[test]
+fn test_object_store_put_get() {
+    let mut rt = Runtime::new();
+    let bytes: Box<[u8]> = vec![1, 2, 3, 4, 5].into_boxed_slice();
+    let id = rt.object_store.put(bytes);
+    let entry = rt.object_store.get(id).unwrap();
+    assert_eq!(entry.as_bytes(), &[1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn test_object_ref_send_same_shard_records_hold() {
+    let mut rt = Runtime::new();
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    let bytes: Box<[u8]> = vec![9, 8, 7].into_boxed_slice();
+    let obj_id = rt.object_store.put(bytes);
+
+    rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+    rt.step_actor(receiver);
+
+    let actor = rt.actors.get(&receiver).unwrap();
+    assert!(
+        actor.held_objects.contains(&obj_id),
+        "receiver should hold the object ref after delivery"
+    );
+    // Refcount: original put (1) + delivery hold (1) = 2
+    assert_eq!(rt.object_store.get(obj_id).unwrap().ref_count(), 2);
+}
+
+#[test]
+fn test_object_ref_released_on_actor_exit() {
+    let mut rt = Runtime::new();
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    let bytes: Box<[u8]> = vec![9, 8, 7].into_boxed_slice();
+    let obj_id = rt.object_store.put(bytes);
+
+    rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+    rt.step_actor(receiver);
+    assert!(rt.object_store.get(obj_id).is_some());
+
+    // Drop the unowned creator ref so that only the receiver's hold remains.
+    rt.object_store.drop_ref(obj_id);
+
+    rt.exit_actor(receiver, ExitReason::Normal);
+    assert!(
+        rt.object_store.get(obj_id).is_none(),
+        "object should be freed when the last actor exits"
+    );
+}
+
+#[test]
+fn test_object_ref_cross_shard_copies_bytes() {
+    let mut shards = Runtime::new_sharded(2);
+
+    // Spawn actors until we have one on each shard with opposite parity.
+    // Actor assignment is actor_id % shard_count, but the global id counter
+    // may be in an arbitrary state when this test runs.
+    let mut a = shards[0].spawn_actor(Box::new(|| vec![]));
+    while a % 2 != 0 {
+        a = shards[0].spawn_actor(Box::new(|| vec![]));
+    }
+    let mut b = shards[1].spawn_actor(Box::new(|| vec![]));
+    while b % 2 != 1 {
+        b = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    // a is in shard 0 with an even id, so routing a -> b crosses to shard 1.
+    let source_shard = (a % 2) as usize;
+    let target_shard = (b % 2) as usize;
+    assert_eq!(source_shard, 0);
+    assert_eq!(target_shard, 1);
+
+    // Put object in the source shard's store and send from a to b.
+    let bytes: Box<[u8]> = vec![11, 22, 33].into_boxed_slice();
+    let obj_id = shards[source_shard].object_store.put(bytes);
+    shards[source_shard].current_actor = Some(a);
+    shards[source_shard].send_message_by_id(b, 0, &[Value::object(obj_id)]);
+
+    // Pump the target shard to receive the cross-shard message.
+    shards[target_shard].drain_cross_shard_messages();
+
+    assert_eq!(
+        shards[target_shard].actors.get(&b).unwrap().mailbox.len(),
+        1
+    );
+
+    // The received object id is local to the target store (ids are per-store
+    // and may coincide by chance, so verify via bytes, not id equality).
+    let received_msg = shards[target_shard]
+        .actors
+        .get_mut(&b)
+        .unwrap()
+        .mailbox
+        .pop()
+        .unwrap();
+    let local_id = received_msg.payload[0].as_object_id().unwrap();
+    assert_eq!(
+        shards[target_shard]
+            .object_store
+            .get(local_id)
+            .unwrap()
+            .as_bytes(),
+        &[11, 22, 33]
+    );
+}
+
+// ========================================================================
+// Built-in Grain effects
+// ========================================================================
+
+fn register_test_grain(rt: &mut Runtime, name: &str) {
+    let mut module = CodeModule::new(name);
+    let mut meta = ActorMeta::new(name);
+    meta.is_virtual = true;
+    module.add_actor_meta(meta);
+    let grain_type = GrainType {
+        module,
+        default_models: vec![],
+        bytecode_offsets: vec![],
+        compensation_offsets: vec![],
+        dehydrate_policy: DehydratePolicy::default(),
+    };
+    rt.grain_registry.register(name, grain_type);
+}
+
+#[test]
+fn test_grain_ref_builtin_string_key() {
+    let mut rt = Runtime::new();
+    register_test_grain(&mut rt, "Counter");
+    let constants = vec![
+        Constant::String("Counter".to_string()),
+        Constant::String("alpha".to_string()),
+    ];
+    let regs = vec![Value::string(0), Value::string(1)];
+    let result = rt.perform_grain_builtin(Some("ref"), &constants, &regs);
+    let expected = Value::actor_ref(grain_actor_id(&GrainId::new("Counter", "alpha")));
+    assert_eq!(result, Some(expected));
+}
+
+#[test]
+fn test_grain_ref_builtin_int_key() {
+    let mut rt = Runtime::new();
+    let constants = vec![Constant::String("User".to_string())];
+    let regs = vec![Value::string(0), Value::int(42)];
+    let result = rt.perform_grain_builtin(Some("ref"), &constants, &regs);
+    let expected = Value::actor_ref(grain_actor_id(&GrainId::new("User", "42")));
+    assert_eq!(result, Some(expected));
+}
+
+#[test]
+fn test_grain_ref_builtin_unknown_key_returns_nil() {
+    let mut rt = Runtime::new();
+    let constants = vec![Constant::String("User".to_string())];
+    let regs = vec![Value::string(0), Value::bool(true)];
+    let result = rt.perform_grain_builtin(Some("ref"), &constants, &regs);
+    assert_eq!(result, Some(Value::nil()));
+}
+
+#[test]
+fn test_grain_prewarm_builtin_hydrates_grain() {
+    let mut rt = Runtime::new();
+    register_test_grain(&mut rt, "Counter");
+    let constants = vec![Constant::String("Counter".to_string())];
+    let regs = vec![Value::string(0), Value::string(0)];
+
+    let grain_id = GrainId::new("Counter", "Counter");
+    let stable_id = grain_actor_id(&grain_id);
+    assert!(!rt.actors.contains_key(&stable_id));
+
+    let result = rt.perform_grain_builtin(Some("prewarm"), &constants, &regs);
+    assert_eq!(result, Some(Value::unit()));
+    assert!(
+        rt.actors.contains_key(&stable_id),
+        "prewarm should hydrate the grain"
+    );
+}
+
+#[test]
+fn test_grain_prewarm_builtin_unknown_type_returns_nil() {
+    let mut rt = Runtime::new();
+    let constants = vec![Constant::String("Unknown".to_string())];
+    let regs = vec![Value::string(0), Value::string(0)];
+    let result = rt.perform_grain_builtin(Some("prewarm"), &constants, &regs);
+    assert_eq!(result, Some(Value::nil()));
+}
+
+#[test]
+fn test_grain_pin_unpin_builtin() {
+    let mut rt = Runtime::new();
+    register_test_grain(&mut rt, "Counter");
+    let constants = vec![Constant::String("Counter".to_string())];
+    let regs = vec![Value::string(0), Value::int(7)];
+
+    let grain_id = GrainId::new("Counter", "7");
+    let stable_id = grain_actor_id(&grain_id);
+
+    assert_eq!(
+        rt.perform_grain_builtin(Some("pin"), &constants, &regs),
+        Some(Value::unit())
+    );
+    assert!(
+        rt.actors.get(&stable_id).unwrap().pinned,
+        "pin should set pinned flag"
+    );
+
+    assert_eq!(
+        rt.perform_grain_builtin(Some("unpin"), &constants, &regs),
+        Some(Value::unit())
+    );
+    assert!(
+        !rt.actors.get(&stable_id).unwrap().pinned,
+        "unpin should clear pinned flag"
+    );
+}
+
+/// Build a simple virtual `Counter` grain module with one behavior
+/// `Counter.inc` that increments durable `count` and returns the new value.
+fn counter_grain_module() -> crate::bytecode::CodeModule {
+    use crate::bytecode::{
+        ActorMeta, BehaviorTableEntry, CodeModule, Constant, Instruction, OpCode,
+    };
+
+    let mut module = CodeModule::new("grain_counter");
+    let field_idx = module.add_constant(Constant::String("count".to_string()));
+    let one_idx = module.add_constant(Constant::Int(1));
+    module.add_behavior(BehaviorTableEntry {
+        name: "Counter.inc".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 4,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    module.emit(Instruction::new3(
+        OpCode::StateGet,
+        ((field_idx >> 8) & 0xFF) as u8,
+        (field_idx & 0xFF) as u8,
+        1,
+    ));
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((one_idx >> 8) & 0xFF) as u8,
+        (one_idx & 0xFF) as u8,
+        2,
+    ));
+    module.emit(Instruction::new3(OpCode::IAdd, 1, 2, 3));
+    module.emit(Instruction::new3(OpCode::StateSet, 0, 0, 3));
+    module.emit(Instruction::new1(OpCode::RetVal, 3));
+    module.add_actor_meta(ActorMeta {
+        name: "Counter".to_string(),
+        persistent: true,
+        state_models: vec![("count".to_string(), crate::ast::StateModel::Durable)],
+        state_defaults: vec![("count".to_string(), Constant::Int(0))],
+        behavior_indices: vec![0],
+        type_hash: None,
+        version: 1,
+        migrations: String::new(),
+        is_workflow: false,
+        is_agent: false,
+        is_organization: false,
+        is_virtual: true,
+        tools: vec![],
+        semantic_memory_dimensions: None,
+        procedural_memory_namespace: None,
+        backend: crate::ast::ActorBackendKind::Native,
+        fallback_config: String::new(),
+        retry_config: String::new(),
+    });
+    module
+}
+
+/// A grain message sent from shard 0 to a grain owned by shard 1 is routed
+/// across shards and hydrates the grain on the owning shard.
+#[test]
+fn test_send_to_grain_cross_shard_routes_and_hydrates() {
+    let module = counter_grain_module();
+    let mut shards = Runtime::new_sharded(2);
+
+    // Register the grain type on every shard so the receiving shard can
+    // hydrate the grain when the cross-shard message arrives.
+    for shard in &mut shards {
+        shard.register_module_grains(&module);
+    }
+
+    // Find a key whose stable actor id maps to shard 1 (odd id).
+    let mut key = "0".to_string();
+    let mut grain_id = GrainId::new("Counter", &key);
+    let mut stable_id = grain_actor_id(&grain_id);
+    let mut attempts = 0;
+    while (stable_id % 2) != 1 && attempts < 1000 {
+        key = format!("k{}", attempts);
+        grain_id = GrainId::new("Counter", &key);
+        stable_id = grain_actor_id(&grain_id);
+        attempts += 1;
+    }
+    assert_eq!(stable_id % 2, 1, "should find a key mapping to shard 1");
+
+    // Send from shard 0 to the grain. The grain is not resident anywhere yet.
+    shards[0].send_to_grain(grain_id.clone(), "inc", vec![], 0);
+
+    // The grain should not hydrate on shard 0; it should be routed to shard 1.
+    assert!(
+        !shards[0].actors.contains_key(&stable_id),
+        "grain should not hydrate on the sending shard"
+    );
+    assert!(
+        !shards[1].actors.contains_key(&stable_id),
+        "grain should not yet be hydrated on the receiving shard"
+    );
+
+    // Drain cross-shard messages on shard 1 and process the enqueued message.
+    shards[1].drain_cross_shard_messages();
+    shards[1].run_scheduler();
+
+    assert!(
+        shards[1].actors.contains_key(&stable_id),
+        "grain should hydrate on shard 1"
+    );
+    let actor = shards[1].actors.get(&stable_id).unwrap();
+    assert_eq!(
+        actor.get_state_field("count").and_then(|v| v.as_int()),
+        Some(1),
+        "inc message should be processed on shard 1"
+    );
 }

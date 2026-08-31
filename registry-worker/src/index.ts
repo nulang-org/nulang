@@ -1,3 +1,5 @@
+import { sortSemver } from './semver';
+
 export interface Env {
   BUCKET: R2Bucket;
   PUBLISH_TOKEN: string;
@@ -8,6 +10,9 @@ export interface Env {
    * with 402 and the hook's response body as the error message.
    * Used by the NLC hosted deployment to enforce per-tenant package quotas
    * (e.g. pointed at an nlc-billing or registry-gateway endpoint).
+   *
+   * Chunked transfers (no Content-Length) are rejected with 411 when this
+   * hook is configured, so `size_bytes` is always the real byte count.
    */
   QUOTA_HOOK_URL?: string;
 }
@@ -73,7 +78,7 @@ export default {
 
       const result = Array.from(packages.entries()).map(([name, versions]) => ({
         name,
-        versions: versions.sort(),
+        versions: sortSemver(versions),
       }));
       return new Response(JSON.stringify({ packages: result }), {
         headers: { 'Content-Type': 'application/json' },
@@ -106,6 +111,16 @@ export default {
         const auth = request.headers.get('Authorization');
         if (!env.PUBLISH_TOKEN || auth !== `Bearer ${env.PUBLISH_TOKEN}`) {
           return new Response('Unauthorized', { status: 401 });
+        }
+
+        // Quota hooks need a byte count, which chunked transfers (no
+        // Content-Length) cannot provide pre-flight. Reject them rather than
+        // reporting size_bytes: 0 and letting the quota check be bypassed.
+        if (env.QUOTA_HOOK_URL && !request.headers.has('Content-Length')) {
+          return new Response(
+            'Length Required: Content-Length header required when quota hook is enabled',
+            { status: 411 }
+          );
         }
 
         // Check if version already exists
@@ -146,7 +161,7 @@ export default {
         return new Response('Not found', { status: 404 });
       }
 
-      return new Response(JSON.stringify({ name, versions }), {
+      return new Response(JSON.stringify({ name, versions: sortSemver(versions) }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }

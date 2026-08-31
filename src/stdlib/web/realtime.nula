@@ -1,0 +1,11 @@
+// Nulang Web framework — realtime broadcast helpers.
+// Import: `import stdlib::web::realtime`
+
+import stdlib::web::types
+
+/// Broadcast a message to every subscriber of a realtime room.
+/// The message is stored in the room's replay history and delivered via
+/// Server-Sent Events to all connected clients.
+pub fn broadcast(room: String, message: String) -> Unit ! {Realtime} {
+    perform Realtime.broadcast(room, message)
+}

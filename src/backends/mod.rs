@@ -104,6 +104,18 @@ pub trait JitBackend {
     /// Reset hot counters.
     fn reset_hot_counters(&mut self);
 
+    /// Wave E2 loop-OSR: compile the loop region starting at `pc` — a loop
+    /// header reached by a hot interpreter back-edge — WITHOUT executing it.
+    /// Returns `true` when a compiled region exists at `pc` afterwards
+    /// (already compiled, or compiled now). Compilation failure or an
+    /// un-compilable region (e.g. an unsupported opcode inside the loop)
+    /// returns `false`; the caller then deopts by staying in the interpreter.
+    /// Default: no OSR support.
+    fn osr_compile_loop(&mut self, module_idx: usize, pc: usize, module: &CodeModule) -> bool {
+        let _ = (module_idx, pc, module);
+        false
+    }
+
     /// Execute one tiered step: if the region at `pc` is compiled, run it;
     /// if hot, compile then run; otherwise record and return `Interpret`.
     fn tiered_execute_step_typed(
@@ -120,7 +132,7 @@ pub trait JitBackend {
 // WASM backend — the interface for MIR→WASM compilers + host runtimes
 // ---------------------------------------------------------------------------
 
-/// A WASM backend compiles MIR to a `.wasm` module and provides a host
+/// A WASM backend compiles MIR to WASM bytes and provides a host
 /// runtime to execute it. The default implementation uses `wasm-encoder` +
 /// `wasmtime` (`src/mir_wasm.rs` + `src/wasm_runtime.rs`, feature
 /// `wasm-backend`). A future runtime could implement this trait with a
@@ -338,6 +350,7 @@ pub trait ServerTlsConfig: Send + Sync + std::any::Any {}
 
 /// Client-side TLS configuration.
 pub trait ClientTlsConfig: Send + Sync + std::any::Any {}
+
 /// A TLS-wrapped stream.
 pub trait TlsStream: std::io::Read + std::io::Write + Send {
     /// Get the peer's certificate chain, if any.
@@ -369,11 +382,11 @@ impl Default for DefaultTlsProvider {
 
 /// A crypto provider supplies hashing, secure random, and optional signing.
 /// The default implementation uses BLAKE3 + `getrandom` + `ed25519-dalek`
-/// (`src/runtime/identity.rs`). A future runtime could implement this with
+/// (`src/runtime/identity.rs`). A future runtime could implement
 /// a hardware security module, a different hash function, or whatever
 /// cryptographic primitives exist in 2125.
 pub trait CryptoProvider: Send + Sync {
-    /// Compute the BLAKE3-256 hash of `data`.
+    /// Compute the BLAKE3-256 hash of `data` (32 bytes).
     /// (The algorithm is BLAKE3, not SHA-256 — the output length is 32 bytes.)
     fn hash(&self, data: &[u8]) -> [u8; 32];
 
@@ -386,7 +399,7 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Verify an Ed25519 signature.  `public_key` is 32 bytes, `signature`
     /// is 64 bytes.  Returns `true` iff the signature is valid.
-    fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool;
+    fn verify(&self, public_key: &[u8], message: &[u8], signature: &[u8; 64]) -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +485,7 @@ impl DefaultCryptoProvider {
         DefaultCryptoProvider { signing_key: None }
     }
 
-    /// Create a provider with an Ed25519 signing key for `sign()`.
+    /// Create a provider with a signing key.
     pub fn with_signing_key(key: ed25519_dalek::SigningKey) -> Self {
         DefaultCryptoProvider {
             signing_key: Some(key),
@@ -505,9 +518,12 @@ impl CryptoProvider for DefaultCryptoProvider {
         Some(out)
     }
 
-    fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+    fn verify(&self, public_key: &[u8], message: &[u8], signature: &[u8; 64]) -> bool {
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let vk = match VerifyingKey::from_bytes(public_key) {
+        let Ok(pk_bytes) = <[u8; 32]>::try_from(public_key) else {
+            return false;
+        };
+        let vk = match VerifyingKey::from_bytes(&pk_bytes) {
             Ok(k) => k,
             Err(_) => return false,
         };
@@ -543,6 +559,7 @@ mod tests {
         accepts_persistence(&store);
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn test_transport_is_network_transport() {
         fn check_blanket<T: crate::runtime::NetworkTransport>() {

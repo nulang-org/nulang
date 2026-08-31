@@ -663,7 +663,7 @@ impl Repl {
                         })?;
                         println!("{} : {}", name, type_to_string(&decl_ty));
                     }
-                    Decl::LetBinding { name, .. } => {
+                    Decl::LetBinding { name, .. } | Decl::Signal { name, .. } => {
                         let decl_ty = self.type_checker.check_module(&AstModule {
                             name: "repl".to_string(),
                             decls: context_decls.clone(),

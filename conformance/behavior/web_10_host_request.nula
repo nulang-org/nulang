@@ -1,0 +1,10 @@
+import stdlib::web::host
+
+fn main() {
+    let body = read_body()
+    let p = param("id")
+    let h = header("x")
+    perform IO.print(body)
+    perform IO.print(p)
+    perform IO.print(h)
+}

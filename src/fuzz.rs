@@ -475,7 +475,7 @@ fn fuzz_one(rng: &mut XorShift64, corpus: &[&str]) -> Result<(), (String, String
 /// A mutant that compiles to bytecode, ready for differential execution.
 #[allow(dead_code)]
 pub(crate) struct CompiledMutant {
-    code_module: crate::bytecode::CodeModule,
+    pub(crate) code_module: crate::bytecode::CodeModule,
     mir_module: crate::mir::Module,
 }
 
@@ -496,7 +496,9 @@ pub(crate) fn compile_for_diff_verbose(source: &str) -> Result<CompiledMutant, S
     let mut lexer = Lexer::new(source);
     let tokens = lexer.lex().map_err(|e| format!("lex: {:?}", e))?;
     let mut parser = Parser::new(tokens);
-    let ast = parser.parse_module().map_err(|e| format!("parse: {:?}", e))?;
+    let ast = parser
+        .parse_module()
+        .map_err(|e| format!("parse: {:?}", e))?;
     let mut type_checker = TypeChecker::new();
     type_checker
         .check_module(&ast)
@@ -565,10 +567,29 @@ pub(crate) fn is_safely_comparable(v: crate::vm::Value) -> bool {
 #[allow(dead_code)]
 pub(crate) fn normalize_error(msg: &str) -> String {
     if msg.contains("Step limit exceeded") {
-        "step limit exceeded".to_string()
-    } else {
-        msg.to_string()
+        return "step limit exceeded".to_string();
     }
+    // `Value::to_string_repr` renders heap pointers as `#Value(<addr>)`;
+    // the address differs between interpreter/JIT/AOT runs (separate
+    // heaps), so strip it for comparison — the tag is what matters.
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(start) = rest.find("#Value(") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "#Value(".len()..];
+        match after.find(')') {
+            Some(end) => {
+                out.push_str("#Value(ptr)");
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str("#Value(ptr)");
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Differentially execute one compiled mutant: interpreter (cold) vs JIT

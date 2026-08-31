@@ -244,6 +244,14 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    /// Virtual actor reference: Grain("Type", key).
+    /// Syntactic sugar for `perform Grain.ref("Type", key)`; the parser
+    /// produces this node and HIR lowering desugars it.
+    GrainRef {
+        grain_type: String,
+        key: Box<Expr>,
+        span: Span,
+    },
     /// Resume continuation: resume(value)
     Resume {
         value: Box<Expr>,
@@ -541,6 +549,9 @@ pub enum FunctionAnnotation {
     Backend { kind: ActorBackendKind },
     /// `@derive(eq, ...)` requests synthesized trait helpers on a record type.
     Derive(Vec<String>),
+    /// `@placement(static|server|edge|client|actor|workflow)` marks a web
+    /// framework function's compile-time execution target.
+    Placement(crate::types::Placement),
 }
 
 // ---------------------------------------------------------------------------
@@ -674,6 +685,11 @@ pub enum Decl {
         /// Migration contracts from a `migration` block (entity only, RFC 0008).
         migrations: Vec<MigrationDecl>,
         is_organization: bool,
+        /// True if declared as `virtual entity` (RFC 0016 virtual actor auto-hydration).
+        virtual_: bool,
+        /// Constructor key parameters for `virtual entity Name(key: Type)`.
+        /// Empty for ordinary actors/entities.
+        key_params: Vec<Param>,
         implements: Option<String>,
         span: Span,
     },
@@ -812,6 +828,13 @@ pub enum Decl {
         type_ann: Option<Type>,
         value: Expr,
         mutable: bool,
+        span: Span,
+    },
+    /// Reactive signal declaration: `signal name: Type = init`
+    Signal {
+        name: String,
+        ty: Type,
+        init: Expr,
         span: Span,
     },
     /// Contextual value declaration: `given name: Type = expr`
@@ -1042,6 +1065,8 @@ pub fn desugar_state_machine(
         version: 1,
         migrations: vec![],
         is_organization: false,
+        virtual_: false,
+        key_params: vec![],
         implements: None,
         span,
     }

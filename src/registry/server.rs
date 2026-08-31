@@ -5,14 +5,25 @@
 //! `crate::runtime::http_server`). Shutdown is controlled by an
 //! `AtomicBool` flag; `stop()` sets it and joins the listener thread.
 
+#[cfg(feature = "tcp")]
 use std::io::{Read, Write};
+#[cfg(feature = "tcp")]
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "tcp")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(feature = "tcp")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "tcp")]
 use std::sync::Arc;
+#[cfg(feature = "tcp")]
 use std::thread;
 
+#[cfg(feature = "tcp")]
+use crate::package::resolver::parse_semver;
+#[cfg(feature = "tcp")]
 use parking_lot::Mutex;
+#[cfg(feature = "tcp")]
 use std::time::Duration;
 
 /// Package registry server.
@@ -26,6 +37,7 @@ use std::time::Duration;
 ///
 /// The listener handle lives behind a `Mutex` so that `start(&self)` and
 /// `stop(&self)` can manage the background thread through shared references.
+#[cfg(feature = "tcp")]
 pub struct RegistryServer {
     data_dir: PathBuf,
     auth_token: Option<String>,
@@ -33,6 +45,7 @@ pub struct RegistryServer {
     handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
+#[cfg(feature = "tcp")]
 impl RegistryServer {
     /// Maximum accepted tarball size (64 MiB).
     const MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
@@ -259,7 +272,7 @@ impl RegistryServer {
             .filter(|f| f.ends_with(".tar.gz"))
             .map(|f| f.trim_end_matches(".tar.gz").to_string())
             .collect();
-        versions.sort();
+        sort_versions(&mut versions);
         let payload = serde_json::json!({ "name": name, "versions": versions });
         let body = payload.to_string();
         Self::write_response(stream, 200, "application/json", body.as_bytes());
@@ -291,6 +304,7 @@ impl RegistryServer {
     }
 }
 
+#[cfg(feature = "tcp")]
 impl Drop for RegistryServer {
     fn drop(&mut self) {
         self.stop();
@@ -300,6 +314,7 @@ impl Drop for RegistryServer {
 /// Validate a package name/version path segment: rejects empty segments,
 /// `.`/`..`, and anything outside `[A-Za-z0-9._-]`, which blocks path
 /// traversal and absolute paths before they reach the filesystem.
+#[cfg(feature = "tcp")]
 fn valid_segment(s: &str) -> bool {
     !s.is_empty()
         && s != "."
@@ -310,6 +325,7 @@ fn valid_segment(s: &str) -> bool {
 
 /// Check `Authorization: Bearer <token>` against the configured token.
 /// When no token is configured, all requests are authorized.
+#[cfg(feature = "tcp")]
 fn authorized(headers: &[(String, String)], auth_token: &Option<String>) -> bool {
     match auth_token {
         None => true,
@@ -319,5 +335,76 @@ fn authorized(headers: &[(String, String)], auth_token: &Option<String>) -> bool
                     scheme.eq_ignore_ascii_case("Bearer") && token.trim() == expected
                 })
         }),
+    }
+}
+
+#[cfg(feature = "tcp")]
+fn sort_versions(versions: &mut [String]) {
+    versions.sort_by(|a, b| match (parse_semver(a), parse_semver(b)) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Err(_)) => a.cmp(b),
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "tcp")]
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_sort_versions_semver_aware() {
+        let mut versions = vec![
+            "0.10.0".to_string(),
+            "0.9.0".to_string(),
+            "1.0.0".to_string(),
+            "0.9.10".to_string(),
+        ];
+        sort_versions(&mut versions);
+        assert_eq!(versions, vec!["0.9.0", "0.9.10", "0.10.0", "1.0.0"]);
+    }
+
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_sort_versions_invalid_last() {
+        let mut versions = vec!["latest".to_string(), "1.0.0".to_string(), "v2".to_string()];
+        sort_versions(&mut versions);
+        assert_eq!(versions, vec!["1.0.0", "latest", "v2"]);
+    }
+}
+
+#[cfg(not(feature = "tcp"))]
+#[allow(dead_code)] // fields kept for API parity; never read without `tcp`
+pub struct RegistryServer {
+    data_dir: PathBuf,
+    auth_token: Option<String>,
+}
+
+#[cfg(not(feature = "tcp"))]
+impl RegistryServer {
+    pub fn new(data_dir: PathBuf, auth_token: Option<String>) -> Self {
+        RegistryServer {
+            data_dir,
+            auth_token,
+        }
+    }
+
+    /// Stub: the `tcp` feature is disabled, so the server cannot start.
+    pub fn start(&self, _bind_addr: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "registry server disabled (feature 'tcp' not enabled)",
+        ))
+    }
+
+    pub fn stop(&self) {}
+}
+
+#[cfg(not(feature = "tcp"))]
+impl Drop for RegistryServer {
+    fn drop(&mut self) {
+        self.stop();
     }
 }

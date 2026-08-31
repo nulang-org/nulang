@@ -14,7 +14,7 @@ state isolation with message-passing — no locks, no shared mutable state.
 Build from source:
 
 ```bash
-git clone https://github.com/dporkka/nulang.git && cd nulang
+git clone https://github.com/nulang-org/nulang.git && cd nulang
 cargo build --release
 ```
 

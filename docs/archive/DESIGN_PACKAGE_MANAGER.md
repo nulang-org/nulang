@@ -258,15 +258,15 @@ The **Registry** is the central package index at `registry.nulang.org`. It store
 |  +------------------+  +------------------+  +-------------------------+  |
 |  |   Registry       |  |   Workspace      |  |   Quality Assurance     |  |
 |  |   Client         |  |   Manager        |  |                         |  |
-|  |                  |  |                  |  |                         |  |
-|  |  - HTTP client   |  |  - Member        |  |  - Test runner           |  |
-|  |  - Authentication|  |    discovery     |  |  - Benchmark runner      |  |
-|  |  - Package       |  |  - Inter-package |  |  - Linter                |  |
-|  |    download      |  |    dependency    |  |  - Formatter             |  |
-|  |  - Package       |  |    resolution    |  |  - Documentation         |  |
-|  |    upload        |  |  - Shared lock   |  |    generator             |  |
-|  |  - Search API    |  |    file          |  |  - Type checker          |  |
-|  +------------------+  +------------------+  |  - Security audit        |  |
+|  |                  |  |                  |  |  - Test runner           |  |
+|  |  - HTTP client   |  |  - Member        |  |  - Benchmark runner      |  |
+|  |  - Authentication|  |    discovery     |  |  - Linter                |  |
+|  |  - Package       |  |  - Inter-package |  |  - Formatter             |  |
+|  |    download      |  |    dependency    |  |  - Documentation         |  |
+|  |  - Package       |  |    resolution    |  |    generator             |  |
+|  |    upload        |  |  - Shared lock   |  |  - Type checker          |  |
+|  |  - Search API    |  |    file          |  |  - Security audit        |  |
+|  +------------------+  +------------------+  +-------------------------+  |
 |                                                                            |
 +============================================================================+
 ```

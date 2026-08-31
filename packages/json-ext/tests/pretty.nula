@@ -1,0 +1,45 @@
+// Tests for json-ext — pretty-printing and structural equality.
+
+import lib
+import stdlib::test
+
+fn main() {
+  // ── type_of ──────────────────────────────────────────────────────────
+  assert(type_of(JsonNull) == "null", "type_of null")
+  assert(type_of(JsonBool(true)) == "bool", "type_of bool")
+  assert(type_of(JsonNumber(1.0)) == "number", "type_of number")
+  assert(type_of(JsonString("x")) == "string", "type_of string")
+  assert(type_of(parse("[]")) == "array", "type_of array")
+  assert(type_of(parse("{}")) == "object", "type_of object")
+
+  // ── json_eq ──────────────────────────────────────────────────────────
+  assert(json_eq(parse("{\"a\": [1, 2]}"), parse("{\"a\":[1,2]}")), "structural equality")
+  assert(!json_eq(parse("[1, 2]"), parse("[2, 1]")), "order matters in arrays")
+  assert(!json_eq(JsonNumber(1.0), JsonString("1")), "type mismatch not equal")
+  assert(json_eq(JsonNull, JsonNull), "null equals null")
+  assert(!json_eq(JsonBool(true), JsonBool(false)), "bool inequality")
+
+  // ── pretty: scalars match stringify ──────────────────────────────────
+  assert(pretty(JsonNull) == "null", "pretty null")
+  assert(pretty(JsonNumber(2.5)) == "2.5", "pretty number")
+  assert(pretty(JsonString("s")) == "\"s\"", "pretty string")
+
+  // ── pretty: empty compounds ──────────────────────────────────────────
+  assert(pretty(parse("[]")) == "[]", "pretty empty array")
+  assert(pretty(parse("{}")) == "{}", "pretty empty object")
+
+  // ── pretty: indentation ──────────────────────────────────────────────
+  assert(
+    pretty(parse("[1, 2]")) == "[\n  1,\n  2\n]",
+    "pretty array indent")
+  assert(
+    pretty(parse("{\"a\": 1}")) == "{\n  \"a\": 1\n}",
+    "pretty object indent")
+  assert(
+    pretty(parse("{\"a\": [true]}")) == "{\n  \"a\": [\n    true\n  ]\n}",
+    "pretty nested indent")
+
+  // ── pretty(parse(x)) reparses to an equal value ──────────────────────
+  let doc = parse("{\"list\": [1, {\"two\": 2}], \"s\": \"x\"}")
+  assert(json_eq(parse(pretty(doc)), doc), "pretty output reparses")
+}

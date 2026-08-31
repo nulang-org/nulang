@@ -240,6 +240,18 @@ pub enum Effect {
     Env,
     Process,
     System,
+    /// Web framework: produce HTML output (server-side rendering / static emit).
+    Render,
+    /// Web framework: read the current HTTP request.
+    Request,
+    /// Web framework: write the HTTP response.
+    Respond,
+    /// Web framework: SSE / WebSocket push (subsumes Net at runtime).
+    Realtime,
+    /// Web framework: browser-only DOM / signal operations.
+    Client,
+    /// Web framework: built-in host operations (route, html, redirect, ...).
+    Web,
     UserDefined(String),
 }
 
@@ -269,7 +281,45 @@ impl std::fmt::Display for Effect {
             Effect::Env => write!(f, "Env"),
             Effect::Process => write!(f, "Process"),
             Effect::System => write!(f, "System"),
+            Effect::Render => write!(f, "Render"),
+            Effect::Request => write!(f, "Request"),
+            Effect::Respond => write!(f, "Respond"),
+            Effect::Realtime => write!(f, "Realtime"),
+            Effect::Client => write!(f, "Client"),
+            Effect::Web => write!(f, "Web"),
             Effect::UserDefined(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+/// Compile-time placement hint for web-framework functions.
+/// Stored on HIR/MIR function metadata; default inference is based on the
+/// function's effect row and purity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Placement {
+    /// Static site generation: no request effects, pure render.
+    Static,
+    /// Server-side request handler.
+    Server,
+    /// Edge compute (CDN worker).
+    Edge,
+    /// Browser-only client code.
+    Client,
+    /// Actor-based backend.
+    Actor,
+    /// Workflow (durable step function).
+    Workflow,
+}
+
+impl std::fmt::Display for Placement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Placement::Static => write!(f, "static"),
+            Placement::Server => write!(f, "server"),
+            Placement::Edge => write!(f, "edge"),
+            Placement::Client => write!(f, "client"),
+            Placement::Actor => write!(f, "actor"),
+            Placement::Workflow => write!(f, "workflow"),
         }
     }
 }
@@ -1104,6 +1154,7 @@ pub enum ErrorCode {
     E010MatchNoArms,
     E011StepLimitExceeded,
     E012UnhandledEffect,
+    E013FfiBoundaryViolation,
 }
 
 impl ErrorCode {
@@ -1121,6 +1172,7 @@ impl ErrorCode {
             ErrorCode::E010MatchNoArms => "E010",
             ErrorCode::E011StepLimitExceeded => "E011",
             ErrorCode::E012UnhandledEffect => "E012",
+            ErrorCode::E013FfiBoundaryViolation => "E013",
         }
     }
     pub fn explain(&self) -> &'static str {
@@ -1147,6 +1199,9 @@ impl ErrorCode {
             ErrorCode::E012UnhandledEffect => {
                 "An effect was performed but no handler exists for it."
             }
+            ErrorCode::E013FfiBoundaryViolation => {
+                "A capability-qualified VM-heap type was used at an FFI boundary; foreign threads are not tracked by ORCA. Move the value into a serialized form (String) or an externally-managed opaque handle."
+            }
         }
     }
 }
@@ -1154,6 +1209,69 @@ impl ErrorCode {
 impl std::fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.code_str())
+    }
+}
+
+/// A non-fatal compiler warning with a stable, category-scoped code.
+///
+/// Warnings use the `Wxxxx` scheme documented in `docs/ERROR_CODES.md`
+/// (`W01xx` — deprecations). They never fail compilation on their own;
+/// the CLI `--deny-warnings` flag escalates them to an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NuWarning {
+    /// Stable warning code, e.g. `"W0101"`.
+    pub code: &'static str,
+    /// Core message (no position prefix).
+    pub msg: String,
+    /// Primary source span.
+    pub span: Span,
+    /// Optional migration hint shown as a help line.
+    pub help: Option<String>,
+}
+
+impl NuWarning {
+    /// `W0101` — deprecated `catch` expression (RFC 0015).
+    pub fn deprecated_catch(span: Span) -> Self {
+        NuWarning {
+            code: "W0101",
+            msg: "use of deprecated `catch` expression".to_string(),
+            span,
+            help: Some(
+                "`catch` is deprecated by RFC 0015 and will be removed in v2.0 — \
+                 rewrite as `match expr { | Ok(x) => x, | Error(e) => ... }` \
+                 and propagate errors with `?` under a `T ! E` signature"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// `W0102` — deprecated `fail` expression (RFC 0015).
+    pub fn deprecated_fail(span: Span) -> Self {
+        NuWarning {
+            code: "W0102",
+            msg: "use of deprecated `fail` expression".to_string(),
+            span,
+            help: Some(
+                "`fail` is deprecated by RFC 0015 and will be removed in v2.0 — \
+                 use `return` with an explicit `Error(...)` value under a \
+                 `T ! E` signature"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Plain-text one-line rendering, used when no SourceMap is installed.
+    pub fn format_plain(&self) -> String {
+        let mut out = format!("warning[{}]: {}", self.code, self.msg);
+        let line = self.span.line();
+        if line > 0 {
+            let file = self.span.file().unwrap_or_else(|| "<input>".to_string());
+            out.push_str(&format!(" --> {}:{}:{}", file, line, self.span.column()));
+        }
+        if let Some(help) = &self.help {
+            out.push_str(&format!("\n  = help: {help}"));
+        }
+        out
     }
 }
 
@@ -1762,6 +1880,14 @@ impl NuError {
     /// Return the canonical error code for this error, preferring structured
     /// fields over message-pattern heuristics.
     pub fn error_code(&self) -> Option<ErrorCode> {
+        // FFI foreign-heap boundary violations are TypeErrors with a
+        // dedicated stable code (E0208); classify them before the generic
+        // structured-field and message heuristics below.
+        if matches!(self, NuError::TypeError { .. })
+            && self.msg_str().contains("cannot cross the FFI boundary")
+        {
+            return Some(ErrorCode::E013FfiBoundaryViolation);
+        }
         // Structured-field shortcuts (more reliable than string matching).
         match self {
             NuError::TypeError {

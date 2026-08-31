@@ -1,0 +1,39 @@
+// Tests for json package — stringify, round-trips, and field accessors.
+
+import lib
+import stdlib::test
+
+fn main() {
+  // ── stringify scalars ────────────────────────────────────────────────
+  assert(stringify(JsonNull) == "null", "stringify null")
+  assert(stringify(JsonBool(true)) == "true", "stringify true")
+  assert(stringify(JsonBool(false)) == "false", "stringify false")
+  assert(stringify(JsonNumber(42.0)) == "42", "stringify int-valued number")
+  assert(stringify(JsonNumber(1.5)) == "1.5", "stringify fraction")
+  assert(stringify(JsonString("hi")) == "\"hi\"", "stringify string")
+
+  // ── stringify escapes ────────────────────────────────────────────────
+  assert(stringify(JsonString("a\nb")) == "\"a\\nb\"", "stringify newline escape")
+  assert(stringify(JsonString("q\"q")) == "\"q\\\"q\"", "stringify quote escape")
+
+  // ── compound round-trips ─────────────────────────────────────────────
+  assert(stringify(parse("[]")) == "[]", "empty array round-trip")
+  assert(stringify(parse("{}")) == "{}", "empty object round-trip")
+  assert(stringify(parse("[1, 2, 3]")) == "[1,2,3]", "array round-trip")
+  assert(
+    stringify(parse("{\"a\": 1, \"b\": [true, null], \"c\": \"x\"}")) == "{\"a\":1,\"b\":[true,null],\"c\":\"x\"}",
+    "nested object round-trip")
+
+  // ── accessors ────────────────────────────────────────────────────────
+  let obj = parse("{\"name\": \"nulang\", \"version\": 1, \"stable\": false}")
+  assert(get_string(obj, "name", "?") == "nulang", "get_string hit")
+  assert(get_string(obj, "missing", "dflt") == "dflt", "get_string default")
+  assert(get_number(obj, "version", 0.0) == 1.0, "get_number hit")
+  assert(get_number(obj, "missing", 9.0) == 9.0, "get_number default")
+  assert(!get_bool(obj, "stable", true), "get_bool hit")
+  assert(get_bool(obj, "missing", true), "get_bool default")
+
+  // ── accessors on non-objects return the default ──────────────────────
+  assert(get_string(JsonNull, "k", "d") == "d", "get_string on null")
+  assert(get_number(JsonBool(true), "k", 7.0) == 7.0, "get_number on bool")
+}

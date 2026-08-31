@@ -9,14 +9,15 @@
   <a href="https://nulang.org">Website</a> •
   <a href="playground/">Playground</a> •
   <a href="https://nulang.cloud">Nulang Cloud</a> •
-  <a href="https://github.com/dporkka/nulang">GitHub</a>
+  <a href="https://github.com/nulang-org/nulang">GitHub</a>
 </p>
 <p align="center">
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-2021%20Edition-orange.svg" alt="Rust 2021"></a>
-  <a href="https://github.com/dporkka/nulang/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License Apache 2.0"></a>
-  <a href="https://github.com/dporkka/nulang/actions"><img src="https://github.com/dporkka/nulang/workflows/CI/badge.svg" alt="CI"></a>
-  <a href="https://codecov.io/github/dporkka/nulang"><img src="https://codecov.io/github/dporkka/nulang/graph/badge.svg" alt="Coverage"></a>
-  <a href="https://deepwiki.com/dporkka/nulang"><img src="https://img.shields.io/badge/DeepWiki-docs-blue.svg" alt="DeepWiki"></a>
+  <a href="https://github.com/nulang-org/nulang/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License Apache 2.0"></a>
+  <a href="https://github.com/nulang-org/nulang/actions"><img src="https://github.com/nulang-org/nulang/workflows/CI/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/github/nulang-org/nulang"><img src="https://codecov.io/github/nulang-org/nulang/graph/badge.svg" alt="Coverage"></a>
+<a href="https://github.com/nulang-org/nulang/actions/workflows/docs-sync.yml"><img src="https://github.com/nulang-org/nulang/actions/workflows/docs-sync.yml/badge.svg" alt="Docs Sync"></a>
+  <a href="https://deepwiki.com/nulang-org/nulang"><img src="https://img.shields.io/badge/DeepWiki-docs-blue.svg" alt="DeepWiki"></a>
 </p>
 
 ---
@@ -37,7 +38,7 @@ location-transparent distribution, and durable persistence.
 ## Installation
 
 ### Pre-built binaries
-Download the latest release from [GitHub Releases](https://github.com/dporkka/nulang/releases)
+Download the latest release from [GitHub Releases](https://github.com/nulang-org/nulang/releases)
 *(prebuilt binaries coming with the first tagged release — for now build from source below)*.
 - **Linux (x86_64)**: `nulang-linux-x86_64.tar.gz`
 - **Linux (aarch64)**: `nulang-linux-aarch64.tar.gz`
@@ -52,7 +53,7 @@ sudo mv nulang /usr/local/bin/
 
 ### From source
 ```bash
-git clone https://github.com/dporkka/nulang.git
+git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
 ```
@@ -64,7 +65,7 @@ Requires Rust 1.95.0 (pinned by `rust-toolchain.toml`), Linux or macOS. Windows 
 **Prerequisites:** Rust 1.95.0, Linux or macOS. Windows is unsupported for now — Windows users should build under WSL.
 
 ```bash
-git clone https://github.com/dporkka/nulang.git
+git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
 ```
@@ -130,6 +131,18 @@ perform IO.print("Hello, " + name + "!")
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Implementation architecture and module map |
 | [`editors/vscode/`](editors/vscode/) | VS Code extension (syntax highlighting, language essentials, snippets) — build a `.vsix` or install manually |
 | [`RFC/`](RFC/) | RFC proposals (format stability, frozen core, deprecation cycles, roadmap) |
+
+### Docs auto-sync and DeepWiki
+
+Changes to `src/**`, `examples/**`, `scripts/**`, `docs/**`, or the
+[`.github/workflows/docs-sync.yml`](.github/workflows/docs-sync.yml) workflow
+trigger a docs regeneration run on every push to `main`. The workflow regenerates
+the derived standard-library pages (`docs/src/content/docs/stdlib/`) and the
+full API reference (`docs/api.md`), commits any changes back to `main` with
+`[skip ci]`, validates the Astro site build, and pings
+[DeepWiki](https://deepwiki.com/nulang-org/nulang) as a best-effort nudge to
+re-index the repository docs. The site is then redeployed automatically by the
+Cloudflare Pages Git integration.
 
 ---
 
@@ -201,14 +214,20 @@ dependencies.
 
 ## Community
 
-- **Questions & discussion:** [GitHub Discussions](https://github.com/dporkka/nulang/discussions)
-- **Bugs & feature requests:** [Issue tracker](https://github.com/dporkka/nulang/issues/new/choose)
+- **Questions & discussion:** [GitHub Discussions](https://github.com/nulang-org/nulang/discussions)
+- **Bugs & feature requests:** [Issue tracker](https://github.com/nulang-org/nulang/issues/new/choose)
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md) and our [Code of Conduct](CODE_OF_CONDUCT.md)
+
+---
+
+## Docs & Wiki
+
+The [nulang.org](https://nulang.org) documentation site is regenerated automatically on every push to `main` via the [Docs Sync workflow](.github/workflows/docs-sync.yml). When source files, examples, or docs content change, the workflow regenerates the standard-library reference and API docs, commits the updates, verifies the Astro build, and pings [DeepWiki](https://deepwiki.com/nulang-org/nulang) to encourage re-indexing.
 
 ---
 
 ## License
 
-Nulang is licensed under the [Apache License, Version 2.0](https://github.com/dporkka/nulang/blob/main/LICENSE).
+Nulang is licensed under the [Apache License, Version 2.0](https://github.com/nulang-org/nulang/blob/main/LICENSE).
 
 Copyright 2026 © David Porkka

@@ -1,0 +1,294 @@
+// collections-ext — deque, ordered map, and priority queue on plain arrays.
+// Consume with: `import lib` from any file in the package.
+// Option constructors (Some/None) come from the prelude.
+// Style follows stdlib `map`: untyped functions, immutable updates that
+// return new collection values.
+
+// ── Deque ─────────────────────────────────────────────────────────────────
+// A deque is just an array; the dq_* helpers give it both-ends semantics.
+// push/pop at the front are O(n); push/pop at the back are O(1).
+
+/// An empty deque.
+pub fn dq_new() { [] }
+
+/// Number of elements.
+pub fn dq_size(d) { perform Array.length(d) }
+
+/// True when the deque has no elements.
+pub fn dq_is_empty(d) { perform Array.length(d) == 0 }
+
+/// Add `x` at the back. Returns the new deque.
+pub fn dq_push_back(d, x) { perform Array.push(d, x) }
+
+/// Add `x` at the front. Returns the new deque.
+pub fn dq_push_front(d, x) {
+    var out = [x];
+    for e in d {
+        out = perform Array.push(out, e)
+    };
+    out
+}
+
+/// The front element, or None when empty.
+pub fn dq_peek_front(d) {
+    if perform Array.length(d) == 0 then { None } else { Some(d[0]) }
+}
+
+/// The back element, or None when empty.
+pub fn dq_peek_back(d) {
+    let n = perform Array.length(d);
+    if n == 0 then { None } else { Some(d[n - 1]) }
+}
+
+/// Remove the front element. Returns (Option value, new deque).
+pub fn dq_pop_front(d) {
+    let n = perform Array.length(d);
+    if n == 0 then { (None, d) }
+    else {
+        var out = [];
+        var i = 1;
+        while i < n {
+            out = perform Array.push(out, d[i]);
+            i = i + 1
+        };
+        (Some(d[0]), out)
+    }
+}
+
+/// Remove the back element. Returns (Option value, new deque).
+pub fn dq_pop_back(d) {
+    let n = perform Array.length(d);
+    if n == 0 then { (None, d) }
+    else {
+        var out = [];
+        var i = 0;
+        while i < n - 1 {
+            out = perform Array.push(out, d[i]);
+            i = i + 1
+        };
+        (Some(d[n - 1]), out)
+    }
+}
+
+/// The deque as an array, front element first.
+pub fn dq_to_array(d) { d }
+
+// ── Ordered map ───────────────────────────────────────────────────────────
+// An ordered map is an array of {key, value} records kept sorted by string
+// key. Insert/remove are O(n); lookups binary-search the key array.
+
+/// An empty ordered map.
+pub fn om_new() { [] }
+
+/// Number of entries.
+pub fn om_size(m) { perform Array.length(m) }
+
+/// True when there are no entries.
+pub fn om_is_empty(m) { perform Array.length(m) == 0 }
+
+/// Lexicographic string less-than, by character codes.
+/// (The `<` operator does not compare strings lexicographically.)
+fn str_lt(a, b) {
+    let na = perform String.length(a);
+    let nb = perform String.length(b);
+    var i = 0;
+    var result = false;
+    var decided = false;
+    while !decided && i < na && i < nb {
+        let ca = perform String.charAt(a, i);
+        let cb = perform String.charAt(b, i);
+        if ca != cb then {
+            result = ca < cb;
+            decided = true
+        } else {};
+        i = i + 1
+    };
+    if !decided then { result = na < nb } else {};
+    result
+}
+
+/// Index of `k`, or -1 when absent (binary search over sorted keys).
+fn om_find(k, m) {
+    var lo = 0;
+    var hi = perform Array.length(m) - 1;
+    var found = -1;
+    while lo <= hi && found == -1 {
+        let mid = (lo + hi) / 2;
+        let r = m[mid];
+        if r.key == k then { found = mid }
+        else if str_lt(k, r.key) then { hi = mid - 1 }
+        else { lo = mid + 1 }
+    };
+    found
+}
+
+/// True when key `k` is present.
+pub fn om_contains(k, m) { om_find(k, m) != -1 }
+
+/// The value for `k`, or None when absent.
+pub fn om_get(k, m) {
+    let i = om_find(k, m);
+    if i == -1 then { None } else { Some(m[i].value) }
+}
+
+/// Insert or overwrite key `k` with value `v`, keeping keys sorted.
+/// Returns the new map.
+pub fn om_insert(k, v, m) {
+    let i = om_find(k, m);
+    if i != -1 then {
+        // overwrite in place (rebuild, since arrays update by copy here)
+        var out = [];
+        var j = 0;
+        let n = perform Array.length(m);
+        while j < n {
+            if j == i then { out = perform Array.push(out, {key: k, value: v}) }
+            else { out = perform Array.push(out, m[j]) };
+            j = j + 1
+        };
+        out
+    } else {
+        var out = [];
+        var inserted = false;
+        for r in m {
+            if !inserted && str_lt(k, r.key) then {
+                out = perform Array.push(out, {key: k, value: v});
+                inserted = true
+            } else {};
+            out = perform Array.push(out, r)
+        };
+        if !inserted then { out = perform Array.push(out, {key: k, value: v}) } else {};
+        out
+    }
+}
+
+/// Remove key `k`. Returns the new map (unchanged when `k` is absent).
+pub fn om_remove(k, m) {
+    var out = [];
+    for r in m {
+        if r.key != k then { out = perform Array.push(out, r) } else {}
+    };
+    out
+}
+
+/// All keys, in sorted order.
+pub fn om_keys(m) {
+    var out = [];
+    for r in m {
+        out = perform Array.push(out, r.key)
+    };
+    out
+}
+
+/// All values, in sorted-key order.
+pub fn om_values(m) {
+    var out = [];
+    for r in m {
+        out = perform Array.push(out, r.value)
+    };
+    out
+}
+
+// ── Priority queue ────────────────────────────────────────────────────────
+// A min-heap of {pri, val} records in an array. pq_pop always returns the
+// element with the smallest priority. push/pop are O(log n).
+
+/// An empty priority queue.
+pub fn pq_new() { [] }
+
+/// Number of queued elements.
+pub fn pq_size(q) { perform Array.length(q) }
+
+/// True when the queue is empty.
+pub fn pq_is_empty(q) { perform Array.length(q) == 0 }
+
+/// Restore heap order by moving the element at index `i` upward.
+fn pq_sift_up(q, i) {
+    var out = q;
+    var child = i;
+    while child > 0 {
+        let parent = (child - 1) / 2;
+        if out[child].pri < out[parent].pri then {
+            let tmp = out[parent];
+            // swap by rebuilding the affected slots
+            var next = [];
+            var j = 0;
+            let n = perform Array.length(out);
+            while j < n {
+                if j == parent then { next = perform Array.push(next, out[child]) }
+                else if j == child then { next = perform Array.push(next, tmp) }
+                else { next = perform Array.push(next, out[j]) };
+                j = j + 1
+            };
+            out = next;
+            child = parent
+        } else { child = 0 }
+    };
+    out
+}
+
+/// Restore heap order by moving the element at index `i` downward.
+fn pq_sift_down(q, i) {
+    var out = q;
+    let n = perform Array.length(out);
+    var parent = i;
+    var done = false;
+    while !done {
+        let left = parent * 2 + 1;
+        let right = parent * 2 + 2;
+        var smallest = parent;
+        if left < n && out[left].pri < out[smallest].pri then { smallest = left } else {};
+        if right < n && out[right].pri < out[smallest].pri then { smallest = right } else {};
+        if smallest == parent then { done = true }
+        else {
+            let tmp = out[parent];
+            var next = [];
+            var j = 0;
+            while j < n {
+                if j == parent then { next = perform Array.push(next, out[smallest]) }
+                else if j == smallest then { next = perform Array.push(next, tmp) }
+                else { next = perform Array.push(next, out[j]) };
+                j = j + 1
+            };
+            out = next;
+            parent = smallest
+        }
+    };
+    out
+}
+
+/// Enqueue value `v` with integer priority `pri`. Returns the new queue.
+pub fn pq_push(pri, v, q) {
+    let with_new = perform Array.push(q, {pri: pri, item: v});
+    pq_sift_up(with_new, perform Array.length(with_new) - 1)
+}
+
+/// The smallest-priority value without removing it, or None when empty.
+pub fn pq_peek(q) {
+    if perform Array.length(q) == 0 then { None } else { Some(q[0].item) }
+}
+
+/// The smallest priority without removing it, or None when empty.
+pub fn pq_peek_priority(q) {
+    if perform Array.length(q) == 0 then { None } else { Some(q[0].pri) }
+}
+
+/// Dequeue the smallest-priority element. Returns (Option value, new queue).
+pub fn pq_pop(q) {
+    let n = perform Array.length(q);
+    if n == 0 then { (None, q) }
+    else {
+        let top = q[0].item;
+        // move last element to the root, drop the last slot, sift down
+        var out = [];
+        if n > 1 then {
+            out = perform Array.push(out, q[n - 1]);
+            var i = 1;
+            while i < n - 1 {
+                out = perform Array.push(out, q[i]);
+                i = i + 1
+            };
+            out = pq_sift_down(out, 0)
+        } else {};
+        (Some(top), out)
+    }
+}

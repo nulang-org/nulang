@@ -1,0 +1,7 @@
+import stdlib::web::types
+
+fn identity(h: Html) -> Html { h }
+
+fn main() {
+    perform IO.print("ok")
+}

@@ -8,6 +8,11 @@
 name = "nulang-docs"
 pages_build_output_dir = "dist"
 compatibility_date = "2026-07-19"
+# Pages secrets (set via wrangler pages secret put):
+#   TURNSTILE_SECRET — Turnstile widget secret for /api/contact
+#   CLOUDFLARE_API_TOKEN — API token with Account Email Sending Edit
+#   CONTACT_TO (optional) — defaults to davidporkka@gmail.com
+
 
 # Cloudflare Pages build configuration:
 #   Framework preset: Astro
@@ -16,5 +21,5 @@ compatibility_date = "2026-07-19"
 #   Build watch paths: docs/**
 #   Custom domain:     nulang.org
 #
-# Email Routing (configured in Cloudflare dashboard):
-#   support@nulang.org → davidporkka@gmail.com
+# Email Routing (catch-all):
+#   *@nulang.org → davidporkka@gmail.com

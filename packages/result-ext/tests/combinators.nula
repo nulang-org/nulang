@@ -1,0 +1,119 @@
+// Tests for result-ext — Result and Option pipeline combinators.
+
+import lib
+import stdlib::test
+
+fn main() {
+  let parse_positive = fn(x) {
+    if x > 0 then { Ok(x) } else { Error("not positive") }
+  };
+
+  // ── and_then / or_else / map_err ─────────────────────────────────────
+  match and_then(Ok(2), parse_positive) {
+    Ok(x) => assert_eq(x, 2),
+    Error(_) => fail_with("and_then on Ok should stay Ok"),
+  }
+  match and_then(Ok(-1), parse_positive) {
+    Ok(_) => fail_with("and_then should propagate f's Error"),
+    Error(e) => assert(e == "not positive", "and_then error payload"),
+  }
+  match and_then(Error("boom"), parse_positive) {
+    Ok(_) => fail_with("and_then on Error should stay Error"),
+    Error(e) => assert(e == "boom", "and_then keeps original error"),
+  }
+  match or_else(Error("e"), fn(_e) { Ok(9) }) {
+    Ok(x) => assert_eq(x, 9),
+    Error(_) => fail_with("or_else should recover"),
+  }
+  match map_err(Error(1), fn(e) { e + 10 }) {
+    Ok(_) => fail_with("map_err on Error stays Error"),
+    Error(e) => assert_eq(e, 11),
+  }
+
+  // ── map2 / unwrap_or ─────────────────────────────────────────────────
+  match map2(fn(a, b) { a + b }, Ok(2), Ok(3)) {
+    Ok(x) => assert_eq(x, 5),
+    Error(_) => fail_with("map2 on two Oks"),
+  }
+  match map2(fn(a, b) { a + b }, Ok(2), Error("bad")) {
+    Ok(_) => fail_with("map2 with Error should fail"),
+    Error(e) => assert(e == "bad", "map2 error payload"),
+  }
+  assert_eq(unwrap_or(Ok(1), 0), 1)
+  assert_eq(unwrap_or(Error("x"), 0), 0)
+
+  // ── sequence / traverse ──────────────────────────────────────────────
+  match sequence([Ok(1), Ok(2), Ok(3)]) {
+    Ok(xs) => {
+      assert_eq(perform Array.length(xs), 3);
+      assert_eq(xs[0], 1);
+      assert_eq(xs[2], 3)
+    },
+    Error(_) => fail_with("sequence of all Oks"),
+  }
+  match sequence([Ok(1), Error("e"), Ok(3)]) {
+    Ok(_) => fail_with("sequence with Error should fail"),
+    Error(e) => assert(e == "e", "sequence error payload"),
+  }
+  match traverse(parse_positive, [1, 2, 3]) {
+    Ok(xs) => assert_eq(perform Array.length(xs), 3),
+    Error(_) => fail_with("traverse over positives"),
+  }
+  match traverse(parse_positive, [1, -2, 3]) {
+    Ok(_) => fail_with("traverse should stop at first Error"),
+    Error(e) => assert(e == "not positive", "traverse error payload"),
+  }
+
+  // ── interop ──────────────────────────────────────────────────────────
+  match ok_or(Some(5), "missing") {
+    Ok(x) => assert_eq(x, 5),
+    Error(_) => fail_with("ok_or on Some"),
+  }
+  match ok_or(None, "missing") {
+    Ok(_) => fail_with("ok_or on None should be Error"),
+    Error(e) => assert(e == "missing", "ok_or error payload"),
+  }
+  match to_option(Ok(7)) {
+    Some(x) => assert_eq(x, 7),
+    None => fail_with("to_option on Ok"),
+  }
+  match to_option(Error("e")) {
+    Some(_) => fail_with("to_option on Error should be None"),
+    None => unit,
+  }
+
+  // ── option combinators ───────────────────────────────────────────────
+  match option_and_then(Some(2), fn(x) { Some(x * 3) }) {
+    Some(x) => assert_eq(x, 6),
+    None => fail_with("option_and_then on Some"),
+  }
+  match option_and_then(None, fn(x) { Some(x * 3) }) {
+    Some(_) => fail_with("option_and_then on None"),
+    None => unit,
+  }
+  match option_map2(fn(a, b) { a + b }, Some(1), Some(2)) {
+    Some(x) => assert_eq(x, 3),
+    None => fail_with("option_map2 on two Somes"),
+  }
+  match option_map2(fn(a, b) { a + b }, Some(1), None) {
+    Some(_) => fail_with("option_map2 with None"),
+    None => unit,
+  }
+  match option_sequence([Some(1), Some(2)]) {
+    Some(xs) => assert_eq(perform Array.length(xs), 2),
+    None => fail_with("option_sequence of all Somes"),
+  }
+  match option_sequence([Some(1), None]) {
+    Some(_) => fail_with("option_sequence with None"),
+    None => unit,
+  }
+  match option_traverse(fn(x) { Some(x + 1) }, [1, 2]) {
+    Some(xs) => {
+      assert_eq(xs[0], 2);
+      assert_eq(xs[1], 3)
+    },
+    None => fail_with("option_traverse all Some"),
+  }
+  assert_eq(option_unwrap_or(Some(4), 0), 4)
+  assert_eq(option_unwrap_or(None, 0), 0)
+}

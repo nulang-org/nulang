@@ -1,0 +1,96 @@
+import stdlib::web::html
+import stdlib::web::types
+import stdlib::web::host
+import stdlib::web::realtime
+import stdlib::json
+
+fn messages_key(room: String) -> String {
+    "chat:messages:" + room
+}
+
+fn get_messages(room: String) -> [JsonValue] {
+    let raw = kv_get(messages_key(room))
+    if raw == "" then { [] }
+    else {
+        match parse(raw) {
+            JsonArray(items) => items
+            _ => []
+        }
+    }
+}
+
+fn add_message(room: String, msg: String) {
+    let key = messages_key(room)
+    let messages = get_messages(room)
+    let updated = perform Array.push(messages, JsonString(msg))
+    kv_set(key, stringify(JsonArray(updated)))
+    broadcast(room, msg)
+}
+
+fn render_messages(room: String) -> Html {
+    let messages = get_messages(room)
+    var rows = []
+    for msg in messages {
+        let content = match msg {
+            JsonString(s) => s
+            _ => ""
+        }
+        let row = el("li", [], [text(content)])
+        rows = perform Array.push(rows, row)
+    }
+    el("ul", [("id", text("messages"))], rows)
+}
+
+fn sse_script(room: String) -> Html {
+    let src = "var es = new EventSource('/__nulang/sse/" + room + "');
+" +
+              "es.onopen = function() { document.getElementById('messages').innerHTML = ''; };
+" +
+              "es.onmessage = function(e) {
+" +
+              "  var msg = JSON.parse(e.data);
+" +
+              "  var li = document.createElement('li');
+" +
+              "  li.textContent = msg;
+" +
+              "  document.getElementById('messages').appendChild(li);
+" +
+              "};"
+    raw(src)
+}
+
+fn chat() -> Html {
+    let room = param("room")
+    let method = request_method()
+    if method == "POST" then {
+        let msg = form_value("msg")
+        if msg != "" then {
+            add_message(room, msg)
+        }
+        redirect("/chat/" + room)
+    } else {
+        document(
+            head([title("Chat: " + room)]),
+            body([
+                el("h1", [], [text("Chat: " + room)]),
+                render_messages(room),
+                el("form", [
+                    ("method", text("POST")),
+                    ("action", text("/chat/" + room)),
+                    ("data-action", text("chat")),
+                    ("data-action-placement", text("server"))
+                ], [
+                    el("input", [("type", text("text")), ("name", text("msg")), ("placeholder", text("Message..."))], []),
+                    el("button", [("type", text("submit"))], [text("Send")])
+                ]),
+                sse_script(room)
+            ])
+        )
+    }
+}
+
+app "chat" {
+    route "GET" "/chat/:room" -> chat
+    route "POST" "/chat/:room" -> chat
+}

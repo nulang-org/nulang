@@ -7,6 +7,7 @@
 //! buffer; the server thread serves whichever snapshot it last received.
 use std::net::TcpListener;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -186,6 +187,111 @@ impl MetricsSnapshot {
             r.cache_misses
         );
 
+        // Supervision topology: total supervisors + per-supervisor child count.
+        out.push_str("# HELP nulang_supervisors_total Number of supervisors\n");
+        out.push_str("# TYPE nulang_supervisors_total gauge\n");
+        out.push_str(&format!(
+            "nulang_supervisors_total {}\n",
+            self.supervisors.len()
+        ));
+        out.push_str("# HELP nulang_supervisor_children Supervisor child actor count\n");
+        out.push_str("# TYPE nulang_supervisor_children gauge\n");
+        for sup in &self.supervisors {
+            out.push_str(&format!(
+                "nulang_supervisor_children{{supervisor_id=\"{}\"}} {}\n",
+                sup.id,
+                sup.children.len()
+            ));
+        }
+
+        // CRDT replication state.
+        out.push_str("# HELP nulang_crdt_entries Number of live CRDT entries\n");
+        out.push_str("# TYPE nulang_crdt_entries gauge\n");
+        out.push_str(&format!("nulang_crdt_entries {}\n", self.crdt.entries));
+        out.push_str("# HELP nulang_crdt_ops_synced Total CRDT ops shipped\n");
+        out.push_str("# TYPE nulang_crdt_ops_synced counter\n");
+        out.push_str(&format!(
+            "nulang_crdt_ops_synced {}\n",
+            self.crdt.ops_synced
+        ));
+        out.push_str("# HELP nulang_crdt_unsynced_deltas CRDT entries with unsynced changes\n");
+        out.push_str("# TYPE nulang_crdt_unsynced_deltas gauge\n");
+        out.push_str(&format!(
+            "nulang_crdt_unsynced_deltas {}\n",
+            self.crdt.unsynced_deltas
+        ));
+
         out
+    }
+
+    /// Render the runtime topology as ASCII text: a summary line plus the
+    /// supervision tree (supervisors nested by parent link, supervised
+    /// actors as leaves). Used for a terminal topology view.
+    pub fn render_topology_text(&self) -> String {
+        let sup_by_id: HashMap<u64, &super::SupervisorMetric> =
+            self.supervisors.iter().map(|s| (s.id, s)).collect();
+
+        let mut out = String::new();
+        out.push_str(&format!(
+            "runtime: actors_live={} supervisors={} dlq_depth={} crdt_entries={} (unsynced={})\n",
+            self.actors_live,
+            self.supervisors.len(),
+            self.dlq_depth,
+            self.crdt.entries,
+            self.crdt.unsynced_deltas
+        ));
+
+        // Roots are supervisors not referenced as a child by any other
+        // supervisor. Building from child relationships (rather than the
+        // `parent` field) is robust: `supervise_child` records the child in
+        // the parent's `children`, but does not always set the child
+        // supervisor's `parent`.
+        let child_sup_ids: std::collections::HashSet<u64> = self
+            .supervisors
+            .iter()
+            .flat_map(|s| s.children.iter().map(|c| c.actor_id))
+            .filter(|id| sup_by_id.contains_key(id))
+            .collect();
+        let roots: Vec<&super::SupervisorMetric> = self
+            .supervisors
+            .iter()
+            .filter(|s| !child_sup_ids.contains(&s.id))
+            .collect();
+
+        if roots.is_empty() {
+            out.push_str("  (no supervisors)\n");
+        }
+        for root in roots {
+            Self::render_supervisor_node(root, 0, &sup_by_id, &mut out);
+        }
+        out
+    }
+
+    fn render_supervisor_node(
+        sup: &super::SupervisorMetric,
+        depth: usize,
+        sup_by_id: &HashMap<u64, &super::SupervisorMetric>,
+        out: &mut String,
+    ) {
+        let indent = "  ".repeat(depth);
+        out.push_str(&format!(
+            "{}supervisor {} [{}]\n",
+            indent, sup.name, sup.strategy
+        ));
+        for child in &sup.children {
+            match sup_by_id.get(&child.actor_id) {
+                Some(child_sup) => {
+                    Self::render_supervisor_node(child_sup, depth + 1, sup_by_id, out)
+                }
+                None => {
+                    out.push_str(&format!(
+                        "{}  actor {} ({})\n",
+                        "  ".repeat(depth + 1),
+                        child.actor_id,
+                        child.spec_id
+                    ));
+                }
+            }
+        }
     }
 }

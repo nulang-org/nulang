@@ -113,6 +113,9 @@ impl WasmRuntime {
             .func_wrap("env", "nulang_dispatch", host_dispatch)
             .map_err(map_wasmtime_err)?;
         linker
+            .func_wrap("env", "nulang_dispatch_args", host_dispatch_args)
+            .map_err(map_wasmtime_err)?;
+        linker
             .func_wrap("env", "log", host_log)
             .map_err(map_wasmtime_err)?;
         linker
@@ -225,10 +228,18 @@ impl WasmRuntime {
     }
 
     pub fn run(&mut self) -> NuResult<crate::vm::Value> {
-        let raw = self
-            .init_func
-            .call(&mut self.store, ())
-            .map_err(map_wasmtime_err)?;
+        let raw = self.init_func.call(&mut self.store, ()).map_err(|e| {
+            // Host functions report interpreter-parity runtime errors (type
+            // errors, 48-bit overflow) via `Error::msg`; wasmtime wraps them
+            // in a trap whose Display only shows a backtrace. Downcast to
+            // the original message and surface it as a RuntimeError so the
+            // WASM backend agrees with the interpreter/JIT/AOT.
+            if let Some(msg) = e.downcast_ref::<String>() {
+                NuError::runtime_error(msg.clone(), Span::default())
+            } else {
+                map_wasmtime_err(e)
+            }
+        })?;
         Ok(crate::vm::Value::from_raw(raw as u64))
     }
 
@@ -527,10 +538,19 @@ fn host_neg(_caller: Caller<'_, HostState>, a: i64) -> Result<i64, Error> {
         // tag range, so canonicalize the result.
         Ok(value_layout::float_bits(-f64::from_bits(a)) as i64)
     } else {
-        // Non-float operand → treat as int via `as_int().unwrap_or(0)`,
-        // matching the interpreter (negating a tuple/array yields 0, not a
-        // corrupted pointer payload).
-        Ok(value_layout::tag_int(-crate::jit::runtime::as_int_or_zero(a)) as i64)
+        // Match the interpreter's INeg (and the JIT helper `nulang_ineg`):
+        // ints negate with a 48-bit overflow check at INT48_MIN; anything
+        // else is a type error.
+        let v = crate::vm::Value::from_raw(a);
+        match v.as_int() {
+            Some(x) if x != crate::value_layout::INT48_MIN => Ok(value_layout::tag_int(-x) as i64),
+            Some(x) => Err(Error::msg(error_message(crate::vm::int_overflow_error(
+                "neg", x, 0,
+            )))),
+            None => Err(Error::msg(error_message(crate::vm::arith_type_error(
+                "neg", v, v,
+            )))),
+        }
     }
 }
 
@@ -779,6 +799,112 @@ fn host_dispatch(mut caller: Caller<'_, HostState>, a: i32, b: i32, c: i32, d: i
     write_len as i64
 }
 
+/// Decode one tagged Nulang value (as produced by the WASM backend) into a
+/// plain JSON value. `TAG_STRING` payload is an offset into `data` addressing
+/// NUL-terminated UTF-8; out-of-bounds or unterminated → null. Untransferable
+/// tags (ptr/actor/closure) → null. Unreadable float bits → null.
+fn guest_value_to_json(raw: u64, data: &[u8]) -> serde_json::Value {
+    use value_layout as vl;
+    if vl::is_float_raw(raw) {
+        return serde_json::Number::from_f64(f64::from_bits(raw))
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null);
+    }
+    match raw & vl::TAG_MASK {
+        vl::TAG_NIL | vl::TAG_UNIT => serde_json::Value::Null,
+        vl::TAG_BOOL => serde_json::Value::Bool(raw & 1 != 0),
+        vl::TAG_INT => serde_json::Value::from(vl::as_int_raw(raw)),
+        vl::TAG_STRING => {
+            let off = (raw & vl::PAYLOAD_MASK) as usize;
+            if off >= data.len() {
+                return serde_json::Value::Null;
+            }
+            match data[off..].iter().position(|&b| b == 0) {
+                Some(n) => serde_json::Value::String(
+                    String::from_utf8_lossy(&data[off..off + n]).into_owned(),
+                ),
+                None => serde_json::Value::Null,
+            }
+        }
+        vl::TAG_PTR | vl::TAG_ACTOR | vl::TAG_CLOSURE => serde_json::Value::Null,
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// `env.nulang_dispatch_args(tag_ptr: i32, tag_len: i32, argv_ptr: i32, argc: i32) -> i64`
+///
+/// Runtime-argument effect dispatch stub: decodes the guest's positional argv
+/// (tagged Nulang values in linear memory) into a positional JSON array,
+/// records it alongside the dotted effect tag for test verification, and
+/// writes the injectable [`HostState::dispatch_result`] (if any) to the ring
+/// buffer at [`crate::mir_wasm::RING_BUFFER_BASE`], returning its length —
+/// matching the length-return contract nulang-cloud's `host_dispatch_args`
+/// implements. Returns 0 when no result is injected.
+fn host_dispatch_args(
+    mut caller: Caller<'_, HostState>,
+    tag_ptr: i32,
+    tag_len: i32,
+    argv_ptr: i32,
+    argc: i32,
+) -> i64 {
+    const MAX_DISPATCH_ARGS: i32 = 16;
+    if argc < 0 || argc > MAX_DISPATCH_ARGS {
+        return 0;
+    }
+    // Read the tag + argv words, decode into a positional JSON array, and
+    // record for tests. Scoped to release the memory borrow before the result
+    // write-back below takes `&mut caller`.
+    {
+        let mem = match get_memory(&mut caller) {
+            Ok(m) => m,
+            Err(_) => return 0,
+        };
+        let data = mem.data(&caller);
+        let read = |off: i32, len: i32| -> Vec<u8> {
+            if off < 0 || len <= 0 {
+                return Vec::new();
+            }
+            let (off, len) = (off as usize, len as usize);
+            data.get(off..off.saturating_add(len))
+                .unwrap_or(&[])
+                .to_vec()
+        };
+        let tag = read(tag_ptr, tag_len);
+        let argv = read(argv_ptr, argc * 8);
+        let args: Vec<serde_json::Value> = argv
+            .chunks_exact(8)
+            .map(|w| {
+                let raw = u64::from_le_bytes(w.try_into().expect("8-byte chunk"));
+                guest_value_to_json(raw, data)
+            })
+            .collect();
+        let payload = serde_json::to_vec(&serde_json::Value::Array(args)).unwrap_or_default();
+        *caller.data().last_dispatch.lock() = Some((tag, payload));
+    }
+    let result = {
+        let guard = caller.data().dispatch_result.lock();
+        guard.clone()
+    };
+    let Some(result) = result else {
+        return 0;
+    };
+    if result.is_empty() {
+        return 0;
+    }
+    let base = crate::mir_wasm::RING_BUFFER_BASE as usize;
+    let write_len = result.len().min(0x1000); // ring buffer is 4 KiB
+    let mem = match get_memory(&mut caller) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    let data = mem.data_mut(&mut caller);
+    if base + write_len > data.len() {
+        return 0;
+    }
+    data[base..base + write_len].copy_from_slice(&result[..write_len]);
+    write_len as i64
+}
+
 /// Helper: retrieve linear memory from the HostState.
 fn get_memory(caller: &mut Caller<'_, HostState>) -> Result<Memory, Error> {
     caller
@@ -789,6 +915,17 @@ fn get_memory(caller: &mut Caller<'_, HostState>) -> Result<Memory, Error> {
 }
 
 // ── Error mapping ────────────────────────────────────────────────────
+
+/// Extract the raw message from a `NuError::RuntimeError` (the message
+/// without the "Runtime error at L:C:" Display prefix). Host functions use
+/// this so the error re-wrapped by `WasmRuntime::run` matches the
+/// interpreter's error text exactly.
+fn error_message(e: NuError) -> String {
+    match e {
+        NuError::RuntimeError { msg, .. } => msg,
+        other => other.to_string(),
+    }
+}
 
 fn map_wasmtime_err(e: impl std::fmt::Display) -> NuError {
     NuError::VMError {
@@ -845,6 +982,9 @@ pub fn load_precompiled(cwasm_bytes: &[u8]) -> NuResult<WasmRuntime> {
         .map_err(map_wasmtime_err)?;
     linker
         .func_wrap("env", "nulang_dispatch", host_dispatch)
+        .map_err(map_wasmtime_err)?;
+    linker
+        .func_wrap("env", "nulang_dispatch_args", host_dispatch_args)
         .map_err(map_wasmtime_err)?;
     linker
         .func_wrap("env", "log", host_log)

@@ -30,11 +30,19 @@
 //! refused, never silently reinterpreted. See `SPEC2.md` §"Format Stability".
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io;
+#[cfg(feature = "tcp")]
+use std::io::{Read, Write};
+use std::net::SocketAddr;
+#[cfg(feature = "tcp")]
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+#[cfg(feature = "tcp")]
+use std::sync::Mutex;
+use std::sync::{mpsc, Arc};
+#[cfg(feature = "tcp")]
 use std::thread::{self, JoinHandle};
+#[cfg(feature = "tcp")]
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -48,6 +56,7 @@ use super::MessagePriority;
 use super::NodeId;
 use crate::vm::Value;
 
+#[cfg(feature = "tcp")]
 use tracing::warn;
 
 // ---------------------------------------------------------------------------
@@ -65,6 +74,7 @@ use tracing::warn;
 ///
 /// `PlaintextInsecure` is the explicit opt-out for development and testing.
 #[derive(Clone)]
+#[cfg(feature = "tcp")]
 pub enum TlsConfig {
     /// Mutual TLS with a cluster CA.
     ///
@@ -90,6 +100,7 @@ pub enum TlsConfig {
     PlaintextInsecure,
 }
 
+#[cfg(feature = "tcp")]
 impl TlsConfig {
     /// Returns `true` when plaintext (insecure) transport is configured.
     pub fn is_plaintext(&self) -> bool {
@@ -200,6 +211,7 @@ impl TlsConfig {
 }
 
 /// Parse a single PEM-encoded X.509 certificate.
+#[cfg(feature = "tcp")]
 fn parse_pem_cert(pem: &[u8]) -> io::Result<rustls::pki_types::CertificateDer<'static>> {
     let certs: Vec<rustls::pki_types::CertificateDer> =
         rustls_pemfile::certs(&mut std::io::BufReader::new(pem))
@@ -212,6 +224,7 @@ fn parse_pem_cert(pem: &[u8]) -> io::Result<rustls::pki_types::CertificateDer<'s
 }
 
 /// Parse a chain of PEM-encoded X.509 certificates (at least one).
+#[cfg(feature = "tcp")]
 fn parse_pem_cert_chain(pem: &[u8]) -> io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let certs: Vec<rustls::pki_types::CertificateDer> =
         rustls_pemfile::certs(&mut std::io::BufReader::new(pem))
@@ -228,6 +241,7 @@ fn parse_pem_cert_chain(pem: &[u8]) -> io::Result<Vec<rustls::pki_types::Certifi
     Ok(certs)
 }
 /// Parse a PEM-encoded private key (PKCS#8 or RSA).
+#[cfg(feature = "tcp")]
 fn parse_pem_key(pem: &[u8]) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>> {
     let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(pem))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("PEM key: {e}")))?
@@ -242,6 +256,7 @@ fn parse_pem_key(pem: &[u8]) -> io::Result<rustls::pki_types::PrivateKeyDer<'sta
 /// A duplex transport stream that can be either a plain `TcpStream` or a
 /// TLS-wrapped connection.  TLS streams are shared behind `Arc<Mutex<>>`
 /// because `rustls::StreamOwned` cannot be cloned the way `TcpStream` can.
+#[cfg(feature = "tcp")]
 pub(crate) enum TransportStream {
     Raw(TcpStream),
     TlsServer(
@@ -252,6 +267,7 @@ pub(crate) enum TransportStream {
     ),
 }
 
+#[cfg(feature = "tcp")]
 impl TransportStream {
     /// Create a clone suitable for the reader half of a duplex connection.
     /// For raw TCP this duplicates the file descriptor; for TLS this clones
@@ -335,6 +351,7 @@ impl TransportStream {
     }
 }
 
+#[cfg(feature = "tcp")]
 impl Read for TransportStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -345,6 +362,7 @@ impl Read for TransportStream {
     }
 }
 
+#[cfg(feature = "tcp")]
 impl Write for TransportStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
@@ -362,6 +380,7 @@ impl Write for TransportStream {
     }
 }
 
+#[cfg(feature = "tcp")]
 fn tls_wrap_server(tcp: TcpStream, config: &TlsConfig) -> io::Result<TransportStream> {
     let cfg = config.server_config()?;
     let conn = rustls::ServerConnection::new(std::sync::Arc::new(cfg))
@@ -372,6 +391,7 @@ fn tls_wrap_server(tcp: TcpStream, config: &TlsConfig) -> io::Result<TransportSt
     )))
 }
 
+#[cfg(feature = "tcp")]
 fn tls_wrap_client(tcp: TcpStream, config: &TlsConfig) -> io::Result<TransportStream> {
     let cfg = config.client_config()?;
     let name_str: String = config.server_name().unwrap_or("localhost").to_owned();
@@ -430,10 +450,12 @@ const MAGIC: &[u8] = &crate::format::constants::WIRE_MAGIC;
 const PACKET_HEADER_LEN: usize = 13;
 
 /// TCP read / write timeout applied to every connection.
+#[cfg(feature = "tcp")]
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the sender thread waits on the outgoing channel before
 /// re-checking the shutdown flag.
+#[cfg(feature = "tcp")]
 const CHANNEL_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 // ---------------------------------------------------------------------------
@@ -441,6 +463,7 @@ const CHANNEL_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 // ---------------------------------------------------------------------------
 
 /// Write the 16-byte NUL0 versioned handshake to a stream.
+#[cfg(feature = "tcp")]
 fn write_handshake<W: Write>(w: &mut W, node_id: NodeId) -> io::Result<()> {
     w.write_all(&crate::format::constants::WIRE_MAGIC)?;
     w.write_all(&crate::format::constants::WIRE_VERSION.to_be_bytes())?;
@@ -452,6 +475,7 @@ fn write_handshake<W: Write>(w: &mut W, node_id: NodeId) -> io::Result<()> {
 /// magic and the wire protocol version. Returns the peer's node id. A
 /// mismatched magic or version is a hard error: the connection is refused
 /// rather than the peer's packets being reinterpreted under the wrong layout.
+#[cfg(feature = "tcp")]
 fn read_handshake<R: Read>(r: &mut R) -> io::Result<NodeId> {
     let mut buf = [0u8; crate::format::constants::WIRE_HANDSHAKE_LEN];
     r.read_exact(&mut buf)?;
@@ -483,6 +507,7 @@ fn read_handshake<R: Read>(r: &mut R) -> io::Result<NodeId> {
 
 /// Maximum length (in bytes) of a single packet payload we are willing to
 /// deserialize — a simple DoS protection.
+#[cfg(feature = "tcp")]
 const MAX_PACKET_LEN: u32 = 16 * 1024 * 1024; // 16 MiB
 
 /// Capacity of the bounded internal channels.
@@ -543,6 +568,11 @@ pub enum Packet {
         /// runtime interns each entry into the target actor's module pool
         /// (`distributed::intern_wire_strings`).
         string_table: Vec<String>,
+        /// Immutable byte payloads for every `Value::object(id)` in `payload`.
+        /// On the wire an object-id value indexes **this table**.  The receiving
+        /// runtime inserts each entry into its local `ObjectStore` and rewrites
+        /// the payload to use the local object id before delivery.
+        object_table: Vec<(u64, Vec<u8>)>,
         sender_actor: u64,
         sender_node: NodeId,
         priority: MessagePriority,
@@ -853,6 +883,7 @@ impl Packet {
                 content_hash,
                 payload,
                 string_table,
+                object_table,
                 sender_actor,
                 sender_node,
                 priority,
@@ -874,6 +905,14 @@ impl Packet {
                 buf.extend_from_slice(&(string_table.len() as u32).to_be_bytes());
                 for s in string_table {
                     write_string(buf, s);
+                }
+                // Object payloads travel after the string table; the object-id
+                // values above index this table.
+                buf.extend_from_slice(&(object_table.len() as u32).to_be_bytes());
+                for (id, bytes) in object_table {
+                    buf.extend_from_slice(&id.to_be_bytes());
+                    buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                    buf.extend_from_slice(bytes);
                 }
                 // trace_id: 1-byte flag + optional content (string).
                 match trace_id {
@@ -1073,6 +1112,22 @@ impl Packet {
             string_table.push(s);
             offset = offset.checked_add(consumed)?;
         }
+        // Object table: immutable byte payloads for the payload's object-id values.
+        let object_count = read_u32(payload, offset)? as usize;
+        offset = offset.checked_add(4)?;
+        let mut object_table = Vec::with_capacity(object_count.min(1024));
+        for _ in 0..object_count {
+            let id = read_u64(payload, offset)?;
+            offset = offset.checked_add(8)?;
+            let bytes_len = read_u32(payload, offset)? as usize;
+            offset = offset.checked_add(4)?;
+            if offset + bytes_len > payload.len() {
+                return None;
+            }
+            let bytes = payload[offset..offset + bytes_len].to_vec();
+            offset = offset.checked_add(bytes_len)?;
+            object_table.push((id, bytes));
+        }
         // trace_id: 1-byte flag + optional string content.
         let trace_id = if offset < payload.len() && payload[offset] == 1 {
             let _ = offset.checked_add(1)?;
@@ -1089,6 +1144,7 @@ impl Packet {
             content_hash,
             payload: values,
             string_table,
+            object_table,
             sender_actor,
             sender_node,
             priority,
@@ -1382,6 +1438,7 @@ const VAL_NIL: u8 = 5;
 /// 1–9 bytes of unsigned LEB128 encoding a zigzag-mapped i64.
 /// Not yet used on the wire — reserved for version-bumped connections.
 const VAL_INT_VARINT: u8 = 6;
+const VAL_OBJECT: u8 = 7;
 
 // ---------------------------------------------------------------------------
 // Varint (unsigned LEB128) encoding — for future compact wire format
@@ -1443,6 +1500,11 @@ fn write_value(buf: &mut Vec<u8>, v: &Value) {
         // constant pool — see `Packet::ActorMessage::string_table`.
         buf.push(VAL_STRING);
         buf.extend_from_slice(&id.to_be_bytes());
+    } else if let Some(id) = v.as_object_id() {
+        // The id indexes the enclosing packet's object table, not any local
+        // object store — see `Packet::ActorMessage::object_table`.
+        buf.push(VAL_OBJECT);
+        buf.extend_from_slice(&id.to_be_bytes());
     } else if v.is_unit() {
         buf.push(VAL_UNIT);
     } else if v.is_nil() {
@@ -1459,8 +1521,11 @@ fn write_value(buf: &mut Vec<u8>, v: &Value) {
 /// pointer is process-local, so those are always rejected. A string-id is
 /// safe only when `strings_ok` — i.e. the enclosing packet carries a string
 /// table with the content (actor messages do; spawn requests do not).
+#[cfg(feature = "tcp")]
 fn value_is_wire_safe(v: &Value, strings_ok: bool) -> bool {
-    !(v.is_ptr() || v.is_actor_ref() || v.is_closure()) && (strings_ok || !v.is_string())
+    !(v.is_ptr() || v.is_actor_ref() || v.is_closure())
+        && (strings_ok || !v.is_string())
+        && (strings_ok || !v.is_object())
 }
 
 /// True if every payload [`Value`] carried by `packet` is wire-safe.
@@ -1471,16 +1536,20 @@ fn value_is_wire_safe(v: &Value, strings_ok: bool) -> bool {
 /// without a table entry is a dangling reference and is rejected. Spawn
 /// requests keep strings rejected entirely: remotely-spawned actors run
 /// native handlers and have no module pool to intern content into.
+#[cfg(feature = "tcp")]
 fn packet_payload_wire_safe(packet: &Packet) -> bool {
     match packet {
         Packet::ActorMessage {
             payload,
             string_table,
+            object_table,
             ..
         } => payload.iter().all(|v| {
             value_is_wire_safe(v, true)
                 && v.as_string_id()
                     .map_or(true, |id| (id as usize) < string_table.len())
+                && v.as_object_id()
+                    .map_or(true, |id| (id as usize) < object_table.len())
         }),
         Packet::SpawnRequest { initial_state, .. } => initial_state
             .iter()
@@ -1510,6 +1579,10 @@ fn read_value(bytes: &[u8], offset: usize) -> Option<(Value, usize)> {
         VAL_STRING => {
             let id = read_u32(bytes, offset + 1)?;
             Some((Value::string(id), 1 + 4))
+        }
+        VAL_OBJECT => {
+            let id = read_u64(bytes, offset + 1)?;
+            Some((Value::object(id), 1 + 8))
         }
         VAL_UNIT => Some((Value::unit(), 1)),
         VAL_NIL => Some((Value::nil(), 1)),
@@ -1682,6 +1755,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 /// Networking threads must keep running when one thread panics while holding
 /// a shared lock; the data protected by these mutexes stays structurally
 /// valid across panics, so poisoning is ignored rather than cascaded.
+#[cfg(feature = "tcp")]
 fn lock_ignore_poison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -1691,6 +1765,7 @@ fn lock_ignore_poison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 // ---------------------------------------------------------------------------
 
 /// A single TCP connection to a remote node.
+#[cfg(feature = "tcp")]
 pub(crate) struct TcpConnection {
     #[allow(dead_code)]
     pub(crate) node_id: NodeId,
@@ -1699,6 +1774,7 @@ pub(crate) struct TcpConnection {
     pub(crate) last_activity: Instant,
 }
 
+#[cfg(feature = "tcp")]
 impl TcpConnection {
     /// Write a framed packet (length-prefixed) to the stream.
     fn send_packet(&mut self, packet_bytes: &[u8]) -> io::Result<()> {
@@ -1810,6 +1886,7 @@ impl NetworkTransport for Box<dyn NetworkTransport> {
         (**self).flush_held()
     }
 }
+#[cfg(feature = "tcp")]
 pub struct TcpTransport {
     node_id: NodeId,
     listen_addr: SocketAddr,
@@ -1833,6 +1910,7 @@ pub struct TcpTransport {
     partition: HashSet<NodeId>,
 }
 
+#[cfg(feature = "tcp")]
 impl TcpTransport {
     /// Create and bind a new network transport.
     ///
@@ -2137,6 +2215,7 @@ impl TcpTransport {
 /// Accepts incoming TCP connections.  For each accepted stream a new
 /// "reader" thread is spawned that performs the handshake and then
 /// enters a read-loop deserialising packets.
+#[cfg(feature = "tcp")]
 fn listener_thread(
     listener: TcpListener,
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
@@ -2182,6 +2261,7 @@ fn listener_thread(
 /// 2. Reads the peer's node-id (8 bytes).
 /// 3. Registers the connection.
 /// 4. Reads framed packets in a loop until disconnect or shutdown.
+#[cfg(feature = "tcp")]
 fn connection_reader(
     tcp: TcpStream,
     addr: SocketAddr,
@@ -2256,6 +2336,7 @@ fn connection_reader(
 /// Shared by the listener-side reader (accepted inbound connections) and
 /// the reader spawned for dialled outbound connections, so every TCP
 /// link is read exactly once regardless of which side initiated it.
+#[cfg(feature = "tcp")]
 fn connection_read_loop(
     mut stream: TransportStream,
     peer_id: NodeId,
@@ -2329,6 +2410,7 @@ fn connection_read_loop(
 ///
 /// Drains the outgoing queue, looks up (or creates) the TCP connection
 /// for each packet, and writes the framed bytes.
+#[cfg(feature = "tcp")]
 fn sender_thread(
     outgoing_rx: mpsc::Receiver<OutgoingPacket>,
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
@@ -2415,6 +2497,7 @@ fn sender_thread(
 /// duplex: without it, a node that only ever dials out (e.g. a cluster
 /// joiner) could never receive packets over the connection it
 /// established, and heartbeat replies from its seed would be lost.
+#[cfg(feature = "tcp")]
 fn connect_in_sender(
     connections: &Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     incoming_tx: &mpsc::SyncSender<IncomingPacket>,
@@ -2489,6 +2572,7 @@ mod tests {
     use super::super::crdt_manager::{CrdtId, CrdtType};
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    #[cfg(feature = "tcp")]
     use std::thread::sleep;
 
     // ------------------------------------------------------------------
@@ -2523,6 +2607,7 @@ mod tests {
             content_hash: None,
             payload: vec![Value::int(123), Value::string(456)],
             string_table: vec![],
+            object_table: vec![],
             sender_actor: 99,
             sender_node: NodeId(0xDEAD_BEEF_CAFE_BABE),
             priority: MessagePriority::Normal,
@@ -2547,6 +2632,7 @@ mod tests {
             content_hash: None,
             payload: vec![Value::string(0), Value::string(1), Value::string(0)],
             string_table: vec!["hello".to_string(), "wörld ✓".to_string()],
+            object_table: vec![],
             sender_actor: 3,
             sender_node: NodeId(0x1111_2222_3333_4444),
             priority: MessagePriority::Normal,
@@ -2561,6 +2647,32 @@ mod tests {
         assert_eq!(decoded, packet);
     }
 
+    // ------------------------------------------------------------------
+    // 2c. ActorMessage object table roundtrip
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_packet_actor_message_object_table_roundtrip() {
+        let packet = Packet::ActorMessage {
+            target_actor: 8,
+            behavior_name: "handle_bytes".to_string(),
+            content_hash: None,
+            payload: vec![Value::object(0), Value::object(1), Value::object(0)],
+            string_table: vec![],
+            object_table: vec![(0, vec![1, 2, 3]), (1, vec![4, 5, 6, 7])],
+            sender_actor: 4,
+            sender_node: NodeId(0x2222_3333_4444_5555),
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        };
+
+        let bytes = packet.to_bytes(88);
+        let (seq, decoded) =
+            Packet::from_bytes(&bytes).expect("actor message object table deserialization failed");
+
+        assert_eq!(seq, 88);
+        assert_eq!(decoded, packet);
+    }
+
     #[test]
     fn test_packet_actor_message_rejects_truncated_string_table() {
         let packet = Packet::ActorMessage {
@@ -2569,6 +2681,7 @@ mod tests {
             content_hash: None,
             payload: vec![Value::string(0)],
             string_table: vec!["hello".to_string()],
+            object_table: vec![],
             sender_actor: 3,
             sender_node: NodeId(1),
             priority: MessagePriority::Normal,
@@ -2842,6 +2955,7 @@ mod tests {
     // 7. Transport bind
     // ------------------------------------------------------------------
     #[test]
+    #[cfg(feature = "tcp")]
     fn test_transport_bind() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
         let mut transport =
@@ -2867,6 +2981,7 @@ mod tests {
     // 8. Two transports can connect
     // ------------------------------------------------------------------
     #[test]
+    #[cfg(feature = "tcp")]
     fn test_transport_connect() {
         let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
         let mut transport_a = TcpTransport::bind(
@@ -2911,6 +3026,7 @@ mod tests {
     // 9. Send packet and receive on the other side
     // ------------------------------------------------------------------
     #[test]
+    #[cfg(feature = "tcp")]
     fn test_transport_send_receive() {
         let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
         let mut transport_a = TcpTransport::bind(
@@ -2965,6 +3081,7 @@ mod tests {
     // 9b. Non-scalar payloads are rejected at send time
     // ------------------------------------------------------------------
     #[test]
+    #[cfg(feature = "tcp")]
     fn test_value_wire_safety_classification() {
         // Scalars round-trip exactly and are safe to send. Strings are safe
         // only where the packet can carry their content (`strings_ok`).
@@ -2991,6 +3108,7 @@ mod tests {
             content_hash: None,
             payload,
             string_table,
+            object_table: vec![],
             sender_actor: 0,
             sender_node: NodeId(5),
             priority: MessagePriority::Normal,
@@ -3045,6 +3163,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tcp")]
     fn test_transport_send_rejects_dangling_string_payload() {
         let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
         let mut transport_a = TcpTransport::bind(
@@ -3075,6 +3194,7 @@ mod tests {
             content_hash: None,
             payload: vec![Value::string(42)],
             string_table: vec![],
+            object_table: vec![],
             sender_actor: 7,
             sender_node: transport_a.node_id(),
             priority: MessagePriority::Normal,
@@ -3098,6 +3218,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tcp")]
     fn test_transport_send_delivers_string_payload_with_table() {
         let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
         let mut transport_a = TcpTransport::bind(
@@ -3125,6 +3246,7 @@ mod tests {
             content_hash: None,
             payload: vec![Value::string(0), Value::int(7), Value::string(1)],
             string_table: vec!["hello".into(), "world".into()],
+            object_table: vec![],
             sender_actor: 7,
             sender_node: transport_a.node_id(),
             priority: MessagePriority::Normal,
@@ -3152,6 +3274,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tcp")]
     fn test_transport_send_delivers_scalar_payload() {
         let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
         let mut transport_a = TcpTransport::bind(
@@ -3179,6 +3302,7 @@ mod tests {
             content_hash: None,
             payload: vec![Value::int(123), Value::bool(true), Value::unit()],
             string_table: vec![],
+            object_table: vec![],
             sender_actor: 7,
             sender_node: transport_a.node_id(),
             priority: MessagePriority::Normal,
@@ -3209,6 +3333,7 @@ mod tests {
     // 10. Sequence numbers increment
     // ------------------------------------------------------------------
     #[test]
+    #[cfg(feature = "tcp")]
     fn test_transport_sequence_numbers() {
         let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
         let mut transport_a = TcpTransport::bind(
@@ -3320,6 +3445,7 @@ mod tests {
     // 14. Disconnect removes connection
     // ------------------------------------------------------------------
     #[test]
+    #[cfg(feature = "tcp")]
     fn test_transport_disconnect() {
         let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
         let mut transport_a = TcpTransport::bind(
@@ -3402,6 +3528,7 @@ mod tests {
         assert!(Packet::from_bytes(truncated).is_none());
     }
 }
+#[cfg(feature = "tcp")]
 impl NetworkTransport for TcpTransport {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()> {
         self.connect(node_id, addr)
@@ -3640,7 +3767,9 @@ mod tls_provider {
     };
     use parking_lot::Mutex;
     use rustls::{ClientConfig, ServerConfig};
-    use std::io::{self, Read, Write};
+    use std::io;
+    #[cfg(feature = "tcp")]
+    use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::Arc;
 

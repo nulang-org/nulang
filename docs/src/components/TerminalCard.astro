@@ -1,0 +1,106 @@
+---
+export interface Props {
+	title?: string;
+	class?: string;
+	code?: string;
+}
+
+const { title = 'terminal', class: className = '', code } = Astro.props;
+---
+
+<div class:list={['terminal-card', className]}>
+	<div class="terminal-card-bar">
+		<span class="t-dot t-red"></span>
+		<span class="t-dot t-yellow"></span>
+		<span class="t-dot t-green"></span>
+		{title && <span class="t-title">{title}</span>}
+	</div>
+	<div class="terminal-card-body">
+		{code ? <pre><code set:html={code}></code></pre> : <slot />}
+	</div>
+</div>
+
+<style>
+	@layer starlight.core {
+		.terminal-card {
+			position: relative;
+			border-radius: 0.875rem;
+			overflow: hidden;
+			border: 1px solid var(--nu-border);
+			background: #0d1117;
+			box-shadow: 0 12px 40px rgba(0, 0, 0, 0.24);
+		}
+
+		.terminal-card::after {
+			content: '';
+			position: absolute;
+			left: 50%;
+			bottom: -2rem;
+			transform: translateX(-50%);
+			width: 80%;
+			height: 4rem;
+			background: rgba(243, 128, 32, 0.14);
+			filter: blur(2rem);
+			border-radius: 9999px;
+			pointer-events: none;
+			z-index: 0;
+		}
+
+		.terminal-card-bar {
+			display: flex;
+			align-items: center;
+			gap: 0.5rem;
+			padding: 0.75rem 1rem;
+			background: #161b22;
+			border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+			position: relative;
+			z-index: 1;
+		}
+
+		.terminal-card-bar .t-dot {
+			width: 0.75rem;
+			height: 0.75rem;
+			border-radius: 9999px;
+		}
+
+		.terminal-card-bar .t-red { background: #ff5f56; }
+		.terminal-card-bar .t-yellow { background: #ffbd2e; }
+		.terminal-card-bar .t-green { background: #27c93f; }
+
+		.terminal-card-bar .t-title {
+			margin-left: 0.5rem;
+			font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+			font-size: 0.75rem;
+			color: #8b949e;
+		}
+
+		.terminal-card-body {
+			position: relative;
+			z-index: 1;
+			padding: 1.25rem 1.5rem;
+			overflow-x: auto;
+			font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+			font-size: 0.8rem;
+			line-height: 1.7;
+			color: #c9d1d9;
+		}
+
+		.terminal-card-body pre {
+			margin: 0;
+			padding: 0;
+			background: transparent;
+			font-family: inherit;
+			font-size: inherit;
+			line-height: inherit;
+			color: inherit;
+		}
+
+		.terminal-card-body code {
+			font-family: inherit;
+			font-size: inherit;
+			line-height: inherit;
+			color: inherit;
+			background: transparent;
+		}
+	}
+</style>

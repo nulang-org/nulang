@@ -6,6 +6,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The repo's .cargo/config.toml sets target-dir=/tmp/cargo-target for
+  # local dev; override it here so the strip/package steps can use the
+  # conventional target/<triple>/ paths.
+  CARGO_TARGET_DIR: target
 
 jobs:
   release:
@@ -21,11 +25,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: nulang-linux-aarch64
           - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: nulang-macos-x86_64
-          - os: macos-latest
             target: aarch64-apple-darwin
             artifact: nulang-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: nulang-windows-x86_64
     permissions:
       contents: write
     steps:
@@ -38,17 +42,57 @@ jobs:
       - name: Install cross-compilation toolchain (Linux aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo dpkg --add-architecture arm64
+          # Restrict the runner's amd64 sources and add arm64 via
+          # ports.ubuntu.com (archive/security mirrors 404 on arm64).
+          sudo sed -i '/^Types: deb$/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          CODENAME=$(lsb_release -cs)
+          # printf (not an indented heredoc) so the deb822 stanza has no
+          # leading whitespace — indented continuation lines would merge
+          # into the previous field and break the source.
+          printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: %s %s-updates %s-backports %s-security\nComponents: main restricted universe multiverse\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' "$CODENAME" "$CODENAME" "$CODENAME" "$CODENAME" | sudo tee /etc/apt/sources.list.d/arm64.sources
+          sudo apt-get update
+          # libpython3-dev:arm64 only (no python3.12-dev): the python3
+          # metapackage chain triggers an apt resolver conflict on the
+          # runner image (shim-signed/grub bootloader deps). pyo3-ffi
+          # uses pre-generated bindings, so only libpython3.12.so is
+          # needed for linking; the version comes from
+          # PYO3_CROSS_PYTHON_VERSION.
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libssl-dev:arm64 libpython3-dev:arm64 pkg-config
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
+          echo "PYO3_CROSS_PYTHON_VERSION=3.12" >> $GITHUB_ENV
+          # Defensive: ensure the cross linker finds libpython3.12.so in
+          # the multiarch dir even if the cross gcc's default search
+          # omits it.
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-L/usr/lib/aarch64-linux-gnu" >> $GITHUB_ENV
 
       - name: Install macOS system dependencies
         if: runner.os == 'macOS'
-        run: brew install python@3.13 || true
+        run: |
+          brew install python@3.13 openssl@3 || true
+          echo "OPENSSL_DIR=/opt/homebrew/opt/openssl@3" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/opt/homebrew/opt/openssl@3/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Install Windows system dependencies
+        if: runner.os == 'Windows'
+        # Pin pyo3 to the interpreter on PATH (hostedtoolcache Python).
+        # No OpenSSL needed: native-tls uses SChannel on Windows.
+        run: |
+          echo "PYO3_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> $GITHUB_ENV
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # dtolnay/rust-toolchain can silently skip the cross-target std when
+      # updating a preinstalled toolchain (observed on macOS runners: host
+      # components only, then "can't find crate for core"). Add the target
+      # explicitly so cross-compilation always has rust-std.
+      - name: Ensure cross-compilation target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -60,15 +104,35 @@ jobs:
 
       - name: Test (release, native only)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --release
+        # --target must match the Build step: the package tests shell out
+        # to the nulang binary via the test harness, which locates it next
+        # to the test binary (target/<triple>/release/nulang). Without
+        # --target the harness falls back to the test binary itself and
+        # the web-build tests fail with exit 101.
+        run: cargo test --release --target ${{ matrix.target }}
 
       - name: Strip binary
-        run: strip target/${{ matrix.target }}/release/nulang
+        # No strip on Windows: the MSVC toolchain has no equivalent
+        # single-step strip, and the binary is already release-sized.
+        if: runner.os != 'Windows'
+        run: |
+          # The host strip cannot process a cross-compiled aarch64 ELF;
+          # use the cross binutils strip (from gcc-aarch64-linux-gnu).
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            STRIP=aarch64-linux-gnu-strip
+          else
+            STRIP=strip
+          fi
+          $STRIP target/${{ matrix.target }}/release/nulang
 
       - name: Package binary
+        # bash shell: the default pwsh on Windows runners cannot run the
+        # POSIX commands below (Git Bash ships with the runner image).
+        shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/nulang dist/${{ matrix.artifact }}
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN=nulang.exe; else BIN=nulang; fi
+          cp target/${{ matrix.target }}/release/$BIN dist/${{ matrix.artifact }}
           tar czf dist/${{ matrix.artifact }}.tar.gz -C dist ${{ matrix.artifact }}
           sha256sum dist/${{ matrix.artifact }}.tar.gz > dist/${{ matrix.artifact }}.tar.gz.sha256
 

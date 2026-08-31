@@ -1,0 +1,110 @@
+---
+const links = [
+	{
+		href: '/getting-started/installation/',
+		label: 'Docs',
+		external: false,
+		icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+	},
+	{
+		href: '/tutorial/',
+		label: 'Tutorial',
+		external: false,
+		icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+	},
+	{
+		href: '/blog/',
+		label: 'Blog',
+		external: false,
+		icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+	},
+	{
+		href: 'https://www.nulang.cloud',
+		label: 'Cloud',
+		external: true,
+		icon: '<path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>',
+	},
+	{
+		href: 'https://github.com/nulang-org/nulang',
+		label: 'GitHub',
+		external: true,
+		icon: '<path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/>',
+	},
+];
+---
+
+<div class="mobile-nav print:hidden">
+	<button
+		type="button"
+		class="mobile-nav-toggle"
+		aria-expanded="false"
+		aria-controls="mobile-nav-menu"
+		aria-label="Open navigation menu"
+	>
+		<svg class="icon-menu" aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+			<line x1="3" y1="6" x2="21" y2="6" />
+			<line x1="3" y1="12" x2="21" y2="12" />
+			<line x1="3" y1="18" x2="21" y2="18" />
+		</svg>
+		<svg class="icon-close" aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+			<line x1="18" y1="6" x2="6" y2="18" />
+			<line x1="6" y1="6" x2="18" y2="18" />
+		</svg>
+	</button>
+	<nav id="mobile-nav-menu" class="mobile-nav-menu" hidden>
+		{links.map((link) => (
+			<a
+				href={link.href}
+				class="mobile-nav-link"
+				{...(link.external ? { target: '_blank', rel: 'noopener' } : {})}
+			>
+				<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" set:html={link.icon} />
+				{link.label}
+			</a>
+		))}
+		<a href="/getting-started/installation/" class="mobile-nav-link">
+			<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+			</svg>
+			Get Started
+		</a>
+	</nav>
+</div>
+
+<script is:inline>
+	(function initMobileNav() {
+		const root = document.querySelector('.mobile-nav');
+		if (!root) return;
+
+		const toggle = root.querySelector('.mobile-nav-toggle');
+		const menu = root.querySelector('.mobile-nav-menu');
+		if (!toggle || !menu) return;
+
+		const setOpen = (open) => {
+			toggle.setAttribute('aria-expanded', String(open));
+			toggle.setAttribute('aria-label', open ? 'Close navigation menu' : 'Open navigation menu');
+			menu.hidden = !open;
+			root.classList.toggle('is-open', open);
+		};
+
+		toggle.addEventListener('click', () => {
+			setOpen(toggle.getAttribute('aria-expanded') !== 'true');
+		});
+
+		menu.querySelectorAll('a').forEach((link) => {
+			link.addEventListener('click', () => setOpen(false));
+		});
+
+		document.addEventListener('click', (event) => {
+			if (!root.contains(event.target)) setOpen(false);
+		});
+
+		document.addEventListener('keydown', (event) => {
+			if (event.key === 'Escape') setOpen(false);
+		});
+
+		matchMedia('(min-width: 50rem)').addEventListener('change', (event) => {
+			if (event.matches) setOpen(false);
+		});
+	})();
+</script>

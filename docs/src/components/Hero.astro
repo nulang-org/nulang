@@ -1,0 +1,94 @@
+---
+const { entry } = Astro.locals.starlightRoute;
+const { data } = entry;
+const { title = data.title, tagline, actions = [] } = data.hero || {};
+const PAGE_TITLE_ID = '_top';
+
+const codeHtml = [
+	'<span class="tok-comment">// counter.nulang — a durable stateful actor</span>',
+	'<span class="tok-kw">state</span> {',
+	'  <span class="tok-id">count</span>: <span class="tok-type">Int</span> = <span class="tok-num">0</span>,',
+	'}',
+	'',
+	'<span class="tok-kw">effect</span> <span class="tok-fn">increment</span>() {',
+	'  <span class="tok-kw">self</span>.<span class="tok-id">count</span> = <span class="tok-kw">self</span>.<span class="tok-id">count</span> + <span class="tok-num">1</span>',
+	'}',
+	'',
+	'<span class="tok-kw">effect</span> <span class="tok-fn">value</span>() {',
+	'  <span class="tok-kw">self</span>.<span class="tok-id">count</span>',
+	'}',
+].join('\n');
+---
+
+<div class="hero hero-cloud">
+	<div class="hero-copy">
+		<div class="hero-copy-inner">
+			<h1 id={PAGE_TITLE_ID} data-page-title set:html={title} />
+			{tagline && <div class="tagline" set:html={tagline} />}
+			{actions.length > 0 && (
+				<div class="actions">
+					{actions.map(({ text, link, icon, variant }) => (
+						<a href={link} class:list={['hero-action', variant]}>
+							{text}
+							{icon === 'right-arrow' && (
+								<svg aria-hidden="true" class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+									<path d="M5 12h14" />
+									<path d="m12 5 7 7-7 7" />
+								</svg>
+							)}
+							{icon === 'external' && (
+								<svg aria-hidden="true" class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+									<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+									<polyline points="15 3 21 3 21 9" />
+									<line x1="10" y1="14" x2="21" y2="3" />
+								</svg>
+							)}
+						</a>
+					))}
+				</div>
+			)}
+		</div>
+	</div>
+
+	<div class="hero-terminal">
+		<div class="hero-terminal-bar">
+			<span class="t-dot t-red"></span>
+			<span class="t-dot t-yellow"></span>
+			<span class="t-dot t-green"></span>
+			<span class="t-title">counter.nulang</span>
+		</div>
+		<pre class="hero-terminal-code"><code set:html={codeHtml}></code></pre>
+	</div>
+</div>
+
+<style>
+	@layer starlight.core {
+		.hero-copy-inner {
+			display: flex;
+			flex-direction: column;
+		}
+
+		h1 {
+			font-size: clamp(var(--sl-text-3xl), calc(0.25rem + 5vw), 3.5rem);
+			line-height: 1.08;
+			font-weight: 700;
+			letter-spacing: -0.03em;
+			color: var(--nu-text);
+		}
+
+		.tagline {
+			margin-top: 1.5rem;
+			font-size: clamp(var(--sl-text-base), calc(0.0625rem + 2vw), var(--sl-text-xl));
+			color: var(--nu-text-secondary);
+			max-width: 36rem;
+			line-height: 1.65;
+		}
+
+		.actions {
+			margin-top: 2rem;
+			display: flex;
+			flex-wrap: wrap;
+			gap: 0.875rem;
+		}
+	}
+</style>

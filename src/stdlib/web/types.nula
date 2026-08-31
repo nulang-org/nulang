@@ -1,0 +1,25 @@
+// Nulang web framework — semantic types.
+// Import: `import stdlib::web::types`
+//
+// These are compile-time distinctions only; at runtime they erase to their
+// underlying String representation. The typechecker enforces opacity so
+// user code cannot accidentally pass a raw String where escaped Html is
+// required.
+
+/// Escaped HTML document fragment. Distinct from String at compile time.
+opaque type Html = String
+
+/// Trusted raw HTML that bypasses automatic escaping. Distinct from String.
+opaque type RawHtml = String
+
+/// Email address (validation is a framework concern, not the type itself).
+opaque type Email = String
+
+/// Absolute or relative URL.
+opaque type Url = String
+
+/// CSS class name string.
+opaque type CssClass = String
+
+/// A path parameter captured from a route.
+opaque type RouteParam = String

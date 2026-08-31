@@ -4,7 +4,7 @@ Suggested title:
 **Nulang: an actor language with HM types, Pony-style capabilities, and durable event-sourced actors**
 
 Tags: `plt`, `compilers`, `rust`, `distributed` (pick 2–3; `plt` + `rust` is the
-natural fit). Submit as a link to https://github.com/dporkka/nulang.
+natural fit). Submit as a link to https://github.com/nulang-org/nulang.
 
 Lobste.rs culture note: no marketing voice, no "excited to announce." Post the
 link, then add a plain-text comment with the technical summary below. If you

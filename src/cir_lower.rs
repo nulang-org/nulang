@@ -319,7 +319,8 @@ fn translate_rvalue(op: &RValue, _func: &mir::Function, pc: u32) -> CirExpr {
         | RValue::Migrate { .. }
         | RValue::SelfRef
         | RValue::CapabilityCheck { .. }
-        | RValue::Resume(..) => CirExpr::ConstNil,
+        | RValue::Resume(..)
+        | RValue::Panic(..) => CirExpr::ConstNil,
     }
 }
 

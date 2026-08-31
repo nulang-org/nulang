@@ -22,7 +22,8 @@ fn parse_u64(s: &str) -> Result<u64, String> {
     if let Some(hex) = s.strip_prefix("0x") {
         u64::from_str_radix(hex, 16).map_err(|e| format!("bad hex value {:?}: {}", s, e))
     } else {
-        s.parse::<u64>().map_err(|e| format!("bad value {:?}: {}", s, e))
+        s.parse::<u64>()
+            .map_err(|e| format!("bad value {:?}: {}", s, e))
     }
 }
 
@@ -92,13 +93,8 @@ fn main() {
         time_secs
     );
 
-    let stats = nulang::difffuzz::run_campaign(
-        seed_base,
-        seeds,
-        deadline,
-        Some(&crashers),
-        verbose,
-    );
+    let stats =
+        nulang::difffuzz::run_campaign(seed_base, seeds, deadline, Some(&crashers), verbose);
 
     println!(
         "campaign: {} programs generated in {:.1}s\n  agreed: {} ({} also agreed under AOT)\n  uncomparable: {}\n  compile failures: {}\n  known-overflow divergences: {}\n  divergences: {}",

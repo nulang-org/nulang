@@ -1,0 +1,11 @@
+import stdlib::web::html
+import stdlib::web::types
+
+app "hello" {
+    route "GET" "/hello/:name" -> greet
+}
+
+@placement(server)
+fn greet() -> Html {
+    text("Hello")
+}

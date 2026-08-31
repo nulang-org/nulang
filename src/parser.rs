@@ -6,7 +6,8 @@
 use crate::ast::*;
 use crate::lexer::{Token, TokenKind};
 use crate::types::{
-    Capability, Effect, EffectRow, NuError, NuResult, PrimitiveType, Region, Span, Type, TypeVar,
+    Capability, Effect, EffectRow, NuError, NuResult, NuWarning, PrimitiveType, Region, Span, Type,
+    TypeVar,
 };
 use std::sync::OnceLock;
 type FxHashMap<K, V> =
@@ -111,6 +112,10 @@ pub struct Parser {
     /// Accumulated parse errors from error-recovery. Callers that want
     /// all errors (not just the first) call `consumed_diagnostics()`.
     diagnostics: Vec<NuError>,
+    /// Non-fatal warnings collected during parsing (e.g. RFC 0015
+    /// `catch`/`fail` deprecations). Callers surface these with
+    /// `take_warnings()`.
+    warnings: Vec<NuWarning>,
     /// Cache of types imported from other modules, populated lazily when
     /// a type name isn't found in the local token stream. Each entry holds
     /// the declaration's type-parameter variables followed by the resolved
@@ -119,6 +124,14 @@ pub struct Parser {
     imported_type_cache: FxHashMap<String, (Vec<TypeVar>, Type)>,
     /// Module-level named handler registry.
     handler_registry: FxHashMap<String, Vec<EffectHandler>>,
+}
+
+/// Parsed app block; kept private to the parser and desugared into
+/// ordinary functions before the AST leaves the parser.
+struct ParsedApp {
+    _name: String,
+    routes: Vec<(String, String, String)>,
+    span: Span,
 }
 
 impl Parser {
@@ -139,6 +152,7 @@ impl Parser {
             imported_type_cache: FxHashMap::default(),
             handler_registry: FxHashMap::default(),
             diagnostics: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -186,11 +200,18 @@ impl Parser {
         self.diagnostics.clear();
         let mut decls = Vec::new();
         let mut pending_lets: Vec<Decl> = Vec::new();
+        let mut app_decls: Vec<ParsedApp> = Vec::new();
         self.skip_newlines();
         while !self.is_at_end() {
             self.skip_newlines();
             if self.is_at_end() {
                 break;
+            }
+
+            // App blocks are handled before other declarations.
+            if self.match_token(&TokenKind::App) {
+                app_decls.push(self.parse_app_decl()?);
+                continue;
             }
 
             // Try declaration first, then expression
@@ -463,6 +484,8 @@ impl Parser {
         if !self.diagnostics.is_empty() {
             return Err(NuError::Multiple(std::mem::take(&mut self.diagnostics)));
         }
+        self.check_route_params(&app_decls, &decls)?;
+        decls.extend(self.desugar_app_decls(app_decls));
         let decls = Self::expand_contracts(Self::expand_derives(decls));
         Ok(AstModule {
             name: "main".to_string(),
@@ -470,222 +493,229 @@ impl Parser {
         })
     }
 
-/// Desugar `@derive(eq)` on record types into a synthetic structural-equality
-/// function `{name}_eq(a, b) -> Bool`. Walks top-level and nested-module decls
-/// so a derive inside a `module { }` block is expanded too.
-fn expand_derives(decls: Vec<Decl>) -> Vec<Decl> {
-    let mut out = Vec::with_capacity(decls.len());
-    for decl in decls {
-        match decl {
-            Decl::RecordType {
-                name,
-                type_params,
-                fields,
-                derives,
-                public,
-                span,
-            } => {
-                let wants_eq = derives.iter().any(|d| d == "eq");
-                out.push(Decl::RecordType {
-                    name: name.clone(),
-                    type_params: type_params.clone(),
-                    fields: fields.clone(),
+    /// Desugar `@derive(eq)` on record types into a synthetic structural-equality
+    /// function `{name}_eq(a, b) -> Bool`. Walks top-level and nested-module decls
+    /// so a derive inside a `module { }` block is expanded too.
+    fn expand_derives(decls: Vec<Decl>) -> Vec<Decl> {
+        let mut out = Vec::with_capacity(decls.len());
+        for decl in decls {
+            match decl {
+                Decl::RecordType {
+                    name,
+                    type_params,
+                    fields,
                     derives,
                     public,
                     span,
-                });
-                if wants_eq {
-                    out.push(Self::derive_eq_function(&name, &fields, span));
+                } => {
+                    let wants_eq = derives.iter().any(|d| d == "eq");
+                    out.push(Decl::RecordType {
+                        name: name.clone(),
+                        type_params: type_params.clone(),
+                        fields: fields.clone(),
+                        derives,
+                        public,
+                        span,
+                    });
+                    if wants_eq {
+                        out.push(Self::derive_eq_function(&name, &fields, span));
+                    }
                 }
-            }
-            Decl::Module {
-                name,
-                exports,
-                decls: inner,
-                span,
-            } => {
-                out.push(Decl::Module {
+                Decl::Module {
                     name,
                     exports,
-                    decls: Self::expand_derives(inner),
+                    decls: inner,
                     span,
-                });
+                } => {
+                    out.push(Decl::Module {
+                        name,
+                        exports,
+                        decls: Self::expand_derives(inner),
+                        span,
+                    });
+                }
+                other => out.push(other),
             }
-            other => out.push(other),
+        }
+        out
+    }
+
+    /// Synthesize `fn {record_name}_eq(a, b) -> Bool` comparing every field with
+    /// `==`, `&&`-chained. The zero-field case is trivially `true`.
+    fn derive_eq_function(record_name: &str, fields: &[(String, Type)], span: Span) -> Decl {
+        let rec_ty = Type::Record(fields.to_vec());
+        let mut body: Option<Expr> = None;
+        for (field, _) in fields {
+            let cmp = Expr::Binary {
+                op: BinOp::Eq,
+                left: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::Var("a".to_string(), span)),
+                    field: field.clone(),
+                    span,
+                }),
+                right: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::Var("b".to_string(), span)),
+                    field: field.clone(),
+                    span,
+                }),
+                span,
+            };
+            body = Some(match body {
+                None => cmp,
+                Some(acc) => Expr::Binary {
+                    op: BinOp::And,
+                    left: Box::new(acc),
+                    right: Box::new(cmp),
+                    span,
+                },
+            });
+        }
+        let body = body.unwrap_or_else(|| Expr::Literal(Literal::Bool(true), span));
+        Decl::Function {
+            name: format!("{}_eq", record_name.to_lowercase()),
+            type_params: vec![],
+            type_param_constraints: vec![],
+            params: vec![
+                Param::new("a", Some(rec_ty.clone())),
+                Param::new("b", Some(rec_ty)),
+            ],
+            default_values: vec![None, None],
+            using_params: vec![],
+            ret_type: Some(Type::bool()),
+            error_type: None,
+            effect: None,
+            cap: None,
+            requires: vec![],
+            ensures: vec![],
+            body,
+            annotations: vec![],
+            public: false,
+            span,
         }
     }
-    out
-}
 
-/// Synthesize `fn {record_name}_eq(a, b) -> Bool` comparing every field with
-/// `==`, `&&`-chained. The zero-field case is trivially `true`.
-fn derive_eq_function(record_name: &str, fields: &[(String, Type)], span: Span) -> Decl {
-    let rec_ty = Type::Record(fields.to_vec());
-    let mut body: Option<Expr> = None;
-    for (field, _) in fields {
-        let cmp = Expr::Binary {
-            op: BinOp::Eq,
-            left: Box::new(Expr::FieldAccess {
-                expr: Box::new(Expr::Var("a".to_string(), span)),
-                field: field.clone(),
-                span,
-            }),
-            right: Box::new(Expr::FieldAccess {
-                expr: Box::new(Expr::Var("b".to_string(), span)),
-                field: field.clone(),
-                span,
-            }),
-            span,
-        };
-        body = Some(match body {
-            None => cmp,
-            Some(acc) => Expr::Binary {
-                op: BinOp::And,
-                left: Box::new(acc),
-                right: Box::new(cmp),
-                span,
-            },
-        });
+    /// Desugar `requires` / `ensures` contract clauses into runtime checks:
+    /// `requires` become entry guards, `ensures` become a `let result = <body>`
+    /// wrapper that checks each postcondition against `result`. Violations raise a
+    /// runtime panic (`OpCode::Panic`) with a stable category message.
+    fn expand_contracts(decls: Vec<Decl>) -> Vec<Decl> {
+        decls
+            .into_iter()
+            .map(|decl| match decl {
+                Decl::Function {
+                    name,
+                    type_params,
+                    type_param_constraints,
+                    params,
+                    default_values,
+                    using_params,
+                    ret_type,
+                    error_type,
+                    effect,
+                    cap,
+                    requires,
+                    ensures,
+                    body,
+                    annotations,
+                    public,
+                    span,
+                } => Decl::Function {
+                    name,
+                    type_params,
+                    type_param_constraints,
+                    params,
+                    default_values,
+                    using_params,
+                    ret_type,
+                    error_type,
+                    effect,
+                    cap,
+                    requires: requires.clone(),
+                    ensures: ensures.clone(),
+                    body: Self::wrap_contracts(body, &requires, &ensures, span),
+                    annotations,
+                    public,
+                    span,
+                },
+                Decl::Module {
+                    name,
+                    exports,
+                    decls: inner,
+                    span,
+                } => Decl::Module {
+                    name,
+                    exports,
+                    decls: Self::expand_contracts(inner),
+                    span,
+                },
+                other => other,
+            })
+            .collect()
     }
-    let body = body.unwrap_or_else(|| Expr::Literal(Literal::Bool(true), span));
-    Decl::Function {
-        name: format!("{}_eq", record_name.to_lowercase()),
-        type_params: vec![],
-        type_param_constraints: vec![],
-        params: vec![
-            Param::new("a", Some(rec_ty.clone())),
-            Param::new("b", Some(rec_ty)),
-        ],
-        default_values: vec![None, None],
-        using_params: vec![],
-        ret_type: Some(Type::bool()),
-        error_type: None,
-        effect: None,
-        cap: None,
-        requires: vec![],
-        ensures: vec![],
-        body,
-        annotations: vec![],
-        public: false,
-        span,
-    }
-}
 
-/// Desugar `requires` / `ensures` contract clauses into runtime checks:
-/// `requires` become entry guards, `ensures` become a `let result = <body>`
-/// wrapper that checks each postcondition against `result`. Violations raise a
-/// runtime panic (`OpCode::Panic`) with a stable category message.
-fn expand_contracts(decls: Vec<Decl>) -> Vec<Decl> {
-    decls
-        .into_iter()
-        .map(|decl| match decl {
-            Decl::Function {
-                name,
-                type_params,
-                type_param_constraints,
-                params,
-                default_values,
-                using_params,
-                ret_type,
-                error_type,
-                effect,
-                cap,
-                requires,
-                ensures,
-                body,
-                annotations,
-                public,
+    /// Wrap a function body with its contract checks.
+    fn wrap_contracts(body: Expr, requires: &[Expr], ensures: &[Expr], span: Span) -> Expr {
+        // Postconditions: `let result = body in if (e1 && e2) then result else panic`.
+        let mut checked = body;
+        if !ensures.is_empty() {
+            let cond = Self::and_chain(ensures, span);
+            checked = Expr::Let {
+                name: "result".to_string(),
+                ty: None,
+                value: Box::new(checked),
+                body: Box::new(Expr::If {
+                    cond: Box::new(cond),
+                    then_branch: Box::new(Expr::Var("result".to_string(), span)),
+                    else_branch: Some(Box::new(Expr::Panic(
+                        "postcondition_violation".to_string(),
+                        span,
+                    ))),
+                    span,
+                }),
+                mutable: false,
+                let_in: false,
                 span,
-            } => Decl::Function {
-                name,
-                type_params,
-                type_param_constraints,
-                params,
-                default_values,
-                using_params,
-                ret_type,
-                error_type,
-                effect,
-                cap,
-                requires: requires.clone(),
-                ensures: ensures.clone(),
-                body: Self::wrap_contracts(body, &requires, &ensures, span),
-                annotations,
-                public,
-                span,
-            },
-            Decl::Module {
-                name,
-                exports,
-                decls: inner,
-                span,
-            } => Decl::Module {
-                name,
-                exports,
-                decls: Self::expand_contracts(inner),
-                span,
-            },
-            other => other,
-        })
-        .collect()
-}
-
-/// Wrap a function body with its contract checks.
-fn wrap_contracts(body: Expr, requires: &[Expr], ensures: &[Expr], span: Span) -> Expr {
-    // Postconditions: `let result = body in if (e1 && e2) then result else panic`.
-    let mut checked = body;
-    if !ensures.is_empty() {
-        let cond = Self::and_chain(ensures, span);
-        checked = Expr::Let {
-            name: "result".to_string(),
-            ty: None,
-            value: Box::new(checked),
-            body: Box::new(Expr::If {
+            };
+        }
+        // Preconditions: `if (r1 && r2) then checked else panic`.
+        if !requires.is_empty() {
+            let cond = Self::and_chain(requires, span);
+            checked = Expr::If {
                 cond: Box::new(cond),
-                then_branch: Box::new(Expr::Var("result".to_string(), span)),
+                then_branch: Box::new(checked),
                 else_branch: Some(Box::new(Expr::Panic(
-                    "postcondition_violation".to_string(),
+                    "precondition_violation".to_string(),
                     span,
                 ))),
                 span,
-            }),
-            mutable: false,
-            let_in: false,
-            span,
-        };
+            };
+        }
+        checked
     }
-    // Preconditions: `if (r1 && r2) then checked else panic`.
-    if !requires.is_empty() {
-        let cond = Self::and_chain(requires, span);
-        checked = Expr::If {
-            cond: Box::new(cond),
-            then_branch: Box::new(checked),
-            else_branch: Some(Box::new(Expr::Panic(
-                "precondition_violation".to_string(),
-                span,
-            ))),
-            span,
-        };
-    }
-    checked
-}
 
-/// `&&`-chain a non-empty slice of boolean predicates.
-fn and_chain(exprs: &[Expr], span: Span) -> Expr {
-    let mut it = exprs.iter().cloned();
-    let first = it.next().expect("and_chain requires a non-empty slice");
-    it.fold(first, |acc, e| Expr::Binary {
-        op: BinOp::And,
-        left: Box::new(acc),
-        right: Box::new(e),
-        span,
-    })
-}
+    /// `&&`-chain a non-empty slice of boolean predicates.
+    fn and_chain(exprs: &[Expr], span: Span) -> Expr {
+        let mut it = exprs.iter().cloned();
+        let first = it.next().expect("and_chain requires a non-empty slice");
+        it.fold(first, |acc, e| Expr::Binary {
+            op: BinOp::And,
+            left: Box::new(acc),
+            right: Box::new(e),
+            span,
+        })
+    }
 
     /// Consume and return all diagnostics accumulated during error-recovery
     /// parsing. After this call, the diagnostics buffer is empty.
     pub fn consumed_diagnostics(&mut self) -> Vec<NuError> {
         std::mem::take(&mut self.diagnostics)
+    }
+
+    /// Consume and return all non-fatal warnings accumulated during parsing
+    /// (e.g. RFC 0015 `catch`/`fail` deprecations). After this call, the
+    /// warnings buffer is empty.
+    pub fn take_warnings(&mut self) -> Vec<NuWarning> {
+        std::mem::take(&mut self.warnings)
     }
 
     // === Declarations ===
@@ -702,7 +732,8 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
             TokenKind::Actor
             | TokenKind::Persistent
             | TokenKind::Entity
-            | TokenKind::Organization => {
+            | TokenKind::Organization
+            | TokenKind::Virtual => {
                 let backend = annotations.iter().find_map(|a| match a {
                     crate::ast::FunctionAnnotation::Backend { kind } => Some(*kind),
                     _ => None,
@@ -766,6 +797,7 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
             TokenKind::Let => self.parse_module_let(public),
             TokenKind::Impl => self.parse_impl(),
             TokenKind::Given => self.parse_given(public),
+            TokenKind::Signal => self.parse_signal(),
             TokenKind::Eof => Err(NuError::parse_error(
                 "Unexpected end of file in declaration".to_string(),
                 self.current_span(),
@@ -845,6 +877,27 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
                         .map(|(k, v)| if k.is_empty() { v } else { k })
                         .collect();
                     annotations.push(FunctionAnnotation::Derive(names));
+                }
+                "placement" => {
+                    let value = fields.remove("").unwrap_or_default();
+                    let placement = match value.as_str() {
+                        "static" => crate::types::Placement::Static,
+                        "server" => crate::types::Placement::Server,
+                        "edge" => crate::types::Placement::Edge,
+                        "client" => crate::types::Placement::Client,
+                        "actor" => crate::types::Placement::Actor,
+                        "workflow" => crate::types::Placement::Workflow,
+                        other => {
+                            return Err(NuError::parse_error(
+                                format!(
+                                    "Unknown placement '{}'; expected 'static', 'server', 'edge', 'client', 'actor', or 'workflow'",
+                                    other
+                                ),
+                                self.current_span(),
+                            ))
+                        }
+                    };
+                    annotations.push(FunctionAnnotation::Placement(placement));
                 }
                 _ => {
                     return Err(NuError::parse_error(
@@ -968,10 +1021,17 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
 
     fn parse_actor(&mut self, backend: Option<crate::ast::ActorBackendKind>) -> NuResult<Decl> {
         let span = self.current_span();
+        let virtual_ = self.consume_if(&TokenKind::Virtual);
         let persistent = self.consume_if(&TokenKind::Persistent);
         let is_entity = self.consume_if(&TokenKind::Entity);
         let is_org = self.consume_if(&TokenKind::Organization);
         let persistent = persistent || is_entity || is_org;
+        if virtual_ && !is_entity {
+            return Err(NuError::parse_error(
+                "'virtual' can only modify 'entity' declarations".to_string(),
+                self.current_span(),
+            ));
+        }
         if !is_entity && !is_org {
             self.expect(TokenKind::Actor)?;
         }
@@ -984,6 +1044,14 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
         // so existing behavior is unchanged; `entity` is the durable-first form.
         let name = self.expect_ident("actor name")?;
         let type_params = self.parse_type_params()?;
+        let key_params = if virtual_ {
+            self.expect(TokenKind::LParen)?;
+            let params = self.parse_params()?;
+            self.expect(TokenKind::RParen)?;
+            params
+        } else {
+            vec![]
+        };
         let implements = match self.peek_kind() {
             TokenKind::Ident(s) if s == "implements" => {
                 self.advance();
@@ -1108,6 +1176,8 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
             apply_handlers,
             migrations,
             is_organization: is_org,
+            virtual_,
+            key_params,
             implements,
             span,
         })
@@ -2451,12 +2521,28 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
     fn parse_import(&mut self) -> NuResult<Decl> {
         let span = self.current_span();
         self.advance(); // consume 'import'
-                        // Parse import path: ident | ident :: ident | ident :: ident :: ident ...
-        let mut path = self.expect_ident("import path")?;
-        while self.consume_if(&TokenKind::DoubleColon) {
-            path.push_str("::");
-            path.push_str(&self.expect_ident("module name")?);
-        }
+
+        // Parse import path:
+        //   - stdlib::set::... or stdlib::web::types
+        //   - @nulang/auth or @nulang/auth/session
+        //   - plain ident (relative file)
+        let path = if self.consume_if(&TokenKind::At) {
+            let mut p = "@".to_string();
+            p.push_str(&self.expect_ident("module name")?);
+            while self.consume_if(&TokenKind::Slash) {
+                p.push('/');
+                p.push_str(&self.expect_ident("module name")?);
+            }
+            p
+        } else {
+            let mut p = self.expect_ident("import path")?;
+            while self.consume_if(&TokenKind::DoubleColon) {
+                p.push_str("::");
+                p.push_str(&self.expect_ident("module name")?);
+            }
+            p
+        };
+
         // Helpful error for dot-separated imports (e.g. `import stdlib.list`)
         if self.match_token(&TokenKind::Dot) {
             return Err(NuError::parse_error(
@@ -2553,6 +2639,22 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
             name,
             ty,
             value,
+            span,
+        })
+    }
+
+    fn parse_signal(&mut self) -> NuResult<Decl> {
+        let span = self.current_span();
+        self.advance(); // consume 'signal'
+        let name = self.expect_ident("signal name")?;
+        self.expect(TokenKind::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect(TokenKind::Assign)?;
+        let init = self.parse_expr()?;
+        Ok(Decl::Signal {
+            name,
+            ty,
+            init,
             span,
         })
     }
@@ -2696,6 +2798,38 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
 
             // Special cases: function call, field access, array index, send
             if self.match_token(&TokenKind::LParen) {
+                // Intercept `Grain("Type", key)` before treating it as a call.
+                if let Expr::Var(ref name, _) = left {
+                    if name == "Grain" {
+                        self.advance(); // consume '('
+                        let args = self.parse_arg_list()?;
+                        if args.len() != 2 {
+                            return Err(NuError::parse_error(
+                                format!(
+                                    "Grain(...) expects exactly 2 arguments, got {}",
+                                    args.len()
+                                ),
+                                self.current_span(),
+                            ));
+                        }
+                        let grain_type = match &args[0] {
+                            Expr::Literal(Literal::String(s), _) => s.clone(),
+                            _ => {
+                                return Err(NuError::parse_error(
+                                    "Grain(...) first argument must be a string literal"
+                                        .to_string(),
+                                    self.current_span(),
+                                ))
+                            }
+                        };
+                        left = Expr::GrainRef {
+                            grain_type,
+                            key: Box::new(args[1].clone()),
+                            span: self.current_span(),
+                        };
+                        continue;
+                    }
+                }
                 // Function call: left(args)
                 self.advance(); // consume '('
                 let args = self.parse_arg_list()?;
@@ -2885,6 +3019,7 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
             // Desugars to match expr { Ok(x) => x, Error(_) => fallback }
             if self.consume_if(&TokenKind::Catch) {
                 let span = self.current_span();
+                self.warnings.push(NuWarning::deprecated_catch(span));
                 if self.consume_if(&TokenKind::LBrace) {
                     // Block form: expr catch { | pat => body, ... }
                     let mut arms = Vec::new();
@@ -3292,8 +3427,10 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
                         }
                     }
                     TokenKind::Fail => {
+                        let fspan = self.current_span();
                         self.advance();
                         // fail is sugar for return; same semantics
+                        self.warnings.push(NuWarning::deprecated_fail(fspan));
                         if self.is_expr_start() {
                             let val = self.parse_expr()?;
                             Ok(Expr::Return(Some(Box::new(val)), self.current_span()))
@@ -3311,6 +3448,7 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
                         }
                     }
                     TokenKind::SelfKw => self.parse_self_ref(),
+                    TokenKind::Lt => self.parse_html_expr(),
 
                     _ => Err(NuError::parse_error(
                         format!("Unexpected token in expression: {}", kind),
@@ -4042,9 +4180,9 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
         self.advance(); // consume 'perform'
         let effect = self.expect_ident("effect name")?;
         self.expect(TokenKind::Dot)?;
-        // `ask`, `link`, `monitor` and `exit` are reserved keywords, so they
-        // lex as keyword tokens rather than identifiers; accept them as
-        // operation names (`perform Actor.link(t)`).
+        // `ask`, `link`, `monitor`, `exit` and `ref` are reserved keywords,
+        // so they lex as keyword tokens rather than identifiers; accept them
+        // as operation names (`perform Actor.link(t)`, `perform Grain.ref(...)`).
         let op = match self.peek_kind() {
             TokenKind::Ask => {
                 self.advance();
@@ -4061,6 +4199,10 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
             TokenKind::Exit => {
                 self.advance();
                 "exit".to_string()
+            }
+            TokenKind::Ref => {
+                self.advance();
+                "ref".to_string()
             }
             _ => self.expect_ident("operation name")?,
         };
@@ -4083,6 +4225,250 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
         Ok(Expr::Emit { event, args, span })
     }
 
+    // -----------------------------------------------------------------------
+    // JSX / HTML expressions (desugared to `el(tag, attrs, children)`)
+    // -----------------------------------------------------------------------
+
+    /// True for tokens that are reserved keywords (anything that is not a
+    /// literal, identifier, operator, or delimiter). Used by JSX parsing so
+    /// keywords like `class` can appear as tag/attribute names.
+    fn is_keyword_token(kind: &TokenKind) -> bool {
+        match kind {
+            TokenKind::IntLit(_)
+            | TokenKind::FloatLit(_)
+            | TokenKind::StringLit(_)
+            | TokenKind::FStringLit(_)
+            | TokenKind::BoolLit(_)
+            | TokenKind::NilLit
+            | TokenKind::UnitLit
+            | TokenKind::Ident(_)
+            | TokenKind::UpperIdent(_)
+            | TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Star2
+            | TokenKind::Slash
+            | TokenKind::Percent
+            | TokenKind::Eq
+            | TokenKind::Ne
+            | TokenKind::Lt
+            | TokenKind::Le
+            | TokenKind::Gt
+            | TokenKind::Ge
+            | TokenKind::And
+            | TokenKind::Or
+            | TokenKind::Not
+            | TokenKind::Ampersand
+            | TokenKind::Pipe
+            | TokenKind::PipeOp
+            | TokenKind::Pipe3
+            | TokenKind::Caret
+            | TokenKind::Tilde
+            | TokenKind::Shl
+            | TokenKind::Shr
+            | TokenKind::Assign
+            | TokenKind::PlusAssign
+            | TokenKind::MinusAssign
+            | TokenKind::Arrow
+            | TokenKind::FatArrow
+            | TokenKind::ThinArrow
+            | TokenKind::ThinArrowQuestion
+            | TokenKind::Dot
+            | TokenKind::DotDot
+            | TokenKind::Colon
+            | TokenKind::DoubleColon
+            | TokenKind::At
+            | TokenKind::Bang
+            | TokenKind::Question
+            | TokenKind::LParen
+            | TokenKind::RParen
+            | TokenKind::LBrace
+            | TokenKind::RBrace
+            | TokenKind::LBracket
+            | TokenKind::RBracket
+            | TokenKind::Comma
+            | TokenKind::Semicolon
+            | TokenKind::Newline
+            | TokenKind::Comment(_)
+            | TokenKind::DocComment(_)
+            | TokenKind::Eof => false,
+            _ => true,
+        }
+    }
+
+    fn expect_html_ident(&mut self, msg: &str) -> NuResult<String> {
+        let span = self.current_span();
+        match self.peek_kind().clone() {
+            TokenKind::Ident(s) | TokenKind::UpperIdent(s) => {
+                self.advance();
+                Ok(s)
+            }
+            other if Self::is_keyword_token(&other) => {
+                self.advance();
+                Ok(other.to_string())
+            }
+            other => Err(NuError::parse_error(
+                format!("Expected {}, found {}", msg, other),
+                span,
+            )),
+        }
+    }
+
+    /// Parse a JSX/HTML element: `<tag attrs>children</tag>` or `<tag attrs />`.
+    /// Desugars to `el("tag", attrs, children)` where `attrs` and `children`
+    /// are arrays. Text children are wrapped in `text("...")` calls.
+    fn parse_html_expr(&mut self) -> NuResult<Expr> {
+        let span = self.current_span();
+        self.expect(TokenKind::Lt)?; // consume '<'
+        let tag = self.expect_html_ident("HTML tag name")?;
+
+        let mut attrs: Vec<Expr> = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.consume_if(&TokenKind::Slash) {
+                self.expect(TokenKind::Gt)?;
+                return Ok(self.html_el(&tag, attrs, Vec::new(), span));
+            }
+            if self.consume_if(&TokenKind::Gt) {
+                let children = self.parse_html_children(&tag, span)?;
+                return Ok(self.html_el(&tag, attrs, children, span));
+            }
+
+            // Attribute: name="value" or name={expr} or boolean name
+            let attr_name = self.expect_html_ident("HTML attribute name")?;
+            let attr_val = if self.consume_if(&TokenKind::Assign) {
+                if self.consume_if(&TokenKind::LBrace) {
+                    let expr = self.parse_expr()?;
+                    self.expect(TokenKind::RBrace)?;
+                    expr
+                } else {
+                    let s = self.expect_string("HTML attribute value")?;
+                    self.html_text(&s, span)
+                }
+            } else {
+                self.html_text(&attr_name, span)
+            };
+            attrs.push(Expr::Tuple(
+                vec![Expr::Literal(Literal::String(attr_name), span), attr_val],
+                span,
+            ));
+        }
+    }
+
+    fn html_el(&self, tag: &str, attrs: Vec<Expr>, children: Vec<Expr>, span: Span) -> Expr {
+        Expr::App {
+            func: Box::new(Expr::Var("el".to_string(), span)),
+            args: vec![
+                Expr::Literal(Literal::String(tag.to_string()), span),
+                Expr::Array(attrs, span),
+                Expr::Array(children, span),
+            ],
+            span,
+        }
+    }
+
+    fn html_text(&self, s: &str, span: Span) -> Expr {
+        Expr::App {
+            func: Box::new(Expr::Var("text".to_string(), span)),
+            args: vec![Expr::Literal(Literal::String(s.to_string()), span)],
+            span,
+        }
+    }
+
+    fn parse_html_children(&mut self, close_tag: &str, span: Span) -> NuResult<Vec<Expr>> {
+        let mut children: Vec<Expr> = Vec::new();
+        while !self.is_at_end() {
+            self.skip_newlines();
+
+            // Closing tag: </close_tag>
+            if self.peek_kind() == &TokenKind::Lt {
+                let saved = self.pos;
+                self.advance(); // '<'
+                if self.consume_if(&TokenKind::Slash) {
+                    let closing = self.expect_html_ident("closing tag name")?;
+                    if closing == close_tag {
+                        self.expect(TokenKind::Gt)?;
+                        return Ok(children);
+                    } else {
+                        return Err(NuError::parse_error(
+                            format!(
+                                "Expected closing tag </{}>, found </{}>",
+                                close_tag, closing
+                            ),
+                            self.current_span(),
+                        ));
+                    }
+                }
+                // Not a closing tag: restore and parse nested element
+                self.pos = saved;
+                children.push(self.parse_html_expr()?);
+                continue;
+            }
+
+            // Interpolated expression: {expr}
+            if self.consume_if(&TokenKind::LBrace) {
+                let expr = self.parse_expr()?;
+                self.expect(TokenKind::RBrace)?;
+                children.push(expr);
+                continue;
+            }
+
+            if self.peek_kind() == &TokenKind::Eof {
+                break;
+            }
+
+            // Text node: consume the next token as literal text
+            let text = self.html_token_text()?;
+            children.push(self.html_text(&text, span));
+        }
+        Err(NuError::parse_error(
+            format!("Unclosed HTML tag <{}>", close_tag),
+            span,
+        ))
+    }
+
+    fn html_token_text(&mut self) -> NuResult<String> {
+        let span = self.current_span();
+        match self.peek_kind().clone() {
+            TokenKind::Ident(s) | TokenKind::UpperIdent(s) => {
+                self.advance();
+                Ok(s)
+            }
+            other if Self::is_keyword_token(&other) => {
+                self.advance();
+                Ok(other.to_string())
+            }
+            TokenKind::IntLit(n) => {
+                self.advance();
+                Ok(n.to_string())
+            }
+            TokenKind::FloatLit(n) => {
+                self.advance();
+                Ok(n.to_string())
+            }
+            TokenKind::StringLit(s) => {
+                self.advance();
+                Ok(s)
+            }
+            TokenKind::BoolLit(b) => {
+                self.advance();
+                Ok(b.to_string())
+            }
+            TokenKind::NilLit => {
+                self.advance();
+                Ok("nil".to_string())
+            }
+            TokenKind::UnitLit => {
+                self.advance();
+                Ok("unit".to_string())
+            }
+            other => Err(NuError::parse_error(
+                format!("Unexpected token in HTML text: {}", other),
+                span,
+            )),
+        }
+    }
+
     // === Helper Methods ===
 
     fn is_at_end(&self) -> bool {
@@ -4099,6 +4485,7 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
             TokenKind::Persistent,
             TokenKind::Entity,
             TokenKind::Organization,
+            TokenKind::Virtual,
             TokenKind::StateMachine,
             TokenKind::Agent,
             TokenKind::Workflow,
@@ -4338,6 +4725,7 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
                 | TokenKind::True
                 | TokenKind::False
                 | TokenKind::Unit
+                | TokenKind::Lt
         )
     }
 
@@ -4494,6 +4882,7 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
     fn parse_catch_prefix(&mut self) -> NuResult<Expr> {
         let span = self.current_span();
         self.advance(); // consume 'catch'
+        self.warnings.push(NuWarning::deprecated_catch(span));
         let expr = self.parse_expr()?;
         if self.consume_if(&TokenKind::LBrace) {
             // Block form: catch expr { | pat => body, ... }
@@ -5314,6 +5703,37 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
                     }
                     path
                 }
+                TokenKind::At => {
+                    let mut path = "@".to_string();
+                    j += 1;
+                    if j < self.tokens.len() {
+                        if let TokenKind::Ident(seg) = &self.tokens[j].kind {
+                            path.push_str(seg);
+                            j += 1;
+                        } else {
+                            i += 1;
+                            continue;
+                        }
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                    while j < self.tokens.len() && self.tokens[j].kind == TokenKind::Slash {
+                        j += 1;
+                        if j < self.tokens.len() {
+                            if let TokenKind::Ident(seg) = &self.tokens[j].kind {
+                                path.push('/');
+                                path.push_str(seg);
+                                j += 1;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    path
+                }
                 _ => {
                     i += 1;
                     continue;
@@ -5329,7 +5749,8 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
                         // Scan the imported tokens for type declarations.
                         let mut k = 0;
                         while k < imported_tokens.len() {
-                            if imported_tokens[k].kind != TokenKind::Type {
+                            let is_opaque = imported_tokens[k].kind == TokenKind::Opaque;
+                            if imported_tokens[k].kind != TokenKind::Type && !is_opaque {
                                 k += 1;
                                 continue;
                             }
@@ -5341,6 +5762,21 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
                                 )
                             {
                                 m += 1;
+                            }
+                            // For opaque type declarations, skip the 'type' keyword before the name.
+                            if is_opaque
+                                && m < imported_tokens.len()
+                                && imported_tokens[m].kind == TokenKind::Type
+                            {
+                                m += 1;
+                                while m < imported_tokens.len()
+                                    && matches!(
+                                        imported_tokens[m].kind,
+                                        TokenKind::Newline | TokenKind::DocComment(_)
+                                    )
+                                {
+                                    m += 1;
+                                }
                             }
                             // Skip optional 'alias' keyword.
                             if m < imported_tokens.len()
@@ -5379,17 +5815,280 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
         Ok(None)
     }
 
+    /// Parse an `app` block: `app "name" { route "GET" "/" -> handler }`.
+    fn parse_app_decl(&mut self) -> NuResult<ParsedApp> {
+        let span = self.current_span();
+        self.advance(); // consume 'app'
+        let name = self.expect_string("app name")?;
+        self.expect(TokenKind::LBrace)?;
+        self.skip_newlines();
+        let mut routes: Vec<(String, String, String)> = Vec::new();
+        while !self.match_token(&TokenKind::RBrace) && !self.is_at_end() {
+            self.skip_newlines();
+            if self.match_token(&TokenKind::RBrace) {
+                break;
+            }
+            // Contextual keyword 'route' inside an app block.
+            if let TokenKind::Ident(s) = self.peek_kind() {
+                if s == "route" {
+                    self.advance();
+                    let method = self.expect_string("route method")?;
+                    let path = self.expect_string("route path")?;
+                    self.expect(TokenKind::Arrow)?;
+                    let handler = self.expect_ident("route handler")?;
+                    routes.push((method, path, handler));
+                    continue;
+                }
+            }
+            return Err(NuError::parse_error(
+                "Expected route declaration inside app block".to_string(),
+                self.current_span(),
+            ));
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(ParsedApp {
+            _name: name,
+            routes,
+            span,
+        })
+    }
+
+    /// Desugar all collected app blocks into a single `web_main` and a `main`
+    /// entrypoint. This is parser-level sugar so no separate runtime path is needed.
+    fn desugar_app_decls(&self, apps: Vec<ParsedApp>) -> Vec<Decl> {
+        if apps.is_empty() {
+            return Vec::new();
+        }
+        // Flatten all app blocks into a single web_main.
+        let mut route_exprs: Vec<Expr> = Vec::new();
+        for app in &apps {
+            for (method, path, handler) in &app.routes {
+                route_exprs.push(Expr::Perform {
+                    effect: "Web".to_string(),
+                    op: "route".to_string(),
+                    args: vec![
+                        Expr::Literal(Literal::String(method.clone()), app.span),
+                        Expr::Literal(Literal::String(path.clone()), app.span),
+                        Expr::Var(handler.clone(), app.span),
+                    ],
+                    span: app.span,
+                });
+            }
+        }
+        let span = apps[0].span;
+        let serve_static = Expr::Perform {
+            effect: "Web".to_string(),
+            op: "serve_static".to_string(),
+            args: vec![Expr::Literal(Literal::String("public".to_string()), span)],
+            span,
+        };
+        let mut web_main_body = vec![serve_static];
+        web_main_body.extend(route_exprs);
+        let web_main = Decl::Function {
+            name: "web_main".to_string(),
+            type_params: vec![],
+            type_param_constraints: vec![],
+            params: vec![],
+            default_values: vec![],
+            using_params: vec![],
+            ret_type: Some(Type::unit()),
+            error_type: None,
+            effect: Some(EffectRow::Closed(vec![Effect::Web])),
+            cap: None,
+            requires: vec![],
+            ensures: vec![],
+            body: Expr::Block {
+                exprs: web_main_body,
+                span,
+            },
+            annotations: vec![],
+            public: false,
+            span,
+        };
+        let main_body = Expr::Block {
+            exprs: vec![Expr::App {
+                func: Box::new(Expr::Var("web_main".to_string(), span)),
+                args: vec![],
+                span,
+            }],
+            span,
+        };
+        let main = Decl::Function {
+            name: "main".to_string(),
+            type_params: vec![],
+            type_param_constraints: vec![],
+            params: vec![],
+            default_values: vec![],
+            using_params: vec![],
+            ret_type: Some(Type::unit()),
+            error_type: None,
+            effect: None,
+            cap: None,
+            requires: vec![],
+            ensures: vec![],
+            body: main_body,
+            annotations: vec![],
+            public: false,
+            span,
+        };
+        vec![web_main, main]
+    }
+
+    /// Check that every route parameter declared in an app route pattern is
+    /// read by the handler via `perform Web.param("name")`. This is a basic
+    /// static check; it does not follow calls into helper functions or imported
+    /// handlers.
+    fn check_route_params(&self, apps: &[ParsedApp], decls: &[Decl]) -> NuResult<()> {
+        for app in apps {
+            for (method, path, handler) in &app.routes {
+                for param in Self::route_param_names(path) {
+                    let found = decls.iter().any(|decl| match decl {
+                        Decl::Function { name, body, .. } if name == handler => {
+                            Self::expr_uses_param(body, &param)
+                        }
+                        _ => false,
+                    });
+                    if !found {
+                        return Err(NuError::parse_error(
+                            format!(
+                                "Route {} {} declares parameter ':{}' but handler '{}' never calls perform Web.param(\"{}\")",
+                                method, path, param, handler, param
+                            ),
+                            app.span,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn route_param_names(path: &str) -> Vec<String> {
+        let path = path.trim_start_matches('/');
+        if path.is_empty() {
+            return Vec::new();
+        }
+        path.split('/')
+            .filter(|seg| seg.starts_with(':'))
+            .map(|seg| seg[1..].to_string())
+            .collect()
+    }
+
+    fn expr_uses_param(expr: &Expr, param: &str) -> bool {
+        match expr {
+            Expr::Perform {
+                effect, op, args, ..
+            } if effect == "Web" && op == "param" && !args.is_empty() => {
+                if let Expr::Literal(Literal::String(name), _) = &args[0] {
+                    if name == param {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Recurse into child expressions.
+        match expr {
+            Expr::Literal(_, _) | Expr::Var(_, _) | Expr::SelfRef(_) => false,
+            Expr::Lambda { body, .. } => Self::expr_uses_param(body, param),
+            Expr::App { func, args, .. } => {
+                Self::expr_uses_param(func, param)
+                    || args.iter().any(|e| Self::expr_uses_param(e, param))
+            }
+            Expr::Let { value, body, .. } => {
+                Self::expr_uses_param(value, param) || Self::expr_uses_param(body, param)
+            }
+            Expr::LetRec { value, body, .. } => {
+                Self::expr_uses_param(value, param) || Self::expr_uses_param(body, param)
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::expr_uses_param(cond, param)
+                    || Self::expr_uses_param(then_branch, param)
+                    || else_branch
+                        .as_ref()
+                        .map(|e| Self::expr_uses_param(e, param))
+                        .unwrap_or(false)
+            }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                Self::expr_uses_param(scrutinee, param)
+                    || arms.iter().any(|(_, guard, body)| {
+                        Self::expr_uses_param(body, param)
+                            || guard
+                                .as_ref()
+                                .map(|g| Self::expr_uses_param(g, param))
+                                .unwrap_or(false)
+                    })
+            }
+            Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => {
+                exprs.iter().any(|e| Self::expr_uses_param(e, param))
+            }
+            Expr::Tuple(exprs, _) | Expr::Array(exprs, _) => {
+                exprs.iter().any(|e| Self::expr_uses_param(e, param))
+            }
+            Expr::Record(fields, _) | Expr::RecordUpdate { fields, .. } => {
+                fields.iter().any(|(_, e)| Self::expr_uses_param(e, param))
+            }
+            Expr::FieldAccess { expr, .. } => Self::expr_uses_param(expr, param),
+            Expr::Index { arr, idx, .. } => {
+                Self::expr_uses_param(arr, param) || Self::expr_uses_param(idx, param)
+            }
+            Expr::Binary { left, right, .. } => {
+                Self::expr_uses_param(left, param) || Self::expr_uses_param(right, param)
+            }
+            Expr::Unary { expr, .. } => Self::expr_uses_param(expr, param),
+            Expr::Assign { target, value, .. } => {
+                Self::expr_uses_param(target, param) || Self::expr_uses_param(value, param)
+            }
+            Expr::Spawn {
+                actor_type, init, ..
+            } => {
+                Self::expr_uses_param(actor_type, param)
+                    || init.iter().any(|(_, e)| Self::expr_uses_param(e, param))
+            }
+            Expr::Send { actor, args, .. } | Expr::Ask { actor, args, .. } => {
+                Self::expr_uses_param(actor, param)
+                    || args.iter().any(|e| Self::expr_uses_param(e, param))
+            }
+            Expr::Receive { arms, after, .. } => {
+                arms.iter().any(|(_, _, guard, body)| {
+                    Self::expr_uses_param(body, param)
+                        || guard
+                            .as_ref()
+                            .map(|g| Self::expr_uses_param(g, param))
+                            .unwrap_or(false)
+                }) || after
+                    .as_ref()
+                    .map(|(t, b)| {
+                        Self::expr_uses_param(t, param) || Self::expr_uses_param(b, param)
+                    })
+                    .unwrap_or(false)
+            }
+            Expr::Emit { args, .. } => args.iter().any(|e| Self::expr_uses_param(e, param)),
+            Expr::Perform { args, .. } => args.iter().any(|e| Self::expr_uses_param(e, param)),
+            Expr::GrainRef { key, .. } => Self::expr_uses_param(key, param),
+            _ => false,
+        }
+    }
+
     /// Resolve an import path to a file path. Handles stdlib:: prefix.
     fn resolve_import_path(&self, import_path: &str) -> Option<std::path::PathBuf> {
         if let Some(module) = import_path.strip_prefix("stdlib::") {
+            let module_path = module.replace("::", std::path::MAIN_SEPARATOR_STR);
             // Try NULANG_STDLIB env var first.
             if let Ok(dir) = std::env::var("NULANG_STDLIB") {
-                return Some(std::path::PathBuf::from(dir).join(format!("{}.nula", module)));
+                return Some(std::path::PathBuf::from(dir).join(format!("{}.nula", module_path)));
             }
             // Try relative to executable.
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(exe_dir) = exe.parent() {
-                    let candidate = exe_dir.join("stdlib").join(format!("{}.nula", module));
+                    let candidate = exe_dir.join("stdlib").join(format!("{}.nula", module_path));
                     if candidate.exists() {
                         return Some(candidate);
                     }
@@ -5400,7 +6099,7 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
                 let dev_path = cwd
                     .join("src")
                     .join("stdlib")
-                    .join(format!("{}.nula", module));
+                    .join(format!("{}.nula", module_path));
                 if dev_path.exists() {
                     return Some(dev_path);
                 }
@@ -5408,9 +6107,39 @@ fn and_chain(exprs: &[Expr], span: Span) -> Expr {
             // Last resort.
             return Some(std::path::PathBuf::from(format!(
                 "src/stdlib/{}.nula",
-                module
+                module_path
             )));
         }
+
+        // @nulang/auth or @nulang/auth/session -> resolved via NULANG_MODULE_PATH.
+        if let Some(module) = import_path.strip_prefix("@nulang/") {
+            let entries = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
+            for entry in entries.split(';') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                if let Some((name, dir)) = entry.split_once('=') {
+                    let name = name.trim();
+                    let dir = dir.trim();
+                    if name.is_empty() || dir.is_empty() {
+                        continue;
+                    }
+                    let bare_name = name.strip_prefix("@nulang/").unwrap_or(name);
+                    if module == bare_name || module.starts_with(&format!("{}/", bare_name)) {
+                        let rest = module.strip_prefix(bare_name).unwrap_or(module);
+                        let rest = rest.trim_start_matches('/');
+                        let subpath = if rest.is_empty() {
+                            "lib.nula"
+                        } else {
+                            &format!("{}.nula", rest.replace('/', std::path::MAIN_SEPARATOR_STR))
+                        };
+                        return Some(std::path::PathBuf::from(dir).join(subpath));
+                    }
+                }
+            }
+        }
+
         None
     }
 
@@ -6468,6 +7197,79 @@ mod tests {
             }
             _ => panic!("Expected actor declaration"),
         }
+    }
+
+    #[test]
+    fn test_parse_virtual_entity() {
+        let source = r#"virtual entity User(key: String) {
+            state durable name: String = ""
+            behavior Greet(who: String) { perform IO.print("hi") }
+        }"#;
+        let ast = parse(source).unwrap();
+        match &ast.decls[0] {
+            Decl::Actor {
+                name,
+                persistent,
+                virtual_,
+                key_params,
+                ..
+            } => {
+                assert_eq!(name, "User");
+                assert!(*persistent, "virtual entity should be persistent");
+                assert!(*virtual_, "entity should be marked virtual");
+                assert_eq!(key_params.len(), 1);
+                assert_eq!(key_params[0].name, "key");
+                assert_eq!(key_params[0].ty, Some(Type::string()));
+            }
+            _ => panic!("Expected virtual entity declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_grain_ref() {
+        let expr = parse_expr(r#"Grain("User", "u1")"#).unwrap();
+        match expr {
+            Expr::GrainRef {
+                grain_type, key, ..
+            } => {
+                assert_eq!(grain_type, "User");
+                match key.as_ref() {
+                    Expr::Literal(Literal::String(s), _) => assert_eq!(s, "u1"),
+                    other => panic!("expected string literal key, got {:?}", other),
+                }
+            }
+            other => panic!("expected Expr::GrainRef, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_grain_ref_int_key() {
+        let expr = parse_expr(r#"Grain("Counter", 42)"#).unwrap();
+        match expr {
+            Expr::GrainRef { grain_type, .. } => {
+                assert_eq!(grain_type, "Counter");
+            }
+            other => panic!("expected Expr::GrainRef, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_grain_ref_requires_string_type() {
+        let result = parse_expr(r#"Grain(Counter, "u1")"#);
+        assert!(result.is_err(), "Grain type must be a string literal");
+    }
+
+    #[test]
+    fn test_parse_virtual_requires_entity() {
+        let source = r#"virtual actor Counter { state count = 0 behavior get() { self.count } }"#;
+        let result = parse(source);
+        assert!(result.is_err(), "virtual must be followed by entity");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("virtual"),
+            "error should mention virtual: {}",
+            err
+        );
     }
 
     #[test]

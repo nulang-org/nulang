@@ -1,0 +1,71 @@
+import stdlib::web::types
+import @nulang/auth
+
+fn layout(page_title: String, content: Html) -> Html {
+    document(
+        head([
+            el("title", [], [text(page_title)]),
+            el("link", [("rel", "stylesheet"), ("href", "/style.css")], [])
+        ]),
+        body([
+            el("nav", [], [
+                el("a", [("href", "/")], [text("Home")]),
+                text(" "),
+                el("a", [("href", "/docs")], [text("Docs")]),
+                text(" "),
+                el("a", [("href", "/admin")], [text("Admin")])
+            ]),
+            el("main", [], [content])
+        ])
+    )
+}
+
+fn home() -> Html {
+    layout("Nulang Docs", el("p", [], [text("Welcome to the Nulang web framework example.")]))
+}
+
+fn docs() -> Html {
+    layout("Documentation", el("p", [], [text("This example demonstrates routes, static pages, and auth helpers.")]))
+}
+
+fn login_page() -> Html {
+    layout("Sign in", el("form", [("method", "POST"), ("action", "/login")], [
+        el("label", [], [text("User: "), el("input", [("name", "user"), ("type", "text")], [])]),
+        el("button", [("type", "submit")], [text("Sign in")])
+    ]))
+}
+
+fn admin_page() -> Html {
+    require(fn(user: User) -> Html {
+        layout("Admin", el("div", [], [
+            el("p", [], [text("Logged in as: " + user)]),
+            el("form", [("method", "POST"), ("action", "/logout")], [
+                el("button", [("type", "submit")], [text("Sign out")])
+            ])
+        ]))
+    })
+}
+
+fn login_handler() -> Html {
+    let user = form_value("user")
+    if user != "" then {
+        login(user)
+        redirect("/admin")
+    } else {
+        redirect("/login")
+    }
+}
+
+fn logout_handler() -> Html {
+    logout()
+    redirect("/")
+}
+
+app "docs-web" {
+    route "GET" "/" -> home
+    route "GET" "/docs" -> docs
+    route "GET" "/login" -> login_page
+    route "GET" "/admin" -> admin_page
+    route "POST" "/login" -> login_handler
+    route "POST" "/logout" -> logout_handler
+}

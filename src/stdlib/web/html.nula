@@ -1,0 +1,48 @@
+// Nulang Web framework — HTML construction utilities.
+// Import: `import stdlib::web::html`
+//
+// These wrappers sit on top of `stdlib::web::host` and provide the canonical
+// names `html.el`, `html.text`, `html.raw`, and `html.attr` from the plan.
+
+import stdlib::web::types
+import stdlib::web::host
+
+/// Build an HTML element. `attrs` is a list of (name, value) pairs.
+pub fn el(name: String, attrs, children: [Html]) -> Html {
+    element(name, attrs, children)
+}
+
+/// Escape plain text into an `Html` fragment. The host's `text` operation is
+/// re-exported here as `html.txt`.
+pub fn txt(s: String) -> Html {
+    text(s)
+}
+
+// The names `text` and `raw` are provided by `stdlib::web::host` and are
+// re-exported through this module; defining local aliases would collide with
+// those imports under the current module semantics.
+
+/// Build an attribute pair.
+pub fn attr(name: String, value: Html) -> (String, Html) {
+    (name, value)
+}
+
+/// Wrap children in a `<body>` element.
+pub fn body(children: [Html]) -> Html {
+    el("body", [], children)
+}
+
+/// Wrap children in a `<head>` element.
+pub fn head(children: [Html]) -> Html {
+    el("head", [], children)
+}
+
+/// Build a `<title>` element.
+pub fn title(s: String) -> Html {
+    el("title", [], [text(s)])
+}
+
+/// Produce a complete `<html>` document from a head and body.
+pub fn document(page_head: Html, page_body: Html) -> Html {
+    el("html", [], [page_head, page_body])
+}

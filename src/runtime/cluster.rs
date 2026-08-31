@@ -338,7 +338,6 @@ impl ClusterConfig {
     }
 }
 
-
 /// A lightweight gossip entry for membership dissemination.
 ///
 /// This compact representation avoids sending full [`NodeInfo`] (including
@@ -373,7 +372,6 @@ pub struct DurableDirectoryEntry {
     /// Activation epoch; higher = newer incarnation.
     pub epoch: u64,
 }
-
 
 // ---------------------------------------------------------------------------
 // ClusterState
@@ -1274,7 +1272,6 @@ impl ClusterState {
         self.directory_gossip
     }
 
-
     /// The durable-actor location directory (RFC 0014 §2), as a copy of the
     /// gossip-replicated entries. A `max_entries` cap bounds the payload.
     pub fn directory_payload(&self, max_entries: usize) -> Vec<DurableDirectoryEntry> {
@@ -1317,7 +1314,6 @@ impl ClusterState {
     pub fn directory_entry(&self, actor_id: u64) -> Option<DurableDirectoryEntry> {
         self.directory.get(&actor_id).copied()
     }
-
 
     /// All directory entries whose home node is `node` (the re-spawn set on
     /// that node's confirmed removal).
@@ -1402,7 +1398,6 @@ impl ClusterState {
             members: view_members,
         }
     }
-
 
     // ------------------------------------------------------------------
     // Internal helpers
@@ -2127,7 +2122,11 @@ mod tests {
         let c = NodeId::new(&addr(9002));
         cs.handle_heartbeat(b, addr(9001));
         cs.handle_heartbeat(c, addr(9002));
-        cs.apply_config(&ClusterConfig { split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 3 }, probe_interval: Duration::from_secs(5), ..Default::default() });
+        cs.apply_config(&ClusterConfig {
+            split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 3 },
+            probe_interval: Duration::from_secs(5),
+            ..Default::default()
+        });
         let stale = Instant::now()
             - DEFAULT_HEARTBEAT_TIMEOUT
             - DEFAULT_SUSPICION_DURATION
@@ -2156,7 +2155,11 @@ mod tests {
         let b_addr = addr(9001);
         let b_id = NodeId::new(&b_addr);
         cs_a.handle_heartbeat(b_id, b_addr);
-        cs_a.apply_config(&ClusterConfig { split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 3 }, probe_interval: Duration::from_secs(5), ..Default::default() });
+        cs_a.apply_config(&ClusterConfig {
+            split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 3 },
+            probe_interval: Duration::from_secs(5),
+            ..Default::default()
+        });
         assert!(!cs_a
             .tick()
             .iter()
@@ -2165,7 +2168,11 @@ mod tests {
         // B's view: A is unreachable; B sees only itself.
         let mut cs_b = ClusterState::new(b_id, b_addr);
         cs_b.handle_heartbeat(a_id, a_addr);
-        cs_b.apply_config(&ClusterConfig { split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 3 }, probe_interval: Duration::from_secs(5), ..Default::default() });
+        cs_b.apply_config(&ClusterConfig {
+            split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 3 },
+            probe_interval: Duration::from_secs(5),
+            ..Default::default()
+        });
         let stale = Instant::now()
             - DEFAULT_HEARTBEAT_TIMEOUT
             - DEFAULT_SUSPICION_DURATION
@@ -2190,7 +2197,11 @@ mod tests {
             - DEFAULT_HEARTBEAT_TIMEOUT
             - DEFAULT_SUSPICION_DURATION
             - Duration::from_secs(1);
-        let config = ClusterConfig { split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 5 }, probe_interval: Duration::from_secs(5), ..Default::default() };
+        let config = ClusterConfig {
+            split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 5 },
+            probe_interval: Duration::from_secs(5),
+            ..Default::default()
+        };
 
         // Majority side: peers 9001, 9002 healthy; 9003, 9004 failed.
         let mut cs = ClusterState::new(local, a);
@@ -2234,7 +2245,11 @@ mod tests {
         let mut cs = ClusterState::new(local, a);
         let b = NodeId::new(&addr(9001));
         cs.handle_heartbeat(b, addr(9001));
-        cs.apply_config(&ClusterConfig { split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 3 }, probe_interval: Duration::from_secs(5), ..Default::default() });
+        cs.apply_config(&ClusterConfig {
+            split_brain: SplitBrainConfig::StaticQuorum { expected_nodes: 3 },
+            probe_interval: Duration::from_secs(5),
+            ..Default::default()
+        });
         let stale = Instant::now()
             - DEFAULT_HEARTBEAT_TIMEOUT
             - DEFAULT_SUSPICION_DURATION
@@ -2252,7 +2267,11 @@ mod tests {
         let mut cs = ClusterState::new(local, a);
         let b = NodeId::new(&addr(9001));
         cs.handle_heartbeat(b, addr(9001));
-        cs.apply_config(&ClusterConfig { split_brain: SplitBrainConfig::Disabled, probe_interval: Duration::from_secs(5), ..Default::default() });
+        cs.apply_config(&ClusterConfig {
+            split_brain: SplitBrainConfig::Disabled,
+            probe_interval: Duration::from_secs(5),
+            ..Default::default()
+        });
         let stale = Instant::now()
             - DEFAULT_HEARTBEAT_TIMEOUT
             - DEFAULT_SUSPICION_DURATION
@@ -2570,9 +2589,21 @@ mod tests {
         let mut cs = ClusterState::new(NodeId::new(&addr(9000)), addr(9000));
         let a = NodeId(1);
         let b = NodeId(2);
-        let e1 = DurableDirectoryEntry { actor_id: 10, node_id: a, epoch: 1 };
-        let e2 = DurableDirectoryEntry { actor_id: 10, node_id: b, epoch: 2 };
-        let stale = DurableDirectoryEntry { actor_id: 10, node_id: a, epoch: 1 };
+        let e1 = DurableDirectoryEntry {
+            actor_id: 10,
+            node_id: a,
+            epoch: 1,
+        };
+        let e2 = DurableDirectoryEntry {
+            actor_id: 10,
+            node_id: b,
+            epoch: 2,
+        };
+        let stale = DurableDirectoryEntry {
+            actor_id: 10,
+            node_id: a,
+            epoch: 1,
+        };
 
         assert!(cs.merge_directory(vec![e1]));
         assert!(cs.merge_directory(vec![e2]), "higher epoch must win");
@@ -2633,9 +2664,9 @@ mod tests {
             *at = Instant::now() - Duration::from_secs(2);
         }
         let actions = cs.tick();
-        assert!(actions.iter().any(
-            |a| matches!(a, ClusterAction::NodeRemoved { node } if *node == b)
-        ));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, ClusterAction::NodeRemoved { node } if *node == b)));
         assert!(cs.is_removed(b));
         // A second tick does not re-emit the action.
         let actions = cs.tick();

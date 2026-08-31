@@ -1,0 +1,5 @@
+fn static_page() -> Unit ! {Render} {}
+
+fn main() {
+    perform IO.print("ok")
+}

@@ -35,6 +35,10 @@ pub enum HelperSig {
     Reg3,
     /// `(*mut u64, u32, u32, u32) -> void` (e.g. `ArrStore`, `FieldL`)
     Reg4,
+    /// `(*mut u64, i64, i64, i64) -> i64` — `nulang_jit_direct_call`
+    /// `(regs_ptr, func_idx, argc, dst)` returns a nonzero status when the
+    /// non-suspending callee raised a runtime error.
+    DirectCall,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +96,7 @@ macro_rules! define_helpers {
             module: &mut M,
             builder: &mut FunctionBuilder,
         ) -> Result<HashMap<RuntimeHelper, FuncRef>, super::compiler::CompileError> {
-            use super::compiler::{make_bin_sig, make_unary_sig, make_void_reg3_sig, make_void_reg4_sig};
+            use super::compiler::{make_bin_sig, make_direct_call_sig, make_unary_sig, make_void_reg3_sig, make_void_reg4_sig};
             let mut helpers = HashMap::new();
 
             $(
@@ -101,6 +105,7 @@ macro_rules! define_helpers {
                     HelperSig::Unary => make_unary_sig(module),
                     HelperSig::Reg3 => make_void_reg3_sig(module),
                     HelperSig::Reg4 => make_void_reg4_sig(module),
+                    HelperSig::DirectCall => make_direct_call_sig(module),
                 };
                 let name = stringify!($c_name);
                 let func_id = module
@@ -175,4 +180,7 @@ define_helpers! {
     SafePoint => nulang_jit_safepoint_check, Unary,
     SetYield => nulang_jit_set_yield_pc, Unary,
     SetBranchExit => nulang_jit_set_branch_exit_pc, Unary,
+    // Re-entrant direct call of a provably non-suspending callee from a
+    // compiled region (see `nulang_jit_direct_call`).
+    DirectCall => nulang_jit_direct_call, DirectCall,
 }

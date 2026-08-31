@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nulang.org/spec/agent/v1/events.schema.json",
+  "title": "NLAP v1 Event Envelope",
+  "type": "object",
+  "required": [
+    "version",
+    "ts",
+    "event"
+  ],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "conversation_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "event": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "goal_id"
+          ],
+          "properties": {
+            "type": {
+              "const": "goal_created"
+            },
+            "goal_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "conversation_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "goal_id"
+          ],
+          "properties": {
+            "type": {
+              "const": "goal_completed"
+            },
+            "goal_id": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "task_id",
+            "goal_id"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_created"
+            },
+            "task_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "goal_id": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "task_id",
+            "agent_id"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_started"
+            },
+            "task_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "agent_id": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "task_id",
+            "agent_id",
+            "progress",
+            "message"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_progress"
+            },
+            "task_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "agent_id": {
+              "type": "string"
+            },
+            "progress": {
+              "type": "number"
+            },
+            "message": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "task_id",
+            "agent_id"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_completed"
+            },
+            "task_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "agent_id": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "conversation_id",
+            "message"
+          ],
+          "properties": {
+            "type": {
+              "const": "director_thinking"
+            },
+            "conversation_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "message": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

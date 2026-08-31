@@ -6,7 +6,7 @@ authors = ["David Porkka"]
 license = "Apache-2.0"
 description = "Browser playground for Nulang: lexer + parser + typechecker + CoreVM compiled to WebAssembly"
 homepage = "https://nulang.org/playground"
-repository = "https://github.com/dporkka/nulang"
+repository = "https://github.com/nulang-org/nulang"
 
 # This crate is EXCLUDED from the root workspace (see `exclude` in the root
 # Cargo.toml): it re-uses the compiler's source files via #[path] includes

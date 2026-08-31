@@ -1,0 +1,63 @@
+// @nulang/auth — in-memory session authentication for Nulang Web apps.
+//
+// This is a lightweight, development-friendly auth module backed by the
+// ephemeral web KV store and a session cookie. It is intended for rapid
+// prototyping and small internal apps; production deployments should swap the
+// KV backend for a durable store or integrate with an identity provider.
+
+import stdlib::web::html
+import stdlib::web::types
+
+/// A user identifier. For this module it is an arbitrary string (e.g., a username
+/// or email) chosen by the application.
+pub type User = String
+
+fn session_key(token: String) -> String {
+    "nulang_auth:session:" + token
+}
+
+fn next_token() -> String {
+    let raw = kv_get("nulang_auth:token_counter")
+    let n = if raw == "" then { 0 } else { perform String.to_int(raw) }
+    kv_set("nulang_auth:token_counter", perform Int.to_string(n + 1))
+    "session-" + perform Int.to_string(n + 1)
+}
+
+/// Returns the current user id from the session cookie, or "" if none.
+pub fn current_user() -> User ! {Web, Request, String} {
+    let token = cookie("nulang_session")
+    if token == "" then { "" }
+    else { kv_get(session_key(token)) }
+}
+
+/// Returns true if the session cookie maps to a stored user.
+pub fn is_authenticated() -> Bool ! {Web, Request, String} {
+    current_user() != ""
+}
+
+/// Wrap a user-dependent page so that unauthenticated visitors are redirected
+/// to `/login`. Use as: `Auth.require(fn(user) { admin_page(user) })`.
+pub fn require(with_user) -> Html ! {Web, Request, String, Respond} {
+    let user = current_user()
+    if user == "" then {
+        redirect("/login")
+    } else {
+        with_user(user)
+    }
+}
+
+/// Start a session for `user` and set the session cookie.
+pub fn login(user: User) -> Unit ! {Web, Request, String, Int, Respond} {
+    let token = next_token()
+    kv_set(session_key(token), user)
+    set_cookie("nulang_session", token)
+}
+
+/// End the current session and clear the cookie.
+pub fn logout() -> Unit ! {Web, Request, String, Respond} {
+    let token = cookie("nulang_session")
+    if token != "" then {
+        kv_delete(session_key(token))
+    } else {}
+    clear_cookie("nulang_session")
+}

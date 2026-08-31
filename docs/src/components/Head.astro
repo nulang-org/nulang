@@ -6,7 +6,6 @@ const site = 'https://nulang.org';
 const isHome = Astro.url.pathname === '/' || entry.data.template === 'splash';
 const canonical = new URL(Astro.url.pathname, site).href;
 
-// Breadcrumbs from the URL path (skip on homepage).
 const segments = Astro.url.pathname.split('/').filter(Boolean);
 const titleCase = (s: string) =>
   s.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
@@ -24,7 +23,7 @@ const org = {
   name: 'Nulang',
   url: site,
   logo: site + '/favicon.svg',
-  sameAs: ['https://github.com/dporkka/nulang', 'https://www.nulang.cloud'],
+  sameAs: ['https://github.com/nulang-org/nulang', 'https://www.nulang.cloud'],
 };
 
 const graph: any[] = [];
@@ -49,8 +48,8 @@ if (isHome) {
       'A distributed, actor-based programming language with algebraic effects, row-polymorphic types, and reference capabilities. Built in Rust with a register-based VM, Cranelift JIT, WASM backend, and native AOT compilation.',
     programmingLanguage: ['Nulang', 'Rust'],
     url: site,
-    codeRepository: 'https://github.com/dporkka/nulang',
-    license: 'https://github.com/dporkka/nulang/blob/main/LICENSE',
+    codeRepository: 'https://github.com/nulang-org/nulang',
+    license: 'https://github.com/nulang-org/nulang/blob/main/LICENSE',
     author: org,
     keywords:
       'programming language, actor model, algebraic effects, distributed systems, Rust, WASM, JIT, type inference, reference capabilities, BEAM, OTP',
@@ -84,4 +83,9 @@ if (isHome) {
 const jsonld = JSON.stringify({ '@context': 'https://schema.org', '@graph': graph });
 ---
 <Default><slot /></Default>
-<script type="application/ld+json" set:html={jsonld} />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+  rel="stylesheet"
+/>

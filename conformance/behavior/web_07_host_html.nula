@@ -1,0 +1,8 @@
+import stdlib::web::host
+
+fn main() {
+    let greeting = text("hello")
+    let child = text("world")
+    let h = element("div", [("class", text("greeting"))], [greeting, child])
+    perform IO.print(h)
+}

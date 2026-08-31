@@ -440,6 +440,24 @@ impl AotModule {
         // (for the entry point with no params).
         let func: extern "C" fn() -> u64 = unsafe { std::mem::transmute(*ptr) };
         let result = func();
+        // Arithmetic helpers (pow/neg/...) cannot unwind from compiled code,
+        // so they record interpreter-parity runtime errors (48-bit overflow,
+        // type errors) in a thread-local. Surface it as the run's error so
+        // the AOT backend agrees with the interpreter.
+        if let Some(msg) = crate::jit::runtime::aot_take_pending_error() {
+            // Clean up before returning (mirror the normal path).
+            unsafe {
+                crate::jit::runtime::clear_jit_callbacks();
+                let _ = Box::from_raw(callbacks_ptr as *mut crate::vm::StandaloneVmCallbacks);
+            }
+            crate::jit::runtime::aot_clear_constants();
+            clear_aot_module_ctx();
+            let _ = crate::jit::runtime::aot_take_heap();
+            return Err(crate::types::NuError::runtime_error(
+                msg,
+                crate::types::Span::default(),
+            ));
+        }
 
         // Clean up: reconstruct Box to drop callbacks and free heap/GC.
         unsafe {

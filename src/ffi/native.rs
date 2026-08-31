@@ -11,7 +11,12 @@ use std::sync::{Mutex, OnceLock};
 use super::marshal::Signature;
 
 /// A loaded dynamic library.
+///
+/// When the `ffi` feature is disabled, the library handle is absent and
+/// `open`/`resolve` return errors; the registry of *pre-registered* native
+/// functions (`register_native_function`) still works without the feature.
 pub struct NativeLibrary {
+    #[cfg(feature = "ffi")]
     inner: libloading::Library,
     name: String,
 }
@@ -21,6 +26,7 @@ impl NativeLibrary {
     ///
     /// # Safety
     /// The caller must ensure the path points to a valid shared library.
+    #[cfg(feature = "ffi")]
     pub unsafe fn open(path: &str) -> Result<Self, String> {
         let inner = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
         Ok(Self {
@@ -29,23 +35,55 @@ impl NativeLibrary {
         })
     }
 
+    /// Open a dynamic library by path.
+    ///
+    /// # Safety
+    /// The caller must ensure the path points to a valid shared library.
+    #[cfg(not(feature = "ffi"))]
+    pub unsafe fn open(path: &str) -> Result<Self, String> {
+        Err(format!(
+            "FFI dynamic library loading disabled (feature 'ffi' not enabled): {}",
+            path
+        ))
+    }
+
     /// Return the path/name used to open this library.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Resolve a symbol from this library.
+    /// Resolve a symbol from this library as an opaque function pointer.
+    ///
+    /// The `T` parameter guides `libloading`'s type-checked lookup; the
+    /// returned pointer must be transmuted to `T` by the caller.
     ///
     /// # Safety
     /// The caller must ensure the symbol actually has the requested type.
-    pub unsafe fn resolve<T>(&self, symbol: &[u8]) -> Result<libloading::Symbol<'_, T>, String> {
-        self.inner.get(symbol).map_err(|e| {
-            format!(
-                "failed to resolve {}: {}",
-                String::from_utf8_lossy(symbol),
-                e
-            )
-        })
+    #[cfg(feature = "ffi")]
+    pub unsafe fn resolve<T>(&self, symbol: &[u8]) -> Result<*const c_void, String> {
+        self.inner
+            .get::<T>(symbol)
+            // `try_as_raw_ptr` extracts the raw symbol address without
+            // going through `Deref` (which, for function types, would
+            // re-derive the pointer from a place expression instead of
+            // returning the resolved entry point).
+            .map(|s| unsafe { s.try_as_raw_ptr() }.unwrap_or(std::ptr::null_mut()) as *const c_void)
+            .map_err(|e| {
+                format!(
+                    "failed to resolve {}: {}",
+                    String::from_utf8_lossy(symbol),
+                    e
+                )
+            })
+    }
+
+    /// Resolve a symbol from this library as an opaque function pointer.
+    ///
+    /// # Safety
+    /// The caller must ensure the symbol actually has the requested type.
+    #[cfg(not(feature = "ffi"))]
+    pub unsafe fn resolve<T>(&self, _symbol: &[u8]) -> Result<*const c_void, String> {
+        Err("FFI dynamic library loading disabled (feature 'ffi' not enabled)".to_string())
     }
 }
 
@@ -182,8 +220,7 @@ impl FfiRegistry {
         let lib = self.load_library(library)?;
         let symbol_name = symbol.to_string();
         // SAFETY: caller guarantees the symbol exists and has the requested type.
-        let sym = unsafe { lib.resolve::<unsafe extern "C" fn()>(symbol.as_bytes())? };
-        let ptr: *const c_void = *sym as *const c_void;
+        let ptr = unsafe { lib.resolve::<unsafe extern "C" fn()>(symbol.as_bytes())? };
         let func = NativeFunction::new(ptr, signature, Some(library.to_string()), symbol_name);
         self.register(func.clone());
         Ok(func)

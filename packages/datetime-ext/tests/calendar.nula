@@ -1,0 +1,74 @@
+// Tests for datetime-ext — calendar math, ISO formatting/parsing.
+
+import lib
+import stdlib::test
+
+fn main() {
+  // ── leap years & month lengths ───────────────────────────────────────
+  assert(is_leap_year(2000), "2000 is leap")
+  assert(!is_leap_year(1900), "1900 is not leap")
+  assert(is_leap_year(2024), "2024 is leap")
+  assert(!is_leap_year(2023), "2023 is not leap")
+  assert_eq(days_in_month(2024, 2), 29)
+  assert_eq(days_in_month(2023, 2), 28)
+  assert_eq(days_in_month(2024, 1), 31)
+  assert_eq(days_in_month(2024, 4), 30)
+
+  // ── days_from_civil anchors ──────────────────────────────────────────
+  assert_eq(days_from_civil(1970, 1, 1), 0)
+  assert_eq(days_from_civil(1970, 1, 2), 1)
+  assert_eq(days_from_civil(2000, 1, 1), 10957)
+  assert_eq(days_from_civil(1969, 12, 31), -1)
+
+  // ── civil_from_days round-trips ──────────────────────────────────────
+  let ymd = civil_from_days(10957);
+  assert_eq(ymd.0, 2000)
+  assert_eq(ymd.1, 1)
+  assert_eq(ymd.2, 1)
+  let epoch = civil_from_days(0);
+  assert_eq(epoch.0, 1970)
+  assert_eq(epoch.1, 1)
+  assert_eq(epoch.2, 1)
+
+  // ── day_of_week (0 = Sunday) ─────────────────────────────────────────
+  assert_eq(day_of_week(new(1970, 1, 1, 0, 0, 0)), 4)   // Thursday
+  assert_eq(day_of_week(new(2000, 1, 1, 0, 0, 0)), 6)   // Saturday
+  assert_eq(day_of_week(new(2024, 2, 29, 0, 0, 0)), 4)  // Thursday
+
+  // ── add_days across boundaries ───────────────────────────────────────
+  let leap_eve = add_days(new(2024, 2, 28, 12, 30, 45), 1);
+  assert_eq(leap_eve.year, 2024)
+  assert_eq(leap_eve.month, 2)
+  assert_eq(leap_eve.day, 29)
+  assert_eq(leap_eve.hour, 12)   // time preserved
+  assert_eq(leap_eve.minute, 30)
+  let ny = add_days(new(2023, 12, 31, 0, 0, 0), 1);
+  assert(to_iso_date(ny) == "2024-01-01", "add_days new year")
+  let back = add_days(new(2024, 3, 1, 0, 0, 0), -1);
+  assert(to_iso_date(back) == "2024-02-29", "add_days backwards over leap day")
+
+  // ── days_between / compare ───────────────────────────────────────────
+  assert_eq(days_between(new(2024, 1, 1, 0, 0, 0), new(2024, 12, 31, 0, 0, 0)), 365)
+  assert_eq(days_between(new(2023, 1, 1, 0, 0, 0), new(2023, 12, 31, 0, 0, 0)), 364)
+  assert_eq(compare(new(2024, 1, 1, 0, 0, 0), new(2024, 1, 1, 0, 0, 1)), -1)
+  assert_eq(compare(new(2024, 1, 2, 0, 0, 0), new(2024, 1, 1, 0, 0, 0)), 1)
+  assert_eq(compare(new(2024, 1, 1, 0, 0, 0), new(2024, 1, 1, 0, 0, 0)), 0)
+
+  // ── ISO formatting ───────────────────────────────────────────────────
+  assert(to_iso_date(new(2024, 7, 5, 0, 0, 0)) == "2024-07-05", "to_iso_date pads")
+  assert(to_iso(new(2024, 7, 5, 9, 8, 7)) == "2024-07-05T09:08:07", "to_iso pads")
+  assert(pad_int(42, 4) == "0042", "pad_int")
+  assert(pad_int(12345, 2) == "12345", "pad_int no-op")
+
+  // ── ISO parsing round-trips ──────────────────────────────────────────
+  let dt = from_iso("2024-07-05T09:08:07");
+  assert(is_valid(dt), "parsed datetime is valid")
+  assert(to_iso(dt) == "2024-07-05T09:08:07", "ISO round-trip")
+  let dt2 = from_iso("2024-07-05 09:08:07");
+  assert(to_iso(dt2) == "2024-07-05T09:08:07", "space separator accepted")
+  let date_only = from_iso_date("2024-07-05");
+  assert(to_iso(date_only) == "2024-07-05T00:00:00", "date-only defaults to midnight")
+
+  // ── stdlib re-exports ────────────────────────────────────────────────
+  assert(is_valid(new(2024, 2, 29, 23, 59, 59)), "stdlib is_valid available")
+}

@@ -174,7 +174,8 @@ fn test_compiled_region_len_recorded() {
     let len = find_compilable_region(0, &instructions);
     assert_eq!(len, STRAIGHT_LINE_MIN);
     assert_eq!(jit.compiled_region_len(0, 0), None, "not compiled yet");
-    let ptr = unsafe { jit.compile_region(0, 0, len, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, len, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
     assert_eq!(jit.compiled_region_len(0, 0), Some(len));
     assert_eq!(
@@ -209,7 +210,8 @@ fn test_jit_compile_empty_region() {
         Instruction::new0(OpCode::Nop),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 2, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -220,7 +222,8 @@ fn test_jit_compile_int_add() {
         Instruction::new3(OpCode::IAdd, 0, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 2, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -236,7 +239,8 @@ fn test_jit_compile_integer_loop() {
         Instruction::new2(OpCode::JmpT, 2, 0xFC),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 7, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 7, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -250,7 +254,8 @@ fn test_jit_compile_float_ops() {
         Instruction::new3(OpCode::FDiv, 4, 1, 5),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 5, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 5, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -265,7 +270,8 @@ fn test_jit_compile_comparisons() {
         Instruction::new3(OpCode::ICmpGe, 0, 1, 14),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 6, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 6, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -278,7 +284,8 @@ fn test_jit_compile_logic() {
         Instruction::new3(OpCode::Or, 0, 1, 3),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 4, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -290,7 +297,8 @@ fn test_jit_compile_conversions() {
         Instruction::new2(OpCode::FToI, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 3, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -303,7 +311,8 @@ fn test_jit_compile_register_moves() {
         Instruction::new2(OpCode::Swap, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 4, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -316,7 +325,8 @@ fn test_jit_compile_jmp_unconditional() {
         Instruction::new0(OpCode::Nop),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 4, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -329,7 +339,8 @@ fn test_jit_compile_jmp_conditional() {
         Instruction::new0(OpCode::Nop),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 4, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 4, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -371,7 +382,15 @@ fn test_jit_compile_all_mvp_opcodes() {
         Instruction::new2(OpCode::FToI, 1, 51),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, instructions.len(), &instructions) };
+    let ptr = unsafe {
+        jit.compile_region(
+            0,
+            0,
+            instructions.len(),
+            &instructions,
+            &std::collections::HashMap::new(),
+        )
+    };
     assert!(ptr.is_some());
 }
 
@@ -384,7 +403,8 @@ fn test_jit_compile_rejects_unsupported_opcode() {
         Instruction::new3(OpCode::ISub, 0, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 1, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 1, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -551,6 +571,161 @@ fn test_jit_pow_loop_tiers_up() {
         "pow-loop sum is wrong"
     );
 }
+
+#[test]
+fn test_jit_direct_call_loop_tiers_up() {
+    // A hot loop calling a provably-non-suspending leaf must fold the direct
+    // call into the compiled region (`find_compilable_region_with_calls`) and
+    // run the callee via the re-entrant `nulang_jit_direct_call` helper while
+    // producing the interpreter's exact result. If the call were NOT folded
+    // (region stops at the Call), the loop body would not compile (no
+    // back-edge captured) and `jit_compiled_count` would be 0.
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn bump(x: Int) -> Int { x + 1 }
+        fn main() {
+            var s = 0;
+            var i = 0;
+            while i < 20000 {
+                s = bump(s);
+                i = i + 1
+            };
+            s
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_direct_call_test").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interp loop should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let result = jit_vm.run().expect("jit loop should run");
+    assert_eq!(
+        result.as_int(),
+        expected.as_int(),
+        "JIT direct-call loop must match the interpreter"
+    );
+    assert_eq!(expected.as_int(), Some(20000), "loop counter is wrong");
+    assert!(
+        jit_vm.jit_compiled_count() > 0,
+        "the loop region must compile around the folded direct call"
+    );
+}
+
+#[test]
+fn test_jit_direct_call_recursion_stays_interpreter() {
+    // Recursive calls (fib -> fib) are in a direct-call cycle and must NOT be
+    // folded into a compiled region: the re-entrant helper consumes native
+    // stack per recursion level, so unbounded recursion would overflow it. The
+    // interpreter uses heap-allocated frames. fib must therefore stay fully
+    // interpreted and still produce the correct result.
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn fib(n: Int) -> Int {
+            if n < 2 then { n } else { fib(n - 1) + fib(n - 2) }
+        }
+        fn main() -> Int { fib(25) }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_direct_call_fib").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interp fib should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let result = jit_vm.run().expect("jit fib should run");
+    assert_eq!(
+        result.as_int(),
+        expected.as_int(),
+        "JIT fib must match the interpreter"
+    );
+    assert_eq!(expected.as_int(), Some(75025), "fib(25) is wrong");
+    assert_eq!(
+        jit_vm.jit_compiled_count(),
+        0,
+        "recursive calls must not fold (recursion-cycle gate)"
+    );
+}
+
+#[test]
+fn test_jit_direct_call_skips_suspending_callee() {
+    // A callee that may suspend (performs an effect) must NOT be folded into
+    // a compiled region — the may_suspend gate keeps it on the interpreter so
+    // suspension semantics are preserved. The program must still run correctly.
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn noisy(x: Int) -> Int {
+            perform IO.print("noise");
+            x + 1
+        }
+        fn main() -> Int {
+            var s = 0;
+            var i = 0;
+            while i < 50 {
+                s = noisy(s);
+                i = i + 1
+            };
+            s
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_direct_call_suspend").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interp should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let result = jit_vm.run().expect("jit should run");
+    assert_eq!(
+        result.as_int(),
+        expected.as_int(),
+        "a loop calling a suspending callee must match the interpreter"
+    );
+    assert_eq!(expected.as_int(), Some(50), "loop counter is wrong");
+}
 // ---------------------------------------------------------------------------
 // Extended opcode coverage: Load/Store, bitwise int ops, FNeg
 // ---------------------------------------------------------------------------
@@ -566,7 +741,8 @@ fn test_jit_compile_bitwise_ops() {
         Instruction::new3(OpCode::BitOr, 5, 1, 6),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 6, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 6, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -577,7 +753,8 @@ fn test_jit_compile_fneg() {
         Instruction::new3(OpCode::FNeg, 0, 0, 1),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 2, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -590,7 +767,8 @@ fn test_jit_compile_pow() {
         Instruction::new3(OpCode::FPow, 3, 4, 5),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 3, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some(), "IPow/FPow region must JIT-compile");
 }
 
@@ -602,7 +780,8 @@ fn test_jit_compile_load_store() {
         Instruction::new2(OpCode::Store, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let ptr = unsafe { jit.compile_region(0, 0, 3, &instructions) };
+    let ptr =
+        unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
 }
 
@@ -623,8 +802,9 @@ fn test_jit_execute_bitwise_ops() {
         Instruction::new3(OpCode::Xor, 14, 15, 16), // r16 = float ^ int -> 0 ^ 7
         Instruction::new0(OpCode::Halt),
     ];
-    let func = unsafe { jit.compile_region(0, 0, 8, &instructions) }
-        .expect("bitwise region should compile");
+    let func =
+        unsafe { jit.compile_region(0, 0, 8, &instructions, &std::collections::HashMap::new()) }
+            .expect("bitwise region should compile");
     let consts: [u64; 0] = [];
     let mut regs = [0u64; 256];
     regs[0] = Value::int(0b1100).as_raw();
@@ -661,7 +841,8 @@ fn test_jit_execute_fneg() {
         Instruction::new0(OpCode::Halt),
     ];
     let func =
-        unsafe { jit.compile_region(0, 0, 3, &instructions) }.expect("FNeg region should compile");
+        unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) }
+            .expect("FNeg region should compile");
     let consts: [u64; 0] = [];
     let mut regs = [0u64; 256];
     regs[0] = Value::float(2.5).as_raw();
@@ -683,8 +864,9 @@ fn test_jit_execute_load_store() {
         Instruction::new2(OpCode::Store, 1, 2),
         Instruction::new0(OpCode::Halt),
     ];
-    let func = unsafe { jit.compile_region(0, 0, 3, &instructions) }
-        .expect("Load/Store region should compile");
+    let func =
+        unsafe { jit.compile_region(0, 0, 3, &instructions, &std::collections::HashMap::new()) }
+            .expect("Load/Store region should compile");
     let consts: [u64; 0] = [];
     let mut regs = [0u64; 256];
     regs[0] = Value::int(42).as_raw();
@@ -759,8 +941,16 @@ fn test_jit_bitwise_loop_matches_interpreter() {
     // 2. JIT-compiled loop body: compile the pc 5..=12 region and drive it
     //    from Rust, replicating the JmpT back-edge via r5.
     let mut jit = make_jit();
-    let func = unsafe { jit.compile_region(0, 5, 8, &module.instructions) }
-        .expect("loop body region should compile");
+    let func = unsafe {
+        jit.compile_region(
+            0,
+            5,
+            8,
+            &module.instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("loop body region should compile");
     let consts: Vec<u64> = module
         .constants
         .iter()
@@ -834,8 +1024,10 @@ fn test_jit_iinc_idec_match_interpreter() {
         };
         let mut jit = make_jit();
         let instructions = vec![Instruction::new1(op, 0), Instruction::new0(OpCode::Halt)];
-        let func = unsafe { jit.compile_region(0, 0, 2, &instructions) }
-            .expect("IInc/IDec region should compile");
+        let func = unsafe {
+            jit.compile_region(0, 0, 2, &instructions, &std::collections::HashMap::new())
+        }
+        .expect("IInc/IDec region should compile");
         let consts: [u64; 0] = [];
         let mut regs = [0u64; 256];
         regs[0] = input_raw;
@@ -1113,17 +1305,33 @@ fn test_typed_path_matches_scalar_path() {
 
     // Scalar path.
     let mut scalar_jit = make_jit();
-    let scalar = unsafe { scalar_jit.compile_region(0, 5, 7, &module.instructions) }
-        .expect("scalar region should compile");
+    let scalar = unsafe {
+        scalar_jit.compile_region(
+            0,
+            5,
+            7,
+            &module.instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("scalar region should compile");
     let scalar_regs = run_region(scalar);
 
     // Typed path.
     let meta = infer_reg_types(&module, 5);
     assert!(!meta.is_empty(), "int loop registers must be typed");
     let mut typed_jit = make_jit();
-    let typed =
-        unsafe { typed_jit.compile_region_typed(0, 5, 7, &module.instructions, Some(&meta)) }
-            .expect("typed region should compile");
+    let typed = unsafe {
+        typed_jit.compile_region_typed(
+            0,
+            5,
+            7,
+            &module.instructions,
+            Some(&meta),
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("typed region should compile");
     assert!(
         typed_jit.is_typed_compiled(0, 5),
         "region with proven types must use the guard-stripped compiler"
@@ -1149,8 +1357,17 @@ fn test_absent_metadata_uses_scalar_path() {
 
     // None metadata: compiles, but is NOT recorded as typed.
     let mut jit = make_jit();
-    let func = unsafe { jit.compile_region_typed(0, 5, 7, &module.instructions, None) }
-        .expect("region should compile without metadata");
+    let func = unsafe {
+        jit.compile_region_typed(
+            0,
+            5,
+            7,
+            &module.instructions,
+            None,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("region should compile without metadata");
     assert_eq!(jit.typed_compiled_count(), 0, "no metadata -> scalar path");
     assert!(!jit.is_typed_compiled(0, 5));
 
@@ -1195,10 +1412,10 @@ fn test_absent_metadata_uses_scalar_path() {
     clobbered.emit(Instruction::new1(OpCode::Const2, 8)); // 4
                                                           // Clobber AFTER all constant setup so no register fact survives the
                                                           // meet at the loop head: forward state is all-Unknown here.
-    // Spawn's result register is op3: target r9, which the loop body
-    // overwrites before any read, so the clobber cannot poison arithmetic.
+                                                          // Spawn's result register is op3: target r9, which the loop body
+                                                          // overwrites before any read, so the clobber cannot poison arithmetic.
     clobbered.emit(Instruction::new3(OpCode::Spawn, 0, 0, 9)); // 5: clobbers analysis state
-                                                            // Loop body (pc 6..=12): same shape as make_int_loop_module.
+                                                               // Loop body (pc 6..=12): same shape as make_int_loop_module.
     clobbered.emit(Instruction::new3(OpCode::IAdd, 0, 1, 0));
     clobbered.emit(Instruction::new3(OpCode::IAdd, 1, 7, 1));
     clobbered.emit(Instruction::new3(OpCode::IAdd, 0, 7, 0));
@@ -1226,6 +1443,60 @@ fn test_absent_metadata_uses_scalar_path() {
     assert!(
         vm.jit_typed_compiled_count() <= 1,
         "only the prologue may use typed path; loop body must stay scalar"
+    );
+}
+
+#[test]
+fn test_compute_recursive_classifies_cycles() {
+    // Acyclic call chains are non-recursive (safe to fold into a compiled
+    // region); self/mutual recursion is flagged so the re-entrant direct-call
+    // helper is NOT used (it consumes native stack per recursion level).
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+
+    let source = r#"
+        fn f0(x: Int) -> Int { x + 1 }
+        fn f1(x: Int) -> Int { f0(x) }
+        fn f2(x: Int) -> Int { f1(x) }
+        fn self_rec(n: Int) -> Int { if n < 1 then 0 else self_rec(n - 1) }
+        fn main() {}
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "recursive_test").expect("codegen");
+
+    let idx_of = |name: &str| -> usize {
+        let off = module
+            .debug_functions
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{} in debug_functions", name))
+            .code_offset;
+        module
+            .function_table
+            .iter()
+            .position(|&o| o == off)
+            .unwrap_or_else(|| panic!("{} offset in function_table", name))
+    };
+
+    let rec = compute_recursive(&module);
+    assert!(!rec[idx_of("f0")], "leaf f0 must be non-recursive");
+    assert!(!rec[idx_of("f1")], "f1 -> f0 chain must be non-recursive");
+    assert!(
+        !rec[idx_of("f2")],
+        "f2 -> f1 -> f0 chain must be non-recursive"
+    );
+    assert!(
+        rec[idx_of("self_rec")],
+        "self-recursion must be flagged recursive"
     );
 }
 
@@ -1272,5 +1543,129 @@ fn test_tier2_counters_are_per_session() {
     assert!(
         jit_b.tier2_counters.get(&(0, 200)).is_none(),
         "session B should have no counter since we never called record_tier2 on it"
+    );
+}
+
+/// ArrLen opcode must write its result (array length) to the *destination*
+/// register (`instr.op2`), not an unused operand (`instr.op3`).  The scalar
+/// compiler previously passed `instr.op3` to `nulang_arr_len`, which silently
+/// wrote the length to the wrong register — causing any cold-vs-warm
+/// divergence when ArrLen appeared inside a JIT-compiled region.
+///
+/// Regression test for commit fcdca62 (op3→op2 in the ArrLen handler).
+#[test]
+fn test_arrlen_scalar_register_destination() {
+    use crate::vm::VM;
+
+    // Build a minimal module: alloc array, store elements, ArrLen into a
+    // register, then loop over the array accumulating a sum.  The loop is
+    // short (4 elements), so repeating `run()` forces region tier-up
+    // (just like the difffuzz warmup loop), which in turn exercised the
+    // bug: ArrLen wrote the length to the wrong register → the loop body
+    // saw a stale 0 → sum stayed 0 instead of 10.
+    let source = "var acc = 0\nvar arr = [1, 2, 3, 4]\nfor x in arr { acc = acc + x }\nacc";
+    let mutant = crate::fuzz::compile_for_diff(source).expect("compile");
+
+    // Interpreter (cold) — authoritative result.
+    let mut cold = VM::new_without_jit();
+    cold.load_module(mutant.code_module.clone());
+    let (cold_val, _) = crate::fuzz::run_once(&mut cold).expect("cold run");
+    let expected = cold_val.as_int().unwrap();
+    assert_eq!(expected, 10, "interpreter sum of [1,2,3,4] must be 10");
+
+    // JIT (warm) — repeated runs force tier-up of the array-setup region
+    // (pc ≈ 7), which includes the ArrLen opcode.
+    let mut warm = VM::new();
+    warm.load_module(mutant.code_module.clone());
+    for _ in 0..1500 {
+        let _ = crate::fuzz::run_once(&mut warm);
+    }
+    let (warm_val, _) = crate::fuzz::run_once(&mut warm).expect("warm run");
+
+    assert_eq!(
+        warm_val.as_int(),
+        Some(expected),
+        "JIT-compiled loop (including ArrLen) must match the interpreter; cold={expected} warm={}",
+        warm_val.as_int().unwrap_or(-1)
+    );
+}
+
+/// `compute_may_suspend` and `direct_call_target`: a pure recursive function
+/// is non-suspending and its direct calls are recovered; a function that
+/// performs an effect (PerformDirect) is conservatively suspending.
+#[test]
+fn test_may_suspend_analysis() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+
+    let source = r#"
+        fn fib(n: Int) -> Int {
+            if n < 2 then { n } else { fib(n - 1) + fib(n - 2) }
+        }
+        fn greeter() {
+            perform IO.print("hi")
+        }
+        fn use_fib() -> Int { fib(10) }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "may_suspend_test").expect("codegen");
+
+    // Locate each function's index by matching its debug code_offset against
+    // function_table.
+    let idx_of = |name: &str| -> usize {
+        let off = module
+            .debug_functions
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{} in debug_functions", name))
+            .code_offset;
+        module
+            .function_table
+            .iter()
+            .position(|&o| o == off)
+            .unwrap_or_else(|| panic!("{} offset in function_table", name))
+    };
+    let fib_idx = idx_of("fib");
+    let greeter_idx = idx_of("greeter");
+    let use_fib_idx = idx_of("use_fib");
+
+    let may = compute_may_suspend(&module);
+    assert_eq!(may.len(), module.function_table.len());
+    assert!(
+        !may[fib_idx],
+        "pure recursive fib must be non-suspending (native-callable)"
+    );
+    assert!(
+        !may[use_fib_idx],
+        "a direct caller of a non-suspending function must be non-suspending"
+    );
+    assert!(
+        may[greeter_idx],
+        "a function performing an effect must be conservatively suspending"
+    );
+
+    // The direct call `use_fib -> fib` must be recovered by the peephole.
+    let start = module.function_table[use_fib_idx];
+    let end = if use_fib_idx + 1 < module.function_table.len() {
+        module.function_table[use_fib_idx + 1]
+    } else {
+        module.instructions.len()
+    };
+    let call_pc = (start..end)
+        .find(|&pc| module.instructions[pc].opcode == OpCode::Call)
+        .expect("use_fib contains a Call");
+    assert_eq!(
+        direct_call_target(&module, call_pc, start),
+        Some(fib_idx),
+        "peephole must recover the direct callee fib"
     );
 }
