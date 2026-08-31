@@ -7,8 +7,10 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::actor::Actor;
 use super::crdt::{AWORSet, Crdt, GCounter, GSet, ORSet, PNCounter};
 use super::crdt_reg::{LWWRegister, MVRegister, RGA};
+use super::persistence::StateModel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CrdtId(pub u64);
@@ -719,6 +721,27 @@ impl CrdtManager {
         self.ops_synced
     }
 
+    /// Register all CRDT-backed state fields for an actor.
+    ///
+    /// Idempotent: fields that already have a `CrdtId` in `field_map` are
+    /// skipped, so this is safe to call after recovery once `field_map` has
+    /// been rebuilt from the snapshot.
+    pub fn register_actor_fields(&mut self, actor_id: u64, actor: &Actor) {
+        for (field_name, model) in &actor.state_models {
+            if let StateModel::Crdt(crdt_type) = model {
+                if self.field_map.contains_key(&(actor_id, field_name.clone())) {
+                    continue;
+                }
+                let initial = actor
+                    .state_data
+                    .get(field_name)
+                    .copied()
+                    .unwrap_or(crate::vm::Value::nil());
+                self.register_actor_field(actor_id, field_name, *crdt_type, initial);
+            }
+        }
+    }
+
     /// Register a CRDT-backed state field for an actor.
     ///
     /// Creates a CRDT entry of the given type initialized from `initial_value`,
@@ -938,7 +961,71 @@ impl CrdtManager {
                 let value = match entry {
                     CrdtEntry::GCounter(c) => crate::vm::Value::int(c.value() as i64),
                     CrdtEntry::PNCounter(c) => crate::vm::Value::int(c.value() as i64),
-                    _ => crate::vm::Value::int(0), // Other types: placeholder
+                    CrdtEntry::GSet(s) => runtime
+                        .actors
+                        .get_mut(&actor_id)
+                        .map(|actor| {
+                            let items: Vec<_> = s
+                                .value()
+                                .into_iter()
+                                .map(|item| actor.allocate_string(&item))
+                                .collect();
+                            actor.allocate_array(items)
+                        })
+                        .unwrap_or(crate::vm::Value::nil()),
+                    CrdtEntry::ORSet(s) => runtime
+                        .actors
+                        .get_mut(&actor_id)
+                        .map(|actor| {
+                            let items: Vec<_> = s
+                                .value()
+                                .into_iter()
+                                .map(|item| actor.allocate_string(&item))
+                                .collect();
+                            actor.allocate_array(items)
+                        })
+                        .unwrap_or(crate::vm::Value::nil()),
+                    CrdtEntry::AWORSet(s) => runtime
+                        .actors
+                        .get_mut(&actor_id)
+                        .map(|actor| {
+                            let items: Vec<_> = s
+                                .value()
+                                .into_iter()
+                                .map(|item| actor.allocate_string(&item))
+                                .collect();
+                            actor.allocate_array(items)
+                        })
+                        .unwrap_or(crate::vm::Value::nil()),
+                    CrdtEntry::LWWRegister(r) => runtime
+                        .actors
+                        .get_mut(&actor_id)
+                        .map(|actor| actor.allocate_string(r.read()))
+                        .unwrap_or(crate::vm::Value::nil()),
+                    CrdtEntry::MVRegister(r) => runtime
+                        .actors
+                        .get_mut(&actor_id)
+                        .map(|actor| {
+                            let items: Vec<_> = r
+                                .read()
+                                .into_iter()
+                                .map(|item| actor.allocate_string(&item))
+                                .collect();
+                            actor.allocate_array(items)
+                        })
+                        .unwrap_or(crate::vm::Value::nil()),
+                    CrdtEntry::RGA(r) => runtime
+                        .actors
+                        .get_mut(&actor_id)
+                        .map(|actor| {
+                            let items: Vec<_> = r
+                                .value()
+                                .into_iter()
+                                .map(|item| actor.allocate_string(&item))
+                                .collect();
+                            actor.allocate_array(items)
+                        })
+                        .unwrap_or(crate::vm::Value::nil()),
                 };
                 if let Some(actor) = runtime.actors.get_mut(&actor_id) {
                     actor.set_state_field(field_name.clone(), value);
@@ -1724,5 +1811,95 @@ mod tests {
         );
         // decrement is outside the mvregister operation set.
         assert_eq!(mgr.apply_field_op(2, "mv", "decrement", None), None);
+    }
+
+    /// Read a heap-allocated string value through an actor's heap.
+    fn read_string(_actor: &Actor, v: crate::vm::Value) -> Option<String> {
+        let ptr = v.as_ptr()?;
+        unsafe {
+            let cstr = std::ffi::CStr::from_ptr(ptr as *const i8);
+            cstr.to_str().ok().map(|s| s.to_string())
+        }
+    }
+
+    /// Compute the element count of a heap-allocated array value.
+    fn array_len(_actor: &Actor, v: crate::vm::Value) -> Option<usize> {
+        let ptr = v.as_ptr()?;
+        unsafe {
+            let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
+            Some(header.payload_size / std::mem::size_of::<crate::vm::Value>())
+        }
+    }
+
+    #[test]
+    fn test_push_to_actors_materializes_crdt_fields() {
+        let mut rt = crate::runtime::Runtime::new();
+        let actor_id = rt.spawn_actor(Box::new(|| {
+            vec![
+                ("count".to_string(), crate::vm::Value::int(0)),
+                ("tags".to_string(), crate::vm::Value::nil()),
+                ("title".to_string(), crate::vm::Value::nil()),
+            ]
+        }));
+        {
+            let actor = rt.actors.get_mut(&actor_id).unwrap();
+            actor
+                .state_models
+                .insert("count".to_string(), StateModel::Crdt(CrdtType::GCounter));
+            actor
+                .state_models
+                .insert("tags".to_string(), StateModel::Crdt(CrdtType::GSet));
+            actor
+                .state_models
+                .insert("title".to_string(), StateModel::Crdt(CrdtType::LWWRegister));
+        }
+
+        let mut mgr = CrdtManager::new(1);
+        let actor = rt.actors.get(&actor_id).unwrap();
+        mgr.register_actor_fields(actor_id, actor);
+
+        // Mutate the CRDT replicas through the manager.
+        assert_eq!(
+            mgr.apply_field_op(actor_id, "count", "increment", None),
+            Some(CrdtValue::Int(1))
+        );
+        assert_eq!(
+            mgr.apply_field_op(actor_id, "tags", "add", Some("a")),
+            Some(CrdtValue::Int(1))
+        );
+        assert_eq!(
+            mgr.apply_field_op(actor_id, "tags", "add", Some("b")),
+            Some(CrdtValue::Int(2))
+        );
+        assert_eq!(
+            mgr.apply_field_op(actor_id, "title", "set", Some("hello")),
+            Some(CrdtValue::Str("hello".to_string()))
+        );
+
+        // Push merged values back into the actor's state_data.
+        mgr.push_to_actors(&mut rt);
+
+        let actor = rt.actors.get(&actor_id).unwrap();
+        assert_eq!(
+            actor.get_state_field("count").and_then(|v| v.as_int()),
+            Some(1),
+            "gcounter must materialize as an int"
+        );
+        let tags = actor
+            .get_state_field("tags")
+            .expect("tags field must be set");
+        assert_eq!(
+            array_len(actor, tags),
+            Some(2),
+            "gset must materialize as an array of two elements"
+        );
+        let title = actor
+            .get_state_field("title")
+            .expect("title field must be set");
+        assert_eq!(
+            read_string(actor, title),
+            Some("hello".to_string()),
+            "lwwregister must materialize as a heap string"
+        );
     }
 }

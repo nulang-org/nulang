@@ -139,6 +139,11 @@ pub struct ActorSnapshot {
     /// `Vec<(crdt_id, crdt_type_u8, payload_bytes)>`.
     #[serde(default)]
     pub crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>>,
+    /// Maps CRDT field names (on this actor) to the `CrdtId` stored in
+    /// `crdt_snapshot`. Needed so `recover_actor` can rebuild `CrdtManager.field_map`
+    /// and `perform Crdt.*` keeps working after a restart.
+    #[serde(default)]
+    pub crdt_field_map: Option<HashMap<String, u64>>,
 }
 
 /// A journal entry records a message delivered to an actor.
@@ -851,7 +856,8 @@ impl LibsqlStore {
                     sequence INTEGER NOT NULL,
                     state TEXT NOT NULL,
                     waiting_signal TEXT,
-                    crdt_snapshot TEXT
+                    crdt_snapshot TEXT,
+                    crdt_field_map TEXT
                 )",
                 (),
             )
@@ -864,6 +870,10 @@ impl LibsqlStore {
             // Migrate databases created before the crdt_snapshot column existed.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN crdt_snapshot TEXT", ())
+                .await;
+            // Migrate databases created before the crdt_field_map column existed.
+            let _ = conn
+                .execute("ALTER TABLE snapshots ADD COLUMN crdt_field_map TEXT", ())
                 .await;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS journal (
@@ -973,12 +983,14 @@ impl PersistenceStore for LibsqlStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str()],
+                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map",
+                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str()],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
