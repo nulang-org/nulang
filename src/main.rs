@@ -2134,10 +2134,11 @@ fn install_persistence_store(runtime: &mut nulang::runtime::Runtime, uri: &str) 
         }
     } else {
         let dir = uri.strip_prefix("json:").unwrap_or(uri);
-        let store = nulang::runtime::JsonFileStore::new(dir).map_err(|e| NuError::RuntimeError {
-            msg: format!("failed to open durable store at '{}': {}", dir, e),
-            span: Span::default(),
-        })?;
+        let store =
+            nulang::runtime::JsonFileStore::new(dir).map_err(|e| NuError::RuntimeError {
+                msg: format!("failed to open durable store at '{}': {}", dir, e),
+                span: Span::default(),
+            })?;
         runtime.persistence = Box::new(store);
         eprintln!("[durable] persistent store: {}", dir);
         Ok(())
