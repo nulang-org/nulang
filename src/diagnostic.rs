@@ -5,13 +5,17 @@
 //! 1. **Stable error codes** — [`NuError::stable_code`] assigns every error
 //!    variant a category-scoped code (`E0101`-style; see
 //!    `docs/ERROR_CODES.md`). Codes are shown in report headers as
-//!    `error[E0201]: ...` by both this renderer and `NuError::format_rich`.
+//!    `error[E0201]: ...`.
 //!
 //! 2. **Ariadne report rendering** — [`render`] builds a full source-snippet
 //!    report (carets, labels, notes, help) from the thread-local
 //!    [`SourceMap`](crate::types::SourceMap) installed by the lexer. When no
 //!    source is available, [`render`] returns `None` and callers fall back to
-//!    `format_rich`/`Display`.
+//!    [`format_diagnostic`], which emits a plain-text Rust-style report.
+//!
+//! [`format_diagnostic`] is the canonical human-facing entry point: it returns
+//! a source-snippet report when a source map is installed and a plain fallback
+//! otherwise, so every CLI/REPL/package error is rendered consistently.
 
 use ariadne::{Color, Config, Label, Report, ReportKind, Source};
 
@@ -97,8 +101,7 @@ impl NuError {
 /// thread-local [`SourceMap`](crate::types::SourceMap) is installed (so no
 /// source text is available), the error is a [`NuError::Suspended`]
 /// notification, or a child of [`NuError::Multiple`] fails to render.
-/// Callers should fall back to `NuError::format_rich` (tty) or `Display`
-/// (plain) in that case.
+/// Callers should fall back to [`format_diagnostic`] in that case.
 ///
 /// `use_color` maps onto ariadne's color config: pass `false` for non-tty/CI
 /// output to get a plain-text snippet report.
@@ -159,6 +162,56 @@ pub fn render_warning(warning: &NuWarning, use_color: bool) -> Option<String> {
 /// installed, otherwise the plain one-line form.
 pub fn format_warning(warning: &NuWarning, use_color: bool) -> String {
     render_warning(warning, use_color).unwrap_or_else(|| warning.format_plain())
+}
+
+/// Format an [`NuError`] for human display.
+///
+/// Returns an `ariadne` source-snippet report when a thread-local source map is
+/// installed, otherwise a plain-text Rust-style report (`error[E0201]: ...`,
+/// `--> file:line:col`, notes, and a `help:` line). This is the canonical
+/// entry point for all terminal/CLI/REPL/package error output.
+pub fn format_diagnostic(err: &NuError, use_color: bool) -> String {
+    render(err, use_color).unwrap_or_else(|| format_plain_diagnostic(err))
+}
+
+/// Plain-text Rust-style fallback when no source map is available.
+///
+/// Emits `error[CODE]: message`, the source location when resolvable, the
+/// structured notes (`expected type:`, `found type:`, `missing effects:`,
+/// `did you mean one of:`, etc.), and any suggestion as a `help:` line.
+fn format_plain_diagnostic(err: &NuError) -> String {
+    match err {
+        NuError::Multiple(errors) => errors
+            .iter()
+            .map(|e| format_plain_diagnostic(e))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        NuError::Suspended(kind) => format!("info: VM suspended ({kind})"),
+        _ => {
+            let mut out = String::new();
+            let msg = err.to_string_message();
+            if let Some(code) = err.stable_code() {
+                out.push_str(&format!("error[{code}]: {msg}\n"));
+            } else {
+                out.push_str(&format!("error: {msg}\n"));
+            }
+            if let Some(span) = err.primary_span() {
+                let line = span.line();
+                if line > 0 {
+                    let file = span.file().unwrap_or_else(|| "<input>".to_string());
+                    let col = span.column();
+                    out.push_str(&format!("  --> {file}:{line}:{col}\n"));
+                }
+            }
+            for note in diagnostic_notes(err) {
+                out.push_str(&format!("  = note: {note}\n"));
+            }
+            if let Some(help) = err.suggestion() {
+                out.push_str(&format!("  = help: {help}\n"));
+            }
+            out
+        }
+    }
 }
 
 /// Render a single (non-`Multiple`) error.
@@ -230,7 +283,7 @@ impl NuError {
 
 /// Build the structured-field note lines for an error (expected/found types,
 /// missing effects, capability explanations, similar-name suggestions).
-/// These mirror the extra lines emitted by `Display`/`format_rich` so no
+/// These mirror the extra lines emitted by `NuError`'s `Display` so no
 /// diagnostic content is lost in the ariadne path.
 pub fn diagnostic_notes(err: &NuError) -> Vec<String> {
     let mut notes = Vec::new();
@@ -520,5 +573,94 @@ mod tests {
                 "parse code: {rendered:?}"
             );
         });
+    }
+
+    // -- canonical format_diagnostic entry point ---------------------------
+
+    #[test]
+    fn test_format_diagnostic_uses_ariadne_with_source_map() {
+        let source = "fn main() = countr + 1\n";
+        with_source(source, || {
+            let start = offset_of(source, "countr") as u32;
+            let err = NuError::unbound_variable(
+                "countr",
+                Span::new(start, start + 6),
+                Some(vec!["counter".to_string()]),
+            );
+            let rendered = format_diagnostic(&err, false);
+            assert!(
+                rendered.contains("[E0202] Error:"),
+                "should contain stable code header: {rendered:?}"
+            );
+            assert!(
+                rendered.contains("countr"),
+                "should contain source span: {rendered:?}"
+            );
+            assert!(
+                rendered.contains("did you mean one of: counter?"),
+                "should contain suggestion note: {rendered:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_format_diagnostic_plain_fallback_without_source_map() {
+        clear_source_map();
+        let err = NuError::type_mismatch("Int", "String", Span::default());
+        let rendered = format_diagnostic(&err, false);
+        assert!(
+            rendered.starts_with("error[E0201]:"),
+            "should start with rustc-style header: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("expected type: Int"),
+            "should contain expected type: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("found type: String"),
+            "should contain found type: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("= help:"),
+            "should contain help line: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_diagnostic_plain_effect_error() {
+        clear_source_map();
+        let err = NuError::missing_effects(vec!["IO".to_string()], "{}", Span::default());
+        let rendered = format_diagnostic(&err, false);
+        assert!(
+            rendered.contains("missing effects: IO"),
+            "should contain missing effects: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("allowed effects: {}"),
+            "should contain allowed effects: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_diagnostic_multiple_renders_each_child() {
+        clear_source_map();
+        let errs = NuError::Multiple(vec![
+            NuError::vm_error("boom".into(), Span::default()),
+            NuError::parse_error("oops".into(), Span::default()),
+        ]);
+        let rendered = format_diagnostic(&errs, false);
+        assert!(rendered.contains("error[E0502]:"), "vm code: {rendered:?}");
+        assert!(
+            rendered.contains("error[E0102]:"),
+            "parse code: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_diagnostic_suspended_returns_info() {
+        clear_source_map();
+        let err = NuError::Suspended(crate::types::VmSuspension::SignalWait);
+        let rendered = format_diagnostic(&err, false);
+        assert!(rendered.contains("VM suspended"), "{rendered:?}");
     }
 }

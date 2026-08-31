@@ -1383,6 +1383,8 @@ pub(crate) fn aot_ctype_from_tag(tag: u64) -> crate::ffi::marshal::CType {
         2 => crate::ffi::marshal::CType::Bool,
         3 => crate::ffi::marshal::CType::CStr,
         4 => crate::ffi::marshal::CType::VoidPtr,
+        5 => crate::ffi::marshal::CType::Unit,
+        6 => crate::ffi::marshal::CType::Value,
         _ => crate::ffi::marshal::CType::Unit,
     }
 }

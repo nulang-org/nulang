@@ -29,10 +29,9 @@ use crate::bytecode::{
 };
 use crate::mir;
 use crate::types::{NuError, NuResult, PrimitiveType, Span, Type};
+use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
-type FxHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 const FUNC_VALUE_REG: u8 = 254;
 /// First general-purpose local register. r0..(LOCAL_BASE-1) is the call/effect staging zone,
 /// r12..r14 are spill scratch registers, and rLOCAL_BASE..253 hold MIR locals that are not spilled.
@@ -242,20 +241,24 @@ impl MirCodegen {
             let params = ff
                 .params
                 .iter()
-                .map(crate::ffi::marshal::nulang_type_to_ffi_type)
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    compile_err(
-                        format!(
-                            "unsupported parameter type in extern function {}",
-                            ff.symbol
-                        ),
-                        Span::default(),
-                    )
-                })?;
+                .map(|ty| {
+                    crate::ffi::marshal::nulang_type_to_ffi_type(ty).ok_or_else(|| {
+                        compile_err(
+                            format!(
+                                "extern function '{}' parameter has unsupported FFI type {:?}",
+                                ff.symbol, ty
+                            ),
+                            Span::default(),
+                        )
+                    })
+                })
+                .collect::<NuResult<Vec<_>>>()?;
             let ret = crate::ffi::marshal::nulang_type_to_ffi_type(&ff.ret).ok_or_else(|| {
                 compile_err(
-                    format!("unsupported return type in extern function {}", ff.symbol),
+                    format!(
+                        "extern function '{}' has unsupported FFI return type {:?}",
+                        ff.symbol, ff.ret
+                    ),
                     Span::default(),
                 )
             })?;
