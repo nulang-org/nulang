@@ -24,12 +24,16 @@
       '.benefit-row',
       '.benefit-callout',
       '.feature-card',
+      '.pillar-card',
+      '.support-card',
+      '.metric',
       '.hero > h1',
       '.hero .tagline',
       '.hero .actions',
       '.hero-example',
       '.sl-markdown-content > h2',
       '.sl-markdown-content > h3',
+      '.nu-section-header',
       '.btn-license',
       '.btn-support'
     ];
@@ -46,7 +50,7 @@
 
       // Hero elements get a subtle scale fade; side-by-side benefit demos slide in
       let revealClass = 'reveal';
-      if (el.classList.contains('feature-card')) {
+      if (el.classList.contains('feature-card') || el.classList.contains('pillar-card') || el.classList.contains('support-card')) {
         revealClass = 'reveal-scale';
       } else if (el.closest('.benefit-row') && el.classList.contains('benefit-text')) {
         revealClass = el.closest('.benefit-row-reverse') ? 'reveal-right' : 'reveal-left';
