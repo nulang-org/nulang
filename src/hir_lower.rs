@@ -16,9 +16,7 @@ use crate::ast::{BinOp, Decl, Expr, FunctionAnnotation, Literal};
 use crate::hir;
 use crate::tool_schema::{function_to_tool_schema, ToolSchema};
 use crate::types::{Capability, EffectRow, Span, Type, TypeVar};
-
-type FxHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+use rustc_hash::FxHashMap;
 
 pub fn lower_module(
     ast: &ast::AstModule,
