@@ -938,6 +938,7 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             positional_args,
             register_as,
             target_node,
+            capabilities,
             ..
         } => {
             out.push_str("spawn");
@@ -967,6 +968,24 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
                 first_arg = false;
             }
             out.push(')');
+            if !capabilities.is_empty() {
+                out.push_str(" with [");
+                for (i, cap) in capabilities.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    // Canonical token `Net::TcpOut(host:port)` → source form.
+                    if let Some(dest) = cap
+                        .strip_prefix("Net::TcpOut(")
+                        .and_then(|r| r.strip_suffix(')'))
+                    {
+                        out.push_str(&format!("Net::TcpOut(\"{}\")", dest));
+                    } else {
+                        out.push_str(cap);
+                    }
+                }
+                out.push(']');
+            }
             if let Some(reg) = register_as {
                 out.push_str(&format!(" as \"{}\"", reg));
             }

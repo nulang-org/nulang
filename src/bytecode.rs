@@ -695,6 +695,13 @@ pub struct CodeModule {
     /// Populated by MIR codegen; consumed by the VM's `step_spawn`.
     #[serde(default)]
     pub spawn_init_overrides: Vec<(usize, Vec<(String, Constant)>)>,
+    /// Spawn-time capability grants.  Maps `Spawn` instruction byte-offset to
+    /// the capability token strings (e.g. `Net::TcpOut(host:port)`) granted to
+    /// the actor spawned by that instruction.  Populated by MIR codegen from
+    /// `spawn Foo() with [...]`; consumed by the VM's `step_spawn`, which
+    /// installs the set on the new actor for runtime enforcement.
+    #[serde(default)]
+    pub spawn_capability_grants: Vec<(usize, Vec<String>)>,
     #[serde(default)]
     pub remote_spawn_init_fields: Vec<(usize, Vec<String>)>,
     /// Sorted (bytecode pc -> 1-indexed source line) for the DAP server's
@@ -722,6 +729,7 @@ impl CodeModule {
             exports: Vec::new(),
             entry_point: None,
             spawn_init_overrides: Vec::new(),
+            spawn_capability_grants: Vec::new(),
             remote_spawn_init_fields: Vec::new(),
             handler_tables: Vec::new(),
             actor_metadata: Vec::new(),
