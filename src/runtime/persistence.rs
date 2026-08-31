@@ -1000,7 +1000,7 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = conn
                 .query(
-                    "SELECT sequence, state, waiting_signal, crdt_snapshot FROM snapshots WHERE actor_id = ?1",
+                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map FROM snapshots WHERE actor_id = ?1",
                     libsql::params![actor_id as i64],
                 )
                 .await
@@ -1010,7 +1010,12 @@ impl PersistenceStore for LibsqlStore {
             let state_json: String = row.get(1).ok()?;
             let waiting_signal: Option<String> = row.get(2).ok()?;
             let crdt_json: Option<String> = row.get(3).ok()?;
+            let crdt_field_map_json: Option<String> = row.get(4).ok()?;
             let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
+                Some(j) => serde_json::from_str(&j).ok()?,
+                None => None,
+            };
+            let crdt_field_map: Option<HashMap<String, u64>> = match crdt_field_map_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
             };
@@ -1021,6 +1026,7 @@ impl PersistenceStore for LibsqlStore {
                 state,
                 waiting_signal,
                 crdt_snapshot,
+                crdt_field_map,
             })
         })
     }
