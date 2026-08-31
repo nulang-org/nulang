@@ -1,0 +1,37 @@
+---
+interface Metric {
+  value: string;
+  label: string;
+  detail?: string;
+  href?: string;
+}
+
+const metrics: Metric[] = [
+  { value: '1558+', label: 'Tests passing', detail: 'Core language suite' },
+  { value: '4', label: 'Backends', detail: 'VM · JIT · AOT · WASM' },
+  { value: '0', label: 'GC pauses', detail: 'Per-actor collection' },
+  { value: 'Apache 2.0', label: 'Open source', detail: 'Contribute on GitHub', href: 'https://github.com/nulang-org/nulang' },
+];
+---
+
+<section class="metrics-band" aria-label="Project metrics">
+  <div class="metrics-band-inner">
+    {metrics.map((metric) => (
+      <div class="metric">
+        {metric.href ? (
+          <a href={metric.href} target="_blank" rel="noopener noreferrer" class="metric-link">
+            <div class="metric-value">{metric.value}</div>
+            <div class="metric-label">{metric.label}</div>
+            {metric.detail && <div class="metric-detail">{metric.detail}</div>}
+          </a>
+        ) : (
+          <>
+            <div class="metric-value">{metric.value}</div>
+            <div class="metric-label">{metric.label}</div>
+            {metric.detail && <div class="metric-detail">{metric.detail}</div>}
+          </>
+        )}
+      </div>
+    ))}
+  </div>
+</section>
