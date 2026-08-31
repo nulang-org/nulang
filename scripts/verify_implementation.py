@@ -195,7 +195,25 @@ def run_tests():
     default features only — check_warnings() already exercises all three
     feature configs for compile-cleanliness; running the full suite three
     times over would be slow for marginal additional coverage.
+
+    Package-manager tests invoke the real `nulang` CLI via the binary
+    resolved from `target/<profile>/nulang`. `cargo test --lib` does not
+    build that binary on its own, so build it explicitly first.
     """
+    print("Building nulang binary for package-manager tests...")
+    res = subprocess.run(
+        ["cargo", "build", "--bin", "nulang", "--quiet"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        print("Error: cargo build --bin nulang failed.")
+        print("STDOUT:")
+        print(res.stdout)
+        print("STDERR:")
+        print(res.stderr)
+        return False
+
     print("Running cargo test --lib (default features)...")
     res = subprocess.run(
         ["cargo", "test", "--lib", "--quiet"],

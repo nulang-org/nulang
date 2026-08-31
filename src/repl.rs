@@ -916,15 +916,8 @@ impl Repl {
     }
 
     fn print_error(&self, err: &NuError) {
-        if std::io::stderr().is_terminal() {
-            if let Some(rendered) = crate::diagnostic::render(err, true) {
-                eprint!("{rendered}");
-            } else {
-                eprint!("{}", err.format_rich());
-            }
-        } else {
-            eprintln!("Error: {}", err);
-        }
+        let use_color = std::io::stderr().is_terminal();
+        eprint!("{}", crate::diagnostic::format_diagnostic(err, use_color));
     }
 
     /// Execute source code without running the interactive loop.

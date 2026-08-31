@@ -151,7 +151,9 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             fields: _,
             span,
         } => {
-            // In a full implementation, this would create a CRDT actor
+            // CRDT declarations are compile-time schemas. The typechecker binds
+            // the name to a record type describing the fields; at runtime they
+            // have no representation and lower to a unit constant.
             hir::Decl::Constant {
                 name: name.clone(),
                 body: hir::Body {

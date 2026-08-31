@@ -9,9 +9,8 @@ use crate::types::{
     Capability, Effect, EffectRow, NuError, NuResult, NuWarning, PrimitiveType, Region, Span, Type,
     TypeVar,
 };
+use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
-type FxHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 /// Resolved prelude variant types (`Option[T]`, `Result[Ok, Err]`), keyed
 /// by name: `(type-parameter vars, expanded body)`. The prelude's type
@@ -1081,7 +1080,7 @@ impl Parser {
                     let ty = if self.consume_if(&TokenKind::Colon) {
                         self.parse_type()?
                     } else {
-                        Type::unit()
+                        Type::Var(TypeVar::fresh())
                     };
                     if !self.consume_if(&TokenKind::Assign) {
                         self.expect(TokenKind::Colon)?;
@@ -2664,6 +2663,7 @@ impl Parser {
         self.advance(); // consume 'extern'
 
         let library = match self.peek_kind() {
+            TokenKind::LBrace => "__nulang_registered__".to_string(),
             TokenKind::StringLit(s) => {
                 let s = s.clone();
                 self.advance();
@@ -2672,7 +2672,7 @@ impl Parser {
             other => {
                 return Err(NuError::parse_error(
                     format!(
-                        "Expected string literal for library path, found {:?}",
+                        "Expected string literal or `{{` after `extern`, found {:?}",
                         other
                     ),
                     self.current_span(),
@@ -2701,7 +2701,18 @@ impl Parser {
             let mut params = Vec::new();
             for p in raw_params {
                 match p.ty {
-                    Some(ty) => params.push((p.name, ty)),
+                    Some(ty) => {
+                        if crate::ffi::marshal::nulang_type_to_ffi_type(&ty).is_none() {
+                            return Err(NuError::parse_error(
+                                format!(
+                                    "Extern function '{}' parameter '{}' has unsupported FFI type",
+                                    name, p.name
+                                ),
+                                func_span,
+                            ));
+                        }
+                        params.push((p.name, ty));
+                    }
                     None => {
                         return Err(NuError::parse_error(
                             format!(
@@ -2714,8 +2725,26 @@ impl Parser {
                 }
             }
 
-            self.expect(TokenKind::Arrow)?;
+            if *self.peek_kind() != TokenKind::Arrow {
+                return Err(NuError::parse_error(
+                    format!(
+                        "Extern function '{}' must declare a return type with `->`",
+                        name
+                    ),
+                    func_span,
+                ));
+            }
+            self.advance(); // consume '->'
             let ret = self.parse_type()?;
+            if crate::ffi::marshal::nulang_type_to_ffi_type(&ret).is_none() {
+                return Err(NuError::parse_error(
+                    format!(
+                        "Extern function '{}' has unsupported FFI return type",
+                        name
+                    ),
+                    func_span,
+                ));
+            }
 
             funcs.push(ExternFunc {
                 name,
@@ -8054,6 +8083,38 @@ mod tests {
         assert!(
             result.is_err(),
             "Expected parse error for missing parameter type in extern"
+        );
+    }
+
+    #[test]
+    fn test_parse_extern_default_library() {
+        let ast = parse(r#"extern { fn identity(x: Int) -> Int }"#).unwrap();
+        assert_eq!(ast.decls.len(), 1);
+        match &ast.decls[0] {
+            Decl::Extern { library, funcs, .. } => {
+                assert_eq!(library, "__nulang_registered__");
+                assert_eq!(funcs.len(), 1);
+                assert_eq!(funcs[0].name, "identity");
+            }
+            _ => panic!("Expected extern declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_extern_missing_arrow_errors() {
+        let result = parse(r#"extern { fn f(x: Int) { } }"#);
+        assert!(
+            result.is_err(),
+            "Expected parse error for missing `->` in extern function"
+        );
+    }
+
+    #[test]
+    fn test_parse_extern_unsupported_type_errors() {
+        let result = parse(r#"extern { fn f(x: Int) -> [Int] }"#);
+        assert!(
+            result.is_err(),
+            "Expected parse error for unsupported FFI return type"
         );
     }
 

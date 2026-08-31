@@ -1364,21 +1364,10 @@ fn run_node_cmd(_args: &[String]) -> NuResult<()> {
 }
 
 fn print_error(err: &NuError, use_color: bool) {
-    // Prefer the ariadne-based renderer (source snippet with carets/labels,
-    // notes, and a stable `Error[Exxxx]` code). It returns `None` when no
-    // thread-local SourceMap is installed (e.g. errors raised before lexing
-    // or in synthetic contexts) — fall back to the hand-rolled rich format.
-    // Non-tty/CI output stays plain `Display` so tooling (and the
-    // conformance suite) can match on stable `Error: ...` prefixes.
-    if use_color {
-        if let Some(rendered) = nulang::diagnostic::render(err, true) {
-            eprint!("{rendered}");
-        } else {
-            eprint!("{}", err.format_rich());
-        }
-    } else {
-        eprintln!("Error: {}", err);
-    }
+    // Use the canonical rich diagnostic renderer (ariadne source snippet when
+    // a source map is installed, plain Rust-style fallback otherwise). The
+    // rendered report already ends with a newline.
+    eprint!("{}", nulang::diagnostic::format_diagnostic(err, use_color));
 }
 
 /// Resolve the `--color` flag against `is_terminal`.
@@ -1890,7 +1879,65 @@ fn run_source(
                 return Ok(());
             }
 
-            let result_raw = aot_module.run()?;
+            // Modules that declare actors need a real Runtime: spawn/send must
+            // create live actors and the scheduler must drain their mailboxes.
+            // Pure modules can use the synchronous standalone runner.
+            let has_actors = !mir.behaviors.is_empty();
+            let result_raw = if has_actors {
+                let mut rt = nulang::runtime::Runtime::new();
+                let has_durable = ast.decls.iter().any(|d| {
+                    matches!(
+                        d,
+                        nulang::ast::Decl::Actor {
+                            persistent: true,
+                            ..
+                        }
+                    )
+                }) || matches!(
+                    ast.decls.iter().find(|d| matches!(d, nulang::ast::Decl::Actor { .. })),
+                    Some(nulang::ast::Decl::Actor { state_fields, .. })
+                        if state_fields.iter().any(|(_, model, _, _)| matches!(
+                            model,
+                            nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
+                        ))
+                );
+                let store_dir = if has_durable {
+                    Some(
+                        store_path
+                            .map(|s| s.to_string())
+                            .or_else(|| std::env::var("NULANG_STORE_PATH").ok())
+                            .unwrap_or_else(|| ".nulang/store".to_string()),
+                    )
+                } else {
+                    None
+                };
+                if let Some(dir) = store_dir.as_deref() {
+                    install_file_store(&mut rt, dir)?;
+                }
+                if let Some(port) = metrics_port {
+                    let _ = rt.enable_metrics_server(port);
+                }
+                let raw = aot_module.run_in_runtime(&mut rt)?;
+                let failures = rt.workflow_failures();
+                if !failures.is_empty() {
+                    for (step_name, error) in &failures {
+                        eprintln!("workflow step '{}' failed: {}", step_name, error);
+                    }
+                    std::process::exit(1);
+                }
+                if verbose {
+                    let snap = rt.metrics_snapshot();
+                    match serde_json::to_string(&snap) {
+                        Ok(json) => eprintln!("[metrics] {}", json),
+                        Err(_) => eprintln!("[metrics] <serialization error>"),
+                    }
+                    eprintln!("{}", rt.render_topology());
+                }
+                rt.publish_metrics();
+                raw
+            } else {
+                aot_module.run()?
+            };
             let result = nulang::vm::Value::from_raw(result_raw);
             let result_str = result.to_string_repr();
             if !result_str.is_empty() && result_str != "unit" && result_str != "()" {

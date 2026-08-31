@@ -85,11 +85,18 @@ impl HostTrait for HostState {
 }
 
 #[cfg(feature = "wasm-backend")]
+struct PooledInstance {
+    store: Store<HostState>,
+    instance: wasmtime::component::Instance,
+}
+
+#[cfg(feature = "wasm-backend")]
 pub struct ComponentRuntime {
-    _engine: Engine,
+    engine: Engine,
     component: Component,
-    config: Config,
+    linker: wasmtime::component::Linker<HostState>,
     caps: Capabilities,
+    pool: std::sync::Mutex<Vec<PooledInstance>>,
 }
 
 #[cfg(feature = "wasm-backend")]
@@ -108,19 +115,21 @@ impl ComponentRuntime {
             msg: format!("wasmtime component: {}", e),
             span: Span::default(),
         })?;
+        let linker = Self::build_linker(&engine, caps)?;
         Ok(ComponentRuntime {
-            _engine: engine,
+            engine,
             component,
-            config,
+            linker,
             caps,
+            pool: std::sync::Mutex::new(Vec::new()),
         })
     }
 
-    fn build_linker(&self, engine: &Engine) -> NuResult<wasmtime::component::Linker<HostState>> {
+    fn build_linker(engine: &Engine, caps: Capabilities) -> NuResult<wasmtime::component::Linker<HostState>> {
         let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
 
         // Add the host instance manually with the correct name
-        if self.caps.allow_log || self.caps.allow_clock || self.caps.allow_random {
+        if caps.allow_log || caps.allow_clock || caps.allow_random {
             let mut inst =
                 linker
                     .instance("nulang:runtime/host")
@@ -128,7 +137,7 @@ impl ComponentRuntime {
                         msg: format!("wasmtime linker: {}", e),
                         span: Span::default(),
                     })?;
-            if self.caps.allow_log {
+            if caps.allow_log {
                 inst.func_wrap(
                     "log",
                     move |mut caller: wasmtime::StoreContextMut<'_, HostState>,
@@ -142,7 +151,7 @@ impl ComponentRuntime {
                     span: Span::default(),
                 })?;
             }
-            if self.caps.allow_clock {
+            if caps.allow_clock {
                 inst.func_wrap(
                     "clock-now",
                     move |mut caller: wasmtime::StoreContextMut<'_, HostState>, _: ()| {
@@ -155,7 +164,7 @@ impl ComponentRuntime {
                     span: Span::default(),
                 })?;
             }
-            if self.caps.allow_random {
+            if caps.allow_random {
                 inst.func_wrap(
                     "random-u64",
                     move |mut caller: wasmtime::StoreContextMut<'_, HostState>, _: ()| {
@@ -172,89 +181,79 @@ impl ComponentRuntime {
         Ok(linker)
     }
 
-    pub fn init(&self) -> NuResult<i64> {
-        let engine = Engine::new(&self.config).map_err(|e| NuError::VMError {
-            msg: format!("wasmtime engine: {}", e),
-            span: Span::default(),
-        })?;
+    /// Acquire a store+instance pair, creating a fresh one if the pool is empty.
+    fn checkout(&self) -> NuResult<PooledInstance> {
+        if let Some(mut pooled) = self.pool.lock().unwrap().pop() {
+            pooled.store.data_mut().log_messages.clear();
+            return Ok(pooled);
+        }
         let mut store = Store::new(
-            &engine,
+            &self.engine,
             HostState {
                 caps: self.caps,
                 log_messages: Vec::new(),
             },
         );
-        let linker = self.build_linker(&engine)?;
-
-        let actor = Actor::instantiate(&mut store, &self.component, &linker).map_err(|e| {
-            NuError::VMError {
+        let instance = self
+            .linker
+            .instantiate(&mut store, &self.component)
+            .map_err(|e| NuError::VMError {
                 msg: format!("wasmtime instantiate: {}", e),
+                span: Span::default(),
+            })?;
+        Ok(PooledInstance { store, instance })
+    }
+
+    /// Return a store+instance pair to the pool for reuse.
+    fn checkin(&self, pooled: PooledInstance) {
+        self.pool.lock().unwrap().push(pooled);
+    }
+
+    fn with_actor<F, R>(&self, f: F) -> NuResult<R>
+    where
+        F: FnOnce(&mut Store<HostState>, &Actor) -> NuResult<R>,
+    {
+        let mut pooled = self.checkout()?;
+        let actor = Actor::new(&mut pooled.store, &pooled.instance).map_err(|e| {
+            NuError::VMError {
+                msg: format!("wasmtime actor bindings: {}", e),
                 span: Span::default(),
             }
         })?;
+        let result = f(&mut pooled.store, &actor);
+        self.checkin(pooled);
+        result
+    }
 
-        actor.call_init(&mut store).map_err(|e| NuError::VMError {
-            msg: format!("wasmtime call_init: {}", e),
-            span: Span::default(),
+    pub fn init(&self) -> NuResult<i64> {
+        self.with_actor(|store, actor| {
+            actor.call_init(store).map_err(|e| NuError::VMError {
+                msg: format!("wasmtime call_init: {}", e),
+                span: Span::default(),
+            })
         })
     }
 
     pub fn handle_message(&self, msg: &[u8]) -> NuResult<i64> {
-        let engine = Engine::new(&self.config).map_err(|e| NuError::VMError {
-            msg: format!("wasmtime engine: {}", e),
-            span: Span::default(),
-        })?;
-        let mut store = Store::new(
-            &engine,
-            HostState {
-                caps: self.caps,
-                log_messages: Vec::new(),
-            },
-        );
-        let linker = self.build_linker(&engine)?;
-
-        let actor = Actor::instantiate(&mut store, &self.component, &linker).map_err(|e| {
-            NuError::VMError {
-                msg: format!("wasmtime instantiate: {}", e),
-                span: Span::default(),
-            }
-        })?;
-
-        actor
-            .call_handle_message(&mut store, msg)
-            .map_err(|e| NuError::VMError {
-                msg: format!("wasmtime call_handle_message: {}", e),
-                span: Span::default(),
-            })
+        self.with_actor(|store, actor| {
+            actor
+                .call_handle_message(store, msg)
+                .map_err(|e| NuError::VMError {
+                    msg: format!("wasmtime call_handle_message: {}", e),
+                    span: Span::default(),
+                })
+        })
     }
 
     pub fn checkpoint(&self) -> NuResult<Vec<u8>> {
-        let engine = Engine::new(&self.config).map_err(|e| NuError::VMError {
-            msg: format!("wasmtime engine: {}", e),
-            span: Span::default(),
-        })?;
-        let mut store = Store::new(
-            &engine,
-            HostState {
-                caps: self.caps,
-                log_messages: Vec::new(),
-            },
-        );
-        let linker = self.build_linker(&engine)?;
-
-        let actor = Actor::instantiate(&mut store, &self.component, &linker).map_err(|e| {
-            NuError::VMError {
-                msg: format!("wasmtime instantiate: {}", e),
-                span: Span::default(),
-            }
-        })?;
-
-        actor
-            .call_checkpoint(&mut store)
-            .map_err(|e| NuError::VMError {
-                msg: format!("wasmtime call_checkpoint: {}", e),
-                span: Span::default(),
-            })
+        self.with_actor(|store, actor| {
+            actor
+                .call_checkpoint(store)
+                .map_err(|e| NuError::VMError {
+                    msg: format!("wasmtime call_checkpoint: {}", e),
+                    span: Span::default(),
+                })
+        })
     }
 }
 
@@ -287,7 +286,7 @@ mod tests {
 
         // Direct instantiation with the linker should fail because the host
         // interface is not added when allow_log is false.
-        let engine = wasmtime::Engine::new(&rt.config).expect("engine");
+        let engine = wasmtime::Engine::new(&component_config()).expect("engine");
         let mut store = wasmtime::Store::new(
             &engine,
             HostState {
@@ -295,7 +294,7 @@ mod tests {
                 log_messages: Vec::new(),
             },
         );
-        let linker = rt.build_linker(&engine).expect("linker");
+        let linker = ComponentRuntime::build_linker(&engine, rt.caps).expect("linker");
         let component = wasmtime::component::Component::new(&engine, &wasm).expect("component");
         let err = linker
             .instantiate(&mut store, &component)
@@ -322,7 +321,7 @@ mod tests {
 
         // Direct instantiation with the linker should succeed because the host
         // interface is added when allow_log is true.
-        let engine = wasmtime::Engine::new(&rt.config).expect("engine");
+        let engine = wasmtime::Engine::new(&component_config()).expect("engine");
         let mut store = wasmtime::Store::new(
             &engine,
             HostState {
@@ -330,7 +329,7 @@ mod tests {
                 log_messages: Vec::new(),
             },
         );
-        let linker = rt.build_linker(&engine).expect("linker");
+        let linker = ComponentRuntime::build_linker(&engine, rt.caps).expect("linker");
         let component = wasmtime::component::Component::new(&engine, &wasm).expect("component");
         let _instance = linker
             .instantiate(&mut store, &component)
