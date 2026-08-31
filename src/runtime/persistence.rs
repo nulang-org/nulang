@@ -139,6 +139,11 @@ pub struct ActorSnapshot {
     /// `Vec<(crdt_id, crdt_type_u8, payload_bytes)>`.
     #[serde(default)]
     pub crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>>,
+    /// Maps CRDT field names (on this actor) to the `CrdtId` stored in
+    /// `crdt_snapshot`. Needed so `recover_actor` can rebuild `CrdtManager.field_map`
+    /// and `perform Crdt.*` keeps working after a restart.
+    #[serde(default)]
+    pub crdt_field_map: Option<HashMap<String, u64>>,
 }
 
 /// A journal entry records a message delivered to an actor.
@@ -851,7 +856,8 @@ impl LibsqlStore {
                     sequence INTEGER NOT NULL,
                     state TEXT NOT NULL,
                     waiting_signal TEXT,
-                    crdt_snapshot TEXT
+                    crdt_snapshot TEXT,
+                    crdt_field_map TEXT
                 )",
                 (),
             )
@@ -864,6 +870,10 @@ impl LibsqlStore {
             // Migrate databases created before the crdt_snapshot column existed.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN crdt_snapshot TEXT", ())
+                .await;
+            // Migrate databases created before the crdt_field_map column existed.
+            let _ = conn
+                .execute("ALTER TABLE snapshots ADD COLUMN crdt_field_map TEXT", ())
                 .await;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS journal (
@@ -973,12 +983,14 @@ impl PersistenceStore for LibsqlStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str()],
+                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map",
+                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str()],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
@@ -988,7 +1000,7 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = conn
                 .query(
-                    "SELECT sequence, state, waiting_signal, crdt_snapshot FROM snapshots WHERE actor_id = ?1",
+                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map FROM snapshots WHERE actor_id = ?1",
                     libsql::params![actor_id as i64],
                 )
                 .await
@@ -998,7 +1010,12 @@ impl PersistenceStore for LibsqlStore {
             let state_json: String = row.get(1).ok()?;
             let waiting_signal: Option<String> = row.get(2).ok()?;
             let crdt_json: Option<String> = row.get(3).ok()?;
+            let crdt_field_map_json: Option<String> = row.get(4).ok()?;
             let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
+                Some(j) => serde_json::from_str(&j).ok()?,
+                None => None,
+            };
+            let crdt_field_map: Option<HashMap<String, u64>> = match crdt_field_map_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
             };
@@ -1009,6 +1026,7 @@ impl PersistenceStore for LibsqlStore {
                 state,
                 waiting_signal,
                 crdt_snapshot,
+                crdt_field_map,
             })
         })
     }
@@ -1277,6 +1295,657 @@ impl PersistenceStore for LibsqlStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RocksDbStore — production LSM-tree persistence backend
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "rocksdb")]
+pub struct RocksDbStore {
+    db: rocksdb::DB,
+}
+
+#[cfg(feature = "rocksdb")]
+impl RocksDbStore {
+    const CF_SNAPSHOTS: &'static str = "snapshots";
+    const CF_JOURNAL: &'static str = "journal";
+    const CF_WORKFLOW_EVENTS: &'static str = "workflow_events";
+    const CF_EVENTS: &'static str = "events";
+
+    /// Open (or create) a RocksDB-backed store at `path`.
+    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        // Each actor's data is logically separated by key prefix; column
+        // families keep the four streams isolated so iteration and deletion
+        // stay cheap.
+        let cfs = vec![
+            rocksdb::ColumnFamilyDescriptor::new(Self::CF_SNAPSHOTS, rocksdb::Options::default()),
+            rocksdb::ColumnFamilyDescriptor::new(Self::CF_JOURNAL, rocksdb::Options::default()),
+            rocksdb::ColumnFamilyDescriptor::new(
+                Self::CF_WORKFLOW_EVENTS,
+                rocksdb::Options::default(),
+            ),
+            rocksdb::ColumnFamilyDescriptor::new(Self::CF_EVENTS, rocksdb::Options::default()),
+        ];
+        let db = rocksdb::DB::open_cf_descriptors(&opts, path, cfs)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(RocksDbStore { db })
+    }
+
+    fn actor_key(actor_id: u64) -> [u8; 8] {
+        actor_id.to_be_bytes()
+    }
+
+    fn actor_seq_key(actor_id: u64, sequence: u64) -> [u8; 16] {
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&actor_id.to_be_bytes());
+        key[8..].copy_from_slice(&sequence.to_be_bytes());
+        key
+    }
+
+    fn cf(&self, name: &str) -> io::Result<&rocksdb::ColumnFamily> {
+        self.db
+            .cf_handle(name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("missing CF {}", name)))
+    }
+}
+
+#[cfg(feature = "rocksdb")]
+impl PersistenceStore for RocksDbStore {
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        let cf = self.cf(Self::CF_SNAPSHOTS)?;
+        let json = serde_json::to_string(&snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.db
+            .put_cf(cf, Self::actor_key(snapshot.actor_id), json.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        // RocksDB's `put` is durable once flushed.  Sync the WAL so the
+        // snapshot survives a process crash before we report success.
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        let cf = self.cf(Self::CF_SNAPSHOTS).ok()?;
+        let bytes = self.db.get_cf(cf, Self::actor_key(actor_id)).ok()??;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
+        let cf = self.cf(Self::CF_JOURNAL)?;
+        let json = serde_json::to_string(&entry)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.db
+            .put_cf(
+                cf,
+                Self::actor_seq_key(actor_id, entry.sequence),
+                json.as_bytes(),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        let cf = match self.cf(Self::CF_JOURNAL) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let mut entries = Vec::new();
+        let start = Self::actor_seq_key(actor_id, 0);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        while let Some(Ok((key, value))) = iter.next() {
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(entry) = serde_json::from_slice::<JournalEntry>(&value) {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
+        let cf = self.cf(Self::CF_WORKFLOW_EVENTS)?;
+        let json = serde_json::to_string(&event)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.db
+            .put_cf(
+                cf,
+                Self::actor_seq_key(actor_id, event.sequence()),
+                json.as_bytes(),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        let cf = match self.cf(Self::CF_WORKFLOW_EVENTS) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let mut events = Vec::new();
+        let start = Self::actor_seq_key(actor_id, 0);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        while let Some(Ok((key, value))) = iter.next() {
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(event) = serde_json::from_slice::<WorkflowEvent>(&value) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
+        let cf = self.cf(Self::CF_EVENTS)?;
+        let json = serde_json::to_string(&entry)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.db
+            .put_cf(
+                cf,
+                Self::actor_seq_key(actor_id, entry.sequence),
+                json.as_bytes(),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        let cf = match self.cf(Self::CF_EVENTS) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let mut entries = Vec::new();
+        let start = Self::actor_seq_key(actor_id, 0);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        while let Some(Ok((key, value))) = iter.next() {
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(entry) = serde_json::from_slice::<EventEntry>(&value) {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        let snapshot_seq = self
+            .load_snapshot(actor_id)
+            .map(|s| s.sequence)
+            .unwrap_or(0);
+        let journal_seq = self
+            .read_journal(actor_id)
+            .last()
+            .map(|e| e.sequence)
+            .unwrap_or(0);
+        let wf_event_seq = self
+            .read_workflow_events(actor_id)
+            .last()
+            .map(|e| e.sequence())
+            .unwrap_or(0);
+        let event_seq = self
+            .read_events(actor_id)
+            .last()
+            .map(|e| e.sequence)
+            .unwrap_or(0);
+        snapshot_seq
+            .max(journal_seq)
+            .max(wf_event_seq)
+            .max(event_seq)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> io::Result<()> {
+        for cf_name in [
+            Self::CF_SNAPSHOTS,
+            Self::CF_JOURNAL,
+            Self::CF_WORKFLOW_EVENTS,
+            Self::CF_EVENTS,
+        ] {
+            let cf = self.cf(cf_name)?;
+            // Start from the bare actor prefix.  Snapshot keys are exactly 8
+            // bytes; journal/event keys are 16 bytes (actor || sequence).
+            // Both layouts sort contiguously under the actor prefix.
+            let actor_key = Self::actor_key(actor_id);
+            let mut iter = self.db.iterator_cf(
+                cf,
+                rocksdb::IteratorMode::From(&actor_key, rocksdb::Direction::Forward),
+            );
+            let mut keys = Vec::new();
+            while let Some(Ok((key, _))) = iter.next() {
+                if key.len() < 8 || key[..8] != actor_key {
+                    break;
+                }
+                keys.push(key.to_vec());
+            }
+            for key in keys {
+                self.db
+                    .delete_cf(cf, &key)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+        }
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PostgresStore — production relational persistence backend
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "postgres")]
+pub struct PostgresStore {
+    conn: std::sync::Mutex<postgres::Client>,
+}
+
+#[cfg(feature = "postgres")]
+impl PostgresStore {
+    /// Open a PostgreSQL-backed store using a libpq-style connection string.
+    ///
+    /// Example: `host=localhost user=postgres password=secret dbname=nulang`.
+    /// TLS is disabled (`NoTls`); use a connection string with SSL parameters
+    /// and a TLS-enabled client for production deployments that require it.
+    pub fn new(config: &str) -> io::Result<Self> {
+        let client = postgres::Client::connect(config, postgres::NoTls)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let store = PostgresStore {
+            conn: std::sync::Mutex::new(client),
+        };
+        store.ensure_tables()?;
+        Ok(store)
+    }
+
+    fn ensure_tables(&self) -> io::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS snapshots (
+                actor_id BIGINT PRIMARY KEY,
+                sequence BIGINT NOT NULL,
+                state TEXT NOT NULL,
+                waiting_signal TEXT,
+                crdt_snapshot TEXT,
+                crdt_field_map TEXT
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                behavior_id INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (actor_id, sequence)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS workflow_events (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                event TEXT NOT NULL,
+                PRIMARY KEY (actor_id, sequence)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS events (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                field_name TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                args TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '1',
+                PRIMARY KEY (actor_id, sequence)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl PersistenceStore for PostgresStore {
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        let state_json = serde_json::to_string(&snapshot.state)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (actor_id) DO UPDATE SET
+               sequence = EXCLUDED.sequence,
+               state = EXCLUDED.state,
+               waiting_signal = EXCLUDED.waiting_signal,
+               crdt_snapshot = EXCLUDED.crdt_snapshot,
+               crdt_field_map = EXCLUDED.crdt_field_map",
+            &[
+                &(snapshot.actor_id as i64),
+                &(snapshot.sequence as i64),
+                &state_json,
+                &snapshot.waiting_signal.as_deref(),
+                &crdt_json.as_str(),
+                &crdt_field_map_json.as_str(),
+            ],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        let mut conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_one(
+                "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map
+                 FROM snapshots WHERE actor_id = $1",
+                &[&(actor_id as i64)],
+            )
+            .ok()?;
+        let sequence: i64 = row.get(0);
+        let state_json: String = row.get(1);
+        let waiting_signal: Option<String> = row.get(2);
+        let crdt_json: Option<String> = row.get(3);
+        let crdt_field_map_json: Option<String> = row.get(4);
+        let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> =
+            crdt_json.and_then(|j| serde_json::from_str(&j).ok());
+        let crdt_field_map: Option<HashMap<String, u64>> =
+            crdt_field_map_json.and_then(|j| serde_json::from_str(&j).ok());
+        let state: HashMap<String, PersistedValue> = serde_json::from_str(&state_json).ok()?;
+        Some(ActorSnapshot {
+            actor_id,
+            sequence: sequence as u64,
+            state,
+            waiting_signal,
+            crdt_snapshot,
+            crdt_field_map,
+        })
+    }
+
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
+        let payload_json = serde_json::to_string(&entry.payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO journal (actor_id, sequence, behavior_id, payload)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (actor_id, sequence) DO UPDATE SET
+               behavior_id = EXCLUDED.behavior_id,
+               payload = EXCLUDED.payload",
+            &[
+                &(actor_id as i64),
+                &(entry.sequence as i64),
+                &(entry.behavior_id as i32),
+                &payload_json,
+            ],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        let mut conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match conn.query(
+            "SELECT sequence, behavior_id, payload FROM journal
+             WHERE actor_id = $1 ORDER BY sequence ASC",
+            &[&(actor_id as i64)],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let seq: i64 = row.get(0);
+                let bid: i32 = row.get(1);
+                let payload_json: String = row.get(2);
+                let payload: Vec<PersistedValue> = serde_json::from_str(&payload_json).ok()?;
+                Some(JournalEntry {
+                    sequence: seq as u64,
+                    behavior_id: bid as u16,
+                    payload,
+                })
+            })
+            .collect()
+    }
+
+    fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
+        let event_json = serde_json::to_string(&event)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO workflow_events (actor_id, sequence, event)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (actor_id, sequence) DO UPDATE SET
+               event = EXCLUDED.event",
+            &[&(actor_id as i64), &(event.sequence() as i64), &event_json],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        let mut conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match conn.query(
+            "SELECT event FROM workflow_events
+             WHERE actor_id = $1 ORDER BY sequence ASC",
+            &[&(actor_id as i64)],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let event_json: String = row.get(0);
+                serde_json::from_str(&event_json).ok()
+            })
+            .collect()
+    }
+
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
+        let args_json = serde_json::to_string(&entry.args)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let value_json = serde_json::to_string(&entry.value)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (actor_id, sequence) DO UPDATE SET
+               field_name = EXCLUDED.field_name,
+               event_name = EXCLUDED.event_name,
+               args = EXCLUDED.args,
+               value = EXCLUDED.value",
+            &[
+                &(actor_id as i64),
+                &(entry.sequence as i64),
+                &entry.field_name,
+                &entry.event_name,
+                &args_json,
+                &value_json,
+            ],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        let mut conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match conn.query(
+            "SELECT sequence, field_name, event_name, args, value FROM events
+             WHERE actor_id = $1 ORDER BY sequence ASC",
+            &[&(actor_id as i64)],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let seq: i64 = row.get(0);
+                let field_name: String = row.get(1);
+                let event_name: String = row.get(2);
+                let args_json: String = row.get(3);
+                let args: Vec<PersistedValue> = serde_json::from_str(&args_json).ok()?;
+                let value_json: String = row.get(4);
+                let value: PersistedValue = serde_json::from_str(&value_json).ok()?;
+                Some(EventEntry {
+                    sequence: seq as u64,
+                    field_name,
+                    event_name,
+                    args,
+                    value,
+                })
+            })
+            .collect()
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        let mut conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let snapshot_seq: Option<i64> = conn
+            .query_opt(
+                "SELECT sequence FROM snapshots WHERE actor_id = $1",
+                &[&(actor_id as i64)],
+            )
+            .ok()
+            .flatten()
+            .map(|row| row.get(0));
+        let journal_seq: Option<i64> = conn
+            .query_opt(
+                "SELECT sequence FROM journal WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
+                &[&(actor_id as i64)],
+            )
+            .ok()
+            .flatten()
+            .map(|row| row.get(0));
+        let wf_event_seq: Option<i64> = conn
+            .query_opt(
+                "SELECT sequence FROM workflow_events WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
+                &[&(actor_id as i64)],
+            )
+            .ok()
+            .flatten()
+            .map(|row| row.get(0));
+        let event_seq: Option<i64> = conn
+            .query_opt(
+                "SELECT sequence FROM events WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
+                &[&(actor_id as i64)],
+            )
+            .ok()
+            .flatten()
+            .map(|row| row.get(0));
+        snapshot_seq
+            .unwrap_or(0)
+            .max(journal_seq.unwrap_or(0))
+            .max(wf_event_seq.unwrap_or(0))
+            .max(event_seq.unwrap_or(0)) as u64
+    }
+
+    fn clear(&mut self, actor_id: u64) -> io::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        for table in ["snapshots", "journal", "workflow_events", "events"] {
+            conn.execute(
+                &format!("DELETE FROM {} WHERE actor_id = $1", table),
+                &[&(actor_id as i64)],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn query(&self, sql: &str, params: &[Value]) -> io::Result<Vec<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        // Preserve Nulang Value types when binding Postgres parameters so
+        // numeric/boolean comparisons work without explicit SQL casts.
+        let typed_params: Vec<Box<dyn postgres::types::ToSql + Sync>> = params
+            .iter()
+            .map(|v| {
+                if let Some(i) = v.as_int() {
+                    Box::new(i) as Box<dyn postgres::types::ToSql + Sync>
+                } else if let Some(f) = v.as_float() {
+                    Box::new(f) as Box<dyn postgres::types::ToSql + Sync>
+                } else if let Some(b) = v.as_bool() {
+                    Box::new(b) as Box<dyn postgres::types::ToSql + Sync>
+                } else {
+                    Box::new(v.to_string_repr()) as Box<dyn postgres::types::ToSql + Sync>
+                }
+            })
+            .collect();
+        let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+            typed_params.iter().map(|p| p.as_ref()).collect();
+        let rows = conn
+            .query(sql, &param_refs)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let mut results = Vec::new();
+        for row in &rows {
+            let mut cols: Vec<serde_json::Value> = Vec::with_capacity(row.len());
+            for i in 0..row.len() {
+                let json_val = match row.columns().get(i).map(|c| c.type_().name()) {
+                    Some("bool") => {
+                        let v: bool = row.get(i);
+                        serde_json::Value::Bool(v)
+                    }
+                    Some("int2") | Some("int4") | Some("int8") => {
+                        let v: i64 = row.get(i);
+                        serde_json::value::Number::from_i128(v as i128)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                    Some("float4") | Some("float8") => {
+                        let v: f64 = row.get(i);
+                        serde_json::value::Number::from_f64(v)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                    _ => {
+                        let v: String = row.get(i);
+                        serde_json::Value::String(v)
+                    }
+                };
+                cols.push(json_val);
+            }
+            let json = serde_json::to_string(&cols)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            results.push(json);
+        }
+        Ok(results)
+    }
+}
 #[cfg(test)]
 mod json_file_store_tests {
     use super::*;
@@ -1306,6 +1975,7 @@ mod json_file_store_tests {
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
+                crdt_field_map: None,
             })
             .unwrap();
 
@@ -1366,6 +2036,7 @@ mod json_file_store_tests {
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
+                crdt_field_map: None,
             })
             .unwrap();
         store
@@ -1393,6 +2064,7 @@ mod json_file_store_tests {
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
+                crdt_field_map: None,
             })
             .unwrap();
         store
@@ -1427,6 +2099,7 @@ mod json_file_store_tests {
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
+                    crdt_field_map: None,
                 })
                 .unwrap();
             store
@@ -1464,6 +2137,7 @@ mod json_file_store_tests {
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
+                crdt_field_map: None,
             })
             .unwrap();
 
@@ -1552,5 +2226,392 @@ mod persisted_value_tests {
             !restored.is_nil(),
             "string must survive restore, not become nil"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "rocksdb")]
+mod rocksdb_store_tests {
+    use super::*;
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_rocksdb_test_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn test_rocksdb_store_save_load_snapshot() {
+        let dir = fresh_dir("snapshot");
+        let mut store = RocksDbStore::new(&dir).unwrap();
+        let mut state = HashMap::new();
+        state.insert("count".to_string(), PersistedValue::Int(42));
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id: 1,
+                sequence: 3,
+                state,
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+            })
+            .unwrap();
+
+        let loaded = store.load_snapshot(1).unwrap();
+        assert_eq!(loaded.actor_id, 1);
+        assert_eq!(loaded.sequence, 3);
+        assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rocksdb_store_append_read_journal() {
+        let dir = fresh_dir("journal");
+        let mut store = RocksDbStore::new(&dir).unwrap();
+        store
+            .append_journal(
+                1,
+                JournalEntry {
+                    sequence: 1,
+                    behavior_id: 0,
+                    payload: vec![PersistedValue::Int(10)],
+                },
+            )
+            .unwrap();
+        store
+            .append_journal(
+                1,
+                JournalEntry {
+                    sequence: 2,
+                    behavior_id: 1,
+                    payload: vec![PersistedValue::Int(20)],
+                },
+            )
+            .unwrap();
+
+        let journal = store.read_journal(1);
+        assert_eq!(journal.len(), 2);
+        assert_eq!(journal[0].sequence, 1);
+        assert_eq!(journal[1].behavior_id, 1);
+        assert_eq!(journal[1].payload, vec![PersistedValue::Int(20)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rocksdb_store_latest_sequence() {
+        let dir = fresh_dir("latest_seq");
+        let mut store = RocksDbStore::new(&dir).unwrap();
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id: 1,
+                sequence: 5,
+                state: HashMap::new(),
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+            })
+            .unwrap();
+        store
+            .append_journal(
+                1,
+                JournalEntry {
+                    sequence: 7,
+                    behavior_id: 0,
+                    payload: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(store.latest_sequence(1), 7);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rocksdb_store_clear() {
+        let dir = fresh_dir("clear");
+        let mut store = RocksDbStore::new(&dir).unwrap();
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id: 1,
+                sequence: 1,
+                state: HashMap::new(),
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+            })
+            .unwrap();
+        store
+            .append_journal(
+                1,
+                JournalEntry {
+                    sequence: 2,
+                    behavior_id: 0,
+                    payload: vec![],
+                },
+            )
+            .unwrap();
+
+        store.clear(1).unwrap();
+        assert!(store.load_snapshot(1).is_none());
+        assert!(store.read_journal(1).is_empty());
+        assert_eq!(store.latest_sequence(1), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rocksdb_store_persists_across_instances() {
+        let dir = fresh_dir("persist");
+        {
+            let mut store = RocksDbStore::new(&dir).unwrap();
+            let mut state = HashMap::new();
+            state.insert("x".to_string(), PersistedValue::Float(1.5));
+            store
+                .save_snapshot(ActorSnapshot {
+                    actor_id: 1,
+                    sequence: 1,
+                    state,
+                    waiting_signal: None,
+                    crdt_snapshot: None,
+                    crdt_field_map: None,
+                })
+                .unwrap();
+            store
+                .append_journal(
+                    1,
+                    JournalEntry {
+                        sequence: 2,
+                        behavior_id: 0,
+                        payload: vec![PersistedValue::Bool(true)],
+                    },
+                )
+                .unwrap();
+        }
+
+        {
+            let store = RocksDbStore::new(&dir).unwrap();
+            let snapshot = store.load_snapshot(1).unwrap();
+            assert_eq!(snapshot.sequence, 1);
+            assert_eq!(snapshot.state.get("x"), Some(&PersistedValue::Float(1.5)));
+            let journal = store.read_journal(1);
+            assert_eq!(journal.len(), 1);
+            assert_eq!(journal[0].payload, vec![PersistedValue::Bool(true)]);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rocksdb_store_query_unsupported() {
+        let dir = fresh_dir("query");
+        let store = RocksDbStore::new(&dir).unwrap();
+        let res = store.query("SELECT 1", &[]);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "postgres")]
+mod postgres_store_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn pg_url() -> Option<String> {
+        std::env::var("NU_TEST_POSTGRES_URL").ok()
+    }
+
+    fn fresh_actor_id() -> u64 {
+        static COUNTER: AtomicU64 = AtomicU64::new(1000);
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    }
+
+    #[test]
+    fn test_postgres_store_save_load_snapshot() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let mut store = PostgresStore::new(&url).unwrap();
+        let actor_id = fresh_actor_id();
+        let mut state = HashMap::new();
+        state.insert("count".to_string(), PersistedValue::Int(42));
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                sequence: 3,
+                state,
+                waiting_signal: Some("signal".to_string()),
+                crdt_snapshot: None,
+                crdt_field_map: None,
+            })
+            .unwrap();
+
+        let loaded = store.load_snapshot(actor_id).unwrap();
+        assert_eq!(loaded.actor_id, actor_id);
+        assert_eq!(loaded.sequence, 3);
+        assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
+        assert_eq!(loaded.waiting_signal, Some("signal".to_string()));
+        store.clear(actor_id).unwrap();
+    }
+
+    #[test]
+    fn test_postgres_store_append_read_journal() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let mut store = PostgresStore::new(&url).unwrap();
+        let actor_id = fresh_actor_id();
+        store
+            .append_journal(
+                actor_id,
+                JournalEntry {
+                    sequence: 1,
+                    behavior_id: 0,
+                    payload: vec![PersistedValue::Int(10)],
+                },
+            )
+            .unwrap();
+        store
+            .append_journal(
+                actor_id,
+                JournalEntry {
+                    sequence: 2,
+                    behavior_id: 1,
+                    payload: vec![PersistedValue::Int(20)],
+                },
+            )
+            .unwrap();
+
+        let journal = store.read_journal(actor_id);
+        assert_eq!(journal.len(), 2);
+        assert_eq!(journal[0].sequence, 1);
+        assert_eq!(journal[1].behavior_id, 1);
+        assert_eq!(journal[1].payload, vec![PersistedValue::Int(20)]);
+        store.clear(actor_id).unwrap();
+    }
+
+    #[test]
+    fn test_postgres_store_latest_sequence() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let mut store = PostgresStore::new(&url).unwrap();
+        let actor_id = fresh_actor_id();
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                sequence: 5,
+                state: HashMap::new(),
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+            })
+            .unwrap();
+        store
+            .append_journal(
+                actor_id,
+                JournalEntry {
+                    sequence: 7,
+                    behavior_id: 0,
+                    payload: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(store.latest_sequence(actor_id), 7);
+        store.clear(actor_id).unwrap();
+    }
+
+    #[test]
+    fn test_postgres_store_clear() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let mut store = PostgresStore::new(&url).unwrap();
+        let actor_id = fresh_actor_id();
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                sequence: 1,
+                state: HashMap::new(),
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+            })
+            .unwrap();
+        store
+            .append_journal(
+                actor_id,
+                JournalEntry {
+                    sequence: 2,
+                    behavior_id: 0,
+                    payload: vec![],
+                },
+            )
+            .unwrap();
+
+        store.clear(actor_id).unwrap();
+        assert!(store.load_snapshot(actor_id).is_none());
+        assert!(store.read_journal(actor_id).is_empty());
+        assert_eq!(store.latest_sequence(actor_id), 0);
+    }
+
+    #[test]
+    fn test_postgres_store_query_typed_params() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let store = PostgresStore::new(&url).unwrap();
+        let rows = store
+            .query(
+                "SELECT $1::int8, $2::float8, $3::bool",
+                &[Value::int(42), Value::float(3.14), Value::bool(true)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], "[42,3.14,true]");
+    }
+
+    #[test]
+    fn test_postgres_store_workflow_events_and_events() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let mut store = PostgresStore::new(&url).unwrap();
+        let actor_id = fresh_actor_id();
+        store
+            .append_workflow_event(
+                actor_id,
+                WorkflowEvent::TimerSet {
+                    sequence: 1,
+                    name: "t".to_string(),
+                    duration_ms: 100,
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                actor_id,
+                EventEntry {
+                    sequence: 2,
+                    field_name: "counter".to_string(),
+                    event_name: "Inc".to_string(),
+                    args: vec![PersistedValue::Int(1)],
+                    value: PersistedValue::Int(1),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.read_workflow_events(actor_id).len(), 1);
+        assert_eq!(store.read_events(actor_id).len(), 1);
+        assert_eq!(store.latest_sequence(actor_id), 2);
+        store.clear(actor_id).unwrap();
     }
 }

@@ -376,16 +376,7 @@ impl Supervisor {
         // Register CRDT-backed fields with the CrdtManager.
         if let Some(ref mut mgr) = runtime.crdt_manager {
             let actor = runtime.actors.get(&new_id).unwrap();
-            for (field_name, model) in &actor.state_models {
-                if let StateModel::Crdt(crdt_type) = model {
-                    let initial = actor
-                        .state_data
-                        .get(field_name)
-                        .copied()
-                        .unwrap_or(Value::nil());
-                    mgr.register_actor_field(new_id, field_name, *crdt_type, initial);
-                }
-            }
+            mgr.register_actor_fields(new_id, actor);
         }
         if is_workflow {
             runtime.layout_workflow_behavior_table(new_id);

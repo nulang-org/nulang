@@ -14,7 +14,6 @@ Transforms applied:
 import sys
 import re
 
-
 def strip_comments(src: str) -> str:
     lines = []
     for line in src.splitlines():
@@ -113,38 +112,63 @@ def transform_perform(source: str) -> str:
 def curry_call_sites(source: str) -> str:
     """Curry function calls with multiple arguments, but not `fn` definitions or nperform."""
     KEYWORDS = {'then', 'else', 'if', 'let', 'in', 'fn', 'and', 'or', 'not'}
-    def repl(match: re.Match) -> str:
-        name = match.group(1)
-        args_str = match.group(2)
-        full = match.group(0)
-        before = source[max(0, match.start() - 10):match.start()]
-        after = source[match.end():match.end() + 20]
-        # Recursively curry all arguments so inner multi-arg calls
-        # (e.g. inside `then(...)`) are also curried.
+
+    def find_call_end(source: str, start: int) -> int:
+        """Return the index just past the matching `)` for `(` at start, or len(source)."""
+        depth = 1
+        i = start + 1
+        in_str = False
+        while i < len(source) and depth > 0:
+            ch = source[i]
+            if ch == '"':
+                in_str = not in_str
+            elif not in_str:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+            i += 1
+        return i
+
+    result = []
+    i = 0
+    while i < len(source):
+        m = re.match(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\(', source[i:])
+        if not m:
+            result.append(source[i])
+            i += 1
+            continue
+        name = m.group(1)
+        paren_start = i + m.end() - 1
+        paren_end = find_call_end(source, paren_start)
+        args_str = source[paren_start + 1:paren_end - 1]
+        full = source[i:paren_end]
+        before = source[max(0, i - 10):i]
+        after = source[paren_end:paren_end + 20]
+        # Recursively curry all arguments so inner multi-arg calls are also curried.
         args = balanced_split_args(args_str)
         curried_args = [curry_call_sites(a) for a in args]
         # Skip keywords.
         if name in KEYWORDS:
-            return name + '(' + ', '.join(curried_args) + ')'
+            result.append(name + '(' + ', '.join(curried_args) + ')')
         # nperform effect calls are parsed specially by compile_hex, but their
         # arguments may still contain multi-arg function calls that need currying.
-        if name == 'nperform':
-            return 'nperform(' + ', '.join(curried_args) + ')'
+        elif name == 'nperform':
+            result.append('nperform(' + ', '.join(curried_args) + ')')
         # Skip qualified names (String.charAt) and function definitions.
-        if match.start() > 0 and source[match.start() - 1] == '.':
-            return full
-        if re.search(r'\bfn\s+$', before) and re.match(r'\s*(?:=>|->|\{)', after):
-            return full
-        if len(args) <= 1:
-            return full
-        c = curry_call(name, args_str)
-        return c if c else full
-
-    return re.sub(
-        r'(\w+)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)',
-        repl,
-        source
-    )
+        elif i > 0 and source[i - 1] == '.':
+            result.append(full)
+        elif re.search(r'\bfn\s+$', before) and re.match(r'\s*(?:=>|->|\{)', after):
+            result.append(full)
+        elif len(args) == 0:
+            result.append(name + '()')
+        elif len(args) == 1:
+            result.append(name + '(' + curried_args[0] + ')')
+        else:
+            c = curry_call(name, args_str)
+            result.append(c if c else full)
+        i = paren_end
+    return ''.join(result)
 
 
 def strip_type_annotations(params_str: str) -> str:
@@ -166,12 +190,16 @@ def curry_fn_definition(name: str, params: list[str], body: str) -> str:
       ->
         add = fn(x) => fn(y) => x + y
     """
+    import sys
+    print(f'CURRY {name} params={params} slice={params[1:]}', file=sys.stderr)
     if not params:
         return f'{name} = fn() => {body}'
     result = body
-    for p in params[1:]:
+    for i, p in enumerate(reversed(params[1:])):
+        print(f'  loop i={i} p={p!r} result_before={result[:40]!r}', file=sys.stderr)
         result = f'fn({p}) => {result}'
     result = f'{name} = fn({params[0]}) => {result}'
+    print(f'CURRY result {result[:80]}', file=sys.stderr)
     return result
 
 
@@ -249,6 +277,28 @@ def _flatten_block_body(body: str) -> str:
             merged.append(part)
     parts = merged
 
+    # Merge parts that continue across newlines: a line ending with a binary
+    # operator, comma, or opening delimiter clearly continues; a line starting
+    # with a binary operator or `else` belongs to the previous line.
+    CONT_END = re.compile(r'(^|.*)([\+\-\*/=<>!,]|\(|\{|\[)\s*$')
+    CONT_START = re.compile(r'^([\+\-\*/=<>!,]|else\b)')
+    changed = True
+    while changed and len(parts) > 1:
+        changed = False
+        new_parts = []
+        i = 0
+        while i < len(parts):
+            if i + 1 < len(parts) and (
+                CONT_END.match(parts[i]) or CONT_START.match(parts[i + 1])
+            ):
+                new_parts.append(parts[i] + ' ' + parts[i + 1])
+                i += 2
+                changed = True
+            else:
+                new_parts.append(parts[i])
+                i += 1
+        parts = new_parts
+
     if not parts:
         return '()'
     if len(parts) == 1:
@@ -261,7 +311,12 @@ def _flatten_block_body(body: str) -> str:
     for stmt in reversed(parts[:-1]):
         m = re.match(r'let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)', stmt, re.DOTALL)
         if m:
-            expr = f'let {m.group(1)} = {m.group(2)} in {expr}'
+            # The body splitter may leave a trailing ` in` token on the
+            # binding's source line (e.g. `let x = e in\n y`). Strip it so
+            # we don't emit the double `in in` that compile_hex.nula parses
+            # as part of the expression and silently drops the rest.
+            val = re.sub(r'\s+in\s*$', '', m.group(2), count=1)
+            expr = f'let {m.group(1)} = {val} in {expr}'
         else:
             expr = f'let _ = {stmt} in {expr}'
     return '(' + expr + ')'

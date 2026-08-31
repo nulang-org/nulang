@@ -4,6 +4,10 @@ rustflags = ["-C", "link-arg=-fuse-ld=bfd", "-C", "link-arg=-Wl,--export-dynamic
 
 [env]
 PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
+# RocksDB 8.1.1 (via librocksdb-sys 0.11) is missing `#include <cstdint>` in
+# some headers, which newer GCC/libstdc++ versions no longer pull in
+# transitively. Force-include it so the `rocksdb` feature compiles.
+CXXFLAGS = "-include cstdint"
 
 [build]
 target-dir = "/tmp/cargo-target"

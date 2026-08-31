@@ -42,7 +42,8 @@ use crate::vm::Value;
 
 /// The storage backend trait. This is the single point through which the
 /// runtime accesses durable storage. Concrete impls: `MemoryStore`,
-/// `JsonFileStore`, `SqliteStore` (feature `sqlite`).
+/// `JsonFileStore`, `SqliteStore` (feature `sqlite`), `RocksDbStore`
+/// (feature `rocksdb`), and `PostgresStore` (feature `postgres`).
 ///
 /// This is a re-export of [`crate::runtime::PersistenceStore`] — storage was
 /// already behind a trait. This alias makes the boundary discoverable from

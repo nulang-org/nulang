@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-NULANG="${NULANG_BIN:-cargo run --quiet --}"
+NULANG="${NULANG_BIN:-cargo run --quiet --bin nulang --}"
 
 echo "=== Bootstrap Core verification ==="
 

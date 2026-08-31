@@ -1,1 +1,1 @@
-{ "exit_code": 4, "stdout": "", "stderr": "expected type: Int\n  found type: String", "proves": "mgu's unification-failure fallback constructs NuError::type_mismatch, populating expected_type/found_type as separate structured fields, not just embedding them in the free-text message." }
+{"exit_code": 4, "stdout": "", "stderr": "Type mismatch: expected Int, found String", "proves": "mgu's unification-failure fallback constructs NuError::type_mismatch, populating expected_type/found_type as separate structured fields, not just embedding them in the free-text message."}

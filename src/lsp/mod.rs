@@ -22,7 +22,13 @@
 //! | `textDocument/documentLink` | Clickable import paths to stdlib/files |
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
+
+// Fast hashing for compiler-internal maps; kept consistent with
+// `typechecker.rs` and `hir_lower.rs` so `TypeChecker::inferred_decl_types`
+// can be passed through without type mismatches.
+type FxHashMap<K, V> = rustc_hash::FxHashMap<K, V>;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -59,7 +65,12 @@ fn utf16_col_to_byte(line: &str, col: usize) -> usize {
 /// Nulang language server implementing the LSP protocol.
 pub struct NulangLanguageServer {
     client: Client,
-    documents: Mutex<HashMap<Url, DocumentState>>,
+    documents: Arc<Mutex<HashMap<Url, DocumentState>>>,
+    /// In-flight debounced diagnostics tasks per document. Stored so that
+    /// rapid edits can abort the previous task before scheduling a new one.
+    pending_diagnostics: Arc<Mutex<HashMap<Url, tokio::task::JoinHandle<()>>>>,
+    /// Cached importable names from stdlib and workspace `.nula` files.
+    import_index: Arc<Mutex<ImportIndex>>,
 }
 
 struct DocumentState {
@@ -67,14 +78,118 @@ struct DocumentState {
     source: String,
     type_map: Option<HashMap<usize, String>>,
     ast: Option<crate::ast::AstModule>,
+    diagnostics: Vec<Diagnostic>,
+    diagnostics_pending: bool,
+    /// Name-to-type map from the typechecker, used by inlay hints.
+    inferred_decl_types: Option<FxHashMap<String, crate::types::Type>>,
+    /// Name-to-effect-row map from the effect checker, used by inlay hints.
+    function_rows: Option<FxHashMap<String, crate::types::EffectRow>>,
+}
+
+/// Complete frontend result used to populate `DocumentState`.
+struct DiagnosticResult {
+    diagnostics: Vec<Diagnostic>,
+    type_map: HashMap<usize, String>,
+    inferred_decl_types: FxHashMap<String, crate::types::Type>,
+    function_rows: FxHashMap<String, crate::types::EffectRow>,
 }
 
 impl NulangLanguageServer {
     pub fn new(client: Client) -> Self {
         NulangLanguageServer {
             client,
-            documents: Mutex::new(HashMap::new()),
+            documents: Arc::new(Mutex::new(HashMap::new())),
+            pending_diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            import_index: Arc::new(Mutex::new(ImportIndex::new())),
         }
+    }
+
+    /// Debounce-delay for diagnostics after a document change (milliseconds).
+    const DIAGNOSTICS_DEBOUNCE_MS: u64 = 200;
+
+    /// Return the stdlib directory used for import indexing.
+    fn stdlib_dir() -> Option<std::path::PathBuf> {
+        if let Ok(dir) = std::env::var("NULANG_STDLIB") {
+            let p = std::path::PathBuf::from(dir);
+            if p.is_dir() {
+                return Some(p);
+            }
+        }
+        let dev = std::path::PathBuf::from("src/stdlib");
+        if dev.is_dir() {
+            return Some(dev);
+        }
+        None
+    }
+
+    /// Lazily build and cache the import index from stdlib + workspace.
+    fn import_index(&self, workspace_dir: Option<&Path>) -> Vec<Importable> {
+        {
+            let idx = self.import_index.lock().unwrap();
+            if !idx.items().is_empty() {
+                return idx.items().to_vec();
+            }
+        }
+        let idx = ImportIndex::build(Self::stdlib_dir().as_deref(), workspace_dir);
+        let items = idx.items().to_vec();
+        *self.import_index.lock().unwrap() = idx;
+        items
+    }
+
+    /// Schedule a debounced diagnostics pass for `uri`. Aborts any previous
+    /// in-flight task for the same document.
+    fn schedule_diagnostics(&self, uri: Url, version: i32, source: String) {
+        let client = self.client.clone();
+        let documents = Arc::clone(&self.documents);
+
+        // Abort any existing task for this document.
+        {
+            let mut pending = self.pending_diagnostics.lock().unwrap();
+            if let Some(old) = pending.remove(&uri) {
+                old.abort();
+            }
+        }
+
+        let uri_clone = uri.clone();
+        let pending = Arc::clone(&self.pending_diagnostics);
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                Self::DIAGNOSTICS_DEBOUNCE_MS,
+            ))
+            .await;
+
+            let result = Self::compute_diagnostics(&source);
+
+            let ast = Lexer::new(&source)
+                .lex()
+                .ok()
+                .and_then(|tokens| Parser::new(tokens).parse_module().ok());
+
+            {
+                let mut docs = documents.lock().unwrap();
+                if let Some(doc) = docs.get_mut(&uri_clone) {
+                    // Ignore stale results for an older version.
+                    if doc.version != version {
+                        return;
+                    }
+                    doc.diagnostics = result.diagnostics.clone();
+                    doc.diagnostics_pending = false;
+                    doc.type_map = Some(result.type_map);
+                    doc.ast = ast;
+                    doc.inferred_decl_types = Some(result.inferred_decl_types);
+                    doc.function_rows = Some(result.function_rows);
+                }
+            }
+
+            client
+                .publish_diagnostics(uri_clone.clone(), result.diagnostics, Some(version))
+                .await;
+
+            // Remove ourselves from the pending map.
+            let _ = pending.lock().unwrap().remove(&uri_clone);
+        });
+
+        self.pending_diagnostics.lock().unwrap().insert(uri, handle);
     }
 }
 
@@ -185,27 +300,33 @@ impl LanguageServer for NulangLanguageServer {
         let version = params.text_document.version;
         let source = params.text_document.text.clone();
 
-        let (diagnostics, type_map) = Self::compute_diagnostics(&source);
+        // For document open, compute diagnostics synchronously so the user
+        // sees errors immediately; typing changes are debounced instead.
+        let result = Self::compute_diagnostics(&source);
+        let ast = Lexer::new(&source)
+            .lex()
+            .ok()
+            .and_then(|tokens| Parser::new(tokens).parse_module().ok());
 
         {
             let mut docs = self.documents.lock().unwrap();
-            let ast = Lexer::new(&source)
-                .lex()
-                .ok()
-                .and_then(|tokens| Parser::new(tokens).parse_module().ok());
             docs.insert(
                 uri.clone(),
                 DocumentState {
                     version,
                     source: source.clone(),
-                    type_map: Some(type_map),
+                    type_map: Some(result.type_map),
                     ast,
+                    diagnostics: result.diagnostics.clone(),
+                    diagnostics_pending: false,
+                    inferred_decl_types: Some(result.inferred_decl_types),
+                    function_rows: Some(result.function_rows),
                 },
             );
         }
 
         self.client
-            .publish_diagnostics(uri, diagnostics, Some(version))
+            .publish_diagnostics(uri, result.diagnostics, Some(version))
             .await;
     }
 
@@ -219,29 +340,33 @@ impl LanguageServer for NulangLanguageServer {
             .map(|c| c.text)
             .unwrap_or_default();
 
-        let (diagnostics, type_map) = Self::compute_diagnostics(&source);
-
         {
             let mut docs = self.documents.lock().unwrap();
             if let Some(doc) = docs.get_mut(&uri) {
                 doc.version = version;
                 doc.source = source.clone();
-                doc.type_map = Some(type_map);
-                doc.ast = Lexer::new(&source)
-                    .lex()
-                    .ok()
-                    .and_then(|tokens| Parser::new(tokens).parse_module().ok());
+                doc.type_map = None;
+                doc.ast = None;
+                doc.diagnostics = Vec::new();
+                doc.diagnostics_pending = true;
+                doc.inferred_decl_types = None;
+                doc.function_rows = None;
             }
         }
 
-        self.client
-            .publish_diagnostics(uri, diagnostics, Some(version))
-            .await;
+        self.schedule_diagnostics(uri, version, source);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = &params.text_document.uri;
+        {
+            let mut pending = self.pending_diagnostics.lock().unwrap();
+            if let Some(old) = pending.remove(uri) {
+                old.abort();
+            }
+        }
         let mut docs = self.documents.lock().unwrap();
-        docs.remove(&params.text_document.uri);
+        docs.remove(uri);
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -255,30 +380,24 @@ impl LanguageServer for NulangLanguageServer {
             }
         };
 
-        let (diagnostics, type_map) = Self::compute_diagnostics(&source);
-
-        {
-            let mut docs = self.documents.lock().unwrap();
-            if let Some(doc) = docs.get_mut(&uri) {
-                doc.type_map = Some(type_map);
-            }
-        }
-
-        self.client
-            .publish_diagnostics(uri, diagnostics, Some(version))
-            .await;
+        self.schedule_diagnostics(uri, version, source);
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let docs = self.documents.lock().unwrap();
-        let source = match docs.get(&params.text_document.uri) {
-            Some(doc) => doc.source.clone(),
+        let doc = match docs.get(&params.text_document.uri) {
+            Some(d) => d,
             None => return Ok(None),
         };
+        let source = doc.source.clone();
+        let ast = doc.ast.clone();
+        let inferred = doc.inferred_decl_types.clone();
+        let function_rows = doc.function_rows.clone();
         drop(docs);
 
         let engine = InlayHintEngine::new(&source);
-        let hints = engine.generate_inlay_hints();
+        let hints =
+            engine.generate_inlay_hints(ast.as_ref(), inferred.as_ref(), function_rows.as_ref());
         Ok(Some(hints))
     }
 
@@ -303,6 +422,8 @@ impl LanguageServer for NulangLanguageServer {
             .to_file_path()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        let import_index = self.import_index(doc_dir.as_deref());
+        engine.set_import_index(import_index);
         let items = engine.complete(params.text_document_position.position, doc_dir.as_deref());
         Ok(Some(CompletionResponse::Array(items)))
     }
@@ -541,7 +662,12 @@ impl LanguageServer for NulangLanguageServer {
         };
         drop(docs);
         let range = Some(params.range);
-        Ok(Self::code_actions(&source, range, &uri))
+        let doc_dir = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        let import_index = self.import_index(doc_dir.as_deref());
+        Ok(Self::code_actions(&source, range, &uri, &import_index))
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
@@ -1450,7 +1576,12 @@ impl NulangLanguageServer {
             .collect()
     }
 
-    fn code_actions(source: &str, range: Option<Range>, uri: &Url) -> Option<CodeActionResponse> {
+    fn code_actions(
+        source: &str,
+        range: Option<Range>,
+        uri: &Url,
+        import_index: &[Importable],
+    ) -> Option<CodeActionResponse> {
         let mut actions = Vec::new();
 
         // Extract variable — only when a non-empty selection range is given.
@@ -1458,6 +1589,47 @@ impl NulangLanguageServer {
             if sel.start != sel.end {
                 if let Some(action) = Self::extract_variable_action(source, sel, uri) {
                     actions.push(action);
+                }
+            }
+        }
+
+        // Auto-import: if the selected range covers an identifier that matches
+        // an indexed unimported name, offer to add the import.
+        if let Some(ref sel) = range {
+            if let Some(selected) = Self::extract_selected_text(source, sel) {
+                let name = selected.trim();
+                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    for imp in import_index {
+                        if imp.name == name {
+                            let import_line = if imp.module.starts_with("stdlib::") {
+                                format!("import {}", imp.module)
+                            } else {
+                                format!("import \"{}.nula\"", imp.module)
+                            };
+                            let edit = TextEdit {
+                                range: Range {
+                                    start: Position::new(0, 0),
+                                    end: Position::new(0, 0),
+                                },
+                                new_text: format!("{}\n", import_line),
+                            };
+                            let mut changes = std::collections::HashMap::new();
+                            changes.insert(uri.clone(), vec![edit]);
+                            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                                title: format!("Add import for '{}' from {}", name, imp.module),
+                                kind: Some(CodeActionKind::QUICKFIX),
+                                diagnostics: None,
+                                edit: Some(WorkspaceEdit {
+                                    changes: Some(changes),
+                                    ..WorkspaceEdit::default()
+                                }),
+                                command: None,
+                                is_preferred: Some(false),
+                                disabled: None,
+                                data: None,
+                            }));
+                        }
+                    }
                 }
             }
         }
@@ -1637,7 +1809,7 @@ impl NulangLanguageServer {
 
         ranges
     }
-    fn compute_diagnostics(source: &str) -> (Vec<Diagnostic>, HashMap<usize, String>) {
+    fn compute_diagnostics(source: &str) -> DiagnosticResult {
         let mut diagnostics = Vec::new();
 
         // Lex
@@ -1645,7 +1817,12 @@ impl NulangLanguageServer {
             Ok(t) => t,
             Err(e) => {
                 diagnostics.extend(nu_error_to_diagnostic(e));
-                return (diagnostics, HashMap::new());
+                return DiagnosticResult {
+                    diagnostics,
+                    type_map: HashMap::new(),
+                    inferred_decl_types: FxHashMap::default(),
+                    function_rows: FxHashMap::default(),
+                };
             }
         };
 
@@ -1654,7 +1831,12 @@ impl NulangLanguageServer {
             Ok(a) => a,
             Err(e) => {
                 diagnostics.extend(nu_error_to_diagnostic(e));
-                return (diagnostics, HashMap::new());
+                return DiagnosticResult {
+                    diagnostics,
+                    type_map: HashMap::new(),
+                    inferred_decl_types: FxHashMap::default(),
+                    function_rows: FxHashMap::default(),
+                };
             }
         };
 
@@ -1667,6 +1849,7 @@ impl NulangLanguageServer {
         for err in tc.collected_errors {
             diagnostics.extend(nu_error_to_diagnostic(err));
         }
+        let inferred_decl_types = tc.inferred_decl_types.clone();
 
         // Effect check: same two-pass driver as the CLI frontend
         // (`run_frontend` in main.rs) — `check_module` flattens nested
@@ -1690,6 +1873,7 @@ impl NulangLanguageServer {
                 data: None,
             });
         }
+        let function_rows = effect_checker.function_rows();
 
         // Capability analysis over the flattened declaration list, so
         // functions nested in `module {}` blocks are checked like top-level
@@ -1730,7 +1914,12 @@ impl NulangLanguageServer {
         }
 
         let type_map = Self::extract_type_map(source, &ast);
-        (diagnostics, type_map)
+        DiagnosticResult {
+            diagnostics,
+            type_map,
+            inferred_decl_types,
+            function_rows,
+        }
     }
 
     /// Walk the AST and extract type information for `let` bindings.
@@ -2262,35 +2451,64 @@ impl<'a> InlayHintEngine<'a> {
         InlayHintEngine { source }
     }
 
-    /// Generate inlay hints for the source file.
-    pub fn generate_inlay_hints(&self) -> Vec<InlayHint> {
-        let annotations = self.collect_annotations();
+    /// Generate inlay hints for the source file. If cached frontend data is
+    /// provided the engine reuses it; otherwise it parses and typechecks the
+    /// source itself.
+    pub fn generate_inlay_hints(
+        &self,
+        cached_ast: Option<&crate::ast::AstModule>,
+        cached_types: Option<&FxHashMap<String, crate::types::Type>>,
+        cached_rows: Option<&FxHashMap<String, crate::types::EffectRow>>,
+    ) -> Vec<InlayHint> {
+        let annotations = self.collect_annotations(cached_ast, cached_types, cached_rows);
         annotations
             .into_iter()
             .map(|a| self.annotation_to_inlay(a))
             .collect()
     }
 
-    fn collect_annotations(&self) -> Vec<TypeAnnotation> {
-        // Parse and typecheck the source.
-        let mut lexer = crate::lexer::Lexer::new(self.source);
-        let tokens = match lexer.lex() {
-            Ok(t) => t,
-            Err(_) => return Vec::new(),
+    fn collect_annotations(
+        &self,
+        cached_ast: Option<&crate::ast::AstModule>,
+        cached_types: Option<&FxHashMap<String, crate::types::Type>>,
+        cached_rows: Option<&FxHashMap<String, crate::types::EffectRow>>,
+    ) -> Vec<TypeAnnotation> {
+        // If we don't have cached data, parse and typecheck the source.
+        let (ast, inferred_decl_types, function_rows): (
+            &crate::ast::AstModule,
+            FxHashMap<String, crate::types::Type>,
+            FxHashMap<String, crate::types::EffectRow>,
+        ) = match (cached_ast, cached_types, cached_rows) {
+            (Some(a), Some(t), Some(r)) => (a, t.clone(), r.clone()),
+            _ => {
+                let mut lexer = crate::lexer::Lexer::new(self.source);
+                let tokens = match lexer.lex() {
+                    Ok(t) => t,
+                    Err(_) => return Vec::new(),
+                };
+                let ast = match Parser::new(tokens).parse_module() {
+                    Ok(a) => a,
+                    Err(_) => return Vec::new(),
+                };
+                let mut tc = TypeChecker::new();
+                if tc.check_module(&ast).is_err() {
+                    return Vec::new();
+                }
+                let inferred = tc.inferred_decl_types.clone();
+                let mut ec = EffectChecker::new();
+                let decl_refs: Vec<&crate::ast::Decl> = ast.decls.iter().collect();
+                if ec.register_function_rows(&decl_refs).is_err() {
+                    return Vec::new();
+                }
+                let rows = ec.function_rows();
+                // We need a stable owned AstModule to borrow from; leak it
+                // into a Box so the returned reference lives as long as the
+                // local variables in this branch.
+                let owned = Box::new(ast);
+                let ptr: &'static crate::ast::AstModule = Box::leak(owned);
+                (ptr, inferred, rows)
+            }
         };
-        let ast = match Parser::new(tokens).parse_module() {
-            Ok(a) => a,
-            Err(_) => return Vec::new(),
-        };
-        let mut tc = TypeChecker::new();
-        if tc.check_module(&ast).is_err() {
-            return Vec::new();
-        }
-        let mut ec = EffectChecker::new();
-        let decl_refs: Vec<&crate::ast::Decl> = ast.decls.iter().collect();
-        if ec.register_function_rows(&decl_refs).is_err() {
-            return Vec::new();
-        }
 
         let mut annotations = Vec::new();
 
@@ -2304,7 +2522,7 @@ impl<'a> InlayHintEngine<'a> {
                     span,
                     ..
                 } => {
-                    let func_ty = match tc.inferred_decl_types.get(name) {
+                    let func_ty = match inferred_decl_types.get(name) {
                         Some(t) => t,
                         None => continue,
                     };
@@ -2348,7 +2566,7 @@ impl<'a> InlayHintEngine<'a> {
                     }
                     // Show effect row hints on functions.
                     if effect.is_none() {
-                        if let Some(row) = ec.function_row(name) {
+                        if let Some(row) = function_rows.get(name) {
                             let is_empty = match row {
                                 crate::types::EffectRow::Closed(effects) => effects.is_empty(),
                                 crate::types::EffectRow::Open(effects, _) => effects.is_empty(),
@@ -2368,8 +2586,49 @@ impl<'a> InlayHintEngine<'a> {
                         }
                     }
                 }
+                crate::ast::Decl::Actor {
+                    name: _,
+                    behaviors,
+                    span,
+                    ..
+                } => {
+                    let line = span.line().saturating_sub(1) as u32;
+                    let source_line = self.source.lines().nth(line as usize).unwrap_or("");
+                    if let Some(lparen) = source_line.find('(') {
+                        // The line is the actor declaration line; behavior
+                        // parameter hints require walking the body. For now
+                        // reuse the per-behavior inferred type when available.
+                        let mut col = (lparen + 1) as u32;
+                        for behavior in behaviors {
+                            let bty = inferred_decl_types.get(&behavior.name);
+                            let param_types: Vec<&crate::types::Type> = match bty {
+                                Some(crate::types::Type::Function { param, .. }) => {
+                                    match param.as_ref() {
+                                        crate::types::Type::Tuple(types) => types.iter().collect(),
+                                        t => vec![t],
+                                    }
+                                }
+                                _ => Vec::new(),
+                            };
+                            for (i, p) in behavior.params.iter().enumerate() {
+                                let pname = &p.name;
+                                let ptype_ann = &p.ty;
+                                let pname_len = pname.len() as u32;
+                                if ptype_ann.is_none() && i < param_types.len() {
+                                    annotations.push(TypeAnnotation {
+                                        line,
+                                        character: col + pname_len,
+                                        label: format!(": {}", type_to_string(param_types[i])),
+                                        kind: AnnotationKind::Type,
+                                    });
+                                }
+                                col += pname_len + 2;
+                            }
+                        }
+                    }
+                }
                 crate::ast::Decl::Signal { name, span, .. } => {
-                    if let Some(ty) = tc.inferred_decl_types.get(name) {
+                    if let Some(ty) = inferred_decl_types.get(name) {
                         let line = span.line().saturating_sub(1) as u32;
                         let col = (span.column() + name.len()) as u32;
                         annotations.push(TypeAnnotation {
@@ -2387,7 +2646,7 @@ impl<'a> InlayHintEngine<'a> {
                     ..
                 } => {
                     if type_ann.is_none() {
-                        if let Some(ty) = tc.inferred_decl_types.get(name) {
+                        if let Some(ty) = inferred_decl_types.get(name) {
                             let line = span.line().saturating_sub(1) as u32;
                             let col = (span.column() + name.len()) as u32;
                             annotations.push(TypeAnnotation {
@@ -2433,6 +2692,162 @@ impl<'a> InlayHintEngine<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Import index (for auto-imports)
+// ---------------------------------------------------------------------------
+
+/// A name that can be imported from another module.
+#[derive(Debug, Clone)]
+pub struct Importable {
+    pub name: String,
+    /// Import path, e.g. `stdlib::map` or `./other`.
+    pub module: String,
+    pub kind: ImportableKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportableKind {
+    Function,
+    Type,
+    Actor,
+}
+
+/// Scans stdlib and workspace `.nula` files for exportable top-level names.
+pub struct ImportIndex {
+    items: Vec<Importable>,
+}
+
+impl ImportIndex {
+    pub fn new() -> Self {
+        ImportIndex { items: Vec::new() }
+    }
+
+    pub fn items(&self) -> &[Importable] {
+        &self.items
+    }
+
+    /// Scan the Nulang stdlib directory and the given workspace directory for
+    /// importable top-level declarations.
+    pub fn build(stdlib_dir: Option<&Path>, workspace_dir: Option<&Path>) -> Self {
+        let mut items = Vec::new();
+        if let Some(dir) = stdlib_dir {
+            Self::scan_dir(dir, &mut items, true);
+        }
+        if let Some(dir) = workspace_dir {
+            Self::scan_dir(dir, &mut items, false);
+        }
+        ImportIndex { items }
+    }
+
+    fn scan_dir(dir: &Path, items: &mut Vec<Importable>, is_stdlib: bool) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "nula") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    let module = if is_stdlib {
+                        format!("stdlib::{}", stem)
+                    } else {
+                        format!("./{}", stem)
+                    };
+                    Self::scan_file(&path, &module, items);
+                }
+            }
+        }
+    }
+
+    fn scan_file(path: &Path, module: &str, items: &mut Vec<Importable>) {
+        let source = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        for line in source.lines() {
+            let trimmed = line.trim();
+            // Skip comments and blank lines.
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            // Stop scanning once we hit a top-level body; imports only matter
+            // for declarations at the top of the file.
+            if trimmed.starts_with("{") || trimmed.starts_with("}") {
+                continue;
+            }
+            if let Some(imp) = Self::parse_importable(trimmed, module) {
+                items.push(imp);
+            }
+        }
+    }
+
+    fn parse_importable(line: &str, module: &str) -> Option<Importable> {
+        // pub fn name(... or fn name(...
+        if let Some(after_fn) = line
+            .strip_prefix("pub fn ")
+            .or_else(|| line.strip_prefix("fn "))
+        {
+            let name = after_fn
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()?;
+            if name.is_empty() {
+                return None;
+            }
+            return Some(Importable {
+                name: name.to_string(),
+                module: module.to_string(),
+                kind: ImportableKind::Function,
+            });
+        }
+        // type Name = ... or pub type Name = ...
+        if let Some(after_type) = line
+            .strip_prefix("pub type ")
+            .or_else(|| line.strip_prefix("type "))
+        {
+            let name = after_type
+                .split(|c: char| c == '=' || c.is_whitespace())
+                .next()?;
+            if name.is_empty() {
+                return None;
+            }
+            return Some(Importable {
+                name: name.to_string(),
+                module: module.to_string(),
+                kind: ImportableKind::Type,
+            });
+        }
+        // opaque type Name
+        if let Some(after_opaque) = line.strip_prefix("opaque type ") {
+            let name = after_opaque
+                .split(|c: char| c == '=' || c.is_whitespace())
+                .next()?;
+            if name.is_empty() {
+                return None;
+            }
+            return Some(Importable {
+                name: name.to_string(),
+                module: module.to_string(),
+                kind: ImportableKind::Type,
+            });
+        }
+        // actor Name { ...
+        if let Some(after_actor) = line.strip_prefix("actor ") {
+            let name = after_actor
+                .split(|c: char| c == '{' || c.is_whitespace())
+                .next()?;
+            if name.is_empty() {
+                return None;
+            }
+            return Some(Importable {
+                name: name.to_string(),
+                module: module.to_string(),
+                kind: ImportableKind::Actor,
+            });
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Completion Engine
 // ---------------------------------------------------------------------------
 
@@ -2454,6 +2869,8 @@ pub struct CompletionEngine<'a> {
     record_type_fields: Vec<(String, Vec<String>)>,
     /// (behavior_name, [param_names]) for snippet generation.
     behavior_params: Vec<(String, Vec<String>)>,
+    /// Indexed unimported names from stdlib/workspace (for auto-imports).
+    import_index: Vec<Importable>,
 }
 
 impl<'a> CompletionEngine<'a> {
@@ -2561,8 +2978,10 @@ impl<'a> CompletionEngine<'a> {
     ];
 
     /// Known stdlib modules for import path completion.
+    /// Keep in sync with the files in `src/stdlib/`.
     const STDLIB_MODULES: &'static [&'static str] = &[
-        "core", "set", "string", "list", "map", "math", "json", "http", "test",
+        "core", "datetime", "fs", "http", "json", "list", "map", "math", "option", "result", "set",
+        "string", "test",
     ];
 
     pub fn new(source: &'a str) -> Self {
@@ -2575,6 +2994,7 @@ impl<'a> CompletionEngine<'a> {
             actor_state_fields: Vec::new(),
             record_type_fields: Vec::new(),
             behavior_params: Vec::new(),
+            import_index: Vec::new(),
         }
     }
 
@@ -2621,6 +3041,11 @@ impl<'a> CompletionEngine<'a> {
                 _ => {}
             }
         }
+    }
+
+    /// Provide the set of unimported names available for auto-import.
+    pub fn set_import_index(&mut self, index: Vec<Importable>) {
+        self.import_index = index;
     }
 
     // ------------------------------------------------------------------
@@ -2714,6 +3139,47 @@ impl<'a> CompletionEngine<'a> {
                     kind: Some(CompletionItemKind::CONSTRUCTOR),
                     detail: Some("variant".to_string()),
                     sort_text: Some(format!("3_{}", name)),
+                    ..CompletionItem::default()
+                });
+            }
+        }
+
+        // Auto-imports from stdlib/workspace (sort "3a").
+        for imp in &self.import_index {
+            if imp.name.to_lowercase().starts_with(&prefix_lower)
+                && !self.function_names.iter().any(|n| n == &imp.name)
+                && !self.type_names.iter().any(|n| n == &imp.name)
+            {
+                let kind = match imp.kind {
+                    ImportableKind::Function => CompletionItemKind::FUNCTION,
+                    ImportableKind::Type => CompletionItemKind::CLASS,
+                    ImportableKind::Actor => CompletionItemKind::CLASS,
+                };
+                let import_line = if imp.module.starts_with("stdlib::") {
+                    format!("import {}", imp.module)
+                } else {
+                    format!("import \"{}.nula\"", imp.module)
+                };
+                let text_edit = TextEdit {
+                    range: Range {
+                        start: Position::new(0, 0),
+                        end: Position::new(0, 0),
+                    },
+                    new_text: format!("{}\n", import_line),
+                };
+                items.push(CompletionItem {
+                    label: imp.name.clone(),
+                    kind: Some(kind),
+                    detail: Some(format!("from {}", imp.module)),
+                    documentation: Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format!(
+                            "Auto-import from `{}`\n\n```nulang\n{}\n```",
+                            imp.module, import_line
+                        ),
+                    })),
+                    sort_text: Some(format!("3a_{}", imp.name)),
+                    additional_text_edits: Some(vec![text_edit]),
                     ..CompletionItem::default()
                 });
             }
@@ -3147,7 +3613,7 @@ mod lsp_tests {
     fn test_type_inlay_for_fn_param() {
         let source = "fn add(x: Int, y) { x + y }";
         let engine = InlayHintEngine::new(source);
-        let hints = engine.generate_inlay_hints();
+        let hints = engine.generate_inlay_hints(None, None, None);
         // The unannotated param `y` should get a hint
         assert!(!hints.is_empty(), "expected hints for fn params, got 0");
     }
@@ -3157,7 +3623,7 @@ mod lsp_tests {
     fn test_type_inlay_for_fn_return() {
         let source = "fn answer() -> Int { 42 }";
         let engine = InlayHintEngine::new(source);
-        let hints = engine.generate_inlay_hints();
+        let hints = engine.generate_inlay_hints(None, None, None);
         // Return type is explicit, so no hint expected
         assert!(
             hints.is_empty(),
@@ -3170,7 +3636,7 @@ mod lsp_tests {
     fn test_inlay_cross_decl() {
         let source = "fn helper(x) { x + 1 }\nfn main() { helper(5) }";
         let engine = InlayHintEngine::new(source);
-        let hints = engine.generate_inlay_hints();
+        let hints = engine.generate_inlay_hints(None, None, None);
         assert!(!hints.is_empty(), "expected hints for cross-decl functions");
     }
 
@@ -3179,7 +3645,7 @@ mod lsp_tests {
     fn test_no_inlay_when_explicit_type() {
         let source = "fn add(x: Int, y: Int) -> Int { x + y }";
         let engine = InlayHintEngine::new(source);
-        let hints = engine.generate_inlay_hints();
+        let hints = engine.generate_inlay_hints(None, None, None);
         assert!(
             hints.is_empty(),
             "should not add hints when all types are explicit"
@@ -3190,7 +3656,7 @@ mod lsp_tests {
     fn test_inlay_position_calculation() {
         let source = "fn f(x) { x }";
         let engine = InlayHintEngine::new(source);
-        let hints = engine.generate_inlay_hints();
+        let hints = engine.generate_inlay_hints(None, None, None);
         assert!(!hints.is_empty(), "expected hint for fn param");
         assert_eq!(hints[0].position.line, 0);
     }
@@ -3200,7 +3666,7 @@ mod lsp_tests {
         // A function that performs an effect should get an effect-row hint.
         let source = "fn greet(s: String) -> String {\n    perform IO.print(s)\n    s\n}";
         let engine = InlayHintEngine::new(source);
-        let hints = engine.generate_inlay_hints();
+        let hints = engine.generate_inlay_hints(None, None, None);
         assert!(
             hints.iter().any(|h| match &h.label {
                 InlayHintLabel::String(l) => l.contains("!"),
@@ -3221,7 +3687,7 @@ mod lsp_tests {
     fn test_no_effect_hint_for_pure_fn() {
         let source = "fn add(x: Int, y: Int) -> Int { x + y }";
         let engine = InlayHintEngine::new(source);
-        let hints = engine.generate_inlay_hints();
+        let hints = engine.generate_inlay_hints(None, None, None);
         assert!(
             !hints.iter().any(|h| match &h.label {
                 InlayHintLabel::String(l) => l.contains("!"),
@@ -3405,6 +3871,7 @@ mod lsp_tests {
             "let x y",
             None,
             &Url::parse("file:///test.nula").unwrap(),
+            &[],
         )
         .is_none());
         // A well-formed binding still produces a quick fix.
@@ -3412,6 +3879,7 @@ mod lsp_tests {
             "let x = 42",
             None,
             &Url::parse("file:///test.nula").unwrap(),
+            &[],
         )
         .is_some());
     }
@@ -3457,7 +3925,7 @@ mod lsp_tests {
         // A malformed `fun` line with `)` before `(` must not panic the
         // parameter slicer in collect_annotations.
         let engine = InlayHintEngine::new("fun foo) bar(");
-        let hints = engine.generate_inlay_hints();
+        let hints = engine.generate_inlay_hints(None, None, None);
         assert!(hints.is_empty());
     }
 
@@ -3468,7 +3936,7 @@ mod lsp_tests {
     fn test_diagnostics_pure_fn_calling_io_fn() {
         let source = "fn do_io() -> Unit ! {IO} { perform IO.print(\"x\") }\n\
                       fn pure() -> Unit ! {} { do_io() }";
-        let (diagnostics, _) = NulangLanguageServer::compute_diagnostics(source);
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
         assert!(
             diagnostics.iter().any(|d| {
                 d.severity == Some(DiagnosticSeverity::ERROR) && d.message.contains("IO")
@@ -3484,7 +3952,7 @@ mod lsp_tests {
     #[test]
     fn test_diagnostics_module_nested_effect_violation() {
         let source = "module M { fn pure() -> Unit ! {} { perform IO.print(\"x\") } }";
-        let (diagnostics, _) = NulangLanguageServer::compute_diagnostics(source);
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
         assert!(
             diagnostics.iter().any(|d| {
                 d.severity == Some(DiagnosticSeverity::ERROR) && d.message.contains("IO")
@@ -3502,7 +3970,7 @@ mod lsp_tests {
                       fn also_pure() -> Unit ! {} { pure() }\n\
                       fn do_io() -> Unit ! {IO} { perform IO.print(\"x\") }\n\
                       fn caller() -> Unit ! {IO} { do_io() }";
-        let (diagnostics, _) = NulangLanguageServer::compute_diagnostics(source);
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
         assert!(
             diagnostics.is_empty(),
             "well-formed effectful/pure functions must be diagnostic-free, got: {:?}",
@@ -3514,8 +3982,7 @@ mod lsp_tests {
     fn test_hover_shows_type_for_let_binding() {
         // Create a minimal NulangLanguageServer to test hover_at with type info
         let source = "fn main() { let x: Int = 42; x }";
-        // compute_diagnostics now returns (diagnostics, type_map)
-        let (_diagnostics, type_map) = NulangLanguageServer::compute_diagnostics(source);
+        let type_map = NulangLanguageServer::compute_diagnostics(source).type_map;
         assert!(
             !type_map.is_empty(),
             "type_map should contain an entry for 'x'"
@@ -3532,7 +3999,7 @@ mod lsp_tests {
     #[test]
     fn test_hover_type_map_for_multiple_bindings() {
         let source = "fn main() { let x: Int = 42; let y: String = \"hi\"; x }";
-        let (_diagnostics, type_map) = NulangLanguageServer::compute_diagnostics(source);
+        let type_map = NulangLanguageServer::compute_diagnostics(source).type_map;
         assert!(
             type_map.values().any(|v| v == "Int"),
             "should have Int type"
@@ -4092,6 +4559,134 @@ mod lsp_tests {
         assert!(
             err.is_err(),
             "request after exit must fail with ExitedError"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Auto-import tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_import_index_scans_stdlib() {
+        let idx = ImportIndex::build(Some(Path::new("src/stdlib")), None);
+        assert!(
+            idx.items()
+                .iter()
+                .any(|i| i.name == "insert" && i.module == "stdlib::map"),
+            "expected map::insert in stdlib index"
+        );
+        assert!(
+            idx.items()
+                .iter()
+                .any(|i| i.name == "empty" && i.module == "stdlib::map"),
+            "expected map::empty in stdlib index"
+        );
+    }
+
+    #[test]
+    fn test_completion_auto_import_stdlib() {
+        let source = "fn main() { inser }";
+        let mut engine = CompletionEngine::new(source);
+        engine.set_import_index(vec![Importable {
+            name: "insert".to_string(),
+            module: "stdlib::map".to_string(),
+            kind: ImportableKind::Function,
+        }]);
+        let items = engine.complete(
+            Position {
+                line: 0,
+                character: 17,
+            },
+            None,
+        );
+        let auto = items
+            .iter()
+            .find(|i| i.label == "insert")
+            .expect("auto-import item for insert");
+        assert_eq!(auto.kind, Some(CompletionItemKind::FUNCTION));
+        let edits = auto
+            .additional_text_edits
+            .as_ref()
+            .expect("auto-import has additional text edits");
+        assert_eq!(edits.len(), 1);
+        assert!(edits[0].new_text.contains("import stdlib::map"));
+    }
+
+    #[test]
+    fn test_import_path_completion_all_stdlib() {
+        let source = "import stdlib::";
+        let engine = CompletionEngine::new(source);
+        let items = engine.complete(
+            Position {
+                line: 0,
+                character: 15,
+            },
+            None,
+        );
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        for expected in ["stdlib::map", "stdlib::list", "stdlib::json"] {
+            assert!(
+                labels.contains(&expected),
+                "missing stdlib import path completion: {}",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_code_action_add_import() {
+        let import_index = vec![Importable {
+            name: "insert".to_string(),
+            module: "stdlib::map".to_string(),
+            kind: ImportableKind::Function,
+        }];
+        let actions = NulangLanguageServer::code_actions(
+            "fn main() { insert(1, 2, []) }",
+            Some(Range {
+                start: Position::new(0, 12),
+                end: Position::new(0, 18),
+            }),
+            &Url::parse("file:///test.nula").unwrap(),
+            &import_index,
+        );
+        let actions = actions.expect("expected code actions");
+        assert!(
+            actions.iter().any(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) => {
+                    ca.title.contains("Add import for 'insert'")
+                }
+                _ => false,
+            }),
+            "expected Add import code action, got {:?}",
+            actions
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Inlay hint cache tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_inlay_reuses_cached_type_map() {
+        let source = "fn add(x) { x + 1 }";
+        let engine = InlayHintEngine::new(source);
+        // Compute the frontend data once.
+        let result = NulangLanguageServer::compute_diagnostics(source);
+        let ast = crate::lexer::Lexer::new(source)
+            .lex()
+            .ok()
+            .and_then(|tokens| crate::parser::Parser::new(tokens).parse_module().ok())
+            .unwrap();
+        let hints = engine.generate_inlay_hints(
+            Some(&ast),
+            Some(&result.inferred_decl_types),
+            Some(&result.function_rows),
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|h| matches!(&h.label, InlayHintLabel::String(s) if s.contains("Int"))),
+            "expected cached inlay hint with Int type"
         );
     }
 }

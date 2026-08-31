@@ -2630,6 +2630,12 @@ impl Runtime {
             if ticks % DEHYDRATE_CHECK_INTERVAL == 0 {
                 self.dehydrate_idle_grains();
             }
+            if ticks % CRDT_SYNC_INTERVAL_TICKS == 0 {
+                // Cheap no-op when distribution is disabled: only local
+                // tombstone GC runs. When clustered, this ships delta-state
+                // syncs to healthy peers on the scheduler cadence.
+                self.sync_crdts();
+            }
         }
         // Deliver pending foreign-ref decrements and run cycle detection only
         // once the run queue has drained. Receiver-side holds now keep
@@ -2867,12 +2873,20 @@ impl Runtime {
                 .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
                 .collect()
         });
+        let crdt_field_map = self.crdt_manager.as_ref().map(|m| {
+            m.field_map
+                .iter()
+                .filter(|((aid, _), _)| *aid == actor_id)
+                .map(|((_, name), id)| (name.clone(), id.0))
+                .collect()
+        });
         Some(ActorSnapshot {
             actor_id,
             sequence,
             state,
             waiting_signal,
             crdt_snapshot,
+            crdt_field_map,
         })
     }
 
@@ -4652,13 +4666,25 @@ impl Runtime {
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
-                let snapshot: HashMap<CrdtId, (CrdtType, Vec<u8>)> = crdt_snap
+                let crdt_map: HashMap<CrdtId, (CrdtType, Vec<u8>)> = crdt_snap
                     .iter()
                     .filter_map(|(id, ty, bytes)| {
                         CrdtType::from_u8(*ty).map(|t| (CrdtId(*id), (t, bytes.clone())))
                     })
                     .collect();
-                manager.restore(snapshot);
+                manager.restore(crdt_map);
+                // Rebuild the (actor_id, field_name) -> CrdtId mapping so
+                // `perform Crdt.*` can target recovered fields.
+                if let Some(field_map) = &snapshot.crdt_field_map {
+                    for (field_name, crdt_id) in field_map {
+                        manager
+                            .field_map
+                            .insert((actor_id, field_name.clone()), CrdtId(*crdt_id));
+                        manager
+                            .field_reverse
+                            .insert(CrdtId(*crdt_id), (actor_id, field_name.clone()));
+                    }
+                }
             }
         }
         for (name, value) in snapshot.state {
@@ -4770,6 +4796,15 @@ impl Runtime {
             self.layout_workflow_behavior_table(actor_id);
         } else {
             self.actors.insert(actor_id, actor);
+        }
+        // Ensure CRDT-backed fields are registered (or re-registered after
+        // recovery). `register_actor_fields` is idempotent, so declared fields
+        // not covered by the snapshot get fresh replicas while recovered fields
+        // reuse their restored CrdtIds.
+        if let Some(ref mut mgr) = self.crdt_manager {
+            if let Some(actor) = self.actors.get(&actor_id) {
+                mgr.register_actor_fields(actor_id, actor);
+            }
         }
 
         if is_workflow {
@@ -5151,6 +5186,16 @@ impl Runtime {
                     })
                     .collect();
                 manager.restore(crdt_map);
+                if let Some(field_map) = &snapshot.crdt_field_map {
+                    for (field_name, crdt_id) in field_map {
+                        manager
+                            .field_map
+                            .insert((actor_id, field_name.clone()), CrdtId(*crdt_id));
+                        manager
+                            .field_reverse
+                            .insert(CrdtId(*crdt_id), (actor_id, field_name.clone()));
+                    }
+                }
             }
         }
 
@@ -5158,6 +5203,11 @@ impl Runtime {
             self.layout_workflow_behavior_table(actor_id);
         }
         self.actors.insert(actor_id, actor);
+        if let Some(ref mut mgr) = self.crdt_manager {
+            if let Some(actor) = self.actors.get(&actor_id) {
+                mgr.register_actor_fields(actor_id, actor);
+            }
+        }
         self.enqueue_actor(actor_id);
 
         tracing::info!("nulang-migrate: actor {} received and enqueued", actor_id);
@@ -6065,7 +6115,10 @@ impl Runtime {
     /// their behaviors through AOT native code (bypassing the bytecode VM)
     /// when the behavior is compiled in the module; behaviors absent from the
     /// module keep their bytecode handlers.
-    pub fn register_aot_module(&mut self, module: crate::aot::AotModule) {
+    pub fn register_aot_module(
+        &mut self,
+        module: crate::aot::AotModule,
+    ) -> *const crate::aot::AotModule {
         // Box the module so its address is stable, then register the raw
         // pointer for every actor type it declares.
         let boxed = Box::new(module);
@@ -6074,6 +6127,7 @@ impl Runtime {
             self.aot_modules.entry(name).or_insert(module_ptr);
         }
         self.aot_module_storage.push(boxed);
+        module_ptr
     }
 
     /// Take the result of a previously issued remote spawn request.
@@ -6341,6 +6395,10 @@ pub(crate) struct ShadowReplica {
 /// Interval (in `sync_crdts` rounds) between full-state repair syncs.
 /// Round 1 is full; rounds 2..=N are delta; round N+1 is full again.
 const CRDT_FULL_SYNC_INTERVAL: u64 = 16;
+/// How often (in scheduler ticks) the runtime synchronizes CRDT state with
+/// healthy peers. Cheap when distribution is disabled: it only runs local
+/// tombstone GC and returns without counting a sync round.
+const CRDT_SYNC_INTERVAL_TICKS: u64 = 512;
 /// How often (in scheduler ticks) deferred local decrements are retried
 /// while actors are still running. Used by both the production
 /// `run_scheduler` and the deterministic DST scheduler.

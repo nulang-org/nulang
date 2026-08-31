@@ -21,6 +21,8 @@ use crate::ast::*;
 use crate::types::*;
 use std::collections::HashSet;
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
 // ---------------------------------------------------------------------------
 // Substitution
 // ---------------------------------------------------------------------------
@@ -28,11 +30,6 @@ use std::collections::HashSet;
 /// A substitution maps type variables to types.
 /// Ordered list: earlier substitutions take precedence.
 pub type Substitution = Vec<(TypeVar, Type)>;
-// Fast hashing for compiler-internal maps (keys are not attacker-controlled).
-type FxHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
-type FxHashSet<T> =
-    std::collections::HashSet<T, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 /// Apply a substitution to a type, replacing any type variables that appear
 /// in the substitution with their mapped types.
@@ -1094,6 +1091,21 @@ impl TypeChecker {
                     // time and have no runtime representation.
                     ctx.bind(name.clone(), Type::unit(), Capability::Ref, false);
                 }
+                Decl::CrdtDecl { name, fields, .. } => {
+                    // Bind the declaration name to a closed record type
+                    // describing its CRDT fields, so it can be referenced as
+                    // a schema elsewhere.
+                    let field_tys: Vec<(String, Type)> = fields
+                        .iter()
+                        .map(|(fname, _crdt_type, ty, _default)| (fname.clone(), ty.clone()))
+                        .collect();
+                    ctx.bind(
+                        name.clone(),
+                        Type::Record(field_tys),
+                        Capability::Ref,
+                        false,
+                    );
+                }
                 Decl::Impl {
                     class_name,
                     for_type,
@@ -1200,11 +1212,36 @@ impl TypeChecker {
         decl: &Decl,
     ) -> NuResult<(Substitution, Type)> {
         match decl {
-            Decl::CrdtDecl {
-                name: _name,
-                span: _span,
-                ..
-            } => Ok((Vec::new(), Type::unit())),
+            Decl::CrdtDecl { fields, .. } => {
+                // Validate field defaults and CRDT type compatibility, mirroring
+                // the checks done for actor state fields.
+                for (field_name, crdt_type, declared_ty, default_expr) in fields {
+                    let (_s, default_ty) = self.infer_expr(ctx, default_expr)?;
+                    // The parser uses Unit for omitted type annotations; in that
+                    // case infer the field type from the default expression.
+                    let effective_ty = if *declared_ty == Type::unit() {
+                        default_ty.clone()
+                    } else {
+                        let _ = mgu(declared_ty, &default_ty, default_expr.span())?;
+                        declared_ty.clone()
+                    };
+
+                    let expected_ty = match crdt_type {
+                        crate::ast::CrdtType::LWWRegister => Type::string(),
+                        _ => Type::int(),
+                    };
+                    if mgu(&effective_ty, &expected_ty, default_expr.span()).is_err() {
+                        return Err(NuError::type_error(
+                            format!(
+                                "CRDT field '{}' has type {}, but '{}' CRDT values materialize as {}",
+                                field_name, effective_ty, crdt_type.keyword(), expected_ty
+                            ),
+                            default_expr.span(),
+                        ));
+                    }
+                }
+                Ok((Vec::new(), Type::unit()))
+            }
             Decl::Function {
                 name,
                 type_param_constraints,
@@ -1411,12 +1448,21 @@ impl TypeChecker {
             Decl::EffectDecl { .. } => Ok((vec![], Type::unit())),
             Decl::Actor {
                 name,
+                state_fields,
                 behaviors,
                 events,
                 migrations,
                 span,
                 ..
-            } => self.infer_actor_decl(ctx, name, behaviors, events, migrations, *span),
+            } => self.infer_actor_decl(
+                ctx,
+                name,
+                state_fields,
+                behaviors,
+                events,
+                migrations,
+                *span,
+            ),
             Decl::StateMachine {
                 name,
                 states,
@@ -3251,6 +3297,7 @@ impl TypeChecker {
         &mut self,
         ctx: &TypeContext,
         name: &str,
+        state_fields: &[(String, crate::ast::StateModel, Type, Expr)],
         behaviors: &[Behavior],
         events: &[crate::ast::EventDecl],
         migrations: &[crate::ast::MigrationDecl],
@@ -3264,6 +3311,39 @@ impl TypeChecker {
             state: Box::new(Type::Var(TypeVar::fresh())),
             behavior: Box::new(Type::Var(TypeVar::fresh())),
         };
+
+        // Type-check state field defaults and CRDT type compatibility.
+        for (field_name, model, declared_ty, default_expr) in state_fields {
+            let (_s, default_ty) = self.infer_expr(ctx, default_expr)?;
+            // The parser uses Unit for omitted type annotations; in that case
+            // infer the field type from the default expression.
+            let effective_ty = if *declared_ty == Type::unit() {
+                default_ty.clone()
+            } else {
+                let _ = mgu(declared_ty, &default_ty, default_expr.span())?;
+                declared_ty.clone()
+            };
+
+            if let crate::ast::StateModel::Crdt(crdt_type) = model {
+                let expected_ty = match crdt_type {
+                    crate::ast::CrdtType::LWWRegister => Type::string(),
+                    _ => Type::int(),
+                };
+                if mgu(&effective_ty, &expected_ty, default_expr.span()).is_err() {
+                    return Err(NuError::type_error(
+                        format!(
+                            "CRDT field '{}' has type {}, but '{}' CRDT values materialize as {}",
+                            field_name,
+                            effective_ty,
+                            crdt_type.keyword(),
+                            expected_ty
+                        ),
+                        default_expr.span(),
+                    ));
+                }
+            }
+        }
+
         // Check each behavior, with event declarations in scope for emit checking
         for behavior in behaviors {
             let mut behavior_ctx = ctx.clone();

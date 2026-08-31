@@ -17,6 +17,9 @@ pub enum CType {
     CStr,
     VoidPtr,
     Unit,
+    /// A raw Nulang value passed as an opaque i64-tagged value. This is only
+    /// usable via the C registration API; it has no language-level syntax.
+    Value,
 }
 
 /// A C function signature for marshalling.
@@ -41,6 +44,7 @@ pub fn ffi_type_to_ctype(t: &FfiType) -> Option<CType> {
         FfiType::String => Some(CType::CStr),
         FfiType::Unit => Some(CType::Unit),
         FfiType::Pointer => Some(CType::VoidPtr),
+        FfiType::Value => Some(CType::Value),
     }
 }
 
@@ -161,191 +165,34 @@ pub fn unit_to_value() -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Type-driven dispatch trait
+// libffi-based dynamic invocation (used when the `ffi` feature is enabled)
 // ---------------------------------------------------------------------------
 
-/// Maps a supported C type to its Rust FFI representation and provides
-/// conversions to/from Nulang `Value`.
-pub trait CTypeArg: Copy {
-    /// The Rust type used in an `extern "C" fn` signature.
-    type Abi: Copy;
-    /// The corresponding `CType` variant.
-    const CTYPE: CType;
-    /// Convert from a Nulang `Value` to this argument type.
-    fn from_value(v: Value) -> Result<Self, String>;
-    /// Convert this argument type to a Nulang `Value`.
-    fn to_value(self) -> Value;
-}
-
-impl CTypeArg for i64 {
-    type Abi = i64;
-    const CTYPE: CType = CType::I64;
-    fn from_value(v: Value) -> Result<Self, String> {
-        value_to_i64(&v)
-    }
-    fn to_value(self) -> Value {
-        i64_to_value(self)
+#[cfg(feature = "ffi")]
+fn ctype_to_libffi(ty: &CType) -> libffi::middle::Type {
+    use libffi::middle::Type;
+    match ty {
+        CType::I64 => Type::i64(),
+        CType::F64 => Type::f64(),
+        CType::Bool => Type::u8(),
+        CType::CStr => Type::pointer(),
+        CType::VoidPtr => Type::pointer(),
+        CType::Unit => Type::void(),
+        CType::Value => Type::u64(),
     }
 }
 
-impl CTypeArg for f64 {
-    type Abi = f64;
-    const CTYPE: CType = CType::F64;
-    fn from_value(v: Value) -> Result<Self, String> {
-        value_to_f64(&v)
-    }
-    fn to_value(self) -> Value {
-        f64_to_value(self)
-    }
-}
-
-impl CTypeArg for bool {
-    type Abi = bool;
-    const CTYPE: CType = CType::Bool;
-    fn from_value(v: Value) -> Result<Self, String> {
-        value_to_bool(&v)
-    }
-    fn to_value(self) -> Value {
-        bool_to_value(self)
-    }
-}
-
-impl CTypeArg for *const c_char {
-    type Abi = *const c_char;
-    const CTYPE: CType = CType::CStr;
-    fn from_value(v: Value) -> Result<Self, String> {
-        // SAFETY: we only borrow the pointer for the duration of the call.
-        unsafe { value_to_cstr(&v) }
-    }
-    // SAFETY: trait-impl signature is fixed; the pointer is a C string
-    // produced by the FFI call whose signature declared it as CType::CStr.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    fn to_value(self) -> Value {
-        // SAFETY: `self` is a C string pointer.
-        unsafe { cstr_to_value(self) }
-    }
-}
-
-impl CTypeArg for *mut c_void {
-    type Abi = *mut c_void;
-    const CTYPE: CType = CType::VoidPtr;
-    fn from_value(v: Value) -> Result<Self, String> {
-        // SAFETY: we only borrow the pointer for the duration of the call.
-        unsafe { value_to_voidptr(&v) }
-    }
-    fn to_value(self) -> Value {
-        voidptr_to_value(self)
-    }
-}
-
-impl CTypeArg for () {
-    type Abi = ();
-    const CTYPE: CType = CType::Unit;
-    fn from_value(_v: Value) -> Result<Self, String> {
-        Ok(())
-    }
-    fn to_value(self) -> Value {
-        unit_to_value()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Compile-time mapping from CType tokens to Rust ABI types.
-// ---------------------------------------------------------------------------
-
-/// Inject the return-type list into another macro invocation.
-macro_rules! with_returns {
-    ($macro:ident!($($args:tt)*)) => {
-        $macro!($($args)*, [(I64, i64); (F64, f64); (Bool, bool); (CStr, *const std::ffi::c_char); (VoidPtr, *mut std::ffi::c_void); (Unit, ())])
-    };
-}
-
-/// Generate match arms for arity 0 (no parameters).
-macro_rules! arity_0_arms {
-    ($ptr:expr, $ret:expr, [$(($r:ident, $rty:ty));*]) => {
-        match $ret {
-            $(CType::$r => {
-                // SAFETY: caller guarantees the function ABI matches.
-                let f: extern "C" fn() -> $rty = unsafe { std::mem::transmute($ptr) };
-                Ok(<$rty as CTypeArg>::to_value(f()))
-            },)*
-        }
-    };
-}
-
-/// Generate match arms for a single parameter of a fixed Rust type.
-macro_rules! arity_1_arms {
-    ($ptr:expr, $args:expr, $ret:expr, $pty:ty, [$(($r:ident, $rty:ty));*]) => {
-        match $ret {
-            $(CType::$r => {{
-                // SAFETY: caller guarantees the function ABI matches.
-                let f: extern "C" fn($pty) -> $rty = unsafe { std::mem::transmute($ptr) };
-                let mut __iter = $args.iter();
-                let __a0 = <$pty as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                Ok(<$rty as CTypeArg>::to_value(f(__a0)))
-            }},)*
-        }
-    };
-}
-
-/// Generate match arms for two parameters of fixed Rust types.
-macro_rules! arity_2_arms {
-    ($ptr:expr, $args:expr, $ret:expr, $pty0:ty, $pty1:ty, [$(($r:ident, $rty:ty));*]) => {
-        match $ret {
-            $(CType::$r => {{
-                // SAFETY: caller guarantees the function ABI matches.
-                let f: extern "C" fn($pty0, $pty1) -> $rty = unsafe { std::mem::transmute($ptr) };
-                let mut __iter = $args.iter();
-                let __a0 = <$pty0 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                let __a1 = <$pty1 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                Ok(<$rty as CTypeArg>::to_value(f(__a0, __a1)))
-            }},)*
-        }
-    };
-}
-
-/// Generate match arms for three parameters of fixed Rust types.
-macro_rules! arity_3_arms {
-    ($ptr:expr, $args:expr, $ret:expr, $pty0:ty, $pty1:ty, $pty2:ty, [$(($r:ident, $rty:ty));*]) => {
-        match $ret {
-            $(CType::$r => {{
-                // SAFETY: caller guarantees the function ABI matches.
-                let f: extern "C" fn($pty0, $pty1, $pty2) -> $rty = unsafe { std::mem::transmute($ptr) };
-                let mut __iter = $args.iter();
-                let __a0 = <$pty0 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                let __a1 = <$pty1 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                let __a2 = <$pty2 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                Ok(<$rty as CTypeArg>::to_value(f(__a0, __a1, __a2)))
-            }},)*
-        }
-    };
-}
-
-/// Generate match arms for four parameters of fixed Rust types.
-macro_rules! arity_4_arms {
-    ($ptr:expr, $args:expr, $ret:expr, $pty0:ty, $pty1:ty, $pty2:ty, $pty3:ty, [$(($r:ident, $rty:ty));*]) => {
-        match $ret {
-            $(CType::$r => {{
-                // SAFETY: caller guarantees the function ABI matches.
-                let f: extern "C" fn($pty0, $pty1, $pty2, $pty3) -> $rty = unsafe { std::mem::transmute($ptr) };
-                let mut __iter = $args.iter();
-                let __a0 = <$pty0 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                let __a1 = <$pty1 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                let __a2 = <$pty2 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                let __a3 = <$pty3 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                Ok(<$rty as CTypeArg>::to_value(f(__a0, __a1, __a2, __a3)))
-            }},)*
-        }
-    };
-}
-
+#[cfg(feature = "ffi")]
 /// Marshal arguments, call a native function, and marshal the return value.
 ///
-/// Supports signatures with up to four parameters.
+/// Uses libffi so arbitrary arities and argument type combinations are
+/// supported, not only the small fixed table used by the non-ffi fallback.
 ///
 /// # Safety
 /// `func.ptr` must point to a valid function whose ABI matches `func.signature`.
 pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value, String> {
+    use libffi::middle::{arg, Cif, CodePtr, Type};
+
     if args.len() != func.signature.params.len() {
         return Err(format!(
             "argument count mismatch: expected {}, got {}",
@@ -354,68 +201,355 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
         ));
     }
 
-    let p = &func.signature.params;
-    let ret = func.signature.ret;
+    // Storage vectors keep argument values alive so libffi can borrow pointers
+    // to them for the duration of the call.
+    let mut i64_storage: Vec<i64> = Vec::new();
+    let mut f64_storage: Vec<f64> = Vec::new();
+    let mut u8_storage: Vec<u8> = Vec::new();
+    let mut ptr_storage: Vec<*const c_void> = Vec::new();
+    let mut u64_storage: Vec<u64> = Vec::new();
 
-    match p.as_slice() {
-        [] => with_returns!(arity_0_arms!(func.ptr, ret)),
-        [p0] => match p0 {
-            CType::I64 => with_returns!(arity_1_arms!(func.ptr, args, ret, i64)),
-            CType::F64 => with_returns!(arity_1_arms!(func.ptr, args, ret, f64)),
-            CType::Bool => with_returns!(arity_1_arms!(func.ptr, args, ret, bool)),
+    let mut ffi_types: Vec<Type> = Vec::with_capacity(args.len());
+    /// Tracks which storage vector holds each argument, so `ffi_args` can be
+    /// built after all pushes complete (avoiding overlapping mutable/immutable
+    /// borrows of the storage vectors).
+    enum ArgSlot {
+        I64(usize),
+        F64(usize),
+        U8(usize),
+        Ptr(usize),
+        U64(usize),
+    }
+    let mut arg_slots: Vec<ArgSlot> = Vec::with_capacity(args.len());
+
+    for (i, (ctype, val)) in func.signature.params.iter().zip(args.iter()).enumerate() {
+        match ctype {
+            CType::I64 => {
+                i64_storage.push(
+                    value_to_i64(val)
+                        .map_err(|e| format!("FFI argument {} for {}: {}", i, func.symbol, e))?,
+                );
+                ffi_types.push(Type::i64());
+                arg_slots.push(ArgSlot::I64(i64_storage.len() - 1));
+            }
+            CType::F64 => {
+                f64_storage.push(
+                    value_to_f64(val)
+                        .map_err(|e| format!("FFI argument {} for {}: {}", i, func.symbol, e))?,
+                );
+                ffi_types.push(Type::f64());
+                arg_slots.push(ArgSlot::F64(f64_storage.len() - 1));
+            }
+            CType::Bool => {
+                u8_storage.push(
+                    if value_to_bool(val)
+                        .map_err(|e| format!("FFI argument {} for {}: {}", i, func.symbol, e))?
+                    {
+                        1
+                    } else {
+                        0
+                    },
+                );
+                ffi_types.push(Type::u8());
+                arg_slots.push(ArgSlot::U8(u8_storage.len() - 1));
+            }
             CType::CStr => {
-                with_returns!(arity_1_arms!(func.ptr, args, ret, *const std::ffi::c_char))
+                let p = unsafe { value_to_cstr(val) }
+                    .map_err(|e| format!("FFI argument {} for {}: {}", i, func.symbol, e))?;
+                ptr_storage.push(p as *const c_void);
+                ffi_types.push(Type::pointer());
+                arg_slots.push(ArgSlot::Ptr(ptr_storage.len() - 1));
             }
             CType::VoidPtr => {
-                with_returns!(arity_1_arms!(func.ptr, args, ret, *mut std::ffi::c_void))
+                let p = unsafe { value_to_voidptr(val) }
+                    .map_err(|e| format!("FFI argument {} for {}: {}", i, func.symbol, e))?;
+                ptr_storage.push(p as *const c_void);
+                ffi_types.push(Type::pointer());
+                arg_slots.push(ArgSlot::Ptr(ptr_storage.len() - 1));
             }
-            CType::Unit => with_returns!(arity_1_arms!(func.ptr, args, ret, ())),
-        },
-        [p0, p1] => match (p0, p1) {
-            // I64
-            (CType::I64, CType::I64) => with_returns!(arity_2_arms!(func.ptr, args, ret, i64, i64)),
-            (CType::I64, CType::F64) => with_returns!(arity_2_arms!(func.ptr, args, ret, i64, f64)),
-            (CType::I64, CType::Bool) => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, i64, bool))
+            CType::Unit => {
+                u8_storage.push(0);
+                ffi_types.push(Type::u8());
+                arg_slots.push(ArgSlot::U8(u8_storage.len() - 1));
             }
-            // F64
-            (CType::F64, CType::I64) => with_returns!(arity_2_arms!(func.ptr, args, ret, f64, i64)),
-            (CType::F64, CType::F64) => with_returns!(arity_2_arms!(func.ptr, args, ret, f64, f64)),
-            (CType::F64, CType::Bool) => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, f64, bool))
+            CType::Value => {
+                u64_storage.push(val.to_bits());
+                ffi_types.push(Type::u64());
+                arg_slots.push(ArgSlot::U64(u64_storage.len() - 1));
             }
-            // Bool
-            (CType::Bool, CType::I64) => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, i64))
-            }
-            (CType::Bool, CType::F64) => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, f64))
-            }
-            (CType::Bool, CType::Bool) => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, bool))
-            }
-            _ => Err("unsupported arity-2 parameter types".to_string()),
-        },
-        [p0, p1, p2] => match (p0, p1, p2) {
-            (CType::I64, CType::I64, CType::I64) => {
-                with_returns!(arity_3_arms!(func.ptr, args, ret, i64, i64, i64))
-            }
-            _ => {
-                Err("unsupported arity-3 parameter types (only I64,I64,I64 supported)".to_string())
-            }
-        },
-        [p0, p1, p2, p3] => match (p0, p1, p2, p3) {
-            (CType::I64, CType::I64, CType::I64, CType::I64) => {
-                with_returns!(arity_4_arms!(func.ptr, args, ret, i64, i64, i64, i64))
-            }
-            _ => Err("unsupported arity-4 parameter types (only I64x4 supported)".to_string()),
-        },
-        _ => Err(format!(
-            "unsupported parameter count: {} (max 4 supported)",
-            p.len()
-        )),
+        }
+    }
+
+    let mut ffi_args: Vec<libffi::middle::Arg> = Vec::with_capacity(args.len());
+    for slot in arg_slots {
+        match slot {
+            ArgSlot::I64(i) => ffi_args.push(arg(&i64_storage[i])),
+            ArgSlot::F64(i) => ffi_args.push(arg(&f64_storage[i])),
+            ArgSlot::U8(i) => ffi_args.push(arg(&u8_storage[i])),
+            ArgSlot::Ptr(i) => ffi_args.push(arg(&ptr_storage[i])),
+            ArgSlot::U64(i) => ffi_args.push(arg(&u64_storage[i])),
+        }
+    }
+
+    let ret_type = ctype_to_libffi(&func.signature.ret);
+    let cif = Cif::new(ffi_types, ret_type);
+    let code = CodePtr(func.ptr as *mut c_void);
+
+    match func.signature.ret {
+        CType::I64 => {
+            let r: i64 = unsafe { cif.call(code, &ffi_args) };
+            Ok(i64_to_value(r))
+        }
+        CType::F64 => {
+            let r: f64 = unsafe { cif.call(code, &ffi_args) };
+            Ok(f64_to_value(r))
+        }
+        CType::Bool => {
+            let r: u8 = unsafe { cif.call(code, &ffi_args) };
+            Ok(bool_to_value(r != 0))
+        }
+        CType::CStr => {
+            let r: *const c_char = unsafe { cif.call(code, &ffi_args) };
+            // SAFETY: caller guarantees the returned pointer is a valid C
+            // string (or null) for the duration of this conversion.
+            Ok(unsafe { cstr_to_value(r) })
+        }
+        CType::VoidPtr => {
+            let r: *mut c_void = unsafe { cif.call(code, &ffi_args) };
+            Ok(voidptr_to_value(r))
+        }
+        CType::Unit => {
+            let _: () = unsafe { cif.call(code, &ffi_args) };
+            Ok(unit_to_value())
+        }
+        CType::Value => {
+            let r: u64 = unsafe { cif.call(code, &ffi_args) };
+            Ok(Value::from_bits(r))
+        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fixed-arity fallback (used when the `ffi` feature is disabled)
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "ffi"))]
+mod fixed_arity {
+    use super::*;
+
+    /// Maps a supported C type to its Rust FFI representation and provides
+    /// conversions to/from Nulang `Value`.
+    pub trait CTypeArg: Copy {
+        /// The Rust type used in an `extern "C" fn` signature.
+        type Abi: Copy;
+        /// Convert from a Nulang `Value` to this argument type.
+        fn from_value(v: Value) -> Result<Self, String>;
+        /// Convert this argument type to a Nulang `Value`.
+        fn to_value(self) -> Value;
+    }
+
+    impl CTypeArg for i64 {
+        type Abi = i64;
+        fn from_value(v: Value) -> Result<Self, String> {
+            value_to_i64(&v)
+        }
+        fn to_value(self) -> Value {
+            i64_to_value(self)
+        }
+    }
+    impl CTypeArg for f64 {
+        type Abi = f64;
+        fn from_value(v: Value) -> Result<Self, String> {
+            value_to_f64(&v)
+        }
+        fn to_value(self) -> Value {
+            f64_to_value(self)
+        }
+    }
+    impl CTypeArg for bool {
+        type Abi = bool;
+        fn from_value(v: Value) -> Result<Self, String> {
+            value_to_bool(&v)
+        }
+        fn to_value(self) -> Value {
+            bool_to_value(self)
+        }
+    }
+    impl CTypeArg for *const c_char {
+        type Abi = *const c_char;
+        fn from_value(v: Value) -> Result<Self, String> {
+            unsafe { value_to_cstr(&v) }
+        }
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        fn to_value(self) -> Value {
+            unsafe { cstr_to_value(self) }
+        }
+    }
+    impl CTypeArg for *mut c_void {
+        type Abi = *mut c_void;
+        fn from_value(v: Value) -> Result<Self, String> {
+            unsafe { value_to_voidptr(&v) }
+        }
+        fn to_value(self) -> Value {
+            voidptr_to_value(self)
+        }
+    }
+    impl CTypeArg for () {
+        type Abi = ();
+        fn from_value(_v: Value) -> Result<Self, String> {
+            Ok(())
+        }
+        fn to_value(self) -> Value {
+            unit_to_value()
+        }
+    }
+
+    macro_rules! with_returns {
+        ($macro:ident!($($args:tt)*)) => {
+            $macro!($($args)*, [(I64, i64); (F64, f64); (Bool, bool); (CStr, *const std::ffi::c_char); (VoidPtr, *mut std::ffi::c_void); (Unit, ())])
+        };
+    }
+
+    macro_rules! arity_0_arms {
+        ($ptr:expr, $ret:expr, [$(($r:ident, $rty:ty));*]) => {
+            match $ret {
+                $(CType::$r => {
+                    let f: extern "C" fn() -> $rty = unsafe { std::mem::transmute($ptr) };
+                    Ok(<$rty as CTypeArg>::to_value(f()))
+                },)*
+                _ => Err("unsupported native return type (Value requires the ffi feature)".to_string()),
+            }
+        };
+    }
+    macro_rules! arity_1_arms {
+        ($ptr:expr, $args:expr, $ret:expr, $pty:ty, [$(($r:ident, $rty:ty));*]) => {
+            match $ret {
+                $(CType::$r => {{
+                    let f: extern "C" fn($pty) -> $rty = unsafe { std::mem::transmute($ptr) };
+                    let mut __iter = $args.iter();
+                    let __a0 = <$pty as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
+                    Ok(<$rty as CTypeArg>::to_value(f(__a0)))
+                }},)*
+                _ => Err("unsupported native return type (Value requires the ffi feature)".to_string()),
+            }
+        };
+    }
+    macro_rules! arity_2_arms {
+        ($ptr:expr, $args:expr, $ret:expr, $pty0:ty, $pty1:ty, [$(($r:ident, $rty:ty));*]) => {
+            match $ret {
+                $(CType::$r => {{
+                    let f: extern "C" fn($pty0, $pty1) -> $rty = unsafe { std::mem::transmute($ptr) };
+                    let mut __iter = $args.iter();
+                    let __a0 = <$pty0 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
+                    let __a1 = <$pty1 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
+                    Ok(<$rty as CTypeArg>::to_value(f(__a0, __a1)))
+                }},)*
+                _ => Err("unsupported native return type (Value requires the ffi feature)".to_string()),
+            }
+        };
+    }
+    macro_rules! arity_3_arms {
+        ($ptr:expr, $args:expr, $ret:expr, $pty0:ty, $pty1:ty, $pty2:ty, [$(($r:ident, $rty:ty));*]) => {
+            match $ret {
+                $(CType::$r => {{
+                    let f: extern "C" fn($pty0, $pty1, $pty2) -> $rty = unsafe { std::mem::transmute($ptr) };
+                    let mut __iter = $args.iter();
+                    let __a0 = <$pty0 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
+                    let __a1 = <$pty1 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
+                    let __a2 = <$pty2 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
+                    Ok(<$rty as CTypeArg>::to_value(f(__a0, __a1, __a2)))
+                }},)*
+                _ => Err("unsupported native return type (Value requires the ffi feature)".to_string()),
+            }
+        };
+    }
+    macro_rules! arity_4_arms {
+        ($ptr:expr, $args:expr, $ret:expr, $pty0:ty, $pty1:ty, $pty2:ty, $pty3:ty, [$(($r:ident, $rty:ty));*]) => {
+            match $ret {
+                $(CType::$r => {{
+                    let f: extern "C" fn($pty0, $pty1, $pty2, $pty3) -> $rty = unsafe { std::mem::transmute($ptr) };
+                    let mut __iter = $args.iter();
+                    let __a0 = <$pty0 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
+                    let __a1 = <$pty1 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
+                    let __a2 = <$pty2 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
+                    let __a3 = <$pty3 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
+                    Ok(<$rty as CTypeArg>::to_value(f(__a0, __a1, __a2, __a3)))
+                }},)*
+                _ => Err("unsupported native return type (Value requires the ffi feature)".to_string()),
+            }
+        };
+    }
+
+    /// Marshal arguments, call a native function, and marshal the return value.
+    ///
+    /// Supports signatures with up to four parameters.
+    ///
+    /// # Safety
+    /// `func.ptr` must point to a valid function whose ABI matches `func.signature`.
+    pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value, String> {
+        if func.signature.params.iter().any(|p| *p == CType::Value)
+            || func.signature.ret == CType::Value
+        {
+            return Err("CType::Value requires the ffi feature".to_string());
+        }
+        if args.len() != func.signature.params.len() {
+            return Err(format!(
+                "argument count mismatch: expected {}, got {}",
+                func.signature.params.len(),
+                args.len()
+            ));
+        }
+
+        let p = &func.signature.params;
+        let ret = func.signature.ret;
+
+        match p.as_slice() {
+            [] => with_returns!(arity_0_arms!(func.ptr, ret)),
+            [CType::I64] => with_returns!(arity_1_arms!(func.ptr, args, ret, i64)),
+            [CType::F64] => with_returns!(arity_1_arms!(func.ptr, args, ret, f64)),
+            [CType::Bool] => with_returns!(arity_1_arms!(func.ptr, args, ret, bool)),
+            [CType::CStr] => {
+                with_returns!(arity_1_arms!(func.ptr, args, ret, *const std::ffi::c_char))
+            }
+            [CType::VoidPtr] => {
+                with_returns!(arity_1_arms!(func.ptr, args, ret, *mut std::ffi::c_void))
+            }
+            [CType::Unit] => with_returns!(arity_1_arms!(func.ptr, args, ret, ())),
+            [CType::I64, CType::I64] => with_returns!(arity_2_arms!(func.ptr, args, ret, i64, i64)),
+            [CType::I64, CType::F64] => with_returns!(arity_2_arms!(func.ptr, args, ret, i64, f64)),
+            [CType::I64, CType::Bool] => {
+                with_returns!(arity_2_arms!(func.ptr, args, ret, i64, bool))
+            }
+            [CType::F64, CType::I64] => with_returns!(arity_2_arms!(func.ptr, args, ret, f64, i64)),
+            [CType::F64, CType::F64] => with_returns!(arity_2_arms!(func.ptr, args, ret, f64, f64)),
+            [CType::F64, CType::Bool] => {
+                with_returns!(arity_2_arms!(func.ptr, args, ret, f64, bool))
+            }
+            [CType::Bool, CType::I64] => {
+                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, i64))
+            }
+            [CType::Bool, CType::F64] => {
+                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, f64))
+            }
+            [CType::Bool, CType::Bool] => {
+                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, bool))
+            }
+            [CType::I64, CType::I64, CType::I64] => {
+                with_returns!(arity_3_arms!(func.ptr, args, ret, i64, i64, i64))
+            }
+            [CType::I64, CType::I64, CType::I64, CType::I64] => {
+                with_returns!(arity_4_arms!(func.ptr, args, ret, i64, i64, i64, i64))
+            }
+            _ => Err(format!(
+                "unsupported parameter count/types (max 4, no Value without ffi feature): {:?}",
+                p
+            )),
+        }
+    }
+}
+
+#[cfg(not(feature = "ffi"))]
+pub use fixed_arity::call_native;
 
 #[cfg(test)]
 mod tests {
@@ -522,8 +656,84 @@ mod tests {
     fn test_marshal_unit() {
         let v = unit_to_value();
         assert!(v.is_unit());
-        let u = <() as CTypeArg>::from_value(v).unwrap();
-        assert_eq!(u, ());
+    }
+
+    #[cfg(feature = "ffi")]
+    extern "C" fn sum_six(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+        a + b + c + d + e + f
+    }
+
+    #[cfg(feature = "ffi")]
+    extern "C" fn identity_value(v: u64) -> u64 {
+        v
+    }
+
+    #[cfg(feature = "ffi")]
+    extern "C" fn make_greeting() -> *const c_char {
+        let s = std::ffi::CString::new("hello ffi").unwrap();
+        s.into_raw()
+    }
+
+    #[test]
+    #[cfg(feature = "ffi")]
+    fn test_call_native_six_args() {
+        let func = make_func(
+            sum_six as *const c_void,
+            Signature::new(
+                vec![
+                    CType::I64,
+                    CType::I64,
+                    CType::I64,
+                    CType::I64,
+                    CType::I64,
+                    CType::I64,
+                ],
+                CType::I64,
+            ),
+        );
+        let result = unsafe {
+            call_native(
+                &func,
+                &[
+                    Value::int(1),
+                    Value::int(2),
+                    Value::int(3),
+                    Value::int(4),
+                    Value::int(5),
+                    Value::int(6),
+                ],
+            )
+            .unwrap()
+        };
+        assert_eq!(result.as_int(), Some(21));
+    }
+
+    #[test]
+    #[cfg(feature = "ffi")]
+    fn test_call_native_value_roundtrip() {
+        let func = make_func(
+            identity_value as *const c_void,
+            Signature::new(vec![CType::Value], CType::Value),
+        );
+        let original = Value::int(42);
+        let result = unsafe { call_native(&func, &[original]).unwrap() };
+        assert_eq!(result.as_int(), Some(42));
+    }
+
+    #[test]
+    #[cfg(feature = "ffi")]
+    fn test_call_native_cstr_return_cleanup() {
+        let func = make_func(
+            make_greeting as *const c_void,
+            Signature::new(vec![], CType::CStr),
+        );
+        let result = unsafe { call_native(&func, &[]).unwrap() };
+        let ptr = result.as_ptr().unwrap() as *const c_char;
+        // SAFETY: pointer came from make_greeting's CString::into_raw.
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr).to_str().unwrap() };
+        assert_eq!(s, "hello ffi");
+        // SAFETY: pointer came from CString::into_raw in make_greeting.
+        unsafe { free_cstr_value(result) };
     }
 
     #[test]
