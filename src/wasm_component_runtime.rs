@@ -125,7 +125,10 @@ impl ComponentRuntime {
         })
     }
 
-    fn build_linker(engine: &Engine, caps: Capabilities) -> NuResult<wasmtime::component::Linker<HostState>> {
+    fn build_linker(
+        engine: &Engine,
+        caps: Capabilities,
+    ) -> NuResult<wasmtime::component::Linker<HostState>> {
         let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
 
         // Add the host instance manually with the correct name
@@ -214,12 +217,11 @@ impl ComponentRuntime {
         F: FnOnce(&mut Store<HostState>, &Actor) -> NuResult<R>,
     {
         let mut pooled = self.checkout()?;
-        let actor = Actor::new(&mut pooled.store, &pooled.instance).map_err(|e| {
-            NuError::VMError {
+        let actor =
+            Actor::new(&mut pooled.store, &pooled.instance).map_err(|e| NuError::VMError {
                 msg: format!("wasmtime actor bindings: {}", e),
                 span: Span::default(),
-            }
-        })?;
+            })?;
         let result = f(&mut pooled.store, &actor);
         self.checkin(pooled);
         result
@@ -247,12 +249,10 @@ impl ComponentRuntime {
 
     pub fn checkpoint(&self) -> NuResult<Vec<u8>> {
         self.with_actor(|store, actor| {
-            actor
-                .call_checkpoint(store)
-                .map_err(|e| NuError::VMError {
-                    msg: format!("wasmtime call_checkpoint: {}", e),
-                    span: Span::default(),
-                })
+            actor.call_checkpoint(store).map_err(|e| NuError::VMError {
+                msg: format!("wasmtime call_checkpoint: {}", e),
+                span: Span::default(),
+            })
         })
     }
 }

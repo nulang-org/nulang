@@ -117,9 +117,8 @@ impl NulangRuntime {
         }
         if let Some(bytes) = vm.string_bytes(value) {
             if let Some(module) = self.modules.get_mut(module_handle) {
-                let id = module
-                    .add_string_constant(String::from_utf8_lossy(&bytes).into_owned())
-                    as u32;
+                let id =
+                    module.add_string_constant(String::from_utf8_lossy(&bytes).into_owned()) as u32;
                 return Value::string(id);
             }
         }

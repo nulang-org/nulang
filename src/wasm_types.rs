@@ -109,14 +109,16 @@ impl WireValue {
                 if name == "__tag" && fields.len() >= 2 {
                     let tag_value = &fields[1].1;
                     let tag = if tag_value.as_string_id().is_some() {
-                        resolver.string_bytes(tag_value).and_then(|b| String::from_utf8(b).ok())
+                        resolver
+                            .string_bytes(tag_value)
+                            .and_then(|b| String::from_utf8(b).ok())
                     } else {
                         None
                     };
                     if let Some(tag) = tag {
-                        let payload = fields.get(2).map(|(_, v)| {
-                            Box::new(WireValue::from_value(v, resolver))
-                        });
+                        let payload = fields
+                            .get(2)
+                            .map(|(_, v)| Box::new(WireValue::from_value(v, resolver)));
                         return WireValue::Variant(tag, payload);
                     }
                 }
@@ -149,7 +151,10 @@ impl WireValue {
                 // Compound string allocation requires a builder context.
                 Value::nil()
             }
-            WireValue::Tuple(_) | WireValue::Record(_) | WireValue::Variant(_, _) | WireValue::Array(_) => {
+            WireValue::Tuple(_)
+            | WireValue::Record(_)
+            | WireValue::Variant(_, _)
+            | WireValue::Array(_) => {
                 // Compound allocations require a builder context.
                 Value::nil()
             }
