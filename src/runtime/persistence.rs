@@ -2408,7 +2408,10 @@ mod rocksdb_store_tests {
         let store = RocksDbStore::new(&dir).unwrap();
         let res = store.query("SELECT 1", &[]);
         assert!(res.is_err());
-        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            res.unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
@@ -2571,7 +2574,11 @@ mod postgres_store_tests {
         let rows = store
             .query(
                 "SELECT $1::int8, $2::float8, $3::bool",
-                &[Value::int(42), Value::float(3.14), Value::bool(true)],
+                &[
+                    Value::int(42),
+                    Value::float(3.14),
+                    Value::bool(true),
+                ],
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
