@@ -932,6 +932,10 @@ impl MirCodegen {
                 args,
                 resolved_handler,
             } => {
+                // stage_args uses spill temps (r12..r14) via local_reg; protect
+                // dst when it lands in that zone so Perform's result is not
+                // clobbered before spill_write_done (see spill_bug_repro class).
+                let safe = self.protect_dst(dst);
                 self.stage_args(args)?;
                 if let Some(href) = resolved_handler {
                     // Statically-resolved handler — emit PerformDirect with
@@ -940,7 +944,7 @@ impl MirCodegen {
                         OpCode::PerformDirect,
                         href.table_index as u8,
                         href.binding_index as u8,
-                        dst,
+                        safe,
                     ));
                 } else {
                     let eff_idx = self
@@ -950,15 +954,17 @@ impl MirCodegen {
                         OpCode::Perform,
                         ((eff_idx >> 8) & 0xFF) as u8,
                         (eff_idx & 0xFF) as u8,
-                        dst,
+                        safe,
                     ));
                 }
+                self.restore_dst(dst, safe);
             }
             mir::RValue::PerformAsync {
                 effect_op,
                 args,
                 resolved_handler: _,
             } => {
+                let safe = self.protect_dst(dst);
                 self.stage_args(args)?;
                 let eff_idx = self
                     .module
@@ -967,8 +973,9 @@ impl MirCodegen {
                     OpCode::PerformAsync,
                     ((eff_idx >> 8) & 0xFF) as u8,
                     (eff_idx & 0xFF) as u8,
-                    dst,
+                    safe,
                 ));
+                self.restore_dst(dst, safe);
             }
             mir::RValue::SignalWait { name } => {
                 let name_idx = self.module.add_constant(Constant::String(name.clone()));

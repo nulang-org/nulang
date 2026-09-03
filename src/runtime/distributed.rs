@@ -1284,8 +1284,20 @@ pub fn process_network_packets(
                                     }
                                     msg.payload = Arc::new(payload_vec);
                                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
-                                        let _ = actor.mailbox.push(msg);
-                                        runtime.scheduler.enqueue(target_actor);
+                                        match actor.mailbox.push(msg) {
+                                            Ok(()) => runtime.scheduler.enqueue(target_actor),
+                                            Err(msg) => {
+                                                // Bounded mailbox at capacity
+                                                // under the Reject policy: the
+                                                // network reader thread cannot
+                                                // drop the message silently, so
+                                                // surface it on the DLQ.
+                                                runtime.route_to_dlq(
+                                                    &msg,
+                                                    "mailbox full on network retry",
+                                                );
+                                            }
+                                        }
                                     } else {
                                         notify_delivery_failed(
                                             runtime,
@@ -1551,8 +1563,16 @@ pub fn process_network_packets(
                     }
                     msg.payload = Arc::new(payload_vec);
                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
-                        let _ = actor.mailbox.push(msg);
-                        runtime.scheduler.enqueue(target_actor);
+                        match actor.mailbox.push(msg) {
+                            Ok(()) => runtime.scheduler.enqueue(target_actor),
+                            Err(msg) => {
+                                // Bounded mailbox at capacity under the Reject
+                                // policy: surface on the DLQ instead of
+                                // silently dropping the network-delivered
+                                // message.
+                                runtime.route_to_dlq(&msg, "mailbox full on network delivery");
+                            }
+                        }
                     } else {
                         notify_delivery_failed(runtime, msg.sender, "target actor not found");
                     }
