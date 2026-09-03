@@ -128,7 +128,7 @@ def split_alpha_branches(alpha_body):
     if_open = find_line(alpha_body, 'if h == 3987 then {', fn_open)
     ranges['comp_kw_if'] = ('kw', branch_body(alpha_body, if_open))
 
-    true_open = find_line(alpha_body, 'if h == 6932 then {', if_open)
+    true_open = find_line(alpha_body, 'if h == 18036 then {', if_open)
     ranges['comp_kw_true'] = ('rq', branch_body(alpha_body, true_open))
 
     false_open = find_line(alpha_body, 'if h == 15187 then {', true_open)
@@ -269,7 +269,7 @@ def main():
     if h == 20633 then comp_kw_let(comp_rec, src, pos, len, nr, env, elen, no_left, p, q)
     else if h == 3884 then comp_kw_fn(comp_rec, src, pos, len, nr, env, elen, no_left, p, q)
     else if h == 3987 then comp_kw_if(comp_rec, src, pos, len, nr, env, elen, no_left, p, q)
-    else if h == 6932 then comp_kw_true(comp_rec, src, pos, len, nr, q)
+    else if h == 18036 then comp_kw_true(comp_rec, src, pos, len, nr, q)
     else if h == 15187 then comp_kw_false(comp_rec, src, pos, len, nr, q)
     else if h == 23741 then comp_kw_not(comp_rec, src, pos, len, nr, env, elen, no_left, p, q)
     else if h == 64877 then comp_kw_nperform(comp_rec, src, pos, len, nr, env, elen, no_left, p, q)

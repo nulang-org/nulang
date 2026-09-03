@@ -379,7 +379,7 @@ def main():
     source = thunk_wrap_let(source)
     source = strip_comments(source)
     fns, main_expr = parse_top_level_fns(source)
-    fns, main_expr = transform_fns_for_self_host(fns)
+    fns, _ = transform_fns_for_self_host(fns)
     # Stage-2 self-host: keep the top-level frame tiny by moving all helper
     # definitions inside the driver function.  The host compiler's register
     # allocator otherwise runs out of frame registers on the long top-level

@@ -93,6 +93,9 @@ def split_comp_for_self_host(source: str) -> str:
 
 DEEP_KWS = (
     ('comp_kw_not', 'kw', 'if h == 23741 then {'),
+    ('comp_kw_let', 'kw', 'if h == 20633 then {'),
+    ('comp_kw_if', 'kw', 'if h == 3987 then {'),
+    ('comp_infix_call', 'infix_call', 'if c == 40 then {'),
 )
 
 

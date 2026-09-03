@@ -82,7 +82,14 @@ fn env_decode(env: String, i: Int) -> Int {
     let b1 = perform String.charAt(env, i + 1) - 1;
     let b2 = perform String.charAt(env, i + 2) - 1;
     let b3 = perform String.charAt(env, i + 3) - 1;
-    (b0 << 18) + (b1 << 12) + (b2 << 6) + b3
+    // Stage each shifted term so no product register is reused by the
+    // next shift (same fix shape as cmp_pack).
+    let t0 = b0 << 18;
+    let t1 = b1 << 12;
+    let t2 = b2 << 6;
+    let s01 = t0 + t1;
+    let s012 = s01 + t2;
+    s012 + b3
 }
 
 // Scan env entries oldest→newest and emit Move+CapStore for each capture.
@@ -200,16 +207,25 @@ fn read_string_end(src: String, pos: Int, len: Int) -> Int {
 // Each binding encodes 24 bits: hash (16 bits) + reg (8 bits).
 
 fn env_push(env: String, h: Int, reg: Int) -> String {
-    let v = ((low16(h)) << 8) + (low8(reg));
+    // Stage each term so the (low16(h) << 8) product register is not
+    // clobbered by the low8(reg) call (self-hosted artifact aliases the
+    // shifted result and the low8 temp; V was 400 = 200+200 instead of
+    // 30920). Same fix shape as cmp_pack.
+    let h16 = low16(h);
+    let shifted = h16 << 8;
+    let r8 = low8(reg);
+    let v = shifted + r8;
     let c0 = (low6((v >> 18))) + 1;
     let c1 = (low6((v >> 12))) + 1;
     let c2 = (low6((v >> 6))) + 1;
     let c3 = (low6(v)) + 1;
-    env +
-        perform String.from_char(c0) +
-        perform String.from_char(c1) +
-        perform String.from_char(c2) +
-        perform String.from_char(c3)
+    // Stage the concat so each perform result is bound before the next
+    // effect; a deep 4-effect chain corrupts intermediate strings in the
+    // self-hosted artifact (same fix shape as cmp_pack/parse_cmp).
+    let s01 = env + perform String.from_char(c0);
+    let s012 = s01 + perform String.from_char(c1);
+    let s0123 = s012 + perform String.from_char(c2);
+    s0123 + perform String.from_char(c3)
 }
 
 fn env_lookup(env: String, elen: Int, h: Int) -> Int {
@@ -639,7 +655,8 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                             emit_word(0x52, cr, 0, 0)
                         };
                         remark("then:");
-                        let then_body = comp(src, tp, len, no_left, 0 - 1, cnext, env, elen);
+                        let nxt_t = nr + 1;
+                        let then_body = comp(src, tp, len, no_left, 0 - 1, nxt_t, env, elen);
                         let tr = then_body >> 18;
                         let tbp = low17(then_body);
                         emit_word(0x12, tr, result_reg, 0);
@@ -651,7 +668,8 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                         let eh = else_id >> 16;
                         let ep = low16(else_id);
                         if eh == 25281 then {
-                            let else_body = comp(src, ep, len, no_left, 0 - 1, cnext, env, elen);
+                            let nxt_e = nr + 1;
+                            let else_body = comp(src, ep, len, no_left, 0 - 1, nxt_e, env, elen);
                             let er = else_body >> 18;
                             let ebp = low17(else_body);
                             emit_word(0x12, er, result_reg, 0);
