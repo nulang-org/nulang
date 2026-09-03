@@ -251,6 +251,12 @@ pub struct Runtime {
     pub main_heap: ActorHeap,
     pub main_gc: OrcaGc,
     pub next_reductions: u32,
+    /// Default mailbox capacity applied to newly spawned actors (0 =
+    /// unbounded BEAM/OTP semantics). Set via
+    /// [`Runtime::set_default_mailbox_bounds`].
+    pub(crate) default_mailbox_capacity: usize,
+    /// Default mailbox overflow policy applied to newly spawned actors.
+    pub(crate) default_mailbox_policy: MailboxOverflowPolicy,
     pub coordinator: OrcaCoordinator,
     pub cycle_detector: CycleDetector,
 
@@ -519,6 +525,8 @@ impl Runtime {
             },
             main_gc: OrcaGc::new(MAIN_HEAP_ACTOR_ID),
             next_reductions: 1000,
+            default_mailbox_capacity: 0,
+            default_mailbox_policy: MailboxOverflowPolicy::Reject,
             coordinator: OrcaCoordinator::new(),
             cycle_detector: CycleDetector::new(),
             vm_execution_depth: 0,
@@ -585,6 +593,26 @@ impl Runtime {
             cross_shard_tx: None,
             cross_shard_rx: None,
         }
+    }
+
+    /// Set the default mailbox capacity and overflow policy applied to every
+    /// actor spawned afterwards (including recovery and supervisor restarts).
+    /// `capacity` 0 keeps the unbounded BEAM/OTP default.
+    pub fn set_default_mailbox_bounds(
+        &mut self,
+        capacity: usize,
+        policy: MailboxOverflowPolicy,
+    ) {
+        self.default_mailbox_capacity = capacity;
+        self.default_mailbox_policy = policy;
+    }
+
+    /// Apply the configured default mailbox bounds to a freshly constructed
+    /// actor. Must run before the actor starts receiving messages.
+    pub fn apply_default_mailbox_bounds(&self, actor: &mut Actor) {
+        actor
+            .mailbox
+            .set_bounds(self.default_mailbox_capacity, self.default_mailbox_policy);
     }
 
     /// Compute the BLAKE3 hash of `data` using the configured [`CryptoProvider`].
@@ -2280,7 +2308,14 @@ impl Runtime {
                 // Activity resets the dehydration idle timer.
                 actor.idle_ms = 0;
             } else {
-                // Mailbox is full (capacity > 0). Route to DLQ with a simple notification.
+                // Mailbox is full (capacity > 0). Route to DLQ with a simple
+                // notification and surface the rejection count.
+                tracing::warn!(
+                    "mailbox full: rejected message to actor {} (behavior {}), {} total rejected",
+                    target_id,
+                    behavior_id,
+                    actor.mailbox.rejected()
+                );
                 self.route_to_dlq(
                     &Message {
                         behavior_id,
@@ -4644,6 +4679,7 @@ impl Runtime {
             .unwrap_or(false);
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        self.apply_default_mailbox_bounds(&mut actor);
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
@@ -4917,6 +4953,10 @@ impl Runtime {
         };
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        // Default mailbox bounds: this free fn has no Runtime reference, so
+        // callers (recover_actor / hydrate_grain) apply them via
+        // `Runtime::apply_default_mailbox_bounds` after construction, on
+        // the same scheduler thread before the actor starts receiving.
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
@@ -4993,16 +5033,19 @@ impl Runtime {
 
         let snapshot = self.persistence.load_snapshot(stable_actor_id);
 
-        let actor = if let Some(ref snap) = snapshot {
-            Self::restore_actor_from_snapshot(
+        let actor = if let Some(snap) = &snapshot {
+            let mut a = Self::restore_actor_from_snapshot(
                 stable_actor_id,
                 &grain_type.module,
                 snap,
                 false,
                 false,
-            )
+            );
+            self.apply_default_mailbox_bounds(&mut a);
+            a
         } else {
             let mut actor = Actor::new(stable_actor_id, grain_id.actor_name(), 0);
+            self.apply_default_mailbox_bounds(&mut actor);
             actor.persistent = true;
             actor.bytecode_module = Some(grain_type.module.clone());
             actor.bytecode_offsets = grain_type.bytecode_offsets.clone();
@@ -5109,8 +5152,9 @@ impl Runtime {
         let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
         let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
 
-        let actor =
+        let mut actor =
             Self::restore_actor_from_snapshot(actor_id, &module, &snapshot, is_workflow, is_agent);
+        self.apply_default_mailbox_bounds(&mut actor);
 
         // Register the recovery module.
         let offsets: Vec<usize> = module

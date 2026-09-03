@@ -41,6 +41,7 @@ pub(crate) fn spawn_actor_with_id(
     workflow: Option<&str>,
 ) -> u64 {
     let mut actor = Actor::new(id, format!("actor_{}", id), 0);
+    rt.apply_default_mailbox_bounds(&mut actor);
     let state_fields = init();
     for (name, value) in state_fields {
         actor.set_state_field(name, value);

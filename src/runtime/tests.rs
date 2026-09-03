@@ -222,6 +222,38 @@ fn test_actor_priority_default_is_normal() {
     assert_eq!(ActorPriority::default(), ActorPriority::Normal);
 }
 
+/// Default mailbox bounds configured on the Runtime must be applied to
+/// every actor it spawns, so a bounded mailbox is enforceable without
+/// per-actor annotation.
+#[test]
+fn test_spawn_applies_default_mailbox_bounds() {
+    let mut rt = Runtime::new();
+    rt.set_default_mailbox_bounds(3, mailbox::MailboxOverflowPolicy::DropOldest);
+
+    let id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    let actor = rt.actors.get_mut(&id).unwrap();
+    assert_eq!(actor.mailbox.capacity(), 3);
+    assert_eq!(
+        actor.mailbox.overflow_policy(),
+        mailbox::MailboxOverflowPolicy::DropOldest
+    );
+
+    // The bounds actually take effect: fill the mailbox to capacity, then
+    // an overflowing send evicts the oldest instead of unbounded growth.
+    for i in 0..5 {
+        let msg = mailbox::Message {
+            behavior_id: 0,
+            payload: std::sync::Arc::new(vec![Value::int(i)]),
+            sender: 0,
+            priority: mailbox::MessagePriority::Normal,
+            trace_id: None,
+        };
+        actor.mailbox.push_local(msg).unwrap();
+    }
+    assert_eq!(actor.mailbox.len(), 3, "bounded at configured capacity");
+    assert_eq!(actor.mailbox.dropped_oldest(), 2);
+}
+
 #[test]
 fn test_scheduler_priority_dequeue_order() {
     // Strict per-level preference: every High entry drains before any
