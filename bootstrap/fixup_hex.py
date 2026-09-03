@@ -77,107 +77,179 @@ def fixup(lines: list[str]) -> list[str]:
                 if check_li in line_to_ic:
                     jmpf_info.append((check_li, line_to_ic[check_li]))
                     break
-        elif marker in ("; Jmp -> end", "; Jmp -> or_end", "; Jmp -> and_end", "; Jmp -> fn_end"):
+        elif marker in ("; Jmp -> end", "; Jmp -> or_end", "; Jmp -> and_end",
+                        "; Jmp -> and_cont", "; Jmp -> or_fill", "; Jmp -> or_cont",
+                        "; Jmp -> fn_end"):
             for check_li in range(li + 1, len(lines)):
                 if check_li in line_to_ic:
                     jmp_info.append((check_li, line_to_ic[check_li]))
                     break
-    
+
     else_markers  = [li for li, m in markers.items() if m.startswith("; else:")]
     end_markers   = [li for li, m in markers.items() if m.startswith("; end:")]
-    and_end_markers = [li for li, m in markers.items() if m.startswith("; and_end:")]
+    and_fill_markers = [li for li, m in markers.items() if m.startswith("; and_fill:")]
+    and_cont_markers = [li for li, m in markers.items() if m.startswith("; and_cont:")]
     or_right_markers = [li for li, m in markers.items() if m.startswith("; or_right:")]
-    or_end_markers = [li for li, m in markers.items() if m.startswith("; or_end:")]
+    or_fill_markers = [li for li, m in markers.items() if m.startswith("; or_fill:")]
+    or_cont_markers = [li for li, m in markers.items() if m.startswith("; or_cont:")]
     fn_end_markers = [li for li, m in markers.items() if m.startswith("; fn_end:")]
     fn_start_markers = [li for li, m in markers.items() if m.startswith("; FN_START")]
     
     patched = {}  # line_idx -> new word
     
     
-    # Patch JmpF offsets (targets: else, and_end, or_right)
-    for jf_li, jf_ic in reversed(jmpf_info):
-        target_ic = None
-        # Check marker after this JmpF to determine target type
-        marker_li = jf_li - 1  # marker is just before the instruction
-        marker = markers.get(marker_li, "")
-        
-        if "and_end" in marker:
-            for em in and_end_markers:
-                if em > jf_li:
-                    for check_li in range(em + 1, len(lines)):
-                        if check_li in line_to_ic:
-                            target_ic = line_to_ic[check_li]
-                            break
-                    break
-        elif "or_right" in marker:
-            for em in or_right_markers:
-                if em > jf_li:
-                    for check_li in range(em + 1, len(lines)):
-                        if check_li in line_to_ic:
-                            target_ic = line_to_ic[check_li]
-                            break
-                    break
-        else:
-            # Default: JmpF -> else
-            for em in else_markers:
-                if em > jf_li:
-                    for check_li in range(em + 1, len(lines)):
-                        if check_li in line_to_ic:
-                            target_ic = line_to_ic[check_li]
-                            break
-                    break
+    # Collect marker line sets for stack-based branch matching.
+    if_marker_lines = {li for li, m in markers.items() if m == "; if"}
+    and_marker_lines = {li for li, m in markers.items() if m == "; and"}
+    or_marker_lines = {li for li, m in markers.items() if m == "; or"}
+
+    # Map JmpF/Jmp instruction lines to their target instruction indices.
+    jmpf_targets = {}
+    jmp_targets = {}
+
+    if_stack = []
+    and_stack = []
+    or_stack = []
+
+    def instr_after(li):
+        for check_li in range(li + 1, len(lines)):
+            if check_li in line_to_ic:
+                return line_to_ic[check_li]
+        return None
+
+    for li in sorted(markers.keys()):
+        m = markers[li]
+        if li in if_marker_lines:
+            if_stack.append({"jmpfs": []})
+        elif li in and_marker_lines:
+            and_stack.append({"jmpfs": []})
+        elif li in or_marker_lines:
+            or_stack.append({"jmpfs": []})
+        elif "JmpF" in m:
+            # Marker immediately precedes the instruction; record the line after.
+            if "and_fill" in m or "and_end" in m:
+                if and_stack:
+                    jf_li = next((c for c in range(li + 1, len(lines)) if c in line_to_ic), None)
+                    if jf_li is not None:
+                        and_stack[-1].setdefault("jmpfs", []).append(jf_li)
+            elif "or_right" in m:
+                if or_stack:
+                    jf_li = next((c for c in range(li + 1, len(lines)) if c in line_to_ic), None)
+                    if jf_li is not None:
+                        or_stack[-1].setdefault("jmpfs", []).append(jf_li)
+            else:
+                if if_stack:
+                    jf_li = next((c for c in range(li + 1, len(lines)) if c in line_to_ic), None)
+                    if jf_li is not None:
+                        if_stack[-1].setdefault("jmpfs", []).append(jf_li)
+        elif "Jmp ->" in m:
+            if "fn_end" in m:
+                continue  # handled separately below
+            if "or_fill" in m:
+                if or_stack:
+                    or_stack[-1]["fill_jmp"] = li + 1
+            elif "or_cont" in m:
+                if or_stack:
+                    or_stack[-1]["cont_jmp"] = li + 1
+            elif "or_end" in m:
+                if or_stack:
+                    or_stack[-1]["jmp"] = li + 1
+            elif "and_cont" in m or "and_end" in m:
+                if and_stack:
+                    and_stack[-1]["jmp"] = li + 1
+            else:
+                if if_stack:
+                    if_stack[-1]["jmp"] = li + 1
+        elif m.startswith("; else:"):
+            if if_stack:
+                frame = if_stack[-1]
+                for jf in frame.get("jmpfs", []):
+                    jmpf_targets[jf] = instr_after(li)
+        elif m.startswith("; end:"):
+            if if_stack:
+                frame = if_stack.pop()
+                if "jmp" in frame:
+                    jmp_targets[frame["jmp"]] = instr_after(li)
+        elif m.startswith("; and_fill:"):
+            if and_stack:
+                frame = and_stack[-1]
+                for jf in frame.get("jmpfs", []):
+                    jmpf_targets[jf] = instr_after(li)
+        elif m.startswith("; and_cont:"):
+            if and_stack:
+                frame = and_stack.pop()
+                if "jmp" in frame:
+                    jmp_targets[frame["jmp"]] = instr_after(li)
+        elif m.startswith("; or_right:"):
+            if or_stack:
+                frame = or_stack[-1]
+                for jf in frame.get("jmpfs", []):
+                    jmpf_targets[jf] = instr_after(li)
+        elif m.startswith("; or_fill:"):
+            if or_stack:
+                frame = or_stack[-1]
+                if "fill_jmp" in frame:
+                    jmp_targets[frame["fill_jmp"]] = instr_after(li)
+        elif m.startswith("; or_cont:"):
+            if or_stack:
+                frame = or_stack.pop()
+                if "cont_jmp" in frame:
+                    jmp_targets[frame["cont_jmp"]] = instr_after(li)
+                if "jmp" in frame:
+                    jmp_targets[frame["jmp"]] = instr_after(li)
+
+    # Apply JmpF patches.
+    for jf_li, jf_ic in jmpf_info:
+        target_ic = jmpf_targets.get(jf_li)
         if target_ic is not None:
             offset = target_ic - jf_ic
             old_word = [w for li, w in instr_lines if li == jf_li][0]
             patched[jf_li] = patch_jmpf(old_word, offset)
-    
-    # Track which fn_ends have been consumed to correctly match
-    # each function-body-skip Jmp with its corresponding fn_end.
-    # Inner fns consume their fn_end first (reversed iteration order).
-    available_fn_ends = sorted(fn_end_markers)
-    
-    def consume_next_fn_end_after(jp_li):
-        for i, em in enumerate(available_fn_ends):
-            if em > jp_li:
-                del available_fn_ends[i]
-                for check_li in range(em + 1, len(lines)):
-                    if check_li in line_to_ic:
-                        return line_to_ic[check_li]
-                break
-        return None
 
-    # Patch Jmp offsets (check ; fn_end: then ; end: then ; or_end: then ; else: then end of list)
-    for jp_li, jp_ic in reversed(jmp_info):
-        target_ic = None
+    # Match fn-body-skip Jmps to their OWN fn_end using nesting.  Each
+    # fn-body-skip Jmp is immediately followed by its fn's FN_START marker;
+    # the skip must land on that fn's matching fn_end (the fn_end that closes
+    # the FN_START's nesting level), NOT the first fn_end that happens to
+    # follow (which, for nested/curried fns, is an inner child's fn_end).
+    # Pair FN_STARTs with FN_ENDs by nesting (stack-based): the innermost
+    # fn_end closes the most recent unclosed FN_START.
+    all_markers = sorted(
+        [(li, 'start') for li in fn_start_markers]
+        + [(li, 'end') for li in fn_end_markers]
+    )
+    stack = []
+    start_to_end = {}
+    for li, kind in all_markers:
+        if kind == 'start':
+            stack.append(li)
+        else:
+            if stack:
+                start_li = stack.pop()
+                start_to_end[start_li] = li
+
+    # Map each fn-body-skip Jmp (line of its Jmp instruction) to the FN_START
+    # marker that immediately follows it.
+    jmp_to_fn_start = {}
+    for jp_li, _jp_ic in jmp_info:
         marker_text = markers.get(jp_li - 1, "")
         if "fn_end" in marker_text:
-            target_ic = consume_next_fn_end_after(jp_li)
-        if target_ic is None:
-            for em in end_markers:
-                if em > jp_li:
-                    for check_li in range(em + 1, len(lines)):
-                        if check_li in line_to_ic:
-                            target_ic = line_to_ic[check_li]
-                        break
-                break
-        if target_ic is None:
-            for em in or_end_markers:
-                if em > jp_li:
-                    for check_li in range(em + 1, len(lines)):
-                        if check_li in line_to_ic:
-                            target_ic = line_to_ic[check_li]
-                            break
+            for fs in fn_start_markers:
+                if fs > jp_li:
+                    jmp_to_fn_start[jp_li] = fs
                     break
-        if target_ic is None:
-            for em in else_markers:
-                if em > jp_li:
-                    for check_li in range(em + 1, len(lines)):
-                        if check_li in line_to_ic:
-                            target_ic = line_to_ic[check_li]
-                            break
-                    break
-        if target_ic is None:
-            target_ic = len(instr_lines)
+
+    # Patch remaining Jmp offsets (function-body skips and any unmatched ends).
+    for jp_li, jp_ic in reversed(jmp_info):
+        if jp_li in jmp_targets:
+            target_ic = jmp_targets[jp_li]
+        else:
+            marker_text = markers.get(jp_li - 1, "")
+            if "fn_end" in marker_text:
+                fs_li = jmp_to_fn_start.get(jp_li)
+                em = start_to_end.get(fs_li) if fs_li is not None else None
+                target_ic = instr_after(em) if em is not None else len(instr_lines)
+            else:
+                target_ic = len(instr_lines)
         if target_ic is not None:
             offset = target_ic - jp_ic
             old_word = [w for li, w in instr_lines if li == jp_li][0]
@@ -247,6 +319,7 @@ def fixup(lines: list[str]) -> list[str]:
                 if check_li in line_to_ic:
                     word = [w for cli, w in instr_lines if cli == check_li][0]
                     op = (word >> 24) & 0xFF
+                    assert op in (0x07, 0x90), f"Expected ConstU/Perform after const marker, got op 0x{op:02x} at line {check_li}"
                     if op == 0x07:  # ConstU
                         patched[check_li] = patch_constu(word, val_to_idx[entry])
                     elif op == 0x90:  # Perform

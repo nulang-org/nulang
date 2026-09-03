@@ -14,6 +14,9 @@ Transforms applied:
 import sys
 import re
 
+from prep_selfhost import transform_fns_for_self_host, rewrite_emit_word_calls
+from split_comp_for_self_host import split_comp_for_self_host, split_comp_deep_kws, thunk_wrap_let
+
 
 def strip_comments(src: str) -> str:
     lines = []
@@ -154,6 +157,16 @@ def curry_call_sites(source: str) -> str:
         result.append(source[i])
         i += 1
     return ''.join(result)
+
+
+def curry_call_sites_to_fixpoint(source: str) -> str:
+    """Apply curry_call_sites until a fixed point."""
+    prev = None
+    cur = source
+    while cur != prev:
+        prev = cur
+        cur = curry_call_sites(cur)
+    return cur
 
 
 def strip_type_annotations(params_str: str) -> str:
@@ -327,22 +340,31 @@ def parse_top_level_fns(source: str) -> tuple[list[tuple[str, list[str], str]], 
     return fns, rest
 
 
-def convert_to_let_chain(fns: list[tuple[str, list[str], str]], main_expr: str) -> str:
+def convert_to_let_chain(
+    fns: list[tuple[str, list[str], str]],
+    main_expr: str,
+    *,
+    transform_effects: bool = True,
+) -> str:
     """Wrap functions in nested let/in and curry definitions.
 
     If the final main expression is empty, invoke the `main` function.
     """
+    if main_expr is None:
+        main_expr = ""
     main_expr = main_expr.strip()
     if not main_expr and fns:
-        main_expr = f'{fns[-1][0]}()'
-    expr = transform_perform(main_expr)
-    expr = curry_call_sites(expr)
+        main_expr = f'let _ = {fns[-1][0]}() in 0'
+    expr = curry_call_sites_to_fixpoint(
+        transform_perform(main_expr) if transform_effects else main_expr
+    )
     for name, params, body in reversed(fns):
         body = flatten_blocks(body)
         body = _flatten_block_body(body)
         body = convert_operators(body)
-        body = transform_perform(body)
-        body = curry_call_sites(body)
+        body = curry_call_sites_to_fixpoint(
+            transform_perform(body) if transform_effects else body
+        )
         defn = curry_fn_definition(name, params, body)
         expr = f'let {defn} in {expr}'
     return expr
@@ -350,9 +372,40 @@ def convert_to_let_chain(fns: list[tuple[str, list[str], str]], main_expr: str) 
 
 def main():
     source = sys.stdin.read()
+    # Extract only the `not` keyword branch (smallest failing codegen). A
+    # 3-way let/if/not split fixed not/if-true but killed infix via layout
+    # churn; try the single smallest helper.
+    source = split_comp_deep_kws(source)
+    source = thunk_wrap_let(source)
     source = strip_comments(source)
     fns, main_expr = parse_top_level_fns(source)
-    result = convert_to_let_chain(fns, main_expr)
+    fns, main_expr = transform_fns_for_self_host(fns)
+    # Stage-2 self-host: keep the top-level frame tiny by moving all helper
+    # definitions inside the driver function.  The host compiler's register
+    # allocator otherwise runs out of frame registers on the long top-level
+    # let-chain and silently drops the trailing main() call.
+    if not main_expr:
+        kept: list[tuple[str, list[str], str]] = []
+        for name, params, body in fns:
+            if name == 'main':
+                main_expr = body
+            else:
+                kept.append((name, params, body))
+        fns = kept
+    # main's body is a semicolon-separated block like fn bodies; flatten it the
+    # same way before wrapping, or the `;` survives into the self-hosted source
+    # where compile_hex.nula's comp() cannot parse it (it stops at the `;`).
+    if main_expr:
+        main_expr = flatten_blocks(main_expr)
+        main_expr = _flatten_block_body(main_expr)
+        main_expr = convert_operators(main_expr)
+    if main_expr:
+        inner = convert_to_let_chain(fns, main_expr, transform_effects=True)
+        inner = rewrite_emit_word_calls(inner)
+        fns = [('main', [], inner)]
+        main_expr = 'main()'
+    result = convert_to_let_chain(fns, main_expr or 'main()', transform_effects=True)
+    result = rewrite_emit_word_calls(result)
     # Collapse whitespace to a single line (preserve necessary spaces around identifiers).
     result = re.sub(r'\s+', ' ', result).strip()
     print(result)

@@ -53,10 +53,15 @@ def main():
         elif s.startswith("; FN_START"):
             # Next non-comment line is the start of a function body
             fn_table.append(len(instructions))
+        elif s.startswith(";"):
+            continue
         else:
             word = parse_hex_word(s)
             if word is not None:
                 instructions.append(word)
+            else:
+                print(f"Error: malformed hex instruction {repr(s)}", file=sys.stderr)
+                sys.exit(1)
 
     if not instructions:
         print("Error: no hex instructions found", file=sys.stderr)
