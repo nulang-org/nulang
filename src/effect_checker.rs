@@ -120,6 +120,106 @@ pub fn effect_resource_category(eff: &Effect) -> Option<&'static str> {
     }
 }
 
+/// Effects whose observable outcome is not a deterministic function of the
+/// journaled state. Performing one unmediated inside a durable execution
+/// context (a workflow step, or the behavior of a `persistent`/`entity`
+/// actor) makes recovery replay diverge from the original run: the journal
+/// records one decision, the replay computes another. Handled effects never
+/// reach this set — `handle Time.now { ... }` remains a legal mediation
+/// escape hatch — and the mediated durable primitives (`Workflow.*`,
+/// `Timer.sleep`, `Signal.wait`) are journaled or suspended-and-resumed, so
+/// they never appear here.
+///
+/// `Inference` (and the `LLM`/`Provider` user effects) is deliberately NOT
+/// in the reject set: the runtime's documented recovery semantic is
+/// at-least-once — a suspended step re-asks on recovery (see
+/// `LLM_SUSPEND_MARKER` in `runtime/mod.rs`). Gating it at compile time
+/// would take model access away from durable agents with no mediated
+/// alternative; the known follow-up is to journal the completion so
+/// recovery resumes instead of re-asking.
+pub fn is_replay_unsafe_effect(eff: &Effect) -> bool {
+    matches!(
+        eff,
+        Effect::Rand
+            | Effect::Time
+            | Effect::Net
+            | Effect::FS
+            | Effect::DB
+            | Effect::Python
+            | Effect::FFI
+            | Effect::Env
+            | Effect::Process
+            | Effect::System
+            | Effect::Async
+            | Effect::Migrate
+            | Effect::Request
+            | Effect::Respond
+            | Effect::Realtime
+            | Effect::Client
+            | Effect::Web
+    )
+}
+
+/// Reject a `perform` at its source while the checker is inside a durable
+/// context. Complements the row-level check: gives a precise span for
+/// direct performs and catches operation-level hazards (`IO` is legal for
+/// deterministic print/log, but `IO.read` reads ambient stdin).
+fn check_durable_perform(
+    durable_scope: &str,
+    effect_name: &str,
+    op: &str,
+    eff: &Effect,
+    is_handled: bool,
+    span: Span,
+) -> NuResult<()> {
+    if is_handled {
+        return Ok(());
+    }
+    let ambient = is_replay_unsafe_effect(eff) || (effect_name == "IO" && op == "read");
+    if !ambient {
+        return Ok(());
+    }
+    Err(NuError::effect_error(
+        format!(
+            "`perform {}.{}` in {} performs an ambient non-deterministic effect, which is not deterministic across recovery replay; \
+             mediate it with a journaled effect (`Workflow.*`, `Timer.sleep`, `Signal.wait`), handle it locally, or move it outside the durable context",
+            effect_name, op, durable_scope
+        ),
+        span,
+    ))
+}
+
+/// Row-level half of the determinism gate: reject an inferred or declared
+/// row whose definite effects include ambient non-deterministic ones.
+/// Catches leakage through module-level callees (their rows propagate to
+/// the call site via `fn_rows`); direct performs are already rejected at
+/// their source by [`check_durable_perform`].
+fn check_durable_row(row: &EffectRow, scope: &str, span: Span) -> NuResult<()> {
+    let mut offending: Vec<String> = Vec::new();
+    for eff in row.effects() {
+        if is_replay_unsafe_effect(eff) {
+            let name = format!("{}", eff);
+            if !offending.contains(&name) {
+                offending.push(name);
+            }
+        }
+    }
+    if offending.is_empty() {
+        return Ok(());
+    }
+    Err(NuError::EffectError {
+        msg: format!(
+            "{} performs ambient non-deterministic effect(s) {} (at least one via a called function), which are not deterministic across recovery replay; \
+             mediate them with a journaled effect (`Workflow.*`, `Timer.sleep`, `Signal.wait`), handle them locally, or move the call out of the durable context",
+            scope,
+            offending.join(", ")
+        ),
+        span,
+        missing_effects: Some(offending),
+        allowed_effects: None,
+    })
+}
+
 /// Flatten nested `module {}` blocks into a single declaration list.
 ///
 /// Mirrors `typechecker::flatten_decls`: modules are purely a namespacing
@@ -492,6 +592,16 @@ pub struct EffectChecker {
     /// is granted; core language effects (IO, Spawn, Send, ...) are never
     /// gated. Populated from the `--with=` CLI flag.
     resource_grants: Option<FxHashSet<String>>,
+    /// Non-`None` while checking a durable execution context (a workflow step
+    /// or the behavior of a `persistent`/`entity` actor): a human-readable
+    /// scope label for determinism-gate errors ("workflow 'W' step
+    /// 'validate'"). While set, `infer_effects` rejects ambient
+    /// non-deterministic performs (Rand, Time, Net, FS, DB, Python, FFI,
+    /// Env, Process, System, Inference, Async, Migrate, web effects,
+    /// `IO.read`) at their source; the caller additionally validates the
+    /// inferred row so effects leaking through module-level callees are
+    /// caught too.
+    durable_scope: Option<String>,
 }
 
 impl EffectChecker {
@@ -506,6 +616,7 @@ impl EffectChecker {
             fn_rows: FxHashMap::default(),
             shadowed: Vec::new(),
             resource_grants: None,
+            durable_scope: None,
         }
     }
 
@@ -835,6 +946,15 @@ impl EffectChecker {
                     ));
                 }
 
+                // Determinism gate: inside a durable execution context
+                // (workflow step, persistent actor behavior) an ambient
+                // non-deterministic perform is rejected at its source with a
+                // precise span. Handled performs are legal mediation and
+                // pass through.
+                if let Some(scope) = &self.durable_scope {
+                    check_durable_perform(scope, effect, op, &eff, is_handled, *span)?;
+                }
+
                 let mut row = if is_handled {
                     EffectRow::empty()
                 } else {
@@ -1073,15 +1193,41 @@ impl EffectChecker {
                 None => self.infer_effects(&ctx, body).map(|_| ()),
             },
             Decl::Actor {
+                persistent,
                 behaviors,
                 state_fields,
                 init,
                 ..
             } => {
                 for b in behaviors {
-                    match &b.effect {
-                        Some(allowed) => self.check_effects(&ctx, &b.body, allowed)?,
-                        None => self.infer_effects(&ctx, &b.body).map(|_| ())?,
+                    if *persistent {
+                        // Determinism gate: a durable actor's journal is
+                        // replayed by re-running behavior bodies after
+                        // recovery, so ambient non-deterministic effects are
+                        // rejected. The declared row is gated too — an
+                        // explicit `! {Time}` assertion is still a replay
+                        // hazard, not a license. Un-annotated bodies keep
+                        // their inferred row so effects leaking through
+                        // module-level callees are caught as well.
+                        let scope = format!("behavior '{}' of persistent actor", b.name);
+                        if let Some(allowed) = &b.effect {
+                            check_durable_row(allowed, &scope, expr_span(&b.body))?;
+                        }
+                        self.durable_scope = Some(scope.clone());
+                        let result = match &b.effect {
+                            Some(allowed) => self.check_effects(&ctx, &b.body, allowed),
+                            None => {
+                                let row = self.infer_effects(&ctx, &b.body)?;
+                                check_durable_row(&row, &scope, expr_span(&b.body))
+                            }
+                        };
+                        self.durable_scope = None;
+                        result?;
+                    } else {
+                        match &b.effect {
+                            Some(allowed) => self.check_effects(&ctx, &b.body, allowed)?,
+                            None => self.infer_effects(&ctx, &b.body).map(|_| ())?,
+                        }
                     }
                 }
                 for (_, _, _, default) in state_fields {
@@ -1112,7 +1258,10 @@ impl EffectChecker {
                 self.check_decl(&actor)
             }
             Decl::Workflow {
-                items, compensate, ..
+                name,
+                items,
+                compensate,
+                ..
             } => {
                 for item in items {
                     let steps: &[WorkflowStep] = match item {
@@ -1120,14 +1269,37 @@ impl EffectChecker {
                         WorkflowItem::Parallel(steps) => steps,
                     };
                     for step in steps {
-                        self.infer_effects(&ctx, &step.body)?;
+                        // Determinism gate: a suspended step re-runs from its
+                        // last pre-suspend checkpoint on recovery, so its body
+                        // must not perform ambient non-deterministic effects.
+                        // Run inference under the durable scope (direct
+                        // performs are rejected at their source with a precise
+                        // span), then validate the inferred row (catches rows
+                        // leaking through module-level callees).
+                        let scope = format!("workflow '{}' step '{}'", name, step.name);
+                        self.durable_scope = Some(scope.clone());
+                        let result = self.infer_effects(&ctx, &step.body);
+                        self.durable_scope = None;
+                        let row = result?;
+                        check_durable_row(&row, &scope, step.span)?;
                         if let Some(comp) = &step.compensate {
-                            self.infer_effects(&ctx, comp)?;
+                            let comp_scope =
+                                format!("workflow '{}' step '{}' compensation", name, step.name);
+                            self.durable_scope = Some(comp_scope.clone());
+                            let comp_result = self.infer_effects(&ctx, comp);
+                            self.durable_scope = None;
+                            let comp_row = comp_result?;
+                            check_durable_row(&comp_row, &comp_scope, expr_span(comp))?;
                         }
                     }
                 }
                 if let Some(comp) = compensate {
-                    self.infer_effects(&ctx, comp)?;
+                    let scope = format!("workflow '{}' compensation", name);
+                    self.durable_scope = Some(scope.clone());
+                    let result = self.infer_effects(&ctx, comp);
+                    self.durable_scope = None;
+                    let row = result?;
+                    check_durable_row(&row, &scope, expr_span(comp))?;
                 }
                 Ok(())
             }
@@ -4214,5 +4386,162 @@ mod tests {
         let mut checker = EffectChecker::new();
         assert!(checker.check_module(&ast.decls).is_ok());
         assert!(checker.diagnostics.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Determinism gate: durable execution contexts (workflow steps and
+    // persistent/event-sourced actor behaviors) must not perform ambient
+    // non-deterministic effects, because journal replay after recovery
+    // re-runs their bodies and would diverge from the original run.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_workflow_step_rejects_ambient_time() {
+        let ast = parse_module("workflow W { step tick { perform Time.now() } }");
+        let mut checker = EffectChecker::new();
+        let err = checker.check_module(&ast.decls).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("Time"), "got: {msg}");
+        assert!(msg.contains("workflow 'W' step 'tick'"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_workflow_step_allows_deterministic_and_mediated_effects() {
+        // A step body is a single expression, so multi-effect bodies use an
+        // inner block.
+        let ast = parse_module(
+            r#"
+            workflow W {
+                step ok {
+                    { perform IO.print("progress"); perform Timer.sleep("t", 1000) }
+                }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_ok(),
+            "deterministic/mediated effects must pass the gate: {:?}",
+            checker.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_workflow_step_handled_effect_is_legal_mediation() {
+        let ast = parse_module(
+            r#"
+            workflow W {
+                step a {
+                    handle { perform Time.now(); 42 } { | Time.now() => 42 }
+                }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_ok(),
+            "locally handled ambient effect is legal mediation: {:?}",
+            checker.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_workflow_step_callee_leak_rejected() {
+        let ast = parse_module(
+            r#"
+            fn now() -> Int ! { Time } { perform Time.now() }
+            workflow W { step a { now() } }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        let err = checker.check_module(&ast.decls).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("Time"), "got: {msg}");
+        assert!(msg.contains("via a called function"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_workflow_step_io_read_rejected_but_print_allowed() {
+        let ast = parse_module(
+            r#"
+            workflow W {
+                step print_ok { perform IO.print("x") }
+                step read_bad { perform IO.read() }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        let err = checker.check_module(&ast.decls).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("IO.read"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_workflow_compensation_rejected_when_ambient() {
+        let ast = parse_module(
+            r#"
+            workflow W {
+                step a { 1 }
+                compensate { perform Time.now() }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        let err = checker.check_module(&ast.decls).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("compensation"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_persistent_actor_behavior_rejects_ambient_net() {
+        let ast = parse_module(
+            r#"
+            persistent actor Fetcher {
+                state durable cache: Int = 0
+                behavior tick() { perform Net.fetch("https://example.com") }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        let err = checker.check_module(&ast.decls).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("Net"), "got: {msg}");
+        assert!(msg.contains("behavior 'tick' of persistent actor"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_persistent_actor_deterministic_behaviors_pass() {
+        let ast = parse_module(
+            r#"
+            persistent actor Counter {
+                state durable count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+                behavior emit_log() { perform IO.print("inc") }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_ok(),
+            "deterministic persistent behaviors must pass the gate: {:?}",
+            checker.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_plain_actor_behavior_unaffected_by_gate() {
+        let ast = parse_module(
+            r#"
+            actor Clocky {
+                behavior now() { perform Time.now() }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_ok(),
+            "non-persistent actors are not replay surfaces: {:?}",
+            checker.diagnostics
+        );
     }
 }
