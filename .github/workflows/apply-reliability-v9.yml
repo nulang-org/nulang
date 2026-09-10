@@ -39,7 +39,7 @@ jobs:
       - name: Apply reliability transformation
         run: |
           set -euo pipefail
-          python3 .github/v9/apply.py
+          python3 .github/v9/driver.py
           bash -n scripts/ci/test_split_brain_stability.sh
           cargo fmt
           git diff --check
