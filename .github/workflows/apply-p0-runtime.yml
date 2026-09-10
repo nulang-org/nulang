@@ -216,24 +216,31 @@ jobs:
                       match differential_fuzz_one(&mutant) {
           ''')
 
-          replace_once(
-              "src/fuzz.rs",
-              '''                    divergence_count += 1;
-                      eprintln!("DIVERGENCE: {}", msg);
-                      if divergence_count >= 10 {
-          ''',
-              '''                    persist_divergence_artifact(
-                          shard_id,
-                          iteration,
-                          rng_state,
-                          seed,
-                          &mutant,
-                          &msg,
-                      );
-                      divergence_count += 1;
-                      eprintln!("DIVERGENCE: {}", msg);
-                      if divergence_count >= 10 {
-          ''')
+          p = Path("src/fuzz.rs")
+          text = p.read_text()
+          loop_anchor = "        for iteration in 0..iterations {\n"
+          loop_at = text.find(loop_anchor)
+          if loop_at < 0:
+              raise SystemExit("src/fuzz.rs: extended fuzz loop anchor missing after rewrite")
+          err_anchor = "                Err(msg) => {\n"
+          err_at = text.find(err_anchor, loop_at)
+          if err_at < 0:
+              raise SystemExit("src/fuzz.rs: divergence arm missing in extended fuzz loop")
+          insert_at = err_at + len(err_anchor)
+          artifact_call = (
+              "                    persist_divergence_artifact(\n"
+              "                        shard_id,\n"
+              "                        iteration,\n"
+              "                        rng_state,\n"
+              "                        seed,\n"
+              "                        &mutant,\n"
+              "                        &msg,\n"
+              "                    );\n"
+          )
+          if text.startswith("                    persist_divergence_artifact(", insert_at):
+              raise SystemExit("src/fuzz.rs: divergence artifact call already present")
+          p.write_text(text[:insert_at] + artifact_call + text[insert_at:])
+          print("updated src/fuzz.rs divergence artifact arm")
           PY
 
       - name: Format
