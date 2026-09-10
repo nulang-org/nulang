@@ -45,6 +45,28 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Added since 1.0.0-frozen — 2026-08-24
+
+- **VM: `ClosureCall` argument staging selection** (`src/vm.rs`). The callee
+  frame receives the full caller register set, with the real call arguments
+  re-selected into `r0..`/`r10..` via `pick_closure_call_arg` — supporting
+  both MIR staging (args in `r0..`) and self-hosted `compile_hex` staging
+  (`Move arg → r10` before `ClosureCall`, real argument in a high spill
+  temp). Also adds an env-gated `NULANG_TRACE` step trace dump (off unless
+  the variable is set).
+- **Self-hosting bootstrap fixes** (`bootstrap/`). `fixup_hex.py` repairs
+  the `()` hex digit the host compiler mis-emits for register 10 (the
+  closure-arg staging register) before patching jump targets, and the
+  `no_left` sentinel in `compile_hex.nula` / `golden_prep.nula` is factored
+  as `268435456 * 4096` to avoid a 2^40 literal overflow in the self-hosted
+  compiler. `bootstrap/verify.sh` checks 1–8 all pass; check 9 (full
+  self-compile oracle) remains blocked on a register-pressure bug in the
+  293-function self-compiled compiler (documented in `bootstrap/verify.sh`).
+- **MIR codegen: `Perform` dst spill protection** (`src/mir_codegen.rs`).
+  `Perform`/`PerformDirect`/`PerformAsync` now protect their destination
+  register from the `stage_args` spill temps (`r12..r14`), so a `dst`
+  landing in that zone is no longer clobbered before `spill_write_done`.
+
 ### Added since 1.0.0-frozen — 2026-08-22 (vscode extension)
 - **AOT backend error parity** (`src/aot/mod.rs`): the native AOT run path
   now surfaces interpreter-parity runtime errors (48-bit overflow, type

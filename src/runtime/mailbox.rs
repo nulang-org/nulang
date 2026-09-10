@@ -16,6 +16,7 @@ use crossbeam::queue::SegQueue;
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Message sent between actors.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +39,21 @@ pub enum MessagePriority {
     System = 0, // Urgent (failure signals, monitoring)
     Normal = 1, // Regular messages
     Bulk = 2,   // Bulk/non-urgent
+}
+
+/// What happens to a `Normal`/`Bulk` message when the mailbox is at
+/// capacity. `System` messages always bypass the limit under every policy,
+/// preserving BEAM/OTP reliability guarantees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MailboxOverflowPolicy {
+    /// Reject the incoming message: return `Err(msg)` and count it in
+    /// `rejected()`. The sender can decide what to do (the runtime's
+    /// fallback is to drop it, as before).
+    #[default]
+    Reject,
+    /// Drop the oldest normal message already queued and accept the new
+    /// one. The dropped message is counted in `dropped_oldest()`.
+    DropOldest,
 }
 
 /// MPSC mailbox with priority bands and optional capacity.
@@ -70,6 +86,11 @@ pub struct Mailbox {
     /// never touches this field.
     local_queue: UnsafeCell<VecDeque<Message>>,
     capacity: usize,
+    overflow_policy: MailboxOverflowPolicy,
+    /// Messages rejected at capacity under `Reject` (across both push paths).
+    rejected_count: AtomicU64,
+    /// Normal messages dropped to make room under `DropOldest`.
+    dropped_oldest_count: AtomicU64,
     /// Skip-buffer for non-matching normal messages drained during selective
     /// receive (`receive_match`). Messages stay here in FIFO order until a
     /// later `receive_match` finds a match. System messages are NOT placed
@@ -105,13 +126,46 @@ impl Mailbox {
     /// `capacity`: maximum total messages allowed.  `0` = unbounded
     /// (BEAM/OTP semantics).  `System` messages always bypass the limit.
     pub fn new(capacity: usize) -> Self {
+        Mailbox::with_policy(capacity, MailboxOverflowPolicy::Reject)
+    }
+
+    /// Create a mailbox with a capacity and an overflow policy.
+    ///
+    /// `capacity`: maximum total messages allowed.  `0` = unbounded
+    /// (BEAM/OTP semantics).  `System` messages always bypass the limit.
+    pub fn with_policy(capacity: usize, policy: MailboxOverflowPolicy) -> Self {
         Mailbox {
             system_queue: SegQueue::new(),
             normal_queue: SegQueue::new(),
             local_queue: UnsafeCell::new(VecDeque::new()),
             capacity,
+            overflow_policy: policy,
+            rejected_count: AtomicU64::new(0),
+            dropped_oldest_count: AtomicU64::new(0),
             skip_buffer: VecDeque::new(),
         }
+    }
+
+    /// Reconfigure the capacity and overflow policy. Scheduler-thread only
+    /// (call before the mailbox is shared with senders).
+    pub fn set_bounds(&mut self, capacity: usize, policy: MailboxOverflowPolicy) {
+        self.capacity = capacity;
+        self.overflow_policy = policy;
+    }
+
+    /// Configured overflow policy.
+    pub fn overflow_policy(&self) -> MailboxOverflowPolicy {
+        self.overflow_policy
+    }
+
+    /// Number of messages rejected at capacity under the `Reject` policy.
+    pub fn rejected(&self) -> u64 {
+        self.rejected_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of normal messages dropped to make room under `DropOldest`.
+    pub fn dropped_oldest(&self) -> u64 {
+        self.dropped_oldest_count.load(Ordering::Relaxed)
     }
 
     /// Push a message into the mailbox.
@@ -126,7 +180,23 @@ impl Mailbox {
             return Ok(());
         }
         if self.capacity > 0 && self.len() >= self.capacity {
-            return Err(msg);
+            match self.overflow_policy {
+                MailboxOverflowPolicy::Reject => {
+                    self.rejected_count.fetch_add(1, Ordering::Relaxed);
+                    return Err(msg);
+                }
+                MailboxOverflowPolicy::DropOldest => {
+                    // Cross-thread path: only the normal queue is touchable
+                    // from `&self`. Drop its oldest message; if it is empty
+                    // (all queued normal messages live in the scheduler-thread
+                    // local queue / skip buffer), fall back to rejecting.
+                    if self.normal_queue.pop().is_none() {
+                        self.rejected_count.fetch_add(1, Ordering::Relaxed);
+                        return Err(msg);
+                    }
+                    self.dropped_oldest_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         self.normal_queue.push(msg);
         Ok(())
@@ -147,7 +217,34 @@ impl Mailbox {
             return Ok(());
         }
         if self.capacity > 0 && self.len() >= self.capacity {
-            return Err(msg);
+            match self.overflow_policy {
+                MailboxOverflowPolicy::Reject => {
+                    self.rejected_count.fetch_add(1, Ordering::Relaxed);
+                    return Err(msg);
+                }
+                MailboxOverflowPolicy::DropOldest => {
+                    // Scheduler thread: drop the oldest NORMAL message.
+                    // System messages are never dropped. The local queue can
+                    // hold System messages (push_local bypasses the capacity
+                    // check for System), so exhaustively scan the FRONT of
+                    // the queue (rotating System entries to the back) until
+                    // the first Normal/Bulk is found — no System is evicted.
+                    // The skip buffer and cross-thread normal queue hold only
+                    // Normal/Bulk messages, so their fronts are safe.
+                    let dropped = self
+                        .local_queue_mut()
+                        .iter()
+                        .position(|m| m.priority != MessagePriority::System)
+                        .map(|idx| self.local_queue_mut().remove(idx).unwrap())
+                        .or_else(|| self.skip_buffer.pop_front().map(|(m, _)| m))
+                        .or_else(|| self.normal_queue.pop());
+                    if dropped.is_none() {
+                        self.rejected_count.fetch_add(1, Ordering::Relaxed);
+                        return Err(msg);
+                    }
+                    self.dropped_oldest_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         self.local_queue_mut().push_back(msg);
         Ok(())
@@ -350,6 +447,112 @@ mod tests {
             priority: MessagePriority::Normal,
             trace_id: None,
         }
+    }
+
+    /// Helper to build a System-priority test message.
+    fn make_system_msg(behavior_id: u16, sender: u64) -> Message {
+        Message {
+            behavior_id,
+            payload: Arc::new(vec![Value::int(0)]),
+            sender,
+            priority: MessagePriority::System,
+            trace_id: None,
+        }
+    }
+
+    // Overflow policy: Reject (default).
+
+    #[test]
+    fn test_reject_policy_returns_err_and_counts() {
+        let mb = Mailbox::with_policy(2, MailboxOverflowPolicy::Reject);
+        assert_eq!(mb.overflow_policy(), MailboxOverflowPolicy::Reject);
+        assert!(mb.push(make_msg(1, 1)).is_ok());
+        assert!(mb.push(make_msg(2, 2)).is_ok());
+        let over = mb.push(make_msg(3, 3));
+        assert!(over.is_err(), "third normal message must be rejected at capacity");
+        assert_eq!(mb.len(), 2);
+        assert_eq!(mb.rejected(), 1);
+        // System messages always bypass the limit.
+        assert!(mb.push(make_system_msg(9, 9)).is_ok());
+        assert_eq!(mb.len(), 3);
+    }
+
+    #[test]
+    fn test_reject_policy_push_local_counts() {
+        let mut mb = Mailbox::with_policy(1, MailboxOverflowPolicy::Reject);
+        assert!(mb.push_local(make_msg(1, 1)).is_ok());
+        assert!(mb.push_local(make_msg(2, 2)).is_err());
+        assert_eq!(mb.len(), 1);
+        assert_eq!(mb.rejected(), 1);
+        assert!(mb.push_local(make_system_msg(9, 9)).is_ok());
+        assert_eq!(mb.len(), 2);
+    }
+
+    // Overflow policy: DropOldest.
+
+    #[test]
+    fn test_drop_oldest_drops_oldest_local_and_accepts() {
+        let mut mb = Mailbox::with_policy(2, MailboxOverflowPolicy::DropOldest);
+        assert!(mb.push_local(make_msg(1, 1)).is_ok());
+        assert!(mb.push_local(make_msg(2, 2)).is_ok());
+        // Third message at capacity: oldest (behavior 1) is dropped.
+        assert!(mb.push_local(make_msg(3, 3)).is_ok());
+        assert_eq!(mb.len(), 2);
+        assert_eq!(mb.dropped_oldest(), 1);
+        assert_eq!(mb.pop().unwrap().behavior_id, 2, "oldest survives");
+        assert_eq!(mb.pop().unwrap().behavior_id, 3, "newest accepted");
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn test_drop_oldest_never_drops_system() {
+        // Capacity counts ALL queues (local + skip-buffer + cross-thread
+        // normal). System messages bypass the capacity check entirely, so
+        // push System first along with one Normal (len() == 2 == capacity).
+        // A third push (Normal) must evict the FIRST Normal, never the
+        // System — the eviction scan skips System messages.
+        let mut mb = Mailbox::with_policy(2, MailboxOverflowPolicy::DropOldest);
+        assert!(mb.push_local(make_system_msg(9, 9)).is_ok());
+        assert!(mb.push_local(make_msg(1, 1)).is_ok());
+        assert!(mb.push_local(make_msg(2, 2)).is_ok());
+        assert_eq!(mb.len(), 2);
+        assert_eq!(mb.dropped_oldest(), 1);
+        assert_eq!(mb.pop().unwrap().behavior_id, 9, "system pops first");
+        assert_eq!(mb.pop().unwrap().behavior_id, 2, "newest normal survives");
+    }
+
+    #[test]
+    fn test_drop_oldest_cross_thread_falls_back_to_reject() {
+        // &self push (network thread) can only evict the normal queue. When
+        // all queued messages live in the scheduler-thread local queue, it
+        // falls back to rejecting the incoming message.
+        let mut mb = Mailbox::with_policy(1, MailboxOverflowPolicy::DropOldest);
+        assert!(mb.push_local(make_msg(1, 1)).is_ok());
+        assert!(mb.push(make_msg(2, 2)).is_err(), "cannot evict local-only queue from &self");
+        assert_eq!(mb.rejected(), 1);
+        assert_eq!(mb.len(), 1);
+    }
+
+    #[test]
+    fn test_drop_oldest_cross_thread_evicts_normal_queue() {
+        let mb = Mailbox::with_policy(1, MailboxOverflowPolicy::DropOldest);
+        assert!(mb.push(make_msg(1, 1)).is_ok());
+        assert!(mb.push(make_msg(2, 2)).is_ok(), "oldest normal evicted, new accepted");
+        assert_eq!(mb.len(), 1);
+        assert_eq!(mb.dropped_oldest(), 1);
+    }
+
+    #[test]
+    fn test_set_bounds_reconfigures() {
+        let mut mb = Mailbox::with_policy(5, MailboxOverflowPolicy::Reject);
+        assert_eq!(mb.capacity(), 5);
+        mb.set_bounds(1, MailboxOverflowPolicy::DropOldest);
+        assert_eq!(mb.capacity(), 1);
+        assert_eq!(mb.overflow_policy(), MailboxOverflowPolicy::DropOldest);
+        assert!(mb.push(make_msg(1, 1)).is_ok());
+        assert!(mb.push(make_msg(2, 2)).is_ok(), "DropOldest now applies");
+        assert_eq!(mb.len(), 1);
+        assert_eq!(mb.dropped_oldest(), 1);
     }
 
     // Test 1: Basic push/pop round-trip.
