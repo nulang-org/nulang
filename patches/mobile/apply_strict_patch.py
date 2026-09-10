@@ -3,12 +3,14 @@
 
 Stale line numbers are ignored for matching. Repeated byte-identical blocks may
 use a bounded non-placeholder line hint for disambiguation. A placeholder hunk
-(`@@ -1 ...`) is skipped only when a later hunk for the same file strictly
-subsumes both its old and new text. No fuzzy context is accepted.
+(`@@ -1 ...`) is skipped only when a later, larger hunk for the same file
+contains all lines actually removed and added by that placeholder. No fuzzy
+context is accepted.
 """
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -31,6 +33,11 @@ class Hunk:
     @property
     def new_text(self) -> str:
         return "".join(self.new)
+
+    def changed_lines(self) -> tuple[Counter[str], Counter[str]]:
+        old = Counter(self.old)
+        new = Counter(self.new)
+        return old - new, new - old
 
 
 @dataclass
@@ -106,19 +113,26 @@ def ident(hunk: Hunk) -> str:
     return f"source_hint={hunk.old_start}, first={first!r}"
 
 
+def counter_contains(haystack: Counter[str], needle: Counter[str]) -> bool:
+    return all(haystack[line] >= count for line, count in needle.items())
+
+
 def is_subsumed_placeholder(patches: list[FilePatch], block_index: int, hunk: Hunk) -> bool:
     if hunk.old_start > 1 or not hunk.old_text:
+        return False
+    removed, added = hunk.changed_lines()
+    if not removed and not added:
         return False
     path = patches[block_index].path
     for later in patches[block_index + 1:]:
         if later.path != path:
             continue
         for later_hunk in later.hunks:
-            if (
-                hunk.old_text in later_hunk.old_text
-                and hunk.new_text in later_hunk.new_text
-                and len(later_hunk.old_text) > len(hunk.old_text)
-            ):
+            if len(later_hunk.old_text) <= len(hunk.old_text):
+                continue
+            later_old = Counter(later_hunk.old)
+            later_new = Counter(later_hunk.new)
+            if counter_contains(later_old, removed) and counter_contains(later_new, added):
                 return True
     return False
 
