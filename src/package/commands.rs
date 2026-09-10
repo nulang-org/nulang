@@ -1,6 +1,7 @@
 //! `nula` CLI subcommands: `new`, `init`, `build`, `build-wasm`, `test`, `run`,
 //! `list`, `clean`, `add`, `remove`, `watch`, `publish`, `deploy`.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -875,47 +876,105 @@ fn capability_args() -> Vec<String> {
     }
 }
 
+/// Try to find an already-built `nulang` CLI executable. Returns `None` if no
+/// standalone binary is available (e.g. during `cargo test --lib` where only
+/// the test harness exists).
+fn try_find_existing_nulang_binary() -> Option<PathBuf> {
+    // 1. Cargo-provided binary path (integration tests / examples).
+    if let Some(p) = std::env::var_os("CARGO_BIN_EXE_nulang") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    // 2. Binary next to the current test harness: target/<profile>/nulang.
+    let current_exe = std::env::current_exe().ok();
+    if let Some(p) = current_exe.as_ref().and_then(|p| {
+        p.parent()
+            .and_then(|deps| deps.parent())
+            .map(|profile| profile.join("nulang"))
+            .filter(|candidate| candidate.is_file())
+    }) {
+        return Some(p);
+    }
+
+    // 3. Coverage runs / custom target dirs: ask cargo metadata for the
+    // workspace target directory and look in debug/release profiles.
+    let out = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let td = meta.get("target_directory")?.as_str()?;
+    for profile in ["debug", "release"] {
+        let candidate = std::path::Path::new(td).join(profile).join("nulang");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    // 4. If the current process is itself the `nulang` CLI, use it.
+    if let Some(p) = current_exe {
+        if p.file_stem() == Some(std::ffi::OsStr::new("nulang")) && p.is_file() {
+            return Some(p);
+        }
+    }
+
+    None
+}
+
+/// Locate the real `nulang` CLI executable. If the standalone binary does not
+/// already exist (typical for `cargo test --lib`), build it on demand so that
+/// package-manager tests do not accidentally invoke the test harness.
+fn locate_nulang_exe() -> NuResult<PathBuf> {
+    static PATH: std::sync::OnceLock<NuResult<PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        if let Some(p) = try_find_existing_nulang_binary() {
+            return Ok(p);
+        }
+
+        // Build on demand for tests / coverage where the standalone binary has
+        // not been produced alongside the test harness.
+        eprintln!("nulang binary not found; building it for package-manager tests...");
+        let out = std::process::Command::new("cargo")
+            .args(["build", "--bin", "nulang", "--quiet"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output();
+        match out {
+            Ok(out) if out.status.success() => {
+                if let Some(p) = try_find_existing_nulang_binary() {
+                    Ok(p)
+                } else {
+                    Err(NuError::PackageError {
+                        msg: "built nulang binary but could not locate it afterwards".to_string(),
+                        span: Span::default(),
+                    })
+                }
+            }
+            Ok(out) => Err(NuError::PackageError {
+                msg: format!(
+                    "failed to build nulang binary:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                span: Span::default(),
+            }),
+            Err(e) => Err(NuError::PackageError {
+                msg: format!("could not run cargo build --bin nulang: {}", e),
+                span: Span::default(),
+            }),
+        }
+    })
+    .clone()
+}
+
 /// Run the current `nulang` executable with `args`, inheriting stdio.
 fn nulang_exe(args: &[&str]) -> NuResult<()> {
-    // When running inside `cargo test`, the current executable is the test
-    // harness, not the CLI binary. `CARGO_BIN_EXE_nulang` points to the real
-    // binary when cargo builds it alongside integration tests; for unit tests
-    // we fall back to `target/<profile>/nulang` next to the deps directory.
-    let current_exe = std::env::current_exe().ok();
-    let exe = std::env::var_os("CARGO_BIN_EXE_nulang")
-        .map(PathBuf::from)
-        .filter(|p| p.is_file())
-        .or_else(|| {
-            current_exe.as_ref().and_then(|p| {
-                p.parent()
-                    .and_then(|deps| deps.parent())
-                    .map(|profile| profile.join("nulang"))
-                    .filter(|candidate| candidate.is_file())
-            })
-        })
-        .or_else(|| {
-            // Coverage runs (`cargo llvm-cov`) use a separate target dir
-            // that has no standalone binary next to the test harness.
-            // Resolve the repo's configured target dir via cargo metadata
-            // (same approach as conformance/run.py) and use its debug bin.
-            let out = std::process::Command::new("cargo")
-                .args(["metadata", "--format-version", "1", "--no-deps"])
-                .current_dir(env!("CARGO_MANIFEST_DIR"))
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            let meta: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-            let td = meta.get("target_directory")?.as_str()?;
-            let candidate = std::path::Path::new(td).join("debug").join("nulang");
-            candidate.is_file().then_some(candidate)
-        })
-        .or_else(|| current_exe.clone())
-        .ok_or_else(|| NuError::PackageError {
-            msg: "cannot locate nulang executable".to_string(),
-            span: Span::default(),
-        })?;
+    let exe = locate_nulang_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.args(args);
     // Auto-detect the stdlib directory relative to the executable so
@@ -1124,10 +1183,7 @@ fn cmd_build_json(root: &Path, name: &str, entry_str: &str) -> NuResult<()> {
 /// Run the nulang exe with piped stdout/stderr, returning the full output.
 /// Used by `--json` modes where child output must not reach our stdout.
 fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
-    let exe = std::env::current_exe().map_err(|e| NuError::PackageError {
-        msg: format!("cannot locate nulang executable: {}", e),
-        span: Span::default(),
-    })?;
+    let exe = locate_nulang_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.args(args);
     cmd.stdout(std::process::Stdio::piped());
@@ -1137,6 +1193,13 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
             let candidate = exe_dir.join("stdlib");
             if candidate.is_dir() {
                 cmd.env("NULANG_STDLIB", &candidate);
+            } else {
+                let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join("stdlib");
+                if dev.is_dir() {
+                    cmd.env("NULANG_STDLIB", &dev);
+                }
             }
         }
     }
@@ -1214,7 +1277,10 @@ fn cmd_run_watch() -> NuResult<()> {
                     let es = entry.to_string_lossy().into_owned();
                     let _ = nulang_exe(&[&es]);
                 }
-                Err(e) => eprintln!("Error: {}", e),
+                Err(e) => {
+                    let use_color = std::io::stderr().is_terminal();
+                    eprint!("{}", crate::diagnostic::format_diagnostic(&e, use_color));
+                }
             }
         }
     }
@@ -1855,7 +1921,7 @@ fn run_test_file(file_path: &str) -> Result<(), String> {
 }
 
 fn run_test_file_impl(file_path: &str, inherit_stdout: bool) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate nulang: {}", e))?;
+    let exe = locate_nulang_exe().map_err(|e| format!("cannot locate nulang: {}", e))?;
     let mut cmd = Command::new(&exe);
     cmd.arg(file_path);
     cmd.args(capability_args());

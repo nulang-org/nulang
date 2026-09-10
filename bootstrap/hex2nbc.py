@@ -26,14 +26,28 @@ def main():
             try:
                 inside = s.split("[", 1)[1].rsplit("]", 1)[0]
                 pool = []
-                for x in inside.split(","):
-                    x = x.strip()
+                i = 0
+                while i < len(inside):
+                    x = inside[i].strip()
                     if not x:
+                        i += 1
                         continue
-                    if x.startswith('"') and x.endswith('"'):
-                        pool.append(("str", x[1:-1]))
+                    if x == '"':
+                        j = i + 1
+                        while j < len(inside) and inside[j] != '"':
+                            j += 1
+                        sval = inside[i + 1:j]
+                        pool.append(("str", sval))
+                        i = j + 1
                     else:
-                        pool.append(("int", int(x)))
+                        j = i + 1
+                        while j < len(inside) and inside[j] != ',':
+                            j += 1
+                        ival = int(inside[i:j].strip())
+                        pool.append(("int", ival))
+                        i = j
+                    while i < len(inside) and inside[i] == ',':
+                        i += 1
             except: pass
         elif s.startswith("; FN_START"):
             # Next non-comment line is the start of a function body

@@ -625,6 +625,8 @@ pub enum FfiType {
     String,
     Unit,
     Pointer,
+    /// Opaque Nulang value (C API only; not expressible in `extern` blocks).
+    Value,
 }
 
 /// A foreign function declared in an `extern "lib" { ... }` block.
@@ -780,6 +782,25 @@ impl CodeModule {
         let idx = self.constants.len();
         self.constants.push(c);
         idx
+    }
+
+    /// Append a string constant and return its pool index so that embedders
+    /// can manufacture `Value::string` values for a compiled module.
+    pub fn add_string_constant(&mut self, s: impl Into<String>) -> usize {
+        self.add_constant(Constant::String(s.into()))
+    }
+
+    /// Find the bytecode offset of a top-level function by name using the
+    /// debug-function table. Returns `None` if the name is not found or belongs
+    /// to an actor behavior (behaviors are not in `function_table`).
+    pub fn function_offset_by_name(&self, name: &str) -> Option<usize> {
+        let info = self.debug_functions.iter().find(|d| d.name == name)?;
+        // `debug_functions` and `function_table` are populated in the same order
+        // for ordinary functions, but behaviors also appear in `debug_functions`
+        // after the function table ends. Verify the offset matches an entry.
+        self.function_table
+            .iter()
+            .position(|&off| off == info.code_offset)
     }
 
     pub fn add_behavior(&mut self, b: BehaviorTableEntry) -> usize {

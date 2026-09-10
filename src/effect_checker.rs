@@ -10,10 +10,8 @@ use crate::ast::*;
 use crate::types::*;
 
 // Fast hashing for compiler-internal maps (keys are not attacker-controlled).
-type FxHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
-type FxHashSet<T> =
-    std::collections::HashSet<T, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+type FxHashMap<K, V> = rustc_hash::FxHashMap<K, V>;
+type FxHashSet<T> = rustc_hash::FxHashSet<T>;
 
 // ---------------------------------------------------------------------------
 // Effect Row Operations
@@ -498,6 +496,13 @@ impl EffectChecker {
     /// Look up the inferred effect row of a module-level function.
     pub fn function_row(&self, name: &str) -> Option<&EffectRow> {
         self.fn_rows.get(name)
+    }
+
+    /// Return a clone of the map from module-level function names to their
+    /// inferred effect rows. Useful for LSP features that want to avoid
+    /// recomputing the effect checker.
+    pub fn function_rows(&self) -> FxHashMap<String, EffectRow> {
+        self.fn_rows.clone()
     }
 
     pub fn new() -> Self {

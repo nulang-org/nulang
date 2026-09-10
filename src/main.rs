@@ -347,7 +347,7 @@ fn main() {
                     opts.store_path = Some(args[i + 1].clone());
                     i += 1;
                 } else {
-                    eprintln!("Error: --store requires a directory path argument");
+                    eprintln!("Error: --store requires a store URI argument");
                     std::process::exit(1);
                 }
             }
@@ -1009,10 +1009,13 @@ struct Options {
     with_capabilities: Vec<String>,
     /// Target ISA for AOT compilation: native (default), ptx, riscv64
     target: String,
-    /// Durable store directory for programs that declare durable/persistent
+    /// Durable store URI for programs that declare durable/persistent
     /// entities. `None` = resolve at run time: `NULANG_STORE_PATH` env var,
     /// else `.nulang/store/`. Only consulted when the program declares
     /// durable entities; other programs keep the in-memory store.
+    ///
+    /// Supported forms: `<dir>` or `json:<dir>` (JSON file store),
+    /// `rocksdb:<path>`, and `postgres:<conn_str>`.
     store_path: Option<String>,
     /// Escalate warnings (e.g. RFC 0015 deprecations) to a hard error.
     deny_warnings: bool,
@@ -1113,8 +1116,9 @@ fn print_help() {
     println!("  --metrics-port <N>  Start Prometheus metrics server on port N");
     println!("  --emit-signals <file> Emit signal graph JSON for the web framework");
     println!("  --rewrite-signals <file> Rewrite HTML for signals and emit client JS");
-    println!("  --store <dir>    Durable store directory for programs declaring durable");
-    println!("                   entities (default: $NULANG_STORE_PATH or .nulang/store/)");
+    println!("  --store <uri>    Durable store URI for programs declaring durable");
+    println!("                   entities (default: $NULANG_STORE_PATH or .nulang/store/).");
+    println!("                   Forms: <dir>|json:<dir>|rocksdb:<path>|postgres:<conn_str>");
     println!("  --color auto|always|never  Colorize error output (default: auto)");
     println!("  -h, --help       Show this help message");
 }
@@ -1364,21 +1368,10 @@ fn run_node_cmd(_args: &[String]) -> NuResult<()> {
 }
 
 fn print_error(err: &NuError, use_color: bool) {
-    // Prefer the ariadne-based renderer (source snippet with carets/labels,
-    // notes, and a stable `Error[Exxxx]` code). It returns `None` when no
-    // thread-local SourceMap is installed (e.g. errors raised before lexing
-    // or in synthetic contexts) — fall back to the hand-rolled rich format.
-    // Non-tty/CI output stays plain `Display` so tooling (and the
-    // conformance suite) can match on stable `Error: ...` prefixes.
-    if use_color {
-        if let Some(rendered) = nulang::diagnostic::render(err, true) {
-            eprint!("{rendered}");
-        } else {
-            eprint!("{}", err.format_rich());
-        }
-    } else {
-        eprintln!("Error: {}", err);
-    }
+    // Use the canonical rich diagnostic renderer (ariadne source snippet when
+    // a source map is installed, plain Rust-style fallback otherwise). The
+    // rendered report already ends with a newline.
+    eprint!("{}", nulang::diagnostic::format_diagnostic(err, use_color));
 }
 
 /// Resolve the `--color` flag against `is_terminal`.
@@ -1890,7 +1883,65 @@ fn run_source(
                 return Ok(());
             }
 
-            let result_raw = aot_module.run()?;
+            // Modules that declare actors need a real Runtime: spawn/send must
+            // create live actors and the scheduler must drain their mailboxes.
+            // Pure modules can use the synchronous standalone runner.
+            let has_actors = !mir.behaviors.is_empty();
+            let result_raw = if has_actors {
+                let mut rt = nulang::runtime::Runtime::new();
+                let has_durable = ast.decls.iter().any(|d| {
+                    matches!(
+                        d,
+                        nulang::ast::Decl::Actor {
+                            persistent: true,
+                            ..
+                        }
+                    )
+                }) || matches!(
+                    ast.decls.iter().find(|d| matches!(d, nulang::ast::Decl::Actor { .. })),
+                    Some(nulang::ast::Decl::Actor { state_fields, .. })
+                        if state_fields.iter().any(|(_, model, _, _)| matches!(
+                            model,
+                            nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
+                        ))
+                );
+                let store_dir = if has_durable {
+                    Some(
+                        store_path
+                            .map(|s| s.to_string())
+                            .or_else(|| std::env::var("NULANG_STORE_PATH").ok())
+                            .unwrap_or_else(|| ".nulang/store".to_string()),
+                    )
+                } else {
+                    None
+                };
+                if let Some(dir) = store_dir.as_deref() {
+                    install_persistence_store(&mut rt, dir)?;
+                }
+                if let Some(port) = metrics_port {
+                    let _ = rt.enable_metrics_server(port);
+                }
+                let raw = aot_module.run_in_runtime(&mut rt)?;
+                let failures = rt.workflow_failures();
+                if !failures.is_empty() {
+                    for (step_name, error) in &failures {
+                        eprintln!("workflow step '{}' failed: {}", step_name, error);
+                    }
+                    std::process::exit(1);
+                }
+                if verbose {
+                    let snap = rt.metrics_snapshot();
+                    match serde_json::to_string(&snap) {
+                        Ok(json) => eprintln!("[metrics] {}", json),
+                        Err(_) => eprintln!("[metrics] <serialization error>"),
+                    }
+                    eprintln!("{}", rt.render_topology());
+                }
+                rt.publish_metrics();
+                raw
+            } else {
+                aot_module.run()?
+            };
             let result = nulang::vm::Value::from_raw(result_raw);
             let result_str = result.to_string_repr();
             if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
@@ -2027,18 +2078,71 @@ fn run_source(
     }
 }
 
-/// Swap a runtime's in-memory persistence store for a file-backed
-/// [`JsonFileStore`](nulang::runtime::JsonFileStore) rooted at `dir`.
+/// Swap a runtime's in-memory persistence store for the backend described by
+/// `uri`.
+///
+/// Supported URI forms:
+/// - `<dir>` or `json:<dir>` — JSON file store (`JsonFileStore`).
+/// - `rocksdb:<path>` — RocksDB backend (requires the `rocksdb` feature).
+/// - `postgres:<conn_str>` — PostgreSQL backend (requires the `postgres`
+///   feature).
+///
 /// Used by `nulang run` when the program declares durable/event-sourced
 /// entities so their state survives process restarts.
-fn install_file_store(runtime: &mut nulang::runtime::Runtime, dir: &str) -> NuResult<()> {
-    let store = nulang::runtime::JsonFileStore::new(dir).map_err(|e| NuError::RuntimeError {
-        msg: format!("failed to open durable store at '{}': {}", dir, e),
-        span: Span::default(),
-    })?;
-    runtime.persistence = Box::new(store);
-    eprintln!("[durable] persistent store: {}", dir);
-    Ok(())
+fn install_persistence_store(runtime: &mut nulang::runtime::Runtime, uri: &str) -> NuResult<()> {
+    if uri.starts_with("rocksdb:") {
+        #[cfg(feature = "rocksdb")]
+        {
+            let path = &uri["rocksdb:".len()..];
+            let store =
+                nulang::runtime::RocksDbStore::new(path).map_err(|e| NuError::RuntimeError {
+                    msg: format!("failed to open RocksDB store at '{}': {}", path, e),
+                    span: Span::default(),
+                })?;
+            runtime.persistence = Box::new(store);
+            eprintln!("[durable] RocksDB persistent store: {}", path);
+            Ok(())
+        }
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            Err(NuError::RuntimeError {
+                msg: "RocksDB persistence backend is not enabled (rebuild with --features rocksdb)"
+                    .to_string(),
+                span: Span::default(),
+            })
+        }
+    } else if uri.starts_with("postgres:") {
+        #[cfg(feature = "postgres")]
+        {
+            let conn = &uri["postgres:".len()..];
+            let store =
+                nulang::runtime::PostgresStore::new(conn).map_err(|e| NuError::RuntimeError {
+                    msg: format!("failed to connect to PostgreSQL '{}': {}", conn, e),
+                    span: Span::default(),
+                })?;
+            runtime.persistence = Box::new(store);
+            eprintln!("[durable] PostgreSQL persistent store: {}", conn);
+            Ok(())
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            Err(NuError::RuntimeError {
+                msg: "PostgreSQL persistence backend is not enabled (rebuild with --features postgres)"
+                    .to_string(),
+                span: Span::default(),
+            })
+        }
+    } else {
+        let dir = uri.strip_prefix("json:").unwrap_or(uri);
+        let store =
+            nulang::runtime::JsonFileStore::new(dir).map_err(|e| NuError::RuntimeError {
+                msg: format!("failed to open durable store at '{}': {}", dir, e),
+                span: Span::default(),
+            })?;
+        runtime.persistence = Box::new(store);
+        eprintln!("[durable] persistent store: {}", dir);
+        Ok(())
+    }
 }
 
 /// Execute a module that declares actors against a real `Runtime`.
@@ -2069,7 +2173,7 @@ fn run_with_runtime(
         let mut shards = nulang::runtime::Runtime::new_sharded(num_shards);
         if let Some(dir) = store_dir {
             for shard in &mut shards {
-                install_file_store(shard, dir)?;
+                install_persistence_store(shard, dir)?;
             }
         }
         for shard in &mut shards {
@@ -2122,7 +2226,7 @@ fn run_with_runtime(
     } else {
         let runtime = std::rc::Rc::new(std::cell::RefCell::new(nulang::runtime::Runtime::new()));
         if let Some(dir) = store_dir {
-            install_file_store(&mut runtime.borrow_mut(), dir)?;
+            install_persistence_store(&mut runtime.borrow_mut(), dir)?;
         }
         runtime.borrow_mut().register_module_grains(&m);
         let mut vm = VM::new();

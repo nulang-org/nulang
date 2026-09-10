@@ -2815,7 +2815,7 @@ fn compile_rvalue(
             }
             // Bit-pack the signature: low 3 bits = return CType tag, then 3
             // bits per parameter (I64=0, F64=1, Bool=2, CStr=3, VoidPtr=4,
-            // Unit=5).
+            // Unit=5, Value=6).
             let ctype_tag = |c: crate::ffi::marshal::CType| -> u64 {
                 match c {
                     crate::ffi::marshal::CType::I64 => 0,
@@ -2824,6 +2824,7 @@ fn compile_rvalue(
                     crate::ffi::marshal::CType::CStr => 3,
                     crate::ffi::marshal::CType::VoidPtr => 4,
                     crate::ffi::marshal::CType::Unit => 5,
+                    crate::ffi::marshal::CType::Value => 6,
                 }
             };
             let mut sig: u64 = ctype_tag(ret);
