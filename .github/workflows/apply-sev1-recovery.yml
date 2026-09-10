@@ -36,19 +36,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Apply audited recovery patches
+      - name: Apply audited recovery transformation
         shell: bash
         run: |
           set -euo pipefail
-          for patch in \
-            .github/sev1/01-native-error-hotfix.patch \
-            .github/sev1/02-jit-controlflow-hotfix.patch \
-            .github/sev1/03-nightly-observability.patch
-          do
-            echo "=== applying $patch ==="
-            git apply --check "$patch"
-            git apply "$patch"
-          done
+          python3 .github/sev1/apply.py
           cargo fmt
           git diff --check
 
