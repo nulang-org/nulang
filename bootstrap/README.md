@@ -36,21 +36,20 @@ to `.nbc` binary (RFC 0001) by `fixup_hex.py` + `hex2nbc.py`.
 
 ### Stage 2 (In Progress — Self-compiling)
 A full Nulang Core parser + type-checker + code generator, written in Nulang
-Core, that compiles itself. `verify.sh` check 6 proves the bootstrap handles
-whole **multi-fn programs** end-to-end: `desugar_fns.py` lowers top-level
-`fn` definitions into a let-binding chain, `compile_hex.nula` compiles it to
-hex, and the VM runs the resulting `.nbc`. Recursion (fib) works through the
-pipeline (check 5).
+Core, that compiles itself. `verify.sh` checks 1–6 are passing: single
+expressions, recursion (fib), and multi-fn programs compile and run through
+`compile_hex.nula`.
 
-**Known blocker:** the 3-argument `nperform` path (`String.charAt`, which
-takes 2 args) emits a corrupted effect-name constant — `compile_hex.nula`'s
-`comp` function has 178 locals, so the host compiler's MIR register
-allocator spills and clobbers live string values (`"const "` literal reads
-empty, `eff_name` gains a leading quote). This is the documented
-`src/mir_codegen.rs` register-spill bug class (see
-`bootstrap/spill_bug_repro.nula`); the existing repro passes, but the
-3-arg-`nperform`-inside-`comp` shape is a residual manifestation not yet
-captured by a repro. `String.length` (1-arg) and `IO.print` work.
+**Known blocker:** the self-compile oracle (check 7) is disabled. The host
+compiler can build `bootstrap/self_compile.nbc` from `prep_core.py` output,
+but running the self-hosted compiler on any input returns a closure value
+(e.g. `#Value(7ff7000000000068)`) instead of hex bytecode. The closure is
+created while the program builds its top-level function table; the final
+`main()` call does not execute or does not return unit. The root cause is
+still under investigation — it is **not** the previously suspected host
+register-spill bug (simple deep let-chains and effect calls inside functions
+compile correctly in isolation). See `bootstrap/diagnose_self_host.py` for
+an automated dump of each pipeline stage.
 
 ### Stage 3 (Planned — Independence)
 The Stage 2 `.nbc` is run on a minimal Core VM (pure interpreter, no JIT, no
@@ -68,19 +67,20 @@ bootstrap/
 ├── compile_arith.nula   # Earlier arithmetic-only emitter
 ├── emitter.nula         # Stage 1: JSON emitter for .nbc generation
 ├── host.nula            # Placeholder host shim (returns 0 until Stage 3)
-├── prep_core.py         # Preprocess compiler_core.nula for compile_hex.nula
-├── desugar_fns.py       # Multi-fn programs → let-binding chains
-├── fixup_hex.py         # Patch jump/constant/closure offsets in hex output
-├── hex2nbc.py           # Hex text → .nbc binary
-├── spill_bug_repro.nula # Register-spill regression repro
-└── verify.sh            # End-to-end bootstrap verification (run: bash verify.sh)
+├── prep_core.py            # Preprocess compiler_core.nula for compile_hex.nula
+├── desugar_fns.py          # Multi-fn programs → let-binding chains
+├── fixup_hex.py            # Patch jump/constant/closure offsets in hex output
+├── hex2nbc.py              # Hex text → .nbc binary
+├── diagnose_self_host.py   # Diagnostic dump of the Stage 2 self-compile pipeline
+├── spill_bug_repro.nula    # Register-spill regression repro
+└── verify.sh               # End-to-end bootstrap verification (run: bash verify.sh)
 ```
 
 ## Build & Test
 
 ```bash
-# Run the self-hosted pipeline end-to-end (11 checks: eval, round-trip,
-# single-expression pipeline, recursion, and multi-fn Stage 2)
+# Run the self-hosted pipeline end-to-end. Checks 1–6 pass; check 7 (the
+# Stage 2 self-compile oracle) is currently disabled.
 bash bootstrap/verify.sh
 
 # Single expression through the self-hosting pipeline:
@@ -88,10 +88,14 @@ echo '1 + 2 * 3' | nulang bootstrap/compile_hex.nula |
   python3 bootstrap/fixup_hex.py |
   python3 bootstrap/hex2nbc.py > /tmp/out.nbc
 nulang /tmp/out.nbc     # → 7
+
+# Diagnose the Stage 2 self-compile oracle:
+python3 bootstrap/diagnose_self_host.py [smoke_expr]
 ```
 
-`verify.sh` accepts `NULANG_BIN=/path/to/nulang bash bootstrap/verify.sh` to
-skip the `cargo run` rebuild.
+`verify.sh` and `diagnose_self_host.py` accept
+`NULANG_BIN=/path/to/nulang bash bootstrap/verify.sh` to skip the `cargo run`
+rebuild.
 
 ## Core Constraints
 

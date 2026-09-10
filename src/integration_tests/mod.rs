@@ -3450,12 +3450,9 @@ match { a: 2, b: 9 } with {
     }
 
     /// `crdt` fields survive crash+recovery as *materialized* `state_data`
-    /// (snapshotted by `checkpoint_actor`'s Durable|Crdt filter). The
-    /// `Crdt.*` effect module is the live-actor mutation path, but
-    /// `recover_actor` does not rebuild `CrdtManager.field_map`, so
-    /// `perform Crdt.*` is a silent nil no-op on a recovered actor — this
-    /// test pins that actual behavior: `state_data["count"]` survives, but a
-    /// post-recovery `inc` does not bump it.
+    /// (snapshotted by `checkpoint_actor`'s Durable|Crdt filter). After
+    /// recovery `CrdtManager.field_map` is rebuilt from the snapshot, so
+    /// `perform Crdt.*` keeps working and mutates the restored replica.
     #[test]
     fn test_crdt_field_survives_recovery() {
         let source = r#"
@@ -3546,10 +3543,9 @@ match { a: 2, b: 9 } with {
             "crdt field's materialized value survives recovery via the snapshot path"
         );
 
-        // Pin the recovery gap: `recover_actor` restores the materialized
-        // value and the CrdtManager entries but not `field_map`, so a
-        // post-recovery `Crdt.increment` is a silent no-op (get_field_id
-        // returns None) and `state_data["count"]` stays at 2.
+        // After recovery the CRDT field map is rebuilt, so a post-recovery
+        // `Crdt.increment` mutates the restored replica and materializes the
+        // new value back into `state_data`.
         rt2.borrow_mut().send_message(actor_id, "inc", &[]);
         rt2.borrow_mut().run_scheduler();
         assert_eq!(
@@ -3559,12 +3555,12 @@ match { a: 2, b: 9 } with {
                 .unwrap()
                 .get_state_field("count")
                 .and_then(|v| v.as_int()),
-            Some(2),
-            "post-recovery Crdt.increment must be a no-op: field_map is not rebuilt"
+            Some(3),
+            "post-recovery Crdt.increment must mutate the restored CRDT replica"
         );
 
-        // The statement AFTER the no-op `perform` must still run — if the
-        // behavior aborted with an unhandled effect, `ticks` would stay 0.
+        // The statement after the `perform` must still run — if the behavior
+        // aborted with an unhandled effect, `ticks` would stay 0.
         assert_eq!(
             rt2.borrow()
                 .actors
@@ -3573,7 +3569,7 @@ match { a: 2, b: 9 } with {
                 .get_state_field("ticks")
                 .and_then(|v| v.as_int()),
             Some(1),
-            "post-recovery Crdt.increment returns nil and the behavior continues"
+            "post-recovery Crdt.increment returns unit and the behavior continues"
         );
     }
 
@@ -3638,6 +3634,47 @@ match { a: 2, b: 9 } with {
             ticks,
             Some(2),
             "the statement after the rejected perform/assignment must still run (no abort)"
+        );
+    }
+
+    /// A `state crdt gcounter` actor field accepts `Crdt.increment` and the
+    /// merged value materializes into `state_data` after the scheduler runs.
+    #[test]
+    fn test_crdt_gcounter_materializes_end_to_end() {
+        let source = r#"
+            actor Counter {
+                state crdt gcounter count: Int = 0
+                behavior inc() { perform Crdt.increment("count") }
+                behavior get() { self.count }
+            }
+            spawn Counter {}
+        "#;
+
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        let (module, _ty) = compile_source(source).unwrap();
+        let actor_id = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap().as_actor_id().unwrap()
+        };
+
+        rt.borrow_mut().send_message(actor_id, "inc", &[]);
+        rt.borrow_mut().send_message(actor_id, "inc", &[]);
+        rt.borrow_mut().send_message(actor_id, "inc", &[]);
+        rt.borrow_mut().run_scheduler();
+
+        let count = rt
+            .borrow()
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int());
+        assert_eq!(
+            count,
+            Some(3),
+            "gcounter must materialize count=3 after three increments"
         );
     }
 

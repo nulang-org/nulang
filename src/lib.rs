@@ -70,6 +70,7 @@ pub mod vm;
 pub mod wasm_component_runtime;
 #[cfg(feature = "wasm-backend")]
 pub mod wasm_runtime;
+#[cfg(feature = "wasm-backend")]
 pub mod wasm_types;
 #[cfg(feature = "wasmfx-backend")]
 pub mod wasmfx_backend;

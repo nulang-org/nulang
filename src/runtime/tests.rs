@@ -1805,6 +1805,7 @@ fn test_memory_store_latest_sequence() {
         state: HashMap::new(),
         waiting_signal: None,
         crdt_snapshot: None,
+        crdt_field_map: None,
     };
     store.save_snapshot(snapshot).unwrap();
     store
@@ -1832,6 +1833,7 @@ fn test_libsql_store_save_load_snapshot() {
         state,
         waiting_signal: None,
         crdt_snapshot: None,
+        crdt_field_map: None,
     };
     store.save_snapshot(snapshot).unwrap();
 
@@ -1884,6 +1886,7 @@ fn test_libsql_store_latest_sequence() {
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
+            crdt_field_map: None,
         })
         .unwrap();
     store
@@ -1910,6 +1913,7 @@ fn test_libsql_store_clear() {
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
+            crdt_field_map: None,
         })
         .unwrap();
     store
@@ -1944,6 +1948,7 @@ fn test_libsql_store_persists_to_disk() {
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
+                crdt_field_map: None,
             })
             .unwrap();
         store
@@ -1982,6 +1987,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3]), (8, 2, vec![])]),
+            crdt_field_map: None,
         })
         .unwrap();
 
@@ -1999,6 +2005,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
+            crdt_field_map: None,
         })
         .unwrap();
     let loaded = store.load_snapshot(1).unwrap();
@@ -2040,6 +2047,7 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3])]),
+                crdt_field_map: None,
             })
             .unwrap();
         let loaded = store.load_snapshot(1).unwrap();
@@ -3901,12 +3909,20 @@ fn test_actor_migration_between_two_nodes() {
                 .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
                 .collect()
         });
+        let crdt_field_map = rt_a.crdt_manager.as_ref().map(|m| {
+            m.field_map
+                .iter()
+                .filter(|((aid, _), _)| *aid == actor_id)
+                .map(|((_, name), id)| (name.clone(), id.0))
+                .collect()
+        });
         let snapshot = ActorSnapshot {
             actor_id,
             sequence: actor.sequence,
             state,
             waiting_signal: actor.waiting_signal.clone(),
             crdt_snapshot,
+            crdt_field_map,
         };
         let json = serde_json::to_vec(&snapshot).unwrap();
         let nbc = module.to_nbc(None).unwrap();
@@ -5884,6 +5900,47 @@ fn test_sync_crdts_round_counting() {
     rt.sync_crdts();
     rt.sync_crdts();
     assert_eq!(rt.crdt_sync_rounds, 2);
+    shutdown_nodes(&mut [&mut rt]);
+}
+
+#[cfg(feature = "tcp")]
+/// The production scheduler calls `sync_crdts` periodically. A clustered
+/// runtime that processes enough scheduler ticks must advance its sync-round
+/// counter; distribution-disabled runtimes must not.
+#[test]
+fn test_scheduler_calls_sync_crdts_periodically() {
+    let mut rt = start_distributed_node();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.register_behavior("inc", |actor, _args| {
+            let n = actor
+                .get_state_field("counter")
+                .and_then(|v| v.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("counter", Value::int(n + 1));
+        });
+    }
+    // Enqueue enough messages that the scheduler runs for at least one
+    // CRDT_SYNC_INTERVAL_TICKS tick batch.
+    for _ in 0..10_000 {
+        rt.send_message(actor_id, "inc", &[]);
+    }
+    rt.run_scheduler();
+
+    assert!(
+        rt.crdt_sync_rounds > 0,
+        "scheduler must call sync_crdts at least once over a long run"
+    );
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("counter")
+            .and_then(|v| v.as_int()),
+        Some(10_000),
+        "all enqueued messages must be processed"
+    );
     shutdown_nodes(&mut [&mut rt]);
 }
 

@@ -11,8 +11,11 @@ fn bench_memory_store(c: &mut Criterion) {
                 actor_id: 1,
                 sequence: 0,
                 state: std::collections::HashMap::new(),
-                waiting_signal: None,
-                crdt_snapshot: None,
+                // This benchmark only cares about persistence throughput. Keep
+                // optional snapshot metadata on its defaults so additive
+                // ActorSnapshot fields do not break unrelated --all-targets
+                // builds, Clippy, or CodeQL.
+                ..ActorSnapshot::default()
             };
             store.save_snapshot(snapshot).ok();
             let _loaded = store.load_snapshot(1);

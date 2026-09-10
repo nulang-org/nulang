@@ -47,17 +47,8 @@ pub(crate) fn spawn_actor_with_id(
     }
     actor.state_models = state_models;
     // Register CRDT-backed fields with the CrdtManager.
-    for (field_name, model) in &actor.state_models {
-        if let StateModel::Crdt(crdt_type) = model {
-            let initial = actor
-                .state_data
-                .get(field_name)
-                .copied()
-                .unwrap_or(Value::nil());
-            if let Some(ref mut mgr) = rt.crdt_manager {
-                mgr.register_actor_field(id, field_name, *crdt_type, initial);
-            }
-        }
+    if let Some(ref mut mgr) = rt.crdt_manager {
+        mgr.register_actor_fields(id, &actor);
     }
     actor.persistent = persistent;
     let workflow_name = workflow.map(|n| n.to_string());
