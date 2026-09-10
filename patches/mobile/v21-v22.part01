@@ -99,7 +99,11 @@ diff --git a/src/runtime/spawn.rs b/src/runtime/spawn.rs
 diff --git a/src/vm.rs b/src/vm.rs
 --- a/src/vm.rs
 +++ b/src/vm.rs
-@@ -1,5 +1,6 @@
+@@ -3203,11 +3203,12 @@
+         // SAFETY: The `&mut dyn ActorVmCallbacks` reference is valid for the
+         // duration of this function call. `set_jit_callbacks` stores it in a
+         // thread-local; `with_callbacks` restores `&mut` provenance before use.
+         // The VM is single-threaded, so no concurrent access.
 +        #[cfg(feature = "native-codegen")]
          unsafe {
              crate::jit::runtime::set_jit_callbacks(
