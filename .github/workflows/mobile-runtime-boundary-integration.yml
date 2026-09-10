@@ -27,13 +27,13 @@ jobs:
               patches/mobile/v21-v22.part04 > /tmp/mobile-runtime-boundary.patch
           echo "56f4fce9e2806750543e13e0067da9a16453f83c219363aa92149dc34d7b8ae7  /tmp/mobile-runtime-boundary.patch" | sha256sum -c -
 
-      - name: Preflight exact-context application
-        shell: bash
-        run: patch --dry-run --batch --forward --fuzz=0 -p1 < /tmp/mobile-runtime-boundary.patch
+      - name: Preflight strict-context application
+        run: python3 patches/mobile/apply_strict_patch.py --check /tmp/mobile-runtime-boundary.patch
 
       - name: Apply mobile runtime boundary
-        shell: bash
-        run: patch --batch --forward --fuzz=0 -p1 < /tmp/mobile-runtime-boundary.patch
+        run: |
+          python3 patches/mobile/apply_strict_patch.py /tmp/mobile-runtime-boundary.patch
+          chmod +x scripts/check_mobile_runtime_profile.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -64,6 +64,7 @@ jobs:
                 patches/mobile/v21-v22.part02 \
                 patches/mobile/v21-v22.part03 \
                 patches/mobile/v21-v22.part04 \
+                patches/mobile/apply_strict_patch.py \
                 .github/workflows/mobile-runtime-boundary-integration.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
