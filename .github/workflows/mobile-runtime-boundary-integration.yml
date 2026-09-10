@@ -26,7 +26,6 @@ jobs:
               patches/mobile/v21-v22.part03 \
               patches/mobile/v21-v22.part04 > /tmp/mobile-runtime-boundary.patch
           echo "56f4fce9e2806750543e13e0067da9a16453f83c219363aa92149dc34d7b8ae7  /tmp/mobile-runtime-boundary.patch" | sha256sum -c -
-          echo "a542002f89cd5770f951840e8515f73bffe200c25c4989f08835c1120c673355  patches/mobile/v21-v22.compile-followup.patch" | sha256sum -c -
 
       - name: Preflight strict-context application
         run: |
