@@ -43,18 +43,14 @@ static LLM_EXECUTOR_TX: OnceLock<crossbeam::channel::Sender<LlmWorkItem>> = Once
 /// Lazily initialize the process-wide bounded provider executor.
 fn executor_tx() -> &'static crossbeam::channel::Sender<LlmWorkItem> {
     LLM_EXECUTOR_TX.get_or_init(|| {
-        let worker_count = env_bounded_usize(
-            "NULANG_LLM_WORKERS",
-            DEFAULT_LLM_WORKERS,
-            MAX_LLM_WORKERS,
-        );
+        let worker_count =
+            env_bounded_usize("NULANG_LLM_WORKERS", DEFAULT_LLM_WORKERS, MAX_LLM_WORKERS);
         let queue_capacity = env_bounded_usize(
             "NULANG_LLM_QUEUE_CAPACITY",
             DEFAULT_LLM_QUEUE_CAPACITY,
             MAX_LLM_QUEUE_CAPACITY,
         );
-        let (request_tx, request_rx) =
-            crossbeam::channel::bounded::<LlmWorkItem>(queue_capacity);
+        let (request_tx, request_rx) = crossbeam::channel::bounded::<LlmWorkItem>(queue_capacity);
 
         for worker_id in 0..worker_count {
             let request_rx = request_rx.clone();
