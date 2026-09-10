@@ -2400,9 +2400,15 @@ fn compile_rvalue(
 
         mir::RValue::Closure { func, captures } => {
             if captures.is_empty() {
-                // Return tagged function index — also register for call resolution.
-                let idx = builder.ins().iconst(types::I64, *func as i64);
-                Ok(emit_tag_int(builder, idx))
+                // A first-class closure must not masquerade as a numeric TAG_INT.
+                // Static direct-call metadata still resolves this target without
+                // dynamic dispatch; the runtime value uses canonical TAG_CLOSURE.
+                let fn_val = builder.ins().iconst(types::I64, *func as i64);
+                let helper = helpers.get("nulang_aot_make_closure_0").ok_or_else(|| {
+                    AotCompileError::Internal("missing nulang_aot_make_closure_0 helper".into())
+                })?;
+                let call = builder.ins().call(*helper, &[fn_val]);
+                Ok(builder.inst_results(call)[0])
             } else {
                 // Allocate a closure object carrying the captured values and
                 // return it as a TAG_CLOSURE value. The lifted target function
@@ -3438,9 +3444,10 @@ fn compile_unary(
                 if mode == CompileMode::Unboxed {
                     Ok(builder.ins().ineg(val))
                 } else {
-                    let payload = emit_sext48(builder, val);
-                    let neg = builder.ins().ineg(payload);
-                    Ok(emit_tag_int(builder, neg))
+                    // Boxed values can still be nil even when MIR metadata says Int
+                    // (for example, a negative integer exponent). Preserve runtime
+                    // type/error semantics instead of re-tagging nil as integer zero.
+                    call_helper(builder, helpers, "nulang_ineg", &[val])
                 }
             } else if type_meta.is_known(reg as usize, KnownType::Float) {
                 let f = builder.ins().bitcast(types::F64, MemFlags::new(), val);

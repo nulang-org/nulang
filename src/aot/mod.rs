@@ -395,6 +395,10 @@ impl AotModule {
     /// parameterized function, and calling it with no args would return
     /// garbage.
     pub fn run(&self) -> NuResult<u64> {
+        // Thread-local compiled errors belong to one AOT invocation only.
+        let _ = crate::jit::runtime::aot_take_pending_error();
+        let _ = crate::jit::runtime::take_jit_pending_vm_error();
+
         // A module with no `__main`/`main` (e.g. only function definitions, a
         // library) has no entry expression; running it yields nil, matching the
         // interpreter. Do NOT fall back to function 0 — that could be a
@@ -444,7 +448,9 @@ impl AotModule {
         // so they record interpreter-parity runtime errors (48-bit overflow,
         // type errors) in a thread-local. Surface it as the run's error so
         // the AOT backend agrees with the interpreter.
-        if let Some(msg) = crate::jit::runtime::aot_take_pending_error() {
+        let aot_error = crate::jit::runtime::aot_take_pending_error();
+        let jit_error = crate::jit::runtime::take_jit_pending_vm_error();
+        if let Some(msg) = aot_error.or(jit_error) {
             // Clean up before returning (mirror the normal path).
             unsafe {
                 crate::jit::runtime::clear_jit_callbacks();

@@ -443,11 +443,16 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Record a runtime error for retrieval by the AOT driver (no-op semantics
-/// for the tiered JIT, which never inspects this slot).
+/// Record a compiled-runtime error for retrieval at the backend boundary.
+///
+/// Native code cannot unwind. Preserve the first error until the backend
+/// consumes it so operations on a nil sentinel cannot replace the cause.
 pub fn aot_set_pending_error(msg: String) {
     AOT_PENDING_ERROR.with(|e| {
-        *e.borrow_mut() = Some(msg);
+        let mut pending = e.borrow_mut();
+        if pending.is_none() {
+            *pending = Some(msg);
+        }
     });
 }
 

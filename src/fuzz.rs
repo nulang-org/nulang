@@ -816,6 +816,34 @@ pub(crate) enum DiffOutcome {
 mod tests {
     use super::*;
 
+    #[test]
+    fn differential_unary_negation_and_error_isolation_regressions() {
+        let cases = [
+            "--(1 + 2,)",
+            "-3 ** -2",
+            "-fn(x) { x + 1 }",
+            "fn pick(b) { if b then 1 else -1 }; pick(true) * pick(-false)",
+            "let f = fn(x) { x + 1 }; f(41)",
+            "let apply = fn(f, x) { f(x) }; apply(fn(x) { x + 5 }, 10)",
+            "0",
+        ];
+        for source in cases {
+            match differential_fuzz_one(source) {
+                Ok(DiffOutcome::Agreed { .. }) => {}
+                Ok(other) => panic!(
+                    "regression case not fully executed: {:?}: {:?}",
+                    source, other
+                ),
+                Err(msg) => panic!("backend divergence for {:?}: {}", source, msg),
+            }
+        }
+        match differential_fuzz_one("0") {
+            Ok(DiffOutcome::Agreed { .. }) => {}
+            Ok(other) => panic!("isolation sentinel not executed: {:?}", other),
+            Err(msg) => panic!("compiled error leaked into isolation sentinel: {}", msg),
+        }
+    }
+
     /// Quick differential fuzz: 300 iterations with a fixed seed, part of
     /// the default `cargo test --lib` run. Unlike `fuzz_typechecker_quick`
     /// (lex/parse/typecheck only), each iteration here compiles to
