@@ -205,14 +205,19 @@ pub extern "C" fn nulang_ineg(a: u64) -> u64 {
     }
 }
 
-/// Record an arithmetic runtime error for the AOT driver and yield nil
-/// (compiled code cannot unwind; see `AOT_PENDING_ERROR`).
+/// Record an arithmetic runtime error for the active compiled backend and
+/// yield nil. Native code cannot unwind, so JIT execution uses the JIT-region
+/// pending-error slot while standalone AOT execution uses the AOT slot.
 fn record_arith_error(e: crate::types::NuError) -> u64 {
     let msg = match e {
         crate::types::NuError::RuntimeError { msg, .. } => msg,
         other => other.to_string(),
     };
-    aot_set_pending_error(msg);
+    if get_jit_vm().is_null() {
+        aot_set_pending_error(msg);
+    } else {
+        set_jit_pending_vm_error(msg);
+    }
     Value::nil().as_raw()
 }
 
@@ -660,7 +665,12 @@ thread_local! {
 }
 
 pub fn set_jit_pending_vm_error(msg: String) {
-    JIT_PENDING_VM_ERROR.with(|e| *e.borrow_mut() = Some(msg));
+    JIT_PENDING_VM_ERROR.with(|e| {
+        let mut pending = e.borrow_mut();
+        if pending.is_none() {
+            *pending = Some(msg);
+        }
+    });
 }
 
 pub fn take_jit_pending_vm_error() -> Option<String> {
@@ -1991,5 +2001,49 @@ mod aot_closure_allocation_tests {
         }
 
         let _ = aot_take_heap();
+    }
+}
+
+#[cfg(test)]
+mod compiled_error_ordering_tests {
+    use super::*;
+
+    #[test]
+    fn jit_runtime_preserves_first_error_across_arithmetic_and_direct_calls() {
+        let _ = take_jit_pending_vm_error();
+        let _ = aot_take_pending_error();
+
+        let mut vm = crate::vm::VM::new_without_jit();
+        unsafe {
+            set_jit_vm(&mut vm as *mut crate::vm::VM);
+        }
+
+        // Arithmetic fails first; a later direct-call failure must not replace it.
+        assert_eq!(
+            nulang_ineg(Value::bool(false).as_raw()),
+            Value::nil().as_raw()
+        );
+        set_jit_pending_vm_error("later direct-call failure".to_string());
+        let first = take_jit_pending_vm_error().expect("JIT arithmetic error should be pending");
+        assert!(
+            first.contains("arithmetic `neg`"),
+            "unexpected first error: {first}"
+        );
+        assert!(first.contains("false"), "unexpected first error: {first}");
+        assert!(aot_take_pending_error().is_none());
+
+        // Direct-call failure first; later arithmetic must not replace it either.
+        set_jit_pending_vm_error("first direct-call failure".to_string());
+        assert_eq!(
+            nulang_ineg(Value::bool(false).as_raw()),
+            Value::nil().as_raw()
+        );
+        assert_eq!(
+            take_jit_pending_vm_error().as_deref(),
+            Some("first direct-call failure")
+        );
+        assert!(aot_take_pending_error().is_none());
+
+        clear_jit_vm();
     }
 }

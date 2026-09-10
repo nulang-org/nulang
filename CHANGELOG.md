@@ -49,8 +49,10 @@ two major versions.*
 
 - **JIT/AOT runtime-error isolation** (`src/jit/runtime.rs`, `src/vm.rs`,
   `src/aot/mod.rs`): compiled invocations now clear and consume pending native
-  error state at backend boundaries and preserve the first arithmetic failure,
-  preventing one execution from contaminating the next.
+  error state at backend boundaries and preserve the first runtime failure
+  across arithmetic helpers and re-entrant JIT direct calls, preventing one
+  execution from contaminating the next or a later callee error from masking
+  the original failure.
 - **AOT unary-negation and closure parity** (`src/aot/codegen.rs`): boxed
   integer negation uses the checked runtime helper when a nominally-`Int`
   operation can yield `nil`; capture-free first-class closures now use the
