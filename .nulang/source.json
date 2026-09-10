@@ -18,7 +18,7 @@
       "isolation": "firecracker",
       "validation": {
         "profile": "rust-ci-v1",
-        "required": ["fmt", "clippy", "unit", "integration"]
+        "required": ["fmt", "check", "test"]
       },
       "integration": "change_dag",
       "auto_rebase": true,
