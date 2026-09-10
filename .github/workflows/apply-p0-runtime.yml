@@ -218,21 +218,21 @@ jobs:
 
           replace_once(
               "src/fuzz.rs",
-              '''                Err(msg) => {
-                          divergence_count += 1;
-                          eprintln!("DIVERGENCE: {}", msg);
+              '''                    divergence_count += 1;
+                      eprintln!("DIVERGENCE: {}", msg);
+                      if divergence_count >= 10 {
           ''',
-              '''                Err(msg) => {
-                          persist_divergence_artifact(
-                              shard_id,
-                              iteration,
-                              rng_state,
-                              seed,
-                              &mutant,
-                              &msg,
-                          );
-                          divergence_count += 1;
-                          eprintln!("DIVERGENCE: {}", msg);
+              '''                    persist_divergence_artifact(
+                          shard_id,
+                          iteration,
+                          rng_state,
+                          seed,
+                          &mutant,
+                          &msg,
+                      );
+                      divergence_count += 1;
+                      eprintln!("DIVERGENCE: {}", msg);
+                      if divergence_count >= 10 {
           ''')
           PY
 
