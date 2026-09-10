@@ -84,7 +84,7 @@ vm = ROOT / "src/vm.rs"
 replace_once(
     vm,
     """    /// Create a pointer value (for strings, lists, etc.).\n    pub fn ptr(p: *mut u8) -> Self {\n        Value {\n            raw: TAG_PTR | (p as u64 & PAYLOAD_MASK),\n        }\n    }\n""",
-    """    /// Create a pointer value (for strings, lists, etc.).\n    ///\n    /// Panics instead of silently truncating addresses that do not fit the\n    /// legacy 48-bit pointer payload. A panic is preferable to manufacturing\n    /// a dangling pointer and triggering undefined behavior on dereference.\n    pub fn ptr(p: *mut u8) -> Self {\n        let addr = p as u64;\n        assert!(\n            crate::value_layout::ptr_fits_payload(addr),\n            \"pointer address does not fit Nulang's 48-bit Value payload\"\n        );\n        Value { raw: TAG_PTR | addr }\n    }\n""",
+    """    /// Create a pointer value (for strings, lists, etc.).\n    ///\n    /// Panics instead of silently truncating addresses that do not fit the\n    /// legacy 48-bit pointer payload.\n    ///\n    /// # Safety\n    /// A non-null `p` must remain valid for every operation that may\n    /// dereference the returned `Value` (for example string resolution or\n    /// heap-object traversal). The pointer must refer to storage whose layout\n    /// matches the tag's consumer expectations.\n    pub unsafe fn ptr(p: *mut u8) -> Self {\n        let addr = p as u64;\n        assert!(\n            crate::value_layout::ptr_fits_payload(addr),\n            \"pointer address does not fit Nulang's 48-bit Value payload\"\n        );\n        Value { raw: TAG_PTR | addr }\n    }\n""",
 )
 replace_once(
     vm,
@@ -97,14 +97,16 @@ replace_once(
     """    /// Construct a `Value` from raw tagged bits.\n    ///\n    /// # Safety\n    /// Same contract as [`Value::from_raw`]: a `TAG_PTR` payload must be a\n    /// live Nulang-heap pointer and every tag payload must satisfy its runtime\n    /// invariant.\n    pub unsafe fn from_bits(raw: u64) -> Self {\n        Value { raw }\n    }\n""",
 )
 
-# Wrap raw-value reconstruction sites throughout Rust sources. This makes each
-# call an explicit safety boundary. Untrusted boundary files are tightened
+# Wrap raw/pointer reconstruction sites throughout Rust sources. This makes
+# each call an explicit safety boundary. Untrusted boundary files are tightened
 # below after wrapping so the relevant condition is enforced, not just stated.
 raw_wrapped = 0
 bits_wrapped = 0
+ptr_wrapped = 0
 for path in list((ROOT / "src").rglob("*.rs")) + list((ROOT / "crates").rglob("*.rs")):
     raw_wrapped += wrap_value_calls(path, "from_raw")
     bits_wrapped += wrap_value_calls(path, "from_bits")
+    ptr_wrapped += wrap_value_calls(path, "ptr")
 
 # C callers can fabricate the repr(C) raw field, so reject pointer-tagged
 # values before crossing back into the host Value domain.
@@ -136,4 +138,7 @@ replace_once(
     """            Ok(Ok(raw)) => {\n                let raw = raw as u64;\n                if (raw & crate::value_layout::TAG_MASK) == crate::value_layout::TAG_PTR {\n                    Err(NuError::runtime_error(\n                        \"WasmFX module returned a host-pointer tag\".to_string(),\n                        crate::types::Span::default(),\n                    ))\n                } else {\n                    // SAFETY: guest host-pointer tags are rejected above.\n                    Ok(unsafe { crate::vm::Value::from_raw(raw) })\n                }\n            }\n""",
 )
 
-print(f"wrapped raw calls: {raw_wrapped}; wrapped bits calls: {bits_wrapped}")
+print(
+    f"wrapped raw calls: {raw_wrapped}; wrapped bits calls: {bits_wrapped}; "
+    f"wrapped ptr calls: {ptr_wrapped}"
+)
