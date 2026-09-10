@@ -1481,7 +1481,7 @@ macro_rules! define_aot_make_closure {
         #[no_mangle]
         pub unsafe extern "C" fn $name(fn_idx: u64 $(, $cap: u64)*) -> u64 {
             let count: usize = 0 $(+ { let _ = stringify!($cap); 1 })*;
-            let Some(ptr) = alloc_obj(2 + count * 8, HeapTypeTag::Closure) else {
+            let Some(ptr) = alloc_obj((2 + count) * std::mem::size_of::<u64>(), HeapTypeTag::Closure) else {
                 return Value::nil().as_raw();
             };
             let slot = ptr as *mut u64;
@@ -1953,5 +1953,43 @@ mod tests {
 
         super::aot_clear_constants();
         let _ = super::aot_take_heap();
+    }
+}
+
+#[cfg(test)]
+mod aot_closure_allocation_tests {
+    use super::*;
+
+    #[test]
+    fn aot_closure_helpers_reserve_full_payload() {
+        clear_jit_callbacks();
+        let _ = aot_take_heap();
+        aot_set_heap(crate::runtime::heap::ActorHeap::new(4096));
+
+        unsafe {
+            let first = nulang_aot_make_closure_0(11);
+            let second = nulang_aot_make_closure_0(22);
+            assert_eq!(first & TAG_MASK, TAG_CLOSURE);
+            assert_eq!(second & TAG_MASK, TAG_CLOSURE);
+
+            let first_ptr = (first & PAYLOAD_MASK) as *mut u64;
+            let second_ptr = (second & PAYLOAD_MASK) as *mut u64;
+            assert_eq!(*first_ptr, 11);
+            assert_eq!(*first_ptr.add(1), 0);
+            assert_eq!(*second_ptr, 22);
+            assert_eq!(*second_ptr.add(1), 0);
+
+            let captured =
+                nulang_aot_make_closure_2(33, Value::int(7).as_raw(), Value::int(9).as_raw());
+            let guard = nulang_aot_make_closure_0(44);
+            let captured_ptr = (captured & PAYLOAD_MASK) as *mut u64;
+            assert_eq!(*captured_ptr, 33);
+            assert_eq!(*captured_ptr.add(1), 2);
+            assert_eq!(*captured_ptr.add(2), Value::int(7).as_raw());
+            assert_eq!(*captured_ptr.add(3), Value::int(9).as_raw());
+            assert_eq!(guard & TAG_MASK, TAG_CLOSURE);
+        }
+
+        let _ = aot_take_heap();
     }
 }

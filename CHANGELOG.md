@@ -55,7 +55,8 @@ two major versions.*
   integer negation uses the checked runtime helper when a nominally-`Int`
   operation can yield `nil`; capture-free first-class closures now use the
   canonical `TAG_CLOSURE` representation instead of masquerading as tagged
-  function-index integers. This restores interpreter/JIT/AOT parity for
+  function-index integers, with exact payload sizing for closure headers and
+  captures. This restores interpreter/JIT/AOT parity for
   invalid negation while retaining direct-call optimization metadata.
 - **Deterministic nightly fuzz evidence** (`src/fuzz.rs`,
   `.github/workflows/fuzz-nightly.yml`): failed shards preserve the full cargo
