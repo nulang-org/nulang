@@ -1,0 +1,68 @@
+name: Mobile Runtime Boundary Integration
+
+on:
+  push:
+    branches:
+      - feat/mobile-runtime-boundary-ci2
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Reassemble boundary patch
+        shell: bash
+        run: |
+          cat patches/mobile/v21-v22.part00 \
+              patches/mobile/v21-v22.part01 \
+              patches/mobile/v21-v22.part02 \
+              patches/mobile/v21-v22.part03 \
+              patches/mobile/v21-v22.part04 > /tmp/mobile-runtime-boundary.patch
+          echo "a1b480624377b539fab22e1db43ca4d2b2adedda7106e2ac57bb8ee2c1e2eaf9  /tmp/mobile-runtime-boundary.patch" | sha256sum -c -
+          git apply --check /tmp/mobile-runtime-boundary.patch
+
+      - name: Apply mobile runtime boundary
+        run: git apply /tmp/mobile-runtime-boundary.patch
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Verify interpreter-only mobile profile
+        run: bash scripts/check_mobile_runtime_profile.sh
+
+      - name: Preserve default build
+        run: cargo check --lib
+
+      - name: Preserve WASM feature graph
+        run: cargo check --lib --features wasm-backend
+
+      - name: Commit validated source changes
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          rm -f patches/mobile/v21-v22.part00 \
+                patches/mobile/v21-v22.part01 \
+                patches/mobile/v21-v22.part02 \
+                patches/mobile/v21-v22.part03 \
+                patches/mobile/v21-v22.part04 \
+                .github/workflows/mobile-runtime-boundary-integration.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(mobile): isolate interpreter-only runtime"
+          git push origin HEAD:feat/mobile-runtime-boundary-ci2
