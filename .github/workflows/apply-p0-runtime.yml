@@ -45,6 +45,33 @@ jobs:
               print(f"updated {path}")
 
           replace_once(
+              "src/jit/runtime.rs",
+              '''/// Record a runtime error for retrieval by the AOT driver (no-op semantics
+              /// for the tiered JIT, which never inspects this slot).
+              pub fn aot_set_pending_error(msg: String) {
+                  AOT_PENDING_ERROR.with(|e| {
+                      *e.borrow_mut() = Some(msg);
+                  });
+              }
+          ''',
+              '''/// Record a compiled-runtime error for retrieval at the backend boundary.
+              ///
+              /// Native code cannot unwind, so execution may continue after a helper
+              /// reports an error. Preserve the first error until it is consumed; later
+              /// operations on the helper's nil sentinel must not overwrite the original
+              /// diagnostic (for example, `--tuple` must report the tuple type error, not
+              /// a second `neg(nil)` error).
+              pub fn aot_set_pending_error(msg: String) {
+                  AOT_PENDING_ERROR.with(|e| {
+                      let mut pending = e.borrow_mut();
+                      if pending.is_none() {
+                          *pending = Some(msg);
+                      }
+                  });
+              }
+          ''')
+
+          replace_once(
               "src/aot/mod.rs",
               '''    pub fn run(&self) -> NuResult<u64> {
                   // A module with no `__main`/`main` (e.g. only function definitions, a
@@ -256,7 +283,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/aot/mod.rs src/vm.rs src/fuzz.rs
+          git add src/aot/mod.rs src/jit/runtime.rs src/vm.rs src/fuzz.rs
           git commit -m "fix(runtime): isolate compiled backend errors"
           git push origin HEAD:fix/compiled-runtime-fuzz-p0
 
