@@ -2,18 +2,17 @@
 //!
 //! Two priority bands (`System` and `Normal`/`Bulk`) ensure that supervisor
 //! exit signals and monitor DOWN messages are never delayed behind a queue
-//! of regular application messages.  When a capacity limit is configured,
-//! `System` messages always bypass the limit — preserving BEAM/OTP
-//! reliability guarantees — while `Normal` and `Bulk` messages are
-//! rejected with backpressure when the mailbox is full.
+//! of regular application messages. When a capacity limit is configured,
+//! `System` messages always bypass the limit while `Normal` and `Bulk`
+//! messages are rejected with backpressure when the mailbox is full.
 //!
-//! Uses `crossbeam::queue::SegQueue` (lock-free, unbounded segments) for
-//! each band.  Memory is reclaimed via crossbeam's epoch-based garbage
-//! collection.
+//! Concurrent producers use the lock-free `SegQueue`s through `push(&self)`.
+//! Scheduler-local traffic uses a plain `VecDeque` through methods requiring
+//! `&mut self`. Keeping scheduler-owned state behind normal Rust borrowing
+//! removes the previous `UnsafeCell`/manual `Sync` soundness dependency.
 
 use crate::vm::Value;
 use crossbeam::queue::SegQueue;
-use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -25,188 +24,134 @@ pub struct Message {
     /// `receive_match` scan. The VM never mutates incoming payloads,
     /// so `Arc` is safe.
     pub payload: Arc<Vec<Value>>,
-    pub sender: u64, // Actor ID of sender
+    pub sender: u64,
     pub priority: MessagePriority,
-    /// W3C traceparent for distributed tracing. When set, the receiver's
-    /// scheduler creates a child span linked to the sender's trace so
-    /// causal chains span actor and node boundaries.
+    /// W3C traceparent for distributed tracing.
     pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessagePriority {
-    System = 0, // Urgent (failure signals, monitoring)
-    Normal = 1, // Regular messages
-    Bulk = 2,   // Bulk/non-urgent
+    System = 0,
+    Normal = 1,
+    Bulk = 2,
 }
 
 /// MPSC mailbox with priority bands and optional capacity.
 ///
-/// Two `SegQueue` instances provide priority ordering without starving
-/// normal messages: every `pop` / `receive_match` drains the system band
-/// completely before touching the normal band.
-///
-/// When `capacity > 0`, `push` rejects `Normal` and `Bulk` messages once
-/// the total message count reaches the limit.  `System` messages always
-/// succeed, preserving BEAM/OTP reliability guarantees.
-///
-/// All methods that access the skip-buffer take `&mut self` because they
-/// run exclusively on the single scheduler thread — no `RefCell` needed.
-///
-/// Padded to a cache line so the two `SegQueue`s (pushed from arbitrary
-/// sender threads, popped on the scheduler thread) don't share a line with
-/// the owning `Actor`'s other fields.
+/// Concurrent producers may call [`Mailbox::push`] through shared references;
+/// all operations touching scheduler-local or selective-receive state require
+/// `&mut self`. This separation is enforced by Rust's type system.
 #[repr(align(64))]
 pub struct Mailbox {
     system_queue: SegQueue<Message>,
     normal_queue: SegQueue<Message>,
-    /// Same-thread local queue: messages pushed from the scheduler thread
-    /// itself (same-shard sends, exit notifications, DLQ) bypass SegQueue
-    /// atomics. Network-thread pushes still go through normal_queue.
-    ///
-    /// SAFETY: Only accessed from the scheduler thread — `push_local` (write)
-    /// and all read methods (`is_empty`, `len`, `pop`, `receive_match`,
-    /// `drain`) run on the single scheduler thread. Network-thread `push`
-    /// never touches this field.
-    local_queue: UnsafeCell<VecDeque<Message>>,
+    /// Same-thread local queue. Only scheduler-owned `&mut self` methods
+    /// access it; network/concurrent producers never touch it.
+    local_queue: VecDeque<Message>,
     capacity: usize,
-    /// Skip-buffer for non-matching normal messages drained during selective
-    /// receive (`receive_match`). Messages stay here in FIFO order until a
-    /// later `receive_match` finds a match. System messages are NOT placed
-    /// here — they are scanned directly from `system_queue`.
+    /// Non-matching normal messages staged during selective receive.
+    /// The boolean marks candidates already tried by the current receive.
     skip_buffer: VecDeque<(Message, bool)>,
 }
 
-// SAFETY: `Mailbox` is `Sync` because mutable fields (`local_queue`,
-// `skip_buffer`) are accessed exclusively from the scheduler thread
-// (all `&mut self` methods run within `step_actor`/`ReceiveMatch`/etc
-// on the single scheduler thread).  The `SegQueue` fields are `Sync`
-// (lock-free concurrent queues) and may be safely pushed from network
-// threads via `&self` methods.  `local_queue` is wrapped in `UnsafeCell`
-// so that `&self` read methods (`is_empty`, `len`) can inspect it without
-// a mutable borrow; `UnsafeCell<T>: Sync` for `Send` T (and `VecDeque<Message>: Send`).
-unsafe impl Sync for Mailbox {}
-
 impl Mailbox {
-    // --- internal unsafe accessors ---
-    // SAFETY: these are always called from the scheduler thread, and
-    // `&mut self` callers prove exclusive access. `&self` callers
-    // (is_empty, len) only read, which is safe because no concurrent
-    // mutation occurs.
-    fn local_queue_ref(&self) -> &VecDeque<Message> {
-        unsafe { &*self.local_queue.get() }
-    }
-    fn local_queue_mut(&mut self) -> &mut VecDeque<Message> {
-        unsafe { &mut *self.local_queue.get() }
-    }
-
     /// Create a new mailbox.
     ///
-    /// `capacity`: maximum total messages allowed.  `0` = unbounded
-    /// (BEAM/OTP semantics).  `System` messages always bypass the limit.
+    /// `capacity`: maximum total messages allowed. `0` = unbounded.
+    /// `System` messages always bypass the limit.
     pub fn new(capacity: usize) -> Self {
         Mailbox {
             system_queue: SegQueue::new(),
             normal_queue: SegQueue::new(),
-            local_queue: UnsafeCell::new(VecDeque::new()),
+            local_queue: VecDeque::new(),
             capacity,
             skip_buffer: VecDeque::new(),
         }
     }
 
-    /// Push a message into the mailbox.
+    /// Push a message from a concurrent producer.
     ///
-    /// `System` messages always succeed.  `Normal` and `Bulk` messages are
-    /// rejected with `Err(msg)` when the mailbox is at capacity (a
-    /// non-zero `capacity` was configured and both queues together hold
-    /// that many messages).
+    /// This method deliberately touches only the thread-safe queues. Capacity
+    /// enforcement is based on those queues because scheduler-local state may
+    /// only be inspected with `&mut self`. The scheduler applies the full
+    /// capacity check on `push_local`.
     pub fn push(&self, msg: Message) -> Result<(), Message> {
         if msg.priority == MessagePriority::System {
             self.system_queue.push(msg);
             return Ok(());
         }
-        if self.capacity > 0 && self.len() >= self.capacity {
+        if self.capacity > 0
+            && self.system_queue.len().saturating_add(self.normal_queue.len()) >= self.capacity
+        {
             return Err(msg);
         }
         self.normal_queue.push(msg);
         Ok(())
     }
 
-    /// Push a message from the same thread (scheduler).
-    ///
-    /// Messages pushed via `push_local` bypass the lock-free `SegQueue`
-    /// atomics and land directly in a thread-local `VecDeque`, drained
-    /// before the concurrent queues on every `pop` / `receive_match`.
-    /// This is the hot path for same-shard actor-to-actor messaging.
-    ///
-    /// `System` messages always succeed.  `Normal` and `Bulk` messages
-    /// are rejected with `Err(msg)` at capacity (same policy as `push`).
+    /// Push a message from the scheduler thread.
     pub fn push_local(&mut self, msg: Message) -> Result<(), Message> {
         if msg.priority == MessagePriority::System {
-            self.local_queue_mut().push_back(msg);
+            self.local_queue.push_back(msg);
             return Ok(());
         }
         if self.capacity > 0 && self.len() >= self.capacity {
             return Err(msg);
         }
-        self.local_queue_mut().push_back(msg);
+        self.local_queue.push_back(msg);
         Ok(())
     }
 
     /// Pop the highest-priority message.
-    ///
-    /// Checks the system queue first (priority), then the same-thread
-    /// local queue, then the skip-buffer (non-matching normal messages
-    /// staged during a prior `receive_match`), then the normal queue.
     pub fn pop(&mut self) -> Option<Message> {
         self.system_queue
             .pop()
-            .or_else(|| self.local_queue_mut().pop_front())
+            .or_else(|| self.local_queue.pop_front())
             .or_else(|| self.skip_buffer.pop_front().map(|(m, _)| m))
             .or_else(|| self.normal_queue.pop())
     }
 
     /// Selective receive: scan for the first message whose behavior id
     /// appears in `behavior_ids`.
-    ///
-    /// Scan order: same-thread local queue, system queue (network-thread,
-    /// rare), skip-buffer (staged normal), then normal queue. Non-matching
-    /// local-queue messages are moved into the skip-buffer (system messages
-    /// keep priority by routing to system_queue).
     pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, Arc<Vec<Value>>)> {
-        // 1. Scan same-thread local queue (fast, fresh).
-        for i in 0..self.local_queue_ref().len() {
-            let bid = self.local_queue_ref()[i].behavior_id;
+        // 1. Scan scheduler-local messages first. A direct local candidate is
+        // consumed here, preserving the existing callback contract.
+        for i in 0..self.local_queue.len() {
+            let bid = self.local_queue[i].behavior_id;
             if let Some(pos) = behavior_ids.iter().position(|&id| id == bid) {
-                let msg = self.local_queue_mut().remove(i).unwrap();
+                let msg = self.local_queue.remove(i).expect("mailbox index was valid");
                 return Some((pos, msg.payload));
             }
         }
-        // No match in local queue: drain it — system messages go to
-        // system_queue (priority preserved), normal messages go to
-        // skip_buffer (scanned in subsequent receive_match calls).
-        while let Some(msg) = self.local_queue_mut().pop_front() {
+
+        // Stage unmatched local traffic. System messages retain priority;
+        // normal/bulk messages enter the selective-receive skip buffer.
+        while let Some(msg) = self.local_queue.pop_front() {
             if msg.priority == MessagePriority::System {
                 self.system_queue.push(msg);
             } else {
                 self.skip_buffer.push_back((msg, false));
             }
         }
-        // 2. Scan system queue (small, rare — drain-scan-requeue is fine).
+
+        // 2. Scan system queue.
         if let Some(result) = Self::scan_queue(&self.system_queue, behavior_ids) {
             return Some(result);
         }
-        // 3. Try the skip-buffer (includes ex-local-queue messages).
+
+        // 3. Try already staged normal messages.
         for i in 0..self.skip_buffer.len() {
             let (tried, bid) = (self.skip_buffer[i].1, self.skip_buffer[i].0.behavior_id);
             if !tried {
                 if let Some(pos) = behavior_ids.iter().position(|&id| id == bid) {
-                    self.skip_buffer[i].1 = true; // mark tried
+                    self.skip_buffer[i].1 = true;
                     return Some((pos, Arc::clone(&self.skip_buffer[i].0.payload)));
                 }
             }
         }
-        // 4. Drain the normal queue into the buffer, then scan again.
+
+        // 4. Drain newly arrived normal messages into the skip buffer.
         while let Some(msg) = self.normal_queue.pop() {
             self.skip_buffer.push_back((msg, false));
         }
@@ -214,7 +159,7 @@ impl Mailbox {
             let (tried, bid) = (self.skip_buffer[i].1, self.skip_buffer[i].0.behavior_id);
             if !tried {
                 if let Some(pos) = behavior_ids.iter().position(|&id| id == bid) {
-                    self.skip_buffer[i].1 = true; // mark tried
+                    self.skip_buffer[i].1 = true;
                     return Some((pos, Arc::clone(&self.skip_buffer[i].0.payload)));
                 }
             }
@@ -222,8 +167,7 @@ impl Mailbox {
         None
     }
 
-    /// Drain and scan a single queue for a matching message.  Used for the
-    /// system queue only (small, rare); the normal queue uses the skip-buffer.
+    /// Drain and scan a concurrent queue for a matching message.
     fn scan_queue(
         queue: &SegQueue<Message>,
         behavior_ids: &[u16],
@@ -249,83 +193,72 @@ impl Mailbox {
         found
     }
 
-    /// Total message count across all queues (approximate — concurrent
-    /// queue lengths are snapshots).  Includes the same-thread local queue.
+    /// Total message count. Call from scheduler-owned code when local and
+    /// skip-buffer state may be active.
     pub fn len(&self) -> usize {
         self.system_queue.len()
-            + self.local_queue_ref().len()
+            + self.local_queue.len()
             + self.skip_buffer.len()
             + self.normal_queue.len()
     }
 
-    /// True when all queues and the skip-buffer are empty.
     pub fn is_empty(&self) -> bool {
         self.system_queue.is_empty()
-            && self.local_queue_ref().is_empty()
+            && self.local_queue.is_empty()
             && self.skip_buffer.is_empty()
             && self.normal_queue.is_empty()
     }
 
-    /// Drain all queues (in priority/FIFO order) into a cloned snapshot,
-    /// then restore all messages.
+    /// Drain all queues into a cloned snapshot, then restore all messages.
     pub fn drain(&mut self) -> Vec<Message> {
         let mut snapshot = Vec::with_capacity(self.len());
-        // Drain system first.
         while let Some(msg) = self.system_queue.pop() {
             snapshot.push(msg);
         }
-        // Same-thread local queue.
-        while let Some(msg) = self.local_queue_mut().pop_front() {
+        while let Some(msg) = self.local_queue.pop_front() {
             snapshot.push(msg);
         }
-        // Then skip-buffer (normal messages staged during selective receive).
         while let Some((msg, _)) = self.skip_buffer.pop_front() {
             snapshot.push(msg);
         }
-        // Then normal queue.
         while let Some(msg) = self.normal_queue.pop() {
             snapshot.push(msg);
         }
-        // Restore: system → system_queue, normal → local_queue.
         for msg in &snapshot {
             if msg.priority == MessagePriority::System {
                 self.system_queue.push(msg.clone());
             } else {
-                self.local_queue_mut().push_back(msg.clone());
+                self.local_queue.push_back(msg.clone());
             }
         }
         snapshot
     }
 
-    /// Return all skip-buffer messages to `normal_queue`, then clear the buffer.
     pub fn flush_skip_buffer(&mut self) {
         while let Some((msg, _)) = self.skip_buffer.pop_front() {
             self.normal_queue.push(msg);
         }
     }
 
-    /// Return the configured capacity (0 = unbounded).
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// Commit a selective receive: remove the first "tried" message from
-    /// the skip-buffer and clear remaining "tried" flags. Called after a
-    /// pattern+guard check succeeds.
+    /// Commit the most recently tried selective-receive candidate.
+    ///
+    /// A receive can try more than one candidate when pattern/guard checks
+    /// fail. The successful candidate is therefore the *last* tried entry,
+    /// not the first one. Removing the last tried entry preserves all earlier
+    /// candidates that were rejected by guards.
     pub fn commit_receive_match(&mut self) {
-        // Remove the first tried entry.
-        if let Some(idx) = self.skip_buffer.iter().position(|(_, tried)| *tried) {
+        if let Some(idx) = self.skip_buffer.iter().rposition(|(_, tried)| *tried) {
             self.skip_buffer.remove(idx);
         }
-        // Clear remaining tried flags.
         for (_, tried) in self.skip_buffer.iter_mut() {
             *tried = false;
         }
     }
 
-    /// Reset "tried" flags in the skip-buffer. Called when
-    /// `receive_match` returns `None`, preparing the buffer for the next
-    /// receive expression.
     pub fn reset_receive_match(&mut self) {
         for (_, tried) in self.skip_buffer.iter_mut() {
             *tried = false;
@@ -333,15 +266,10 @@ impl Mailbox {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Helper to build a test message with minimal boilerplate.
     fn make_msg(behavior_id: u16, sender: u64) -> Message {
         Message {
             behavior_id,
@@ -352,46 +280,32 @@ mod tests {
         }
     }
 
-    // Test 1: Basic push/pop round-trip.
     #[test]
     fn test_push_and_pop() {
         let mut mb = Mailbox::new(4);
         let msg = make_msg(1, 100);
-
         assert!(mb.is_empty());
         assert_eq!(mb.len(), 0);
-
         mb.push(msg.clone()).unwrap();
         assert!(!mb.is_empty());
         assert_eq!(mb.len(), 1);
-
         let popped = mb.pop().unwrap();
         assert_eq!(popped.behavior_id, 1);
         assert_eq!(popped.sender, 100);
         assert_eq!(*popped.payload, vec![Value::int(42)]);
-
         assert!(mb.is_empty());
         assert_eq!(mb.pop(), None);
     }
 
-    // Test 2: Unbounded — push never fails, even with many messages.
     #[test]
     fn test_unbounded_never_fails() {
-        let mut mb = Mailbox::new(0); // 0 = unbounded
-
+        let mut mb = Mailbox::new(0);
         for i in 0..10000 {
-            let result = mb.push(make_msg(i as u16, i as u64));
-            assert!(
-                result.is_ok(),
-                "push {} should never fail on unbounded queue",
-                i
-            );
+            assert!(mb.push(make_msg(i as u16, i as u64)).is_ok());
         }
         assert_eq!(mb.len(), 10000);
-
-        // Pop all messages
         for i in 0..10000 {
-            let msg = mb.pop().expect(&format!("pop {} should succeed", i));
+            let msg = mb.pop().expect("message should exist");
             assert_eq!(msg.behavior_id, i as u16);
         }
         assert!(mb.is_empty());
@@ -400,81 +314,62 @@ mod tests {
     #[test]
     fn test_supervisor_signals_never_dropped() {
         let mut mb = Mailbox::new(4);
-
-        // Flood with system-priority exit signals
         for i in 0..1000 {
-            let signal = Message {
-                behavior_id: 0, // System message
+            mb.push(Message {
+                behavior_id: 0,
                 payload: Arc::new(vec![Value::int(i)]),
                 sender: i as u64,
                 priority: MessagePriority::System,
                 trace_id: None,
-            };
-            mb.push(signal).unwrap();
+            })
+            .unwrap();
         }
-
-        // All 1000 signals must be present
         assert_eq!(mb.len(), 1000);
-
-        // Verify every signal is recoverable
         let mut count = 0;
         while mb.pop().is_some() {
             count += 1;
         }
-        assert_eq!(count, 1000, "no supervisor signals should be lost");
+        assert_eq!(count, 1000);
     }
 
-    // Test 4: len and is_empty track correctly across operations.
     #[test]
     fn test_len_and_is_empty() {
         let mut mb = Mailbox::new(4);
         assert!(mb.is_empty());
-        assert_eq!(mb.len(), 0);
-
         mb.push(make_msg(10, 1)).unwrap();
-        assert!(!mb.is_empty());
-        assert_eq!(mb.len(), 1);
-
         mb.push(make_msg(20, 2)).unwrap();
         mb.push(make_msg(30, 3)).unwrap();
         assert_eq!(mb.len(), 3);
-
         mb.pop().unwrap();
         assert_eq!(mb.len(), 2);
-
         mb.pop().unwrap();
         mb.pop().unwrap();
         assert!(mb.is_empty());
-        assert_eq!(mb.len(), 0);
     }
-    // Test 5: drain returns a cloned snapshot without removing messages.
+
     #[test]
     fn test_drain_snapshot() {
         let mut mb = Mailbox::new(4);
         mb.push(make_msg(1, 10)).unwrap();
         mb.push(make_msg(2, 20)).unwrap();
         mb.push(make_msg(3, 30)).unwrap();
-
         let snapshot = mb.drain();
         assert_eq!(snapshot.len(), 3);
         assert_eq!(snapshot[0].behavior_id, 1);
         assert_eq!(snapshot[1].behavior_id, 2);
         assert_eq!(snapshot[2].behavior_id, 3);
-
-        // Mailbox should still contain all messages after drain.
         assert_eq!(mb.len(), 3);
         assert_eq!(mb.pop().unwrap().behavior_id, 1);
         assert_eq!(mb.pop().unwrap().behavior_id, 2);
         assert_eq!(mb.pop().unwrap().behavior_id, 3);
     }
+
     #[test]
     fn test_concurrent_push() {
         use std::sync::Arc;
         use std::thread;
-
-        let mb = Arc::new(Mailbox::new(0)); // 0 = unbounded for concurrent test
+        let mb = Arc::new(Mailbox::new(0));
         let mut handles = Vec::new();
-
         for t in 0..4 {
             let mb_clone = Arc::clone(&mb);
             handles.push(thread::spawn(move || {
@@ -485,15 +380,10 @@ mod tests {
                 }
             }));
         }
-
         for handle in handles {
             handle.join().unwrap();
         }
-
-        // All 400 messages should be present
         assert_eq!(mb.len(), 400);
-
-        // Recover the owned Mailbox so we can call &mut self methods.
         let mut mb = Arc::try_unwrap(mb).unwrap_or_else(|_| panic!("Arc still has live clones"));
         let mut count = 0;
         while mb.pop().is_some() {
@@ -501,25 +391,33 @@ mod tests {
         }
         assert_eq!(count, 400);
     }
-    // Test 7: receive_match preserves the relative FIFO order of ALL
-    // non-matched messages, including those queued behind the match.
+
     #[test]
     fn test_receive_match_preserves_skipped_order() {
         let mut mb = Mailbox::new(4);
-        mb.push(make_msg(1, 100)).unwrap(); // A: skipped (no match)
-        mb.push(make_msg(2, 200)).unwrap(); // B: matched
-        mb.push(make_msg(3, 300)).unwrap(); // C: queued behind the match
-
+        mb.push(make_msg(1, 100)).unwrap();
+        mb.push(make_msg(2, 200)).unwrap();
+        mb.push(make_msg(3, 300)).unwrap();
         let found = mb.receive_match(&[2]);
         assert_eq!(found, Some((0, Arc::new(vec![Value::int(42)]))));
-        // Commit: remove the matched ("tried") message from the skip-buffer.
         mb.commit_receive_match();
-
-        // The mailbox must still serve A before C: selective receive only
-        // removes the matched message, it must not reorder the rest.
         assert_eq!(mb.len(), 2);
         assert_eq!(mb.pop().unwrap().behavior_id, 1);
         assert_eq!(mb.pop().unwrap().behavior_id, 3);
         assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn commit_removes_last_tried_candidate() {
+        let mut mb = Mailbox::new(0);
+        mb.push(make_msg(1, 1)).unwrap();
+        mb.push(make_msg(1, 2)).unwrap();
+        assert!(mb.receive_match(&[1]).is_some());
+        assert!(mb.receive_match(&[1]).is_some());
+        mb.commit_receive_match();
+        // First candidate failed its guard and must remain; the second was
+        // the successful candidate committed by the VM.
+        assert_eq!(mb.len(), 1);
+        assert_eq!(mb.pop().unwrap().sender, 1);
     }
 }
