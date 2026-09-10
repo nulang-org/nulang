@@ -1,0 +1,78 @@
+n: bash scripts/check_mobile_runtime_profile.sh
++
++  # -----------------------------------------------------------------------
+   # WASM backend
+diff --git a/docs/web/MOBILE_RUNTIME_RELEASE_GATE.md b/docs/web/MOBILE_RUNTIME_RELEASE_GATE.md
+new file mode 100644
+--- /dev/null
++++ b/docs/web/MOBILE_RUNTIME_RELEASE_GATE.md
+@@ -0,0 +1,43 @@
++# Mobile runtime release gate
++
++The `mobile-runtime` Cargo profile is a distribution boundary, not merely a
++runtime setting.
++
++Every change must preserve all of the following:
++
++1. `cargo check --lib --no-default-features --features mobile-runtime` passes.
++2. Library tests pass under the same feature set.
++3. The normal/build dependency tree contains no:
++   - Cranelift crates;
++   - Wasmtime;
++   - libloading.
++4. Every Cranelift/target-lexicon root dependency remains owned by the
++   `native-codegen` feature.
++5. `mobile-runtime` does not directly enable `native-codegen`, `ffi`,
++   Cranelift, Wasmtime, or libloading.
++6. Default builds still include `native-codegen` unless a deliberate public
++   default change is made.
++
++The canonical local/CI command is:
++
++```sh
++bash scripts/check_mobile_runtime_profile.sh
++```
++
++## Why both compilation and dependency inspection?
++
++A no-JIT constructor only changes execution behavior. An Apple binary can still
++contain runtime code-generation machinery if those crates remain linked.
++
++Conversely, a clean `cargo tree` is insufficient if conditional compilation
++leaves unresolved code paths. The compile/test steps catch source-level leaks;
++the dependency audit catches binary-surface regressions.
++
++## Apple packaging gate
++
++Do not publish the iOS static library/XCFramework unless this job is green on
++the exact commit being packaged.
++
++Cross-compiling for Apple targets is a later gate. This profile check is the
++architecture prerequisite that ensures the Rust graph itself is suitable for a
++no-JIT host.
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -44,6 +44,22 @@ version + migration.*
+ *Breaking changes require an accepted RFC and a deprecation cycle of at least
+ two major versions.*
+ 
++### Added since 1.0.0-frozen — 2026-09-09 (mobile runtime boundary)
++
++- **JIT-free mobile runtime distribution boundary** (Experimental,
++  `Cargo.toml`, `src/lib.rs`, `src/backends/`, `src/runtime/`, `src/vm.rs`,
++  `scripts/check_mobile_runtime_profile.sh`). Cranelift-backed JIT/current AOT
++  code moves behind `native-codegen`, while the `mobile-runtime` marker builds
++  the bytecode interpreter without Cranelift, Wasmtime, or dynamic libloading.
++  Default builds continue to enable native codegen, and WASM explicitly retains
++  its existing native-codegen dependency until that compiler-analysis coupling
++  is separated.
++- **Mobile runtime release gate** (Experimental,
++  `.github/workflows/ci.yml`, `docs/web/MOBILE_RUNTIME_RELEASE_GATE.md`). CI now
++  compiles and tests the interpreter-only profile, audits its dependency graph,
++  and verifies Cargo feature ownership before mobile runtime artifacts may be
++  treated as distributable.
++
+ ### Added since 1.0.0-frozen — 2026-08-22 (vscode extension)
+ - **AOT backend error parity** (`src/aot/mod.rs`): the native AOT run path
+   now surfaces interpreter-parity runtime errors (48-bit overflow, type
