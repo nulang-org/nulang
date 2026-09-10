@@ -1,6 +1,6 @@
 //! LLM subsystem for the actor runtime.
 //!
-//! Manages the persistent LLM worker thread, request dispatch, completion
+//! Manages bounded concurrent LLM execution, request dispatch, completion
 //! polling, and non-blocking suspension for `perform LLM.ask` in bytecode
 //! behaviors.
 
@@ -8,21 +8,40 @@ use std::sync::Arc;
 
 use nulang_ai::{LlmClient, LlmError, LlmRequest, LlmResponse, TokenBudget};
 
-/// Work item sent to the persistent LLM worker thread.
+/// Default number of blocking provider workers. Provider calls are I/O-bound,
+/// so this intentionally exceeds a single worker while remaining conservative
+/// for local runtimes. Override with `NULANG_LLM_WORKERS` (1..=64).
+const DEFAULT_LLM_WORKERS: usize = 8;
+const MAX_LLM_WORKERS: usize = 64;
+
+/// Maximum number of provider requests waiting behind active workers.
+/// A bounded queue is deliberate: actor scheduling must receive backpressure
+/// instead of allowing an unreachable/slow provider to consume unbounded RAM.
+/// Override with `NULANG_LLM_QUEUE_CAPACITY` (1..=65536).
+const DEFAULT_LLM_QUEUE_CAPACITY: usize = 1024;
+const MAX_LLM_QUEUE_CAPACITY: usize = 65_536;
+
+fn env_bounded_usize(name: &str, default: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=max).contains(value))
+        .unwrap_or(default)
+}
+
+/// Work item sent to the provider worker pool.
 pub(crate) struct LlmWorkItem {
     pub(crate) actor_id: u64,
     pub(crate) request: LlmRequest,
     pub(crate) client: Arc<dyn LlmClient>,
 }
 
-// Safety: LlmWorkItem is Send because all fields are Send.
-unsafe impl Send for LlmWorkItem {}
-
 /// Consolidated LLM subsystem state.
 ///
-/// Extracted from the Runtime god-object to group related fields and
-/// clarify ownership. The worker thread is spawned in [`LlmState::new`]
-/// and runs for the lifetime of the runtime.
+/// Provider execution is isolated behind a bounded MPMC queue. Each worker
+/// owns a current-thread Tokio runtime and processes one request at a time;
+/// the worker pool therefore permits bounded concurrency without blocking the
+/// actor scheduler or creating an OS thread per request.
 pub struct LlmState {
     /// Token budget for LLM calls. When set, the runtime rejects
     /// LLM requests that would exceed the configured token limit.
@@ -32,50 +51,64 @@ pub struct LlmState {
     /// threads can perform non-blocking `perform LLM.ask` calls.
     pub client: Option<Arc<dyn LlmClient>>,
 
-    /// Channel receiving results from the persistent LLM worker thread.
-    /// Drained by `poll_llm_completions`.
+    /// Channel receiving results from provider workers. Drained by
+    /// `poll_llm_completions` on the scheduler thread.
     pub rx: std::sync::mpsc::Receiver<(u64, Result<LlmResponse, LlmError>)>,
 
-    /// Number of LLM calls currently in flight. Incremented on dispatch,
-    /// decremented when the completion is stored.
+    /// Number of successfully dispatched LLM calls whose completion has not
+    /// yet been observed by the scheduler.
     pub inflight_count: usize,
 
-    /// Channel to dispatch work to the persistent LLM worker thread.
-    /// `None` after the runtime is dropped (sender half is owned by the
-    /// worker thread, which outlives the runtime).
+    /// Bounded channel used to dispatch work to the provider worker pool.
     pub(crate) request_tx: Option<crossbeam::channel::Sender<LlmWorkItem>>,
 }
 
 impl LlmState {
-    /// Create the LLM subsystem, spawning the persistent worker thread.
-    ///
-    /// The worker thread owns its own single-threaded tokio runtime and
-    /// processes requests sequentially. Results are sent back through the
-    /// `rx` channel.
+    /// Create the LLM subsystem and its bounded provider worker pool.
     pub fn new() -> Self {
-        let (llm_tx, llm_rx) = std::sync::mpsc::channel();
-        let llm_tx_worker = llm_tx.clone();
-        let (llm_request_tx, llm_request_rx) = crossbeam::channel::unbounded::<LlmWorkItem>();
+        let worker_count = env_bounded_usize(
+            "NULANG_LLM_WORKERS",
+            DEFAULT_LLM_WORKERS,
+            MAX_LLM_WORKERS,
+        );
+        let queue_capacity = env_bounded_usize(
+            "NULANG_LLM_QUEUE_CAPACITY",
+            DEFAULT_LLM_QUEUE_CAPACITY,
+            MAX_LLM_QUEUE_CAPACITY,
+        );
 
-        // Spawn a persistent LLM worker thread.
-        let _worker = std::thread::Builder::new()
-            .name("nulang-llm".to_string())
-            .spawn(move || {
-                let tokio_rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(_) => return,
-                };
-                while let Ok(item) = llm_request_rx.recv() {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        tokio_rt.block_on(item.client.complete(item.request))
-                    }))
-                    .unwrap_or_else(|_| Err(LlmError::from_string("LLM worker thread panicked")));
-                    let _ = llm_tx_worker.send((item.actor_id, result));
-                }
-            });
+        let (llm_tx, llm_rx) = std::sync::mpsc::channel();
+        let (llm_request_tx, llm_request_rx) =
+            crossbeam::channel::bounded::<LlmWorkItem>(queue_capacity);
+
+        for worker_id in 0..worker_count {
+            let request_rx = llm_request_rx.clone();
+            let completion_tx = llm_tx.clone();
+            let _worker = std::thread::Builder::new()
+                .name(format!("nulang-llm-{worker_id}"))
+                .spawn(move || {
+                    let tokio_rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    while let Ok(item) = request_rx.recv() {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            tokio_rt.block_on(item.client.complete(item.request))
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(LlmError::from_string("LLM worker thread panicked"))
+                        });
+                        let _ = completion_tx.send((item.actor_id, result));
+                    }
+                });
+        }
+        // Workers own all completion senders after construction. Dropping this
+        // extra sender lets the receiver observe disconnection if every worker
+        // exits unexpectedly.
+        drop(llm_tx);
 
         LlmState {
             token_budget: None,
@@ -101,11 +134,10 @@ impl LlmState {
         self.token_budget = None;
     }
 
-    /// Check whether the token budget allows the given estimated tokens.
-    /// Returns `true` if the request is allowed (budget not exhausted).
-    pub fn check_token_budget(&self, _estimated_tokens: u64) -> bool {
+    /// Check whether the token budget has room for the estimated request.
+    pub fn check_token_budget(&self, estimated_tokens: u64) -> bool {
         if let Some(budget) = &self.token_budget {
-            !budget.is_exhausted()
+            estimated_tokens <= budget.remaining()
         } else {
             true
         }
@@ -336,8 +368,11 @@ pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &s
         return;
     };
     if !dispatch_llm_request(rt, actor_id, request, prompt) {
-        // Dispatch failed (e.g. worker thread exited): fail gracefully.
+        // Dispatch failed (queue full or worker pool unavailable): fail
+        // gracefully without leaving stale in-flight bookkeeping behind.
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
+            actor.llm_inflight = false;
+            actor.llm_pending_prompt = None;
             actor.llm_completed = Some(Ok(LlmResponse {
                 content: None,
                 tool_calls: Vec::new(),
@@ -352,9 +387,12 @@ pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &s
     }
 }
 
-/// Send an LLM request to the persistent worker thread for execution.
-/// Returns true if the request was dispatched, false if the worker
-/// channel is unavailable (caller should roll back in-flight state).
+/// Try to enqueue an LLM request for bounded background execution.
+///
+/// The scheduler is never allowed to block on provider backpressure. Returns
+/// `false` when the queue is full or disconnected. Actor/in-flight state is
+/// changed only after a successful enqueue, so failed dispatch cannot strand
+/// an actor in a phantom in-flight state.
 pub(crate) fn dispatch_llm_request(
     rt: &mut Runtime,
     actor_id: u64,
@@ -367,17 +405,22 @@ pub(crate) fn dispatch_llm_request(
     let Some(tx) = rt.llm.request_tx.as_ref() else {
         return false;
     };
+
+    let item = LlmWorkItem {
+        actor_id,
+        request,
+        client,
+    };
+    if tx.try_send(item).is_err() {
+        return false;
+    }
+
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.llm_inflight = true;
         actor.llm_pending_prompt = Some(prompt.to_string());
     }
     rt.llm.inflight_count += 1;
-    tx.send(LlmWorkItem {
-        actor_id,
-        request,
-        client,
-    })
-    .is_ok()
+    true
 }
 
 /// Prune an agent's episodic memory to fit within `max_tokens`, using a
