@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """Apply a unified diff by exact hunk content, ignoring stale line offsets.
 
-Every non-new-file hunk must match its original text exactly once at the point
-it is applied. Missing or ambiguous matches are fatal. This is intentionally
-stricter than fuzzy `patch` and is used only to rebase generated patches whose
-line-number metadata is stale.
+Every hunk body must match exactly. If an exact old block occurs more than
+once, a non-placeholder source line may disambiguate only between those
+byte-identical matches, and only within a bounded distance. Missing or still
+ambiguous matches are fatal. No fuzzy context is ever accepted.
 """
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 import shlex
 import sys
+
+MAX_LINE_DRIFT = 250
 
 
 @dataclass
 class Hunk:
+    old_start: int
     old: list[str] = field(default_factory=list)
     new: list[str] = field(default_factory=list)
 
@@ -52,7 +56,10 @@ def parse_patch(text: str) -> list[FilePatch]:
             continue
 
         if line.startswith("@@"):
-            hunk = Hunk()
+            match = re.match(r"@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", line)
+            if not match:
+                raise ValueError(f"unsupported hunk header: {line.rstrip()}")
+            hunk = Hunk(old_start=int(match.group(1)))
             current.hunks.append(hunk)
             continue
 
@@ -69,8 +76,6 @@ def parse_patch(text: str) -> list[FilePatch]:
         elif line.startswith("+"):
             hunk.new.append(line[1:])
         else:
-            # A new metadata block ends the current hunk; malformed content is
-            # rejected rather than guessed.
             raise ValueError(
                 f"unexpected line inside hunk for {current.path}: {line.rstrip()}"
             )
@@ -81,6 +86,53 @@ def parse_patch(text: str) -> list[FilePatch]:
         missing = [p.path for p in patches if not p.hunks]
         raise ValueError(f"file patch has no hunks: {missing}")
     return patches
+
+
+def exact_positions(text: str, needle: str) -> list[int]:
+    positions: list[int] = []
+    start = 0
+    while True:
+        pos = text.find(needle, start)
+        if pos < 0:
+            return positions
+        positions.append(pos)
+        start = pos + max(1, len(needle))
+
+
+def choose_position(path: str, index: int, current: str, old: str, old_start: int) -> int:
+    positions = exact_positions(current, old)
+    if len(positions) == 1:
+        return positions[0]
+    if not positions:
+        raise RuntimeError(f"{path} hunk {index}: exact original block not found")
+
+    # `@@ -1 ...` was used by the generated patch as a placeholder. It must
+    # never influence placement; repeated matches remain ambiguous.
+    if old_start <= 1:
+        raise RuntimeError(
+            f"{path} hunk {index}: {len(positions)} exact matches and no usable line hint"
+        )
+
+    candidates = []
+    for pos in positions:
+        line = current.count("\n", 0, pos) + 1
+        candidates.append((abs(line - old_start), line, pos))
+    candidates.sort()
+
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        raise RuntimeError(
+            f"{path} hunk {index}: exact matches tie around source line {old_start}"
+        )
+    drift, line, pos = candidates[0]
+    if drift > MAX_LINE_DRIFT:
+        raise RuntimeError(
+            f"{path} hunk {index}: nearest exact match at line {line} drifts {drift} lines"
+        )
+    print(
+        f"strict patch: {path} hunk {index} disambiguated exact duplicate "
+        f"at line {line} (hint {old_start})"
+    )
+    return pos
 
 
 def apply(root: Path, patches: list[FilePatch], write: bool) -> None:
@@ -106,12 +158,8 @@ def apply(root: Path, patches: list[FilePatch], write: bool) -> None:
                 current = new
                 continue
 
-            count = current.count(old)
-            if count != 1:
-                raise RuntimeError(
-                    f"{patch.path} hunk {index}: expected exactly one exact match, found {count}"
-                )
-            current = current.replace(old, new, 1)
+            pos = choose_position(patch.path, index, current, old, hunk.old_start)
+            current = current[:pos] + new + current[pos + len(old):]
 
         contents[patch.path] = current
 
