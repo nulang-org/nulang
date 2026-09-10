@@ -3095,7 +3095,10 @@ mod tests {
         // Heap/tagged values (except nil) would arrive corrupted on the
         // receiving node, so they must always be rejected. Nil is now
         // wire-safe (VAL_NIL tag).
-        assert!(!value_is_wire_safe(&Value::ptr(std::ptr::null_mut()), true));
+        assert!(!value_is_wire_safe(
+            &unsafe { Value::ptr(std::ptr::null_mut()) },
+            true
+        ));
         assert!(!value_is_wire_safe(&Value::actor_ref(9), true));
         assert!(!value_is_wire_safe(&Value::closure(3), true));
         assert!(value_is_wire_safe(&Value::nil(), true));
@@ -3126,7 +3129,7 @@ mod tests {
         )));
         // Heap values stay rejected even with a table present.
         assert!(!packet_payload_wire_safe(&mk(
-            vec![Value::ptr(std::ptr::null_mut())],
+            vec![unsafe { Value::ptr(std::ptr::null_mut()) }],
             vec!["x".into()]
         )));
 

@@ -816,7 +816,7 @@ fn test_supervised_child_restart_retires_heap_with_foreign_refs() {
         .heap
         .alloc(16, TypeTag::Raw)
         .unwrap();
-    let v = Value::ptr(ptr);
+    let v = unsafe { Value::ptr(ptr) };
     rt.send_message_by_id(b, 0, &[v]);
 
     // A crashes with the in-flight foreign ref still pending.
@@ -2751,7 +2751,7 @@ fn test_cycle_detector_registers_real_cross_actor_ref() {
         );
     }
 
-    let v = Value::ptr(ptr);
+    let v = unsafe { Value::ptr(ptr) };
     rt.send_message_by_id(b, 0, &[v]);
     assert_eq!(
         rt.cycle_detector.graph_size(),
@@ -2781,7 +2781,7 @@ fn test_cycle_detector_accumulates_edge_ref_count() {
         .heap
         .alloc(16, crate::runtime::heap::TypeTag::Raw)
         .unwrap();
-    let v = Value::ptr(ptr);
+    let v = unsafe { Value::ptr(ptr) };
 
     rt.send_message_by_id(b, 0, &[v]);
     rt.send_message_by_id(b, 0, &[v]);
@@ -2817,7 +2817,7 @@ fn test_cross_actor_send_foreign_count_lifecycle() {
         assert_eq!(header.foreign_count, 0);
     }
 
-    let v = Value::ptr(ptr);
+    let v = unsafe { Value::ptr(ptr) };
     rt.send_message_by_id(b, 0, &[v]);
 
     unsafe {
@@ -2914,7 +2914,7 @@ fn test_run_scheduler_pumps_gc() {
         .heap
         .alloc(16, TypeTag::Raw)
         .unwrap();
-    let v = Value::ptr(ptr);
+    let v = unsafe { Value::ptr(ptr) };
     rt.send_message_by_id(b, 0, &[v]);
 
     // Sender drops its local reference while foreign_count is still 1: the
@@ -2974,7 +2974,7 @@ fn test_exiting_sender_heap_retired_until_refs_drain() {
         .heap
         .alloc(16, TypeTag::Raw)
         .unwrap();
-    let v = Value::ptr(ptr);
+    let v = unsafe { Value::ptr(ptr) };
     rt.send_message_by_id(b, 0, &[v]);
 
     // A exits with the in-flight op still pending and B's message unread.
@@ -3031,7 +3031,7 @@ fn test_forwarding_received_reference_uses_true_owner() {
         .heap
         .alloc(16, TypeTag::Raw)
         .unwrap();
-    let v = Value::ptr(ptr);
+    let v = unsafe { Value::ptr(ptr) };
 
     // A sends the reference to B; B receives it (taking a hold).
     rt.current_actor = Some(a);
@@ -3092,7 +3092,7 @@ fn test_receiver_hold_survives_sender_drop_until_release() {
         .heap
         .alloc(16, TypeTag::Raw)
         .unwrap();
-    let v = Value::ptr(ptr);
+    let v = unsafe { Value::ptr(ptr) };
     rt.send_message_by_id(b, 0, &[v]);
 
     // B receives the message and holds the reference.
@@ -6482,7 +6482,7 @@ fn test_dst_gc_during_send_seed_sweep() {
                         for (x, islot) in inner_slots.iter_mut().enumerate() {
                             *islot = Value::int((10 * (i * K + j) + x) as i64);
                         }
-                        *slot = Value::ptr(inner);
+                        *slot = unsafe { Value::ptr(inner) };
                     }
                 }
                 outer
@@ -6491,7 +6491,7 @@ fn test_dst_gc_during_send_seed_sweep() {
             // send path's `send_ref_to` (bumps the in-flight foreign
             // count so the tree survives until the receiver pops+holds).
             rt.current_actor = Some(builder);
-            rt.send_message(receiver, "accum", &[Value::ptr(outer)]);
+            rt.send_message(receiver, "accum", &[unsafe { Value::ptr(outer) }]);
             rt.current_actor = None;
             // The builder releases its local reference after the send;
             // the in-flight bump defers the free until the receiver's

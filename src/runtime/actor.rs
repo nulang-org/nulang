@@ -583,7 +583,7 @@ impl Actor {
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                     *ptr.add(bytes.len()) = 0;
                 }
-                Value::ptr(ptr)
+                unsafe { Value::ptr(ptr) }
             }
             None => Value::nil(),
         }

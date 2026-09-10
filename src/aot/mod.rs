@@ -705,7 +705,7 @@ macro_rules! define_aot_perform {
         pub unsafe extern "C" fn $name(eff_raw: u64, op_raw: u64 $(, $arg: u64)*) -> u64 {
             let effect = crate::jit::runtime::resolve_string_coerce(eff_raw).unwrap_or_default();
             let op = crate::jit::runtime::resolve_string_coerce(op_raw).unwrap_or_default();
-            let regs = [$(crate::vm::Value::from_bits($arg)),*];
+            let regs = [$(unsafe { crate::vm::Value::from_bits($arg) }),*];
             // The module is only needed by `perform_builtin_effect_in_module`
             // for a few effects (Otp/Http resolve against it); the common
             // IO/Actor/Timer path ignores it.

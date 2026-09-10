@@ -145,7 +145,18 @@ impl WasmFxRuntime {
             self.init_func.call(&mut self.store, ())
         }));
         match result {
-            Ok(Ok(raw)) => Ok(crate::vm::Value::from_raw(raw as u64)),
+            Ok(Ok(raw)) => {
+                let raw = raw as u64;
+                if (raw & crate::value_layout::TAG_MASK) == crate::value_layout::TAG_PTR {
+                    Err(NuError::runtime_error(
+                        "WasmFX module returned a host-pointer tag".to_string(),
+                        crate::types::Span::default(),
+                    ))
+                } else {
+                    // SAFETY: guest host-pointer tags are rejected above.
+                    Ok(unsafe { crate::vm::Value::from_raw(raw) })
+                }
+            }
             Ok(Err(trap)) => {
                 let msg = format!(
                     "wasm module suspended or trapped: {} \

@@ -3645,7 +3645,7 @@ mod tests {
         // Boxed calling convention: extern "C" fn(u64) -> u64.
         let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(ptr) };
         let result = f(crate::vm::Value::int(21).as_raw());
-        let got = crate::vm::Value::from_bits(result).as_int();
+        let got = unsafe { crate::vm::Value::from_bits(result) }.as_int();
         assert_eq!(got, Some(42));
     }
 
@@ -4256,7 +4256,7 @@ mod tests {
         let aot = crate::aot::AotModule::compile(&mir_module).expect("AOT compile");
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(5),
             "abortive handle without a perform evaluates to the body value"
         );
@@ -4299,7 +4299,7 @@ mod tests {
         let aot = crate::aot::AotModule::compile(&mir_module).expect("AOT compile");
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(42),
             "resuming handler must deliver 41 then continue with a+1"
         );
@@ -4342,7 +4342,7 @@ mod tests {
         let aot = crate::aot::AotModule::compile(&mir_module).expect("AOT compile");
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(12),
             "handler param x must receive 5, resume 6, then a*2 = 12"
         );
@@ -4386,7 +4386,7 @@ mod tests {
         let aot = crate::aot::AotModule::compile(&mir_module).expect("AOT compile");
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(107),
             "abortive handler must receive x = 7 and yield 7 + 100 = 107 (post-perform code is dead)"
         );
@@ -4428,7 +4428,7 @@ mod tests {
         let aot = crate::aot::AotModule::compile(&mir_module).expect("AOT compile");
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(99),
             "abortive handler with no args must yield the handler body result"
         );
@@ -4472,7 +4472,7 @@ mod tests {
         let aot = crate::aot::AotModule::compile(&mir_module).expect("AOT compile");
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(23),
             "a = 1+10 = 11, b = 2+10 = 12, a+b = 23"
         );
@@ -4520,7 +4520,7 @@ mod tests {
         );
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(23),
             "f(true)=1+10=11, f(false)=2+10=12, sum=23"
         );
@@ -4547,7 +4547,7 @@ mod tests {
         );
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(24),
             "f(true)=2+10=12, f(false)=2+10=12, sum=24"
         );
@@ -4567,7 +4567,7 @@ mod tests {
         );
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(2),
             "array indexing must work"
         );
@@ -4585,7 +4585,7 @@ mod tests {
         );
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_float(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_float(),
             Some(9.8596),
             "3.14 ** 2.0 must be a float pow"
         );
@@ -4593,7 +4593,7 @@ mod tests {
         let aot = aot_compile_source(r#"fn main() -> Int { 1000000000 ** 1000000000 }"#);
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(0),
             "int pow overflow wraps (wrapping_mul), not nil"
         );
@@ -4611,7 +4611,7 @@ mod tests {
         let aot = aot_compile_source(r#"fn main() -> Int { 3 ** 3 }"#);
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(27),
             "3 ** 3 must be 27, not 0 (unboxed-pow hazard)"
         );
@@ -4620,7 +4620,7 @@ mod tests {
         let aot = aot_compile_source(r#"fn main() -> Int { 2 ** 10 }"#);
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(1024),
             "2 ** 10 must be 1024"
         );
@@ -4630,7 +4630,7 @@ mod tests {
         let aot = aot_compile_source(r#"fn main() -> Int { 3 ** -1 }"#);
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw),
+            unsafe { crate::vm::Value::from_raw(raw) },
             crate::vm::Value::nil(),
             "3 ** -1 must be nil, not int 0"
         );
@@ -4646,7 +4646,7 @@ mod tests {
         let aot = aot_compile_source(r#"fn main() -> Float { -(0.1 + 0.22) }"#);
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_float(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_float(),
             Some(-0.32),
             "neg of literal float sum"
         );
@@ -4655,7 +4655,7 @@ mod tests {
             aot_compile_source(r#"fn main() -> Float { let x = 0.1; let y = 0.2; -(x + y) }"#);
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_float(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_float(),
             Some(-0.30000000000000004),
             "neg of float sum through vars"
         );
@@ -4671,10 +4671,16 @@ mod tests {
         // the top level (boxed entry).
         let aot = aot_compile_source(r#"fn main() { 1 / 0 }"#);
         let raw = aot.run().expect("native run");
-        assert!(crate::vm::Value::from_raw(raw).is_nil(), "1/0 must be nil");
+        assert!(
+            unsafe { crate::vm::Value::from_raw(raw) }.is_nil(),
+            "1/0 must be nil"
+        );
         let aot = aot_compile_source(r#"fn f() -> Int { 1 % 0 } fn main() { f() }"#);
         let raw = aot.run().expect("native run");
-        assert!(crate::vm::Value::from_raw(raw).is_nil(), "1%0 must be nil");
+        assert!(
+            unsafe { crate::vm::Value::from_raw(raw) }.is_nil(),
+            "1%0 must be nil"
+        );
     }
 
     #[test]
@@ -4697,7 +4703,7 @@ mod tests {
         );
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(11),
             "f(true)=1+5=6, f(false)=0+5=5, sum=11"
         );
@@ -4728,7 +4734,7 @@ mod tests {
         );
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(35),
             "f(true)=11+12=23, f(false)=0+12=12, sum=35"
         );
@@ -4760,7 +4766,7 @@ mod tests {
         );
         let raw = aot.run().expect("native run");
         assert_eq!(
-            crate::vm::Value::from_raw(raw).as_int(),
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
             Some(3),
             "loop: acc 0->1->2->3 = 3"
         );
@@ -5020,7 +5026,7 @@ mod tests {
         let aot = aot_compile_source(r#"fn mix(x, y) { x + y * 2 }"#);
         let raw = aot.run().expect("native run");
         assert!(
-            crate::vm::Value::from_raw(raw).is_nil(),
+            unsafe { crate::vm::Value::from_raw(raw) }.is_nil(),
             "library module must run to nil"
         );
     }
@@ -5049,7 +5055,7 @@ mod tests {
         };
         let aot = crate::aot::AotModule::compile(&module).expect("AOT compile");
         let raw = aot.run().expect("native run");
-        let val = crate::vm::Value::from_raw(raw);
+        let val = unsafe { crate::vm::Value::from_raw(raw) };
         assert_eq!(
             val,
             crate::vm::Value::bool(true),
@@ -5111,7 +5117,7 @@ mod tests {
         };
         let aot = crate::aot::AotModule::compile(&module).expect("AOT compile");
         let raw = aot.run().expect("native run");
-        let val = crate::vm::Value::from_raw(raw);
+        let val = unsafe { crate::vm::Value::from_raw(raw) };
         assert_eq!(
             val.as_int(),
             Some(42),
@@ -5147,7 +5153,7 @@ mod tests {
         let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
         let aot = crate::aot::AotModule::compile(&mir_module).expect("AOT compile");
         let raw = aot.run().expect("native run");
-        let val = crate::vm::Value::from_raw(raw);
+        let val = unsafe { crate::vm::Value::from_raw(raw) };
         assert_eq!(
             val.as_int(),
             Some(42),
@@ -5181,7 +5187,7 @@ mod tests {
         let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
         let aot = crate::aot::AotModule::compile(&mir_module).expect("AOT compile");
         let raw = aot.run().expect("native run");
-        let val = crate::vm::Value::from_raw(raw);
+        let val = unsafe { crate::vm::Value::from_raw(raw) };
         assert_eq!(
             val.as_int(),
             Some(42),
@@ -5221,7 +5227,7 @@ mod tests {
         let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
         let aot = crate::aot::AotModule::compile(&mir_module).expect("AOT compile");
         let raw = aot.run().expect("native run");
-        let val = crate::vm::Value::from_raw(raw);
+        let val = unsafe { crate::vm::Value::from_raw(raw) };
         assert_eq!(
             val.as_int(),
             Some(120),

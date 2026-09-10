@@ -240,7 +240,17 @@ impl WasmRuntime {
                 map_wasmtime_err(e)
             }
         })?;
-        Ok(crate::vm::Value::from_raw(raw as u64))
+        let raw = raw as u64;
+        if (raw & crate::value_layout::TAG_MASK) == crate::value_layout::TAG_PTR {
+            return Err(NuError::runtime_error(
+                "WASM module returned a host-pointer tag".to_string(),
+                Span::default(),
+            ));
+        }
+        // SAFETY: guest pointer tags are rejected above. Other guest values
+        // remain opaque immediates/floats; TAG_STRING is a guest-memory offset
+        // consumed only through `string_value`.
+        Ok(unsafe { crate::vm::Value::from_raw(raw) })
     }
 
     /// Resolve a tagged string `Value` (`TAG_STRING | offset`) to its text by
@@ -383,7 +393,7 @@ fn host_str_concat(mut caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<
                     .unwrap_or_default();
                 String::from_utf8_lossy(&bytes).into_owned()
             } else {
-                crate::vm::Value::from_raw(v as u64).to_string_repr()
+                unsafe { crate::vm::Value::from_raw(v as u64) }.to_string_repr()
             }
         };
         (read(a), read(b))
@@ -541,7 +551,7 @@ fn host_neg(_caller: Caller<'_, HostState>, a: i64) -> Result<i64, Error> {
         // Match the interpreter's INeg (and the JIT helper `nulang_ineg`):
         // ints negate with a 48-bit overflow check at INT48_MIN; anything
         // else is a type error.
-        let v = crate::vm::Value::from_raw(a);
+        let v = unsafe { crate::vm::Value::from_raw(a) };
         match v.as_int() {
             Some(x) if x != crate::value_layout::INT48_MIN => Ok(value_layout::tag_int(-x) as i64),
             Some(x) => Err(Error::msg(error_message(crate::vm::int_overflow_error(
@@ -623,10 +633,16 @@ fn host_ffi_call_impl(
         if *p == crate::ffi::marshal::CType::CStr {
             let s = read_wasm_string(&mut caller, args[i]);
             let c = std::ffi::CString::new(s).map_err(|_| Error::msg("bad cstr"))?;
-            cargs.push(crate::vm::Value::ptr(c.as_ptr() as *mut u8));
+            cargs.push(unsafe { crate::vm::Value::ptr(c.as_ptr() as *mut u8) });
             cstrings.push(c);
         } else {
-            cargs.push(crate::vm::Value::from_bits(args[i] as u64));
+            let raw = args[i] as u64;
+            if (raw & crate::value_layout::TAG_MASK) == crate::value_layout::TAG_PTR {
+                cargs.push(crate::vm::Value::nil());
+            } else {
+                // SAFETY: guest host-pointer tags are rejected above.
+                cargs.push(unsafe { crate::vm::Value::from_bits(raw) });
+            }
         }
     }
     // SAFETY: func.ptr points to a function whose ABI matches the signature.

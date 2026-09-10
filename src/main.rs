@@ -1891,7 +1891,7 @@ fn run_source(
             }
 
             let result_raw = aot_module.run()?;
-            let result = nulang::vm::Value::from_raw(result_raw);
+            let result = unsafe { nulang::vm::Value::from_raw(result_raw) };
             let result_str = result.to_string_repr();
             if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
                 println!("{}", result_str);
@@ -2005,7 +2005,7 @@ fn run_source(
             let result_str = if let Some(s) = vm.resolve_display_string(value) {
                 s
             } else {
-                nulang::vm::Value::from_raw(value).to_string_repr()
+                unsafe { nulang::vm::Value::from_raw(value) }.to_string_repr()
             };
             if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
                 println!("{}", result_str);

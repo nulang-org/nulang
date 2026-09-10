@@ -111,7 +111,7 @@ pub fn bool_to_value(b: bool) -> Value {
 /// closed here is strictly safer than the legacy masking behavior.
 fn ptr_to_value_checked(p: *mut u8) -> Value {
     if crate::value_layout::ptr_fits_payload(p as u64) {
-        Value::ptr(p)
+        unsafe { Value::ptr(p) }
     } else {
         Value::nil()
     }
@@ -494,7 +494,7 @@ mod tests {
     fn test_marshal_cstr_roundtrip() {
         let original = CString::new("hello ffi").unwrap();
         let ptr = original.as_ptr() as *mut u8;
-        let v = Value::ptr(ptr);
+        let v = unsafe { Value::ptr(ptr) };
         // SAFETY: pointer is a valid C string for the borrow.
         let borrowed = unsafe { value_to_cstr(&v).unwrap() };
         // SAFETY: borrowed pointer is valid.
@@ -555,7 +555,7 @@ mod tests {
             Signature::new(vec![CType::CStr], CType::I64),
         );
         let s = CString::new("nulang").unwrap();
-        let v = Value::ptr(s.as_ptr() as *mut u8);
+        let v = unsafe { Value::ptr(s.as_ptr() as *mut u8) };
         // SAFETY: pointer matches signature and is a valid C string.
         let result = unsafe { call_native(&func, &[v]).unwrap() };
         assert_eq!(result.as_int(), Some(6));

@@ -1166,7 +1166,7 @@ fn stress_gc_foreign_ref_churn() {
     }
 
     for ptr in &ptrs {
-        rt.send_message(target, "ref", &[Value::ptr(*ptr)]);
+        rt.send_message(target, "ref", &[unsafe { Value::ptr(*ptr) }]);
     }
 
     let stats = rt.gc_stats();
@@ -1506,8 +1506,8 @@ fn stress_gc_cycle_detector_under_foreign_ref_load() {
         let prev = actors[(i + N - 1) % N];
 
         for &ptr in &ptrs[i] {
-            rt.send_message_by_id(next, 0, &[Value::ptr(ptr)]);
-            rt.send_message_by_id(prev, 0, &[Value::ptr(ptr)]);
+            rt.send_message_by_id(next, 0, &[unsafe { Value::ptr(ptr) }]);
+            rt.send_message_by_id(prev, 0, &[unsafe { Value::ptr(ptr) }]);
         }
     }
 

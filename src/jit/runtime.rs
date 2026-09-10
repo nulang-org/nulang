@@ -15,7 +15,7 @@ use std::cell::{Cell, UnsafeCell};
 fn coerce_string(raw: u64) -> String {
     match resolve_string_coerce(raw) {
         Some(s) => s,
-        None => Value::from_raw(raw).to_string_repr(),
+        None => unsafe { Value::from_raw(raw) }.to_string_repr(),
     }
 }
 
@@ -23,7 +23,7 @@ fn coerce_string(raw: u64) -> String {
 /// string), as opposed to merely coercible to one? `resolve_string_coerce`
 /// returns Some for ints/floats/bools too, so it can't gate the concat path.
 fn raw_is_string(raw: u64) -> bool {
-    let val = Value::from_raw(raw);
+    let val = unsafe { Value::from_raw(raw) };
     if val.is_string() {
         return true;
     }
@@ -59,7 +59,7 @@ fn alloc_string_value(s: String) -> u64 {
                 crate::value_layout::ptr_fits_payload(ptr as u64),
                 "heap pointer exceeds 48-bit value payload; address would be truncated"
             );
-            Value::ptr(ptr).as_raw()
+            unsafe { Value::ptr(ptr) }.as_raw()
         } else {
             Value::nil().as_raw()
         }
@@ -196,7 +196,7 @@ pub extern "C" fn nulang_ineg(a: u64) -> u64 {
     if is_float_raw(a) {
         Value::float(-f64::from_bits(a)).as_raw()
     } else {
-        let v = Value::from_raw(a);
+        let v = unsafe { Value::from_raw(a) };
         match v.as_int() {
             Some(x) if x != INT48_MIN => Value::int(-x).as_raw(),
             Some(x) => record_arith_error(crate::vm::int_overflow_error("neg", x, 0)),
@@ -893,7 +893,7 @@ pub unsafe extern "C" fn nulang_alloc_obj(slot_count: u64, type_tag_raw: u32) ->
         for slot in slots.iter_mut() {
             *slot = Value::nil();
         }
-        Value::ptr(ptr).as_raw()
+        unsafe { Value::ptr(ptr) }.as_raw()
     } else {
         Value::nil().as_raw()
     }
@@ -927,7 +927,7 @@ pub unsafe extern "C" fn nulang_obj_set(obj: u64, idx: u64, val: u64) {
     if obj_ptr.is_null() {
         return;
     }
-    let val = Value::from_raw(val);
+    let val = unsafe { Value::from_raw(val) };
     let header = &*ActorHeap::header_of(obj_ptr);
     let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
     let len = payload_size / std::mem::size_of::<Value>();
@@ -985,7 +985,7 @@ pub unsafe extern "C" fn nulang_rec_copy(obj: u64) -> u64 {
             }
             dst_slots[i] = val;
         }
-        Value::ptr(dst_ptr).as_raw()
+        unsafe { Value::ptr(dst_ptr) }.as_raw()
     } else {
         Value::nil().as_raw()
     }
@@ -1008,7 +1008,7 @@ pub unsafe extern "C" fn nulang_str_eq(a: u64, b: u64) -> u64 {
 /// Returns tagged pointer or nil.
 #[no_mangle]
 pub fn resolve_string_coerce(raw: u64) -> Option<String> {
-    let val = crate::vm::Value::from_raw(raw);
+    let val = unsafe { crate::vm::Value::from_raw(raw) };
     if val.is_int() {
         return Some(val.as_int().unwrap().to_string());
     }
@@ -1105,8 +1105,8 @@ pub extern "C" fn nulang_pow(a: u64, b: u64) -> u64 {
         let bf = f64::from_bits(b);
         return Value::float(af.powf(bf)).as_raw();
     }
-    let va = Value::from_raw(a);
-    let vb = Value::from_raw(b);
+    let va = unsafe { Value::from_raw(a) };
+    let vb = unsafe { Value::from_raw(b) };
     let base = va.as_int().unwrap_or(0);
     let exp = vb.as_int().unwrap_or(0);
     if exp < 0 {
@@ -1142,7 +1142,7 @@ pub unsafe extern "C" fn nulang_arr_store(
 ) {
     let arr_ptr_val = *regs.add(arr_reg as usize);
     let idx_val = *regs.add(idx_reg as usize);
-    let val = Value::from_raw(*regs.add(src_reg as usize));
+    let val = unsafe { Value::from_raw(*regs.add(src_reg as usize)) };
     let arr_ptr = val_ptr(arr_ptr_val);
     if arr_ptr.is_null() {
         return;
@@ -1248,7 +1248,7 @@ pub unsafe extern "C" fn nulang_aot_state_get(field_name_raw: u64) -> u64 {
 #[no_mangle]
 pub unsafe extern "C" fn nulang_aot_state_set(field_name_raw: u64, value: u64) {
     let field = resolve_string_coerce(field_name_raw).unwrap_or_default();
-    try_with_callbacks(|cb| cb.set_state_field(&field, Value::from_bits(value)));
+    try_with_callbacks(|cb| cb.set_state_field(&field, unsafe { Value::from_bits(value) }));
 }
 
 // ---------------------------------------------------------------------------
@@ -1266,9 +1266,9 @@ macro_rules! define_aot_send {
         /// Send a fire-and-forget actor message from AOT-compiled code.
         #[no_mangle]
         pub unsafe extern "C" fn $name(target_raw: u64, behavior_raw: u64 $(, $arg: u64)*) {
-            let args = [$(Value::from_bits($arg)),*];
+            let args = [$(unsafe { Value::from_bits($arg) }),*];
             let _ = try_with_callbacks(|cb| {
-                cb.send_message(Value::from_bits(target_raw), behavior_raw as u16, &args);
+                cb.send_message(unsafe { Value::from_bits(target_raw) }, behavior_raw as u16, &args);
                 true
             });
         }
@@ -1301,7 +1301,7 @@ macro_rules! define_aot_emit {
         #[no_mangle]
         pub unsafe extern "C" fn $name(event_raw: u64 $(, $arg: u64)*) {
             let event = resolve_string_coerce(event_raw).unwrap_or_default();
-            let args = [$(Value::from_bits($arg)),*];
+            let args = [$(unsafe { Value::from_bits($arg) }),*];
             let _ = try_with_callbacks(|cb| {
                 cb.emit_event(&event, &args);
                 true
@@ -1338,10 +1338,10 @@ macro_rules! define_aot_ask {
             actor_raw: u64,
             behavior_raw: u64 $(, $arg: u64)*,
         ) -> u64 {
-            let args = [$(Value::from_bits($arg)),*];
+            let args = [$(unsafe { Value::from_bits($arg) }),*];
             try_with_callbacks(|cb| {
                 cb.ask_actor(
-                    Value::from_bits(actor_raw),
+                    unsafe { Value::from_bits(actor_raw) },
                     behavior_raw as u16,
                     &args,
                 )
@@ -1423,10 +1423,10 @@ fn aot_ffi_call_impl(lib_raw: u64, sym_raw: u64, sig: u64, args: &[u64]) -> Valu
                 Ok(c) => c,
                 Err(_) => return Value::nil(),
             };
-            cargs.push(Value::ptr(c.as_ptr() as *mut u8));
+            cargs.push(unsafe { Value::ptr(c.as_ptr() as *mut u8) });
             cstrings.push(c);
         } else {
-            cargs.push(Value::from_bits(args[i]));
+            cargs.push(unsafe { Value::from_bits(args[i]) });
         }
     }
     // SAFETY: func.ptr points to a function whose ABI matches the signature.
@@ -1678,14 +1678,14 @@ macro_rules! define_aot_perform_async {
             let args = [$($arg),*];
             let effect_op = resolve_string_coerce(effect_raw).unwrap_or_default();
             let constants = crate::aot::aot_module_constants();
-            let vals: Vec<Value> = args.iter().map(|a| Value::from_bits(*a)).collect();
+            let vals: Vec<Value> = args.iter().map(|a| unsafe { Value::from_bits(*a) }).collect();
             match try_with_callbacks(|cb| cb.perform_async(&effect_op, constants, &vals)) {
                 Some(crate::vm::PerformAsyncResult::Ready(Some(content))) => {
                     let bytes = content.into_bytes();
                     if let Some(ptr) = alloc_obj(bytes.len() + 1, HeapTypeTag::String) {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
-                        Value::ptr(ptr).as_raw()
+                        unsafe { Value::ptr(ptr) }.as_raw()
                     } else {
                         Value::nil().as_raw()
                     }
@@ -1773,7 +1773,8 @@ thread_local! {
 #[no_mangle]
 pub unsafe extern "C" fn nulang_aot_spawn_push(name_idx: u64, value: u64) {
     AOT_SPAWN_INIT.with(|c| {
-        c.borrow_mut().push((name_idx, Value::from_bits(value)));
+        c.borrow_mut()
+            .push((name_idx, unsafe { Value::from_bits(value) }));
     });
 }
 
@@ -1944,7 +1945,7 @@ mod tests {
             crate::vm::Value::int(5).as_raw(),
             crate::vm::Value::int(7).as_raw(),
         );
-        assert_eq!(crate::vm::Value::from_raw(ri).as_int(), Some(12));
+        assert_eq!(unsafe { crate::vm::Value::from_raw(ri) }.as_int(), Some(12));
 
         super::aot_clear_constants();
         let _ = super::aot_take_heap();

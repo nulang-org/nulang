@@ -169,7 +169,12 @@ impl From<Value> for NulangValue {
 
 impl From<NulangValue> for Value {
     fn from(value: NulangValue) -> Self {
-        Value::from_bits(value.raw)
+        if (value.raw & crate::value_layout::TAG_MASK) == crate::value_layout::TAG_PTR {
+            return Value::nil();
+        }
+        // SAFETY: the public C boundary rejects host-pointer tags above. The
+        // remaining immediate tags/floats do not authorize host dereferences.
+        unsafe { Value::from_bits(value.raw) }
     }
 }
 

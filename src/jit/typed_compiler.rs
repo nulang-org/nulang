@@ -1751,7 +1751,7 @@ mod typed_tests {
 
         regs[1] = Value::float(2.0).as_raw();
         func(regs.as_mut_ptr(), consts.as_ptr());
-        assert_eq!(Value::from_bits(regs[2]).as_float(), Some(3.5));
+        assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_float(), Some(3.5));
     }
 
     #[test]
@@ -1790,7 +1790,7 @@ mod typed_tests {
 
         regs[1] = Value::float(2.0).as_raw();
         func(regs.as_mut_ptr(), consts.as_ptr());
-        assert_eq!(Value::from_bits(regs[2]).as_float(), Some(3.5));
+        assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_float(), Some(3.5));
     }
 
     // ------------------------------------------------------------------

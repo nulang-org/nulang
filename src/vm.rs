@@ -180,7 +180,7 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
             Some(ptr) => unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                 *ptr.add(bytes.len()) = 0;
-                Value::ptr(ptr)
+                unsafe { Value::ptr(ptr) }
             },
             None => Value::nil(),
         }
@@ -455,7 +455,7 @@ pub(crate) fn strbuilder_op(
                 *(ptr as *mut u64) = 0; // len
                 *((ptr as *mut u64).add(1)) = cap as u64;
             }
-            Some(Value::ptr(ptr))
+            Some(unsafe { Value::ptr(ptr) })
         }
         "push" | "append" => {
             let b = regs.first()?.as_ptr()?;
@@ -472,7 +472,7 @@ pub(crate) fn strbuilder_op(
                     );
                     *(b as *mut u64) = needed as u64;
                 }
-                Some(Value::ptr(b))
+                Some(unsafe { Value::ptr(b) })
             } else {
                 let new_cap = (cap * 2).max(needed);
                 let new_ptr = callbacks.alloc(STRBUILDER_HDR + new_cap, HeapTypeTag::Raw)?;
@@ -490,7 +490,7 @@ pub(crate) fn strbuilder_op(
                     *(new_ptr as *mut u64) = needed as u64;
                     *((new_ptr as *mut u64).add(1)) = new_cap as u64;
                 }
-                Some(Value::ptr(new_ptr))
+                Some(unsafe { Value::ptr(new_ptr) })
             }
         }
         "to_string" => {
@@ -501,7 +501,7 @@ pub(crate) fn strbuilder_op(
                 std::ptr::copy_nonoverlapping(b.add(STRBUILDER_HDR), ptr, len);
                 *ptr.add(len) = 0;
             }
-            Some(Value::ptr(ptr))
+            Some(unsafe { Value::ptr(ptr) })
         }
         "len" => {
             let b = regs.first()?.as_ptr()?;
@@ -512,7 +512,7 @@ pub(crate) fn strbuilder_op(
             unsafe {
                 *(b as *mut u64) = 0;
             }
-            Some(Value::ptr(b))
+            Some(unsafe { Value::ptr(b) })
         }
         _ => None,
     }
@@ -672,7 +672,7 @@ fn map_grow(callbacks: &mut dyn ActorVmCallbacks, m: *mut u8, new_cap: usize) ->
         let used = map_used(m);
         *((new_ptr as *mut Value).add(1)) = Value::int(used as i64);
     }
-    Some(Value::ptr(new_ptr))
+    Some(unsafe { Value::ptr(new_ptr) })
 }
 
 pub(crate) fn hashmap_op(
@@ -693,7 +693,7 @@ pub(crate) fn hashmap_op(
                     *slot = Value::int(MAP_EMPTY);
                 }
             }
-            Some(Value::ptr(m))
+            Some(unsafe { Value::ptr(m) })
         }
         "insert" => {
             let m_orig = regs.first()?.as_ptr()?;
@@ -730,7 +730,7 @@ pub(crate) fn hashmap_op(
                         }
                     }
                     map_set_used(m, used + 1);
-                    return Some(Value::ptr(m));
+                    return Some(unsafe { Value::ptr(m) });
                 }
                 if hc == MAP_TOMB {
                     if first_tomb.is_none() {
@@ -758,7 +758,7 @@ pub(crate) fn hashmap_op(
                             callbacks.retain_ref(p);
                         }
                     }
-                    return Some(Value::ptr(m));
+                    return Some(unsafe { Value::ptr(m) });
                 }
             }
             // No empty slot: reuse the first tombstone (table can't be all
@@ -778,7 +778,7 @@ pub(crate) fn hashmap_op(
                     }
                 }
                 map_set_used(m, used + 1);
-                Some(Value::ptr(m))
+                Some(unsafe { Value::ptr(m) })
             } else {
                 None
             }
@@ -866,10 +866,10 @@ pub(crate) fn hashmap_op(
                         *(base as *mut Value) = Value::int(MAP_TOMB);
                     }
                     map_set_used(m, used.saturating_sub(1));
-                    return Some(Value::ptr(m));
+                    return Some(unsafe { Value::ptr(m) });
                 }
             }
-            Some(Value::ptr(m))
+            Some(unsafe { Value::ptr(m) })
         }
         "size" => {
             let m = regs.first()?.as_ptr()?;
@@ -969,7 +969,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe { Value::ptr(ptr) });
                 }
                 None => return Some(Value::nil()),
             }
@@ -988,7 +988,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe { Value::ptr(ptr) });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1003,7 +1003,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe { Value::ptr(ptr) });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1022,7 +1022,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe { Value::ptr(ptr) });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1116,7 +1116,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe { Value::ptr(ptr) });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1132,7 +1132,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe { Value::ptr(ptr) });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1153,7 +1153,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe { Value::ptr(ptr) });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1188,7 +1188,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                         );
                                         *ptr.add(bytes.len()) = 0;
                                     }
-                                    return Some(Value::ptr(ptr));
+                                    return Some(unsafe { Value::ptr(ptr) });
                                 }
                                 None => return Some(Value::nil()),
                             }
@@ -1294,7 +1294,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 self.gc.local_ref(&self.heap, ptr);
                             }
                         }
-                        return Some(Value::ptr(new_ptr));
+                        return Some(unsafe { Value::ptr(new_ptr) });
                     }
                     return Some(Value::nil());
                 }
@@ -1316,7 +1316,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 }
                             }
                         }
-                        return Some(Value::ptr(new_ptr));
+                        return Some(unsafe { Value::ptr(new_ptr) });
                     }
                     return Some(Value::nil());
                 }
@@ -1350,7 +1350,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 }
                             }
                         }
-                        return Some(Value::ptr(new_ptr));
+                        return Some(unsafe { Value::ptr(new_ptr) });
                     }
                     return Some(Value::nil());
                 }
@@ -1393,7 +1393,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 }
                             }
                         }
-                        return Some(Value::ptr(new_ptr));
+                        return Some(unsafe { Value::ptr(new_ptr) });
                     }
                     return Some(Value::nil());
                 }
@@ -1413,7 +1413,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 slots[i] = Value::int(start + i as i64);
                             }
                         }
-                        return Some(Value::ptr(new_ptr));
+                        return Some(unsafe { Value::ptr(new_ptr) });
                     }
                     return Some(Value::nil());
                 }
@@ -1449,7 +1449,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                                 );
                                                 *ptr.add(bytes.len()) = 0;
                                             }
-                                            return Some(Value::ptr(ptr));
+                                            return Some(unsafe { Value::ptr(ptr) });
                                         }
                                         None => return Some(Value::nil()),
                                     }
@@ -1469,7 +1469,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                     std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr, msg.len());
                                     *ptr.add(msg.len()) = 0;
                                 }
-                                return Some(Value::ptr(ptr));
+                                return Some(unsafe { Value::ptr(ptr) });
                             }
                             None => return Some(Value::nil()),
                         }
@@ -1500,7 +1500,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                                 );
                                                 *ptr.add(bytes.len()) = 0;
                                             }
-                                            return Some(Value::ptr(ptr));
+                                            return Some(unsafe { Value::ptr(ptr) });
                                         }
                                         None => return Some(Value::nil()),
                                     }
@@ -1520,7 +1520,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                     std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr, msg.len());
                                     *ptr.add(msg.len()) = 0;
                                 }
-                                return Some(Value::ptr(ptr));
+                                return Some(unsafe { Value::ptr(ptr) });
                             }
                             None => return Some(Value::nil()),
                         }
@@ -1556,7 +1556,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                                     *ptr.add(bytes.len()) = 0;
                                 }
-                                return Some(Value::ptr(ptr));
+                                return Some(unsafe { Value::ptr(ptr) });
                             }
                             None => return Some(Value::nil()),
                         }
@@ -1581,7 +1581,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                                 *ptr.add(bytes.len()) = 0;
                             }
-                            return Some(Value::ptr(ptr));
+                            return Some(unsafe { Value::ptr(ptr) });
                         }
                         None => return Some(Value::nil()),
                     }
@@ -1603,7 +1603,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                                 *ptr.add(bytes.len()) = 0;
                             }
-                            return Some(Value::ptr(ptr));
+                            return Some(unsafe { Value::ptr(ptr) });
                         }
                         None => return Some(Value::nil()),
                     }
@@ -1686,7 +1686,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                             *ptr.add(bytes.len()) = 0;
                         }
-                        Some(Value::ptr(ptr))
+                        Some(unsafe { Value::ptr(ptr) })
                     }
                     None => Some(Value::nil()),
                 }
@@ -1841,9 +1841,23 @@ impl Value {
     }
 
     /// Create a pointer value (for strings, lists, etc.).
-    pub fn ptr(p: *mut u8) -> Self {
+    ///
+    /// Panics instead of silently truncating addresses that do not fit the
+    /// legacy 48-bit pointer payload.
+    ///
+    /// # Safety
+    /// A non-null `p` must remain valid for every operation that may
+    /// dereference the returned `Value` (for example string resolution or
+    /// heap-object traversal). The pointer must refer to storage whose layout
+    /// matches the tag's consumer expectations.
+    pub unsafe fn ptr(p: *mut u8) -> Self {
+        let addr = p as u64;
+        assert!(
+            crate::value_layout::ptr_fits_payload(addr),
+            "pointer address does not fit Nulang's 48-bit Value payload"
+        );
         Value {
-            raw: TAG_PTR | (p as u64 & PAYLOAD_MASK),
+            raw: TAG_PTR | addr,
         }
     }
 
@@ -1952,11 +1966,13 @@ impl Value {
         self.raw
     }
 
-    /// Construct a Value from raw NaN-boxed bits.
+    /// Construct a `Value` from raw tagged bits.
     ///
     /// # Safety
-    /// The caller must ensure the bits form a valid tagged value.
-    pub fn from_raw(raw: u64) -> Self {
+    /// If `raw` has `TAG_PTR`, its payload must be a live pointer produced by
+    /// a Nulang heap and remain valid for every use of the returned value.
+    /// Other tagged payloads must satisfy their tag-specific invariants.
+    pub unsafe fn from_raw(raw: u64) -> Self {
         Value { raw }
     }
 
@@ -1965,8 +1981,13 @@ impl Value {
         self.raw
     }
 
-    /// Construct a Value from raw NaN-boxed bits.
-    pub fn from_bits(raw: u64) -> Self {
+    /// Construct a `Value` from raw tagged bits.
+    ///
+    /// # Safety
+    /// Same contract as [`Value::from_raw`]: a `TAG_PTR` payload must be a
+    /// live Nulang-heap pointer and every tag payload must satisfy its runtime
+    /// invariant.
+    pub unsafe fn from_bits(raw: u64) -> Self {
         Value { raw }
     }
 
@@ -2819,7 +2840,7 @@ impl VM {
         unsafe {
             crate::ffi::marshal::free_cstr_value(value);
         }
-        Ok(Value::ptr(heap_ptr))
+        Ok(unsafe { Value::ptr(heap_ptr) })
     }
 
     /// Get a constant string from a module's constant pool.
@@ -2908,7 +2929,7 @@ impl VM {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                 *ptr.add(bytes.len()) = 0;
             }
-            Value::ptr(ptr)
+            unsafe { Value::ptr(ptr) }
         } else {
             Value::nil()
         }
@@ -3228,7 +3249,7 @@ impl VM {
 
         if action != TieredAction::Interpret {
             for (i, bits) in regs.iter().enumerate() {
-                self.frames[frame_idx].regs[i] = Value::from_bits(*bits);
+                self.frames[frame_idx].regs[i] = unsafe { Value::from_bits(*bits) };
             }
 
             // A re-entrant callee raised a runtime error (e.g. step-limit
@@ -3338,7 +3359,7 @@ impl VM {
                     msg: format!("FFI argument {} contains null byte: {}", i, e),
                     span: Span::default(),
                 })?;
-                args.push(Value::ptr(cstring.as_ptr() as *mut u8));
+                args.push(unsafe { Value::ptr(cstring.as_ptr() as *mut u8) });
                 cstrings.push(cstring);
             } else {
                 args.push(src);
@@ -3434,7 +3455,7 @@ impl VM {
         for i in 0..argc {
             // SAFETY: `regs` points at the compiled region's 256-entry buffer.
             let bits = unsafe { *regs.add(i) };
-            frame.regs[i] = Value::from_bits(bits);
+            frame.regs[i] = unsafe { Value::from_bits(bits) };
         }
         frame.return_dst = dst.min(255) as u8;
         self.frames.push(frame);
@@ -4015,7 +4036,7 @@ impl VM {
                             }
                             dst_slots[i] = val;
                         }
-                        self.frames[frame_idx].regs[dst_reg] = Value::ptr(dst_ptr);
+                        self.frames[frame_idx].regs[dst_reg] = unsafe { Value::ptr(dst_ptr) };
                     } else {
                         self.frames[frame_idx].regs[dst_reg] = Value::nil();
                     }
@@ -4321,7 +4342,7 @@ impl VM {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                 *ptr.add(bytes.len()) = 0;
             }
-            Value::ptr(ptr)
+            unsafe { Value::ptr(ptr) }
         } else {
             Value::nil()
         };
@@ -4347,7 +4368,7 @@ impl VM {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    Value::ptr(ptr)
+                    unsafe { Value::ptr(ptr) }
                 } else {
                     Value::nil()
                 }
@@ -5086,7 +5107,7 @@ impl VM {
                                 *slot = Value::nil();
                             }
                         }
-                        Value::ptr(ptr)
+                        unsafe { Value::ptr(ptr) }
                     } else {
                         Value::nil()
                     };
@@ -5124,7 +5145,7 @@ impl VM {
                             *slot = Value::nil();
                         }
                     }
-                    Value::ptr(ptr)
+                    unsafe { Value::ptr(ptr) }
                 } else {
                     Value::nil()
                 };
@@ -5151,7 +5172,7 @@ impl VM {
                                 *slot = Value::nil();
                             }
                         }
-                        Value::ptr(ptr)
+                        unsafe { Value::ptr(ptr) }
                     } else {
                         Value::nil()
                     };
@@ -8105,7 +8126,7 @@ mod vm_tests {
             .actor_callbacks
             .alloc(std::mem::size_of::<Value>(), HeapTypeTag::Record)
             .expect("record allocation");
-        let result = run_scmpeq(&mut vm, Value::ptr(rec_ptr), hello);
+        let result = run_scmpeq(&mut vm, unsafe { Value::ptr(rec_ptr) }, hello);
         assert_eq!(
             result.as_bool(),
             Some(false),
@@ -8134,7 +8155,7 @@ mod vm_tests {
             .actor_callbacks
             .alloc(2 * std::mem::size_of::<Value>(), HeapTypeTag::Array)
             .expect("array allocation");
-        let arr_value = Value::ptr(arr_ptr);
+        let arr_value = unsafe { Value::ptr(arr_ptr) };
         // Write [int(42), string("hello")] into the array.
         unsafe {
             let slots = std::slice::from_raw_parts_mut(arr_ptr as *mut Value, 2);
