@@ -1,0 +1,150 @@
+codegen`. Existing WASM
++SIMD analysis imports JIT types, and Wasmtime is configured with its Cranelift
++backend. Decoupling WASM compiler analysis is a separate cleanup and is not
++required for the mobile runtime.
++
++## Required release gate
++
++Before publishing an Apple runtime artifact, CI must prove both:
++
++```sh
++cargo check --lib --no-default-features --features mobile-runtime
++cargo tree --no-default-features --features mobile-runtime
++```
++
++and reject dependency trees containing:
++
++- `cranelift*`
++- `wasmtime`
++- `libloading`
++
++Runtime selection alone is not sufficient; the dependencies must be absent from
++the compiled graph.
+diff --git a/src/vm.rs b/src/vm.rs
+--- a/src/vm.rs
++++ b/src/vm.rs
+@@ -1,5 +1,6 @@
+-        // Thread the current module's constant pool so the JIT runtime can
+-        // resolve interned (TAG_STRING) values for string comparison.
++        // Thread the current module's constant pool only when a native
++        // codegen tier exists.
++        #[cfg(feature = "native-codegen")]
+         unsafe {
+             crate::jit::runtime::set_jit_constants(&module.constants);
+         }
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -4380,25 +4380,33 @@
+-            // Reset JIT safepoint counter for this behavior invocation.
+-            if let Some(actor) = self.actors.get_mut(&actor_id) {
+-                actor.jit_safepoint_counter = crate::jit::runtime::JIT_SAFEPOINT_BUDGET;
+-                crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
++            #[cfg(feature = "native-codegen")]
++            {
++                // Reset native-codegen safepoint counter for this behavior.
++                if let Some(actor) = self.actors.get_mut(&actor_id) {
++                    actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
++                    crate::jit::runtime::set_jit_safepoint_ptr(
++                        &mut actor.jit_safepoint_counter,
++                    );
++                }
+             }
+ 
+             let result = vm.run_from(module_idx, code_offset);
+ 
+-            // JIT safepoint yield: capture state for inline resume on next turn.
+-            if vm.yield_pending {
+-                if let Some(vm_state) = vm.take_suspended_state() {
+-                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+-                        actor.suspended_execution =
+-                            Some(crate::runtime::actor::SuspendedExecution {
+-                                vm_state,
+-                                behavior_idx: 0,
+-                                step_name: String::new(),
+-                            });
+-                        actor.jit_yield_pending = true;
++            #[cfg(feature = "native-codegen")]
++            {
++                // JIT safepoint yield: capture state for inline resume.
++                if vm.yield_pending {
++                    if let Some(vm_state) = vm.take_suspended_state() {
++                        if let Some(actor) = self.actors.get_mut(&actor_id) {
++                            actor.suspended_execution =
++                                Some(crate::runtime::actor::SuspendedExecution {
++                                    vm_state,
++                                    behavior_idx: 0,
++                                    step_name: String::new(),
++                                });
++                            actor.jit_yield_pending = true;
++                        }
+                     }
++                    crate::jit::runtime::clear_jit_safepoint_ptr();
++                    (*self_ptr).vm_exec_end();
++                    return Ok(Value::nil());
+                 }
+-                crate::jit::runtime::clear_jit_safepoint_ptr();
+-                (*self_ptr).vm_exec_end();
+-                return Ok(Value::nil());
+             }
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -4470,3 +4470,4 @@
+             (*self_ptr).vm_exec_end();
++            #[cfg(feature = "native-codegen")]
+             crate::jit::runtime::clear_jit_safepoint_ptr();
+             // String-id values index into this runtime VM's constant pool. When
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1870,37 +1870,42 @@
++        #[cfg(feature = "native-codegen")]
+         "native" => {
+             let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+             let mir = nulang::mir_lower::lower_module(&hir)?;
+             if verbose {
+                 println!("=== AOT native compilation (target: {}) ===", target);
+                 for func in &mir.functions {
+                     println!(
+                         "  fn {} ({} locals, {} blocks)",
+                         func.name,
+                         func.locals.len(),
+                         func.blocks.len()
+                     );
+                 }
+             }
+             let aot_module = nulang::aot::AotModule::compile_for_target(&mir, target)?;
+ 
+-            // If --out is specified, write assembly to file
+             if let Some(out_file) = out_file {
+                 let assembly = aot_module.emit_assembly();
+                 std::fs::write(out_file, assembly).map_err(|e| {
+                     nulang::types::NuError::VMError {
+                         msg: format!("failed to write assembly to {}: {}", out_file, e),
+                         span: Span::default(),
+                     }
+                 })?;
+                 println!("Wrote assembly to {}", out_file);
+                 return Ok(());
+             }
+ 
+             let result_raw = aot_module.run()?;
+             let result = nulang::vm::Value::from_raw(result_raw);
+             let result_str = result.to_string_repr();
+             if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
+                 println!("{}", result_str);
+             }
+             Ok(())
+         }
++        #[cfg(not(feature = "native-codegen"))]
++        "native" => Err(nulang::types::NuError::VMError {
++            msg: "native backend not compiled in (enable 'native-codegen' feature)".into(),
++            span: Span::default(),
++        }),
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1080,9 +1080,14 @@
+-    print!("  --backend <b>    Backend: bytecode (default) | native | core-vm");
++    print!("  --backend <b>    Backend: b
