@@ -115,6 +115,28 @@ jobs:
           ])
           replace_once("src/aot/codegen.rs", old, new)
 
+          old = "\n".join([
+              "            if captures.is_empty() {",
+              "                // Return tagged function index — also register for call resolution.",
+              "                let idx = builder.ins().iconst(types::I64, *func as i64);",
+              "                Ok(emit_tag_int(builder, idx))",
+              "            } else {",
+          ])
+          new = "\n".join([
+              "            if captures.is_empty() {",
+              "                // A first-class closure must not masquerade as a numeric TAG_INT.",
+              "                // Static direct-call metadata still resolves this target without",
+              "                // dynamic dispatch; the runtime value uses canonical TAG_CLOSURE.",
+              "                let fn_val = builder.ins().iconst(types::I64, *func as i64);",
+              "                let helper = helpers.get(\"nulang_aot_make_closure_0\").ok_or_else(|| {",
+              "                    AotCompileError::Internal(\"missing nulang_aot_make_closure_0 helper\".into())",
+              "                })?;",
+              "                let call = builder.ins().call(*helper, &[fn_val]);",
+              "                Ok(builder.inst_results(call)[0])",
+              "            } else {",
+          ])
+          replace_once("src/aot/codegen.rs", old, new)
+
           anchor = "mod tests {\n    use super::*;\n"
           test = "\n".join([
               "mod tests {",
@@ -127,6 +149,8 @@ jobs:
               "            \"-3 ** -2\",",
               "            \"-fn(x) { x + 1 }\",",
               "            \"fn pick(b) { if b then 1 else -1 }; pick(true) * pick(-false)\",",
+              "            \"let f = fn(x) { x + 1 }; f(41)\",",
+              "            \"let apply = fn(f, x) { f(x) }; apply(fn(x) { x + 5 }, 10)\",",
               "            \"0\",",
               "        ];",
               "        for source in cases {",
