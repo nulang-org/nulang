@@ -17,6 +17,7 @@
       "max_agent_concurrency": 250,
       "isolation": "firecracker",
       "validation": {
+        "profile": "rust-ci-v1",
         "required": ["fmt", "clippy", "unit", "integration"]
       },
       "integration": "change_dag",
