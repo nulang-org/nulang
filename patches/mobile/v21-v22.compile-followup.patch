@@ -1,0 +1,58 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -46,4 +46,5 @@
+ #[cfg(feature = "wasm-backend")]
+ pub mod mir_wasm;
++#[cfg(feature = "wasm-backend")]
+ pub mod mir_wasm_simd;
+ #[cfg(feature = "otel")]
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -1120,5 +1120,6 @@
+     /// LLM-specific logic: re-installs callbacks, restores VM state,
+     /// resets the safepoint counter, and resumes execution.
++    #[cfg(feature = "native-codegen")]
+     fn resume_suspended_jit_yield(&mut self, actor_id: u64) {
+         let suspended = match self.actors.get_mut(&actor_id) {
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -6080,4 +6080,5 @@
++    #[cfg(feature = "native-codegen")]
+     pub fn register_aot_module(&mut self, module: crate::aot::AotModule) {
+         // Box the module so its address is stable, then register the raw
+diff --git a/src/vm.rs b/src/vm.rs
+--- a/src/vm.rs
++++ b/src/vm.rs
+@@ -3164,5 +3164,6 @@
+     /// Returns `true` if the JIT executed a compiled region and advanced the
+     /// PC — the caller should return `Ok(())` immediately.
++    #[cfg(feature = "native-codegen")]
+     fn try_jit_execute(&mut self, frame_idx: usize) -> bool {
+         let module_idx = self.frames[frame_idx].module_idx;
+diff --git a/src/vm.rs b/src/vm.rs
+--- a/src/vm.rs
++++ b/src/vm.rs
+@@ -3270,5 +3270,12 @@
+         false
+     }
+ 
++    #[cfg(not(feature = "native-codegen"))]
++    fn try_jit_execute(&mut self, _frame_idx: usize) -> bool {
++        false
++    }
++
+     /// Execute a single bytecode instruction.
+     ///
+diff --git a/src/vm.rs b/src/vm.rs
+--- a/src/vm.rs
++++ b/src/vm.rs
+@@ -3390,4 +3390,5 @@
+     /// # Safety
+     /// `regs` must point at the 256-entry register buffer of the compiled
+     /// region that invoked this helper.
++    #[cfg(feature = "native-codegen")]
+     pub(crate) fn jit_direct_call(
+         &mut self,
