@@ -47,14 +47,11 @@ def parse_patch(text: str) -> list[FilePatch]:
             patches.append(current)
             hunk = None
             continue
-
         if current is None:
             continue
-
         if line.startswith("new file mode "):
             current.new_file = True
             continue
-
         if line.startswith("@@"):
             match = re.match(r"@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", line)
             if not match:
@@ -62,10 +59,8 @@ def parse_patch(text: str) -> list[FilePatch]:
             hunk = Hunk(old_start=int(match.group(1)))
             current.hunks.append(hunk)
             continue
-
         if hunk is None:
             continue
-
         if line.startswith("\\ No newline at end of file"):
             continue
         if line.startswith(" "):
@@ -99,18 +94,23 @@ def exact_positions(text: str, needle: str) -> list[int]:
         start = pos + max(1, len(needle))
 
 
+def hunk_identity(old: str, old_start: int) -> str:
+    first = old.splitlines()[0].strip() if old.splitlines() else "<empty>"
+    return f"source_hint={old_start}, first={first!r}"
+
+
 def choose_position(path: str, index: int, current: str, old: str, old_start: int) -> int:
+    ident = hunk_identity(old, old_start)
     positions = exact_positions(current, old)
     if len(positions) == 1:
         return positions[0]
     if not positions:
-        raise RuntimeError(f"{path} hunk {index}: exact original block not found")
-
-    # `@@ -1 ...` was used by the generated patch as a placeholder. It must
-    # never influence placement; repeated matches remain ambiguous.
+        raise RuntimeError(
+            f"{path} hunk {index} ({ident}): exact original block not found"
+        )
     if old_start <= 1:
         raise RuntimeError(
-            f"{path} hunk {index}: {len(positions)} exact matches and no usable line hint"
+            f"{path} hunk {index} ({ident}): {len(positions)} exact matches and no usable line hint"
         )
 
     candidates = []
@@ -121,12 +121,12 @@ def choose_position(path: str, index: int, current: str, old: str, old_start: in
 
     if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
         raise RuntimeError(
-            f"{path} hunk {index}: exact matches tie around source line {old_start}"
+            f"{path} hunk {index} ({ident}): exact matches tie around source line {old_start}"
         )
     drift, line, pos = candidates[0]
     if drift > MAX_LINE_DRIFT:
         raise RuntimeError(
-            f"{path} hunk {index}: nearest exact match at line {line} drifts {drift} lines"
+            f"{path} hunk {index} ({ident}): nearest exact match at line {line} drifts {drift} lines"
         )
     print(
         f"strict patch: {path} hunk {index} disambiguated exact duplicate "
@@ -139,7 +139,7 @@ def apply(root: Path, patches: list[FilePatch], write: bool) -> None:
     contents: dict[str, str] = {}
     existed: dict[str, bool] = {}
 
-    for patch in patches:
+    for block_index, patch in enumerate(patches, start=1):
         path = root / patch.path
         if patch.path not in contents:
             existed[patch.path] = path.exists()
@@ -149,17 +149,18 @@ def apply(root: Path, patches: list[FilePatch], write: bool) -> None:
         for index, hunk in enumerate(patch.hunks, start=1):
             old = "".join(hunk.old)
             new = "".join(hunk.new)
-
-            if not old:
-                if current != "" or existed[patch.path]:
-                    raise RuntimeError(
-                        f"{patch.path} hunk {index}: empty-old hunk requires a new empty file"
-                    )
-                current = new
-                continue
-
-            pos = choose_position(patch.path, index, current, old, hunk.old_start)
-            current = current[:pos] + new + current[pos + len(old):]
+            try:
+                if not old:
+                    if current != "" or existed[patch.path]:
+                        raise RuntimeError("empty-old hunk requires a new empty file")
+                    current = new
+                    continue
+                pos = choose_position(patch.path, index, current, old, hunk.old_start)
+                current = current[:pos] + new + current[pos + len(old):]
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"diff block {block_index}, {patch.path}: {exc}"
+                ) from exc
 
         contents[patch.path] = current
 
