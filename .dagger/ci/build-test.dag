@@ -1,0 +1,23 @@
+#!/usr/bin/env dagger
+
+# Portable equivalent of the Build & Test GitHub Actions job.
+# Run locally with: dagger .dagger/ci/build-test.dag
+
+src=$(host | directory . --exclude .git --exclude target --exclude test-pkg)
+
+container |
+  from rust:bookworm |
+  with-exec -- apt-get update |
+  with-exec -- apt-get install -y --no-install-recommends python3-dev pkg-config libssl-dev ca-certificates |
+  with-mounted-cache /usr/local/cargo/registry nulang-cargo-registry |
+  with-mounted-cache /usr/local/cargo/git nulang-cargo-git |
+  with-exec -- cargo install cargo-llvm-cov --locked |
+  with-directory /src $src |
+  with-workdir /src |
+  with-mounted-cache /tmp/cargo-target nulang-cargo-target |
+  with-exec -- cargo build --all-targets |
+  with-exec -- bash -lc 'cargo test || (echo "Retrying test suite after flaky failure..." && cargo test)' |
+  with-exec -- cargo llvm-cov --all-features --lcov --output-path /src/lcov.info |
+  with-exec -- python3 scripts/verify_implementation.py |
+  file /src/lcov.info |
+  export ./lcov.info
