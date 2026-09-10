@@ -25,15 +25,15 @@ jobs:
               patches/mobile/v21-v22.part02 \
               patches/mobile/v21-v22.part03 \
               patches/mobile/v21-v22.part04 > /tmp/mobile-runtime-boundary.patch
-          echo "2b215525d1756d35e9eac964bcd03fa077e65d87bab53855bb3f1bf08cecb7f2  /tmp/mobile-runtime-boundary.patch" | sha256sum -c -
+          echo "56f4fce9e2806750543e13e0067da9a16453f83c219363aa92149dc34d7b8ae7  /tmp/mobile-runtime-boundary.patch" | sha256sum -c -
 
-      - name: Preflight context application
+      - name: Preflight exact-context application
         shell: bash
-        run: patch --dry-run --batch --forward --fuzz=3 -p1 < /tmp/mobile-runtime-boundary.patch
+        run: patch --dry-run --batch --forward --fuzz=0 -p1 < /tmp/mobile-runtime-boundary.patch
 
       - name: Apply mobile runtime boundary
         shell: bash
-        run: patch --batch --forward --fuzz=3 -p1 < /tmp/mobile-runtime-boundary.patch
+        run: patch --batch --forward --fuzz=0 -p1 < /tmp/mobile-runtime-boundary.patch
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
