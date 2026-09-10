@@ -98,6 +98,23 @@ jobs:
           ]) + "\n"
           replace_once("src/vm.rs", old, new)
 
+          old = "\n".join([
+              "                } else {",
+              "                    let payload = emit_sext48(builder, val);",
+              "                    let neg = builder.ins().ineg(payload);",
+              "                    Ok(emit_tag_int(builder, neg))",
+              "                }",
+          ])
+          new = "\n".join([
+              "                } else {",
+              "                    // Boxed values can still be nil even when MIR metadata says Int",
+              "                    // (for example, a negative integer exponent). Preserve runtime",
+              "                    // type/error semantics instead of re-tagging nil as integer zero.",
+              "                    call_helper(builder, helpers, \"nulang_ineg\", &[val])",
+              "                }",
+          ])
+          replace_once("src/aot/codegen.rs", old, new)
+
           anchor = "mod tests {\n    use super::*;\n"
           test = "\n".join([
               "mod tests {",
@@ -142,7 +159,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/aot/mod.rs src/jit/runtime.rs src/vm.rs src/fuzz.rs
+          git add src/aot/codegen.rs src/aot/mod.rs src/jit/runtime.rs src/vm.rs src/fuzz.rs
           git commit -m "fix(runtime): isolate compiled backend errors"
           git push origin HEAD:fix/compiled-runtime-fuzz-p0
 
