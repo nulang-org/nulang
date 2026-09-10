@@ -1,0 +1,164 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,7 +38,26 @@
+ [features]
+-default = ["python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
++default = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
++# Cranelift-backed tiered JIT plus the current "AOT" native backend. The
++# current AOT implementation uses cranelift_jit::JITModule internally, so both
++# belong behind one boundary until true object-file AOT is separated.
++native-codegen = [
++    "dep:cranelift",
++    "dep:cranelift-jit",
++    "dep:cranelift-module",
++    "dep:cranelift-native",
++    "dep:cranelift-frontend",
++    "dep:cranelift-codegen",
++    "dep:target-lexicon",
++]
++# Marker profile for the embedded mobile runtime. Intentionally empty:
++# pre-registered native callbacks work without dynamic `libloading`, and the
++# bytecode interpreter/actors/.nbc loader do not require Cranelift.
++mobile-runtime = []
+ python = ["dep:pyo3"]
+ sqlite = ["dep:libsql"]
+ lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
+ ai-runtime = ["dep:nulang-ai", "dep:nulang-ai-local", "dep:uuid", "dep:reqwest", "dep:tokio"]
+-wasm-backend = ["dep:wasm-encoder", "dep:wasmtime", "dep:wat"]
++# The current WASM SIMD path shares native-codegen analysis types, and Wasmtime
++# itself is configured with its Cranelift backend. Keep that relationship
++# explicit rather than broadening the mobile refactor.
++wasm-backend = ["native-codegen", "dep:wasm-encoder", "dep:wasmtime", "dep:wat"]
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -70,2 +70,2 @@
+-# Differential fuzzing driver binary (src/bin/nula_difffuzz.rs).
+-difffuzz = []
++# Differential fuzzing compares interpreter/JIT/AOT, so it requires native codegen.
++difffuzz = ["native-codegen"]
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -91,7 +91,7 @@
+-# Cranelift JIT backend
+-cranelift = "0.132"
+-cranelift-jit = "0.132"
+-cranelift-module = "0.132"
+-cranelift-native = "0.132"
+-cranelift-frontend = "0.132"
+-cranelift-codegen = { version = "0.132", features = ["riscv64"] }
++# Cranelift native-codegen backend (optional; excluded from mobile-runtime).
++cranelift = { version = "0.132", optional = true }
++cranelift-jit = { version = "0.132", optional = true }
++cranelift-module = { version = "0.132", optional = true }
++cranelift-native = { version = "0.132", optional = true }
++cranelift-frontend = { version = "0.132", optional = true }
++cranelift-codegen = { version = "0.132", features = ["riscv64"], optional = true }
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1 +1 @@
+-target-lexicon = "0.13"
++target-lexicon = { version = "0.13", optional = true }
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,4 +7,5 @@
+ pub mod agent;
++#[cfg(feature = "native-codegen")]
+ pub mod aot;
+ pub mod ast;
+ pub mod backends;
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -18,13 +18,16 @@
+ pub mod core_vm;
++#[cfg(feature = "native-codegen")]
+ pub mod cranelift_utils;
+ pub mod dap;
+ pub mod diagnostic;
++#[cfg(feature = "native-codegen")]
+ pub mod difffuzz;
+ pub mod docgen;
+ pub mod dst;
+ pub mod effect_checker;
+ pub mod ffi;
+ pub mod fmt;
+ pub mod format;
++#[cfg(feature = "native-codegen")]
+ pub mod fuzz;
+ pub mod hir;
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -31,3 +31,4 @@
+ pub mod iso_arena;
++#[cfg(feature = "native-codegen")]
+ pub mod jit;
+ pub mod json_diagnostics;
+diff --git a/src/backends/mod.rs b/src/backends/mod.rs
+--- a/src/backends/mod.rs
++++ b/src/backends/mod.rs
+@@ -530,8 +530,19 @@
+-/// Create the default JIT backend (Cranelift via `JitSession`).
++/// Scheduler budget used by native-codegen safepoints.
+ ///
+-/// This is the **sole** call-site for `JitSession::new()` outside of tests.
+-/// The VM calls this factory rather than importing `JitSession` directly,
+-/// keeping the JIT implementation behind the `JitBackend` trait boundary.
++/// Kept outside `crate::jit` so interpreter-only runtimes may retain the
++/// actor bookkeeping fields without importing the Cranelift module tree.
++pub const JIT_SAFEPOINT_BUDGET: u64 = 1000;
++
++/// Create the default JIT backend (Cranelift via `JitSession`) when native
++/// codegen is compiled in.
++#[cfg(feature = "native-codegen")]
+ pub fn create_default_jit() -> Option<Box<dyn JitBackend>> {
+     crate::jit::JitSession::new().map(|j| Box::new(j) as Box<dyn JitBackend>)
+ }
++
++/// Interpreter-only builds preserve the same VM trait boundary; there simply
++/// is no native tier to instantiate.
++#[cfg(not(feature = "native-codegen"))]
++pub fn create_default_jit() -> Option<Box<dyn JitBackend>> {
++    None
++}
+diff --git a/src/runtime/actor.rs b/src/runtime/actor.rs
+--- a/src/runtime/actor.rs
++++ b/src/runtime/actor.rs
+@@ -160,4 +160,3 @@
+-    /// AOT-compiled behavior targets, parallel to `behavior_table`. `Some`
+-    /// means the behavior at that index dispatches through AOT native code;
+-    /// the scheduler arms the target before invoking `handler_fn`.
++    /// AOT-compiled behavior targets, parallel to `behavior_table`.
++    #[cfg(feature = "native-codegen")]
+     pub aot_targets: Vec<Option<crate::aot::AotDispatchTarget>>,
+diff --git a/src/runtime/actor.rs b/src/runtime/actor.rs
+--- a/src/runtime/actor.rs
++++ b/src/runtime/actor.rs
+@@ -280,3 +280,4 @@
+             behavior_table: Vec::new(),
++            #[cfg(feature = "native-codegen")]
+             aot_targets: Vec::new(),
+             bytecode_offsets: Vec::new(),
+diff --git a/src/runtime/actor.rs b/src/runtime/actor.rs
+--- a/src/runtime/actor.rs
++++ b/src/runtime/actor.rs
+@@ -300,3 +300,3 @@
+             priority: ActorPriority::Normal,
+-            jit_safepoint_counter: crate::jit::runtime::JIT_SAFEPOINT_BUDGET,
++            jit_safepoint_counter: crate::backends::JIT_SAFEPOINT_BUDGET,
+             jit_yield_pending: false,
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -430,7 +430,6 @@
+-    /// AOT-compiled modules registered for native behavior dispatch, keyed by
+-    /// actor type name → module pointer. Ownership lives in
+-    /// `aot_module_storage`; the pointers are stable (each module is Boxed).
++    /// AOT-compiled modules registered for native behavior dispatch.
++    #[cfg(feature = "native-codegen")]
+     pub aot_modules: std::collections::HashMap<String, *const crate::aot::AotModule
