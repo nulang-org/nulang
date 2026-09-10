@@ -1,0 +1,261 @@
+name: Apply P0 runtime isolation fix
+
+on:
+  push:
+    branches:
+      - fix/compiled-runtime-fuzz-p0
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Apply scoped source edits
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected context exactly once, found {count}")
+              p.write_text(text.replace(old, new, 1))
+              print(f"updated {path}")
+
+          replace_once(
+              "src/aot/mod.rs",
+              '''    pub fn run(&self) -> NuResult<u64> {
+                  // A module with no `__main`/`main` (e.g. only function definitions, a
+          ''',
+              '''    pub fn run(&self) -> NuResult<u64> {
+                  // Compiled helpers cannot unwind through native code, so runtime errors
+                  // are stored in thread-local channels. Start every standalone AOT run
+                  // from a clean state; otherwise a prior JIT/AOT failure on this thread
+                  // can poison the next invocation, including the no-entry early return.
+                  let _ = crate::jit::runtime::aot_take_pending_error();
+                  let _ = crate::jit::runtime::take_jit_pending_vm_error();
+
+                  // A module with no `__main`/`main` (e.g. only function definitions, a
+          ''')
+
+          replace_once(
+              "src/aot/mod.rs",
+              '''        if let Some(msg) = crate::jit::runtime::aot_take_pending_error() {
+                      // Clean up before returning (mirror the normal path).
+          ''',
+              '''        // Drain both compiled-runtime error channels. Arithmetic helpers
+                  // currently report through the AOT slot while re-entrant helpers can
+                  // report through the JIT VM-error slot; either is a failure of this run.
+                  let aot_error = crate::jit::runtime::aot_take_pending_error();
+                  let jit_error = crate::jit::runtime::take_jit_pending_vm_error();
+                  if let Some(msg) = aot_error.or(jit_error) {
+                      // Clean up before returning (mirror the normal path).
+          ''')
+
+          replace_once(
+              "src/vm.rs",
+              '''        unsafe {
+                      crate::jit::runtime::set_jit_vm(self_ptr);
+                  }
+                  let action = jit.tiered_execute_step_typed(module_idx, pc, module, &mut regs, constants);
+                  crate::jit::runtime::clear_jit_vm();
+                  crate::jit::runtime::clear_jit_constants();
+                  crate::jit::runtime::clear_jit_callbacks();
+
+                  if action != TieredAction::Interpret {
+          ''',
+              '''        unsafe {
+                      crate::jit::runtime::set_jit_vm(self_ptr);
+                  }
+
+                  // Error slots are thread-local and shared by compiled runtime helpers.
+                  // Clear both at the execution boundary so no previous backend run can
+                  // affect this compiled region.
+                  let _ = crate::jit::runtime::take_jit_pending_vm_error();
+                  let _ = crate::jit::runtime::aot_take_pending_error();
+
+                  let action = jit.tiered_execute_step_typed(module_idx, pc, module, &mut regs, constants);
+                  crate::jit::runtime::clear_jit_vm();
+                  crate::jit::runtime::clear_jit_constants();
+                  crate::jit::runtime::clear_jit_callbacks();
+
+                  // Arithmetic helpers currently report through the AOT slot while
+                  // re-entrant direct calls use the JIT slot. Consume both immediately
+                  // after native execution and surface either through VM::step.
+                  let jit_error = crate::jit::runtime::take_jit_pending_vm_error();
+                  let aot_error = crate::jit::runtime::aot_take_pending_error();
+                  if let Some(msg) = jit_error.or(aot_error) {
+                      self.jit_pending_error = Some(msg);
+                      return true;
+                  }
+
+                  if action != TieredAction::Interpret {
+          ''')
+
+          replace_once(
+              "src/vm.rs",
+              '''            // A re-entrant callee raised a runtime error (e.g. step-limit
+                      // exceeded); the compiled region exited early via its error path.
+                      // Stash it on the VM so `step` can surface it (this fn returns
+                      // bool). Propagate BEFORE handling branch-exit/yield.
+                      if let Some(msg) = crate::jit::runtime::take_jit_pending_vm_error() {
+                          self.jit_pending_error = Some(msg);
+                          return true;
+                      }
+
+          ''',
+              '''''')
+
+          replace_once(
+              "src/fuzz.rs",
+              '''mod tests {
+              use super::*;
+
+              /// Quick differential fuzz: 300 iterations with a fixed seed, part of
+          ''',
+              '''mod tests {
+              use super::*;
+
+              fn persist_divergence_artifact(
+                  shard_id: u64,
+                  iteration: usize,
+                  rng_state: u64,
+                  seed: &str,
+                  mutant: &str,
+                  msg: &str,
+              ) {
+                  let artifact_dir = std::env::var("NULANG_FUZZ_ARTIFACT_DIR")
+                      .unwrap_or_else(|_| "/tmp/nulang-fuzz".to_string());
+                  let dir = std::path::Path::new(&artifact_dir);
+                  if let Err(err) = std::fs::create_dir_all(dir) {
+                      eprintln!("failed to create fuzz artifact directory {}: {}", dir.display(), err);
+                      return;
+                  }
+
+                  let path = dir.join(format!("shard-{shard_id}-iteration-{iteration}.log"));
+                  let body = format!(
+                      "shard_id={shard_id}\\niteration={iteration}\\n\\
+                       rng_state_before_iteration=0x{rng_state:016x}\\n\\n\\
+                       seed:\\n---\\n{seed}\\n---\\n\\n\\
+                       mutant:\\n---\\n{mutant}\\n---\\n\\n\\
+                       divergence:\\n{msg}\\n"
+                  );
+                  if let Err(err) = std::fs::write(&path, body) {
+                      eprintln!("failed to write fuzz artifact {}: {}", path.display(), err);
+                  } else {
+                      eprintln!("wrote differential fuzz reproducer: {}", path.display());
+                  }
+              }
+
+              #[test]
+              fn differential_unary_negation_and_error_isolation_regressions() {
+                  let cases = [
+                      "--(1 + 2,)",
+                      "-3 ** -2",
+                      "-fn(x) { x + 1 }",
+                      "fn pick(b) { if b then 1 else -1 }; pick(true) * pick(-false)",
+                      "0",
+                  ];
+
+                  for source in cases {
+                      match differential_fuzz_one(source) {
+                          Ok(DiffOutcome::Agreed { .. }) => {}
+                          Ok(other) => panic!(
+                              "regression case was not fully differentially executed: {:?}: {:?}",
+                              source, other
+                          ),
+                          Err(msg) => panic!("backend divergence for {:?}: {}", source, msg),
+                      }
+                  }
+
+                  match differential_fuzz_one("0") {
+                      Ok(DiffOutcome::Agreed { .. }) => {}
+                      Ok(other) => panic!("isolation sentinel was not executed: {:?}", other),
+                      Err(msg) => panic!("compiled error leaked into isolation sentinel: {}", msg),
+                  }
+              }
+
+              /// Quick differential fuzz: 300 iterations with a fixed seed, part of
+          ''')
+
+          replace_once(
+              "src/fuzz.rs",
+              '''        for _ in 0..iterations {
+                      let seed = corpus[rng.index(&corpus)];
+                      let mutant = mutate(&mut rng, seed, &corpus);
+                      match differential_fuzz_one(&mutant) {
+          ''',
+              '''        for iteration in 0..iterations {
+                      // Preserve the PRNG state before corpus selection. Restoring this
+                      // state reproduces the exact corpus choice and mutation sequence.
+                      let rng_state = rng.0;
+                      let seed = corpus[rng.index(&corpus)];
+                      let mutant = mutate(&mut rng, seed, &corpus);
+                      match differential_fuzz_one(&mutant) {
+          ''')
+
+          replace_once(
+              "src/fuzz.rs",
+              '''                Err(msg) => {
+                          divergence_count += 1;
+                          eprintln!("DIVERGENCE: {}", msg);
+          ''',
+              '''                Err(msg) => {
+                          persist_divergence_artifact(
+                              shard_id,
+                              iteration,
+                              rng_state,
+                              seed,
+                              &mutant,
+                              &msg,
+                          );
+                          divergence_count += 1;
+                          eprintln!("DIVERGENCE: {}", msg);
+          ''')
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Check diff
+        run: git diff --check
+
+      - name: Run unary-negation regression
+        run: cargo test --lib --features wasm-backend differential_unary_negation_and_error_isolation_regressions -- --nocapture
+
+      - name: Run focused differential fuzz shard
+        env:
+          NULANG_FUZZ_ITERATIONS: "1000"
+          NULANG_FUZZ_SHARD_ID: "0"
+          NULANG_FUZZ_ARTIFACT_DIR: /tmp/nulang-fuzz
+        run: cargo test --lib --features wasm-backend fuzz_differential_extended -- --ignored --nocapture
+
+      - name: Commit verified fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/aot/mod.rs src/vm.rs src/fuzz.rs
+          git commit -m "fix(runtime): isolate compiled backend errors"
+          git push origin HEAD:fix/compiled-runtime-fuzz-p0
