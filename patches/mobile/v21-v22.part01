@@ -1,0 +1,170 @@
+>,
+-    /// Owns the registered AOT modules so the raw pointers in `aot_modules`
+-    /// (and on actors) stay valid for the Runtime's lifetime.
++    /// Owns registered AOT modules so actor raw pointers remain stable.
++    #[cfg(feature = "native-codegen")]
+     pub aot_module_storage: Vec<Box<crate::aot::AotModule>>,
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -565,5 +565,7 @@
+             crypto: Box::new(crate::backends::DefaultCryptoProvider::new()),
+             spawnable_behaviors: HashMap::new(),
++            #[cfg(feature = "native-codegen")]
+             aot_modules: std::collections::HashMap::new(),
++            #[cfg(feature = "native-codegen")]
+             aot_module_storage: Vec::new(),
+             #[cfg(any(feature = "ai-runtime", feature = "http-client"))]
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -1 +1,2 @@
++    #[cfg(feature = "native-codegen")]
+     pub fn register_aot_module(&mut self, module: crate::aot::AotModule) {
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -1 +1,2 @@
++    #[cfg(feature = "native-codegen")]
+     fn resume_suspended_jit_yield(&mut self, actor_id: u64) {
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -1120,2 +1120,2 @@
+-                actor.jit_safepoint_counter = crate::jit::runtime::JIT_SAFEPOINT_BUDGET;
++                actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
+                 crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -1,2 +1,2 @@
+-                actor.jit_safepoint_counter = crate::jit::runtime::JIT_SAFEPOINT_BUDGET;
++                actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
+                 crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -3180,8 +3180,11 @@
+-        let jit_yield = self
+-            .actors
+-            .get(&actor_id)
+-            .map(|a| a.jit_yield_pending)
+-            .unwrap_or(false);
+-        if jit_yield {
+-            self.resume_suspended_jit_yield(actor_id);
++        #[cfg(feature = "native-codegen")]
++        {
++            let jit_yield = self
++                .actors
++                .get(&actor_id)
++                .map(|a| a.jit_yield_pending)
++                .unwrap_or(false);
++            if jit_yield {
++                self.resume_suspended_jit_yield(actor_id);
++            }
+         }
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -3440,5 +3440,6 @@
++            #[cfg(feature = "native-codegen")]
+             let aot_target = self
+                 .actors
+                 .get(&actor_id)
+                 .and_then(|a| a.aot_targets.get(behavior_idx))
+                 .and_then(|t| *t);
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -3480,7 +3480,9 @@
++                    #[cfg(feature = "native-codegen")]
+                     if let Some(target) = aot_target {
+                         crate::aot::set_aot_dispatch(Some(target));
+                     }
+                     handler(actor, &msg.payload);
++                    #[cfg(feature = "native-codegen")]
+                     if aot_target.is_some() {
+                         crate::aot::clear_aot_dispatch();
+                     }
+diff --git a/src/runtime/spawn.rs b/src/runtime/spawn.rs
+--- a/src/runtime/spawn.rs
++++ b/src/runtime/spawn.rs
+@@ -255,4 +255,3 @@
+-    // Wire AOT-native dispatch: if an AOT module is registered for this actor
+-    // type, register the adapter for each behavior it compiles so the
+-    // scheduler dispatches them natively (bytecode falls back for the rest).
++    // Wire AOT-native dispatch only when native codegen is present.
++    #[cfg(feature = "native-codegen")]
+     if let Some(meta) = meta.as_ref() {
+diff --git a/src/vm.rs b/src/vm.rs
+--- a/src/vm.rs
++++ b/src/vm.rs
+@@ -1,5 +1,6 @@
++        #[cfg(feature = "native-codegen")]
+         unsafe {
+             crate::jit::runtime::set_jit_callbacks(
+                 self.actor_callbacks.as_mut() as *mut dyn ActorVmCallbacks
+             );
+         }
+diff --git a/docs/web/NATIVE_CODEGEN_FEATURE.md b/docs/web/NATIVE_CODEGEN_FEATURE.md
+new file mode 100644
+--- /dev/null
++++ b/docs/web/NATIVE_CODEGEN_FEATURE.md
+@@ -0,0 +1,78 @@
++# Native codegen feature boundary
++
++Status: Experimental implementation boundary.
++
++The embedded mobile runtime must be buildable without runtime executable-code
++generation and without linking Cranelift.
++
++## Cargo profiles
++
++Default/full runtime:
++
++```sh
++cargo build
++```
++
++continues to enable `native-codegen`.
++
++Interpreter-only mobile library:
++
++```sh
++cargo check --lib --no-default-features --features mobile-runtime
++```
++
++`mobile-runtime` is deliberately an empty marker feature. The bytecode VM,
++actors, frozen `.nbc` loader, C embedding ABI, and pre-registered FFI callbacks
++are part of the base library.
++
++Dynamic native library loading remains a separate `ffi` feature. The mobile UI
++bridge does not require it because callbacks are registered in-process.
++
++## `native-codegen`
++
++The feature owns both:
++
++- tiered Cranelift JIT;
++- the current AOT backend.
++
++The current AOT implementation uses `cranelift_jit::JITModule`, so calling it
++"AOT" does not make it safe to include in an iOS runtime binary. Both code paths
++therefore stay behind the same feature until true object-file AOT is separated.
++
++Cranelift crates and `target-lexicon` are optional dependencies activated only
++by `native-codegen`.
++
++## Stable VM boundary
++
++`JitBackend` remains always compiled. When `native-codegen` is absent,
++`create_default_jit()` returns `None`, so VM construction naturally stays on
++the bytecode interpreter without conditional code in the VM data model.
++
++Actor JIT scheduling counters also remain in the actor layout for now; the
++neutral safepoint constant lives in `backends`. Concrete AOT targets/module
++storage and JIT thread-local wiring are compiled only with `native-codegen`.
++
++## WASM
++
++For this first split, `wasm-backend` implies `native-
