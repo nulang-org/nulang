@@ -99,7 +99,7 @@ diff --git a/src/runtime/spawn.rs b/src/runtime/spawn.rs
 diff --git a/src/vm.rs b/src/vm.rs
 --- a/src/vm.rs
 +++ b/src/vm.rs
-@@ -3203,11 +3203,12 @@
+@@ -3203,9 +3203,10 @@
          // SAFETY: The `&mut dyn ActorVmCallbacks` reference is valid for the
          // duration of this function call. `set_jit_callbacks` stores it in a
          // thread-local; `with_callbacks` restores `&mut` provenance before use.
