@@ -1,0 +1,154 @@
+from pathlib import Path
+
+
+def replace_once(path: str, old: str, new: str) -> None:
+    p = Path(path)
+    text = p.read_text()
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{path}: expected context once, found {count}")
+    p.write_text(text.replace(old, new, 1))
+    print(f"updated {path}")
+
+
+extended_anchor = "    /// Extended differential fuzz (ignored by default — run explicitly or\n"
+helper = r'''    fn persist_differential_divergence(
+        artifact_dir: &std::path::Path,
+        shard_id: u64,
+        iteration: usize,
+        rng_state_before: u64,
+        rng_state_after_mutation: u64,
+        seed_index: usize,
+        seed: &str,
+        mutant: &str,
+        message: &str,
+    ) -> std::io::Result<std::path::PathBuf> {
+        std::fs::create_dir_all(artifact_dir)?;
+        let path = artifact_dir.join(format!(
+            "divergence-shard-{shard_id}-iter-{iteration}.txt"
+        ));
+        let body = format!(
+            "shard_id={shard_id}\niteration={iteration}\nrng_state_before=0x{rng_state_before:016x}\nrng_state_after_mutation=0x{rng_state_after_mutation:016x}\nseed_index={seed_index}\n\n--- corpus seed ---\n{seed}\n\n--- mutant ---\n{mutant}\n\n--- divergence ---\n{message}\n"
+        );
+        std::fs::write(&path, body)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn differential_divergence_artifact_contains_repro_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-fuzz-artifact-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = persist_differential_divergence(
+            &dir,
+            7,
+            42,
+            0x0123_4567_89AB_CDEF,
+            0xFEDC_BA98_7654_3210,
+            3,
+            "seed source",
+            "mutant source",
+            "interpreter/AOT divergence",
+        )
+        .expect("write divergence artifact");
+        let artifact = std::fs::read_to_string(&path).expect("read divergence artifact");
+        assert!(artifact.contains("shard_id=7"));
+        assert!(artifact.contains("iteration=42"));
+        assert!(artifact.contains("rng_state_before=0x0123456789abcdef"));
+        assert!(artifact.contains("rng_state_after_mutation=0xfedcba9876543210"));
+        assert!(artifact.contains("seed_index=3"));
+        assert!(artifact.contains("--- corpus seed ---\nseed source"));
+        assert!(artifact.contains("--- mutant ---\nmutant source"));
+        assert!(artifact.contains("--- divergence ---\ninterpreter/AOT divergence"));
+        std::fs::remove_dir_all(&dir).expect("remove divergence artifact test dir");
+    }
+
+'''
+replace_once("src/fuzz.rs", extended_anchor, helper + extended_anchor)
+
+old_loop = r'''        let mut wasm_agreed = 0usize;
+        let mut uncomparable = 0usize;
+
+        for _ in 0..iterations {
+            let seed = corpus[rng.index(&corpus)];
+            let mutant = mutate(&mut rng, seed, &corpus);
+            match differential_fuzz_one(&mutant) {'''
+new_loop = r'''        let mut wasm_agreed = 0usize;
+        let mut uncomparable = 0usize;
+        let artifact_dir =
+            std::env::var_os("NULANG_FUZZ_ARTIFACT_DIR").map(std::path::PathBuf::from);
+
+        for iteration in 0..iterations {
+            let rng_state_before = rng.0;
+            let seed_index = rng.index(&corpus);
+            let seed = corpus[seed_index];
+            let mutant = mutate(&mut rng, seed, &corpus);
+            let rng_state_after_mutation = rng.0;
+            match differential_fuzz_one(&mutant) {'''
+replace_once("src/fuzz.rs", old_loop, new_loop)
+
+old_error = r'''                Err(msg) => {
+                    divergence_count += 1;
+                    eprintln!("DIVERGENCE: {}", msg);
+                    if divergence_count >= 10 {
+                        panic!("Too many divergences ({}) — aborting", divergence_count);
+                    }
+                }'''
+new_error = r'''                Err(msg) => {
+                    divergence_count += 1;
+                    eprintln!("DIVERGENCE: {}", msg);
+                    if let Some(dir) = artifact_dir.as_deref() {
+                        match persist_differential_divergence(
+                            dir,
+                            shard_id,
+                            iteration,
+                            rng_state_before,
+                            rng_state_after_mutation,
+                            seed_index,
+                            seed,
+                            &mutant,
+                            &msg,
+                        ) {
+                            Ok(path) => eprintln!(
+                                "wrote deterministic divergence artifact: {}",
+                                path.display()
+                            ),
+                            Err(err) => eprintln!(
+                                "failed to write deterministic divergence artifact: {}",
+                                err
+                            ),
+                        }
+                    }
+                    if divergence_count >= 10 {
+                        panic!("Too many divergences ({}) — aborting", divergence_count);
+                    }
+                }'''
+replace_once("src/fuzz.rs", old_error, new_error)
+
+changelog_anchor = "## Stable tier\n\n*Breaking changes require an accepted RFC and a deprecation cycle of at least\ntwo major versions.*\n\n"
+changelog_entry = r'''## Stable tier
+
+*Breaking changes require an accepted RFC and a deprecation cycle of at least
+two major versions.*
+
+### Fixed since 1.0.0-frozen — 2026-09-10 (compiled backend correctness)
+
+- **JIT/AOT runtime-error isolation** (`src/jit/runtime.rs`, `src/vm.rs`,
+  `src/aot/mod.rs`): compiled invocations now clear and consume pending native
+  error state at backend boundaries and preserve the first arithmetic failure,
+  preventing one execution from contaminating the next.
+- **AOT unary-negation and closure parity** (`src/aot/codegen.rs`): boxed
+  integer negation uses the checked runtime helper when a nominally-`Int`
+  operation can yield `nil`; capture-free first-class closures now use the
+  canonical `TAG_CLOSURE` representation instead of masquerading as tagged
+  function-index integers. This restores interpreter/JIT/AOT parity for
+  invalid negation while retaining direct-call optimization metadata.
+- **Deterministic nightly fuzz evidence** (`src/fuzz.rs`,
+  `.github/workflows/fuzz-nightly.yml`): failed shards preserve the full cargo
+  log plus per-divergence shard, iteration, RNG state, corpus seed, mutant
+  source, and backend divergence diagnostic for replay and triage.
+
+'''
+replace_once("CHANGELOG.md", changelog_anchor, changelog_entry)
