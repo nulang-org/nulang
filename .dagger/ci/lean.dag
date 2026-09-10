@@ -1,0 +1,14 @@
+#!/usr/bin/env dagger
+
+# Portable equivalent of the Lean Formalization GitHub Actions job.
+# Run locally with: dagger .dagger/ci/lean.dag
+
+src=$(host | directory . --exclude .git --exclude target --exclude test-pkg)
+
+container |
+  from leanprover/lean4:v4.16.0 |
+  with-directory /src $src |
+  with-workdir /src/spec/formal |
+  with-exec -- lake build |
+  with-exec -- bash -lc 'count=$(grep -rc '\''\bsorry\b'\'' *.lean | awk -F: '\''{sum+=$2} END {print sum+0}'\''); baseline=1; echo "sorry count: $count (baseline: $baseline)"; if [ "$count" -gt "$baseline" ]; then echo "spec/formal/*.lean sorry count ($count) exceeds baseline ($baseline)."; echo "A PR must not silently regress a proved theorem to sorry."; exit 1; fi' |
+  sync
