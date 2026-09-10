@@ -1,0 +1,85 @@
+name: Apply reliability v9
+
+on:
+  push:
+    branches: [hardening/reliability-v9-2026-09-10]
+    paths:
+      - '.github/v9/**'
+      - '.github/workflows/apply-reliability-v9.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  apply-test-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: hardening/reliability-v9-2026-09-10
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Apply reliability transformation
+        run: |
+          set -euo pipefail
+          python3 .github/v9/apply.py
+          bash -n scripts/ci/test_split_brain_stability.sh
+          cargo fmt
+          git diff --check
+
+      - name: Split-brain isolation smoke
+        timeout-minutes: 10
+        env:
+          NULANG_SPLIT_BRAIN_ITERATIONS: '2'
+          NULANG_SPLIT_BRAIN_TIMEOUT_SECONDS: '90'
+        run: scripts/ci/test_split_brain_stability.sh
+
+      - name: Rotating DST smoke
+        timeout-minutes: 20
+        env:
+          NULANG_DST_SEEDS: '5'
+          NULANG_DST_SEED_BASE: '100000'
+        run: cargo test --lib dst_ -- --nocapture
+
+      - name: NBC decoder suite
+        timeout-minutes: 10
+        run: cargo test --lib format::nbc::tests -- --nocapture
+
+      - name: NUL0 corruption regression
+        timeout-minutes: 10
+        run: cargo test --lib test_packet_decoder_never_panics_on_deterministic_corruptions -- --nocapture
+
+      - name: Clippy correctness
+        run: cargo clippy --all-targets --all-features -- -D clippy::correctness
+
+      - name: Repository verification
+        run: python3 scripts/verify_implementation.py
+
+      - name: Commit validated implementation
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm -r .github/v9
+          git rm .github/workflows/apply-reliability-v9.yml
+          git add -A
+          git diff --cached --check
+          git commit -m 'fix: harden deterministic reliability gates'
+          git push origin HEAD:hardening/reliability-v9-2026-09-10
