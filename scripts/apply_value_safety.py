@@ -18,47 +18,46 @@ def replace_once(path: Path, old: str, new: str) -> None:
     path.write_text(text.replace(old, new, 1))
 
 
-def wrap_calls(path: Path, needle: str) -> int:
-    """Wrap calls to `needle(...)` in `unsafe { ... }` using balanced parens."""
+def wrap_value_calls(path: Path, method: str) -> int:
+    """Wrap qualified `...Value::<method>(...)` calls in an unsafe block."""
     text = path.read_text()
-    out = []
+    needle = f"Value::{method}("
+    out: list[str] = []
     cursor = 0
     wrapped = 0
+
     while True:
-        idx = text.find(needle, cursor)
-        if idx < 0:
+        value_idx = text.find(needle, cursor)
+        if value_idx < 0:
             out.append(text[cursor:])
             break
 
-        # Keep text before the call. Calls already immediately wrapped by this
-        # migration are left alone, which makes the script idempotent enough
-        # for a failed workflow retry.
-        prefix = text[max(0, idx - 9):idx]
+        # Include a complete Rust path such as `crate::vm::Value` or
+        # `nulang::vm::Value`, rather than wrapping only the `Value` suffix.
+        start = value_idx
+        while start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_:"):
+            start -= 1
+
+        prefix = text[max(0, start - 9):start]
         if prefix.endswith("unsafe { "):
-            out.append(text[cursor:idx + len(needle)])
-            cursor = idx + len(needle)
+            out.append(text[cursor:value_idx + len(needle)])
+            cursor = value_idx + len(needle)
             continue
 
-        open_paren = idx + len(needle) - 1
+        open_paren = value_idx + len(needle) - 1
         depth = 0
         i = open_paren
         in_string = False
-        in_char = False
         escape = False
         while i < len(text):
             ch = text[i]
             if escape:
                 escape = False
-            elif ch == "\\" and (in_string or in_char):
+            elif ch == "\\" and in_string:
                 escape = True
-            elif ch == '"' and not in_char:
+            elif ch == '"':
                 in_string = not in_string
-            elif ch == "'" and not in_string:
-                # Lifetimes can contain apostrophes, but raw-constructor
-                # arguments in this codebase do not contain lifetimes. Treat
-                # balanced character literals conservatively.
-                in_char = not in_char
-            elif not in_string and not in_char:
+            elif not in_string:
                 if ch == "(":
                     depth += 1
                 elif ch == ")":
@@ -68,11 +67,11 @@ def wrap_calls(path: Path, needle: str) -> int:
                         break
             i += 1
         else:
-            raise SystemExit(f"{path}: unterminated call at byte {idx}: {needle}")
+            raise SystemExit(f"{path}: unterminated Value::{method} call at byte {value_idx}")
 
-        out.append(text[cursor:idx])
+        out.append(text[cursor:start])
         out.append("unsafe { ")
-        out.append(text[idx:end])
+        out.append(text[start:end])
         out.append(" }")
         cursor = end
         wrapped += 1
@@ -98,18 +97,14 @@ replace_once(
     """    /// Construct a `Value` from raw tagged bits.\n    ///\n    /// # Safety\n    /// Same contract as [`Value::from_raw`]: a `TAG_PTR` payload must be a\n    /// live Nulang-heap pointer and every tag payload must satisfy its runtime\n    /// invariant.\n    pub unsafe fn from_bits(raw: u64) -> Self {\n        Value { raw }\n    }\n""",
 )
 
-# Wrap trusted raw-value reconstruction sites throughout Rust sources. These
-# calls become explicit proof obligations. Untrusted boundary files are
-# tightened below after wrapping so their safety conditions are enforced.
+# Wrap raw-value reconstruction sites throughout Rust sources. This makes each
+# call an explicit safety boundary. Untrusted boundary files are tightened
+# below after wrapping so the relevant condition is enforced, not just stated.
 raw_wrapped = 0
 bits_wrapped = 0
 for path in list((ROOT / "src").rglob("*.rs")) + list((ROOT / "crates").rglob("*.rs")):
-    raw_wrapped += wrap_calls(path, "Value::from_raw(")
-    raw_wrapped += wrap_calls(path, "crate::vm::Value::from_raw(")
-    raw_wrapped += wrap_calls(path, "nulang::vm::Value::from_raw(")
-    bits_wrapped += wrap_calls(path, "Value::from_bits(")
-    bits_wrapped += wrap_calls(path, "crate::vm::Value::from_bits(")
-    bits_wrapped += wrap_calls(path, "nulang::vm::Value::from_bits(")
+    raw_wrapped += wrap_value_calls(path, "from_raw")
+    bits_wrapped += wrap_value_calls(path, "from_bits")
 
 # C callers can fabricate the repr(C) raw field, so reject pointer-tagged
 # values before crossing back into the host Value domain.
