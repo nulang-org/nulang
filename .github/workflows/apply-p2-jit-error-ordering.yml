@@ -1,0 +1,158 @@
+name: Apply P2 JIT first-error ordering fix
+
+on:
+  push:
+    branches:
+      - fix/compiled-runtime-fuzz-p0
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Route compiled arithmetic errors to the active backend
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("src/jit/runtime.rs")
+          s = p.read_text()
+
+          old = '''/// Record an arithmetic runtime error for the AOT driver and yield nil
+/// (compiled code cannot unwind; see `AOT_PENDING_ERROR`).
+fn record_arith_error(e: crate::types::NuError) -> u64 {
+    let msg = match e {
+        crate::types::NuError::RuntimeError { msg, .. } => msg,
+        other => other.to_string(),
+    };
+    aot_set_pending_error(msg);
+    Value::nil().as_raw()
+}
+'''
+          new = '''/// Record an arithmetic runtime error for the active compiled backend and
+/// yield nil. Native code cannot unwind, so JIT execution uses the JIT-region
+/// pending-error slot while standalone AOT execution uses the AOT slot.
+fn record_arith_error(e: crate::types::NuError) -> u64 {
+    let msg = match e {
+        crate::types::NuError::RuntimeError { msg, .. } => msg,
+        other => other.to_string(),
+    };
+    if get_jit_vm().is_null() {
+        aot_set_pending_error(msg);
+    } else {
+        set_jit_pending_vm_error(msg);
+    }
+    Value::nil().as_raw()
+}
+'''
+          assert s.count(old) == 1, f"expected one record_arith_error block, found {s.count(old)}"
+          s = s.replace(old, new, 1)
+
+          old = '''pub fn set_jit_pending_vm_error(msg: String) {
+    JIT_PENDING_VM_ERROR.with(|e| *e.borrow_mut() = Some(msg));
+}
+'''
+          new = '''pub fn set_jit_pending_vm_error(msg: String) {
+    JIT_PENDING_VM_ERROR.with(|e| {
+        let mut pending = e.borrow_mut();
+        if pending.is_none() {
+            *pending = Some(msg);
+        }
+    });
+}
+'''
+          assert s.count(old) == 1, f"expected one JIT error setter, found {s.count(old)}"
+          s = s.replace(old, new, 1)
+
+          p.write_text(s)
+          PY
+
+          cat >> src/jit/runtime.rs <<'EOF'
+
+#[cfg(test)]
+mod compiled_error_ordering_tests {
+    use super::*;
+
+    #[test]
+    fn jit_runtime_preserves_first_error_across_arithmetic_and_direct_calls() {
+        let _ = take_jit_pending_vm_error();
+        let _ = aot_take_pending_error();
+
+        let mut vm = crate::vm::VM::new_without_jit();
+        unsafe {
+            set_jit_vm(&mut vm as *mut crate::vm::VM);
+        }
+
+        // Arithmetic fails first; a later direct-call failure must not replace it.
+        assert_eq!(nulang_ineg(Value::bool(false).as_raw()), Value::nil().as_raw());
+        set_jit_pending_vm_error("later direct-call failure".to_string());
+        let first = take_jit_pending_vm_error().expect("JIT arithmetic error should be pending");
+        assert!(first.contains("arithmetic `neg`"), "unexpected first error: {first}");
+        assert!(first.contains("false"), "unexpected first error: {first}");
+        assert!(aot_take_pending_error().is_none());
+
+        // Direct-call failure first; later arithmetic must not replace it either.
+        set_jit_pending_vm_error("first direct-call failure".to_string());
+        assert_eq!(nulang_ineg(Value::bool(false).as_raw()), Value::nil().as_raw());
+        assert_eq!(
+            take_jit_pending_vm_error().as_deref(),
+            Some("first direct-call failure")
+        );
+        assert!(aot_take_pending_error().is_none());
+
+        clear_jit_vm();
+    }
+}
+EOF
+
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path("CHANGELOG.md")
+          s = p.read_text()
+          old = '''  error state at backend boundaries and preserve the first arithmetic failure,
+  preventing one execution from contaminating the next.
+'''
+          new = '''  error state at backend boundaries and preserve the first runtime failure
+  across arithmetic helpers and re-entrant JIT direct calls, preventing one
+  execution from contaminating the next or a later callee error from masking
+  the original failure.
+'''
+          assert s.count(old) == 1, f"expected changelog context once, found {s.count(old)}"
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Format and validate diff
+        run: |
+          cargo fmt --all
+          git diff --check
+          git diff --exit-code -- . ':(exclude)src/jit/runtime.rs' ':(exclude)CHANGELOG.md' ':(exclude).github/workflows/apply-p2-jit-error-ordering.yml'
+
+      - name: Verify first-error routing regression
+        run: cargo test --lib jit_runtime_preserves_first_error_across_arithmetic_and_direct_calls -- --nocapture
+
+      - name: Re-run backend differential regression
+        run: cargo test --lib differential_unary_negation_and_error_isolation_regressions -- --nocapture
+
+      - name: Remove one-shot workflow and commit verified fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-p2-jit-error-ordering.yml
+          git add src/jit/runtime.rs CHANGELOG.md
+          git commit -m "fix(jit): preserve first compiled-region error"
+          git push origin HEAD:fix/compiled-runtime-fuzz-p0
