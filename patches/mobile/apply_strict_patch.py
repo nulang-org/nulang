@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Apply a unified diff by exact hunk content, ignoring stale line offsets.
+"""Apply a generated unified diff using exact original content only.
 
-Every hunk body must match exactly. If an exact old block occurs more than
-once, a non-placeholder source line may disambiguate only between those
-byte-identical matches, and only within a bounded distance. Missing or still
-ambiguous matches are fatal. No fuzzy context is ever accepted.
+Stale line numbers are ignored for matching. Repeated byte-identical blocks may
+use a bounded non-placeholder line hint for disambiguation. A placeholder hunk
+(`@@ -1 ...`) is skipped only when a later hunk for the same file strictly
+subsumes both its old and new text. No fuzzy context is accepted.
 """
 from __future__ import annotations
 
@@ -24,6 +24,14 @@ class Hunk:
     old: list[str] = field(default_factory=list)
     new: list[str] = field(default_factory=list)
 
+    @property
+    def old_text(self) -> str:
+        return "".join(self.old)
+
+    @property
+    def new_text(self) -> str:
+        return "".join(self.new)
+
 
 @dataclass
 class FilePatch:
@@ -37,7 +45,6 @@ def parse_patch(text: str) -> list[FilePatch]:
     patches: list[FilePatch] = []
     current: FilePatch | None = None
     hunk: Hunk | None = None
-
     for line in lines:
         if line.startswith("diff --git "):
             parts = shlex.split(line.rstrip("\n"))
@@ -64,8 +71,7 @@ def parse_patch(text: str) -> list[FilePatch]:
         if line.startswith("\\ No newline at end of file"):
             continue
         if line.startswith(" "):
-            hunk.old.append(line[1:])
-            hunk.new.append(line[1:])
+            hunk.old.append(line[1:]); hunk.new.append(line[1:])
         elif line.startswith("-"):
             hunk.old.append(line[1:])
         elif line.startswith("+"):
@@ -74,12 +80,12 @@ def parse_patch(text: str) -> list[FilePatch]:
             raise ValueError(
                 f"unexpected line inside hunk for {current.path}: {line.rstrip()}"
             )
-
     if not patches:
         raise ValueError("no file patches found")
     if any(not p.hunks for p in patches):
-        missing = [p.path for p in patches if not p.hunks]
-        raise ValueError(f"file patch has no hunks: {missing}")
+        raise ValueError(
+            "file patch has no hunks: " + ", ".join(p.path for p in patches if not p.hunks)
+        )
     return patches
 
 
@@ -94,43 +100,59 @@ def exact_positions(text: str, needle: str) -> list[int]:
         start = pos + max(1, len(needle))
 
 
-def hunk_identity(old: str, old_start: int) -> str:
-    first = old.splitlines()[0].strip() if old.splitlines() else "<empty>"
-    return f"source_hint={old_start}, first={first!r}"
+def ident(hunk: Hunk) -> str:
+    lines = hunk.old_text.splitlines()
+    first = lines[0].strip() if lines else "<empty>"
+    return f"source_hint={hunk.old_start}, first={first!r}"
 
 
-def choose_position(path: str, index: int, current: str, old: str, old_start: int) -> int:
-    ident = hunk_identity(old, old_start)
+def is_subsumed_placeholder(patches: list[FilePatch], block_index: int, hunk: Hunk) -> bool:
+    if hunk.old_start > 1 or not hunk.old_text:
+        return False
+    path = patches[block_index].path
+    for later in patches[block_index + 1:]:
+        if later.path != path:
+            continue
+        for later_hunk in later.hunks:
+            if (
+                hunk.old_text in later_hunk.old_text
+                and hunk.new_text in later_hunk.new_text
+                and len(later_hunk.old_text) > len(hunk.old_text)
+            ):
+                return True
+    return False
+
+
+def choose_position(path: str, hunk_index: int, current: str, hunk: Hunk) -> int:
+    old = hunk.old_text
     positions = exact_positions(current, old)
     if len(positions) == 1:
         return positions[0]
     if not positions:
         raise RuntimeError(
-            f"{path} hunk {index} ({ident}): exact original block not found"
+            f"{path} hunk {hunk_index} ({ident(hunk)}): exact original block not found"
         )
-    if old_start <= 1:
+    if hunk.old_start <= 1:
         raise RuntimeError(
-            f"{path} hunk {index} ({ident}): {len(positions)} exact matches and no usable line hint"
+            f"{path} hunk {hunk_index} ({ident(hunk)}): {len(positions)} exact matches and no usable line hint"
         )
-
     candidates = []
     for pos in positions:
         line = current.count("\n", 0, pos) + 1
-        candidates.append((abs(line - old_start), line, pos))
+        candidates.append((abs(line - hunk.old_start), line, pos))
     candidates.sort()
-
     if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
         raise RuntimeError(
-            f"{path} hunk {index} ({ident}): exact matches tie around source line {old_start}"
+            f"{path} hunk {hunk_index} ({ident(hunk)}): exact matches tie around source line {hunk.old_start}"
         )
     drift, line, pos = candidates[0]
     if drift > MAX_LINE_DRIFT:
         raise RuntimeError(
-            f"{path} hunk {index} ({ident}): nearest exact match at line {line} drifts {drift} lines"
+            f"{path} hunk {hunk_index} ({ident(hunk)}): nearest exact match at line {line} drifts {drift} lines"
         )
     print(
-        f"strict patch: {path} hunk {index} disambiguated exact duplicate "
-        f"at line {line} (hint {old_start})"
+        f"strict patch: {path} hunk {hunk_index} disambiguated exact duplicate "
+        f"at line {line} (hint {hunk.old_start})"
     )
     return pos
 
@@ -138,32 +160,35 @@ def choose_position(path: str, index: int, current: str, old: str, old_start: in
 def apply(root: Path, patches: list[FilePatch], write: bool) -> None:
     contents: dict[str, str] = {}
     existed: dict[str, bool] = {}
-
-    for block_index, patch in enumerate(patches, start=1):
+    for zero_block, patch in enumerate(patches):
+        block_index = zero_block + 1
         path = root / patch.path
         if patch.path not in contents:
             existed[patch.path] = path.exists()
             contents[patch.path] = path.read_text() if path.exists() else ""
-
         current = contents[patch.path]
-        for index, hunk in enumerate(patch.hunks, start=1):
-            old = "".join(hunk.old)
-            new = "".join(hunk.new)
+        for hunk_index, hunk in enumerate(patch.hunks, start=1):
             try:
+                if is_subsumed_placeholder(patches, zero_block, hunk):
+                    print(
+                        f"strict patch: skip subsumed placeholder block {block_index} "
+                        f"for {patch.path} ({ident(hunk)})"
+                    )
+                    continue
+                old = hunk.old_text
+                new = hunk.new_text
                 if not old:
                     if current != "" or existed[patch.path]:
                         raise RuntimeError("empty-old hunk requires a new empty file")
                     current = new
                     continue
-                pos = choose_position(patch.path, index, current, old, hunk.old_start)
+                pos = choose_position(patch.path, hunk_index, current, hunk)
                 current = current[:pos] + new + current[pos + len(old):]
             except RuntimeError as exc:
                 raise RuntimeError(
                     f"diff block {block_index}, {patch.path}: {exc}"
                 ) from exc
-
         contents[patch.path] = current
-
     if write:
         for rel, content in contents.items():
             path = root / rel
@@ -176,17 +201,16 @@ def main() -> int:
     parser.add_argument("patch", type=Path)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-
-    root = Path.cwd()
     try:
         patches = parse_patch(args.patch.read_text())
-        apply(root, patches, write=not args.check)
+        apply(Path.cwd(), patches, write=not args.check)
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"strict patch error: {exc}", file=sys.stderr)
         return 1
-
-    action = "preflight" if args.check else "apply"
-    print(f"strict patch {action}: OK ({len(patches)} file diff blocks)")
+    print(
+        f"strict patch {'preflight' if args.check else 'apply'}: OK "
+        f"({len(patches)} file diff blocks)"
+    )
     return 0
 
 
