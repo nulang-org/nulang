@@ -1,0 +1,178 @@
+name: Apply P2 nested JIT error preservation fix
+
+on:
+  push:
+    branches:
+      - fix/compiled-runtime-fuzz-p0
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Preserve outer JIT error across re-entrant execution
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("src/jit/runtime.rs")
+          s = p.read_text()
+
+          old = '''struct JitThreadState {
+              vm: *mut crate::vm::VM,
+              constants: ConstantsPtr,
+              callbacks: CbPair,
+              safepoint: *mut u64,
+              yield_pc: u64,
+              branch_exit_pc: u64,
+              pending_error: Option<String>,
+          }
+          '''
+          new = '''struct JitThreadState {
+              vm: *mut crate::vm::VM,
+              constants: ConstantsPtr,
+              callbacks: CbPair,
+              safepoint: *mut u64,
+              yield_pc: u64,
+              branch_exit_pc: u64,
+              aot_pending_error: Option<String>,
+              jit_pending_error: Option<String>,
+          }
+          '''
+          assert s.count(old) == 1, f"expected JitThreadState once, found {s.count(old)}"
+          s = s.replace(old, new, 1)
+
+          old = '''    let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
+              JitThreadState {
+                  vm,
+                  constants,
+                  callbacks,
+                  safepoint,
+                  yield_pc,
+                  branch_exit_pc,
+                  pending_error,
+              }
+          }
+          '''
+          new = '''    let aot_pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
+              let jit_pending_error = JIT_PENDING_VM_ERROR.with(|e| e.borrow().clone());
+              JitThreadState {
+                  vm,
+                  constants,
+                  callbacks,
+                  safepoint,
+                  yield_pc,
+                  branch_exit_pc,
+                  aot_pending_error,
+                  jit_pending_error,
+              }
+          }
+          '''
+          assert s.count(old) == 1, f"expected save state block once, found {s.count(old)}"
+          s = s.replace(old, new, 1)
+
+          old = '''    JIT_BRANCH_EXIT_PC.with(|c| c.set(s.branch_exit_pc));
+              AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.pending_error);
+          }
+          '''
+          new = '''    JIT_BRANCH_EXIT_PC.with(|c| c.set(s.branch_exit_pc));
+              AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.aot_pending_error);
+              // A nested JIT region clears the JIT slot at its own entry. If the
+              // outer region already had an error, restore it because it happened
+              // first. If the outer slot was empty, leave any nested error intact.
+              if let Some(outer_error) = s.jit_pending_error {
+                  JIT_PENDING_VM_ERROR.with(|e| *e.borrow_mut() = Some(outer_error));
+              }
+          }
+          '''
+          assert s.count(old) == 1, f"expected restore state block once, found {s.count(old)}"
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+
+          cat >> src/jit/runtime.rs <<'EOF'
+
+          #[cfg(test)]
+          mod nested_jit_error_state_tests {
+              use super::*;
+
+              #[test]
+              fn reentrant_jit_state_preserves_chronological_first_error() {
+                  let _ = take_jit_pending_vm_error();
+                  let _ = aot_take_pending_error();
+
+                  // Simulate an outer compiled arithmetic failure followed by a
+                  // re-entrant direct call that reaches a nested hot JIT region.
+                  set_jit_pending_vm_error("outer error".to_string());
+                  let saved = save_jit_thread_state();
+                  let _ = take_jit_pending_vm_error(); // nested JIT clean-at-entry
+                  set_jit_pending_vm_error("nested error".to_string());
+                  restore_jit_thread_state(saved);
+                  assert_eq!(take_jit_pending_vm_error().as_deref(), Some("outer error"));
+
+                  // With no outer error, a nested error must still propagate.
+                  let saved = save_jit_thread_state();
+                  set_jit_pending_vm_error("nested-only error".to_string());
+                  restore_jit_thread_state(saved);
+                  assert_eq!(
+                      take_jit_pending_vm_error().as_deref(),
+                      Some("nested-only error")
+                  );
+              }
+          }
+          EOF
+
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path("CHANGELOG.md")
+          s = p.read_text()
+          old = '''  across arithmetic helpers and re-entrant JIT direct calls, preventing one
+            execution from contaminating the next or a later callee error from masking
+            the original failure.
+          '''
+          new = '''  across arithmetic helpers, re-entrant JIT direct calls, and nested JIT
+            regions, preventing one execution from contaminating the next or a later
+            callee error from masking the original failure.
+          '''
+          assert s.count(old) == 1, f"expected changelog context once, found {s.count(old)}"
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Format and validate diff
+        run: |
+          cargo fmt --all
+          git diff --check
+          git diff --exit-code -- . ':(exclude)src/jit/runtime.rs' ':(exclude)CHANGELOG.md' ':(exclude).github/workflows/apply-p2-nested-jit-error.yml'
+
+      - name: Verify nested JIT state regression
+        run: cargo test --lib reentrant_jit_state_preserves_chronological_first_error -- --nocapture
+
+      - name: Re-run first-error routing regression
+        run: cargo test --lib jit_runtime_preserves_first_error_across_arithmetic_and_direct_calls -- --nocapture
+
+      - name: Re-run backend differential regression
+        run: cargo test --lib differential_unary_negation_and_error_isolation_regressions -- --nocapture
+
+      - name: Remove one-shot workflow and commit verified fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-p2-nested-jit-error.yml
+          git add src/jit/runtime.rs CHANGELOG.md
+          git commit -m "fix(jit): preserve errors across nested regions"
+          git push origin HEAD:fix/compiled-runtime-fuzz-p0
