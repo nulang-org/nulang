@@ -1,0 +1,51 @@
+name: Apply Value Safety Migration
+
+on:
+  push:
+    branches:
+      - fix/value-safety-boundary
+    paths:
+      - scripts/apply_value_safety.py
+      - .github/workflows/apply-value-safety.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/value-safety-boundary
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install feature dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Apply migration
+        run: python3 scripts/apply_value_safety.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Compile all features
+        run: cargo check --all-features
+
+      - name: Commit generated hardening patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src crates
+          if git diff --cached --quiet; then
+            echo "No generated changes"
+            exit 1
+          fi
+          git commit -s -m "fix(vm): harden raw Value construction boundaries"
+          git push origin HEAD:fix/value-safety-boundary
