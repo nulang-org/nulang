@@ -25,7 +25,7 @@ jobs:
               patches/mobile/v21-v22.part02 \
               patches/mobile/v21-v22.part03 \
               patches/mobile/v21-v22.part04 > /tmp/mobile-runtime-boundary.patch
-          echo "a1b480624377b539fab22e1db43ca4d2b2adedda7106e2ac57bb8ee2c1e2eaf9  /tmp/mobile-runtime-boundary.patch" | sha256sum -c -
+          echo "2b215525d1756d35e9eac964bcd03fa077e65d87bab53855bb3f1bf08cecb7f2  /tmp/mobile-runtime-boundary.patch" | sha256sum -c -
 
       - name: Preflight context application
         shell: bash
