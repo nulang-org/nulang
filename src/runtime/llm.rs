@@ -339,6 +339,10 @@ pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &s
         return;
     };
     if !dispatch_llm_request(rt, actor_id, request, prompt) {
+        // `dispatch_llm_request` reserves in-flight bookkeeping before trying
+        // the bounded queue so both current callers share one rollback
+        // contract. Undo that reservation on failed submission.
+        rt.llm.inflight_count = rt.llm.inflight_count.saturating_sub(1);
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
             actor.llm_inflight = false;
             actor.llm_pending_prompt = None;
@@ -358,8 +362,10 @@ pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &s
 
 /// Try to enqueue an LLM request without blocking the actor scheduler.
 ///
-/// Returns `false` on queue saturation or executor failure. In-flight state is
-/// committed only after the bounded queue accepts the work item.
+/// In-flight bookkeeping is reserved before submission. A `false` return
+/// means the caller MUST roll that reservation back; both runtime call sites
+/// do so. Reserving first keeps the callback and retry paths on one consistent
+/// contract while the bounded queue itself guarantees scheduler non-blocking.
 pub(crate) fn dispatch_llm_request(
     rt: &mut Runtime,
     actor_id: u64,
@@ -370,22 +376,19 @@ pub(crate) fn dispatch_llm_request(
         return false;
     };
 
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.llm_inflight = true;
+        actor.llm_pending_prompt = Some(prompt.to_string());
+    }
+    rt.llm.inflight_count += 1;
+
     let item = LlmWorkItem {
         actor_id,
         request,
         client,
         completion_tx: rt.llm.completion_tx.clone(),
     };
-    if executor_tx().try_send(item).is_err() {
-        return false;
-    }
-
-    if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        actor.llm_inflight = true;
-        actor.llm_pending_prompt = Some(prompt.to_string());
-    }
-    rt.llm.inflight_count += 1;
-    true
+    executor_tx().try_send(item).is_ok()
 }
 
 /// Prune an agent's episodic memory to fit within `max_tokens`, using a
