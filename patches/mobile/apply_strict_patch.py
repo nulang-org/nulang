@@ -4,8 +4,9 @@
 Stale line numbers are ignored for matching. Repeated byte-identical blocks may
 use a bounded non-placeholder line hint for disambiguation. A placeholder hunk
 (`@@ -1 ...`) is skipped only when a later, larger hunk for the same file
-contains all lines actually removed and added by that placeholder. No fuzzy
-context is accepted.
+contains all lines actually removed and added by that placeholder. Leading
+whitespace is ignored only for this overlap test; actual application remains
+byte-exact. No fuzzy context is accepted.
 """
 from __future__ import annotations
 
@@ -117,12 +118,19 @@ def counter_contains(haystack: Counter[str], needle: Counter[str]) -> bool:
     return all(haystack[line] >= count for line, count in needle.items())
 
 
+def normalized_counter(lines: list[str] | Counter[str]) -> Counter[str]:
+    source = lines.elements() if isinstance(lines, Counter) else lines
+    return Counter(line.lstrip() for line in source)
+
+
 def is_subsumed_placeholder(patches: list[FilePatch], block_index: int, hunk: Hunk) -> bool:
     if hunk.old_start > 1 or not hunk.old_text:
         return False
     removed, added = hunk.changed_lines()
     if not removed and not added:
         return False
+    normalized_removed = normalized_counter(removed)
+    normalized_added = normalized_counter(added)
     path = patches[block_index].path
     for later in patches[block_index + 1:]:
         if later.path != path:
@@ -130,9 +138,11 @@ def is_subsumed_placeholder(patches: list[FilePatch], block_index: int, hunk: Hu
         for later_hunk in later.hunks:
             if len(later_hunk.old_text) <= len(hunk.old_text):
                 continue
-            later_old = Counter(later_hunk.old)
-            later_new = Counter(later_hunk.new)
-            if counter_contains(later_old, removed) and counter_contains(later_new, added):
+            later_old = normalized_counter(later_hunk.old)
+            later_new = normalized_counter(later_hunk.new)
+            if counter_contains(later_old, normalized_removed) and counter_contains(
+                later_new, normalized_added
+            ):
                 return True
     return False
 
