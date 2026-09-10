@@ -688,7 +688,8 @@ struct JitThreadState {
     safepoint: *mut u64,
     yield_pc: u64,
     branch_exit_pc: u64,
-    pending_error: Option<String>,
+    aot_pending_error: Option<String>,
+    jit_pending_error: Option<String>,
 }
 
 fn save_jit_thread_state() -> JitThreadState {
@@ -702,7 +703,8 @@ fn save_jit_thread_state() -> JitThreadState {
         JIT_YIELD_PC.with(|c| c.get()),
         JIT_BRANCH_EXIT_PC.with(|c| c.get()),
     );
-    let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
+    let aot_pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
+    let jit_pending_error = JIT_PENDING_VM_ERROR.with(|e| e.borrow().clone());
     JitThreadState {
         vm,
         constants,
@@ -710,7 +712,8 @@ fn save_jit_thread_state() -> JitThreadState {
         safepoint,
         yield_pc,
         branch_exit_pc,
-        pending_error,
+        aot_pending_error,
+        jit_pending_error,
     }
 }
 
@@ -723,7 +726,13 @@ fn restore_jit_thread_state(s: JitThreadState) {
     JIT_SAFEPOINT_PTR.with(|c| c.set(s.safepoint));
     JIT_YIELD_PC.with(|c| c.set(s.yield_pc));
     JIT_BRANCH_EXIT_PC.with(|c| c.set(s.branch_exit_pc));
-    AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.pending_error);
+    AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.aot_pending_error);
+    // A nested JIT region clears the JIT slot at its own entry. If the
+    // outer region already had an error, restore it because it happened
+    // first. If the outer slot was empty, leave any nested error intact.
+    if let Some(outer_error) = s.jit_pending_error {
+        JIT_PENDING_VM_ERROR.with(|e| *e.borrow_mut() = Some(outer_error));
+    }
 }
 
 /// Run a provably-non-suspending callee (function-table index `func_idx`) to
@@ -2045,5 +2054,34 @@ mod compiled_error_ordering_tests {
         assert!(aot_take_pending_error().is_none());
 
         clear_jit_vm();
+    }
+}
+
+#[cfg(test)]
+mod nested_jit_error_state_tests {
+    use super::*;
+
+    #[test]
+    fn reentrant_jit_state_preserves_chronological_first_error() {
+        let _ = take_jit_pending_vm_error();
+        let _ = aot_take_pending_error();
+
+        // Simulate an outer compiled arithmetic failure followed by a
+        // re-entrant direct call that reaches a nested hot JIT region.
+        set_jit_pending_vm_error("outer error".to_string());
+        let saved = save_jit_thread_state();
+        let _ = take_jit_pending_vm_error(); // nested JIT clean-at-entry
+        set_jit_pending_vm_error("nested error".to_string());
+        restore_jit_thread_state(saved);
+        assert_eq!(take_jit_pending_vm_error().as_deref(), Some("outer error"));
+
+        // With no outer error, a nested error must still propagate.
+        let saved = save_jit_thread_state();
+        set_jit_pending_vm_error("nested-only error".to_string());
+        restore_jit_thread_state(saved);
+        assert_eq!(
+            take_jit_pending_vm_error().as_deref(),
+            Some("nested-only error")
+        );
     }
 }
