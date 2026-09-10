@@ -1,24 +1,26 @@
 //! LLM subsystem for the actor runtime.
 //!
-//! Manages bounded concurrent LLM execution, request dispatch, completion
-//! polling, and non-blocking suspension for `perform LLM.ask` in bytecode
-//! behaviors.
+//! Provider execution is isolated behind one process-wide bounded worker pool.
+//! Runtime shards keep only their client/configuration and completion inbox;
+//! each work item carries the originating shard's completion sender. This
+//! avoids both the old single-worker bottleneck and a worker-pool-per-shard
+//! explosion in multi-threaded nodes.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use nulang_ai::{LlmClient, LlmError, LlmRequest, LlmResponse, TokenBudget};
 
-/// Default number of provider workers once an LLM client is installed.
-/// Override with `NULANG_LLM_WORKERS` (1..=64).
+/// Default process-wide provider concurrency. Override with
+/// `NULANG_LLM_WORKERS` (1..=64).
 const DEFAULT_LLM_WORKERS: usize = 8;
 const MAX_LLM_WORKERS: usize = 64;
 
 /// Maximum number of provider requests waiting behind active workers.
-/// A bounded queue is deliberate: actor scheduling must receive backpressure
-/// instead of allowing a slow/unreachable provider to consume unbounded RAM.
 /// Override with `NULANG_LLM_QUEUE_CAPACITY` (1..=65536).
 const DEFAULT_LLM_QUEUE_CAPACITY: usize = 1024;
 const MAX_LLM_QUEUE_CAPACITY: usize = 65_536;
+
+type Completion = (u64, Result<LlmResponse, LlmError>);
 
 fn env_bounded_usize(name: &str, default: usize, max: usize) -> usize {
     std::env::var(name)
@@ -28,65 +30,19 @@ fn env_bounded_usize(name: &str, default: usize, max: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Work item sent to the provider worker pool.
+/// Work item submitted to the process-wide provider executor.
 pub(crate) struct LlmWorkItem {
     pub(crate) actor_id: u64,
     pub(crate) request: LlmRequest,
     pub(crate) client: Arc<dyn LlmClient>,
+    completion_tx: std::sync::mpsc::Sender<Completion>,
 }
 
-/// Consolidated LLM subsystem state.
-///
-/// Provider workers are started lazily when the first client is installed.
-/// This matters because a multi-threaded Nulang node owns one `Runtime` per
-/// scheduler shard; eagerly creating a pool per shard would multiply idle OS
-/// threads even for programs that never use AI. Once active, requests pass
-/// through a bounded MPMC queue to a configurable worker pool.
-pub struct LlmState {
-    /// Token budget for LLM calls. When set, the runtime rejects
-    /// LLM requests that would exceed the configured token limit.
-    pub token_budget: Option<Arc<TokenBudget>>,
+static LLM_EXECUTOR_TX: OnceLock<crossbeam::channel::Sender<LlmWorkItem>> = OnceLock::new();
 
-    /// LLM client for the v0.9 AI Runtime. Shared (Arc) so provider workers
-    /// can issue requests concurrently.
-    pub client: Option<Arc<dyn LlmClient>>,
-
-    /// Channel receiving results from provider workers. Drained by
-    /// `poll_llm_completions` on the scheduler thread.
-    pub rx: std::sync::mpsc::Receiver<(u64, Result<LlmResponse, LlmError>)>,
-
-    /// Sender retained so lazily-created workers can publish completions.
-    completion_tx: std::sync::mpsc::Sender<(u64, Result<LlmResponse, LlmError>)>,
-
-    /// Number of successfully dispatched LLM calls whose completion has not
-    /// yet been observed by the scheduler.
-    pub inflight_count: usize,
-
-    /// Bounded channel used to dispatch work to the provider worker pool.
-    /// `None` until an LLM client is installed.
-    pub(crate) request_tx: Option<crossbeam::channel::Sender<LlmWorkItem>>,
-}
-
-impl LlmState {
-    /// Create dormant LLM state. No worker threads are created until a client
-    /// is actually installed.
-    pub fn new() -> Self {
-        let (completion_tx, rx) = std::sync::mpsc::channel();
-        LlmState {
-            token_budget: None,
-            client: None,
-            rx,
-            completion_tx,
-            inflight_count: 0,
-            request_tx: None,
-        }
-    }
-
-    fn ensure_workers(&mut self) {
-        if self.request_tx.is_some() {
-            return;
-        }
-
+/// Lazily initialize the process-wide bounded provider executor.
+fn executor_tx() -> &'static crossbeam::channel::Sender<LlmWorkItem> {
+    LLM_EXECUTOR_TX.get_or_init(|| {
         let worker_count = env_bounded_usize(
             "NULANG_LLM_WORKERS",
             DEFAULT_LLM_WORKERS,
@@ -102,7 +58,6 @@ impl LlmState {
 
         for worker_id in 0..worker_count {
             let request_rx = request_rx.clone();
-            let completion_tx = self.completion_tx.clone();
             let _worker = std::thread::Builder::new()
                 .name(format!("nulang-llm-{worker_id}"))
                 .spawn(move || {
@@ -120,44 +75,73 @@ impl LlmState {
                         .unwrap_or_else(|_| {
                             Err(LlmError::from_string("LLM worker thread panicked"))
                         });
-                        let _ = completion_tx.send((item.actor_id, result));
+                        let _ = item.completion_tx.send((item.actor_id, result));
                     }
                 });
         }
-        // The receiver held here only exists to seed worker clones. Once all
-        // workers exit, dropping it ensures future try_send calls fail rather
-        // than accepting work that nobody can execute.
+
+        // Only worker clones retain receivers after initialization. If every
+        // worker fails to start or exits, try_send sees a disconnected channel
+        // instead of accepting work that can never complete.
         drop(request_rx);
-        self.request_tx = Some(request_tx);
+        request_tx
+    })
+}
+
+/// Per-runtime-shard LLM state.
+///
+/// The expensive execution pool is process-wide; a shard owns only its
+/// provider client, token budget, completion channel, and bookkeeping.
+pub struct LlmState {
+    /// Token budget for LLM calls. When set, the runtime rejects requests that
+    /// cannot fit within the remaining estimated budget.
+    pub token_budget: Option<Arc<TokenBudget>>,
+
+    /// Provider client installed for this runtime shard.
+    pub client: Option<Arc<dyn LlmClient>>,
+
+    /// Completed provider calls destined for this runtime shard.
+    pub rx: std::sync::mpsc::Receiver<Completion>,
+    completion_tx: std::sync::mpsc::Sender<Completion>,
+
+    /// Successfully dispatched calls whose completion has not yet been
+    /// observed by the scheduler.
+    pub inflight_count: usize,
+}
+
+impl LlmState {
+    /// Create dormant per-shard state. This does not create provider workers;
+    /// the process-wide executor starts on the first actual dispatch.
+    pub fn new() -> Self {
+        let (completion_tx, rx) = std::sync::mpsc::channel();
+        LlmState {
+            token_budget: None,
+            client: None,
+            rx,
+            completion_tx,
+            inflight_count: 0,
+        }
     }
 
-    /// Install or replace the provider client. The worker pool is initialized
-    /// only on the first installation and reused for later client swaps.
     pub fn set_client(&mut self, client: Box<dyn LlmClient>) {
-        self.ensure_workers();
         self.client = Some(Arc::from(client));
     }
 
-    /// Set a token budget limit. Requests exceeding this are rejected.
     pub fn set_token_budget(&mut self, limit: u64) {
         self.token_budget = Some(Arc::new(TokenBudget::new(limit)));
     }
 
-    /// Remove the token budget limit.
     pub fn clear_token_budget(&mut self) {
         self.token_budget = None;
     }
 
-    /// Check whether the token budget has room for the estimated request.
     pub fn check_token_budget(&self, estimated_tokens: u64) -> bool {
-        if let Some(budget) = &self.token_budget {
-            estimated_tokens <= budget.remaining()
-        } else {
-            true
-        }
+        self.token_budget
+            .as_ref()
+            .map(|budget| estimated_tokens <= budget.remaining())
+            .unwrap_or(true)
     }
 
-    /// Record token usage against the budget.
     pub fn record_token_usage(&self, tokens: u64) {
         if let Some(budget) = &self.token_budget {
             budget.charge(tokens);
@@ -191,9 +175,8 @@ pub(crate) fn poll_llm_completions(rt: &mut Runtime) {
     }
 }
 
-/// Record a completed background LLM call on its actor and resume the
-/// actor's suspended behavior, if any. Errors trigger the retry/fallback
-/// pipeline when the actor has a configured agent retry or fallback.
+/// Record a completed background LLM call on its actor and resume the actor's
+/// suspended behavior, if any.
 pub(crate) fn store_llm_completion(
     rt: &mut Runtime,
     actor_id: u64,
@@ -216,22 +199,18 @@ pub(crate) fn store_llm_completion(
                 resume_suspended_llm_step(rt, actor_id);
             }
         }
-        Err(error) => {
-            handle_llm_error(rt, actor_id, error);
-        }
+        Err(error) => handle_llm_error(rt, actor_id, error),
     }
 }
 
 /// Process an LLM error: decide whether to retry, fall back, or fail.
 pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError) {
-    // Only agent actors have retry/fallback config.
     let is_agent = rt
         .actors
         .get(&actor_id)
         .map(|a| a.is_agent)
         .unwrap_or(false);
     if !is_agent {
-        // Non-agent actors: store the error and resume.
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
             actor.llm_inflight = false;
             actor.llm_pending_prompt = None;
@@ -244,8 +223,6 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
         return;
     }
 
-    // Read retry/fallback config from cached actor fields (parsed once at
-    // agent init), plus mutable state for attempt tracking and prompt.
     let (retry_config, fallback_config, attempt, fallback_step, prompt) = {
         let actor = match rt.actors.get(&actor_id) {
             Some(a) => a,
@@ -265,13 +242,12 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
         (retry, fallback, attempt_val, fallback_step_val, prompt_val)
     };
 
-    // --- Retry path ---
     if let Some(retry) = &retry_config {
         if attempt < retry.max_attempts {
             let new_attempt = attempt + 1;
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 actor.llm_inflight = false;
-                actor.set_state_field("llm_attempt", crate::vm::Value::int(new_attempt as i64));
+                actor.set_state_field("llm_attempt", Value::int(new_attempt as i64));
             }
             let delay_ms = compute_backoff(retry, attempt, actor_id);
             rt.timer_wheel
@@ -280,7 +256,6 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
         }
     }
 
-    // --- Fallback path ---
     if fallback_step < fallback_config.len() {
         let error_kind_name = format!("{:?}", error.kind);
         let fb = &fallback_config[fallback_step];
@@ -291,11 +266,8 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
                 actor.llm_inflight = false;
                 let model_ptr = actor.allocate_string(&fb.model);
                 actor.set_state_field("model", model_ptr);
-                actor.set_state_field("llm_attempt", crate::vm::Value::int(0));
-                actor.set_state_field(
-                    "llm_fallback_step",
-                    crate::vm::Value::int(new_fallback_step as i64),
-                );
+                actor.set_state_field("llm_attempt", Value::int(0));
+                actor.set_state_field("llm_fallback_step", Value::int(new_fallback_step as i64));
                 if let Some(max_tokens) = fb.max_tokens {
                     prune_episodic_memory(rt, actor_id, max_tokens);
                 }
@@ -304,17 +276,13 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
             return;
         }
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
-            actor.set_state_field("llm_attempt", crate::vm::Value::int(0));
-            actor.set_state_field(
-                "llm_fallback_step",
-                crate::vm::Value::int(new_fallback_step as i64),
-            );
+            actor.set_state_field("llm_attempt", Value::int(0));
+            actor.set_state_field("llm_fallback_step", Value::int(new_fallback_step as i64));
         }
         handle_llm_error(rt, actor_id, error);
         return;
     }
 
-    // --- Terminal: all retries and fallbacks exhausted ---
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.llm_inflight = false;
         actor.llm_pending_prompt = None;
@@ -338,7 +306,7 @@ pub(crate) fn handle_llm_retry_timer(rt: &mut Runtime, actor_id: u64) {
     redispatch_llm_request(rt, actor_id, &prompt);
 }
 
-/// Build and dispatch an LLM request for the actor, marking it in-flight.
+/// Build and dispatch an LLM request for the actor.
 pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &str) {
     let is_agent = rt
         .actors
@@ -392,12 +360,10 @@ pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &s
     }
 }
 
-/// Try to enqueue an LLM request for bounded background execution.
+/// Try to enqueue an LLM request without blocking the actor scheduler.
 ///
-/// The scheduler is never allowed to block on provider backpressure. Returns
-/// `false` when the queue is full or disconnected. Actor/in-flight state is
-/// changed only after a successful enqueue, so failed dispatch cannot strand
-/// an actor in a phantom in-flight state.
+/// Returns `false` on queue saturation or executor failure. In-flight state is
+/// committed only after the bounded queue accepts the work item.
 pub(crate) fn dispatch_llm_request(
     rt: &mut Runtime,
     actor_id: u64,
@@ -407,16 +373,14 @@ pub(crate) fn dispatch_llm_request(
     let Some(client) = rt.llm.client.clone() else {
         return false;
     };
-    let Some(tx) = rt.llm.request_tx.as_ref() else {
-        return false;
-    };
 
     let item = LlmWorkItem {
         actor_id,
         request,
         client,
+        completion_tx: rt.llm.completion_tx.clone(),
     };
-    if tx.try_send(item).is_err() {
+    if executor_tx().try_send(item).is_err() {
         return false;
     }
 
@@ -429,8 +393,7 @@ pub(crate) fn dispatch_llm_request(
 }
 
 /// Prune an agent's episodic memory to fit within `max_tokens`, using a
-/// character-count heuristic (chars / 4). Always preserves the system
-/// prompt (which lives in its own state field).
+/// character-count heuristic (chars / 4).
 pub(crate) fn prune_episodic_memory(rt: &mut Runtime, actor_id: u64, max_tokens: usize) {
     let memory_json = {
         let actor = match rt.actors.get(&actor_id) {
@@ -444,7 +407,7 @@ pub(crate) fn prune_episodic_memory(rt: &mut Runtime, actor_id: u64, max_tokens:
         Runtime::vm_value_to_string(
             &actor
                 .get_state_field("episodic_memory")
-                .unwrap_or(crate::vm::Value::nil()),
+                .unwrap_or(Value::nil()),
             Some(module),
         )
         .unwrap_or_default()
@@ -470,10 +433,7 @@ pub(crate) fn prune_episodic_memory(rt: &mut Runtime, actor_id: u64, max_tokens:
     }
 }
 
-/// Resume an actor whose bytecode behavior suspended on
-/// `perform LLM.ask` once the background worker has delivered the
-/// response. The re-executed `LlmAsk` picks the response up from
-/// `actor.llm_completed` via the VM callback.
+/// Resume an actor whose bytecode behavior suspended on an LLM provider call.
 pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     let suspended = match rt.actors.get_mut(&actor_id) {
         Some(actor) => actor.suspended_execution.take(),
