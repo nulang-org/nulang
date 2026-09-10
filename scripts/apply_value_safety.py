@@ -121,7 +121,7 @@ wasm = ROOT / "src/wasm_runtime.rs"
 replace_once(
     wasm,
     """        Ok(unsafe { crate::vm::Value::from_raw(raw as u64) })\n""",
-    """        let raw = raw as u64;\n        if (raw & crate::value_layout::TAG_MASK) == crate::value_layout::TAG_PTR {\n            return Err(NuError::runtime_error(\n                \"WASM module returned a host-pointer tag\",\n                Span::default(),\n            ));\n        }\n        // SAFETY: guest pointer tags are rejected above. Other guest values\n        // remain opaque immediates/floats; TAG_STRING is a guest-memory offset\n        // consumed only through `string_value`.\n        Ok(unsafe { crate::vm::Value::from_raw(raw) })\n""",
+    """        let raw = raw as u64;\n        if (raw & crate::value_layout::TAG_MASK) == crate::value_layout::TAG_PTR {\n            return Err(NuError::runtime_error(\n                \"WASM module returned a host-pointer tag\".to_string(),\n                Span::default(),\n            ));\n        }\n        // SAFETY: guest pointer tags are rejected above. Other guest values\n        // remain opaque immediates/floats; TAG_STRING is a guest-memory offset\n        // consumed only through `string_value`.\n        Ok(unsafe { crate::vm::Value::from_raw(raw) })\n""",
 )
 replace_once(
     wasm,
@@ -133,7 +133,7 @@ wasmfx = ROOT / "src/wasmfx_runtime.rs"
 replace_once(
     wasmfx,
     """            Ok(Ok(raw)) => Ok(unsafe { crate::vm::Value::from_raw(raw as u64) }),\n""",
-    """            Ok(Ok(raw)) => {\n                let raw = raw as u64;\n                if (raw & crate::value_layout::TAG_MASK) == crate::value_layout::TAG_PTR {\n                    Err(NuError::runtime_error(\n                        \"WasmFX module returned a host-pointer tag\",\n                        Span::default(),\n                    ))\n                } else {\n                    // SAFETY: guest host-pointer tags are rejected above.\n                    Ok(unsafe { crate::vm::Value::from_raw(raw) })\n                }\n            }\n""",
+    """            Ok(Ok(raw)) => {\n                let raw = raw as u64;\n                if (raw & crate::value_layout::TAG_MASK) == crate::value_layout::TAG_PTR {\n                    Err(NuError::runtime_error(\n                        \"WasmFX module returned a host-pointer tag\".to_string(),\n                        crate::types::Span::default(),\n                    ))\n                } else {\n                    // SAFETY: guest host-pointer tags are rejected above.\n                    Ok(unsafe { crate::vm::Value::from_raw(raw) })\n                }\n            }\n""",
 )
 
 print(f"wrapped raw calls: {raw_wrapped}; wrapped bits calls: {bits_wrapped}")
