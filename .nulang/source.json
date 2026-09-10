@@ -6,6 +6,7 @@
       "provider": "github",
       "namespace": "nulang-org",
       "name": "nulang",
+      "external_id": "1278594551",
       "default_branch": "main",
       "transport": "https"
     },
