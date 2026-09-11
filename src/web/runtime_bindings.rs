@@ -3,12 +3,127 @@
 //! The compiler owns route syntax and produces [`RouteBindingContract`] values.
 //! This module is deliberately transport-agnostic: it accepts already-captured
 //! request values and stages them into the VM call ABI (`r0..rN`, `argc`) without
-//! re-parsing route patterns or consulting ambient request state.
+//! re-parsing route contracts or consulting ambient request state.
 
 use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
 use crate::vm::VM;
-use crate::web::bindings::{RouteBindingContract, RouteBindingSource};
+use crate::web::bindings::{compile_route_bindings, RouteBindingContract, RouteBindingSource};
+use crate::web::contracts::RouteContract;
 use std::collections::HashMap;
+
+/// One precompiled route-pattern segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeRouteSegment {
+    Literal(String),
+    PathParam(String),
+}
+
+/// Runtime projection of a compiler route contract.
+///
+/// Pattern syntax is compiled once here. Request dispatch therefore performs
+/// only segment comparison/capture; it does not need to rediscover handler
+/// argument order or source types from the route string on every request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRoutePlan {
+    pub method: String,
+    pub path: String,
+    pub segments: Vec<RuntimeRouteSegment>,
+    pub bindings: Vec<RouteBindingContract>,
+    pub handler_param_count: usize,
+}
+
+/// Compile a source-level route contract into a runtime matching/call plan.
+pub fn compile_runtime_route_plan(
+    contract: &RouteContract,
+) -> Result<RuntimeRoutePlan, Vec<String>> {
+    let binding_compilation = compile_route_bindings(contract);
+    if !binding_compilation.diagnostics.is_empty() {
+        return Err(binding_compilation.diagnostics);
+    }
+
+    let segments = compile_route_segments(&contract.path).map_err(|diagnostic| {
+        vec![format!(
+            "{} {}: {diagnostic}",
+            contract.method, contract.path
+        )]
+    })?;
+
+    Ok(RuntimeRoutePlan {
+        method: contract.method.clone(),
+        path: contract.path.clone(),
+        segments,
+        bindings: binding_compilation.bindings,
+        handler_param_count: contract.handler_params.len(),
+    })
+}
+
+/// Match a request path using a precompiled route plan.
+pub fn match_runtime_route(
+    plan: &RuntimeRoutePlan,
+    request_path: &str,
+) -> Option<HashMap<String, String>> {
+    let request_path = request_path.trim_start_matches('/');
+    let request_segments: Vec<&str> = if request_path.is_empty() {
+        vec![""]
+    } else {
+        request_path.split('/').collect()
+    };
+    if plan.segments.len() != request_segments.len() {
+        return None;
+    }
+
+    let mut params = HashMap::new();
+    for (pattern, value) in plan.segments.iter().zip(request_segments) {
+        match pattern {
+            RuntimeRouteSegment::Literal(expected) if expected != value => return None,
+            RuntimeRouteSegment::Literal(_) => {}
+            RuntimeRouteSegment::PathParam(name) => {
+                params.insert(name.clone(), value.to_string());
+            }
+        }
+    }
+    Some(params)
+}
+
+fn compile_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
+    let normalized = path.trim_start_matches('/');
+    let parts: Vec<&str> = if normalized.is_empty() {
+        vec![""]
+    } else {
+        normalized.split('/').collect()
+    };
+
+    parts
+        .into_iter()
+        .map(|segment| {
+            if let Some(name) = segment.strip_prefix(':') {
+                if name.is_empty() {
+                    return Err("route contains an empty legacy path parameter".to_string());
+                }
+                return Ok(RuntimeRouteSegment::PathParam(name.to_string()));
+            }
+
+            if segment.starts_with('{') || segment.ends_with('}') {
+                let Some(inner) = segment
+                    .strip_prefix('{')
+                    .and_then(|segment| segment.strip_suffix('}'))
+                else {
+                    return Err(format!("malformed path parameter '{segment}'"));
+                };
+                let name = inner
+                    .split_once(':')
+                    .map_or(inner, |(name, _)| name)
+                    .trim();
+                if name.is_empty() {
+                    return Err("route contains an empty contract path parameter".to_string());
+                }
+                return Ok(RuntimeRouteSegment::PathParam(name.to_string()));
+            }
+
+            Ok(RuntimeRouteSegment::Literal(segment.to_string()))
+        })
+        .collect()
+}
 
 /// One VM argument produced from a compiler binding.
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +284,7 @@ fn decode_path_constant(raw: &str, ty: Option<&str>) -> Result<Constant, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::contracts::{HandlerParamContract, RouteParamContract};
 
     fn binding(name: &str, index: usize, ty: Option<&str>) -> RouteBindingContract {
         RouteBindingContract {
@@ -178,6 +294,50 @@ mod tests {
             handler_index: index,
             ty: ty.map(str::to_string),
         }
+    }
+
+    fn contract(path: &str) -> RouteContract {
+        RouteContract {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            handler: Some("show_user".to_string()),
+            params: vec![RouteParamContract {
+                name: "id".to_string(),
+                ty: Some("Int".to_string()),
+            }],
+            handler_params: vec![HandlerParamContract {
+                name: "id".to_string(),
+                ty: Some("Int".to_string()),
+                capability: None,
+            }],
+            response_type: Some("String".to_string()),
+            error_type: None,
+            effects: Vec::new(),
+            reference_capability: None,
+            placement: Some("server".to_string()),
+        }
+    }
+
+    #[test]
+    fn compiles_and_matches_contract_route_once() {
+        let plan = compile_runtime_route_plan(&contract("/users/{id: Int}")).unwrap();
+        assert_eq!(
+            plan.segments,
+            vec![
+                RuntimeRouteSegment::Literal("users".to_string()),
+                RuntimeRouteSegment::PathParam("id".to_string())
+            ]
+        );
+        let params = match_runtime_route(&plan, "/users/42").unwrap();
+        assert_eq!(params.get("id"), Some(&"42".to_string()));
+        assert!(match_runtime_route(&plan, "/accounts/42").is_none());
+    }
+
+    #[test]
+    fn legacy_route_plan_keeps_colon_matching() {
+        let plan = compile_runtime_route_plan(&contract("/users/:id")).unwrap();
+        let params = match_runtime_route(&plan, "/users/9").unwrap();
+        assert_eq!(params.get("id"), Some(&"9".to_string()));
     }
 
     #[test]
