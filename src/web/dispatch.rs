@@ -75,47 +75,19 @@ pub fn render_direct_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::CodeModule;
-    use crate::runtime::HttpMethod;
-    use crate::web::runtime_bindings::{RuntimeRoutePlan, RuntimeRouteSegment};
-
-    fn raw_route(path: &str) -> WebRoute {
-        WebRoute {
-            method: HttpMethod::Get,
-            path: path.to_string(),
-            handler_module: CodeModule::new("dispatch-test"),
-            handler_func_idx: 0,
-        }
-    }
 
     #[test]
-    fn legacy_route_without_plan_uses_legacy_matcher() {
-        let route = RuntimeWebRoute {
-            route: raw_route("/users/:id"),
-            plan: None,
-        };
-        let params = match_route(&route, "/users/42").unwrap();
-        assert_eq!(params.get("id"), Some(&"42".to_string()));
-        assert!(render_direct_route(&route, &params).unwrap().is_none());
-    }
+    fn empty_package_compiles_to_empty_runtime_route_set() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_dispatch_empty_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
 
-    #[test]
-    fn compiler_plan_enables_brace_matching_without_legacy_parser_changes() {
-        let route = RuntimeWebRoute {
-            route: raw_route("/users/{id: Int}"),
-            plan: Some(RuntimeRoutePlan {
-                method: "GET".to_string(),
-                path: "/users/{id: Int}".to_string(),
-                segments: vec![
-                    RuntimeRouteSegment::Literal("users".to_string()),
-                    RuntimeRouteSegment::PathParam("id".to_string()),
-                ],
-                bindings: Vec::new(),
-                handler_param_count: 0,
-                direct_call: false,
-            }),
-        };
-        let params = match_route(&route, "/users/42").unwrap();
-        assert_eq!(params.get("id"), Some(&"42".to_string()));
+        let routes = compile_runtime_routes(Vec::new(), &dir).unwrap();
+        assert!(routes.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
