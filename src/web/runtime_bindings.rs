@@ -6,9 +6,10 @@
 //! re-parsing route contracts or consulting ambient request state.
 
 use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
+use crate::runtime::WebRoute;
 use crate::vm::VM;
 use crate::web::bindings::{compile_route_bindings, RouteBindingContract, RouteBindingSource};
-use crate::web::contracts::RouteContract;
+use crate::web::contracts::{ContractCompilation, RouteContract};
 use std::collections::HashMap;
 
 /// One precompiled route-pattern segment.
@@ -30,6 +31,68 @@ pub struct RuntimeRoutePlan {
     pub segments: Vec<RuntimeRouteSegment>,
     pub bindings: Vec<RouteBindingContract>,
     pub handler_param_count: usize,
+    /// True when every declared handler parameter is supplied directly from a
+    /// route input and every path parameter has a direct binding. Legacy routes
+    /// that still rely on ambient `Web.param` access keep this false.
+    pub direct_call: bool,
+}
+
+/// A low-level runtime registration paired with optional compiler metadata.
+///
+/// Keeping this as a sidecar avoids teaching the `Web.route` host effect about
+/// source-level types. Registration remains method/path/function; package build
+/// and dev tooling attach the richer contract once source analysis is complete.
+#[derive(Clone, Debug)]
+pub struct RuntimeWebRoute {
+    pub route: WebRoute,
+    pub plan: Option<RuntimeRoutePlan>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeRouteAttachment {
+    pub routes: Vec<RuntimeWebRoute>,
+    pub diagnostics: Vec<String>,
+}
+
+/// Attach package-level compiler contracts to routes collected by the VM.
+///
+/// Missing contracts are preserved as legacy runtime registrations. Invalid
+/// compiler contracts keep the route available for diagnostics but do not opt
+/// it into contract-first dispatch.
+pub fn attach_runtime_route_plans(
+    routes: Vec<WebRoute>,
+    compilation: &ContractCompilation,
+) -> RuntimeRouteAttachment {
+    let contract_index: HashMap<(&str, &str), &RouteContract> = compilation
+        .routes
+        .iter()
+        .map(|contract| ((contract.method.as_str(), contract.path.as_str()), contract))
+        .collect();
+
+    let mut diagnostics = compilation.diagnostics.clone();
+    let routes = routes
+        .into_iter()
+        .map(|route| {
+            let key = (route.method.as_str(), route.path.as_str());
+            let plan = contract_index.get(&key).and_then(|contract| {
+                match compile_runtime_route_plan(contract) {
+                    Ok(plan) => Some(plan),
+                    Err(mut route_diagnostics) => {
+                        diagnostics.append(&mut route_diagnostics);
+                        None
+                    }
+                }
+            });
+            RuntimeWebRoute { route, plan }
+        })
+        .collect();
+
+    diagnostics.sort();
+    diagnostics.dedup();
+    RuntimeRouteAttachment {
+        routes,
+        diagnostics,
+    }
 }
 
 /// Compile a source-level route contract into a runtime matching/call plan.
@@ -47,6 +110,8 @@ pub fn compile_runtime_route_plan(
             contract.method, contract.path
         )]
     })?;
+    let direct_call = binding_compilation.bindings.len() == contract.handler_params.len()
+        && binding_compilation.bindings.len() == contract.params.len();
 
     Ok(RuntimeRoutePlan {
         method: contract.method.clone(),
@@ -54,6 +119,7 @@ pub fn compile_runtime_route_plan(
         segments,
         bindings: binding_compilation.bindings,
         handler_param_count: contract.handler_params.len(),
+        direct_call,
     })
 }
 
@@ -62,18 +128,39 @@ pub fn match_runtime_route(
     plan: &RuntimeRoutePlan,
     request_path: &str,
 ) -> Option<HashMap<String, String>> {
+    match_segments(&plan.segments, request_path)
+}
+
+/// Match a collected route, preferring its compiler plan and falling back to
+/// the existing `:name` runtime convention when no contract was attached.
+pub fn match_attached_route(
+    route: &RuntimeWebRoute,
+    request_path: &str,
+) -> Option<HashMap<String, String>> {
+    match &route.plan {
+        Some(plan) => match_runtime_route(plan, request_path),
+        None => compile_legacy_route_segments(&route.route.path)
+            .ok()
+            .and_then(|segments| match_segments(&segments, request_path)),
+    }
+}
+
+fn match_segments(
+    segments: &[RuntimeRouteSegment],
+    request_path: &str,
+) -> Option<HashMap<String, String>> {
     let request_path = request_path.trim_start_matches('/');
     let request_segments: Vec<&str> = if request_path.is_empty() {
         vec![""]
     } else {
         request_path.split('/').collect()
     };
-    if plan.segments.len() != request_segments.len() {
+    if segments.len() != request_segments.len() {
         return None;
     }
 
     let mut params = HashMap::new();
-    for (pattern, value) in plan.segments.iter().zip(request_segments) {
+    for (pattern, value) in segments.iter().zip(request_segments) {
         match pattern {
             RuntimeRouteSegment::Literal(expected) if expected != value => return None,
             RuntimeRouteSegment::Literal(_) => {}
@@ -86,6 +173,17 @@ pub fn match_runtime_route(
 }
 
 fn compile_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
+    compile_segments(path, true)
+}
+
+fn compile_legacy_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
+    compile_segments(path, false)
+}
+
+fn compile_segments(
+    path: &str,
+    allow_contract_params: bool,
+) -> Result<Vec<RuntimeRouteSegment>, String> {
     let normalized = path.trim_start_matches('/');
     let parts: Vec<&str> = if normalized.is_empty() {
         vec![""]
@@ -103,7 +201,7 @@ fn compile_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String
                 return Ok(RuntimeRouteSegment::PathParam(name.to_string()));
             }
 
-            if segment.starts_with('{') || segment.ends_with('}') {
+            if allow_contract_params && (segment.starts_with('{') || segment.ends_with('}')) {
                 let Some(inner) = segment
                     .strip_prefix('{')
                     .and_then(|segment| segment.strip_suffix('}'))
@@ -321,6 +419,7 @@ mod tests {
     #[test]
     fn compiles_and_matches_contract_route_once() {
         let plan = compile_runtime_route_plan(&contract("/users/{id: Int}")).unwrap();
+        assert!(plan.direct_call);
         assert_eq!(
             plan.segments,
             vec![
@@ -338,6 +437,14 @@ mod tests {
         let plan = compile_runtime_route_plan(&contract("/users/:id")).unwrap();
         let params = match_runtime_route(&plan, "/users/9").unwrap();
         assert_eq!(params.get("id"), Some(&"9".to_string()));
+    }
+
+    #[test]
+    fn legacy_ambient_route_is_not_marked_direct_call() {
+        let mut ambient = contract("/users/:id");
+        ambient.handler_params.clear();
+        let plan = compile_runtime_route_plan(&ambient).unwrap();
+        assert!(!plan.direct_call);
     }
 
     #[test]
