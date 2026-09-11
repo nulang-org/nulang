@@ -56,3 +56,7 @@ src/jit/mir_compiler.rs
 .agents/
 .devin/
 .nula/
+
+# Local bootstrap/dev artifacts
+/.nulang/
+/target2/
