@@ -1,0 +1,19 @@
+#!/usr/bin/env dagger
+
+# Portable equivalent of the wasm-backend feature CI job.
+# Run locally with: dagger .dagger/ci/wasm-backend.dag
+
+src=$(host | directory . --exclude .git --exclude target --exclude test-pkg)
+
+container |
+  from rust:bookworm |
+  with-exec -- apt-get update |
+  with-exec -- apt-get install -y --no-install-recommends python3-dev pkg-config libssl-dev ca-certificates |
+  with-mounted-cache /usr/local/cargo/registry nulang-cargo-registry |
+  with-mounted-cache /usr/local/cargo/git nulang-cargo-git |
+  with-directory /src $src |
+  with-workdir /src |
+  with-mounted-cache /tmp/cargo-target nulang-cargo-target-wasm |
+  with-exec -- cargo build --all-targets --features wasm-backend |
+  with-exec -- cargo test --features wasm-backend |
+  sync
