@@ -1,0 +1,59 @@
+name: Format LLM Backpressure Fix
+
+on:
+  push:
+    branches: [fix/llm-executor-backpressure]
+    paths:
+      - .github/workflows/format-llm-backpressure.yml
+
+permissions:
+  contents: write
+
+jobs:
+  format-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/llm-executor-backpressure
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Verify saturation regression
+        run: cargo test --lib saturated_executor_submission_becomes_error_completion -- --nocapture
+
+      - name: Verify disconnect regression
+        run: cargo test --lib disconnected_executor_submission_becomes_error_completion -- --nocapture
+
+      - name: Verify all targets compile
+        run: cargo check --all-targets
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Remove one-shot workflow
+        run: git rm .github/workflows/format-llm-backpressure.yml
+
+      - name: Commit verified formatting
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No formatting change produced; refusing an empty workflow commit."
+            exit 1
+          fi
+          git commit -m "style(ai): format LLM backpressure changes"
+          git push origin HEAD:fix/llm-executor-backpressure
