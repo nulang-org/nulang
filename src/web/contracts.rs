@@ -1,13 +1,13 @@
 //! Compile-time web route contracts.
 //!
 //! This module bridges Nulang's existing `perform Web.route(...)` surface to a
-//! structured contract representation.  The deployment IR can consume these
+//! structured contract representation. The deployment IR can consume these
 //! contracts without relying on string scans for handler metadata.
 //!
 //! The first version is deliberately backwards compatible with `:name` path
-//! parameters.  It also understands `{name}` and `{name: Type}` segments so the
-//! IR format is ready for the typed route syntax without forcing a runtime
-//! migration in the same change.
+//! parameters. It also understands `{name}` and `{name: Type}` segments so the
+//! IR format is ready for typed route syntax without forcing a runtime migration
+//! in the same change.
 
 use crate::ast::{AstModule, Decl, Expr, FunctionAnnotation, Literal, Param, WorkflowItem};
 use crate::lexer::Lexer;
@@ -20,7 +20,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteParamContract {
     pub name: String,
-    /// Source-level type name when known.  Legacy `:name` segments inherit the
+    /// Source-level type name when known. Legacy `:name` segments inherit the
     /// type from a same-named handler parameter when one is declared.
     pub ty: Option<String>,
 }
@@ -43,7 +43,7 @@ pub struct RouteContract {
     pub error_type: Option<String>,
     pub effects: Vec<String>,
     /// Nulang reference capability (`iso`, `ref`, `val`, ...), when the handler
-    /// declares one.  Resource/security capabilities will be represented by a
+    /// declares one. Resource/security capabilities will be represented by a
     /// separate field once capability-parameterized effects land.
     pub reference_capability: Option<String>,
     pub placement: Option<String>,
@@ -53,9 +53,9 @@ pub struct RouteContract {
 pub struct ContractCompilation {
     pub routes: Vec<RouteContract>,
     /// Best-effort source discovery must not make deployment IR generation
-    /// panic.  Parse failures are retained here so build tooling can surface
-    /// them and can become hard errors once the contract pass is part of the
-    /// typed compiler pipeline.
+    /// panic. Parse and contract-validation failures are retained here so build
+    /// tooling can surface them and can become hard errors once the contract
+    /// pass is integrated into the typed compiler pipeline.
     pub diagnostics: Vec<String>,
 }
 
@@ -106,7 +106,7 @@ impl FunctionMeta {
 
 /// Compile contracts from every `.nula` source file below `src_root`.
 ///
-/// Parsing is intentionally file-local and best effort.  Package builds have
+/// Parsing is intentionally file-local and best effort. Package builds have
 /// already validated their source through the normal compiler pipeline; this
 /// pass exists to preserve static web metadata in the deployment artifact.
 pub fn compile_contracts_from_tree(src_root: &Path) -> ContractCompilation {
@@ -162,11 +162,18 @@ fn collect_contracts_recursive(path: &Path, out: &mut ContractCompilation) {
         }
     };
 
-    out.routes.extend(contracts_from_module(&module));
+    let compiled = compile_module_contracts(&module);
+    out.routes.extend(compiled.routes);
+    out.diagnostics.extend(
+        compiled
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| format!("{}: {diagnostic}", path.display())),
+    );
 }
 
-/// Extract static route contracts from a parsed module.
-pub fn contracts_from_module(module: &AstModule) -> Vec<RouteContract> {
+/// Compile and validate static route contracts from a parsed module.
+pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
     let functions: HashMap<String, FunctionMeta> = module
         .decls
         .iter()
@@ -176,47 +183,94 @@ pub fn contracts_from_module(module: &AstModule) -> Vec<RouteContract> {
     let mut raw_routes = Vec::new();
     collect_routes_in_module(module, &mut raw_routes);
 
-    raw_routes
-        .into_iter()
-        .map(|(method, path, handler)| {
-            let handler_name = match &handler {
-                Expr::Var(name, _) => Some(name.clone()),
-                _ => None,
-            };
-            let meta = handler_name
-                .as_ref()
-                .and_then(|name| functions.get(name.as_str()));
+    let mut out = ContractCompilation::default();
+    for (method, path, handler) in raw_routes {
+        let handler_name = match &handler {
+            Expr::Var(name, _) => Some(name.clone()),
+            _ => None,
+        };
+        let meta = handler_name
+            .as_ref()
+            .and_then(|name| functions.get(name.as_str()));
 
-            let mut params = parse_path_params(&path).unwrap_or_default();
-            if let Some(meta) = meta {
-                for route_param in &mut params {
-                    if route_param.ty.is_none() {
-                        route_param.ty = meta
-                            .params
-                            .iter()
-                            .find(|param| param.name == route_param.name)
-                            .and_then(|param| param.ty.as_ref())
-                            .map(ToString::to_string);
-                    }
-                }
+        let mut params = match parse_path_params(&path) {
+            Ok(params) => params,
+            Err(message) => {
+                out.diagnostics.push(format!("{method} {path}: {message}"));
+                Vec::new()
             }
+        };
 
-            RouteContract {
-                method,
-                path,
-                handler: handler_name,
-                params,
-                handler_params: meta
-                    .map(|m| m.params.iter().map(handler_param_contract).collect())
-                    .unwrap_or_default(),
-                response_type: meta.and_then(|m| m.response_type.clone()),
-                error_type: meta.and_then(|m| m.error_type.clone()),
-                effects: meta.map(|m| m.effects.clone()).unwrap_or_default(),
-                reference_capability: meta.and_then(|m| m.reference_capability.clone()),
-                placement: meta.and_then(|m| m.placement.clone()),
+        if let Some(meta) = meta {
+            validate_and_infer_param_types(
+                &method,
+                &path,
+                handler_name.as_deref().unwrap_or("<handler>"),
+                &mut params,
+                &meta.params,
+                &mut out.diagnostics,
+            );
+        }
+
+        out.routes.push(RouteContract {
+            method,
+            path,
+            handler: handler_name,
+            params,
+            handler_params: meta
+                .map(|m| m.params.iter().map(handler_param_contract).collect())
+                .unwrap_or_default(),
+            response_type: meta.and_then(|m| m.response_type.clone()),
+            error_type: meta.and_then(|m| m.error_type.clone()),
+            effects: meta.map(|m| m.effects.clone()).unwrap_or_default(),
+            reference_capability: meta.and_then(|m| m.reference_capability.clone()),
+            placement: meta.and_then(|m| m.placement.clone()),
+        });
+    }
+
+    out
+}
+
+/// Backwards-compatible convenience API for callers that only need routes.
+pub fn contracts_from_module(module: &AstModule) -> Vec<RouteContract> {
+    compile_module_contracts(module).routes
+}
+
+fn validate_and_infer_param_types(
+    method: &str,
+    path: &str,
+    handler_name: &str,
+    route_params: &mut [RouteParamContract],
+    handler_params: &[Param],
+    diagnostics: &mut Vec<String>,
+) {
+    for route_param in route_params {
+        let handler_param = handler_params
+            .iter()
+            .find(|param| param.name == route_param.name);
+        let handler_ty = handler_param
+            .and_then(|param| param.ty.as_ref())
+            .map(ToString::to_string);
+
+        match (&route_param.ty, handler_ty) {
+            (Some(route_ty), Some(handler_ty)) if route_ty != &handler_ty => {
+                diagnostics.push(format!(
+                    "{method} {path}: route parameter '{}' is typed as {} but handler '{}' declares {}",
+                    route_param.name, route_ty, handler_name, handler_ty
+                ));
             }
-        })
-        .collect()
+            (Some(route_ty), None) => {
+                diagnostics.push(format!(
+                    "{method} {path}: typed route parameter '{}: {}' has no same-named typed parameter on handler '{}'",
+                    route_param.name, route_ty, handler_name
+                ));
+            }
+            (None, Some(handler_ty)) => {
+                route_param.ty = Some(handler_ty);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn handler_param_contract(param: &Param) -> HandlerParamContract {
@@ -257,7 +311,9 @@ pub fn parse_path_params(path: &str) -> Result<Vec<RouteParamContract>, String> 
 
         if segment.starts_with('{') || segment.ends_with('}') {
             if !(segment.starts_with('{') && segment.ends_with('}')) {
-                return Err(format!("route '{path}' contains malformed parameter '{segment}'"));
+                return Err(format!(
+                    "route '{path}' contains malformed parameter '{segment}'"
+                ));
             }
             let inner = &segment[1..segment.len() - 1];
             let (name, ty) = match inner.split_once(':') {
@@ -268,7 +324,9 @@ pub fn parse_path_params(path: &str) -> Result<Vec<RouteParamContract>, String> 
                 return Err(format!("route '{path}' contains an empty parameter"));
             }
             if matches!(ty, Some("")) {
-                return Err(format!("route '{path}' parameter '{name}' has an empty type"));
+                return Err(format!(
+                    "route '{path}' parameter '{name}' has an empty type"
+                ));
             }
             params.push(RouteParamContract {
                 name: name.to_string(),
@@ -280,7 +338,11 @@ pub fn parse_path_params(path: &str) -> Result<Vec<RouteParamContract>, String> 
 }
 
 fn collect_routes_in_module(module: &AstModule, out: &mut Vec<(String, String, Expr)>) {
-    for decl in &module.decls {
+    collect_routes_in_decls(&module.decls, out);
+}
+
+fn collect_routes_in_decls(decls: &[Decl], out: &mut Vec<(String, String, Expr)>) {
+    for decl in decls {
         match decl {
             Decl::Function { body, .. }
             | Decl::LetBinding { value: body, .. }
@@ -297,14 +359,7 @@ fn collect_routes_in_module(module: &AstModule, out: &mut Vec<(String, String, E
                     }
                 }
             }
-            Decl::Module { decls, .. } => {
-                let nested = AstModule {
-                    name: module.name.clone(),
-                    decls: decls.clone(),
-                    ..module.clone()
-                };
-                collect_routes_in_module(&nested, out);
-            }
+            Decl::Module { decls, .. } => collect_routes_in_decls(decls, out),
             _ => {}
         }
     }
@@ -515,9 +570,10 @@ fn web_main() {
 "#,
         );
 
-        let contracts = contracts_from_module(&module);
-        assert_eq!(contracts.len(), 1);
-        let route = &contracts[0];
+        let compiled = compile_module_contracts(&module);
+        assert!(compiled.diagnostics.is_empty(), "{:?}", compiled.diagnostics);
+        assert_eq!(compiled.routes.len(), 1);
+        let route = &compiled.routes[0];
         assert_eq!(route.handler.as_deref(), Some("show_user"));
         assert_eq!(route.params[0].ty.as_deref(), Some("UserId"));
         assert_eq!(route.response_type.as_deref(), Some("String"));
@@ -526,7 +582,28 @@ fn web_main() {
     }
 
     #[test]
-    fn explicit_typed_path_wins_over_handler_fallback() {
+    fn typed_path_matches_handler_parameter_type() {
+        let module = parse(
+            r#"
+type UserId = String
+
+fn show_user(id: UserId) -> String {
+    "ok"
+}
+
+fn web_main() {
+    perform Web.route("GET", "/users/{id: UserId}", show_user)
+}
+"#,
+        );
+
+        let compiled = compile_module_contracts(&module);
+        assert!(compiled.diagnostics.is_empty(), "{:?}", compiled.diagnostics);
+        assert_eq!(compiled.routes[0].params[0].ty.as_deref(), Some("UserId"));
+    }
+
+    #[test]
+    fn typed_path_mismatch_is_diagnostic() {
         let module = parse(
             r#"
 type UserId = String
@@ -542,7 +619,9 @@ fn web_main() {
 "#,
         );
 
-        let contracts = contracts_from_module(&module);
-        assert_eq!(contracts[0].params[0].ty.as_deref(), Some("ExternalId"));
+        let compiled = compile_module_contracts(&module);
+        assert_eq!(compiled.diagnostics.len(), 1);
+        assert!(compiled.diagnostics[0].contains("typed as ExternalId"));
+        assert!(compiled.diagnostics[0].contains("declares UserId"));
     }
 }
