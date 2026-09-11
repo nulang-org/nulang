@@ -338,11 +338,7 @@ impl Scheduler {
     }
 
     /// Steal from another worker's local queue within one priority band.
-    fn steal_peer_for(
-        &self,
-        worker_idx: usize,
-        priority: ActorPriority,
-    ) -> (Option<u64>, u64) {
+    fn steal_peer_for(&self, worker_idx: usize, priority: ActorPriority) -> (Option<u64>, u64) {
         let stealers = self.stealers_for(priority);
         let mut attempts = 0u64;
 
@@ -377,7 +373,11 @@ impl Scheduler {
     pub fn next_task(&self, worker_idx: usize) -> Option<u64> {
         let mut steal_attempts = 0u64;
 
-        for priority in [ActorPriority::High, ActorPriority::Normal, ActorPriority::Low] {
+        for priority in [
+            ActorPriority::High,
+            ActorPriority::Normal,
+            ActorPriority::Low,
+        ] {
             if let Some(task) = self.pop_local(worker_idx, priority) {
                 self.record_steal_attempts(steal_attempts);
                 return Some(task);
@@ -409,7 +409,11 @@ impl Scheduler {
     /// peer scans here removes three empty High-band probes from the common
     /// Normal-priority path while retaining batch transfer and strict priority.
     fn next_owner_task(&self, worker_idx: usize) -> Option<u64> {
-        for priority in [ActorPriority::High, ActorPriority::Normal, ActorPriority::Low] {
+        for priority in [
+            ActorPriority::High,
+            ActorPriority::Normal,
+            ActorPriority::Low,
+        ] {
             if let Some(task) = self.pop_local(worker_idx, priority) {
                 return Some(task);
             }
@@ -439,7 +443,11 @@ impl Scheduler {
     pub fn steal_one(&self) -> Option<u64> {
         let mut steal_attempts = 0u64;
 
-        for priority in [ActorPriority::High, ActorPriority::Normal, ActorPriority::Low] {
+        for priority in [
+            ActorPriority::High,
+            ActorPriority::Normal,
+            ActorPriority::Low,
+        ] {
             if let Some(task) = self.steal_global_for(priority) {
                 self.record_steal_attempts(steal_attempts);
                 return Some(task);
@@ -594,7 +602,9 @@ mod scheduler_tests {
         assert_eq!(first_stats.tasks_from_global_queue, 1);
         assert_eq!(first_stats.tasks_from_local_queue, 0);
 
-        let second = s.next_task(0).expect("batched local queue should have work");
+        let second = s
+            .next_task(0)
+            .expect("batched local queue should have work");
         let second_stats = s.stats();
         assert_eq!(second_stats.tasks_from_global_queue, 1);
         assert_eq!(second_stats.tasks_from_local_queue, 1);
