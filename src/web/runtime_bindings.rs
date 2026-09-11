@@ -96,12 +96,6 @@ pub fn render_bound_route_handler(
     path_params: &HashMap<String, String>,
 ) -> Result<String, String> {
     let args = bind_path_arguments(bindings, handler_param_count, path_params)?;
-    if handler_param_count >= u8::MAX as usize {
-        // One additional register is required for the closure itself.
-        return Err(format!(
-            "route handler has {handler_param_count} parameters; no VM register remains for the call target"
-        ));
-    }
 
     let mut vm = VM::new();
     let mut executable = module.clone();
@@ -120,6 +114,9 @@ pub fn render_bound_route_handler(
         ));
     }
 
+    // `handler_param_count <= 255` above means r0..r(argc-1) hold arguments
+    // and r(argc) remains available for the non-capturing closure, including
+    // the maximum case where argc=255 and the closure occupies r255.
     let closure_reg = handler_param_count as u8;
     if func_idx > u16::MAX as usize {
         return Err(format!(
@@ -218,7 +215,10 @@ mod tests {
 
     #[test]
     fn decodes_supported_primitive_types() {
-        assert_eq!(decode_path_constant("7", Some("Int")).unwrap(), Constant::Int(7));
+        assert_eq!(
+            decode_path_constant("7", Some("Int")).unwrap(),
+            Constant::Int(7)
+        );
         assert_eq!(
             decode_path_constant("3.5", Some("Float")).unwrap(),
             Constant::Float(3.5)
