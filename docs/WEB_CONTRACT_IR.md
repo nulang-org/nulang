@@ -37,13 +37,38 @@ Legacy `:id` routes remain backwards compatible. If a same-named handler paramet
 
 Brace syntax is contract-first. `{id}` and `{id: UserId}` require a same-named handler parameter in the binding compiler. A typed route/handler mismatch is also retained as a contract diagnostic. For example, `{id: ExternalId}` paired with `fn handler(id: UserId)` is invalid contract metadata.
 
-Recognizing brace syntax and emitting bindings does not yet imply that the current HTTP runtime invokes handlers with those arguments. The runtime registration object currently stores only method, path, module, and function index. Runtime support should land together with a place to preserve the compiled binding plan so Nulang does not re-parse route conventions at dispatch time.
-
 ## Package-wide extraction
 
 Contract extraction parses the package source tree and builds one package-level analysis module so a route in one file can retain handler metadata declared in another. Public `route(...)` and `route_method(...)` helper calls are also lowered to the same route contract representation.
 
 Bare helper-call recognition is scoped to the source module that imports `stdlib::web*`. A web import in one file therefore cannot reinterpret an unrelated user-defined `route()` call in another file as framework metadata.
+
+## Runtime binding and dispatch
+
+The runtime bridge is implemented as a sidecar rather than adding source-level type metadata to the low-level `Web.route` host effect. VM registration remains method/path/module/function. Package analysis then joins the matching compiler contract onto each collected route.
+
+A `RuntimeRoutePlan` precompiles:
+
+- literal and path-parameter segments for request matching,
+- the deterministic request-input to handler-slot binding plan,
+- handler parameter count,
+- whether the compiler proved the handler is safe for a complete direct call.
+
+Contract-backed request matching therefore does not re-parse `{id: Type}` or rediscover parameter ordering on every request. Routes without a compiler plan keep the legacy `:name` matcher.
+
+Direct path arguments are staged into VM registers `r0..rN`, followed by a non-capturing handler closure and a `ClosureCall` with the real argument count. Primitive `Int`, `Float`, and `Bool` path values are decoded explicitly. `String`, untyped values, and custom/opaque identifier types remain string-backed until the contract IR carries an explicit runtime representation for aliases and opaque types.
+
+A route is marked `direct_call` only when every declared handler parameter and every route path parameter has a compiler-produced binding. Legacy handlers that still depend on ambient `Web.param(...)` therefore do not silently switch execution models.
+
+The transport-facing `web::dispatch` seam exposes three operations:
+
+```text
+compile_runtime_routes(...)  -> validate package contracts + attach plans
+match_route(...)             -> match using compiled plan or legacy fallback
+render_direct_route(...)     -> invoke only fully bound typed handlers
+```
+
+HTTP remains responsible for request lifecycle, headers, cookies, cancellation, and the existing request context during migration. The final dev-server call-site wiring should wrap both legacy and typed calls in that request lifecycle while selecting `render_direct_route(...)` only for `direct_call` plans.
 
 ## Binding example
 
@@ -85,7 +110,9 @@ The contract IR is intended to become the stable seam between language semantics
 Nulang source
     -> typed/effect/capability analysis
     -> Web Contract IR
-       -> HTTP runtime
+       -> validated runtime route plan
+          -> HTTP runtime
+          -> future request actor runtime
        -> OpenAPI / client generation
        -> test harness
        -> Nulang Cloud deployment metadata
@@ -96,8 +123,8 @@ The runtime should ultimately execute a route as an ephemeral supervised request
 
 ## Next implementation slices
 
-1. Integrate contract/binding validation with the typed compiler pass and make invalid contract-first routes hard diagnostics.
-2. Preserve the compiled binding plan on runtime route registrations and stage typed path arguments into the VM call ABI; then enable `{name: Type}` runtime routing.
+1. Wire `compile_runtime_routes`, compiled matching, and `render_direct_route` into `nula dev` / the existing `WebDevServer`, preserving the legacy request context around execution during migration.
+2. Make contract/binding diagnostics hard `nula build --web` and `nula dev` failures before serving or emitting deployment artifacts.
 3. Extend binding sources to query/body/header inputs and generate transport-independent response/error contracts and OpenAPI/client artifacts from the same IR.
 4. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
 5. Replace ambient request context and middleware dependency injection with effect handlers.
