@@ -198,6 +198,16 @@ Phases 1 and 2 are additive:
 - timer-wheel wake variants map to `TimeOperation` without changing timer formats;
 - delivery/effect vocabulary is tightened without weakening existing execution APIs.
 
+## Phase 2 implemented in this change
+
+- `Actor::role()` gives live runtime actors the same canonical role interpretation as
+  HIR and bytecode metadata;
+- workflow event, query, signal/timer eligibility paths now consume canonical role
+  semantics rather than independently reading `is_workflow`;
+- internal timer wake variants map to `TimeOperation`, unifying sleep, scheduled
+  delivery, deadlines, and retry backoff under the `Time` primitive;
+- tests reject conflicting live actor roles just as compiler metadata already does.
+
 ## Follow-up phases
 
 1. Continue migrating remaining direct role-boolean consumers (agent, supervisor,
