@@ -4,9 +4,11 @@ Status: experimental implementation foundation.
 
 Nulang Web routes are moving from runtime-only `Web.route` registrations toward a compiler-visible contract that can be shared by the HTTP runtime, generated clients, tests, adapters, and Nulang Cloud.
 
-## Deployment IR v2
+## Additive Deployment IR v1 contract metadata
 
-`nula build --web` emits route metadata in `nulang-app.ir.json` with the existing method/path/placement/artifact fields plus:
+`nula build --web` keeps the deployment document at schema version 1 and adds optional/defaulted per-route metadata. This is deliberately an additive extension: existing v1 consumers can ignore unknown fields, so a schema-version bump would create incompatibility without buying stronger guarantees.
+
+The route metadata in `nulang-app.ir.json` now includes the existing method/path/placement/artifact fields plus:
 
 - `handler`: statically resolved handler name when available.
 - `params`: path parameter names and source-level types when known.
@@ -36,6 +38,12 @@ Legacy `:id` routes remain backwards compatible. If a same-named handler paramet
 Brace syntax is contract-first. `{id}` and `{id: UserId}` require a same-named handler parameter in the binding compiler. A typed route/handler mismatch is also retained as a contract diagnostic. For example, `{id: ExternalId}` paired with `fn handler(id: UserId)` is invalid contract metadata.
 
 Recognizing brace syntax and emitting bindings does not yet imply that the current HTTP runtime invokes handlers with those arguments. The runtime registration object currently stores only method, path, module, and function index. Runtime support should land together with a place to preserve the compiled binding plan so Nulang does not re-parse route conventions at dispatch time.
+
+## Package-wide extraction
+
+Contract extraction parses the package source tree and builds one package-level analysis module so a route in one file can retain handler metadata declared in another. Public `route(...)` and `route_method(...)` helper calls are also lowered to the same route contract representation.
+
+Bare helper-call recognition is scoped to the source module that imports `stdlib::web*`. A web import in one file therefore cannot reinterpret an unrelated user-defined `route()` call in another file as framework metadata.
 
 ## Binding example
 
