@@ -173,8 +173,10 @@ pub fn generate_deployment_ir(
     let _binding_diagnostics = binding_diagnostics;
 
     DeploymentIr {
-        // v2 adds per-route contract metadata while retaining all v1 fields.
-        version: 2,
+        // This is an additive v1 extension: every new per-route field is
+        // serde-defaulted/optional, so existing v1 consumers remain valid and
+        // may ignore the additional contract metadata.
+        version: 1,
         routes: ir_routes,
         signals,
         capabilities,
@@ -205,9 +207,10 @@ fn route_path_to_artifact(path: &str) -> String {
 /// Concatenate all `.nula` source files under `src_root` into a single string
 /// so capability scanning can see effects performed anywhere in the package.
 ///
-/// This package-level scan is retained for IR v2 compatibility. Per-route
-/// effect metadata now comes from the AST contract compiler; a later capability
-/// IR change can replace the remaining package scan with typed resource grants.
+/// This package-level scan is retained for deployment-IR v1 compatibility.
+/// Per-route effect metadata now comes from the AST contract compiler; a later
+/// capability IR change can replace the remaining package scan with typed
+/// resource grants.
 fn collect_source_text(src_root: &Path) -> String {
     let mut out = String::new();
     if !src_root.is_dir() {
