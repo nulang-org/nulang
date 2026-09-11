@@ -6,11 +6,18 @@
 //! scheduling semantics. Within a priority, workers prefer local work, then
 //! batch from the global injector, then steal from peers.
 //!
+//! The live runtime currently has one owning scheduler thread per shard. Its
+//! [`Scheduler::dequeue`] path therefore uses worker slot 0 as a locality
+//! anchor and deliberately skips peer-steal scans. The generic
+//! [`Scheduler::next_task`] path retains peer stealing for callers that run
+//! actual multi-worker scheduling.
+//!
 //! This design provides:
 //! - lock-free local push/pop on the owning worker
 //! - batched global-to-local transfers to reduce shared-injector contention
-//! - lock-free peer stealing for load balancing
+//! - lock-free peer stealing for true multi-worker callers
 //! - strict priority across both global and worker-local queues
+//! - no useless peer scans on the current single-owner runtime path
 //! - backoff and sleep for idle workers
 //!
 //! Based on the Chase-Lev algorithm (PPoPP 2005) as implemented by
@@ -62,9 +69,9 @@ pub fn core_pinning_enabled() -> bool {
 /// Lightweight, atomics-based profiling metrics for the scheduler.
 ///
 /// All counters are monotonically increasing unless reset via
-/// [`Scheduler::reset_stats`]. They are snapshots of the underlying
-/// atomic counters and are therefore not guaranteed to be mutually
-/// consistent in a concurrent execution.
+/// [`Scheduler::reset_stats`]. They are snapshots of the underlying atomic
+/// counters and are therefore not guaranteed to be mutually consistent in a
+/// concurrent execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SchedulerStats {
     /// Total tasks successfully retrieved by any worker (local, global, or stolen).
@@ -82,7 +89,7 @@ pub struct SchedulerStats {
     pub steal_attempts: u64,
     /// `steal()` calls that returned a task.
     pub steal_successes: u64,
-    /// Times `next_task` or `steal_one` found no work anywhere.
+    /// Times a scheduler lookup found no work anywhere it was allowed to look.
     pub empty_polls: u64,
 }
 
@@ -125,11 +132,11 @@ impl SchedulerStatsInternal {
 
 /// A strict-priority work-stealing scheduler with Chase-Lev deques.
 ///
-/// Each worker has one local deque per actor priority. This matters because a
-/// single local queue would allow previously batched Low/Normal work to run in
-/// front of newly-arrived High work. Splitting the local queues preserves the
-/// same priority contract as the global injectors while still allowing batch
-/// transfers and cache-local dispatch.
+/// Each worker has one local deque per actor priority. A single local queue
+/// would allow previously batched Low/Normal work to run in front of newly
+/// arrived High work. Splitting local queues preserves the same priority
+/// contract as the global injectors while still allowing batch transfer and
+/// cache-local dispatch.
 #[repr(align(64))]
 pub struct Scheduler {
     global_high: Injector<u64>,
@@ -152,8 +159,6 @@ pub struct Scheduler {
 impl Scheduler {
     /// Create a scheduler with `worker_count` worker slots.
     pub fn new(worker_count: usize) -> Self {
-        assert!(worker_count > 0, "scheduler worker_count must be >= 1");
-
         fn make_band(count: usize) -> (Vec<Worker<u64>>, Vec<Stealer<u64>>) {
             let mut workers = Vec::with_capacity(count);
             let mut stealers = Vec::with_capacity(count);
@@ -241,15 +246,22 @@ impl Scheduler {
     }
 
     #[inline]
+    fn record_steal_attempts(&self, attempts: u64) {
+        if attempts != 0 {
+            self.stats
+                .steal_attempts
+                .fetch_add(attempts, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
     fn record_stolen_task(&self, attempts: u64) {
         self.stats
             .total_tasks_processed
             .fetch_add(1, Ordering::Relaxed);
         self.stats.tasks_from_steal.fetch_add(1, Ordering::Relaxed);
         self.stats.steal_successes.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .steal_attempts
-            .fetch_add(attempts, Ordering::Relaxed);
+        self.record_steal_attempts(attempts);
     }
 
     /// Push an actor at Normal priority.
@@ -292,7 +304,7 @@ impl Scheduler {
     }
 
     /// Steal one item from a global priority queue without a worker-local
-    /// destination. Used by external event loops and `steal_one`.
+    /// destination. Used by external event loops and [`Scheduler::steal_one`].
     fn steal_global_for(&self, priority: ActorPriority) -> Option<u64> {
         loop {
             match self.global_for(priority).steal() {
@@ -325,7 +337,7 @@ impl Scheduler {
         }
     }
 
-    /// Steal from another worker's local queue within a single priority band.
+    /// Steal from another worker's local queue within one priority band.
     fn steal_peer_for(
         &self,
         worker_idx: usize,
@@ -367,10 +379,12 @@ impl Scheduler {
 
         for priority in [ActorPriority::High, ActorPriority::Normal, ActorPriority::Low] {
             if let Some(task) = self.pop_local(worker_idx, priority) {
+                self.record_steal_attempts(steal_attempts);
                 return Some(task);
             }
 
             if let Some(task) = self.steal_global_batch_for(worker_idx, priority) {
+                self.record_steal_attempts(steal_attempts);
                 return Some(task);
             }
 
@@ -383,31 +397,51 @@ impl Scheduler {
         }
 
         self.stats.empty_polls.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .steal_attempts
-            .fetch_add(steal_attempts, Ordering::Relaxed);
+        self.record_steal_attempts(steal_attempts);
         None
     }
 
-    /// Pop the next task for the runtime scheduler thread.
+    /// Pop work for a scheduler thread that owns one worker-local slot.
     ///
-    /// Runtime shards currently have one owning scheduler thread; worker slot
-    /// 0 is therefore the locality anchor. Using `next_task(0)` here activates
-    /// priority-safe batch transfer for the live runtime path instead of
-    /// bypassing local queues through `steal_one`.
+    /// The current runtime has exactly one owning scheduler thread per shard.
+    /// It therefore has no useful peers to steal from even though the
+    /// scheduler is provisioned with multiple generic worker slots. Skipping
+    /// peer scans here removes three empty High-band probes from the common
+    /// Normal-priority path while retaining batch transfer and strict priority.
+    fn next_owner_task(&self, worker_idx: usize) -> Option<u64> {
+        for priority in [ActorPriority::High, ActorPriority::Normal, ActorPriority::Low] {
+            if let Some(task) = self.pop_local(worker_idx, priority) {
+                return Some(task);
+            }
+            if let Some(task) = self.steal_global_batch_for(worker_idx, priority) {
+                return Some(task);
+            }
+        }
+
+        self.stats.empty_polls.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    /// Pop the next task for the live runtime scheduler thread.
+    ///
+    /// Worker slot 0 is the runtime's locality anchor. This path intentionally
+    /// avoids peer-steal probes because no other scheduler worker owns the
+    /// remaining slots today. Generic multi-worker callers should use
+    /// [`Scheduler::next_task`].
     pub fn dequeue(&self) -> Option<u64> {
-        self.next_task(0)
+        self.next_owner_task(0)
     }
 
     /// Steal one task from any source without owning a local worker slot.
     ///
-    /// Priority is still strict: all High global/local sources are inspected
-    /// before Normal, and all Normal sources before Low.
+    /// Priority is strict: all High global/local sources are inspected before
+    /// Normal, and all Normal sources before Low.
     pub fn steal_one(&self) -> Option<u64> {
         let mut steal_attempts = 0u64;
 
         for priority in [ActorPriority::High, ActorPriority::Normal, ActorPriority::Low] {
             if let Some(task) = self.steal_global_for(priority) {
+                self.record_steal_attempts(steal_attempts);
                 return Some(task);
             }
 
@@ -427,9 +461,7 @@ impl Scheduler {
         }
 
         self.stats.empty_polls.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .steal_attempts
-            .fetch_add(steal_attempts, Ordering::Relaxed);
+        self.record_steal_attempts(steal_attempts);
         None
     }
 
@@ -458,9 +490,8 @@ impl Scheduler {
 
             thread::sleep(std::time::Duration::from_micros(EMPTY_SLEEP_US));
 
-            // Important: if work arrives during the sleep, process the task we
-            // just dequeued. The previous implementation used `is_none()` and
-            // silently discarded a `Some(actor_id)` returned after backoff.
+            // Process work discovered by the post-backoff probe. Calling only
+            // `.is_none()` here would dequeue and silently drop a task.
             match self.next_task(worker_idx) {
                 Some(actor_id) => {
                     empty_count = 0;
@@ -486,22 +517,27 @@ impl Scheduler {
         }
     }
 
+    /// Number of configured worker slots.
     pub fn worker_count(&self) -> usize {
         self.worker_count
     }
 
+    /// Total number of tasks processed through `run_one` / `run_worker`.
     pub fn processed_count(&self) -> usize {
         self.processed_count.load(Ordering::Relaxed)
     }
 
+    /// Reset the processed count.
     pub fn reset_processed_count(&self) {
         self.processed_count.store(0, Ordering::Relaxed);
     }
 
+    /// Snapshot scheduler profiling counters.
     pub fn stats(&self) -> SchedulerStats {
         self.stats.snapshot()
     }
 
+    /// Reset scheduler profiling counters.
     pub fn reset_stats(&self) {
         self.stats.reset();
     }
@@ -577,11 +613,8 @@ mod scheduler_tests {
         for id in 1..=32 {
             s.enqueue_with_priority(id, ActorPriority::Low);
         }
-
-        // This batches additional Low work into worker 0.
         assert!(s.next_task(0).is_some());
 
-        // Newly-arrived High work must still preempt the already-local Low batch.
         s.enqueue_with_priority(999, ActorPriority::High);
         assert_eq!(s.next_task(0), Some(999));
     }
@@ -600,7 +633,7 @@ mod scheduler_tests {
 
     #[test]
     fn test_dequeue_uses_priority_safe_local_batching() {
-        let s = Scheduler::new(1);
+        let s = Scheduler::new(4);
         for id in 0..16 {
             s.enqueue(id);
         }
@@ -609,6 +642,28 @@ mod scheduler_tests {
         let stats = s.stats();
         assert_eq!(stats.tasks_from_global_queue, 1);
         assert_eq!(stats.tasks_from_local_queue, 1);
+    }
+
+    #[test]
+    fn test_dequeue_owner_path_skips_unused_peer_scans() {
+        let s = Scheduler::new(4);
+        s.enqueue(42);
+        assert_eq!(s.dequeue(), Some(42));
+        let stats = s.stats();
+        assert_eq!(stats.tasks_from_global_queue, 1);
+        assert_eq!(stats.steal_attempts, 0);
+        assert_eq!(stats.steal_successes, 0);
+    }
+
+    #[test]
+    fn test_dequeue_preserves_priority_with_batched_local_work() {
+        let s = Scheduler::new(4);
+        for id in 1..=32 {
+            s.enqueue_with_priority(id, ActorPriority::Low);
+        }
+        assert!(s.dequeue().is_some());
+        s.enqueue_with_priority(1000, ActorPriority::High);
+        assert_eq!(s.dequeue(), Some(1000));
     }
 
     #[test]
@@ -702,10 +757,22 @@ mod scheduler_tests {
         assert_eq!(stats.tasks_from_local_queue, 0);
         assert_eq!(stats.tasks_from_global_queue, 1);
         assert_eq!(stats.tasks_from_steal, 0);
-        // High is checked before Normal, so worker 0 probes one empty High peer.
+        // next_task checks High peers before reaching Normal global work.
         assert!(stats.steal_attempts >= 1);
         assert_eq!(stats.steal_successes, 0);
         assert_eq!(stats.empty_polls, 0);
+    }
+
+    #[test]
+    fn test_stats_count_failed_higher_priority_steals_before_local_work() {
+        let s = Scheduler::new(2);
+        s.enqueue_local_with_priority(0, 7, ActorPriority::Normal);
+        assert_eq!(s.next_task(0), Some(7));
+        let stats = s.stats();
+        // Worker 0 checks the empty High band (including peer worker 1)
+        // before consuming Normal-local work; that failed probe must be counted.
+        assert_eq!(stats.tasks_from_local_queue, 1);
+        assert!(stats.steal_attempts >= 1);
     }
 
     #[test]
