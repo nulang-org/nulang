@@ -985,7 +985,8 @@ pub fn is_all_int(func: &mir::Function) -> bool {
                     mir::RValue::Binary(
                         crate::ast::BinOp::Div | crate::ast::BinOp::Mod | crate::ast::BinOp::Pow,
                         ..
-                    ) | mir::RValue::ArrayLit(_)
+                    ) | mir::RValue::Unary(crate::ast::UnOp::Neg, ..)
+                        | mir::RValue::ArrayLit(_)
                         | mir::RValue::ArrayLoad { .. }
                         | mir::RValue::ArrayLen(_)
                         | mir::RValue::Record(_)
@@ -2400,15 +2401,19 @@ fn compile_rvalue(
 
         mir::RValue::Closure { func, captures } => {
             if captures.is_empty() {
-                // A first-class closure must not masquerade as a numeric TAG_INT.
-                // Static direct-call metadata still resolves this target without
-                // dynamic dispatch; the runtime value uses canonical TAG_CLOSURE.
-                let fn_val = builder.ins().iconst(types::I64, *func as i64);
-                let helper = helpers.get("nulang_aot_make_closure_0").ok_or_else(|| {
-                    AotCompileError::Internal("missing nulang_aot_make_closure_0 helper".into())
-                })?;
-                let call = builder.ins().call(*helper, &[fn_val]);
-                Ok(builder.inst_results(call)[0])
+                // Immediate closure representation is shared with the VM:
+                // TAG_CLOSURE with the function index in the 48-bit payload.
+                // Encoding this as TAG_INT makes a function value numeric;
+                // heap-allocating it makes immediate/dynamic closure semantics diverge.
+                let idx = builder.ins().iconst(types::I64, *func as i64);
+                let mask = builder
+                    .ins()
+                    .iconst(types::I64, crate::value_layout::PAYLOAD_MASK as i64);
+                let payload = builder.ins().band(idx, mask);
+                let tag = builder
+                    .ins()
+                    .iconst(types::I64, crate::value_layout::TAG_CLOSURE as i64);
+                Ok(builder.ins().bor(payload, tag))
             } else {
                 // Allocate a closure object carrying the captured values and
                 // return it as a TAG_CLOSURE value. The lifted target function

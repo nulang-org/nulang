@@ -1500,9 +1500,14 @@ macro_rules! define_aot_make_closure {
         #[no_mangle]
         pub unsafe extern "C" fn $name(fn_idx: u64 $(, $cap: u64)*) -> u64 {
             let count: usize = 0 $(+ { let _ = stringify!($cap); 1 })*;
-            let Some(ptr) = alloc_obj((2 + count) * std::mem::size_of::<u64>(), HeapTypeTag::Closure) else {
+            let payload_size = (2 + count) * std::mem::size_of::<u64>();
+            let Some(ptr) = alloc_obj(payload_size, HeapTypeTag::Closure) else {
                 return Value::nil().as_raw();
             };
+            debug_assert!(
+                crate::value_layout::ptr_fits_payload(ptr as u64),
+                "AOT closure pointer exceeds 48-bit value payload"
+            );
             let slot = ptr as *mut u64;
             *slot = fn_idx;
             *slot.add(1) = count as u64;
@@ -1510,7 +1515,7 @@ macro_rules! define_aot_make_closure {
             for (i, c) in caps.iter().enumerate() {
                 *slot.add(2 + i) = *c;
             }
-            (TAG_CLOSURE | ptr as u64)
+            TAG_CLOSURE | ((ptr as u64) & PAYLOAD_MASK)
         }
     };
 }
@@ -1630,38 +1635,54 @@ unsafe fn call_closure_dispatch(fn_ptr: u64, all: &[u64]) -> u64 {
 
 macro_rules! define_aot_call_closure {
     ($name:ident, $($arg:ident),*) => {
-        /// Invoke a closure value: an uncaptured closure is a tagged fn index
-        /// (dispatch with the explicit args only); a captured closure is a
-        /// TAG_CLOSURE object carrying fn_idx + captures (dispatch with
-        /// args + captures). Handles closures whose target is not statically
-        /// known at the call site (e.g. passed as a parameter).
+        /// Invoke a closure value. Uncaptured closures use the VM's
+        /// immediate representation (TAG_CLOSURE + function-index payload).
+        /// Captured AOT closures use TAG_CLOSURE + a heap-object pointer whose
+        /// payload is [fn_idx, cap_count, cap0..]. Handles closure values whose
+        /// target is not statically known at the call site.
         #[no_mangle]
         pub unsafe extern "C" fn $name(closure_raw: u64 $(, $arg: u64)*) -> u64 {
             let args = [$($arg),*];
+            if (closure_raw & TAG_MASK) != TAG_CLOSURE {
+                return Value::nil().as_raw();
+            }
+
+            let payload = closure_raw & PAYLOAD_MASK;
+            let immediate_fn = crate::aot::nulang_aot_resolve_fn(payload);
             let fn_ptr;
             let mut all: Vec<u64>;
-            if (closure_raw & TAG_MASK) == TAG_INT {
-                // Uncaptured closure: the tagged payload is the fn index.
-                let fn_idx = (closure_raw & PAYLOAD_MASK) as i64;
-                fn_ptr = crate::aot::nulang_aot_resolve_fn(fn_idx as u64);
+            if immediate_fn != 0 {
+                // Canonical zero-capture closure: payload is the function idx.
+                fn_ptr = immediate_fn;
                 all = Vec::with_capacity(args.len());
                 all.extend_from_slice(&args);
-            } else if (closure_raw & TAG_MASK) == TAG_CLOSURE {
-                // Captured closure object: [fn_idx, cap_count, cap0..].
-                let ptr = (closure_raw & PAYLOAD_MASK) as *mut u64;
+            } else {
+                // AOT captured closure object: [fn_idx, cap_count, cap0..].
+                let ptr = payload as *mut u64;
                 if ptr.is_null() {
+                    return Value::nil().as_raw();
+                }
+                let header = &*ActorHeap::header_of(ptr as *mut u8);
+                if header.type_tag != HeapTypeTag::Closure {
+                    return Value::nil().as_raw();
+                }
+                let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+                if payload_size < 2 * std::mem::size_of::<u64>() {
                     return Value::nil().as_raw();
                 }
                 let fn_idx = *ptr;
                 let cap_count = *ptr.add(1) as usize;
+                let required = (2usize.saturating_add(cap_count))
+                    .saturating_mul(std::mem::size_of::<u64>());
+                if required > payload_size {
+                    return Value::nil().as_raw();
+                }
                 fn_ptr = crate::aot::nulang_aot_resolve_fn(fn_idx);
                 all = Vec::with_capacity(args.len() + cap_count);
                 all.extend_from_slice(&args);
                 for i in 0..cap_count {
                     all.push(*ptr.add(2 + i));
                 }
-            } else {
-                return Value::nil().as_raw();
             }
             if fn_ptr == 0 {
                 return Value::nil().as_raw();
