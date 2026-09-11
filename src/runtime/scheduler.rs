@@ -497,7 +497,6 @@ impl Scheduler {
             }
 
             thread::sleep(std::time::Duration::from_micros(EMPTY_SLEEP_US));
-
             // Process work discovered by the post-backoff probe. Calling only
             // `.is_none()` here would dequeue and silently drop a task.
             match self.next_task(worker_idx) {
@@ -752,7 +751,8 @@ mod scheduler_tests {
         assert_eq!(stats.tasks_from_local_queue, 1);
         assert_eq!(stats.tasks_from_global_queue, 0);
         assert_eq!(stats.tasks_from_steal, 0);
-        assert_eq!(stats.steal_attempts, 0);
+        // Generic next_task checks the empty High peer band before Normal-local work.
+        assert_eq!(stats.steal_attempts, 1);
         assert_eq!(stats.steal_successes, 0);
         assert_eq!(stats.empty_polls, 0);
     }
