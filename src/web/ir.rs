@@ -8,10 +8,9 @@
 use crate::package::manifest::BudgetsSection;
 use crate::runtime::WebRoute;
 use crate::web::bindings::{compile_route_bindings, RouteBindingContract};
-use crate::web::contracts::{
-    compile_contracts_from_tree, HandlerParamContract, RouteContract, RouteParamContract,
-};
+use crate::web::contracts::{HandlerParamContract, RouteContract, RouteParamContract};
 use crate::web::modules::ModuleRegistry;
+use crate::web::package_contracts::compile_contracts_from_tree;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
