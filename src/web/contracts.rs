@@ -371,7 +371,8 @@ fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr)>) {
     } = expr
     {
         if effect == "Web" && op == "route" && args.len() == 3 {
-            if let (Some(method), Some(path)) = (string_literal(&args[0]), string_literal(&args[1])) {
+            if let (Some(method), Some(path)) = (string_literal(&args[0]), string_literal(&args[1]))
+            {
                 out.push((method, path, args[2].clone()));
             }
         }
@@ -571,7 +572,11 @@ fn web_main() {
         );
 
         let compiled = compile_module_contracts(&module);
-        assert!(compiled.diagnostics.is_empty(), "{:?}", compiled.diagnostics);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
         assert_eq!(compiled.routes.len(), 1);
         let route = &compiled.routes[0];
         assert_eq!(route.handler.as_deref(), Some("show_user"));
@@ -598,7 +603,11 @@ fn web_main() {
         );
 
         let compiled = compile_module_contracts(&module);
-        assert!(compiled.diagnostics.is_empty(), "{:?}", compiled.diagnostics);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
         assert_eq!(compiled.routes[0].params[0].ty.as_deref(), Some("UserId"));
     }
 

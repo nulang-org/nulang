@@ -39,9 +39,7 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::web::contracts::{
-        HandlerParamContract, RouteContract, RouteParamContract,
-    };
+    use crate::web::contracts::{HandlerParamContract, RouteContract, RouteParamContract};
 
     fn contract(path: &str, handler_params: Vec<HandlerParamContract>) -> RouteContract {
         RouteContract {

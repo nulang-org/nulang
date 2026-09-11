@@ -9,8 +9,7 @@
 use crate::runtime::WebRoute;
 use crate::web::package_contracts::compile_contracts_from_tree;
 use crate::web::runtime_bindings::{
-    attach_runtime_route_plans, match_attached_route, render_bound_route_handler,
-    RuntimeWebRoute,
+    attach_runtime_route_plans, match_attached_route, render_bound_route_handler, RuntimeWebRoute,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -37,10 +36,7 @@ pub fn compile_runtime_routes(
 ///
 /// Contract-backed routes use their precompiled route segments. Legacy routes
 /// fall back to the existing `:name` convention.
-pub fn match_route(
-    route: &RuntimeWebRoute,
-    request_path: &str,
-) -> Option<HashMap<String, String>> {
+pub fn match_route(route: &RuntimeWebRoute, request_path: &str) -> Option<HashMap<String, String>> {
     match_attached_route(route, request_path)
 }
 
@@ -78,10 +74,8 @@ mod tests {
 
     #[test]
     fn empty_package_compiles_to_empty_runtime_route_set() {
-        let dir = std::env::temp_dir().join(format!(
-            "nulang_web_dispatch_empty_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_dispatch_empty_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

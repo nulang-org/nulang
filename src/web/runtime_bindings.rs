@@ -74,15 +74,16 @@ pub fn attach_runtime_route_plans(
         .into_iter()
         .map(|route| {
             let key = (route.method.as_str(), route.path.as_str());
-            let plan = contract_index.get(&key).and_then(|contract| {
-                match compile_runtime_route_plan(contract) {
-                    Ok(plan) => Some(plan),
-                    Err(mut route_diagnostics) => {
-                        diagnostics.append(&mut route_diagnostics);
-                        None
+            let plan =
+                contract_index.get(&key).and_then(|contract| {
+                    match compile_runtime_route_plan(contract) {
+                        Ok(plan) => Some(plan),
+                        Err(mut route_diagnostics) => {
+                            diagnostics.append(&mut route_diagnostics);
+                            None
+                        }
                     }
-                }
-            });
+                });
             RuntimeWebRoute { route, plan }
         })
         .collect();
@@ -208,10 +209,7 @@ fn compile_segments(
                 else {
                     return Err(format!("malformed path parameter '{segment}'"));
                 };
-                let name = inner
-                    .split_once(':')
-                    .map_or(inner, |(name, _)| name)
-                    .trim();
+                let name = inner.split_once(':').map_or(inner, |(name, _)| name).trim();
                 if name.is_empty() {
                     return Err("route contains an empty contract path parameter".to_string());
                 }

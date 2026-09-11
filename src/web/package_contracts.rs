@@ -78,7 +78,10 @@ fn collect_modules_recursive(
 ) {
     if path.is_dir() {
         let Ok(entries) = std::fs::read_dir(path) else {
-            diagnostics.push(format!("{}: failed to read source directory", path.display()));
+            diagnostics.push(format!(
+                "{}: failed to read source directory",
+                path.display()
+            ));
             return;
         };
         let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
