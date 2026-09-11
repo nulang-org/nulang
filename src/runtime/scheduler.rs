@@ -2,11 +2,12 @@
 //!
 //! Each worker thread maintains a local Chase-Lev deque for LIFO
 //! push/pop of actor IDs. When a worker's local deque is empty, it
-//! attempts to steal from other workers' deques (FIFO steal for
-//! load balancing) and falls back to a global injector queue.
+//! attempts to pull a batch from the priority-ordered global injector,
+//! then steals from other workers' deques (FIFO steal for load balancing).
 //!
 //! This design provides:
 //! - Lock-free local operations (push/pop on own deque)
+//! - Batched global-to-local transfers to reduce injector contention
 //! - Lock-free work stealing from other workers
 //! - Global overflow queues for newly spawned / requeued actors, split
 //!   by actor priority (High drains before Normal before Low)
@@ -70,7 +71,11 @@ pub struct SchedulerStats {
     pub total_tasks_processed: u64,
     /// Tasks retrieved from the calling worker's own local deque.
     pub tasks_from_local_queue: u64,
-    /// Tasks retrieved from the global injector queue.
+    /// Tasks retrieved directly from a global injector queue.
+    ///
+    /// Tasks transferred from a global injector into a worker deque by a
+    /// batched steal are counted here only for the item returned immediately;
+    /// the remaining items are counted as local-queue tasks when consumed.
     pub tasks_from_global_queue: u64,
     /// Tasks stolen from another worker's deque.
     pub tasks_from_steal: u64,
@@ -126,7 +131,7 @@ impl SchedulerStatsInternal {
 ///
 /// Created with a fixed number of worker slots. Each worker thread
 /// claims one slot and uses its local deque for LIFO operations.
-/// Staling uses FIFO order to promote breadth-first execution.
+/// Stealing uses FIFO order to promote breadth-first execution.
 ///
 /// Actor priority: the global injector is split into three priority
 /// queues (High/Normal/Low). Dequeue drains every High entry before any
@@ -152,9 +157,6 @@ pub struct Scheduler {
 
     /// Per-worker deques. Each worker has one Worker handle;
     /// all other workers hold Stealer handles to it.
-    ///
-    /// Index 0 is reserved for the global injector (stealers only).
-    /// Workers 1..N are the actual worker threads.
     workers: Vec<Worker<u64>>,
     stealers: Vec<Stealer<u64>>,
 
@@ -244,19 +246,58 @@ impl Scheduler {
         }
     }
 
+    #[inline]
+    fn record_global_task(&self) {
+        self.stats
+            .total_tasks_processed
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .tasks_from_global_queue
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Steal one task from the priority-ordered global queues: every High
     /// entry drains before any Normal, every Normal before any Low (FIFO
     /// within a level). All three count toward `tasks_from_global_queue`.
     fn steal_global(&self) -> Option<u64> {
         for queue in [&self.global_high, &self.global, &self.global_low] {
-            if let Steal::Success(task) = queue.steal() {
-                self.stats
-                    .total_tasks_processed
-                    .fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .tasks_from_global_queue
-                    .fetch_add(1, Ordering::Relaxed);
-                return Some(task);
+            loop {
+                match queue.steal() {
+                    Steal::Success(task) => {
+                        self.record_global_task();
+                        return Some(task);
+                    }
+                    Steal::Retry => std::hint::spin_loop(),
+                    Steal::Empty => break,
+                }
+            }
+        }
+        None
+    }
+
+    /// Pull work from the global injector into a worker-local deque and
+    /// return one task immediately.
+    ///
+    /// `Injector::steal_batch_and_pop` moves roughly half of the selected
+    /// injector queue into the worker deque in one synchronization operation.
+    /// Subsequent scheduler iterations therefore hit the cheap local deque
+    /// instead of contending on the shared injector for every actor. Priority
+    /// ordering is preserved when choosing which global queue to batch from.
+    fn steal_global_batch(&self, worker_idx: usize) -> Option<u64> {
+        let Some(worker) = self.workers.get(worker_idx) else {
+            return self.steal_global();
+        };
+
+        for queue in [&self.global_high, &self.global, &self.global_low] {
+            loop {
+                match queue.steal_batch_and_pop(worker) {
+                    Steal::Success(task) => {
+                        self.record_global_task();
+                        return Some(task);
+                    }
+                    Steal::Retry => std::hint::spin_loop(),
+                    Steal::Empty => break,
+                }
             }
         }
         None
@@ -266,7 +307,8 @@ impl Scheduler {
     ///
     /// Tries in order:
     /// 1. Worker's own local deque (LIFO — hot cache; not priority-aware)
-    /// 2. Global injector queues (High, then Normal, then Low)
+    /// 2. Global injector queues (High, then Normal, then Low), batching
+    ///    additional work into the local deque
     /// 3. Steal from other workers' deques (FIFO — load balancing)
     ///
     /// Returns `None` if no work is available across all sources.
@@ -284,8 +326,10 @@ impl Scheduler {
             }
         }
 
-        // 2. Try the global injectors in priority order
-        if let Some(task) = self.steal_global() {
+        // 2. Pull a batch from the highest-priority non-empty global injector.
+        //    The returned item counts as global; the remainder are consumed
+        //    from the worker-local deque on subsequent iterations.
+        if let Some(task) = self.steal_global_batch(worker_idx) {
             return Some(task);
         }
 
@@ -443,6 +487,7 @@ impl Scheduler {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -464,6 +509,33 @@ mod scheduler_tests {
         s.enqueue_local(1, 200);
         assert_eq!(s.next_task(0).unwrap(), 100);
         assert_eq!(s.next_task(1).unwrap(), 200);
+    }
+
+    #[test]
+    fn test_global_steal_batches_into_local_queue() {
+        let s = Scheduler::new(1);
+        for id in 0..32 {
+            s.enqueue(id);
+        }
+
+        let first = s.next_task(0).expect("global queue should have work");
+        let first_stats = s.stats();
+        assert_eq!(first_stats.tasks_from_global_queue, 1);
+        assert_eq!(first_stats.tasks_from_local_queue, 0);
+
+        // steal_batch_and_pop transfers additional global work to worker 0,
+        // so the next dispatch should avoid the shared injector.
+        let second = s.next_task(0).expect("batched local queue should have work");
+        let second_stats = s.stats();
+        assert_eq!(second_stats.tasks_from_global_queue, 1);
+        assert_eq!(second_stats.tasks_from_local_queue, 1);
+        assert_ne!(first, second);
+
+        let mut seen = HashSet::from([first, second]);
+        while let Some(id) = s.next_task(0) {
+            assert!(seen.insert(id), "actor id {id} was scheduled twice");
+        }
+        assert_eq!(seen.len(), 32);
     }
 
     #[test]
