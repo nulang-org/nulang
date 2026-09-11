@@ -36,10 +36,19 @@ Record:
 - `steal_attempts`
 - CPU cycles and cache misses when `perf stat` is available
 
+Run each workload at least three times on both revisions and compare medians, not a single run.
+
 Expected signal on the current one-owner runtime path:
 
 - after the first global batch transfer, most remaining tasks should be counted as local-queue work;
 - `dequeue()` should report zero peer steal attempts;
 - throughput should improve primarily under burst/high-contention global enqueue workloads.
+
+Acceptance criteria:
+
+- no correctness or priority-invariant regression;
+- no material (>2%) median throughput regression in mixed-priority or synthetic multi-worker workloads;
+- a measurable reduction in shared-global dispatches and peer-steal probes on the one-owner runtime path;
+- keep the change only if the measured benefit justifies the extra per-priority local queues.
 
 Do not claim a production speedup from this change until release-mode measurements show one.
