@@ -1,0 +1,543 @@
+name: Apply selective receive ownership fix
+
+on:
+  push:
+    branches:
+      - fix/selective-receive-orca-transaction
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/selective-receive-orca-transaction
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Apply transactional selective-receive changes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              return text.replace(old, new, 1)
+
+          mailbox_path = Path("src/runtime/mailbox.rs")
+          mailbox = mailbox_path.read_text()
+
+          priority_block = '''#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub enum MessagePriority {
+              System = 0,
+              Normal = 1,
+              Bulk = 2,
+          }
+          '''
+          priority_new = priority_block + '''
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          enum ReservedMatch {
+              System(usize),
+              Normal(usize),
+          }
+          '''
+          mailbox = replace_once(mailbox, priority_block, priority_new, "reserved-match enum")
+
+          old_fields = '''    /// Non-matching normal messages staged during selective receive.
+              /// The boolean marks candidates already tried by the current receive.
+              skip_buffer: VecDeque<(Message, bool)>,
+          '''
+          new_fields = '''    /// System-priority messages staged during selective receive. They remain
+              /// logically queued until an explicit `ReceiveCommit`.
+              system_skip_buffer: VecDeque<(Message, bool)>,
+              /// Normal/bulk messages staged during selective receive. The boolean
+              /// marks candidates already rejected by the current receive expression.
+              skip_buffer: VecDeque<(Message, bool)>,
+              /// The candidate returned by the most recent `receive_match`. A second
+              /// scan before commit means that candidate failed its pattern/guard;
+              /// it remains queued and its `tried` bit stays set.
+              reserved_match: Option<ReservedMatch>,
+          '''
+          mailbox = replace_once(mailbox, old_fields, new_fields, "mailbox fields")
+
+          old_init = '''            capacity,
+              queued_count: AtomicUsize::new(0),
+              skip_buffer: VecDeque::new(),
+          '''
+          new_init = '''            capacity,
+              queued_count: AtomicUsize::new(0),
+              system_skip_buffer: VecDeque::new(),
+              skip_buffer: VecDeque::new(),
+              reserved_match: None,
+          '''
+          mailbox = replace_once(mailbox, old_init, new_init, "mailbox initializer")
+
+          old_pop = '''    /// Pop the highest-priority message.
+              pub fn pop(&mut self) -> Option<Message> {
+                  let result = self
+                      .system_queue
+                      .pop()
+                      .or_else(|| self.local_queue.pop_front())
+                      .or_else(|| self.skip_buffer.pop_front().map(|(m, _)| m))
+                      .or_else(|| self.normal_queue.pop());
+                  if result.is_some() {
+                      self.release_slot();
+                  }
+                  result
+              }
+          '''
+          new_pop = '''    /// Pop the highest-priority message.
+              pub fn pop(&mut self) -> Option<Message> {
+                  self.reserved_match = None;
+                  let result = self
+                      .system_skip_buffer
+                      .pop_front()
+                      .map(|(m, _)| m)
+                      .or_else(|| self.system_queue.pop())
+                      .or_else(|| self.local_queue.pop_front())
+                      .or_else(|| self.skip_buffer.pop_front().map(|(m, _)| m))
+                      .or_else(|| self.normal_queue.pop());
+                  if result.is_some() {
+                      self.release_slot();
+                  }
+                  self.clear_receive_attempts();
+                  result
+              }
+          '''
+          mailbox = replace_once(mailbox, old_pop, new_pop, "mailbox pop")
+
+          start_marker = "    /// Selective receive: scan for the first message whose behavior id\n"
+          end_marker = "    /// Total logical message count. Safe to query concurrently.\n"
+          start = mailbox.index(start_marker)
+          end = mailbox.index(end_marker, start)
+          receive_impl = '''    /// Selective receive: reserve the first matching message without consuming it.
+              ///
+              /// Calling this method again before `commit_receive_match` means the
+              /// previously reserved candidate failed its pattern/guard. That candidate
+              /// remains queued with its `tried` bit set so the scan advances to the
+              /// next eligible message. Ownership is transferred only at commit time.
+              pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, Arc<Vec<Value>>)> {
+                  // A retry is proof that the prior reservation was rejected. Keep its
+                  // tried bit set, but no candidate is currently eligible for commit.
+                  self.reserved_match = None;
+
+                  // Preserve system priority while making every source transactional.
+                  // Messages move between physical queues here, but queued_count does
+                  // not change because no logical message has been consumed.
+                  while let Some(msg) = self.system_queue.pop() {
+                      self.system_skip_buffer.push_back((msg, false));
+                  }
+                  while let Some(msg) = self.local_queue.pop_front() {
+                      if msg.priority == MessagePriority::System {
+                          self.system_skip_buffer.push_back((msg, false));
+                      } else {
+                          self.skip_buffer.push_back((msg, false));
+                      }
+                  }
+
+                  if let Some((arm_idx, candidate_idx, payload)) =
+                      Self::reserve_in_buffer(&mut self.system_skip_buffer, behavior_ids)
+                  {
+                      self.reserved_match = Some(ReservedMatch::System(candidate_idx));
+                      return Some((arm_idx, payload));
+                  }
+
+                  while let Some(msg) = self.normal_queue.pop() {
+                      self.skip_buffer.push_back((msg, false));
+                  }
+                  if let Some((arm_idx, candidate_idx, payload)) =
+                      Self::reserve_in_buffer(&mut self.skip_buffer, behavior_ids)
+                  {
+                      self.reserved_match = Some(ReservedMatch::Normal(candidate_idx));
+                      return Some((arm_idx, payload));
+                  }
+
+                  None
+              }
+
+              fn reserve_in_buffer(
+                  buffer: &mut VecDeque<(Message, bool)>,
+                  behavior_ids: &[u16],
+              ) -> Option<(usize, usize, Arc<Vec<Value>>)> {
+                  for idx in 0..buffer.len() {
+                      let (tried, behavior_id) = (buffer[idx].1, buffer[idx].0.behavior_id);
+                      if tried {
+                          continue;
+                      }
+                      if let Some(arm_idx) = behavior_ids.iter().position(|&id| id == behavior_id) {
+                          buffer[idx].1 = true;
+                          return Some((arm_idx, idx, Arc::clone(&buffer[idx].0.payload)));
+                      }
+                  }
+                  None
+              }
+
+          '''
+          mailbox = mailbox[:start] + receive_impl + mailbox[end:]
+
+          old_drain = '''    /// Drain all queues into a cloned snapshot, then restore all messages.
+              /// The logical count is intentionally unchanged because this is
+              /// observational.
+              pub fn drain(&mut self) -> Vec<Message> {
+                  let mut snapshot = Vec::with_capacity(self.len());
+                  while let Some(msg) = self.system_queue.pop() {
+                      snapshot.push(msg);
+                  }
+                  while let Some(msg) = self.local_queue.pop_front() {
+                      snapshot.push(msg);
+                  }
+                  while let Some((msg, _)) = self.skip_buffer.pop_front() {
+                      snapshot.push(msg);
+                  }
+                  while let Some(msg) = self.normal_queue.pop() {
+                      snapshot.push(msg);
+                  }
+                  for msg in &snapshot {
+                      if msg.priority == MessagePriority::System {
+                          self.system_queue.push(msg.clone());
+                      } else {
+                          self.local_queue.push_back(msg.clone());
+                      }
+                  }
+                  snapshot
+              }
+          '''
+          new_drain = '''    /// Drain all queues into a cloned snapshot, then restore all messages.
+              /// The logical count is intentionally unchanged because this is
+              /// observational.
+              pub fn drain(&mut self) -> Vec<Message> {
+                  self.reserved_match = None;
+                  let mut snapshot = Vec::with_capacity(self.len());
+                  while let Some((msg, _)) = self.system_skip_buffer.pop_front() {
+                      snapshot.push(msg);
+                  }
+                  while let Some(msg) = self.system_queue.pop() {
+                      snapshot.push(msg);
+                  }
+                  while let Some(msg) = self.local_queue.pop_front() {
+                      snapshot.push(msg);
+                  }
+                  while let Some((msg, _)) = self.skip_buffer.pop_front() {
+                      snapshot.push(msg);
+                  }
+                  while let Some(msg) = self.normal_queue.pop() {
+                      snapshot.push(msg);
+                  }
+                  for msg in &snapshot {
+                      if msg.priority == MessagePriority::System {
+                          self.system_queue.push(msg.clone());
+                      } else {
+                          self.local_queue.push_back(msg.clone());
+                      }
+                  }
+                  snapshot
+              }
+          '''
+          mailbox = replace_once(mailbox, old_drain, new_drain, "mailbox drain")
+
+          old_tail = '''    pub fn flush_skip_buffer(&mut self) {
+                  while let Some((msg, _)) = self.skip_buffer.pop_front() {
+                      self.normal_queue.push(msg);
+                  }
+              }
+
+              pub fn capacity(&self) -> usize {
+                  self.capacity
+              }
+
+              /// Commit the first candidate tried by the existing selective-receive
+              /// protocol. The candidate remains counted until it is physically removed.
+              pub fn commit_receive_match(&mut self) {
+                  if let Some(idx) = self.skip_buffer.iter().position(|(_, tried)| *tried) {
+                      self.skip_buffer.remove(idx);
+                      self.release_slot();
+                  }
+                  for (_, tried) in self.skip_buffer.iter_mut() {
+                      *tried = false;
+                  }
+              }
+
+              pub fn reset_receive_match(&mut self) {
+                  for (_, tried) in self.skip_buffer.iter_mut() {
+                      *tried = false;
+                  }
+              }
+          '''
+          new_tail = '''    pub fn flush_skip_buffer(&mut self) {
+                  self.reserved_match = None;
+                  while let Some((msg, _)) = self.system_skip_buffer.pop_front() {
+                      self.system_queue.push(msg);
+                  }
+                  while let Some((msg, _)) = self.skip_buffer.pop_front() {
+                      self.normal_queue.push(msg);
+                  }
+              }
+
+              pub fn capacity(&self) -> usize {
+                  self.capacity
+              }
+
+              /// Commit exactly the candidate reserved by the last successful scan.
+              /// Returns its payload so the runtime can establish receiver-side ORCA
+              /// ownership exactly once, after pattern and guard evaluation succeed.
+              pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
+                  let reserved = self.reserved_match.take()?;
+                  let removed = match reserved {
+                      ReservedMatch::System(idx) => self.system_skip_buffer.remove(idx),
+                      ReservedMatch::Normal(idx) => self.skip_buffer.remove(idx),
+                  };
+                  let Some((msg, _)) = removed else {
+                      self.clear_receive_attempts();
+                      return None;
+                  };
+                  let payload = Arc::clone(&msg.payload);
+                  self.release_slot();
+                  self.clear_receive_attempts();
+                  Some(payload)
+              }
+
+              fn clear_receive_attempts(&mut self) {
+                  for (_, tried) in self.system_skip_buffer.iter_mut() {
+                      *tried = false;
+                  }
+                  for (_, tried) in self.skip_buffer.iter_mut() {
+                      *tried = false;
+                  }
+              }
+
+              pub fn reset_receive_match(&mut self) {
+                  self.reserved_match = None;
+                  self.clear_receive_attempts();
+              }
+          '''
+          mailbox = replace_once(mailbox, old_tail, new_tail, "mailbox commit/reset")
+
+          tests = '''
+              #[test]
+              fn rejected_candidate_remains_when_later_candidate_commits() {
+                  let mut mb = Mailbox::new(8);
+                  mb.push(make_msg(1, 10)).unwrap();
+                  mb.push(make_msg(2, 20)).unwrap();
+                  mb.push(make_msg(3, 30)).unwrap();
+
+                  // First candidate is returned but its guard is assumed to fail.
+                  assert_eq!(mb.receive_match(&[1, 2]).map(|(arm, _)| arm), Some(0));
+                  assert_eq!(mb.len(), 3);
+
+                  // Retrying reserves the next candidate; commit must consume only it.
+                  assert_eq!(mb.receive_match(&[1, 2]).map(|(arm, _)| arm), Some(1));
+                  assert!(mb.commit_receive_match().is_some());
+                  assert_eq!(mb.len(), 2);
+                  assert_eq!(mb.pop().unwrap().behavior_id, 1);
+                  assert_eq!(mb.pop().unwrap().behavior_id, 3);
+              }
+
+              #[test]
+              fn reset_reexposes_reserved_candidate_without_consuming_it() {
+                  let mut mb = Mailbox::new(4);
+                  mb.push(make_msg(7, 1)).unwrap();
+                  assert_eq!(mb.receive_match(&[7]).map(|(arm, _)| arm), Some(0));
+                  assert_eq!(mb.len(), 1);
+                  mb.reset_receive_match();
+                  assert_eq!(mb.receive_match(&[7]).map(|(arm, _)| arm), Some(0));
+                  assert_eq!(mb.len(), 1);
+              }
+
+              #[test]
+              fn system_candidate_is_reserved_until_commit() {
+                  let mut mb = Mailbox::new(1);
+                  let mut msg = make_msg(9, 1);
+                  msg.priority = MessagePriority::System;
+                  mb.push(msg).unwrap();
+
+                  assert_eq!(mb.receive_match(&[9]).map(|(arm, _)| arm), Some(0));
+                  assert_eq!(mb.len(), 1);
+                  assert!(mb.commit_receive_match().is_some());
+                  assert_eq!(mb.len(), 0);
+                  assert!(mb.pop().is_none());
+              }
+          '''
+          module_end = mailbox.rfind("\n}")
+          if module_end < 0:
+              raise SystemExit("could not find mailbox test-module end")
+          mailbox = mailbox[:module_end] + tests + mailbox[module_end:]
+          mailbox_path.write_text(mailbox)
+
+          callbacks_path = Path("src/runtime/callbacks.rs")
+          callbacks = callbacks_path.read_text()
+
+          old_try_refcell = '''    fn try_receive_match(
+                  &mut self,
+                  behavior_ids: &[u16],
+              ) -> Option<(usize, Vec<crate::vm::Value>)> {
+                  let mut rt = self.runtime.borrow_mut();
+                  let actor_id = rt.current_actor?;
+                  let (pos, payload) = rt
+                      .actors
+                      .get_mut(&actor_id)?
+                      .mailbox
+                      .receive_match(behavior_ids)?;
+                  // ORCA receiver protocol: hold heap pointers carried by the message.
+                  rt.hold_payload_refs(actor_id, &*payload);
+                  Some((
+                      pos,
+                      Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
+                  ))
+              }
+          '''
+          new_try_refcell = '''    fn try_receive_match(
+                  &mut self,
+                  behavior_ids: &[u16],
+              ) -> Option<(usize, Vec<crate::vm::Value>)> {
+                  let mut rt = self.runtime.borrow_mut();
+                  let actor_id = rt.current_actor?;
+                  let (pos, payload) = rt
+                      .actors
+                      .get_mut(&actor_id)?
+                      .mailbox
+                      .receive_match(behavior_ids)?;
+                  // The mailbox only reserves a candidate here. Receiver-side ORCA
+                  // ownership is established by commit_receive_match after its
+                  // pattern and guard have succeeded.
+                  Some((
+                      pos,
+                      Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
+                  ))
+              }
+          '''
+          callbacks = replace_once(callbacks, old_try_refcell, new_try_refcell, "refcell receive candidate")
+
+          old_commit_refcell = '''    fn commit_receive_match(&mut self) {
+                  let mut rt = self.runtime.borrow_mut();
+                  if let Some(actor_id) = rt.current_actor {
+                      if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                          actor.mailbox.commit_receive_match();
+                      }
+                  }
+              }
+          '''
+          new_commit_refcell = '''    fn commit_receive_match(&mut self) {
+                  let mut rt = self.runtime.borrow_mut();
+                  if let Some(actor_id) = rt.current_actor {
+                      let payload = rt
+                          .actors
+                          .get_mut(&actor_id)
+                          .and_then(|actor| actor.mailbox.commit_receive_match());
+                      if let Some(payload) = payload {
+                          rt.hold_payload_refs(actor_id, &payload);
+                      }
+                  }
+              }
+          '''
+          callbacks = replace_once(callbacks, old_commit_refcell, new_commit_refcell, "refcell receive commit")
+
+          old_try_raw = '''    fn try_receive_match(
+                  &mut self,
+                  behavior_ids: &[u16],
+              ) -> Option<(usize, Vec<crate::vm::Value>)> {
+                  unsafe {
+                      let (pos, payload) = {
+                          let actor = (*self.runtime).actors.get_mut(&self.actor_id)?;
+                          actor.mailbox.receive_match(behavior_ids)?
+                      };
+                      // ORCA receiver protocol: hold heap pointers carried by the message.
+                      (*self.runtime).hold_payload_refs(self.actor_id, &*payload);
+                      Some((
+                          pos,
+                          Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
+                      ))
+                  }
+              }
+          '''
+          new_try_raw = '''    fn try_receive_match(
+                  &mut self,
+                  behavior_ids: &[u16],
+              ) -> Option<(usize, Vec<crate::vm::Value>)> {
+                  unsafe {
+                      let (pos, payload) = {
+                          let actor = (*self.runtime).actors.get_mut(&self.actor_id)?;
+                          actor.mailbox.receive_match(behavior_ids)?
+                      };
+                      // Candidate only: receiver-side ORCA ownership is established
+                      // by commit_receive_match after pattern/guard success.
+                      Some((
+                          pos,
+                          Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
+                      ))
+                  }
+              }
+          '''
+          callbacks = replace_once(callbacks, old_try_raw, new_try_raw, "raw receive candidate")
+
+          old_commit_raw = '''    fn commit_receive_match(&mut self) {
+                  unsafe {
+                      if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
+                          actor.mailbox.commit_receive_match();
+                      }
+                  }
+              }
+          '''
+          new_commit_raw = '''    fn commit_receive_match(&mut self) {
+                  unsafe {
+                      let payload = (*self.runtime)
+                          .actors
+                          .get_mut(&self.actor_id)
+                          .and_then(|actor| actor.mailbox.commit_receive_match());
+                      if let Some(payload) = payload {
+                          (*self.runtime).hold_payload_refs(self.actor_id, &payload);
+                      }
+                  }
+              }
+          '''
+          callbacks = replace_once(callbacks, old_commit_raw, new_commit_raw, "raw receive commit")
+          callbacks_path.write_text(callbacks)
+
+          changelog_path = Path("CHANGELOG.md")
+          changelog = changelog_path.read_text()
+          stable_marker = "## Stable tier\n\n*Breaking changes require an accepted RFC and a deprecation cycle of at least\ntwo major versions.*\n\n"
+          changelog_entry = '''### Fixed — 2026-09-11 (transactional selective receive ownership)
+          - **Selective receive / ORCA ownership:** mailbox candidates are now reserved until
+            `ReceiveCommit` instead of being consumed or receiver-held during the initial scan.
+            Guard-rejected candidates remain queued without accumulating `held_foreign_refs`,
+            `ReceiveCommit` consumes exactly the currently reserved candidate and establishes
+            receiver ownership once, and reset/timeout paths clear reservation state without
+            changing ownership. System, scheduler-local, skipped, and concurrently arrived
+            normal messages now share the same commit lifecycle while preserving system priority.
+
+          '''
+          if changelog_entry.strip() not in changelog:
+              changelog = replace_once(changelog, stable_marker, stable_marker + changelog_entry, "changelog stable marker")
+          changelog_path.write_text(changelog)
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Focused mailbox tests
+        run: cargo test --lib runtime::mailbox::tests
+
+      - name: Compile all targets
+        run: cargo check --all-targets
+
+      - name: Remove one-shot workflow and commit verified changes
+        run: |
+          rm .github/workflows/p0-selective-receive.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix(runtime): make selective receive ownership transactional"
+          git push origin HEAD:fix/selective-receive-orca-transaction
