@@ -45,6 +45,50 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Added since 1.0.0-frozen — 2026-09-11 (backend parity + durable determinism)
+- **Canonical behavior content hashing** (`src/types.rs`,
+  `src/mir_codegen.rs`): the BLAKE3 content hash that gates
+  remote-behavior verification (and hot-reload fetch) now covers the
+  *full canonical signature* — every parameter type plus the return
+  type — instead of a parameter count and a `format!("{:?}")` Debug
+  string. The Debug string was non-canonical (record field order
+  changed the hash even though record unification is
+  order-insensitive) and the count-only hashing collided behaviors
+  that differ only in parameter types. The new
+  `types::write_canonical_type` encoding is explicit-tagged,
+  length-prefixed, record-field-sorted, and effect-row-sorted; it
+  deliberately preserves information NTIR erases (type variables,
+  effect rows, Nil/Never distinction) because a content hash has no
+  `mgu` backstop. Hash domain is separated (`NLBH\x02`) from NTIR and
+  wire-frame BLAKE3 uses.
+- **Continuation capture soundness** (`src/effect_checker.rs`): handler
+  arms in `handle ... with` are now capability-analyzed — previously
+  `CapabilityAnalyzer` walked only the handle body, so a linear value used
+  in an arm *and* in the resumed body passed checking (a use-after-move
+  across the dynamic `resume` boundary: the arm consumes before the body
+  continues). Each arm is analyzed as an alternative path from the incoming
+  consumption set (arm params shadow outer bindings as `Ref`), and every
+  arm's consumptions are unioned into the body's continuation set. Arm-only
+  uses now satisfy the exactly-once obligation; multi-arm handlers do not
+  double-count across arms.
+- **Durable-effect determinism gate** (`src/effect_checker.rs`): `workflow`
+  step bodies (including saga compensations) now reject ambient effects that
+  are unsafe under crash re-drive at compile time: `Time.now*`, `Rand.*`,
+  `Net.*`, `FS.*`, and stdio (`IO.print`/`IO.println`/`IO.read`). Recovery
+  re-runs a suspended step from its start, so these would execute again with
+  different results or duplicate side effects. `Timer.sleep` (journaled and
+  re-armed), performs intercepted by a user `handle`, and `LLM.ask`
+  (re-run by design) remain allowed. Module-function calls from steps are
+  followed transitively.
+- **Backend parity fixes** (`src/aot/mod.rs`, `src/main.rs`,
+  `src/wasm_runtime.rs`): the AOT perform helpers record `Unhandled effect`
+  on the pending-error channel instead of silently yielding nil; `--backend
+  wasm-run` prints the program result (previously discarded) and runs
+  `IO.print` (the host ignored the guest's null-terminated-string
+  contract); string results no longer print as raw `#Value(...)` after
+  backend memory teardown; `--eval` no longer falls through to piped-stdin
+  script execution after evaluating.
+
 ### Added since 1.0.0-frozen — 2026-08-22 (vscode extension)
 - **AOT backend error parity** (`src/aot/mod.rs`): the native AOT run path
   now surfaces interpreter-parity runtime errors (48-bit overflow, type

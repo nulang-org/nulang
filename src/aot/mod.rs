@@ -460,6 +460,7 @@ impl AotModule {
         }
 
         // Clean up: reconstruct Box to drop callbacks and free heap/GC.
+        stash_aot_result_repr(result);
         unsafe {
             crate::jit::runtime::clear_jit_callbacks();
             let _ = Box::from_raw(callbacks_ptr as *mut crate::vm::StandaloneVmCallbacks);
@@ -543,6 +544,7 @@ impl AotModule {
 
         crate::jit::runtime::aot_clear_constants();
         clear_aot_module_ctx();
+        stash_aot_result_repr(result);
         let _ = crate::jit::runtime::aot_take_heap();
 
         // Drain actor mailboxes.
@@ -663,6 +665,35 @@ pub fn clear_aot_module_ctx() {
     AOT_MODULE_CTX.with(|c| *c.borrow_mut() = std::ptr::null());
 }
 
+thread_local! {
+    /// Materialized text of the last `AotModule::run`/`run_in_runtime`
+    /// result when it is a heap string, captured before the standalone heap
+    /// is torn down. After teardown the payload pointer dangles and
+    /// `Value::to_string_repr` degrades to a raw `#Value(...)` repr —
+    /// diverging from the interpreter, which prints the string content.
+    static AOT_RESULT_REPR: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Take the materialized string result of the last native run, if any.
+/// Consumed once by the driver in place of `to_string_repr`.
+pub fn take_aot_result_repr() -> Option<String> {
+    AOT_RESULT_REPR.with(|c| c.borrow_mut().take())
+}
+
+/// If `raw` is a string value, copy its content into `AOT_RESULT_REPR`
+/// while the owning heap/constant pool is still alive. No-op for non-strings.
+fn stash_aot_result_repr(raw: u64) {
+    use crate::value_layout::{TAG_MASK, TAG_PTR, TAG_STRING};
+    let tag = raw & TAG_MASK;
+    if tag != TAG_STRING && tag != TAG_PTR {
+        return;
+    }
+    if let Some(s) = crate::jit::runtime::resolve_string_coerce(raw) {
+        AOT_RESULT_REPR.with(|c| *c.borrow_mut() = Some(s));
+    }
+}
+
 /// The armed module's constant pool, for callbacks that resolve string
 /// arguments (async effect dispatch). Empty when no module is armed.
 pub fn aot_module_constants() -> &'static [crate::bytecode::Constant] {
@@ -776,7 +807,11 @@ pub unsafe extern "C" fn nulang_aot_spawn(behavior_idx: u64) -> u64 {
 // effects (an active handler for the same effect at runtime) are not
 // supported by the native backend — the compile-time `resolved_handler: None`
 // only guarantees no *lexical* handler, matching the bytecode fallback for
-// unbound effects. Outside an actor context the helper degrades to nil.
+// unbound effects. An effect the callback leaves unhandled (returns None) is
+// recorded on the pending-error channel and surfaced by the driver's
+// `aot_take_pending_error` drain, matching the interpreter's `Unhandled
+// effect` error; effects the callback handles with a nil result (e.g.
+// `Actor.*` outside an actor context) still degrade to nil.
 
 macro_rules! define_aot_perform {
     ($name:ident, $($arg:ident),*) => {
@@ -800,7 +835,7 @@ macro_rules! define_aot_perform {
             } else {
                 unsafe { &(*module).constants }
             };
-            crate::jit::runtime::try_with_callbacks(|cb| {
+            let handled = crate::jit::runtime::try_with_callbacks(|cb| {
                 if module.is_null() {
                     cb.perform_builtin_effect(&effect, Some(&op), constants, &regs)
                 } else {
@@ -812,9 +847,23 @@ macro_rules! define_aot_perform {
                     )
                 }
             })
-            .flatten()
-            .unwrap_or_else(crate::vm::Value::nil)
-            .as_raw()
+            .flatten();
+            // Interpreter parity (`vm.rs` Perform fast path): a builtin
+            // callback returning None means the effect is genuinely unhandled
+            // and the VM errors with "Unhandled effect: '<Effect>.<op>'".
+            // Record it on the shared pending-error channel (drained by
+            // `AotModule::run`/`run_in_runtime`) instead of silently
+            // yielding nil, which masked unknown effects as false values.
+            match handled {
+                Some(v) => v.as_raw(),
+                None => {
+                    crate::jit::runtime::aot_set_pending_error(format!(
+                        "Unhandled effect: '{}.{}'",
+                        effect, op
+                    ));
+                    crate::vm::Value::nil().as_raw()
+                }
+            }
         }
     };
 }

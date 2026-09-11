@@ -4099,6 +4099,9 @@ impl Parser {
             positional_args,
             register_as,
             target_node,
+            // Spawn-time capability-grant syntax (`with [Net::TcpOut(...)]`) is
+            // not parsed yet; the field is plumbed through as empty.
+            capabilities: Vec::new(),
             span,
         };
         Ok(match link_op {

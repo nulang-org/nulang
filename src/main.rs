@@ -753,6 +753,13 @@ fn main() {
                 std::process::exit(exit_code(&e));
             }
         }
+        // Eval consumed the request: without this return, a piped stdin
+        // (non-terminal) fell through to the stdin-script block below and
+        // executed the empty/leftover stdin as a second program — e.g.
+        // `nulang --backend wasm-run --eval '1+2*3' < /dev/null` ran an
+        // empty module after the eval, failing on the missing nulang_init
+        // export (and double-running every other backend's eval).
+        return;
     }
     if let Some(path) = opts.check_file {
         let source = match std::fs::read_to_string(&path) {
@@ -1767,7 +1774,18 @@ fn run_source(
                     span: Span::default(),
                 }
             })?;
-            wasm_backend.run(&wasm_bytes)?;
+            // Run via the host runtime directly (not `WasmBackend::run`) so
+            // the Wasmtime store stays alive while the program result is
+            // stringified — a string result's bytes live in linear memory
+            // and would otherwise print as a raw `#Value(...)` repr.
+            let mut runtime = nulang::wasm_runtime::WasmRuntime::new(&wasm_bytes, None)?;
+            let result = runtime.run()?;
+            let result_str = runtime
+                .string_value(&result)
+                .unwrap_or_else(|| result.to_string_repr());
+            if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
+                println!("{}", result_str);
+            }
             return Ok(());
         }
         #[cfg(feature = "wasm-backend")]
@@ -1943,7 +1961,12 @@ fn run_source(
                 aot_module.run()?
             };
             let result = nulang::vm::Value::from_raw(result_raw);
-            let result_str = result.to_string_repr();
+            // Native runs materialize a string result before tearing down the
+            // standalone heap (see `aot::take_aot_result_repr`); without it
+            // the payload pointer dangles and string results print as raw
+            // `#Value(...)` instead of their content.
+            let result_str = nulang::aot::take_aot_result_repr()
+                .unwrap_or_else(|| result.to_string_repr());
             if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
                 println!("{}", result_str);
             }

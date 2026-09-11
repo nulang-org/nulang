@@ -306,19 +306,35 @@ impl MirCodegen {
             let end = self.module.instructions.len();
 
             // Compute BLAKE3 content hash from the compiled bytecode slice +
-            // param types + return type.
+            // the full canonical signature (parameter types + return type).
+            // Parameter types matter for content identity: two behaviors
+            // with identical bytecode but different parameter types are NOT
+            // interchangeable, and the hash is the receiver-side gate that
+            // rejects mismatched behavior code on the wire. The canonical
+            // encoding (types::write_canonical_type) is field-order
+            // insensitive for records and free of compiler-internal state,
+            // unlike format!("{:?}").
             let bytecode_slice = &self.module.instructions[offset..end];
             let mut hasher = blake3::Hasher::new();
+            // Domain separation from other BLAKE3 uses (NTIR, wire frames).
+            hasher.update(b"NLBH\x02");
             for instr in bytecode_slice {
                 hasher.update(&[instr.opcode as u8, instr.op1, instr.op2, instr.op3]);
             }
-            let param_count_bytes = (func.params.len() as u32).to_be_bytes();
-            hasher.update(&param_count_bytes);
-            // Hash return type if present
-            if let Some(ref ret_ty) = func.ret {
-                let ty_str = format!("{:?}", ret_ty);
-                hasher.update(ty_str.as_bytes());
+            let mut ty_buf = Vec::new();
+            for param in &func.params {
+                if let Some(local) = func.locals.iter().find(|l| l.id == *param) {
+                    ty_buf.clear();
+                    crate::types::write_canonical_type(&local.ty, &mut ty_buf);
+                    hasher.update(&ty_buf);
+                }
             }
+            ty_buf.clear();
+            match &func.ret {
+                Some(ret_ty) => crate::types::write_canonical_type(ret_ty, &mut ty_buf),
+                None => ty_buf.push(0xFF), // no declared return type
+            }
+            hasher.update(&ty_buf);
             let hash_bytes = *hasher.finalize().as_bytes();
 
             self.module
@@ -3412,5 +3428,55 @@ mod optimize_tests {
                 op: mir::RValue::Load(a)
             }
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Behavior content hashing: canonical full-signature identity
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_behavior_content_hash_distinguishes_param_types() {
+        // Identical bodies and arity, different parameter types: these
+        // behaviors are NOT interchangeable, and the content hash is the
+        // receiver-side gate that rejects mismatched behavior code.
+        let a = compile_source("actor A { behavior poke(x: Int) { 1 } }").unwrap();
+        let b = compile_source("actor A { behavior poke(x: String) { 1 } }").unwrap();
+        let ha = a.behaviors[0].content_hash.expect("hash present");
+        let hb = b.behaviors[0].content_hash.expect("hash present");
+        assert_ne!(
+            ha, hb,
+            "different param types must produce different content hashes"
+        );
+    }
+
+    #[test]
+    fn test_behavior_content_hash_record_field_order_invariant() {
+        // Records unify field-order-insensitively; re-declaring the same
+        // record fields in a different order must not change the hash.
+        let a = compile_source("actor A { behavior poke(p: {x: Int, y: Int}) { 1 } }")
+            .unwrap();
+        let b = compile_source("actor A { behavior poke(p: {y: Int, x: Int}) { 1 } }")
+            .unwrap();
+        assert_eq!(
+            a.behaviors[0].content_hash,
+            b.behaviors[0].content_hash,
+            "record field order must not change the content hash"
+        );
+    }
+
+    #[test]
+    fn test_behavior_content_hash_deterministic() {
+        let source =
+            "actor A { behavior poke(x: Int) { x + 1 } behavior other(s: String) { 1 } }";
+        let a = compile_source(source).unwrap();
+        let b = compile_source(source).unwrap();
+        assert_eq!(a.behaviors.len(), b.behaviors.len());
+        for (ba, bb) in a.behaviors.iter().zip(b.behaviors.iter()) {
+            assert_eq!(ba.name, bb.name);
+            assert_eq!(
+                ba.content_hash, bb.content_hash,
+                "same source must produce identical content hashes"
+            );
+        }
     }
 }

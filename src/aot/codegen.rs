@@ -4436,6 +4436,79 @@ mod tests {
     }
 
     #[test]
+    fn test_aot_unhandled_builtin_effect_errors() {
+        // Interpreter parity (vm.rs Perform fast path): a builtin effect the
+        // callback leaves unhandled must surface as an `Unhandled effect`
+        // runtime error, not silently yield nil (the pre-fix behavior that
+        // turned `perform Time.now_ms()` into a false value on native).
+        use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        use crate::typechecker::TypeChecker;
+        let source = r#"
+            fn main() { perform Time.now_ms() }
+        "#;
+        let tokens = Lexer::new(source).lex().unwrap();
+        let ast = Parser::new(tokens).parse_module().unwrap();
+        let mut tc = TypeChecker::new();
+        tc.check_module(&ast).unwrap();
+        let mut ec = EffectChecker::new();
+        ec.check_module(&ast.decls).unwrap();
+        let mut ca = CapabilityAnalyzer::new();
+        let ctx = CapContext::new();
+        for d in crate::effect_checker::flatten_decls(&ast.decls) {
+            if let crate::ast::Decl::Function { body, .. } = d {
+                ca.infer_cap(&ctx, body).unwrap();
+            }
+        }
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
+        let aot = crate::aot::AotModule::compile(&mir_module).expect("AOT compile");
+        let err = aot.run().err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            err.contains("Unhandled effect: 'Time.now_ms'"),
+            "unhandled builtin effect must error like the interpreter, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_aot_nil_handled_builtin_effect_still_degrades() {
+        // The parity fix must not change effects the callback HANDLES with a
+        // nil result: `Actor.*` outside an actor context nil-no-ops in the
+        // interpreter (StandaloneVmCallbacks), so native must keep returning
+        // nil rather than recording an unhandled-effect error.
+        use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        use crate::typechecker::TypeChecker;
+        let source = r#"
+            fn main() { perform Actor.link(1, 2) }
+        "#;
+        let tokens = Lexer::new(source).lex().unwrap();
+        let ast = Parser::new(tokens).parse_module().unwrap();
+        let mut tc = TypeChecker::new();
+        tc.check_module(&ast).unwrap();
+        let mut ec = EffectChecker::new();
+        ec.check_module(&ast.decls).unwrap();
+        let mut ca = CapabilityAnalyzer::new();
+        let ctx = CapContext::new();
+        for d in crate::effect_checker::flatten_decls(&ast.decls) {
+            if let crate::ast::Decl::Function { body, .. } = d {
+                ca.infer_cap(&ctx, body).unwrap();
+            }
+        }
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
+        let aot = crate::aot::AotModule::compile(&mir_module).expect("AOT compile");
+        let raw = aot.run().expect("handled nil effect must not error");
+        assert!(
+            crate::vm::Value::from_raw(raw).is_nil(),
+            "Actor.link outside an actor must nil-no-op like the interpreter"
+        );
+    }
+
+    #[test]
     fn test_aot_resuming_handler_multi_perform() {
         // Two performs of the SAME resuming handler in one handle body. Each
         // perform gets its own continuation; the handler body's Resume

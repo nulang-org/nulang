@@ -558,6 +558,226 @@ impl std::fmt::Display for Type {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Canonical type encoding (content hashing)
+// ---------------------------------------------------------------------------
+
+/// Append the canonical structural encoding of `ty` to `out`.
+///
+/// The encoding is deterministic and free of compiler-internal
+/// presentation: record fields are sorted by name (matching
+/// `unify_closed_records`, which treats records as
+/// field-order-insensitive), effect rows are sorted (they are sets),
+/// and every node carries an explicit tag with length-prefixed
+/// strings. Two structurally equal types always encode to identical
+/// bytes regardless of source field order or inference state.
+///
+/// This is intentionally NOT `Type::to_ntir`: NTIR erases information
+/// (type variables and skolems become `Unit`, function effect rows are
+/// dropped, `Nil`/`Never`/`Address` collapse to one code, nominal
+/// wrappers vanish). Those erasures are fine for the typechecker's
+/// fast-path equality probe, which still has full `mgu` as backstop —
+/// but a content hash has no backstop, so colliding distinct
+/// signatures would let mismatched behavior code run silently.
+pub fn write_canonical_type(ty: &Type, out: &mut Vec<u8>) {
+    fn write_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+    match ty {
+        Type::Var(v) => {
+            out.push(0x00);
+            out.extend_from_slice(&v.0.to_le_bytes());
+        }
+        Type::Primitive(p) => {
+            out.push(0x01);
+            out.push(match p {
+                PrimitiveType::Int => 0,
+                PrimitiveType::Float => 1,
+                PrimitiveType::Bool => 2,
+                PrimitiveType::String => 3,
+                PrimitiveType::Nil => 4,
+                PrimitiveType::Unit => 5,
+                PrimitiveType::Never => 6,
+                PrimitiveType::Address => 7,
+            });
+        }
+        Type::Tuple(ts) => {
+            out.push(0x02);
+            out.extend_from_slice(&(ts.len() as u32).to_le_bytes());
+            for t in ts {
+                write_canonical_type(t, out);
+            }
+        }
+        Type::Record(fields) => {
+            out.push(0x03);
+            // Records unify field-order-insensitively, so sort.
+            let mut sorted: Vec<&(String, Type)> = fields.iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+            for (name, t) in sorted {
+                write_str(out, name);
+                write_canonical_type(t, out);
+            }
+        }
+        Type::Variant(cases) => {
+            out.push(0x04);
+            // Constructor order is semantically significant; keep it.
+            out.extend_from_slice(&(cases.len() as u32).to_le_bytes());
+            for (name, t) in cases {
+                write_str(out, name);
+                match t {
+                    Some(t) => {
+                        out.push(1);
+                        write_canonical_type(t, out);
+                    }
+                    None => out.push(0),
+                }
+            }
+        }
+        Type::Array(t) => {
+            out.push(0x05);
+            write_canonical_type(t, out);
+        }
+        Type::Function {
+            param,
+            ret,
+            effect,
+            cap,
+        } => {
+            out.push(0x06);
+            write_canonical_type(param, out);
+            write_canonical_type(ret, out);
+            write_canonical_effect_row(effect, out);
+            out.push(canonical_cap_code(cap));
+        }
+        Type::Actor { state, behavior } => {
+            out.push(0x07);
+            write_canonical_type(state, out);
+            write_canonical_type(behavior, out);
+        }
+        Type::App { constructor, args } => {
+            out.push(0x08);
+            write_canonical_type(constructor, out);
+            out.extend_from_slice(&(args.len() as u32).to_le_bytes());
+            for a in args {
+                write_canonical_type(a, out);
+            }
+        }
+        Type::Reference { cap, inner } => {
+            out.push(0x09);
+            out.push(canonical_cap_code(cap));
+            write_canonical_type(inner, out);
+        }
+        Type::Scheme { vars, body } => {
+            out.push(0x0A);
+            out.extend_from_slice(&(vars.len() as u32).to_le_bytes());
+            for v in vars {
+                out.extend_from_slice(&v.0.to_le_bytes());
+            }
+            write_canonical_type(body, out);
+        }
+        Type::Nominal { name, underlying } => {
+            out.push(0x0B);
+            write_str(out, name);
+            write_canonical_type(underlying, out);
+        }
+        Type::Skolem(id) => {
+            out.push(0x0C);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+}
+
+/// Convenience wrapper around [`write_canonical_type`].
+pub fn canonical_type_bytes(ty: &Type) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_canonical_type(ty, &mut out);
+    out
+}
+
+/// Stable capability codes for the canonical type encoding. Explicit
+/// match arms (not `as u8`) keep the wire-stable values pinned even if
+/// the enum declaration order changes.
+pub fn canonical_cap_code(cap: &Capability) -> u8 {
+    match cap {
+        Capability::LinearIso => 0,
+        Capability::Linear => 1,
+        Capability::Iso => 2,
+        Capability::Trn => 3,
+        Capability::Ref => 4,
+        Capability::Val => 5,
+        Capability::Box => 6,
+        Capability::Tag => 7,
+    }
+}
+
+fn write_canonical_effect_row(row: &EffectRow, out: &mut Vec<u8>) {
+    fn effect_code(e: &Effect) -> u8 {
+        match e {
+            Effect::IO => 0,
+            Effect::Net => 1,
+            Effect::String => 2,
+            Effect::FS => 3,
+            Effect::Rand => 4,
+            Effect::Time => 5,
+            Effect::Spawn => 6,
+            Effect::Send => 7,
+            Effect::Receive => 8,
+            Effect::Migrate => 9,
+            Effect::STM => 10,
+            Effect::Async => 11,
+            Effect::Inference => 12,
+            Effect::Cost => 13,
+            Effect::Event => 14,
+            Effect::Array => 15,
+            Effect::FFI => 16,
+            Effect::Test => 17,
+            Effect::DB => 18,
+            Effect::Python => 19,
+            Effect::Env => 20,
+            Effect::Process => 21,
+            Effect::System => 22,
+            Effect::Render => 23,
+            Effect::Request => 24,
+            Effect::Respond => 25,
+            Effect::Realtime => 26,
+            Effect::Client => 27,
+            Effect::Web => 28,
+            Effect::UserDefined(_) => 29,
+        }
+    }
+    fn write_effect(e: &Effect, out: &mut Vec<u8>) {
+        out.push(effect_code(e));
+        if let Effect::UserDefined(name) = e {
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+    }
+    match row {
+        EffectRow::Closed(effects) => {
+            out.push(0x00);
+            // Effect rows are sets; sort for a canonical form.
+            let mut sorted: Vec<&Effect> = effects.iter().collect();
+            sorted.sort();
+            out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+            for e in sorted {
+                write_effect(e, out);
+            }
+        }
+        EffectRow::Open(effects, region) => {
+            out.push(0x01);
+            let mut sorted: Vec<&Effect> = effects.iter().collect();
+            sorted.sort();
+            out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+            for e in sorted {
+                write_effect(e, out);
+            }
+            out.extend_from_slice(&region.0.to_le_bytes());
+        }
+    }
+}
+
 /// Reserved pseudo-field name carrying the *row tail* of an open record type.
 ///
 /// Record row polymorphism is encoded without changing the shape of
@@ -2223,5 +2443,105 @@ mod tests {
     #[test]
     fn test_linear_subtype_of_val() {
         assert!(Capability::Linear.is_subtype_of(Capability::Val));
+    }
+
+    // -----------------------------------------------------------------
+    // Canonical type encoding (content hashing)
+    // -----------------------------------------------------------------
+
+    fn prim(p: PrimitiveType) -> Type {
+        Type::Primitive(p)
+    }
+
+    fn fn_type(effect: EffectRow) -> Type {
+        Type::Function {
+            param: Box::new(prim(PrimitiveType::Int)),
+            ret: Box::new(prim(PrimitiveType::Int)),
+            effect,
+            cap: Capability::Ref,
+        }
+    }
+
+    #[test]
+    fn test_canonical_type_record_field_order_invariant() {
+        // Records unify field-order-insensitively (unify_closed_records
+        // sorts by name), so the canonical encoding must too.
+        let a = Type::Record(vec![
+            ("x".to_string(), prim(PrimitiveType::Int)),
+            ("y".to_string(), prim(PrimitiveType::String)),
+        ]);
+        let b = Type::Record(vec![
+            ("y".to_string(), prim(PrimitiveType::String)),
+            ("x".to_string(), prim(PrimitiveType::Int)),
+        ]);
+        assert_eq!(canonical_type_bytes(&a), canonical_type_bytes(&b));
+    }
+
+    #[test]
+    fn test_canonical_type_distinguishes_ntir_collapsed_types() {
+        // NTIR collapses Nil/Never/Address and drops effect rows; a
+        // content hash must not — these are distinct signatures.
+        assert_ne!(
+            canonical_type_bytes(&prim(PrimitiveType::Never)),
+            canonical_type_bytes(&prim(PrimitiveType::Unit))
+        );
+        assert_ne!(
+            canonical_type_bytes(&prim(PrimitiveType::Nil)),
+            canonical_type_bytes(&prim(PrimitiveType::Unit))
+        );
+        assert_ne!(
+            canonical_type_bytes(&fn_type(EffectRow::Closed(vec![Effect::IO]))),
+            canonical_type_bytes(&fn_type(EffectRow::Closed(vec![Effect::Send])))
+        );
+        // Tuple order is significant.
+        let t1 = Type::Tuple(vec![
+            prim(PrimitiveType::Int),
+            prim(PrimitiveType::String),
+        ]);
+        let t2 = Type::Tuple(vec![
+            prim(PrimitiveType::String),
+            prim(PrimitiveType::Int),
+        ]);
+        assert_ne!(canonical_type_bytes(&t1), canonical_type_bytes(&t2));
+    }
+
+    #[test]
+    fn test_canonical_type_effect_row_order_invariant() {
+        // Effect rows are sets; ordering must not affect the encoding.
+        let a = fn_type(EffectRow::Closed(vec![Effect::IO, Effect::Send]));
+        let b = fn_type(EffectRow::Closed(vec![Effect::Send, Effect::IO]));
+        assert_eq!(canonical_type_bytes(&a), canonical_type_bytes(&b));
+    }
+
+    #[test]
+    fn test_canonical_type_user_defined_effect_distinct() {
+        let a = fn_type(EffectRow::Closed(vec![Effect::UserDefined(
+            "a".to_string(),
+        )]));
+        let b = fn_type(EffectRow::Closed(vec![Effect::UserDefined(
+            "b".to_string(),
+        )]));
+        assert_ne!(canonical_type_bytes(&a), canonical_type_bytes(&b));
+    }
+
+    #[test]
+    fn test_canonical_type_deterministic_nested() {
+        let ty = Type::Record(vec![
+            (
+                "f".to_string(),
+                Type::Array(Box::new(Type::Variant(vec![
+                    ("Some".to_string(), Some(prim(PrimitiveType::Int))),
+                    ("None".to_string(), None),
+                ]))),
+            ),
+            (
+                "g".to_string(),
+                Type::Reference {
+                    cap: Capability::Iso,
+                    inner: Box::new(prim(PrimitiveType::String)),
+                },
+            ),
+        ]);
+        assert_eq!(canonical_type_bytes(&ty), canonical_type_bytes(&ty));
     }
 }
