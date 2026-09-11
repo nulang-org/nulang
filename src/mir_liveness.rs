@@ -7,7 +7,7 @@
 //! continues.
 
 use crate::mir::{BlockId, FuncRef, Function, LocalId, RValue, Stmt, Terminator};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A deterministic set of live MIR locals.
 pub type LiveSet = BTreeSet<LocalId>;
@@ -63,13 +63,6 @@ impl Liveness {
 
 /// Compute classical backwards liveness for a MIR function.
 pub fn analyze(function: &Function) -> Liveness {
-    let block_index: HashMap<BlockId, usize> = function
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(index, block)| (block.id, index))
-        .collect();
-
     let mut live_in: BTreeMap<BlockId, LiveSet> = function
         .blocks
         .iter()
@@ -80,7 +73,7 @@ pub fn analyze(function: &Function) -> Liveness {
         let mut changed = false;
 
         for block in function.blocks.iter().rev() {
-            let mut live = successor_live_in(&block.terminator, &live_in, &block_index);
+            let mut live = successor_live_in(&block.terminator, &live_in);
             add_terminator_uses(&block.terminator, &mut live);
 
             for stmt in block.stmts.iter().rev() {
@@ -105,7 +98,7 @@ pub fn analyze(function: &Function) -> Liveness {
     };
 
     for block in &function.blocks {
-        let mut live = successor_live_in(&block.terminator, &live_in, &block_index);
+        let mut live = successor_live_in(&block.terminator, &live_in);
         add_terminator_uses(&block.terminator, &mut live);
 
         for (stmt_index, stmt) in block.stmts.iter().enumerate().rev() {
@@ -125,14 +118,11 @@ pub fn analyze(function: &Function) -> Liveness {
 fn successor_live_in(
     terminator: &Terminator,
     live_in: &BTreeMap<BlockId, LiveSet>,
-    block_index: &HashMap<BlockId, usize>,
 ) -> LiveSet {
     let mut live = LiveSet::new();
     let mut add_successor = |id: BlockId| {
-        if block_index.contains_key(&id) {
-            if let Some(successor_live) = live_in.get(&id) {
-                live.extend(successor_live.iter().copied());
-            }
+        if let Some(successor_live) = live_in.get(&id) {
+            live.extend(successor_live.iter().copied());
         }
     };
 
@@ -282,7 +272,7 @@ fn add_terminator_uses(terminator: &Terminator, live: &mut LiveSet) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mir::{Block, HandlerRef, Module};
+    use crate::mir::{Block, HandlerRef};
 
     fn function(blocks: Vec<Block>) -> Function {
         Function {
@@ -444,21 +434,5 @@ mod tests {
             liveness.live_before(BlockId(0), 0).unwrap(),
             &LiveSet::from([LocalId(2), LocalId(3)])
         );
-    }
-
-    #[test]
-    fn module_import_stays_unused_in_test_fixture() {
-        // Keep this module-level smoke construction near the analysis tests so
-        // future MIR shape additions are caught by exhaustive matches above.
-        let module = Module {
-            name: "test".into(),
-            functions: Vec::new(),
-            behaviors: Vec::new(),
-            actor_metadata: Vec::new(),
-            compensation_of: Vec::new(),
-            parallel_branches_of: Vec::new(),
-            foreign_functions: Vec::new(),
-        };
-        assert!(module.functions.is_empty());
     }
 }
