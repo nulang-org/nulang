@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod bindings;
 pub mod budget;
 pub mod contracts;
+pub mod dispatch;
 pub mod ir;
 pub mod modules;
 pub mod package_contracts;
