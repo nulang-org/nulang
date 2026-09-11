@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use nulang_ai::{LlmClient, LlmError, LlmRequest, LlmResponse, TokenBudget};
+use nulang_ai::{LlmClient, LlmError, LlmErrorKind, LlmRequest, LlmResponse, TokenBudget};
 
 /// Default process-wide provider concurrency. Override with
 /// `NULANG_LLM_WORKERS` (1..=64).
@@ -36,6 +36,56 @@ pub(crate) struct LlmWorkItem {
     pub(crate) request: LlmRequest,
     pub(crate) client: Arc<dyn LlmClient>,
     completion_tx: std::sync::mpsc::Sender<Completion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutorSendFailure {
+    Full,
+    Disconnected,
+}
+
+/// Preserve the work item while classifying a non-blocking queue failure.
+/// Keeping this generic makes the overload/disconnect behavior testable
+/// without constructing an LLM provider request.
+fn classify_try_send<T>(
+    result: Result<(), crossbeam::channel::TrySendError<T>>,
+) -> Result<(), (T, ExecutorSendFailure)> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(crossbeam::channel::TrySendError::Full(item)) => {
+            Err((item, ExecutorSendFailure::Full))
+        }
+        Err(crossbeam::channel::TrySendError::Disconnected(item)) => {
+            Err((item, ExecutorSendFailure::Disconnected))
+        }
+    }
+}
+
+fn executor_submission_error(reason: ExecutorSendFailure) -> LlmError {
+    match reason {
+        ExecutorSendFailure::Full => LlmError::new(
+            LlmErrorKind::ProviderError,
+            "LLM executor queue is full; request was not submitted",
+        ),
+        ExecutorSendFailure::Disconnected => LlmError::new(
+            LlmErrorKind::ProviderError,
+            "LLM executor is unavailable; request was not submitted",
+        ),
+    }
+}
+
+/// Route local executor failures through the same asynchronous completion
+/// channel as provider failures. This keeps one decrement/retry/fallback path
+/// and prevents overload from being mistaken for an empty successful model
+/// response by the caller.
+fn report_submission_failure(
+    completion_tx: &std::sync::mpsc::Sender<Completion>,
+    actor_id: u64,
+    reason: ExecutorSendFailure,
+) -> bool {
+    completion_tx
+        .send((actor_id, Err(executor_submission_error(reason))))
+        .is_ok()
 }
 
 static LLM_EXECUTOR_TX: OnceLock<crossbeam::channel::Sender<LlmWorkItem>> = OnceLock::new();
@@ -339,9 +389,9 @@ pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &s
         return;
     };
     if !dispatch_llm_request(rt, actor_id, request, prompt) {
-        // `dispatch_llm_request` reserves in-flight bookkeeping before trying
-        // the bounded queue so both current callers share one rollback
-        // contract. Undo that reservation on failed submission.
+        // This path is now limited to pre-dispatch failures such as a missing
+        // client. Queue saturation/disconnect are reported asynchronously as
+        // structured LLM errors by `dispatch_llm_request` itself.
         rt.llm.inflight_count = rt.llm.inflight_count.saturating_sub(1);
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
             actor.llm_inflight = false;
@@ -362,10 +412,12 @@ pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &s
 
 /// Try to enqueue an LLM request without blocking the actor scheduler.
 ///
-/// In-flight bookkeeping is reserved before submission. A `false` return
-/// means the caller MUST roll that reservation back; both runtime call sites
-/// do so. Reserving first keeps the callback and retry paths on one consistent
-/// contract while the bounded queue itself guarantees scheduler non-blocking.
+/// Returns `false` only when dispatch cannot begin (currently: no configured
+/// client), preserving the existing caller rollback contract. Once in-flight
+/// bookkeeping has been reserved, either provider work or a structured local
+/// executor failure is delivered through the shard completion channel. This
+/// guarantees exactly one completion/decrement path and prevents queue
+/// saturation from becoming an empty successful LLM response.
 pub(crate) fn dispatch_llm_request(
     rt: &mut Runtime,
     actor_id: u64,
@@ -388,7 +440,15 @@ pub(crate) fn dispatch_llm_request(
         client,
         completion_tx: rt.llm.completion_tx.clone(),
     };
-    executor_tx().try_send(item).is_ok()
+    match classify_try_send(executor_tx().try_send(item)) {
+        Ok(()) => true,
+        Err((item, reason)) => {
+            // The runtime/shard receiver is alive while this method holds
+            // `&mut Runtime`, so this normally cannot fail. If it ever does,
+            // returning false lets the caller perform its existing rollback.
+            report_submission_failure(&item.completion_tx, item.actor_id, reason)
+        }
+    }
 }
 
 /// Prune an agent's episodic memory to fit within `max_tokens`, using a
@@ -502,4 +562,47 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         (*self_ptr).vm_exec_end();
     }
     rt.requeue_if_mail_pending(actor_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturated_executor_submission_becomes_error_completion() {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        tx.try_send(1u8).expect("fill tiny executor queue");
+
+        let (_, reason) = classify_try_send(tx.try_send(2u8))
+            .expect_err("second non-blocking submission must report saturation");
+        assert_eq!(reason, ExecutorSendFailure::Full);
+
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        assert!(report_submission_failure(&completion_tx, 42, reason));
+        let (actor_id, result) = completion_rx.recv().expect("failure completion");
+        assert_eq!(actor_id, 42);
+        let error = result.expect_err("saturation must never look successful");
+        assert_eq!(error.kind, LlmErrorKind::ProviderError);
+        assert!(error.message.contains("queue is full"));
+
+        assert_eq!(rx.recv().unwrap(), 1);
+    }
+
+    #[test]
+    fn disconnected_executor_submission_becomes_error_completion() {
+        let (tx, rx) = crossbeam::channel::bounded::<u8>(1);
+        drop(rx);
+
+        let (_, reason) = classify_try_send(tx.try_send(7u8))
+            .expect_err("submission to disconnected executor must fail");
+        assert_eq!(reason, ExecutorSendFailure::Disconnected);
+
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        assert!(report_submission_failure(&completion_tx, 9, reason));
+        let (actor_id, result) = completion_rx.recv().expect("failure completion");
+        assert_eq!(actor_id, 9);
+        let error = result.expect_err("disconnect must never look successful");
+        assert_eq!(error.kind, LlmErrorKind::ProviderError);
+        assert!(error.message.contains("unavailable"));
+    }
 }
