@@ -355,10 +355,10 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// timer cannot fire into a later wait. Default is a no-op.
     fn receive_wait_matched(&mut self) {}
 
-    /// Commit a selective receive: remove the matched ("tried") message from
-    /// the skip-buffer and clear remaining "tried" flags. Called after a
-    /// pattern+guard check succeeds. Default is a no-op (standalone VM has no
-    /// skip-buffer).
+    /// Commit the candidate reserved by the most recent selective receive.
+    /// Runtime-backed implementations consume exactly that message and
+    /// establish receiver-side ownership only after pattern+guard success.
+    /// Default is a no-op for the standalone VM.
     fn commit_receive_match(&mut self) {}
 
     /// Reset "tried" flags in the skip-buffer. Called when

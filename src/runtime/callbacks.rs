@@ -970,8 +970,9 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             .get_mut(&actor_id)?
             .mailbox
             .receive_match(behavior_ids)?;
-        // ORCA receiver protocol: hold heap pointers carried by the message.
-        rt.hold_payload_refs(actor_id, &*payload);
+        // Reservation is speculative: the message stays queued and its
+        // in-flight ownership protects pointer payloads while patterns/guards
+        // run. Receiver-side ownership is established only on commit.
         Some((
             pos,
             Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
@@ -981,8 +982,14 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
     fn commit_receive_match(&mut self) {
         let mut rt = self.runtime.borrow_mut();
         if let Some(actor_id) = rt.current_actor {
-            if let Some(actor) = rt.actors.get_mut(&actor_id) {
-                actor.mailbox.commit_receive_match();
+            let payload = rt
+                .actors
+                .get_mut(&actor_id)
+                .and_then(|actor| actor.mailbox.commit_receive_match());
+            if let Some(payload) = payload {
+                // Transfer from queued/in-flight ownership to exactly one
+                // receiver hold only after pattern+guard success.
+                rt.hold_payload_refs(actor_id, &payload);
             }
         }
     }
@@ -1817,8 +1824,8 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 let actor = (*self.runtime).actors.get_mut(&self.actor_id)?;
                 actor.mailbox.receive_match(behavior_ids)?
             };
-            // ORCA receiver protocol: hold heap pointers carried by the message.
-            (*self.runtime).hold_payload_refs(self.actor_id, &*payload);
+            // Do not take an ORCA receiver hold for a speculative candidate.
+            // The message remains queued until commit.
             Some((
                 pos,
                 Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
@@ -1867,8 +1874,14 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
 
     fn commit_receive_match(&mut self) {
         unsafe {
-            if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
-                actor.mailbox.commit_receive_match();
+            let payload = (*self.runtime)
+                .actors
+                .get_mut(&self.actor_id)
+                .and_then(|actor| actor.mailbox.commit_receive_match());
+            if let Some(payload) = payload {
+                // Commit is the ownership boundary: establish one receiver
+                // hold only for the message that actually won the guard.
+                (*self.runtime).hold_payload_refs(self.actor_id, &payload);
             }
         }
     }

@@ -6940,3 +6940,106 @@ fn test_send_to_grain_cross_shard_routes_and_hydrates() {
         "inc message should be processed on shard 1"
     );
 }
+
+// ========================================================================
+// Transactional selective receive / ORCA ownership regressions (#143)
+// ========================================================================
+
+fn selective_receive_pointer_fixture() -> (Runtime, u64, u64, *mut u8) {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(|| vec![]));
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    let ptr = rt
+        .actors
+        .get_mut(&owner)
+        .expect("owner actor")
+        .heap
+        .alloc(std::mem::size_of::<Value>(), TypeTag::Raw)
+        .expect("owner heap allocation");
+    rt.send_message_by_id(receiver, 0, &[Value::ptr(ptr)]);
+    (rt, owner, receiver, ptr)
+}
+
+#[test]
+fn selective_receive_rejected_pointer_candidate_takes_no_hold() {
+    use crate::vm::ActorVmCallbacks;
+
+    let (mut rt, _owner, receiver, ptr) = selective_receive_pointer_fixture();
+    let before = unsafe { (*ActorHeap::header_of(ptr)).foreign_count };
+    assert_eq!(rt.actors[&receiver].orca_gc.held_ref_count(), 0);
+
+    let mut callbacks = BytecodeRuntimeCallbacks::new(&mut rt as *mut Runtime, receiver);
+    let first = callbacks
+        .try_receive_match(&[0])
+        .expect("pointer-bearing candidate");
+    assert_eq!(first.1[0].as_ptr(), Some(ptr));
+    assert_eq!(
+        unsafe { (*ActorHeap::header_of(ptr)).foreign_count },
+        before
+    );
+    assert_eq!(rt.actors[&receiver].orca_gc.held_ref_count(), 0);
+
+    // A second scan represents guard rejection of the first candidate. The
+    // same queued message must be skipped, not re-held.
+    assert!(callbacks.try_receive_match(&[0]).is_none());
+    assert_eq!(
+        unsafe { (*ActorHeap::header_of(ptr)).foreign_count },
+        before
+    );
+    assert_eq!(rt.actors[&receiver].orca_gc.held_ref_count(), 0);
+
+    callbacks.reset_receive_match();
+    assert!(callbacks.try_receive_match(&[0]).is_some());
+    assert_eq!(
+        unsafe { (*ActorHeap::header_of(ptr)).foreign_count },
+        before
+    );
+    assert_eq!(rt.actors[&receiver].orca_gc.held_ref_count(), 0);
+}
+
+#[test]
+fn selective_receive_commit_establishes_exactly_one_receiver_hold() {
+    use crate::vm::ActorVmCallbacks;
+
+    let (mut rt, _owner, receiver, ptr) = selective_receive_pointer_fixture();
+    let before = unsafe { (*ActorHeap::header_of(ptr)).foreign_count };
+
+    let mut callbacks = BytecodeRuntimeCallbacks::new(&mut rt as *mut Runtime, receiver);
+    assert!(callbacks.try_receive_match(&[0]).is_some());
+    callbacks.commit_receive_match();
+
+    assert_eq!(rt.actors[&receiver].mailbox.len(), 0);
+    assert_eq!(rt.actors[&receiver].orca_gc.held_ref_count(), 1);
+    assert_eq!(
+        unsafe { (*ActorHeap::header_of(ptr)).foreign_count },
+        before + 1,
+        "commit adds one receiver hold"
+    );
+
+    // Settle the original in-flight send, leaving only the receiver hold.
+    rt.process_gc_ops();
+    assert_eq!(unsafe { (*ActorHeap::header_of(ptr)).foreign_count }, 1);
+    rt.release_held_foreign_refs(receiver);
+    assert_eq!(unsafe { (*ActorHeap::header_of(ptr)).foreign_count }, 0);
+    assert_eq!(rt.actors[&receiver].orca_gc.held_ref_count(), 0);
+}
+
+#[test]
+fn selective_receive_reset_preserves_pointer_ownership_and_message() {
+    use crate::vm::ActorVmCallbacks;
+
+    let (mut rt, _owner, receiver, ptr) = selective_receive_pointer_fixture();
+    let before = unsafe { (*ActorHeap::header_of(ptr)).foreign_count };
+
+    let mut callbacks = BytecodeRuntimeCallbacks::new(&mut rt as *mut Runtime, receiver);
+    assert!(callbacks.try_receive_match(&[0]).is_some());
+    callbacks.reset_receive_match();
+
+    assert_eq!(rt.actors[&receiver].mailbox.len(), 1);
+    assert_eq!(rt.actors[&receiver].orca_gc.held_ref_count(), 0);
+    assert_eq!(
+        unsafe { (*ActorHeap::header_of(ptr)).foreign_count },
+        before
+    );
+    assert!(callbacks.try_receive_match(&[0]).is_some());
+}

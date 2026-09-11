@@ -442,6 +442,11 @@ impl OrcaGc {
         std::mem::take(&mut self.held_foreign_refs)
     }
 
+    #[cfg(test)]
+    pub(crate) fn held_ref_count(&self) -> usize {
+        self.held_foreign_refs.len()
+    }
+
     /// Process a foreign ref operation delivered from another actor.
     ///
     /// Applies `op.delta` to the target object's `foreign_count`.  If the
