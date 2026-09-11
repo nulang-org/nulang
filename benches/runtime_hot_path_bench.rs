@@ -3,6 +3,8 @@
 //! These isolate the mechanisms that dominate actor turns before broader
 //! runtime benchmarks add VM dispatch, behavior execution, persistence, and
 //! GC coordination noise.
+//!
+//! Run with: `cargo bench --bench bench_main -- runtime_hot_path`
 
 use criterion::{black_box, criterion_group, BenchmarkId, Criterion, Throughput};
 use nulang::iso_arena::IsoArena;
