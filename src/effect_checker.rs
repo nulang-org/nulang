@@ -1382,8 +1382,7 @@ impl<'a> DurableEffectWalker<'a> {
                 args,
                 span,
             } => {
-                if is_forbidden_in_durable(effect, op) && !is_handled_by_user(effect, op, handled)
-                {
+                if is_forbidden_in_durable(effect, op) && !is_handled_by_user(effect, op, handled) {
                     return Err(NuError::EffectError {
                         msg: format!(
                             "workflow '{wf}' step '{step}': effect '{effect}.{op}' is not allowed in durable steps — a step re-run after a crash (signal/LLM suspend) would execute it again with different results; handle it locally with `handle ... with` (deterministic implementation) or move it outside the workflow"
@@ -1398,9 +1397,7 @@ impl<'a> DurableEffectWalker<'a> {
                 }
                 Ok(())
             }
-            Expr::Handle {
-                body, handlers, ..
-            } => {
+            Expr::Handle { body, handlers, .. } => {
                 // Performs inside the handled body that an arm binds are
                 // intercepted by user code — extend the handled set for the
                 // body walk only.
@@ -1552,9 +1549,7 @@ impl<'a> DurableEffectWalker<'a> {
                 self.walk(wf, step, left, handled)?;
                 self.walk(wf, step, right, handled)
             }
-            Expr::For {
-                iterable, body, ..
-            } => {
+            Expr::For { iterable, body, .. } => {
                 self.walk(wf, step, iterable, handled)?;
                 self.walk(wf, step, body, handled)
             }
@@ -2382,9 +2377,7 @@ impl CapabilityAnalyzer {
             // exactly-once obligation for bindings used only inside arms —
             // previously arms were never walked, so a `g(x)` in an arm plus a
             // `g(x)` after `resume` both passed.
-            Expr::Handle {
-                body, handlers, ..
-            } => {
+            Expr::Handle { body, handlers, .. } => {
                 let base = consumed.clone();
                 for h in handlers {
                     let mut arm_consumed = base.clone();
