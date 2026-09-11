@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::primitives::ActorRole;
 use crate::types::ExitReason;
 
 use tracing::warn;
@@ -371,7 +372,19 @@ impl Supervisor {
                 template.compensation_offsets.clone(),
             );
         }
-        let is_workflow = new_actor.is_workflow;
+        let role = match new_actor.role() {
+            Ok(role) => role,
+            Err(error) => {
+                warn!(
+                    supervisor = %self.name,
+                    child = %spec.id,
+                    %error,
+                    "refusing to restart child with conflicting role metadata"
+                );
+                return None;
+            }
+        };
+        let is_workflow = matches!(role, ActorRole::Workflow);
         runtime.actors.insert(new_id, new_actor);
         // Register CRDT-backed fields with the CrdtManager.
         if let Some(ref mut mgr) = runtime.crdt_manager {
