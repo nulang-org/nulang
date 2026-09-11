@@ -122,6 +122,23 @@ impl crate::hir::ActorDef {
     }
 }
 
+impl crate::bytecode::ActorMeta {
+    /// Return the canonical role encoded in serialized actor metadata without
+    /// changing the bytecode format.
+    ///
+    /// Keeping this derivation identical to HIR is the first migration step
+    /// toward replacing four serialized booleans with one versioned role
+    /// field in a future format revision.
+    pub fn role(&self) -> Result<ActorRole, ActorRoleConflict> {
+        ActorRole::from_flags(
+            self.is_workflow,
+            self.is_agent,
+            self.is_organization,
+            self.is_virtual,
+        )
+    }
+}
+
 /// Durability boundary for a side effect.
 ///
 /// This is deliberately narrower than an "exactly once" claim. Nulang can
@@ -181,5 +198,15 @@ mod tests {
     fn conflicting_roles_are_rejected() {
         assert!(ActorRole::from_flags(true, true, false, false).is_err());
         assert!(ActorRole::from_flags(false, true, true, false).is_err());
+    }
+
+    #[test]
+    fn bytecode_metadata_uses_the_same_role_rules() {
+        let mut meta = crate::bytecode::ActorMeta::new("assistant");
+        meta.is_agent = true;
+        assert_eq!(meta.role(), Ok(ActorRole::Agent));
+
+        meta.is_workflow = true;
+        assert!(meta.role().is_err());
     }
 }
