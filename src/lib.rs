@@ -50,6 +50,7 @@ pub mod observability;
 pub mod package;
 pub mod parser;
 pub mod prelude_source;
+pub mod primitives;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod registry;
