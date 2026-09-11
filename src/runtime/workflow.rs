@@ -6,6 +6,7 @@
 //! to keep the god-object at a manageable size.
 
 use crate::bytecode::Constant;
+use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
@@ -22,7 +23,7 @@ pub(crate) fn next_sequence(rt: &Runtime, actor_id: u64) -> u64 {
 pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
     rt.actors
         .get(&actor_id)
-        .map(|a| a.is_workflow)
+        .map(|a| matches!(a.role(), Ok(ActorRole::Workflow)))
         .unwrap_or(false)
 }
 
@@ -109,11 +110,7 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
 /// event-sourced (non-workflow) actors the event is persisted to the event
 /// journal and a checkpoint is forced.
 pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
-    let is_workflow = rt
-        .actors
-        .get(&actor_id)
-        .map(|a| a.is_workflow)
-        .unwrap_or(false);
+    let is_workflow = actor_is_workflow(rt, actor_id);
     let seq = next_sequence(rt, actor_id);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.event_log.push((event.to_string(), args.to_vec()));
@@ -287,7 +284,7 @@ pub(crate) fn signal_workflow(
 /// Register a read-only query handler on a workflow actor.
 pub(crate) fn register_workflow_query(rt: &mut Runtime, actor_id: u64, name: &str, handler: Value) {
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        if actor.is_workflow {
+        if matches!(actor.role(), Ok(ActorRole::Workflow)) {
             actor.query_handlers.insert(name.to_string(), handler);
         }
     }
@@ -297,7 +294,7 @@ pub(crate) fn register_workflow_query(rt: &mut Runtime, actor_id: u64, name: &st
 pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Option<Value> {
     let (handler, module) = {
         let actor = rt.actors.get(&actor_id)?;
-        if !actor.is_workflow {
+        if !matches!(actor.role(), Ok(ActorRole::Workflow)) {
             return None;
         }
         let handler = *actor.query_handlers.get(name)?;
