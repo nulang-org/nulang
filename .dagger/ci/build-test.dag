@@ -2,6 +2,9 @@
 
 # Portable equivalent of the Build & Test GitHub Actions job.
 # Run locally with: dagger .dagger/ci/build-test.dag
+#
+# Major stages capture verbose Cargo output and print a bounded tail only on
+# failure. This keeps CI diagnostics readable without changing gate semantics.
 
 src=$(host | directory . --exclude .git --exclude target --exclude test-pkg)
 
@@ -15,9 +18,9 @@ container |
   with-directory /src $src |
   with-workdir /src |
   with-mounted-cache /tmp/cargo-target nulang-cargo-target |
-  with-exec -- cargo build --all-targets |
-  with-exec -- bash -lc 'cargo test || (echo "Retrying test suite after flaky failure..." && cargo test)' |
-  with-exec -- cargo llvm-cov --all-features --lcov --output-path /src/lcov.info |
-  with-exec -- python3 scripts/verify_implementation.py |
+  with-exec -- bash -lc 'log=$(mktemp); if cargo build --all-targets >"$log" 2>&1; then echo "=== STAGE PASSED: build ==="; else rc=$?; echo "=== STAGE FAILED: build ==="; tail -n 160 "$log"; exit "$rc"; fi' |
+  with-exec -- bash -lc 'first=$(mktemp); if cargo test >"$first" 2>&1; then echo "=== STAGE PASSED: test ==="; else echo "=== STAGE RETRY: test ==="; tail -n 80 "$first"; second=$(mktemp); if cargo test >"$second" 2>&1; then echo "=== STAGE PASSED: test (retry) ==="; else rc=$?; echo "=== STAGE FAILED: test (retry) ==="; tail -n 160 "$second"; exit "$rc"; fi; fi' |
+  with-exec -- bash -lc 'log=$(mktemp); if cargo llvm-cov --all-features --lcov --output-path /src/lcov.info >"$log" 2>&1; then echo "=== STAGE PASSED: coverage ==="; else rc=$?; echo "=== STAGE FAILED: coverage ==="; tail -n 160 "$log"; exit "$rc"; fi' |
+  with-exec -- bash -lc 'log=$(mktemp); if python3 scripts/verify_implementation.py >"$log" 2>&1; then echo "=== STAGE PASSED: implementation gate ==="; else rc=$?; echo "=== STAGE FAILED: implementation gate ==="; tail -n 200 "$log"; exit "$rc"; fi' |
   file /src/lcov.info |
   export ./lcov.info
