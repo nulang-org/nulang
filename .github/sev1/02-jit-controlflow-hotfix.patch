@@ -1,0 +1,89 @@
+diff --git a/src/jit/typed_compiler.rs b/src/jit/typed_compiler.rs
+--- a/src/jit/typed_compiler.rs
++++ b/src/jit/typed_compiler.rs
+@@
+-/// Opcodes the typed compiler knows how to emit.
++/// Opcodes the typed compiler knows how to emit soundly.
+ ///
+ /// This is deliberately a subset of `compiler::is_opcode_compilable`: the
+ /// typed compiler's catch-all arm jumps to the return block, so an
+ /// unsupported opcode in the middle of a region would silently drop the
+ /// remaining instructions. Callers must pre-check regions with this
+ /// function (as `compile_bytecode_region_typed` does) and fall back to the
+ /// scalar compiler for anything outside the set.
++///
++/// Control flow is intentionally excluded for now. `infer_reg_types` performs
++/// a proper per-PC CFG fixpoint, but `compile_bytecode_region_typed` receives
++/// only the entry-point `TypeMetadata` and then mutates one metadata object in
++/// linear bytecode order while emitting branches/backedges. Those linearly
++/// evolved facts are not sound at join points or on later loop iterations.
++/// Until codegen consumes per-PC metadata, any region containing a jump must
++/// use the scalar JIT, whose runtime helpers preserve the interpreter's tagged
++/// semantics. This is a correctness fallback, not a permanent optimization
++/// limitation.
+ pub fn is_opcode_supported_typed(op: OpCode) -> bool {
+@@
+-            | OpCode::Jmp
+-            | OpCode::JmpT
+-            | OpCode::JmpF
+             | OpCode::IToF
+             | OpCode::FToI
+             | OpCode::DbgPrint
+diff --git a/src/fuzz.rs b/src/fuzz.rs
+--- a/src/fuzz.rs
++++ b/src/fuzz.rs
+@@
+     fn differential_native_arithmetic_error_regressions() {
+@@
+     }
++
++    /// Control-flow regressions from differential campaigns. The typed JIT
++    /// must not use entry/linearized type facts across CFG joins/backedges
++    /// until it has per-PC metadata available during codegen.
++    #[test]
++    fn differential_jit_control_flow_regressions() {
++        let cases = [
++            // Historical minimized Sev-1 from the typed-JIT campaign:
++            // cold=964593, warm=0 when a loop-carried var update was lost.
++            r#"let i2 = { var fa0 = 0
++for x1 in [964593] { fa0 = fa0 + x1 }
++fa0 }
++i2"#,
++            // Straightforward loop-carried floating state. This also guards
++            // against reintroducing unsound type facts on a backedge.
++            "var i = 0.0; var s = 0.0; while i < 100.0 { s = s + i * 2.5; i = i + 1.0; }; s",
++        ];
++
++        for source in cases {
++            if let Err(msg) = differential_fuzz_one(source) {
++                panic!("JIT control-flow regression on {source:?}: {msg}");
++            }
++        }
++    }
+diff --git a/docs/PERFORMANCE_ANALYSIS.md b/docs/PERFORMANCE_ANALYSIS.md
+--- a/docs/PERFORMANCE_ANALYSIS.md
++++ b/docs/PERFORMANCE_ANALYSIS.md
+@@
+ ### Typed path (`src/jit/typed_compiler.rs`)
++
++**Correctness guard (2026-09-08):** typed guard stripping is currently
++restricted to straight-line regions. Regions containing `Jmp`/`JmpT`/`JmpF`
++fall back to the scalar JIT because the current typed codegen evolves one
++`TypeMetadata` value in lexical bytecode order; that is not a sound substitute
++for the per-PC CFG facts required at loop backedges and branch joins. Restore
++typed control-flow compilation only after codegen accepts per-PC metadata and
++the differential control-flow regressions stay green.
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@
+ ### Fixed since 1.0.0-frozen — 2026-09-08
++
++- **Tiered-JIT control-flow type-fact soundness**
++  (`src/jit/typed_compiler.rs`). Typed guard stripping no longer compiles
++  regions containing branches/backedges using a single metadata state evolved
++  in linear bytecode order. Such regions fall back to the scalar JIT until
++  codegen consumes the already-available per-PC CFG analysis. Deterministic
++  differential regressions pin loop-carried integer and floating state.
+ 
+ - **Native backend arithmetic-error parity** (`src/jit/runtime.rs`,

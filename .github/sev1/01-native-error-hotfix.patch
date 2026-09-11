@@ -1,0 +1,160 @@
+diff --git a/src/jit/runtime.rs b/src/jit/runtime.rs
+--- a/src/jit/runtime.rs
++++ b/src/jit/runtime.rs
+@@
+ /// Record an arithmetic runtime error for the AOT driver and yield nil
+-/// (compiled code cannot unwind; see `AOT_PENDING_ERROR`).
++/// (compiled code cannot unwind). The same helpers are shared by tiered JIT
++/// and standalone AOT, so route the error to the currently-active native
++/// execution channel instead of always poisoning the AOT slot.
+ fn record_arith_error(e: crate::types::NuError) -> u64 {
+     let msg = match e {
+         crate::types::NuError::RuntimeError { msg, .. } => msg,
+         other => other.to_string(),
+     };
+-    aot_set_pending_error(msg);
++    if get_jit_vm().is_null() {
++        aot_set_pending_error(msg);
++    } else {
++        set_jit_pending_vm_error(msg);
++    }
+     Value::nil().as_raw()
+ }
+@@
+ pub fn aot_set_pending_error(msg: String) {
+     AOT_PENDING_ERROR.with(|e| {
+-        *e.borrow_mut() = Some(msg);
++        // Preserve the first runtime error. Compiled code may continue long
++        // enough to execute another helper after the first fault; replacing
++        // the slot would report a secondary nil/type error instead of the
++        // operation that actually failed.
++        let mut slot = e.borrow_mut();
++        if slot.is_none() {
++            *slot = Some(msg);
++        }
+     });
+ }
+@@
+ pub fn set_jit_pending_vm_error(msg: String) {
+-    JIT_PENDING_VM_ERROR.with(|e| *e.borrow_mut() = Some(msg));
++    JIT_PENDING_VM_ERROR.with(|e| {
++        let mut slot = e.borrow_mut();
++        if slot.is_none() {
++            *slot = Some(msg);
++        }
++    });
+ }
+@@
+-    let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
++    // Re-entrant interpreter calls are nested inside a tiered-JIT region.
++    // Preserve the JIT error channel, not the unrelated standalone-AOT slot.
++    let pending_error = JIT_PENDING_VM_ERROR.with(|e| e.borrow().clone());
+@@
+-    AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.pending_error);
++    JIT_PENDING_VM_ERROR.with(|e| *e.borrow_mut() = s.pending_error);
+ }
+diff --git a/src/aot/mod.rs b/src/aot/mod.rs
+--- a/src/aot/mod.rs
++++ b/src/aot/mod.rs
+@@
+     pub fn run(&self) -> NuResult<u64> {
+@@
+         let ptr = self
+             .compiled_funcs
+             .get(idx)
+@@
+             })?;
+
++        // AOT arithmetic errors are thread-local because native helpers cannot
++        // unwind through generated code. A previous interrupted/older run must
++        // never contaminate this invocation. Normal successful/error exits
++        // consume the slot below; this defensive clear makes run boundaries
++        // explicit and protects callers that mix tiered JIT and AOT.
++        let _ = crate::jit::runtime::aot_take_pending_error();
++
+         // Set up standalone heap for AOT runtime helpers.
+         let mut heap = crate::runtime::heap::ActorHeap::new(1024 * 1024);
+diff --git a/src/aot/codegen.rs b/src/aot/codegen.rs
+--- a/src/aot/codegen.rs
++++ b/src/aot/codegen.rs
+@@
+         UnOp::Neg => {
+             if type_meta.is_known(reg as usize, KnownType::Int) {
+                 if mode == CompileMode::Unboxed {
+                     Ok(builder.ins().ineg(val))
+                 } else {
+-                    let payload = emit_sext48(builder, val);
+-                    let neg = builder.ins().ineg(payload);
+-                    Ok(emit_tag_int(builder, neg))
++                    // A statically-Int expression can still produce `nil` at
++                    // runtime (negative integer exponent, div/mod by zero).
++                    // Boxed mode therefore MUST retain the runtime tag check;
++                    // blindly sext48'ing nil turned `-(1 % 0)` and
++                    // `-3 ** -2` into integer 0 instead of the interpreter's
++                    // type error.
++                    call_helper(builder, helpers, "nulang_ineg", &[val])
+                 }
+             } else if type_meta.is_known(reg as usize, KnownType::Float) {
+diff --git a/src/fuzz.rs b/src/fuzz.rs
+--- a/src/fuzz.rs
++++ b/src/fuzz.rs
+@@
+     #[test]
+     fn fuzz_differential_quick() {
+@@
+     }
++
++    /// Regressions minimized from the 2026-09-08 nightly campaign, where all
++    /// ten shards failed. These must run directly on every PR rather than
++    /// relying on mutation probability to rediscover them.
++    #[test]
++    fn differential_native_arithmetic_error_regressions() {
++        let cases = [
++            // Boxed Int expressions whose inner operation yields nil.
++            "-3 ** -2",
++            "-(1 % 0)",
++            // Non-numeric negation must fault in both interpreter and native
++            // backends; first-error preservation keeps the original operand
++            // in diagnostics instead of a secondary neg(nil).
++            "-fn(x) { x + 1 }",
++            "--(1 + 2,)",
++            // Tiered JIT must surface helper errors through its own pending
++            // error channel instead of continuing with the helper's nil.
++            "fn pick(b) { if b then 1 else -1 }; pick(true) * pick(-false)",
++        ];
++
++        for source in cases {
++            if let Err(msg) = differential_fuzz_one(source) {
++                panic!("native arithmetic regression on {source:?}: {msg}");
++            }
++        }
++
++        // A JIT-side arithmetic fault used to write AOT_PENDING_ERROR; the
++        // next unrelated AOT run could then report that stale error. A clean
++        // scalar after the fault is an explicit cross-run isolation check.
++        differential_fuzz_one("0")
++            .unwrap_or_else(|msg| panic!("native error-slot contamination: {msg}"));
++    }
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@
+ ## Stable tier
+ 
+ *Breaking changes require an accepted RFC and a deprecation cycle of at least
+ two major versions.*
+ 
++### Fixed since 1.0.0-frozen — 2026-09-08
++
++- **Native backend arithmetic-error parity** (`src/jit/runtime.rs`,
++  `src/aot/mod.rs`, `src/aot/codegen.rs`). Tiered JIT arithmetic helpers now
++  report runtime faults through the JIT's existing pending-error channel
++  instead of contaminating the standalone-AOT slot; re-entrant JIT
++  save/restore preserves the correct channel; first error wins in both native
++  channels; AOT clears stale error state at each run boundary; and boxed
++  statically-Int negation retains its runtime tag check so nil-producing
++  integer operations cannot be miscompiled as zero. Deterministic regressions
++  cover the failures found by all ten shards of the 2026-09-08 differential
++  fuzz campaign.
++
+ ### Added since 1.0.0-frozen — 2026-08-22 (vscode extension)
