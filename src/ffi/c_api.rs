@@ -8,6 +8,7 @@
 //! and `NulangValue` types are `#[repr(C)]` and can be passed by pointer or
 //! by value across the FFI boundary.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 
 use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
@@ -25,6 +26,10 @@ use crate::vm::{Value, VM};
 #[repr(C)]
 pub struct NulangRuntime {
     modules: Vec<crate::bytecode::CodeModule>,
+    /// Source-hash -> first compiled module handle. Repeated compiles clone the
+    /// immutable compiled module into a fresh handle, preserving C API handle
+    /// semantics while skipping lex/parse/type/effect/MIR/codegen work.
+    compile_cache: HashMap<[u8; 32], usize>,
     last_error: Option<String>,
     /// Holds the CString backing `nulang_last_error`.
     error_cstring: Option<CString>,
@@ -36,6 +41,7 @@ impl NulangRuntime {
     fn new() -> Self {
         NulangRuntime {
             modules: Vec::new(),
+            compile_cache: HashMap::new(),
             last_error: None,
             error_cstring: None,
             string_cache: Vec::new(),
@@ -53,10 +59,25 @@ impl NulangRuntime {
 
     fn compile(&mut self, source: &str) -> Option<usize> {
         self.clear_error();
+
+        let source_hash = *blake3::hash(source.as_bytes()).as_bytes();
+        if let Some(&cached_handle) = self.compile_cache.get(&source_hash) {
+            if let Some(module) = self.modules.get(cached_handle).cloned() {
+                let handle = self.modules.len();
+                self.modules.push(module);
+                return Some(handle);
+            }
+            // The cache is internal and module handles are append-only, so a
+            // missing cached handle should be impossible. Fall through and
+            // repair the entry by recompiling rather than failing the FFI call.
+            self.compile_cache.remove(&source_hash);
+        }
+
         match compile_source(source) {
             Ok(module) => {
                 let handle = self.modules.len();
                 self.modules.push(module);
+                self.compile_cache.insert(source_hash, handle);
                 Some(handle)
             }
             Err(e) => {
@@ -401,6 +422,48 @@ mod tests {
         assert_eq!(nulang_value_int(value), 3);
 
         // SAFETY: rt is valid.
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_identical_source_reuses_compiled_module_with_fresh_handle() {
+        let rt = nulang_runtime_new();
+        assert!(!rt.is_null());
+
+        let source = CString::new("40 + 2").unwrap();
+        let first = unsafe { nulang_compile(rt, source.as_ptr()) };
+        let second = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(first >= 0 && second >= 0);
+        assert_ne!(first, second, "each compile call must retain fresh-handle semantics");
+
+        // SAFETY: rt is valid for the duration of this test.
+        let runtime = unsafe { &*rt };
+        assert_eq!(runtime.compile_cache.len(), 1);
+        assert_eq!(runtime.modules.len(), 2);
+        assert_eq!(runtime.modules[first as usize], runtime.modules[second as usize]);
+
+        let first_value = unsafe { nulang_run(rt, first) };
+        let second_value = unsafe { nulang_run(rt, second) };
+        assert_eq!(nulang_value_int(first_value), 42);
+        assert_eq!(nulang_value_int(second_value), 42);
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_different_source_creates_distinct_compile_cache_entries() {
+        let rt = nulang_runtime_new();
+        let first_source = CString::new("1 + 1").unwrap();
+        let second_source = CString::new("2 + 2").unwrap();
+
+        let first = unsafe { nulang_compile(rt, first_source.as_ptr()) };
+        let second = unsafe { nulang_compile(rt, second_source.as_ptr()) };
+        assert!(first >= 0 && second >= 0);
+
+        let runtime = unsafe { &*rt };
+        assert_eq!(runtime.compile_cache.len(), 2);
+        assert_ne!(runtime.modules[first as usize], runtime.modules[second as usize]);
+
         unsafe { nulang_runtime_free(rt) };
     }
 
