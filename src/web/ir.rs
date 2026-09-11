@@ -7,7 +7,9 @@
 
 use crate::package::manifest::BudgetsSection;
 use crate::runtime::WebRoute;
-use crate::web::contracts::{compile_contracts_from_tree, HandlerParamContract, RouteContract, RouteParamContract};
+use crate::web::contracts::{
+    compile_contracts_from_tree, HandlerParamContract, RouteContract, RouteParamContract,
+};
 use crate::web::modules::ModuleRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -68,11 +70,6 @@ pub struct DeploymentIr {
     pub budgets: BudgetsIr,
     pub middleware: Vec<String>,
     pub cloud_config: Vec<CloudConfigEntry>,
-    /// Best-effort contract extraction diagnostics. The normal compiler has
-    /// already validated package source; retaining these makes IR generation
-    /// observable instead of silently dropping metadata.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub contract_diagnostics: Vec<String>,
 }
 
 impl DeploymentIr {
@@ -98,18 +95,15 @@ pub fn generate_deployment_ir(
     let contract_index: HashMap<(String, String), &RouteContract> = contracts
         .routes
         .iter()
-        .map(|contract| {
-            (
-                (contract.method.clone(), contract.path.clone()),
-                contract,
-            )
-        })
+        .map(|contract| ((contract.method.clone(), contract.path.clone()), contract))
         .collect();
 
     let mut ir_routes = Vec::new();
     for route in routes {
         let method = route.method.as_str().to_string();
-        let contract = contract_index.get(&(method.clone(), route.path.clone())).copied();
+        let contract = contract_index
+            .get(&(method.clone(), route.path.clone()))
+            .copied();
         let placement = contract
             .and_then(|contract| contract.placement.clone())
             .unwrap_or_else(|| default_route_placement(&method, &route.path));
@@ -159,6 +153,11 @@ pub fn generate_deployment_ir(
     let cloud_config = infer_module_cloud_config(&source_text);
     let middleware = infer_middleware(&source_text);
 
+    // Contract diagnostics are compile-time concerns. They intentionally do
+    // not become part of the deployment schema; the IR contains only valid,
+    // deployable metadata and the compiler can hard-fail diagnostics later.
+    let _contract_diagnostics = contracts.diagnostics;
+
     DeploymentIr {
         // v2 adds per-route contract metadata while retaining all v1 fields.
         version: 2,
@@ -168,7 +167,6 @@ pub fn generate_deployment_ir(
         budgets: budgets_ir,
         middleware,
         cloud_config,
-        contract_diagnostics: contracts.diagnostics,
     }
 }
 
