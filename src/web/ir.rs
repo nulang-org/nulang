@@ -7,6 +7,7 @@
 
 use crate::package::manifest::BudgetsSection;
 use crate::runtime::WebRoute;
+use crate::web::bindings::{compile_route_bindings, RouteBindingContract};
 use crate::web::contracts::{
     compile_contracts_from_tree, HandlerParamContract, RouteContract, RouteParamContract,
 };
@@ -33,6 +34,10 @@ pub struct IrRoute {
     /// function signature without inventing an ambient request context.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handler_params: Vec<HandlerParamContract>,
+    /// Deterministic request-source to handler-slot bindings. Runtimes can
+    /// consume these directly instead of rediscovering name/position mapping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<RouteBindingContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,12 +103,17 @@ pub fn generate_deployment_ir(
         .map(|contract| ((contract.method.clone(), contract.path.clone()), contract))
         .collect();
 
+    let mut binding_diagnostics = Vec::new();
     let mut ir_routes = Vec::new();
     for route in routes {
         let method = route.method.as_str().to_string();
         let contract = contract_index
             .get(&(method.clone(), route.path.clone()))
             .copied();
+        let binding_compilation = contract.map(compile_route_bindings);
+        if let Some(compilation) = &binding_compilation {
+            binding_diagnostics.extend(compilation.diagnostics.iter().cloned());
+        }
         let placement = contract
             .and_then(|contract| contract.placement.clone())
             .unwrap_or_else(|| default_route_placement(&method, &route.path));
@@ -122,6 +132,9 @@ pub fn generate_deployment_ir(
             params: contract.map(|c| c.params.clone()).unwrap_or_default(),
             handler_params: contract
                 .map(|c| c.handler_params.clone())
+                .unwrap_or_default(),
+            bindings: binding_compilation
+                .map(|compilation| compilation.bindings)
                 .unwrap_or_default(),
             response_type: contract.and_then(|c| c.response_type.clone()),
             error_type: contract.and_then(|c| c.error_type.clone()),
@@ -153,10 +166,12 @@ pub fn generate_deployment_ir(
     let cloud_config = infer_module_cloud_config(&source_text);
     let middleware = infer_middleware(&source_text);
 
-    // Contract diagnostics are compile-time concerns. They intentionally do
-    // not become part of the deployment schema; the IR contains only valid,
-    // deployable metadata and the compiler can hard-fail diagnostics later.
+    // Contract/binding diagnostics are compile-time concerns. They
+    // intentionally do not become part of the deployment schema; the IR
+    // contains only deployable metadata and the compiler can hard-fail these
+    // diagnostics when the route pass moves into the typed frontend.
     let _contract_diagnostics = contracts.diagnostics;
+    let _binding_diagnostics = binding_diagnostics;
 
     DeploymentIr {
         // v2 adds per-route contract metadata while retaining all v1 fields.
