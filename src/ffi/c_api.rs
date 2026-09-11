@@ -25,10 +25,12 @@ use crate::vm::{Value, VM};
 /// An opaque runtime context that owns compiled modules and error state.
 #[repr(C)]
 pub struct NulangRuntime {
+    /// Unique compiled modules. Repeated source is stored only once.
     modules: Vec<crate::bytecode::CodeModule>,
-    /// Source-hash -> first compiled module handle. Repeated compiles clone the
-    /// immutable compiled module into a fresh handle, preserving C API handle
-    /// semantics while skipping lex/parse/type/effect/MIR/codegen work.
+    /// Public C handle -> unique module index. This preserves fresh-handle
+    /// semantics without deep-cloning a CodeModule for each repeated compile.
+    module_handles: Vec<usize>,
+    /// Source-hash -> unique compiled module index.
     compile_cache: HashMap<[u8; 32], usize>,
     last_error: Option<String>,
     /// Holds the CString backing `nulang_last_error`.
@@ -41,6 +43,7 @@ impl NulangRuntime {
     fn new() -> Self {
         NulangRuntime {
             modules: Vec::new(),
+            module_handles: Vec::new(),
             compile_cache: HashMap::new(),
             last_error: None,
             error_cstring: None,
@@ -57,28 +60,32 @@ impl NulangRuntime {
         self.error_cstring = None;
     }
 
+    fn fresh_handle_for(&mut self, module_index: usize) -> usize {
+        let handle = self.module_handles.len();
+        self.module_handles.push(module_index);
+        handle
+    }
+
     fn compile(&mut self, source: &str) -> Option<usize> {
         self.clear_error();
 
         let source_hash = *blake3::hash(source.as_bytes()).as_bytes();
-        if let Some(&cached_handle) = self.compile_cache.get(&source_hash) {
-            if let Some(module) = self.modules.get(cached_handle).cloned() {
-                let handle = self.modules.len();
-                self.modules.push(module);
-                return Some(handle);
+        if let Some(&module_index) = self.compile_cache.get(&source_hash) {
+            if self.modules.get(module_index).is_some() {
+                return Some(self.fresh_handle_for(module_index));
             }
-            // The cache is internal and module handles are append-only, so a
-            // missing cached handle should be impossible. Fall through and
-            // repair the entry by recompiling rather than failing the FFI call.
+            // The cache is internal and modules are append-only, so a missing
+            // module index should be impossible. Fall through and repair the
+            // entry by recompiling rather than failing the FFI call.
             self.compile_cache.remove(&source_hash);
         }
 
         match compile_source(source) {
             Ok(module) => {
-                let handle = self.modules.len();
+                let module_index = self.modules.len();
                 self.modules.push(module);
-                self.compile_cache.insert(source_hash, handle);
-                Some(handle)
+                self.compile_cache.insert(source_hash, module_index);
+                Some(self.fresh_handle_for(module_index))
             }
             Err(e) => {
                 self.set_error(e);
@@ -89,7 +96,8 @@ impl NulangRuntime {
 
     fn run(&mut self, module_handle: usize) -> Option<Value> {
         self.clear_error();
-        let module = self.modules.get(module_handle)?.clone();
+        let module_index = *self.module_handles.get(module_handle)?;
+        let module = self.modules.get(module_index)?.clone();
         let mut vm = VM::new();
         vm.load_module(module);
         match vm.run() {
@@ -442,10 +450,11 @@ mod tests {
         // SAFETY: rt is valid for the duration of this test.
         let runtime = unsafe { &*rt };
         assert_eq!(runtime.compile_cache.len(), 1);
-        assert_eq!(runtime.modules.len(), 2);
+        assert_eq!(runtime.modules.len(), 1);
+        assert_eq!(runtime.module_handles.len(), 2);
         assert_eq!(
-            runtime.modules[first as usize],
-            runtime.modules[second as usize]
+            runtime.module_handles[first as usize],
+            runtime.module_handles[second as usize]
         );
 
         let first_value = unsafe { nulang_run(rt, first) };
@@ -468,9 +477,10 @@ mod tests {
 
         let runtime = unsafe { &*rt };
         assert_eq!(runtime.compile_cache.len(), 2);
+        assert_eq!(runtime.modules.len(), 2);
         assert_ne!(
-            runtime.modules[first as usize],
-            runtime.modules[second as usize]
+            runtime.module_handles[first as usize],
+            runtime.module_handles[second as usize]
         );
 
         unsafe { nulang_runtime_free(rt) };
