@@ -52,9 +52,7 @@ fn classify_try_send<T>(
 ) -> Result<(), (T, ExecutorSendFailure)> {
     match result {
         Ok(()) => Ok(()),
-        Err(crossbeam::channel::TrySendError::Full(item)) => {
-            Err((item, ExecutorSendFailure::Full))
-        }
+        Err(crossbeam::channel::TrySendError::Full(item)) => Err((item, ExecutorSendFailure::Full)),
         Err(crossbeam::channel::TrySendError::Disconnected(item)) => {
             Err((item, ExecutorSendFailure::Disconnected))
         }
