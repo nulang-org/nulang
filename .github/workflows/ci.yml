@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# Superseded PR commits should not keep burning runner time. Main pushes are
+# deliberately not cancelled because the benchmark job below records rolling
+# history and should retain every main-branch sample.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   DAGGER_VERSION: v0.21.9
 

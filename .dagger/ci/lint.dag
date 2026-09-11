@@ -24,5 +24,5 @@ container |
   with-exec -- cargo audit |
   with-exec -- cargo check --all-features |
   with-exec -- cargo doc --no-deps |
-  with-exec -- bash -lc 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps 2>&1 || true' |
+  with-exec -- bash -c 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps 2>&1 || true' |
   sync
