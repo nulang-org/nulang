@@ -3221,10 +3221,22 @@ impl VM {
         unsafe {
             crate::jit::runtime::set_jit_vm(self_ptr);
         }
+        // Start each native JIT region with clean thread-local error state.
+        let _ = crate::jit::runtime::take_jit_pending_vm_error();
+        let _ = crate::jit::runtime::aot_take_pending_error();
         let action = jit.tiered_execute_step_typed(module_idx, pc, module, &mut regs, constants);
         crate::jit::runtime::clear_jit_vm();
         crate::jit::runtime::clear_jit_constants();
         crate::jit::runtime::clear_jit_callbacks();
+
+        // Compiled helpers may report through either channel. Consume both
+        // before another backend invocation can observe stale state.
+        let jit_error = crate::jit::runtime::take_jit_pending_vm_error();
+        let aot_error = crate::jit::runtime::aot_take_pending_error();
+        if let Some(msg) = jit_error.or(aot_error) {
+            self.jit_pending_error = Some(msg);
+            return true;
+        }
 
         if action != TieredAction::Interpret {
             for (i, bits) in regs.iter().enumerate() {

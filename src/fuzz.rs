@@ -816,6 +816,34 @@ pub(crate) enum DiffOutcome {
 mod tests {
     use super::*;
 
+    #[test]
+    fn differential_unary_negation_and_error_isolation_regressions() {
+        let cases = [
+            "--(1 + 2,)",
+            "-3 ** -2",
+            "-fn(x) { x + 1 }",
+            "fn pick(b) { if b then 1 else -1 }; pick(true) * pick(-false)",
+            "let f = fn(x) { x + 1 }; f(41)",
+            "let apply = fn(f, x) { f(x) }; apply(fn(x) { x + 5 }, 10)",
+            "0",
+        ];
+        for source in cases {
+            match differential_fuzz_one(source) {
+                Ok(DiffOutcome::Agreed { .. }) => {}
+                Ok(other) => panic!(
+                    "regression case not fully executed: {:?}: {:?}",
+                    source, other
+                ),
+                Err(msg) => panic!("backend divergence for {:?}: {}", source, msg),
+            }
+        }
+        match differential_fuzz_one("0") {
+            Ok(DiffOutcome::Agreed { .. }) => {}
+            Ok(other) => panic!("isolation sentinel not executed: {:?}", other),
+            Err(msg) => panic!("compiled error leaked into isolation sentinel: {}", msg),
+        }
+    }
+
     /// Quick differential fuzz: 300 iterations with a fixed seed, part of
     /// the default `cargo test --lib` run. Unlike `fuzz_typechecker_quick`
     /// (lex/parse/typecheck only), each iteration here compiles to
@@ -883,6 +911,55 @@ mod tests {
         }
     }
 
+    fn persist_differential_divergence(
+        artifact_dir: &std::path::Path,
+        shard_id: u64,
+        iteration: usize,
+        rng_state_before: u64,
+        rng_state_after_mutation: u64,
+        seed_index: usize,
+        seed: &str,
+        mutant: &str,
+        message: &str,
+    ) -> std::io::Result<std::path::PathBuf> {
+        std::fs::create_dir_all(artifact_dir)?;
+        let path = artifact_dir.join(format!("divergence-shard-{shard_id}-iter-{iteration}.txt"));
+        let body = format!(
+            "shard_id={shard_id}\niteration={iteration}\nrng_state_before=0x{rng_state_before:016x}\nrng_state_after_mutation=0x{rng_state_after_mutation:016x}\nseed_index={seed_index}\n\n--- corpus seed ---\n{seed}\n\n--- mutant ---\n{mutant}\n\n--- divergence ---\n{message}\n"
+        );
+        std::fs::write(&path, body)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn differential_divergence_artifact_contains_repro_metadata() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang-fuzz-artifact-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = persist_differential_divergence(
+            &dir,
+            7,
+            42,
+            0x0123_4567_89AB_CDEF,
+            0xFEDC_BA98_7654_3210,
+            3,
+            "seed source",
+            "mutant source",
+            "interpreter/AOT divergence",
+        )
+        .expect("write divergence artifact");
+        let artifact = std::fs::read_to_string(&path).expect("read divergence artifact");
+        assert!(artifact.contains("shard_id=7"));
+        assert!(artifact.contains("iteration=42"));
+        assert!(artifact.contains("rng_state_before=0x0123456789abcdef"));
+        assert!(artifact.contains("rng_state_after_mutation=0xfedcba9876543210"));
+        assert!(artifact.contains("seed_index=3"));
+        assert!(artifact.contains("--- corpus seed ---\nseed source"));
+        assert!(artifact.contains("--- mutant ---\nmutant source"));
+        assert!(artifact.contains("--- divergence ---\ninterpreter/AOT divergence"));
+        std::fs::remove_dir_all(&dir).expect("remove divergence artifact test dir");
+    }
+
     /// Extended differential fuzz (ignored by default — run explicitly or
     /// from a dedicated CI job): 30,000 iterations with a fixed seed by
     /// default. Shardable for a CI matrix via env vars so a scheduled
@@ -916,10 +993,15 @@ mod tests {
         let mut aot_agreed = 0usize;
         let mut wasm_agreed = 0usize;
         let mut uncomparable = 0usize;
+        let artifact_dir =
+            std::env::var_os("NULANG_FUZZ_ARTIFACT_DIR").map(std::path::PathBuf::from);
 
-        for _ in 0..iterations {
-            let seed = corpus[rng.index(&corpus)];
+        for iteration in 0..iterations {
+            let rng_state_before = rng.0;
+            let seed_index = rng.index(&corpus);
+            let seed = corpus[seed_index];
             let mutant = mutate(&mut rng, seed, &corpus);
+            let rng_state_after_mutation = rng.0;
             match differential_fuzz_one(&mutant) {
                 Ok(DiffOutcome::NothingToCompile) => {}
                 Ok(DiffOutcome::Uncomparable) => uncomparable += 1,
@@ -935,6 +1017,28 @@ mod tests {
                 Err(msg) => {
                     divergence_count += 1;
                     eprintln!("DIVERGENCE: {}", msg);
+                    if let Some(dir) = artifact_dir.as_deref() {
+                        match persist_differential_divergence(
+                            dir,
+                            shard_id,
+                            iteration,
+                            rng_state_before,
+                            rng_state_after_mutation,
+                            seed_index,
+                            seed,
+                            &mutant,
+                            &msg,
+                        ) {
+                            Ok(path) => eprintln!(
+                                "wrote deterministic divergence artifact: {}",
+                                path.display()
+                            ),
+                            Err(err) => eprintln!(
+                                "failed to write deterministic divergence artifact: {}",
+                                err
+                            ),
+                        }
+                    }
                     if divergence_count >= 10 {
                         panic!("Too many divergences ({}) — aborting", divergence_count);
                     }

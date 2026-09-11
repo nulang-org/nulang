@@ -205,14 +205,19 @@ pub extern "C" fn nulang_ineg(a: u64) -> u64 {
     }
 }
 
-/// Record an arithmetic runtime error for the AOT driver and yield nil
-/// (compiled code cannot unwind; see `AOT_PENDING_ERROR`).
+/// Record an arithmetic runtime error for the active compiled backend and
+/// yield nil. Native code cannot unwind, so JIT execution uses the JIT-region
+/// pending-error slot while standalone AOT execution uses the AOT slot.
 fn record_arith_error(e: crate::types::NuError) -> u64 {
     let msg = match e {
         crate::types::NuError::RuntimeError { msg, .. } => msg,
         other => other.to_string(),
     };
-    aot_set_pending_error(msg);
+    if get_jit_vm().is_null() {
+        aot_set_pending_error(msg);
+    } else {
+        set_jit_pending_vm_error(msg);
+    }
     Value::nil().as_raw()
 }
 
@@ -443,11 +448,16 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Record a runtime error for retrieval by the AOT driver (no-op semantics
-/// for the tiered JIT, which never inspects this slot).
+/// Record a compiled-runtime error for retrieval at the backend boundary.
+///
+/// Native code cannot unwind. Preserve the first error until the backend
+/// consumes it so operations on a nil sentinel cannot replace the cause.
 pub fn aot_set_pending_error(msg: String) {
     AOT_PENDING_ERROR.with(|e| {
-        *e.borrow_mut() = Some(msg);
+        let mut pending = e.borrow_mut();
+        if pending.is_none() {
+            *pending = Some(msg);
+        }
     });
 }
 
@@ -655,7 +665,12 @@ thread_local! {
 }
 
 pub fn set_jit_pending_vm_error(msg: String) {
-    JIT_PENDING_VM_ERROR.with(|e| *e.borrow_mut() = Some(msg));
+    JIT_PENDING_VM_ERROR.with(|e| {
+        let mut pending = e.borrow_mut();
+        if pending.is_none() {
+            *pending = Some(msg);
+        }
+    });
 }
 
 pub fn take_jit_pending_vm_error() -> Option<String> {
@@ -673,7 +688,8 @@ struct JitThreadState {
     safepoint: *mut u64,
     yield_pc: u64,
     branch_exit_pc: u64,
-    pending_error: Option<String>,
+    aot_pending_error: Option<String>,
+    jit_pending_error: Option<String>,
 }
 
 fn save_jit_thread_state() -> JitThreadState {
@@ -687,7 +703,8 @@ fn save_jit_thread_state() -> JitThreadState {
         JIT_YIELD_PC.with(|c| c.get()),
         JIT_BRANCH_EXIT_PC.with(|c| c.get()),
     );
-    let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
+    let aot_pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
+    let jit_pending_error = JIT_PENDING_VM_ERROR.with(|e| e.borrow().clone());
     JitThreadState {
         vm,
         constants,
@@ -695,7 +712,8 @@ fn save_jit_thread_state() -> JitThreadState {
         safepoint,
         yield_pc,
         branch_exit_pc,
-        pending_error,
+        aot_pending_error,
+        jit_pending_error,
     }
 }
 
@@ -708,7 +726,13 @@ fn restore_jit_thread_state(s: JitThreadState) {
     JIT_SAFEPOINT_PTR.with(|c| c.set(s.safepoint));
     JIT_YIELD_PC.with(|c| c.set(s.yield_pc));
     JIT_BRANCH_EXIT_PC.with(|c| c.set(s.branch_exit_pc));
-    AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.pending_error);
+    AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.aot_pending_error);
+    // A nested JIT region clears the JIT slot at its own entry. If the
+    // outer region already had an error, restore it because it happened
+    // first. If the outer slot was empty, leave any nested error intact.
+    if let Some(outer_error) = s.jit_pending_error {
+        JIT_PENDING_VM_ERROR.with(|e| *e.borrow_mut() = Some(outer_error));
+    }
 }
 
 /// Run a provably-non-suspending callee (function-table index `func_idx`) to
@@ -1476,9 +1500,14 @@ macro_rules! define_aot_make_closure {
         #[no_mangle]
         pub unsafe extern "C" fn $name(fn_idx: u64 $(, $cap: u64)*) -> u64 {
             let count: usize = 0 $(+ { let _ = stringify!($cap); 1 })*;
-            let Some(ptr) = alloc_obj(2 + count * 8, HeapTypeTag::Closure) else {
+            let payload_size = (2 + count) * std::mem::size_of::<u64>();
+            let Some(ptr) = alloc_obj(payload_size, HeapTypeTag::Closure) else {
                 return Value::nil().as_raw();
             };
+            debug_assert!(
+                crate::value_layout::ptr_fits_payload(ptr as u64),
+                "AOT closure pointer exceeds 48-bit value payload"
+            );
             let slot = ptr as *mut u64;
             *slot = fn_idx;
             *slot.add(1) = count as u64;
@@ -1486,7 +1515,7 @@ macro_rules! define_aot_make_closure {
             for (i, c) in caps.iter().enumerate() {
                 *slot.add(2 + i) = *c;
             }
-            (TAG_CLOSURE | ptr as u64)
+            TAG_CLOSURE | ((ptr as u64) & PAYLOAD_MASK)
         }
     };
 }
@@ -1606,38 +1635,54 @@ unsafe fn call_closure_dispatch(fn_ptr: u64, all: &[u64]) -> u64 {
 
 macro_rules! define_aot_call_closure {
     ($name:ident, $($arg:ident),*) => {
-        /// Invoke a closure value: an uncaptured closure is a tagged fn index
-        /// (dispatch with the explicit args only); a captured closure is a
-        /// TAG_CLOSURE object carrying fn_idx + captures (dispatch with
-        /// args + captures). Handles closures whose target is not statically
-        /// known at the call site (e.g. passed as a parameter).
+        /// Invoke a closure value. Uncaptured closures use the VM's
+        /// immediate representation (TAG_CLOSURE + function-index payload).
+        /// Captured AOT closures use TAG_CLOSURE + a heap-object pointer whose
+        /// payload is [fn_idx, cap_count, cap0..]. Handles closure values whose
+        /// target is not statically known at the call site.
         #[no_mangle]
         pub unsafe extern "C" fn $name(closure_raw: u64 $(, $arg: u64)*) -> u64 {
             let args = [$($arg),*];
+            if (closure_raw & TAG_MASK) != TAG_CLOSURE {
+                return Value::nil().as_raw();
+            }
+
+            let payload = closure_raw & PAYLOAD_MASK;
+            let immediate_fn = crate::aot::nulang_aot_resolve_fn(payload);
             let fn_ptr;
             let mut all: Vec<u64>;
-            if (closure_raw & TAG_MASK) == TAG_INT {
-                // Uncaptured closure: the tagged payload is the fn index.
-                let fn_idx = (closure_raw & PAYLOAD_MASK) as i64;
-                fn_ptr = crate::aot::nulang_aot_resolve_fn(fn_idx as u64);
+            if immediate_fn != 0 {
+                // Canonical zero-capture closure: payload is the function idx.
+                fn_ptr = immediate_fn;
                 all = Vec::with_capacity(args.len());
                 all.extend_from_slice(&args);
-            } else if (closure_raw & TAG_MASK) == TAG_CLOSURE {
-                // Captured closure object: [fn_idx, cap_count, cap0..].
-                let ptr = (closure_raw & PAYLOAD_MASK) as *mut u64;
+            } else {
+                // AOT captured closure object: [fn_idx, cap_count, cap0..].
+                let ptr = payload as *mut u64;
                 if ptr.is_null() {
+                    return Value::nil().as_raw();
+                }
+                let header = &*ActorHeap::header_of(ptr as *mut u8);
+                if header.type_tag != HeapTypeTag::Closure {
+                    return Value::nil().as_raw();
+                }
+                let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+                if payload_size < 2 * std::mem::size_of::<u64>() {
                     return Value::nil().as_raw();
                 }
                 let fn_idx = *ptr;
                 let cap_count = *ptr.add(1) as usize;
+                let required = (2usize.saturating_add(cap_count))
+                    .saturating_mul(std::mem::size_of::<u64>());
+                if required > payload_size {
+                    return Value::nil().as_raw();
+                }
                 fn_ptr = crate::aot::nulang_aot_resolve_fn(fn_idx);
                 all = Vec::with_capacity(args.len() + cap_count);
                 all.extend_from_slice(&args);
                 for i in 0..cap_count {
                     all.push(*ptr.add(2 + i));
                 }
-            } else {
-                return Value::nil().as_raw();
             }
             if fn_ptr == 0 {
                 return Value::nil().as_raw();
@@ -1948,5 +1993,116 @@ mod tests {
 
         super::aot_clear_constants();
         let _ = super::aot_take_heap();
+    }
+}
+
+#[cfg(test)]
+mod aot_closure_allocation_tests {
+    use super::*;
+
+    #[test]
+    fn aot_closure_helpers_reserve_full_payload() {
+        clear_jit_callbacks();
+        let _ = aot_take_heap();
+        aot_set_heap(crate::runtime::heap::ActorHeap::new(4096));
+
+        unsafe {
+            let first = nulang_aot_make_closure_0(11);
+            let second = nulang_aot_make_closure_0(22);
+            assert_eq!(first & TAG_MASK, TAG_CLOSURE);
+            assert_eq!(second & TAG_MASK, TAG_CLOSURE);
+
+            let first_ptr = (first & PAYLOAD_MASK) as *mut u64;
+            let second_ptr = (second & PAYLOAD_MASK) as *mut u64;
+            assert_eq!(*first_ptr, 11);
+            assert_eq!(*first_ptr.add(1), 0);
+            assert_eq!(*second_ptr, 22);
+            assert_eq!(*second_ptr.add(1), 0);
+
+            let captured =
+                nulang_aot_make_closure_2(33, Value::int(7).as_raw(), Value::int(9).as_raw());
+            let guard = nulang_aot_make_closure_0(44);
+            let captured_ptr = (captured & PAYLOAD_MASK) as *mut u64;
+            assert_eq!(*captured_ptr, 33);
+            assert_eq!(*captured_ptr.add(1), 2);
+            assert_eq!(*captured_ptr.add(2), Value::int(7).as_raw());
+            assert_eq!(*captured_ptr.add(3), Value::int(9).as_raw());
+            assert_eq!(guard & TAG_MASK, TAG_CLOSURE);
+        }
+
+        let _ = aot_take_heap();
+    }
+}
+
+#[cfg(test)]
+mod compiled_error_ordering_tests {
+    use super::*;
+
+    #[test]
+    fn jit_runtime_preserves_first_error_across_arithmetic_and_direct_calls() {
+        let _ = take_jit_pending_vm_error();
+        let _ = aot_take_pending_error();
+
+        let mut vm = crate::vm::VM::new_without_jit();
+        unsafe {
+            set_jit_vm(&mut vm as *mut crate::vm::VM);
+        }
+
+        // Arithmetic fails first; a later direct-call failure must not replace it.
+        assert_eq!(
+            nulang_ineg(Value::bool(false).as_raw()),
+            Value::nil().as_raw()
+        );
+        set_jit_pending_vm_error("later direct-call failure".to_string());
+        let first = take_jit_pending_vm_error().expect("JIT arithmetic error should be pending");
+        assert!(
+            first.contains("arithmetic `neg`"),
+            "unexpected first error: {first}"
+        );
+        assert!(first.contains("false"), "unexpected first error: {first}");
+        assert!(aot_take_pending_error().is_none());
+
+        // Direct-call failure first; later arithmetic must not replace it either.
+        set_jit_pending_vm_error("first direct-call failure".to_string());
+        assert_eq!(
+            nulang_ineg(Value::bool(false).as_raw()),
+            Value::nil().as_raw()
+        );
+        assert_eq!(
+            take_jit_pending_vm_error().as_deref(),
+            Some("first direct-call failure")
+        );
+        assert!(aot_take_pending_error().is_none());
+
+        clear_jit_vm();
+    }
+}
+
+#[cfg(test)]
+mod nested_jit_error_state_tests {
+    use super::*;
+
+    #[test]
+    fn reentrant_jit_state_preserves_chronological_first_error() {
+        let _ = take_jit_pending_vm_error();
+        let _ = aot_take_pending_error();
+
+        // Simulate an outer compiled arithmetic failure followed by a
+        // re-entrant direct call that reaches a nested hot JIT region.
+        set_jit_pending_vm_error("outer error".to_string());
+        let saved = save_jit_thread_state();
+        let _ = take_jit_pending_vm_error(); // nested JIT clean-at-entry
+        set_jit_pending_vm_error("nested error".to_string());
+        restore_jit_thread_state(saved);
+        assert_eq!(take_jit_pending_vm_error().as_deref(), Some("outer error"));
+
+        // With no outer error, a nested error must still propagate.
+        let saved = save_jit_thread_state();
+        set_jit_pending_vm_error("nested-only error".to_string());
+        restore_jit_thread_state(saved);
+        assert_eq!(
+            take_jit_pending_vm_error().as_deref(),
+            Some("nested-only error")
+        );
     }
 }

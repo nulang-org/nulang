@@ -45,6 +45,26 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fixed since 1.0.0-frozen — 2026-09-10 (compiled backend correctness)
+
+- **JIT/AOT runtime-error isolation** (`src/jit/runtime.rs`, `src/vm.rs`,
+  `src/aot/mod.rs`): compiled invocations now clear and consume pending native
+  error state at backend boundaries and preserve the first runtime failure
+  across arithmetic helpers, re-entrant JIT direct calls, and nested JIT
+  regions, preventing one execution from contaminating the next or a later
+  callee error from masking the original failure.
+- **AOT unary-negation and closure parity** (`src/aot/codegen.rs`): boxed
+  integer negation uses the checked runtime helper when a nominally-`Int`
+  operation can yield `nil`; capture-free first-class closures now use the
+  canonical `TAG_CLOSURE` representation instead of masquerading as tagged
+  function-index integers, with exact payload sizing for closure headers and
+  captures. This restores interpreter/JIT/AOT parity for
+  invalid negation while retaining direct-call optimization metadata.
+- **Deterministic nightly fuzz evidence** (`src/fuzz.rs`,
+  `.github/workflows/fuzz-nightly.yml`): failed shards preserve the full cargo
+  log plus per-divergence shard, iteration, RNG state, corpus seed, mutant
+  source, and backend divergence diagnostic for replay and triage.
+
 ### Added since 1.0.0-frozen — 2026-08-22 (vscode extension)
 - **AOT backend error parity** (`src/aot/mod.rs`): the native AOT run path
   now surfaces interpreter-parity runtime errors (48-bit overflow, type

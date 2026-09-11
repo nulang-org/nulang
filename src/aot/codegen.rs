@@ -985,7 +985,8 @@ pub fn is_all_int(func: &mir::Function) -> bool {
                     mir::RValue::Binary(
                         crate::ast::BinOp::Div | crate::ast::BinOp::Mod | crate::ast::BinOp::Pow,
                         ..
-                    ) | mir::RValue::ArrayLit(_)
+                    ) | mir::RValue::Unary(crate::ast::UnOp::Neg, ..)
+                        | mir::RValue::ArrayLit(_)
                         | mir::RValue::ArrayLoad { .. }
                         | mir::RValue::ArrayLen(_)
                         | mir::RValue::Record(_)
@@ -2400,9 +2401,19 @@ fn compile_rvalue(
 
         mir::RValue::Closure { func, captures } => {
             if captures.is_empty() {
-                // Return tagged function index — also register for call resolution.
+                // Immediate closure representation is shared with the VM:
+                // TAG_CLOSURE with the function index in the 48-bit payload.
+                // Encoding this as TAG_INT makes a function value numeric;
+                // heap-allocating it makes immediate/dynamic closure semantics diverge.
                 let idx = builder.ins().iconst(types::I64, *func as i64);
-                Ok(emit_tag_int(builder, idx))
+                let mask = builder
+                    .ins()
+                    .iconst(types::I64, crate::value_layout::PAYLOAD_MASK as i64);
+                let payload = builder.ins().band(idx, mask);
+                let tag = builder
+                    .ins()
+                    .iconst(types::I64, crate::value_layout::TAG_CLOSURE as i64);
+                Ok(builder.ins().bor(payload, tag))
             } else {
                 // Allocate a closure object carrying the captured values and
                 // return it as a TAG_CLOSURE value. The lifted target function
@@ -3438,9 +3449,10 @@ fn compile_unary(
                 if mode == CompileMode::Unboxed {
                     Ok(builder.ins().ineg(val))
                 } else {
-                    let payload = emit_sext48(builder, val);
-                    let neg = builder.ins().ineg(payload);
-                    Ok(emit_tag_int(builder, neg))
+                    // Boxed values can still be nil even when MIR metadata says Int
+                    // (for example, a negative integer exponent). Preserve runtime
+                    // type/error semantics instead of re-tagging nil as integer zero.
+                    call_helper(builder, helpers, "nulang_ineg", &[val])
                 }
             } else if type_meta.is_known(reg as usize, KnownType::Float) {
                 let f = builder.ins().bitcast(types::F64, MemFlags::new(), val);
