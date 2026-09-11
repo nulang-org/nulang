@@ -1,17 +1,17 @@
-//! Work-stealing scheduler: Chase-Lev deque per worker thread.
+//! Priority-aware work-stealing scheduler built on Chase-Lev deques.
 //!
-//! Each worker thread maintains a local Chase-Lev deque for LIFO
-//! push/pop of actor IDs. When a worker's local deque is empty, it
-//! attempts to pull a batch from the priority-ordered global injector,
-//! then steals from other workers' deques (FIFO steal for load balancing).
+//! Each worker owns three local queues (High, Normal, Low). Keeping local
+//! queues split by priority lets the scheduler batch-transfer work out of the
+//! shared injectors without weakening the runtime's strict High > Normal > Low
+//! scheduling semantics. Within a priority, workers prefer local work, then
+//! batch from the global injector, then steal from peers.
 //!
 //! This design provides:
-//! - Lock-free local operations (push/pop on own deque)
-//! - Batched global-to-local transfers to reduce injector contention
-//! - Lock-free work stealing from other workers
-//! - Global overflow queues for newly spawned / requeued actors, split
-//!   by actor priority (High drains before Normal before Low)
-//! - Backoff and sleep for idle workers (avoids busy-waiting)
+//! - lock-free local push/pop on the owning worker
+//! - batched global-to-local transfers to reduce shared-injector contention
+//! - lock-free peer stealing for load balancing
+//! - strict priority across both global and worker-local queues
+//! - backoff and sleep for idle workers
 //!
 //! Based on the Chase-Lev algorithm (PPoPP 2005) as implemented by
 //! crossbeam::deque.
@@ -71,13 +71,12 @@ pub struct SchedulerStats {
     pub total_tasks_processed: u64,
     /// Tasks retrieved from the calling worker's own local deque.
     pub tasks_from_local_queue: u64,
-    /// Tasks retrieved directly from a global injector queue.
+    /// Tasks returned directly from a global injector queue.
     ///
-    /// Tasks transferred from a global injector into a worker deque by a
-    /// batched steal are counted here only for the item returned immediately;
-    /// the remaining items are counted as local-queue tasks when consumed.
+    /// A batched transfer counts only its immediately returned task here;
+    /// transferred remainder items count as local tasks when later consumed.
     pub tasks_from_global_queue: u64,
-    /// Tasks stolen from another worker's deque.
+    /// Tasks stolen from another worker's local deque.
     pub tasks_from_steal: u64,
     /// Individual `steal()` calls against another worker's deque.
     pub steal_attempts: u64,
@@ -87,11 +86,8 @@ pub struct SchedulerStats {
     pub empty_polls: u64,
 }
 
-/// Profiling counters touched by every worker thread. Padded to a cache
-/// line so a worker updating one counter doesn't invalidate the line holding
-/// another counter being read concurrently on a different core (false
-/// sharing). Monotonically increasing unless reset via
-/// [`Scheduler::reset_stats`].
+/// Profiling counters touched by worker threads. Padded to a cache line so
+/// counter traffic does not false-share with scheduler queue metadata.
 #[repr(align(64))]
 struct SchedulerStatsInternal {
     total_tasks_processed: AtomicU64,
@@ -127,70 +123,62 @@ impl SchedulerStatsInternal {
     }
 }
 
-/// A work-stealing scheduler with Chase-Lev deques.
+/// A strict-priority work-stealing scheduler with Chase-Lev deques.
 ///
-/// Created with a fixed number of worker slots. Each worker thread
-/// claims one slot and uses its local deque for LIFO operations.
-/// Stealing uses FIFO order to promote breadth-first execution.
-///
-/// Actor priority: the global injector is split into three priority
-/// queues (High/Normal/Low). Dequeue drains every High entry before any
-/// Normal, and every Normal before any Low — strict per-level preference
-/// (Erlang-like), FIFO within a level. A sustained stream of High work
-/// can therefore starve lower levels; priority is a scheduling hint for
-/// latency-sensitive actors, not a fairness mechanism (fairness comes
-/// from the per-turn reduction budget, which is unchanged).
-///
-/// Padded to a cache line so the lock-free `Injector`/`Worker` deques and
-/// the counters in `SchedulerStatsInternal` don't share cache lines across
-/// the worker threads that access them concurrently.
+/// Each worker has one local deque per actor priority. This matters because a
+/// single local queue would allow previously batched Low/Normal work to run in
+/// front of newly-arrived High work. Splitting the local queues preserves the
+/// same priority contract as the global injectors while still allowing batch
+/// transfers and cache-local dispatch.
 #[repr(align(64))]
 pub struct Scheduler {
-    /// Global overflow queue for High-priority actors.
     global_high: Injector<u64>,
-
-    /// Global overflow queue for Normal-priority actors (the default).
     global: Injector<u64>,
-
-    /// Global overflow queue for Low-priority actors.
     global_low: Injector<u64>,
 
-    /// Per-worker deques. Each worker has one Worker handle;
-    /// all other workers hold Stealer handles to it.
+    workers_high: Vec<Worker<u64>>,
     workers: Vec<Worker<u64>>,
+    workers_low: Vec<Worker<u64>>,
+
+    stealers_high: Vec<Stealer<u64>>,
     stealers: Vec<Stealer<u64>>,
+    stealers_low: Vec<Stealer<u64>>,
 
-    /// Number of worker threads this scheduler was configured for.
     worker_count: usize,
-
-    /// Total number of actors processed (statistics).
     processed_count: AtomicUsize,
-
-    /// Lightweight profiling counters.
     stats: SchedulerStatsInternal,
 }
 
 impl Scheduler {
-    /// Create a new work-stealing scheduler for `worker_count` threads.
-    ///
-    /// Each worker gets its own Chase-Lev deque. The global injector
-    /// handles overflow.
+    /// Create a scheduler with `worker_count` worker slots.
     pub fn new(worker_count: usize) -> Self {
-        let mut workers = Vec::with_capacity(worker_count);
-        let mut stealers = Vec::with_capacity(worker_count);
+        assert!(worker_count > 0, "scheduler worker_count must be >= 1");
 
-        for _ in 0..worker_count {
-            let w = Worker::new_fifo();
-            stealers.push(w.stealer());
-            workers.push(w);
+        fn make_band(count: usize) -> (Vec<Worker<u64>>, Vec<Stealer<u64>>) {
+            let mut workers = Vec::with_capacity(count);
+            let mut stealers = Vec::with_capacity(count);
+            for _ in 0..count {
+                let worker = Worker::new_fifo();
+                stealers.push(worker.stealer());
+                workers.push(worker);
+            }
+            (workers, stealers)
         }
 
-        Scheduler {
+        let (workers_high, stealers_high) = make_band(worker_count);
+        let (workers, stealers) = make_band(worker_count);
+        let (workers_low, stealers_low) = make_band(worker_count);
+
+        Self {
             global_high: Injector::new(),
             global: Injector::new(),
             global_low: Injector::new(),
+            workers_high,
             workers,
+            workers_low,
+            stealers_high,
             stealers,
+            stealers_low,
             worker_count,
             processed_count: AtomicUsize::new(0),
             stats: SchedulerStatsInternal {
@@ -205,45 +193,41 @@ impl Scheduler {
         }
     }
 
-    /// Push an actor ID onto the global injector queue at Normal priority.
-    ///
-    /// Used when:
-    /// - A new actor is spawned (no affinity yet)
-    /// - An actor is requeued after yielding / completing a message
-    /// - An actor is woken from a timer or I/O event
-    ///
-    /// The next worker to need work will pick this actor up from the
-    /// global queue or steal it via FIFO from another worker.
-    pub fn enqueue(&self, actor_id: u64) {
-        self.enqueue_with_priority(actor_id, ActorPriority::Normal);
-    }
-
-    /// Push an actor ID onto the global queue for its priority level.
-    ///
-    /// Dequeue preference is strict per level — all High entries drain
-    /// before any Normal, all Normal before any Low — and FIFO within a
-    /// level. The runtime reads the priority off the actor at enqueue
-    /// time, so a priority change takes effect on the actor's next
-    /// (re)queue.
-    pub fn enqueue_with_priority(&self, actor_id: u64, priority: ActorPriority) {
+    #[inline]
+    fn global_for(&self, priority: ActorPriority) -> &Injector<u64> {
         match priority {
-            ActorPriority::High => self.global_high.push(actor_id),
-            ActorPriority::Normal => self.global.push(actor_id),
-            ActorPriority::Low => self.global_low.push(actor_id),
+            ActorPriority::High => &self.global_high,
+            ActorPriority::Normal => &self.global,
+            ActorPriority::Low => &self.global_low,
         }
     }
 
-    /// Push an actor ID onto a specific worker's local deque.
-    ///
-    /// Used for actor affinity — if an actor was just processed by
-    /// worker N, requeue it to worker N's local deque for cache
-    /// locality (LIFO = hot actor stays hot).
-    pub fn enqueue_local(&self, worker_idx: usize, actor_id: u64) {
-        if worker_idx < self.workers.len() {
-            self.workers[worker_idx].push(actor_id);
-        } else {
-            self.global.push(actor_id);
+    #[inline]
+    fn workers_for(&self, priority: ActorPriority) -> &[Worker<u64>] {
+        match priority {
+            ActorPriority::High => &self.workers_high,
+            ActorPriority::Normal => &self.workers,
+            ActorPriority::Low => &self.workers_low,
         }
+    }
+
+    #[inline]
+    fn stealers_for(&self, priority: ActorPriority) -> &[Stealer<u64>] {
+        match priority {
+            ActorPriority::High => &self.stealers_high,
+            ActorPriority::Normal => &self.stealers,
+            ActorPriority::Low => &self.stealers_low,
+        }
+    }
+
+    #[inline]
+    fn record_local_task(&self) {
+        self.stats
+            .total_tasks_processed
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .tasks_from_local_queue
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -256,103 +240,144 @@ impl Scheduler {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Steal one task from the priority-ordered global queues: every High
-    /// entry drains before any Normal, every Normal before any Low (FIFO
-    /// within a level). All three count toward `tasks_from_global_queue`.
-    fn steal_global(&self) -> Option<u64> {
-        for queue in [&self.global_high, &self.global, &self.global_low] {
-            loop {
-                match queue.steal() {
-                    Steal::Success(task) => {
-                        self.record_global_task();
-                        return Some(task);
-                    }
-                    Steal::Retry => std::hint::spin_loop(),
-                    Steal::Empty => break,
-                }
-            }
-        }
-        None
+    #[inline]
+    fn record_stolen_task(&self, attempts: u64) {
+        self.stats
+            .total_tasks_processed
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats.tasks_from_steal.fetch_add(1, Ordering::Relaxed);
+        self.stats.steal_successes.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .steal_attempts
+            .fetch_add(attempts, Ordering::Relaxed);
     }
 
-    /// Pull work from the global injector into a worker-local deque and
-    /// return one task immediately.
+    /// Push an actor at Normal priority.
+    pub fn enqueue(&self, actor_id: u64) {
+        self.enqueue_with_priority(actor_id, ActorPriority::Normal);
+    }
+
+    /// Push an actor onto the global injector for its priority.
+    pub fn enqueue_with_priority(&self, actor_id: u64, priority: ActorPriority) {
+        self.global_for(priority).push(actor_id);
+    }
+
+    /// Push onto a worker's Normal-priority local queue.
     ///
-    /// `Injector::steal_batch_and_pop` moves roughly half of the selected
-    /// injector queue into the worker deque in one synchronization operation.
-    /// Subsequent scheduler iterations therefore hit the cheap local deque
-    /// instead of contending on the shared injector for every actor. Priority
-    /// ordering is preserved when choosing which global queue to batch from.
-    fn steal_global_batch(&self, worker_idx: usize) -> Option<u64> {
-        let Some(worker) = self.workers.get(worker_idx) else {
-            return self.steal_global();
+    /// Retained for compatibility with existing callers. Priority-aware code
+    /// should use [`Scheduler::enqueue_local_with_priority`].
+    pub fn enqueue_local(&self, worker_idx: usize, actor_id: u64) {
+        self.enqueue_local_with_priority(worker_idx, actor_id, ActorPriority::Normal);
+    }
+
+    /// Push an actor onto a specific worker's local queue for its priority.
+    pub fn enqueue_local_with_priority(
+        &self,
+        worker_idx: usize,
+        actor_id: u64,
+        priority: ActorPriority,
+    ) {
+        if let Some(worker) = self.workers_for(priority).get(worker_idx) {
+            worker.push(actor_id);
+        } else {
+            self.global_for(priority).push(actor_id);
+        }
+    }
+
+    /// Try the worker-local queue for one priority.
+    fn pop_local(&self, worker_idx: usize, priority: ActorPriority) -> Option<u64> {
+        let task = self.workers_for(priority).get(worker_idx)?.pop()?;
+        self.record_local_task();
+        Some(task)
+    }
+
+    /// Steal one item from a global priority queue without a worker-local
+    /// destination. Used by external event loops and `steal_one`.
+    fn steal_global_for(&self, priority: ActorPriority) -> Option<u64> {
+        loop {
+            match self.global_for(priority).steal() {
+                Steal::Success(task) => {
+                    self.record_global_task();
+                    return Some(task);
+                }
+                Steal::Retry => std::hint::spin_loop(),
+                Steal::Empty => return None,
+            }
+        }
+    }
+
+    /// Batch work from one global priority queue into the matching worker-local
+    /// queue and return one task immediately.
+    fn steal_global_batch_for(&self, worker_idx: usize, priority: ActorPriority) -> Option<u64> {
+        let Some(worker) = self.workers_for(priority).get(worker_idx) else {
+            return self.steal_global_for(priority);
         };
 
-        for queue in [&self.global_high, &self.global, &self.global_low] {
+        loop {
+            match self.global_for(priority).steal_batch_and_pop(worker) {
+                Steal::Success(task) => {
+                    self.record_global_task();
+                    return Some(task);
+                }
+                Steal::Retry => std::hint::spin_loop(),
+                Steal::Empty => return None,
+            }
+        }
+    }
+
+    /// Steal from another worker's local queue within a single priority band.
+    fn steal_peer_for(
+        &self,
+        worker_idx: usize,
+        priority: ActorPriority,
+    ) -> (Option<u64>, u64) {
+        let stealers = self.stealers_for(priority);
+        let mut attempts = 0u64;
+
+        for i in 0..stealers.len() {
+            let steal_idx = (worker_idx + i + 1) % stealers.len();
+            if steal_idx == worker_idx {
+                continue;
+            }
+            attempts += 1;
             loop {
-                match queue.steal_batch_and_pop(worker) {
-                    Steal::Success(task) => {
-                        self.record_global_task();
-                        return Some(task);
-                    }
+                match stealers[steal_idx].steal() {
+                    Steal::Success(task) => return (Some(task), attempts),
                     Steal::Retry => std::hint::spin_loop(),
                     Steal::Empty => break,
                 }
             }
         }
-        None
+
+        (None, attempts)
     }
 
-    /// Pop the next actor ID for the given worker.
+    /// Pop the next actor for a worker while preserving strict priority.
     ///
-    /// Tries in order:
-    /// 1. Worker's own local deque (LIFO — hot cache; not priority-aware)
-    /// 2. Global injector queues (High, then Normal, then Low), batching
-    ///    additional work into the local deque
-    /// 3. Steal from other workers' deques (FIFO — load balancing)
+    /// For each priority band in High → Normal → Low order:
+    /// 1. consume worker-local work,
+    /// 2. batch from that priority's global injector,
+    /// 3. steal from peers in that priority.
     ///
-    /// Returns `None` if no work is available across all sources.
+    /// This ordering is the key invariant that makes batch transfer safe: a
+    /// previously batched Low task can never run before currently available
+    /// High or Normal work.
     pub fn next_task(&self, worker_idx: usize) -> Option<u64> {
-        // 1. Try local deque first (LIFO — cache hot)
-        if worker_idx < self.workers.len() {
-            if let Some(task) = self.workers[worker_idx].pop() {
-                self.stats
-                    .total_tasks_processed
-                    .fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .tasks_from_local_queue
-                    .fetch_add(1, Ordering::Relaxed);
+        let mut steal_attempts = 0u64;
+
+        for priority in [ActorPriority::High, ActorPriority::Normal, ActorPriority::Low] {
+            if let Some(task) = self.pop_local(worker_idx, priority) {
                 return Some(task);
             }
-        }
 
-        // 2. Pull a batch from the highest-priority non-empty global injector.
-        //    The returned item counts as global; the remainder are consumed
-        //    from the worker-local deque on subsequent iterations.
-        if let Some(task) = self.steal_global_batch(worker_idx) {
-            return Some(task);
-        }
-
-        // 3. Steal from other workers (FIFO — promotes breadth-first)
-        //    We iterate in a different order per worker to reduce
-        //    contention (each worker starts stealing from a different
-        //    neighbor).
-        let mut steal_attempts: u64 = 0;
-        for i in 0..self.stealers.len() {
-            let steal_idx = (worker_idx + i + 1) % self.stealers.len();
-            if steal_idx == worker_idx {
-                continue; // Don't steal from self
+            if let Some(task) = self.steal_global_batch_for(worker_idx, priority) {
+                return Some(task);
             }
-            steal_attempts += 1;
-            if let Steal::Success(task) = self.stealers[steal_idx].steal() {
-                self.stats
-                    .total_tasks_processed
-                    .fetch_add(1, Ordering::Relaxed);
-                self.stats.tasks_from_steal.fetch_add(1, Ordering::Relaxed);
-                self.stats.steal_successes.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .steal_attempts
-                    .fetch_add(steal_attempts, Ordering::Relaxed);
+
+            let (task, attempts) = self.steal_peer_for(worker_idx, priority);
+            steal_attempts += attempts;
+            if let Some(task) = task {
+                self.record_stolen_task(steal_attempts);
                 return Some(task);
             }
         }
@@ -364,38 +389,43 @@ impl Scheduler {
         None
     }
 
-    /// Pop the next task from the scheduler.
+    /// Pop the next task for the runtime scheduler thread.
     ///
-    /// Alias for `steal_one` — used by the runtime's scheduler loop.
+    /// Runtime shards currently have one owning scheduler thread; worker slot
+    /// 0 is therefore the locality anchor. Using `next_task(0)` here activates
+    /// priority-safe batch transfer for the live runtime path instead of
+    /// bypassing local queues through `steal_one`.
     pub fn dequeue(&self) -> Option<u64> {
-        self.steal_one()
+        self.next_task(0)
     }
 
-    /// Steal one task from any source, without a local deque.
+    /// Steal one task from any source without owning a local worker slot.
     ///
-    /// Used by external event loops (I/O, timers) that need to
-    /// grab work but don't have a dedicated worker thread.
+    /// Priority is still strict: all High global/local sources are inspected
+    /// before Normal, and all Normal sources before Low.
     pub fn steal_one(&self) -> Option<u64> {
-        // Try the global injectors first, in priority order
-        if let Some(task) = self.steal_global() {
-            return Some(task);
-        }
-        // Try any worker
-        let mut steal_attempts: u64 = 0;
-        for stealer in &self.stealers {
-            steal_attempts += 1;
-            if let Steal::Success(task) = stealer.steal() {
-                self.stats
-                    .total_tasks_processed
-                    .fetch_add(1, Ordering::Relaxed);
-                self.stats.tasks_from_steal.fetch_add(1, Ordering::Relaxed);
-                self.stats.steal_successes.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .steal_attempts
-                    .fetch_add(steal_attempts, Ordering::Relaxed);
+        let mut steal_attempts = 0u64;
+
+        for priority in [ActorPriority::High, ActorPriority::Normal, ActorPriority::Low] {
+            if let Some(task) = self.steal_global_for(priority) {
                 return Some(task);
             }
+
+            for stealer in self.stealers_for(priority) {
+                steal_attempts += 1;
+                loop {
+                    match stealer.steal() {
+                        Steal::Success(task) => {
+                            self.record_stolen_task(steal_attempts);
+                            return Some(task);
+                        }
+                        Steal::Retry => std::hint::spin_loop(),
+                        Steal::Empty => break,
+                    }
+                }
+            }
         }
+
         self.stats.empty_polls.fetch_add(1, Ordering::Relaxed);
         self.stats
             .steal_attempts
@@ -403,12 +433,7 @@ impl Scheduler {
         None
     }
 
-    /// Run the scheduler loop for the given worker.
-    ///
-    /// Repeatedly calls `process_fn` with dequeued actor IDs until
-    /// no work is available and all steal attempts fail. Then
-    /// returns, allowing the caller to park the thread or check
-    /// for external events.
+    /// Run a worker until the scheduler stays empty through its backoff.
     pub fn run_worker<F>(&self, worker_idx: usize, mut process_fn: F)
     where
         F: FnMut(u64),
@@ -423,28 +448,31 @@ impl Scheduler {
                 empty_count = 0;
                 process_fn(actor_id);
                 self.processed_count.fetch_add(1, Ordering::Relaxed);
-            } else {
-                empty_count += 1;
+                continue;
+            }
 
-                if empty_count >= MAX_STEAL_ATTEMPTS {
-                    // No work after multiple attempts — sleep briefly
-                    // to avoid busy-waiting, then check again.
-                    thread::sleep(std::time::Duration::from_micros(EMPTY_SLEEP_US));
+            empty_count += 1;
+            if empty_count < MAX_STEAL_ATTEMPTS {
+                continue;
+            }
 
-                    // If still no work, let the caller decide
-                    // whether to park or continue.
-                    if self.next_task(worker_idx).is_none() {
-                        return;
-                    }
+            thread::sleep(std::time::Duration::from_micros(EMPTY_SLEEP_US));
+
+            // Important: if work arrives during the sleep, process the task we
+            // just dequeued. The previous implementation used `is_none()` and
+            // silently discarded a `Some(actor_id)` returned after backoff.
+            match self.next_task(worker_idx) {
+                Some(actor_id) => {
+                    empty_count = 0;
+                    process_fn(actor_id);
+                    self.processed_count.fetch_add(1, Ordering::Relaxed);
                 }
+                None => return,
             }
         }
     }
 
     /// Process one task for the given worker.
-    ///
-    /// Returns `true` if a task was processed, `false` if no work
-    /// was available.
     pub fn run_one<F>(&self, worker_idx: usize, mut process_fn: F) -> bool
     where
         F: FnMut(u64),
@@ -458,27 +486,22 @@ impl Scheduler {
         }
     }
 
-    /// Number of configured worker threads.
     pub fn worker_count(&self) -> usize {
         self.worker_count
     }
 
-    /// Total number of actors processed since creation.
     pub fn processed_count(&self) -> usize {
         self.processed_count.load(Ordering::Relaxed)
     }
 
-    /// Reset the processed count to zero.
     pub fn reset_processed_count(&self) {
         self.processed_count.store(0, Ordering::Relaxed);
     }
 
-    /// Snapshot the current scheduler profiling metrics.
     pub fn stats(&self) -> SchedulerStats {
         self.stats.snapshot()
     }
 
-    /// Reset all scheduler profiling metrics to zero.
     pub fn reset_stats(&self) {
         self.stats.reset();
     }
@@ -512,7 +535,19 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn test_global_steal_batches_into_local_queue() {
+    fn test_local_enqueue_preserves_priority() {
+        let s = Scheduler::new(1);
+        s.enqueue_local_with_priority(0, 1, ActorPriority::Low);
+        s.enqueue_local_with_priority(0, 2, ActorPriority::Normal);
+        s.enqueue_local_with_priority(0, 3, ActorPriority::High);
+
+        assert_eq!(s.next_task(0), Some(3));
+        assert_eq!(s.next_task(0), Some(2));
+        assert_eq!(s.next_task(0), Some(1));
+    }
+
+    #[test]
+    fn test_global_steal_batches_into_matching_local_queue() {
         let s = Scheduler::new(1);
         for id in 0..32 {
             s.enqueue(id);
@@ -523,8 +558,6 @@ mod scheduler_tests {
         assert_eq!(first_stats.tasks_from_global_queue, 1);
         assert_eq!(first_stats.tasks_from_local_queue, 0);
 
-        // steal_batch_and_pop transfers additional global work to worker 0,
-        // so the next dispatch should avoid the shared injector.
         let second = s.next_task(0).expect("batched local queue should have work");
         let second_stats = s.stats();
         assert_eq!(second_stats.tasks_from_global_queue, 1);
@@ -536,6 +569,46 @@ mod scheduler_tests {
             assert!(seen.insert(id), "actor id {id} was scheduled twice");
         }
         assert_eq!(seen.len(), 32);
+    }
+
+    #[test]
+    fn test_high_preempts_batched_low_work() {
+        let s = Scheduler::new(1);
+        for id in 1..=32 {
+            s.enqueue_with_priority(id, ActorPriority::Low);
+        }
+
+        // This batches additional Low work into worker 0.
+        assert!(s.next_task(0).is_some());
+
+        // Newly-arrived High work must still preempt the already-local Low batch.
+        s.enqueue_with_priority(999, ActorPriority::High);
+        assert_eq!(s.next_task(0), Some(999));
+    }
+
+    #[test]
+    fn test_normal_preempts_batched_low_work() {
+        let s = Scheduler::new(1);
+        for id in 1..=32 {
+            s.enqueue_with_priority(id, ActorPriority::Low);
+        }
+        assert!(s.next_task(0).is_some());
+
+        s.enqueue_with_priority(777, ActorPriority::Normal);
+        assert_eq!(s.next_task(0), Some(777));
+    }
+
+    #[test]
+    fn test_dequeue_uses_priority_safe_local_batching() {
+        let s = Scheduler::new(1);
+        for id in 0..16 {
+            s.enqueue(id);
+        }
+        assert!(s.dequeue().is_some());
+        assert!(s.dequeue().is_some());
+        let stats = s.stats();
+        assert_eq!(stats.tasks_from_global_queue, 1);
+        assert_eq!(stats.tasks_from_local_queue, 1);
     }
 
     #[test]
@@ -572,9 +645,9 @@ mod scheduler_tests {
 
     #[test]
     fn test_concurrent_enqueue() {
-        // Scheduler is !Sync (Worker contains Cell), so we can't share
-        // Arc<Scheduler> across threads. Instead, use a channel to collect
-        // values from worker threads and enqueue from the main thread.
+        // Scheduler contains owning Worker handles and is intentionally !Sync.
+        // Feed it from worker threads through a channel, mirroring the runtime's
+        // cross-shard channel ownership model.
         use std::thread;
         let s = Scheduler::new(4);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -587,7 +660,7 @@ mod scheduler_tests {
                 }
             }));
         }
-        drop(tx); // Close original sender; rx ends when all clones dropped.
+        drop(tx);
         for val in rx {
             s.enqueue(val);
         }
@@ -629,7 +702,8 @@ mod scheduler_tests {
         assert_eq!(stats.tasks_from_local_queue, 0);
         assert_eq!(stats.tasks_from_global_queue, 1);
         assert_eq!(stats.tasks_from_steal, 0);
-        assert_eq!(stats.steal_attempts, 0);
+        // High is checked before Normal, so worker 0 probes one empty High peer.
+        assert!(stats.steal_attempts >= 1);
         assert_eq!(stats.steal_successes, 0);
         assert_eq!(stats.empty_polls, 0);
     }
@@ -638,7 +712,6 @@ mod scheduler_tests {
     fn test_stats_steal() {
         let s = Scheduler::new(2);
         s.enqueue_local(0, 42);
-        // Worker 1 has no local work and no global work, so it steals from worker 0.
         assert_eq!(s.next_task(1).unwrap(), 42);
         let stats = s.stats();
         assert_eq!(stats.total_tasks_processed, 1);
@@ -657,7 +730,7 @@ mod scheduler_tests {
         let stats = s.stats();
         assert_eq!(stats.empty_polls, 1);
         assert_eq!(stats.total_tasks_processed, 0);
-        assert_eq!(stats.steal_attempts, 0); // no other workers to attempt stealing from
+        assert_eq!(stats.steal_attempts, 0);
     }
 
     #[test]
@@ -667,8 +740,9 @@ mod scheduler_tests {
         let stats = s.stats();
         assert_eq!(stats.empty_polls, 1);
         assert_eq!(stats.total_tasks_processed, 0);
-        // steal_one probes every stealer, including the single worker's own deque.
-        assert_eq!(stats.steal_attempts, 1);
+        // steal_one has no owner slot, so it probes the one worker in each of
+        // the three priority bands.
+        assert_eq!(stats.steal_attempts, 3);
     }
 
     #[test]
@@ -686,6 +760,6 @@ mod scheduler_tests {
         assert_eq!(stats.steal_attempts, 0);
         assert_eq!(stats.steal_successes, 0);
         assert_eq!(stats.empty_polls, 0);
-        assert_eq!(s.processed_count(), 1); // existing API unaffected
+        assert_eq!(s.processed_count(), 1);
     }
 }
