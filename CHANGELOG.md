@@ -72,11 +72,15 @@ two major versions.*
   uses now satisfy the exactly-once obligation; multi-arm handlers do not
   double-count across arms.
 - **Durable-effect determinism gate** (`src/effect_checker.rs`): `workflow`
-  step bodies (including saga compensations) now reject ambient effects that
+  step bodies (including saga compensations), the behavior bodies of
+  `persistent` and `entity` actors, and entity `apply` handlers now reject
+  ambient effects that
   are unsafe under crash re-drive at compile time: `Time.now*`, `Rand.*`,
   `Net.*`, `FS.*`, and stdio (`IO.print`/`IO.println`/`IO.read`). Recovery
   re-runs a suspended step from its start, so these would execute again with
-  different results or duplicate side effects. `Timer.sleep` (journaled and
+  different results or duplicate side effects; persistent actors and entity
+  apply handlers replay on recovery under the same rule. `Timer.sleep`
+  (journaled and
   re-armed), performs intercepted by a user `handle`, and `LLM.ask`
   (re-run by design) remain allowed. Module-function calls from steps are
   followed transitively.
