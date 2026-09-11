@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use crate::primitives::ActorRole;
 use crate::runtime::actor::{Actor, ActorBackend, BehaviorEntry};
 use crate::runtime::persistence::{PersistedValue, StateModel, WorkflowEvent};
 use crate::runtime::timer_fired_handler;
@@ -62,6 +63,8 @@ pub(crate) fn spawn_actor_with_id(
     actor.persistent = persistent;
     let workflow_name = workflow.map(|n| n.to_string());
     if let Some(name) = workflow {
+        // Legacy storage field retained until the versioned ActorRole format
+        // migration. Semantic reads use Actor::role()/ActorMeta::role().
         actor.is_workflow = true;
         actor.name = name.to_string();
         actor.register_behavior("__timer_fired", timer_fired_handler);
@@ -147,8 +150,6 @@ fn restore_persistent_state(rt: &Runtime, actor: &mut Actor) {
     }
 }
 
-/// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with the
-/// `init` state fields, and wire up its bytecode handlers. Shared body of
 /// Build a bytecode actor's `bytecode_offsets` vector.
 ///
 /// Ordinary bytecode actors are dispatched by WHOLE-MODULE behavior id
@@ -161,13 +162,13 @@ fn restore_persistent_state(rt: &Runtime, actor: &mut Actor) {
 /// #2, also seen at recover/migrate/hot-reload).
 pub(crate) fn bytecode_offsets_for(
     module: &crate::bytecode::CodeModule,
-    is_workflow: bool,
+    role: ActorRole,
 ) -> Vec<usize> {
-    if is_workflow {
+    if matches!(role, ActorRole::Workflow) {
         module
             .actor_metadata
             .iter()
-            .find(|m| m.is_workflow)
+            .find(|m| matches!(m.role(), Ok(ActorRole::Workflow)))
             .map(|meta| {
                 meta.behavior_indices
                     .iter()
@@ -180,7 +181,7 @@ pub(crate) fn bytecode_offsets_for(
     }
 }
 
-/// both VM-callback `spawn_actor` impls.
+/// Shared body of both VM-callback `spawn_actor` implementations.
 pub(crate) fn spawn_from_module(
     rt: &mut Runtime,
     module: &crate::bytecode::CodeModule,
@@ -192,6 +193,21 @@ pub(crate) fn spawn_from_module(
         .actor_metadata
         .iter()
         .find(|m| m.behavior_indices.contains(&behavior_idx));
+    let role = match meta {
+        Some(meta) => match meta.role() {
+            Ok(role) => role,
+            Err(error) => {
+                tracing::warn!(
+                    actor = %meta.name,
+                    %error,
+                    "refusing to spawn actor with conflicting role metadata"
+                );
+                return Value::nil();
+            }
+        },
+        None => ActorRole::Plain,
+    };
+
     let id = if let Some(meta) = meta {
         let state_models: HashMap<String, StateModel> = meta
             .state_models
@@ -211,7 +227,7 @@ pub(crate) fn spawn_from_module(
             }),
             state_models,
             meta.persistent,
-            if meta.is_workflow {
+            if matches!(role, ActorRole::Workflow) {
                 Some(meta.name.as_str())
             } else {
                 None
@@ -220,8 +236,7 @@ pub(crate) fn spawn_from_module(
     } else {
         spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
     };
-    let offsets: Vec<usize> =
-        bytecode_offsets_for(module, meta.map(|m| m.is_workflow).unwrap_or(false));
+    let offsets: Vec<usize> = bytecode_offsets_for(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
     // step-local indices in run_saga_compensation match.
     let compensation_offsets: Vec<Option<usize>> = if let Some(meta) = meta {
@@ -241,7 +256,9 @@ pub(crate) fn spawn_from_module(
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
         if let Some(meta) = meta {
-            if meta.is_agent {
+            if matches!(role, ActorRole::Agent) {
+                // Legacy storage flag retained until the serialized role enum
+                // replaces the compatibility booleans.
                 actor.is_agent = true;
                 for (name, c) in &meta.state_defaults {
                     if let crate::bytecode::Constant::String(json) = c {
@@ -271,7 +288,7 @@ pub(crate) fn spawn_from_module(
     // type, register the adapter for each behavior it compiles so the
     // scheduler dispatches them natively (bytecode falls back for the rest).
     if let Some(meta) = meta.as_ref() {
-        if !meta.is_workflow {
+        if !matches!(role, ActorRole::Workflow) {
             let module_ptr = rt.aot_modules.get(&meta.name).copied();
             if let Some(module_ptr) = module_ptr {
                 let aot_module = unsafe { &*module_ptr };
@@ -306,7 +323,7 @@ pub(crate) fn spawn_from_module(
             }
         }
     }
-    if meta.map(|m| m.is_workflow).unwrap_or(false) {
+    if matches!(role, ActorRole::Workflow) {
         layout_workflow_behavior_table(rt, id);
     }
     register_recovery_module(rt, id, module.clone(), offsets, compensation_offsets);
@@ -317,7 +334,7 @@ pub(crate) fn spawn_from_module(
 /// each bytecode step plus the internal `__timer_fired` handler.
 pub(crate) fn layout_workflow_behavior_table(rt: &mut Runtime, actor_id: u64) {
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        if !actor.is_workflow {
+        if !matches!(actor.role(), Ok(ActorRole::Workflow)) {
             return;
         }
         let step_count = actor.bytecode_offsets.len();
