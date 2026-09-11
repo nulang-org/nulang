@@ -142,6 +142,50 @@ impl crate::bytecode::ActorMeta {
     }
 }
 
+impl crate::runtime::Actor {
+    /// Return the canonical role of a live runtime actor.
+    ///
+    /// Runtime actors currently persist only the legacy workflow/agent flags;
+    /// organization and virtual status are compiler/placement metadata. Keeping
+    /// role interpretation here makes runtime subsystems consume the same
+    /// semantic model as HIR and bytecode without changing the persisted actor
+    /// representation in this phase.
+    pub fn role(&self) -> Result<ActorRole, ActorRoleConflict> {
+        ActorRole::from_flags(self.is_workflow, self.is_agent, false, false)
+    }
+}
+
+/// Runtime operations implemented by the single [`RuntimePrimitive::Time`]
+/// primitive.
+///
+/// The timer wheel has multiple internal wake-message variants for efficiency,
+/// but those variants are implementation detail. Language features such as
+/// `Timer.sleep`, receive deadlines, workflow timers, delayed delivery, and
+/// retry backoff all share this semantic primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimeOperation {
+    /// Resume computation after an explicit sleep.
+    Sleep,
+    /// Deliver a message after a delay, including durable workflow timers.
+    ScheduledDelivery,
+    /// Enforce a timeout/deadline or delayed termination.
+    Deadline,
+    /// Wake a retry attempt after backoff.
+    RetryBackoff,
+}
+
+impl crate::runtime::TimerMessage {
+    /// Classify an internal timer-wheel message as a canonical Time operation.
+    pub fn time_operation(&self) -> TimeOperation {
+        match self {
+            Self::TimerSleepWake => TimeOperation::Sleep,
+            Self::Send { .. } | Self::SendWithContext { .. } => TimeOperation::ScheduledDelivery,
+            Self::Exit { .. } | Self::Kill | Self::ReceiveWaitTimeout => TimeOperation::Deadline,
+            Self::LlmRetry => TimeOperation::RetryBackoff,
+        }
+    }
+}
+
 /// Durability boundary for a side effect.
 ///
 /// This is deliberately narrower than an "exactly once" claim. Nulang can
@@ -211,5 +255,41 @@ mod tests {
 
         meta.is_workflow = true;
         assert!(meta.role().is_err());
+    }
+
+    #[test]
+    fn live_runtime_actor_uses_the_same_role_rules() {
+        let mut actor = crate::runtime::Actor::new(1, "order-workflow", 0);
+        actor.is_workflow = true;
+        assert_eq!(actor.role(), Ok(ActorRole::Workflow));
+
+        actor.is_agent = true;
+        assert!(actor.role().is_err());
+    }
+
+    #[test]
+    fn internal_timer_messages_lower_to_time_operations() {
+        use crate::runtime::TimerMessage;
+
+        assert_eq!(
+            TimerMessage::TimerSleepWake.time_operation(),
+            TimeOperation::Sleep
+        );
+        assert_eq!(
+            TimerMessage::ReceiveWaitTimeout.time_operation(),
+            TimeOperation::Deadline
+        );
+        assert_eq!(
+            TimerMessage::LlmRetry.time_operation(),
+            TimeOperation::RetryBackoff
+        );
+        assert_eq!(
+            TimerMessage::Send {
+                behavior_id: 0,
+                payload: vec![],
+            }
+            .time_operation(),
+            TimeOperation::ScheduledDelivery
+        );
     }
 }
