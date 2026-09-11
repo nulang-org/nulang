@@ -99,7 +99,10 @@ impl std::fmt::Display for ActorRoleConflict {
         write!(
             f,
             "actor metadata has conflicting roles (workflow={}, agent={}, organization={}, virtual={})",
-            self.is_workflow, self.is_agent, self.is_organization, self.is_virtual
+            self.is_workflow,
+            self.is_agent,
+            self.is_organization,
+            self.is_virtual
         )
     }
 }
