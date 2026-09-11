@@ -1,0 +1,13 @@
+fn callee(s: String) -> Int {
+    perform String.length(s)
+}
+
+fn outer(a: Int, b: Int, c: Int, f: String -> Int, s: String, d: Int) -> Int -> Int -> Int {
+    fn(x: Int) {
+        fn(y: Int) {
+            f(s) + a + b + c + d + x + y
+        }
+    }
+}
+
+outer(1, 2, 3, callee, "hello world", 4)(5)(6)

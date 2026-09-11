@@ -1,0 +1,10 @@
+fn low17(x: Int) -> Int { x }
+fn skip_ws(src: Int) -> fn(Int) -> fn(Int) -> Int { fn(pos) => fn(len) => (if pos >= len then pos else pos + 1) }
+fn comp_rec(a: Int) -> fn(Int) -> fn(Int) -> fn(Int) -> fn(Int) -> fn(Int) -> fn(Int) -> fn(Int) -> Int { fn(b) => fn(c) => fn(d) => fn(e) => fn(f) => fn(g) => fn(h) => fn(i) => a + b + c + d + e + f + g + h + i }
+let f = fn(comp_rec) => fn(src) => fn(eff_start) => fn(q5) => fn(len) => fn(nr) => fn(env) => fn(elen) => fn(no_left) => fn(p) => (
+    let p0 = skip_ws(src)(q5 + 1)(len) in
+    let inner0 = comp_rec(src)(p0)(len)(no_left)(0)(nr + 1)(env)(elen) in
+    let r0 = inner0 >> 18 in
+    let e0 = low17(inner0) in
+    (nr * 262144) + p
+) in 123

@@ -1,0 +1,15 @@
+; let low17 = fn(x) => (x) in fn skip_ws(src: Int) -> fn(Int) -> fn(Int) -> Int { fn(pos) => fn(len) => pos + len } let f = fn(a) => fn(b) => fn(c) => ( skip_ws(a)(b)(c) ) in 123
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6500
+12650b00
+12650c00
+120c0000
+57000000
+; fn_end:
+60ffff08
+1208d000
+12090000
+01000000
+; result in r9

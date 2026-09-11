@@ -1,0 +1,8 @@
+let f = fn(a) => fn(b) => fn(c) => fn(d) => fn(e) => fn(g) => fn(h) => fn(i) => fn(j) => fn(k) => (
+    if a == 0 then (
+        if b == 0 then (
+            if c == 0 then 42 else 1
+        ) else 2
+    ) else 3
+) in
+f(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)

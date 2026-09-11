@@ -1,0 +1,4 @@
+fn f(a: Int) -> Int { a }
+fn g(a: Int, b: Int, c: Int) -> Int { a + b + c }
+fn deep(c: Int) -> Int { if c == 1 then (let v1 = f(c) in let v2 = g(v1)(v1)(v1) in let v3 = v2 >> 1 in let v4 = f(v3) in let v5 = g(v4)(v4)(v4) in let v6 = f(v5) in if v6 > 0 then g(v6)(v6)(v6) else 0) else 99 }
+deep(1)

@@ -1,0 +1,8 @@
+fn greet(name: String) -> Unit {
+    perform IO.print("Hello, " + name)
+}
+
+fn main() -> Unit {
+    let input = perform IO.read()
+    greet(input)
+}

@@ -1,0 +1,9 @@
+fn low17(x: Int) -> Int { x }
+fn f(a: Int, b: Int, c: Int) -> Int {
+    if a == 0 then (
+        if b == 0 then (
+            if c == 0 then 1 else 2
+        ) else 3
+    ) else 4
+}
+123

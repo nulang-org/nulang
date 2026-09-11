@@ -1,0 +1,15 @@
+fn a0(x: Int) -> Int { x }
+fn a1(x: Int) -> Int { x }
+fn a2(x: Int) -> Int { x }
+fn a3(x: Int) -> Int { x }
+fn a4(x: Int) -> Int { x }
+fn a5(x: Int) -> Int { x }
+fn a6(x: Int) -> Int { x }
+fn a7(x: Int) -> Int { x }
+fn a8(x: Int) -> Int { x }
+fn a9(x: Int) -> Int { x }
+fn f(a: Int) -> Int { a }
+fn g(a: Int, b: Int, c: Int) -> Int { a + b + c }
+fn h(a: Int, b: Int) -> Int { a + b }
+fn deep(c: Int) -> Int { if c == 1 then (let v1 = f(c) in let v2 = g(v1)(v1)(v1) in let v3 = v2 >> 1 in let v4 = f(v3) in let v5 = h(g(v4)(v4)(v4))(f(v4)) in let v6 = f(v5) in if v6 > 0 then g(v6)(v6)(v6) else 0) else 99 }
+deep(1)

@@ -1,0 +1,5 @@
+fn outer() {
+    fn add(x, y) { x + y }
+    add(3, 4)
+}
+outer()

@@ -1,0 +1,16 @@
+fn callee(s: String, n: Int) -> Int {
+    perform String.length(s)
+}
+
+fn caller(f, s: String, a1: Int, a2: Int, a3: Int, a4: Int, a5: Int, a6: Int, a7: Int, a8: Int, a9: Int, a10: Int) -> Int {
+    let x1 = a1 + a2 in
+    let x2 = a3 + a4 in
+    let x3 = a5 + a6 in
+    let x4 = a7 + a8 in
+    let x5 = a9 + a10 in
+    f(s, x1 + x2 + x3 + x4 + x5)
+}
+
+let s = "hello world" in
+let r = caller(callee, s, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10) in
+perform IO.print(r)

@@ -1,0 +1,5 @@
+let comp = fn(src) => fn(pos) => fn(len) => fn(left) => fn(min_prec) => fn(nr) => fn(env) => fn(elen) => (
+    if left == 268435456 * 4096 then ((nr * 65536)) + pos
+    else 0
+) in
+comp("hello")(10)(5)(268435456 * 4096)(-1)(8)("")(0)

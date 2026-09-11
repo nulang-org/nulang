@@ -1,0 +1,792 @@
+// Work around a host-compiler quirk where bitwise `&` is miscompiled in
+// some high-register-pressure contexts. Extract the low bits arithmetically.
+fn low17(x: Int) -> Int {
+    let q = x / 0x20000;
+    x - q * 0x20000
+}
+
+fn low16(x: Int) -> Int {
+    let q = x / 0x10000;
+    x - q * 0x10000
+}
+
+fn low8(x: Int) -> Int {
+    let q = x / 0x100;
+    x - q * 0x100
+}
+
+fn low4(x: Int) -> Int {
+    let q = x / 16;
+    x - q * 16
+}
+
+fn low6(x: Int) -> Int {
+    let q = x / 0x40;
+    x - q * 0x40
+}
+
+fn bit17(x: Int) -> Int {
+    let t = x / 0x20000;
+    t - (t / 2) * 2
+}
+
+// bootstrap/compile_hex.nula — Compile Nulang Core expressions to hex bytecode.
+// Supports: arithmetic, comparisons, booleans, if/then/else, let bindings,
+//   closures fn(x) => body, function application f(arg).
+// Environment is stored as a string of 4-byte records (code points 0-63, 6 bits each).
+// Each binding encodes 24 bits: hash (16 bits) + reg (8 bits).
+
+fn hex_digit(n: Int) -> String {
+    if n < 10 then perform Int.to_string(n)
+    else if n == 10 then "a" else if n == 11 then "b"
+    else if n == 12 then "c" else if n == 13 then "d"
+    else if n == 14 then "e" else "f"
+}
+
+fn remark(msg: String) {
+    perform IO.print("; " + msg)
+}
+
+fn emit_hex(w: Int) {
+    perform IO.print("" +
+        hex_digit(low4(w / 0x10000000)) +
+        hex_digit(low4(w / 0x1000000)) +
+        hex_digit(low4(w / 0x100000)) +
+        hex_digit(low4(w / 0x10000)) +
+        hex_digit(low4(w / 0x1000)) +
+        hex_digit(low4(w / 0x100)) +
+        hex_digit(low4(w / 0x10)) +
+        hex_digit(low4(w))
+    )
+}
+
+// Encode instruction: opcode<<24 | op1<<16 | op2<<8 | op3
+
+fn instr(opcode: Int, op1: Int, op2: Int, op3: Int) -> Int {
+    (opcode << 24) + (op1 << 16) + (op2 << 8) + op3
+}
+
+fn emit_word(opcode: Int, op1: Int, op2: Int, op3: Int) -> Int {
+    let w = instr(opcode, op1, op2, op3);
+    emit_hex(w);
+    0
+}
+
+fn env_decode(env: String, i: Int) -> Int {
+    let b0 = perform String.charAt(env, i) - 1;
+    let b1 = perform String.charAt(env, i + 1) - 1;
+    let b2 = perform String.charAt(env, i + 2) - 1;
+    let b3 = perform String.charAt(env, i + 3) - 1;
+    (b0 << 18) + (b1 << 12) + (b2 << 6) + b3
+}
+
+// Scan env entries oldest→newest and emit Move+CapStore for each capture.
+// Returns the next slot index.
+
+fn emit_cap_step(closure_reg: Int, slot: Int, is_store: Int) -> Int {
+    let cap_reg = 11 + slot;
+    if is_store != 0 then emit_word(0x62, closure_reg, slot, cap_reg)
+    else emit_word(0x61, slot, cap_reg, 0)
+}
+
+fn emit_fnend_step(reg: Int, slot: Int, closure_reg: Int) -> Int {
+    let cap_dst = 11 + slot;
+    emit_word(0x12, reg, cap_dst, 0);
+    emit_word(0x62, closure_reg, slot, cap_dst)
+}
+// Recursively emit CapLoad (is_store=0) or CapStore (is_store!=0)
+// for capture slots [slot..count-1].
+
+fn emit_caps(closure_reg: Int, count: Int, slot: Int, is_store: Int) -> Int {
+    if slot >= count then 0
+    else {
+        emit_cap_step(closure_reg, slot, is_store);
+        emit_caps(closure_reg, count, slot + 1, is_store)
+    }
+}
+
+fn emit_fnend_caps(env: String, elen: Int, idx: Int, slot: Int, closure_reg: Int) -> Int {
+    if idx >= elen then slot
+    else {
+        let v = env_decode(env, idx * 4);
+        let reg = low8(v);
+        let is_cap = reg >= 100;
+        if is_cap then {
+            emit_fnend_step(reg, slot, closure_reg);
+            emit_fnend_caps(env, elen, idx + 1, slot + 1, closure_reg)
+        } else {
+            emit_fnend_caps(env, elen, idx + 1, slot, closure_reg)
+        }
+    }
+}
+
+// Returns (result_reg << 18) | pos.  The bool bit is (1<<17).
+
+fn is_digit(c: Int) -> Bool { c >= 48 and c <= 57 }
+
+fn is_alpha(c: Int) -> Bool { (c >= 65 and c <= 90) or (c >= 97 and c <= 122) }
+
+fn is_alphanum(c: Int) -> Bool { is_alpha(c) or is_digit(c) or c == 95 }
+
+fn is_space(c: Int) -> Bool { c == 32 or c == 10 or c == 13 or c == 9 }
+
+fn skip_ws(src: String, pos: Int, len: Int) -> Int {
+    if pos >= len then pos
+    else if is_space(perform String.charAt(src, pos)) then skip_ws(src, pos + 1, len)
+    else pos
+}
+
+fn read_int(src: String, pos: Int, len: Int, acc: Int) -> Int {
+    if pos >= len then (acc << 16) + pos
+    else {
+        let c = perform String.charAt(src, pos);
+        if is_digit(c) then read_int(src, pos + 1, len, acc * 10 + (c - 48))
+        else (acc << 16) + pos
+    }
+}
+
+fn read_ident(src: String, pos: Int, len: Int, h: Int) -> Int {
+    if pos >= len then ((low16(h)) << 16) + pos
+    else {
+        let c = perform String.charAt(src, pos);
+        if is_alphanum(c) then {
+            let nh = h * 5 + c;
+            read_ident(src, pos + 1, len, nh)
+        } else ((low16(h)) << 16) + pos
+    }
+}
+
+fn read_string(src: String, pos: Int, len: Int, acc: String) -> String {
+    if pos >= len then acc
+    else {
+        let c = perform String.charAt(src, pos);
+        if c == 34 then acc
+        else read_string(src, pos + 1, len, acc + perform String.from_char(c))
+    }
+}
+
+fn read_string_end(src: String, pos: Int, len: Int) -> Int {
+    if pos >= len then pos
+    else {
+        let c = perform String.charAt(src, pos);
+        if c == 34 then pos + 1
+        else read_string_end(src, pos + 1, len)
+    }
+}
+
+// Environment stored as a string of 4-byte records (code points 0-63, 6 bits each).
+// Each binding encodes 24 bits: hash (16 bits) + reg (8 bits).
+
+fn env_push(env: String, h: Int, reg: Int) -> String {
+    let v = ((low16(h)) << 8) + (low8(reg));
+    let c0 = (low6((v >> 18))) + 1;
+    let c1 = (low6((v >> 12))) + 1;
+    let c2 = (low6((v >> 6))) + 1;
+    let c3 = (low6(v)) + 1;
+    env +
+        perform String.from_char(c0) +
+        perform String.from_char(c1) +
+        perform String.from_char(c2) +
+        perform String.from_char(c3)
+}
+
+fn env_lookup(env: String, elen: Int, h: Int) -> Int {
+    if elen <= 0 then 0
+    else {
+        let v = env_decode(env, (elen - 1) * 4);
+        let hh = low16((v >> 8));
+        let reg = low8(v);
+        if hh == (low16(h)) then reg
+        else env_lookup(env, elen - 1, h)
+    }
+}
+
+// Count capture-worthy entries in the env (registers 100-127 or 11-19).
+
+fn count_captures(env: String, elen: Int) -> Int {
+    if elen <= 0 then 0
+    else {
+        let v = env_decode(env, (elen - 1) * 4);
+        let reg = low8(v);
+        // Any variable stored in the high save/param register bank must be
+        // captured into a closure; the 8-bit reg field can hold 0-255.
+        let is_cap = reg >= 100;
+        let rest = count_captures(env, elen - 1);
+        if is_cap then 1 + rest else rest
+    }
+}
+
+// Rebuild env by appending remapped entries for captured variables.
+// Processes entries oldest→newest (idx 0→elen-1).  For each captured
+// entry, appends an env_push mapping the same hash to r(11+slot).
+// Returns the augmented env; the capture count is in emit order.
+
+fn remap_captures(env: String, elen: Int, idx: Int, slot: Int) -> String {
+    if idx >= elen then env
+    else {
+        let v = env_decode(env, idx * 4);
+        let hh = low16((v >> 8));
+        let reg = low8(v);
+        let is_cap = reg >= 100;
+        if is_cap then {
+            let tail = remap_captures(env, elen, idx + 1, slot + 1);
+            env_push(tail, hh, 11 + slot)
+        } else {
+            remap_captures(env, elen, idx + 1, slot)
+        }
+    }
+}
+
+fn prec_of(c: Int) -> Int {
+    if c == 43 then 2 else if c == 45 then 2
+    else if c == 42 then 3 else if c == 47 then 3
+    else if c == 38 then 2
+    else 0
+}
+
+fn parse_cmp(src: String, p: Int, len: Int) -> Int {
+    if p >= len then 0 else {
+        let c = perform String.charAt(src, p);
+        if c == 61 and p + 1 < len then {
+            let c2 = perform String.charAt(src, p + 1);
+            if c2 == 61 then (1 << 16) + (0x40 << 8) + 2 else 0
+        } else if c == 33 and p + 1 < len then {
+            let c2 = perform String.charAt(src, p + 1);
+            if c2 == 61 then (1 << 16) + (0xFF << 8) + 2 else 0
+        } else if c == 60 then {
+            if p + 1 < len then { let c2 = perform String.charAt(src, p + 1);
+                if c2 == 61 then (1 << 16) + (0x43 << 8) + 2 else (1 << 16) + (0x41 << 8) + 1
+            } else (1 << 16) + (0x41 << 8) + 1
+        } else if c == 62 then {
+            if p + 1 < len then { let c2 = perform String.charAt(src, p + 1);
+                if c2 == 61 then (1 << 16) + (0x44 << 8) + 2 else (1 << 16) + (0x42 << 8) + 1
+            } else (1 << 16) + (0x42 << 8) + 1
+        } else 0
+    }
+}
+
+fn parse_shift(src: String, p: Int, len: Int) -> Int {
+    if p + 1 < len then {
+        let c1 = perform String.charAt(src, p);
+        let c2 = perform String.charAt(src, p + 1);
+        if c1 == 60 and c2 == 60 then (3 << 16) + (0x2A << 8) + 2
+        else if c1 == 62 and c2 == 62 then (3 << 16) + (0x2B << 8) + 2
+        else 0
+    } else 0
+}
+
+// Convert nybble (0-15) to hex char
+
+fn skip_fn_type(src: String, pos: Int, len: Int) -> Int {
+    let q5_raw = skip_ws(src, pos, len);
+    if q5_raw < len then {
+        let c_colon = perform String.charAt(src, q5_raw);
+        if c_colon == 58 then {
+            let after_colon = skip_ws(src, q5_raw + 1, len);
+            let type_id = read_ident(src, after_colon, len, 0);
+            low16(type_id)
+        } else { q5_raw }
+    } else { q5_raw }
+}
+
+fn comp_fn_closure(comp_rec, src: String, q6: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, ph: Int, p: Int) -> Int {
+    if q6 + 1 < len then {
+        let c3 = perform String.charAt(src, q6);
+        let c4 = perform String.charAt(src, q6 + 1);
+        if c3 == 61 and c4 == 62 then {
+            remark("Jmp -> fn_end");
+            emit_word(0x50, 0, 0, 0);
+            remark("FN_START");
+            let param_save = 100 + elen;
+            emit_word(0x12, 10, param_save, 0);
+            let env_remapped = remap_captures(env, elen, 0, 0);
+            let capture_count = (perform String.length(env_remapped) - perform String.length(env)) / 4;
+            let env2 = if capture_count > 0 then {
+                env_push(env_remapped, low16(ph), param_save)
+            } else {
+                env_push(env, low16(ph), param_save)
+            };
+            let elen2 = elen + capture_count + 1;
+            let _ = emit_caps(0, capture_count, 0, 0);
+            emit_word(0x12, param_save, 11 + capture_count, 0);
+            // Body temporaries must start after the capture registers (r11..)
+            // and the parameter register (r11+capture_count), otherwise a
+            // sufficiently long let-chain overwrites the capture/param.
+            let body = comp_rec(src, q6 + 2, len, no_left, -1, 12 + capture_count, env2, elen2);
+            let body_reg = body >> 18;
+            let body_end = low17(body);
+            emit_word(0x12, body_reg, 0, 0);
+            emit_word(0x57, 0, 0, 0);
+            remark("fn_end:");
+            let closure_reg = nr;
+            emit_word(0x60, 0xFF, 0xFF, closure_reg);
+            // Capture all free variables from env.  The recursive self-reference
+            // (newest high-register env entry) is captured from its save register
+            // before that register holds the real closure, so it is patched below.
+            let _ = emit_fnend_caps(env, elen, 0, 0, closure_reg);
+            // Patch the recursive self-capture with a closure that already has
+            // an environment, so recursive calls receive a usable closure.
+            let self_reg = if elen > 0 then {
+                let newest = env_decode(env, (elen - 1) * 4);
+                low8(newest)
+            } else 0;
+            let self_slot = count_captures(env, elen - 1);
+            let _ = if self_reg >= 100 then {
+                emit_word(0x12, closure_reg, self_reg, 0);
+                emit_word(0x62, closure_reg, self_slot, self_reg)
+            } else 0;
+            (closure_reg << 18) + body_end
+        } else (nr << 18) + p
+    } else (nr << 18) + p
+}
+
+fn comp_fn_parse(comp_rec, src: String, pos: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, p: Int, q: Int) -> Int {
+    let q2 = skip_ws(src, q, len);
+    if q2 < len then {
+        let c1 = perform String.charAt(src, q2);
+        if c1 == 40 then {
+            let q3 = skip_ws(src, q2 + 1, len);
+            let param_id = read_ident(src, q3, len, 0);
+            let ph = param_id >> 16;
+            let q4 = low16(param_id);
+            let q5 = skip_fn_type(src, q4, len);
+            if q5 < len then {
+                let c2 = perform String.charAt(src, q5);
+                if c2 == 41 then {
+                    let q6 = skip_ws(src, q5 + 1, len);
+                    comp_fn_closure(comp_rec, src, q6, len, nr, env, elen, no_left, ph, p)
+                } else (nr << 18) + p
+            } else (nr << 18) + p
+        } else (nr << 18) + p
+    } else (nr << 18) + p
+}
+
+fn nperform_finish(src: String, eff_start: Int, len: Int, dst: Int, end_pos: Int) -> Int {
+    let eff_name = read_string(src, eff_start, len, "");
+    let quote = perform String.from_char(34);
+    remark("const " + quote + eff_name + quote);
+    emit_word(0x90, 0, 0, dst);
+    (dst << 18) + end_pos
+}
+
+fn comp_nperform_arg0(comp_rec, src: String, len: Int, no_left_np: Int, nr: Int, env: String, elen: Int, p0: Int) -> Int {
+    let inner0 = comp_rec(src, p0, len, no_left_np, 0, nr + 1, env, elen);
+    let r0 = inner0 >> 18;
+    let e0 = low17(inner0);
+    emit_word(0x12, r0, 0, 0);
+    e0
+}
+
+fn comp_nperform_arg1(comp_rec, src: String, len: Int, no_left_np: Int, nr: Int, env: String, elen: Int, p1: Int) -> Int {
+    let inner1 = comp_rec(src, p1, len, no_left_np, 0, nr + 2, env, elen);
+    let r1 = inner1 >> 18;
+    let e1 = low17(inner1);
+    emit_word(0x12, r1, 1, 0);
+    e1
+}
+
+fn comp_nperform_arg2(comp_rec, src: String, len: Int, no_left_np: Int, nr: Int, env: String, elen: Int, p2: Int) -> Int {
+    let inner2 = comp_rec(src, p2, len, no_left_np, 0, nr + 3, env, elen);
+    let r2 = inner2 >> 18;
+    let e2 = low17(inner2);
+    emit_word(0x12, r2, 2, 0);
+    e2
+}
+
+fn comp_nperform_after2(src: String, eff_start: Int, len: Int, nr: Int, p: Int, ap2: Int) -> Int {
+    if ap2 < len then {
+        let cp2 = perform String.charAt(src, ap2);
+        if cp2 == 41 then {
+            nperform_finish(src, eff_start, len, nr, skip_ws(src, ap2 + 1, len))
+        } else (nr << 18) + p
+    } else (nr << 18) + p
+}
+
+fn comp_nperform_after1(comp_rec, src: String, eff_start: Int, len: Int, nr: Int, env: String, elen: Int, p: Int, ap1: Int) -> Int {
+    if ap1 < len then {
+        let cp1 = perform String.charAt(src, ap1);
+        if cp1 == 41 then {
+            nperform_finish(src, eff_start, len, nr, skip_ws(src, ap1 + 1, len))
+        } else if cp1 == 44 then {
+            let no_left_np = 268435456 * 4096;
+            let p2 = skip_ws(src, ap1 + 1, len);
+            let e2 = comp_nperform_arg2(comp_rec, src, len, no_left_np, nr, env, elen, p2);
+            let ap2 = skip_ws(src, e2, len);
+            comp_nperform_after2(src, eff_start, len, nr, p, ap2)
+        } else (nr << 18) + p
+    } else (nr << 18) + p
+}
+
+fn comp_nperform_after0(comp_rec, src: String, eff_start: Int, len: Int, nr: Int, env: String, elen: Int, p: Int, ap0: Int) -> Int {
+    if ap0 < len then {
+        let cp0 = perform String.charAt(src, ap0);
+        if cp0 == 41 then {
+            nperform_finish(src, eff_start, len, nr, skip_ws(src, ap0 + 1, len))
+        } else if cp0 == 44 then {
+            let no_left_np = 268435456 * 4096;
+            let p1 = skip_ws(src, ap0 + 1, len);
+            let e1 = comp_nperform_arg1(comp_rec, src, len, no_left_np, nr, env, elen, p1);
+            let ap1 = skip_ws(src, e1, len);
+            comp_nperform_after1(comp_rec, src, eff_start, len, nr, env, elen, p, ap1)
+        } else (nr << 18) + p
+    } else (nr << 18) + p
+}
+
+fn comp_nperform_body(comp_rec, src: String, eff_start: Int, q5: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, p: Int) -> Int {
+    if q5 < len then {
+        let c3 = perform String.charAt(src, q5);
+        let dst = nr;
+        if c3 == 41 then {
+            nperform_finish(src, eff_start, len, dst, skip_ws(src, q5 + 1, len))
+        } else if c3 == 44 then {
+            let no_left_np = 268435456 * 4096;
+            let p0 = skip_ws(src, q5 + 1, len);
+            let e0 = comp_nperform_arg0(comp_rec, src, len, no_left_np, nr, env, elen, p0);
+            let ap0 = skip_ws(src, e0, len);
+            comp_nperform_after0(comp_rec, src, eff_start, len, nr, env, elen, p, ap0)
+        } else (nr << 18) + p
+    } else (nr << 18) + p
+}
+
+fn comp_nperform_parse(comp_rec, src: String, pos: Int, len: Int, nr: Int, env: String, elen: Int, no_left: Int, p: Int, q: Int) -> Int {
+    let q2 = skip_ws(src, q, len);
+    if q2 < len then {
+        let c1 = perform String.charAt(src, q2);
+        if c1 == 40 then {
+            let q3 = skip_ws(src, q2 + 1, len);
+            if q3 < len then {
+                let c2 = perform String.charAt(src, q3);
+                if c2 == 34 then {
+                    let eff_start = q3 + 1;
+                    let q4 = read_string_end(src, q3 + 1, len);
+                    let q5 = skip_ws(src, q4, len);
+                    comp_nperform_body(comp_rec, src, eff_start, q5, len, nr, env, elen, no_left, p)
+                } else (nr << 18) + p
+            } else (nr << 18) + p
+        } else (nr << 18) + p
+    } else (nr << 18) + p
+}
+
+fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env: String, elen: Int) -> Int {
+    let no_left = 268435456 * 4096;
+    let pair = if left == no_left then {
+        let p = skip_ws(src, pos, len);
+        if p >= len then (nr << 18) + p
+        else {
+            let c = perform String.charAt(src, p);
+            if is_digit(c) then {
+                let packed = read_int(src, p, len, 0);
+                let num = packed >> 16;
+                let q = low16(packed);
+                if num == 0 then emit_word(0x03, nr, 0, 0)
+                else if num == 1 then emit_word(0x04, nr, 0, 0)
+                else if num == 2 then emit_word(0x05, nr, 0, 0)
+                else if num == -1 then emit_word(0x06, nr, 0, 0)
+                else {
+                    remark("const " + perform Int.to_string(num));
+                    emit_word(0x07, 0, 0, nr)
+                };
+                (nr << 18) + q
+            } else if c == 40 then {
+                let inner = comp(src, p + 1, len, no_left, -1, nr, env, elen);
+                let rv = inner >> 18;
+                let rp = low17(inner);
+                let q2 = skip_ws(src, rp, len);
+                if q2 < len then {
+                    let c2 = perform String.charAt(src, q2);
+                    if c2 == 41 then (rv << 18) + (q2 + 1)
+                    else (rv << 18) + q2
+                } else (rv << 18) + q2
+            } else if c == 34 then {
+                let s = read_string(src, p + 1, len, "");
+                let q = read_string_end(src, p + 1, len);
+                let quote = perform String.from_char(34);
+                remark("const " + quote + s + quote);
+                emit_word(0x07, 0, 0, nr);
+                (nr << 18) + q
+            } else if is_alpha(c) then {
+                let ident = read_ident(src, p, len, 0);
+                let h = ident >> 16;
+                let q = low16(ident);
+                if h == 3321 then {
+                    // let
+                    let q2 = skip_ws(src, q, len);
+                    let var_id = read_ident(src, q2, len, 0);
+                    let vh = var_id >> 16;
+                    let q3 = low16(var_id);
+                    let q4 = skip_ws(src, q3, len);
+                    if q4 < len then {
+                        let c3 = perform String.charAt(src, q4);
+                        if c3 == 61 then {
+                            // Pre-bind the variable in a high register so recursive function
+                            // bodies can refer to themselves without the placeholder being
+                            // clobbered by temporaries during body compilation.
+                            let vh16 = low16(vh);
+                            let ne = nr + elen;
+                            let save_reg = if ne < 56 then 200 + ne else 143 + (ne - 56);
+                            let env_rec = env_push(env, vh16, save_reg);
+                            let bound = comp(src, q4 + 1, len, no_left, -1, nr, env_rec, elen + 1);
+                            let vr = bound >> 18;
+                            let vp = low17(bound);
+                            emit_word(0x12, vr, save_reg, 0);
+                            let vp2 = skip_ws(src, vp, len);
+                            if vp2 + 1 < len then {
+                                let ci = perform String.charAt(src, vp2);
+                                let cn = perform String.charAt(src, vp2 + 1);
+                                if ci == 105 and cn == 110 then {
+                                    let nxt = nr + 1;
+                                    comp(src, vp2 + 2, len, no_left, -1, nxt, env_rec, elen + 1)
+                                } else {
+                                    remark("let miss in at vp2=" + perform Int.to_string(vp2) + " ci=" + perform Int.to_string(ci) + " cn=" + perform Int.to_string(cn));
+                                    (save_reg << 18) + vp2
+                                }
+                            } else {
+                                remark("let no in at vp2=" + perform Int.to_string(vp2));
+                                (save_reg << 18) + vp2
+                            }
+                        } else (nr << 18) + p
+                    } else (nr << 18) + p
+                } else if h == 620 then {
+                    // fn
+                    comp_fn_parse(comp, src, pos, len, nr, env, elen, no_left, p, q)
+                } else if h == 627 then {
+                    // if
+                    let cond = comp(src, q, len, no_left, -1, nr, env, elen);
+                    let cr = cond >> 18;
+                    let cp = low17(cond);
+                    let cnext = nr + 1;
+                    let cp2 = skip_ws(src, cp, len);
+                    let then_id = read_ident(src, cp2, len, 0);
+                    let th = then_id >> 16;
+                    let tp = low16(then_id);
+                    if th == 17715 then {
+                        let lb = bit17(cond);
+                        let result_reg = nr + 2;
+                        remark("if");
+                        if lb == 0 then {
+                            remark("truthiness: check int 0");
+                            emit_word(0x03, 7, 0, 0);
+                            let tmp = cnext + 1;
+                            emit_word(0x40, cr, 7, tmp);
+                            emit_word(0x49, tmp, tmp, 0);
+                            remark("JmpF -> else");
+                            emit_word(0x52, tmp, 0, 0);
+                            remark("truthiness: check bool false");
+                            let bf = tmp + 1;
+                            emit_word(0x04, bf, 0, 0);
+                            let bfc = bf + 1;
+                            emit_word(0x40, 7, bf, bfc);
+                            let bfck = bfc + 1;
+                            emit_word(0x40, cr, bfc, bfck);
+                            emit_word(0x49, bfck, bfck, 0);
+                            remark("JmpF -> else");
+                            emit_word(0x52, bfck, 0, 0)
+                        } else {
+                            remark("JmpF -> else");
+                            emit_word(0x52, cr, 0, 0)
+                        };
+                        remark("then:");
+                        let then_body = comp(src, tp, len, no_left, -1, cnext, env, elen);
+                        let tr = then_body >> 18;
+                        let tbp = low17(then_body);
+                        emit_word(0x12, tr, result_reg, 0);
+                        remark("Jmp -> end");
+                        emit_word(0x50, 0, 0, 0);
+                        remark("else:");
+                        let tbp2 = skip_ws(src, tbp, len);
+                        let else_id = read_ident(src, tbp2, len, 0);
+                        let eh = else_id >> 16;
+                        let ep = low16(else_id);
+                        if eh == 16001 then {
+                            let else_body = comp(src, ep, len, no_left, -1, cnext, env, elen);
+                            let er = else_body >> 18;
+                            let ebp = low17(else_body);
+                            emit_word(0x12, er, result_reg, 0);
+                            remark("end:");
+                            (result_reg << 18) + ebp
+                        } else (nr << 18) + p
+                    } else (nr << 18) + p
+                } else if h == 18036 then {
+                    // true
+                    emit_word(0x04, nr, 0, 0);
+                    (nr << 18) + q
+                } else if h == 13715 then {
+                    // false (low16 of hash 79251)
+                    emit_word(0x03, nr, 0, 0);
+                    (nr << 18) + q
+                } else if h == 3421 then {
+                    // not
+                    let inner = comp(src, q, len, no_left, -1, nr, env, elen);
+                    let iv = inner >> 18;
+                    let ip = low17(inner);
+                    let dr = nr + 1;
+                    emit_word(0x03, dr, 0, 0);
+                    let dr2 = nr + 2;
+                    emit_word(0x40, iv, dr, dr2);
+                    (dr2 << 18) + (1 << 17) + ip
+                } else if h == 64461 then {
+                    // nperform("effect.name" [, arg1 [, arg2 [, arg3]]])
+                    comp_nperform_parse(comp, src, pos, len, nr, env, elen, no_left, p, q)
+                } else {
+                    let reg = env_lookup(env, elen, low16(h));
+                    if reg == 0 then (nr << 18) + p
+                    else {
+                        emit_word(0x12, reg, nr, 0);
+                        (nr << 18) + q
+                    }
+                }
+            } else { (nr << 18) + p }
+        }
+    } else {
+        let is_bool_bit = 1 << 39;
+        let lb = if left >= is_bool_bit then 1 else 0;
+        let rl = if left >= is_bool_bit then left - is_bool_bit else left;
+        (rl << 18) + (lb << 17) + pos
+    };
+
+    let lr = pair >> 18;
+    let lp = low17(pair);
+    let p = skip_ws(src, lp, len);
+    if p >= len then pair
+    else {
+        let c = perform String.charAt(src, p);
+        if c == 40 then {
+            let ne = nr + elen;
+            let save_reg = if ne < 56 then 150 + ne else 93 + (ne - 56);
+            emit_word(0x12, lr, save_reg, 0);
+            let arg = comp(src, p + 1, len, no_left, -1, nr + 1, env, elen);
+            let arg_end = low17(arg);
+            let ap = skip_ws(src, arg_end, len);
+            if ap < len then {
+                let c2 = perform String.charAt(src, ap);
+                if c2 == 41 then {
+                    // Zero-arg call: comp consumed nothing (arg_end still
+                    // at the starting position, which was the close-paren).
+                    let has_arg = arg_end != p + 1;
+                    if has_arg then {
+                        let arg_reg = arg >> 18;
+                        emit_word(0x12, arg_reg, 10, 0)
+                    } else 0;
+                    let dst = nr;
+                    let argc = if has_arg then 1 else 0;
+                    emit_word(0x64, save_reg, argc, dst);
+                    comp(src, ap + 1, len, dst, min_prec, dst + 1, env, elen)
+                } else pair
+            } else pair
+        } else if c == 61 or c == 33 or c == 60 or c == 62 then {
+            let shift = parse_shift(src, p, len);
+            if shift != 0 then {
+                let sprec = shift >> 16;
+                let sop = low8((shift >> 8));
+                let slen = low8(shift);
+                if sprec < min_prec then pair else {
+                    let rhs = comp(src, p + slen, len, no_left, sprec, nr + 1, env, elen);
+                    let dr = nr + 2;
+                    let rr = rhs >> 18;
+                    let rp = low17(rhs);
+                    emit_word(sop, lr, rr, dr);
+                    comp(src, rp, len, dr + (1 << 39), min_prec, dr + 1, env, elen)
+                }
+            } else {
+                let cmp = parse_cmp(src, p, len);
+                if cmp == 0 then pair else {
+                    let cprec = cmp >> 16;
+                    let cop = low8((cmp >> 8));
+                    let clen = low8(cmp);
+                    if cprec < min_prec then pair else {
+                        let rhs = comp(src, p + clen, len, no_left, cprec, nr + 1, env, elen);
+                        let dr = nr + 2;
+                        let rr = rhs >> 18;
+                        let rp = low17(rhs);
+                        if cop == 0xFF then {
+                            emit_word(0x40, lr, rr, dr);
+                            emit_word(0x49, dr, dr, 0)
+                        } else {
+                            emit_word(cop, lr, rr, dr)
+                        };
+                        comp(src, rp, len, dr + (1 << 39), min_prec, dr + 1, env, elen)
+                    }
+                }
+            }
+        } else if is_alpha(c) then {
+            let ident = read_ident(src, p, len, 0);
+            let kw = ident >> 16;
+            let q = low16(ident);
+            if kw == 3075 then {
+                if 0 < min_prec then pair else {
+                    let lb = bit17(pair);
+                    remark("and");
+                    if lb == 0 then {
+                        emit_word(0x03, 7, 0, 0);
+                        let tmp = nr + 1;
+                        emit_word(0x40, lr, 7, tmp);
+                        emit_word(0x49, tmp, tmp, 0);
+                        remark("JmpF -> and_end");
+                        emit_word(0x52, tmp, 0, 0)
+                    } else {
+                        remark("JmpF -> and_end");
+                        emit_word(0x52, lr, 0, 0)
+                    };
+                    let rhs = comp(src, q, len, no_left, 0, nr + 1, env, elen);
+                    let rr = rhs >> 18;
+                    let rp = low17(rhs);
+                    remark("and_end:");
+                    comp(src, rp, len, rr, min_prec, rr + 1, env, elen)
+                }
+            } else if kw == 669 then {
+                if 0 < min_prec then pair else {
+                    let lb = bit17(pair);
+                    remark("or");
+                    if lb == 0 then {
+                        emit_word(0x03, 7, 0, 0);
+                        let tmp = nr + 1;
+                        emit_word(0x40, lr, 7, tmp);
+                        emit_word(0x49, tmp, tmp, 0);
+                        remark("JmpF -> or_right");
+                        emit_word(0x52, tmp, 0, 0)
+                    } else {
+                        remark("JmpF -> or_right");
+                        emit_word(0x52, lr, 0, 0)
+                    };
+                    let dr = nr + 2;
+                    emit_word(0x04, dr, 0, 0);
+                    remark("Jmp -> or_end");
+                    emit_word(0x50, 0, 0, 0);
+                    remark("or_right:");
+                    let rhs = comp(src, q, len, no_left, 0, dr + 1, env, elen);
+                    let rr = rhs >> 18;
+                    let rp = low17(rhs);
+                    remark("or_end:");
+                    comp(src, rp, len, rr, min_prec, rr + 1, env, elen)
+                }
+            } else pair
+        } else {
+            let prec = prec_of(c);
+            if prec == 0 or prec < min_prec then pair else {
+                let opcode = if c == 43 then 0x20 else if c == 45 then 0x21
+                else if c == 42 then 0x22 else 0x23;
+                let rhs = comp(src, p + 1, len, no_left, prec, nr + 1, env, elen);
+                let rr = rhs >> 18;
+                let rp = low17(rhs);
+                let dr = nr + 2;
+                emit_word(opcode, lr, rr, dr);
+                comp(src, rp, len, dr, min_prec, dr + 1, env, elen)
+            }
+        }
+    }
+}
+
+fn compile(src: String) {
+    let len = perform String.length(src);
+    perform IO.print("; " + src);
+    let result = comp(src, 0, len, 1 << 40, -1, 8, "", 0);
+    let reg = result >> 18;
+    emit_word(0x12, reg, 0, 0);
+    emit_word(0x01, 0, 0, 0);
+    perform IO.print("; result in r" + perform Int.to_string(result >> 18))
+}
+
+fn main() {
+    let input = perform IO.read();
+    if input == "" then compile("1 < 2 and 2 < 3") else compile(input)
+}

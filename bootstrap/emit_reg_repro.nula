@@ -1,0 +1,37 @@
+fn low17(x: Int) -> Int {
+    let q = x / 0x20000;
+    x - q * 0x20000
+}
+
+fn emit_word(op: Int, a: Int, b: Int, c: Int) -> Int {
+    op + a + b + c
+}
+
+fn comp_stub(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env: String, elen: Int) -> Int {
+    (nr << 18) + pos
+}
+
+fn bad(comp_rec, src: String, ap1: Int, len: Int, nr: Int, env: String, elen: Int, no_left_np: Int) -> Int {
+    let p2 = ap1 + 1;
+    let inner2 = comp_rec(src, p2, len, no_left_np, 0, nr + 21, env, elen);
+    let r2 = inner2 >> 18;
+    let e2 = low17(inner2);
+    emit_word(0x12, r2, 2, 0)
+}
+
+fn good(comp_rec, src: String, ap1: Int, len: Int, nr: Int, env: String, elen: Int, no_left_np: Int) -> Int {
+    let p2 = ap1 + 1;
+    let inner2 = comp_rec(src, p2, len, no_left_np, 0, nr + 21, env, elen);
+    let e2 = low17(inner2);
+    emit_word(0x12, inner2 >> 18, 2, 0)
+}
+
+fn main() {
+    let no_left_np = 1 << 40;
+    let bad_v = bad(comp_stub, "", 0, 0, 8, "", 0, no_left_np);
+    let good_v = good(comp_stub, "", 0, 0, 8, "", 0, no_left_np);
+    perform IO.print("bad=");
+    perform IO.print("" + bad_v);
+    perform IO.print(" good=");
+    perform IO.print("" + good_v)
+}

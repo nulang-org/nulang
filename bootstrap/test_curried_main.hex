@@ -1,0 +1,96 @@
+; let low17 = fn(x) => (x) in let f = fn(a) => fn(b) => fn(c) => ( if a == 0 then ( if b == 0 then ( if c == 0 then 1 else 2 ) else 3 ) else 4 ) in 123
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6500
+12650b00
+12650c00
+120c0000
+57000000
+; fn_end:
+60ffff08
+1208d000
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6600
+12660b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6700
+61000b00
+12670c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6900
+61000b00
+61010c00
+12690d00
+120b0e00
+030f0000
+400e0f10
+; if
+; JmpF -> else
+52100000
+; then:
+120c0f00
+03100000
+400f1011
+; if
+; JmpF -> else
+52110000
+; then:
+12691000
+03110000
+40101112
+; if
+; JmpF -> else
+52120000
+; then:
+04110000
+12111200
+; Jmp -> end
+50000000
+; else:
+05110000
+12111200
+; end:
+12121100
+; Jmp -> end
+50000000
+; else:
+; const 3
+07000010
+12101100
+; end:
+12111000
+; Jmp -> end
+50000000
+; else:
+; const 4
+0700000f
+120f1000
+; end:
+12100000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff09
+1209d200
+; const 123
+0700000a
+120a0000
+01000000
+; result in r10

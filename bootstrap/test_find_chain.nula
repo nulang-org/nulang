@@ -1,0 +1,24 @@
+fn find_let_chain_in(src: String, pos: Int, len: Int) -> Int {
+    if pos + 6 >= len then pos
+    else if perform String.charAt(src, pos) == 105 and perform String.charAt(src, pos + 1) == 110 then {
+        let before_c = if pos > 0 then perform String.charAt(src, pos - 1) else 32;
+        let before_ok = pos == 0 or before_c == 32 or before_c == 41;
+        let c2 = if pos + 2 < len then perform String.charAt(src, pos + 2) else 32;
+        let c3 = if pos + 3 < len then perform String.charAt(src, pos + 3) else 32;
+        let c4 = if pos + 4 < len then perform String.charAt(src, pos + 4) else 32;
+        let c5 = if pos + 5 < len then perform String.charAt(src, pos + 5) else 32;
+        let is_chain = before_ok and c2 == 32 and (
+            (c3 == 108 and c4 == 101 and c5 == 116) or
+            (c3 == 48) or
+            (c3 == 95 and c4 == 32)
+        );
+        if is_chain then pos else find_let_chain_in(src, pos + 1, len)
+    } else {
+        find_let_chain_in(src, pos + 1, len)
+    }
+}
+
+fn main() {
+    let s = "let a = fn(x) => (let q = 1 in x) in let b = 1 in 0";
+    find_let_chain_in(s, 28, 51)
+}

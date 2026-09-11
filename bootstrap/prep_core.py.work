@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""prep_core.py - Convert compiler_core.nula into a form compile_hex.nula can compile.
+
+Transforms applied:
+  1. Strip comments.
+  2. Convert top-level `fn name(params) -> Type { body }` into a let-chain of
+     single-parameter functions, wrapping everything in `main(...)`.
+  3. Curry multi-argument call sites.
+  4. Flatten `{ ... }` blocks into nested `let/in` or parenthesized expressions.
+  5. Convert unsupported operators (`<<`, `>>`) to arithmetic.
+  6. Emit the result as a single line (compile_hex.nula treats newlines as terminators).
+"""
+
+import sys
+import re
+
+
+def strip_comments(src: str) -> str:
+    lines = []
+    for line in src.splitlines():
+        if '//' in line:
+            line = line.split('//')[0]
+        lines.append(line)
+    return '\n'.join(lines)
+
+
+def balanced_split_args(args_str: str) -> list[str]:
+    args = []
+    depth = 0
+    curr = ''
+    for ch in args_str:
+        if ch == ',' and depth == 0:
+            args.append(curr.strip())
+            curr = ''
+        else:
+            if ch in '({[':
+                depth += 1
+            elif ch in ')}]':
+                depth -= 1
+            curr += ch
+    if curr.strip():
+        args.append(curr.strip())
+    return args
+
+
+def curry_call(name: str, args_str: str) -> str | None:
+    args = balanced_split_args(args_str)
+    if len(args) <= 1:
+        return None
+    result = name + '(' + args[0] + ')'
+    for a in args[1:]:
+        result += '(' + a + ')'
+    return result
+
+
+def transform_perform(source: str) -> str:
+    """Transform `perform Effect.name(args)` into `_perform("Effect.name")(args)`."""
+    result = []
+    i = 0
+    in_str = False
+    while i < len(source):
+        ch = source[i]
+        if ch == '"':
+            in_str = not in_str
+            result.append(ch)
+            i += 1
+            continue
+        if in_str:
+            result.append(ch)
+            i += 1
+            continue
+        m = re.match(r'\bperform\s+', source[i:])
+        if m:
+            j = i + m.end()
+            name_match = re.match(r'([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)', source[j:])
+            if name_match:
+                effect_name = name_match.group(1)
+                k = j + name_match.end()
+                while k < len(source) and source[k].isspace():
+                    k += 1
+                if k < len(source) and source[k] == '(':
+                    depth = 1
+                    end = k + 1
+                    inner_str = False
+                    while end < len(source) and depth > 0:
+                        if source[end] == '"':
+                            inner_str = not inner_str
+                        elif not inner_str:
+                            if source[end] == '(':
+                                depth += 1
+                            elif source[end] == ')':
+                                depth -= 1
+                        end += 1
+                    if depth == 0:
+                        args_str = source[k + 1:end - 1]
+                        args = balanced_split_args(args_str)
+                        if args:
+                            curried = f'nperform("{effect_name}", ' + ', '.join(args) + ')'
+                        else:
+                            curried = f'nperform("{effect_name}")'
+                        result.append(curried)
+                        i = end
+                        continue
+        result.append(ch)
+        i += 1
+    out = ''.join(result)
+    # Recurse to transform nested perform calls inside effect arguments.
+    if out != source:
+        out = transform_perform(out)
+    return out
+
+
+def curry_call_sites(source: str) -> str:
+    """Curry function calls with multiple arguments, but not `fn` definitions or nperform."""
+    KEYWORDS = {'then', 'else', 'if', 'let', 'in', 'fn', 'and', 'or', 'not'}
+    def repl(match: re.Match) -> str:
+        name = match.group(1)
+        args_str = match.group(2)
+        full = match.group(0)
+        before = source[max(0, match.start() - 10):match.start()]
+        after = source[match.end():match.end() + 20]
+        # Recursively curry all arguments so inner multi-arg calls
+        # (e.g. inside `then(...)`) are also curried.
+        args = balanced_split_args(args_str)
+        curried_args = [curry_call_sites(a) for a in args]
+        # Skip keywords.
+        if name in KEYWORDS:
+            return name + '(' + ', '.join(curried_args) + ')'
+        # nperform effect calls are parsed specially by compile_hex, but their
+        # arguments may still contain multi-arg function calls that need currying.
+        if name == 'nperform':
+            return 'nperform(' + ', '.join(curried_args) + ')'
+        # Skip qualified names (String.charAt) and function definitions.
+        if match.start() > 0 and source[match.start() - 1] == '.':
+            return full
+        if re.search(r'\bfn\s+$', before) and re.match(r'\s*(?:=>|->|\{)', after):
+            return full
+        if len(args) <= 1:
+            return full
+        c = curry_call(name, args_str)
+        return c if c else full
+
+    return re.sub(
+        r'(\w+)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)',
+        repl,
+        source
+    )
+
+
+def strip_type_annotations(params_str: str) -> str:
+    """From `x: Int, y: String` produce `x, y`."""
+    args = balanced_split_args(params_str)
+    stripped = []
+    for a in args:
+        a2 = a.split(':', 1)[0].strip()
+        if a2:
+            stripped.append(a2)
+    return ', '.join(stripped)
+
+
+def curry_fn_definition(name: str, params: list[str], body: str) -> str:
+    """Convert multi-param definition into nested single-param lambdas.
+
+    Example:
+        name='add', params=['x','y'], body='x + y'
+      ->
+        add = fn(x) => fn(y) => x + y
+    """
+    if not params:
+        return f'{name} = fn() => {body}'
+    result = body
+    for p in reversed(params[1:]):
+        result = f'fn({p}) => {result}'
+    result = f'{name} = fn({params[0]}) => {result}'
+    return result
+
+
+def flatten_blocks(source: str) -> str:
+    """Convert `{ a; b; expr }` blocks into nested `let/in` or `(expr)`."""
+    # Repeatedly find outermost {} blocks and replace them.
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        i = 0
+        while i < len(source):
+            if source[i] == '{':
+                depth = 1
+                j = i + 1
+                in_str = False
+                while j < len(source) and depth > 0:
+                    ch = source[j]
+                    if ch == '"':
+                        in_str = not in_str
+                    elif not in_str:
+                        if ch == '{':
+                            depth += 1
+                        elif ch == '}':
+                            depth -= 1
+                    j += 1
+                inner = source[i + 1:j - 1].strip()
+                replacement = _flatten_block_body(inner)
+                out.append(replacement)
+                i = j
+                changed = True
+            else:
+                out.append(source[i])
+                i += 1
+        source = ''.join(out)
+    return source
+
+
+def _flatten_block_body(body: str) -> str:
+    """Flatten a block body (semicolon/newline-separated statements) into an expression."""
+    # Split at top-level semicolons or newlines.  Newlines inside a multi-line
+    # `if ... then ... else ...` chain are continuations: any part that begins
+    # with `else` is merged back onto the previous part.
+    parts = []
+    depth = 0
+    in_str = False
+    curr = ''
+    for ch in body:
+        if ch == '"':
+            in_str = not in_str
+            curr += ch
+        elif in_str:
+            curr += ch
+        elif ch in '({[':
+            depth += 1
+            curr += ch
+        elif ch in ')}]':
+            depth -= 1
+            curr += ch
+        elif (ch == ';' or ch == '\n') and depth == 0:
+            if curr.strip():
+                parts.append(curr.strip())
+            curr = ''
+        else:
+            curr += ch
+    if curr.strip():
+        parts.append(curr.strip())
+
+    # Merge `else` continuations.
+    merged = []
+    for part in parts:
+        if merged and re.match(r'else\b', part):
+            merged[-1] = merged[-1] + ' ' + part
+        else:
+            merged.append(part)
+    parts = merged
+
+    if not parts:
+        return '()'
+    if len(parts) == 1:
+        return '(' + parts[0] + ')'
+
+    # Wrap as nested let/in: let a = stmt1 in let b = stmt2 in ... in final_expr
+    # Heuristic: the LAST part is the value; preceding parts are let bindings if they
+    # are of the form `let x = ...`. Otherwise wrap each non-let as `let _ = expr in`.
+    expr = parts[-1]
+    for stmt in reversed(parts[:-1]):
+        m = re.match(r'let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)', stmt, re.DOTALL)
+        if m:
+            expr = f'let {m.group(1)} = {m.group(2)} in {expr}'
+        else:
+            expr = f'let _ = {stmt} in {expr}'
+    return '(' + expr + ')'
+
+
+def _replace_shift(source: str, op: str, repl_fn) -> str:
+    """Replace `x op n` (where op is << or >> and n is a literal) by scanning
+    leftwards from the operator to find the balanced operand expression.
+    """
+    out = []
+    last_end = 0
+    i = 0
+    while i < len(source):
+        if source.startswith(op, i):
+            # Skip whitespace immediately before the operator.
+            left_start = i - 1
+            while left_start >= 0 and source[left_start].isspace():
+                left_start -= 1
+            # Find left operand by scanning backwards from the operand's end,
+            # respecting parens and strings.
+            j = left_start
+            depth = 0
+            in_str = False
+            end_j = None
+            while j >= 0:
+                c = source[j]
+                if c == '"':
+                    in_str = not in_str
+                elif not in_str:
+                    if c == ')':
+                        depth += 1
+                    elif c == '(':
+                        if depth == 0:
+                            end_j = j
+                            break
+                        depth -= 1
+                    elif depth == 0 and c in ' +-*/%=<>!&|,:;':
+                        end_j = j + 1
+                        break
+                j -= 1
+            else:
+                end_j = 0
+            # Find literal n after the operator.
+            k = i + len(op)
+            while k < len(source) and source[k].isspace():
+                k += 1
+            m_end = k
+            while m_end < len(source) and source[m_end].isdigit():
+                m_end += 1
+            if m_end > k:
+                x = source[end_j:i].strip()
+                n = int(source[k:m_end])
+                out.append(source[last_end:end_j])
+                out.append(repl_fn(x, n))
+                last_end = m_end
+                i = m_end
+                continue
+        i += 1
+    out.append(source[last_end:])
+    return ''.join(out)
+
+
+def convert_operators(source: str) -> str:
+    """Replace operators/lexemes that compile_hex.nula does not support."""
+    source = _replace_shift(source, '<<', lambda x, n: f'({x} * {1 << n})')
+    source = _replace_shift(source, '>>', lambda x, n: f'({x} / {1 << n})')
+    # compile_hex.nula's read_int only handles decimal literals, so convert
+    # hex literals to decimal.
+    source = re.sub(r'\b0x([0-9a-fA-F]+)\b', lambda m: str(int(m.group(1), 16)), source)
+    return source
+
+
+def parse_top_level_fns(source: str) -> tuple[list[tuple[str, list[str], str]], str]:
+    """Parse top-level `fn name(params) -> Type { body }` blocks."""
+    fns = []
+    rest = source.strip()
+    pattern = re.compile(
+        r'^\s*fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?:->\s*\w+\s*)?\{',
+        re.MULTILINE
+    )
+    while True:
+        m = pattern.search(rest)
+        if not m:
+            break
+        name = m.group(1)
+        params_raw = m.group(2)
+        start_body = rest.find('{', m.end() - 1)
+        if start_body < 0:
+            break
+        depth = 1
+        i = start_body + 1
+        while i < len(rest) and depth > 0:
+            if rest[i] == '{':
+                depth += 1
+            elif rest[i] == '}':
+                depth -= 1
+            i += 1
+        body = rest[start_body + 1:i - 1].strip()
+        params = [p.strip().split(':', 1)[0].strip() for p in balanced_split_args(params_raw)]
+        params = [p for p in params if p]
+        fns.append((name, params, body))
+        rest = rest[i:].strip()
+    return fns, rest
+
+
+# Inline small, pure helpers so the Stage-2 self-host pipeline stays under the
+# host compiler's function-count ceiling.  These functions have no side effects
+# and no recursion, so textual substitution is safe.
+_INLINEABLE: dict[str, tuple[list[str], str]] = {
+    'low17': (['x'], '(let q = ($0) / 131072 in ($0) - q * 131072)'),
+    'low16': (['x'], '(let q = ($0) / 65536 in ($0) - q * 65536)'),
+    'low8': (['x'], '(let q = ($0) / 256 in ($0) - q * 256)'),
+    'low4': (['x'], '(let q = ($0) / 16 in ($0) - q * 16)'),
+    'low6': (['x'], '(let q = ($0) / 64 in ($0) - q * 64)'),
+    'bit17': (['x'], '(let t = ($0) / 131072 in t - (t / 2) * 2)'),
+    'prec_of': (['c'], '(if ($0) == 43 then 2 else if ($0) == 45 then 2 else if ($0) == 42 then 3 else if ($0) == 47 then 3 else if ($0) == 38 then 2 else 0)'),
+    'is_digit': (['c'], '(($0) >= 48 and ($0) <= 57)'),
+    'is_alpha': (['c'], '(($0) >= 65 and ($0) <= 90 or ($0) >= 97 and ($0) <= 122)'),
+    'is_alphanum': (['c'], '(($0) >= 65 and ($0) <= 90 or ($0) >= 97 and ($0) <= 122 or ($0) >= 48 and ($0) <= 57 or ($0) == 95)'),
+    'is_space': (['c'], '(($0) == 32 or ($0) == 10 or ($0) == 13 or ($0) == 9)'),
+    'env_decode': (['env', 'i'], '(let b0 = perform String.charAt(($0), ($1)) - 1 in let b1 = perform String.charAt(($0), ($1) + 1) - 1 in let b2 = perform String.charAt(($0), ($1) + 2) - 1 in let b3 = perform String.charAt(($0), ($1) + 3) - 1 in (b0 * 262144) + (b1 * 4096) + (b2 * 64) + b3)'),
+    'parse_cmp': (['src', 'p', 'len'], '(if p >= len then 0 else (let c = nperform("String.charAt", src, p) in if c == 61 and p + 1 < len then (let c2 = nperform("String.charAt", src, p + 1) in if c2 == 61 then (1 * 65536) + (64 * 256) + 2 else 0) else if c == 33 and p + 1 < len then (let c2 = nperform("String.charAt", src, p + 1) in if c2 == 61 then (1 * 65536) + (255 * 256) + 2 else 0) else if c == 60 then (if p + 1 < len then (let c2 = nperform("String.charAt", src, p + 1) in if c2 == 61 then (1 * 65536) + (67 * 256) + 2 else (1 * 65536) + (65 * 256) + 1) else (1 * 65536) + (65 * 256) + 1) else if c == 62 then (if p + 1 < len then (let c2 = nperform("String.charAt", src, p + 1) in if c2 == 61 then (1 * 65536) + (68 * 256) + 2 else (1 * 65536) + (66 * 256) + 1) else (1 * 65536) + (66 * 256) + 1) else 0))'),
+    'parse_shift': (['src', 'p', 'len'], '(if p + 1 < len then (let c1 = nperform("String.charAt", src, p) in let c2 = nperform("String.charAt", src, p + 1) in if c1 == 60 and c2 == 60 then (3 * 65536) + (42 * 256) + 2 else if c1 == 62 and c2 == 62 then (3 * 65536) + (43 * 256) + 2 else 0) else 0)'),
+    'instr': (['opcode', 'op1', 'op2', 'op3'], '((($0) << 24) + (($1) << 16) + (($2) << 8) + ($3))'),
+    'emit_cap_step': (['closure_reg', 'slot', 'is_store'], '(let cap_reg = 11 + ($1) in if ($2) != 0 then emit_word(0x62, ($0), ($1), cap_reg) else emit_word(0x61, ($1), cap_reg, 0))'),
+    'emit_fnend_step': (['reg', 'slot', 'closure_reg'], '(let cap_dst = 11 + ($1) in let _ = emit_word(0x12, ($0), cap_dst, 0) in emit_word(0x62, ($2), ($1), cap_dst))'),
+    'hex_digit': (['n'], '(if ($0) < 10 then perform Int.to_string(($0)) else if ($0) == 10 then "a" else if ($0) == 11 then "b" else if ($0) == 12 then "c" else if ($0) == 13 then "d" else if ($0) == 14 then "e" else "f")'),
+    'env_push': (['env', 'h', 'reg'], '(let v = ((low16(($1))) << 8) + (low8(($2))) in let c0 = (low6((v >> 18))) + 1 in let c1 = (low6((v >> 12))) + 1 in let c2 = (low6((v >> 6))) + 1 in let c3 = (low6(v)) + 1 in ($0) + perform String.from_char(c0) + perform String.from_char(c1) + perform String.from_char(c2) + perform String.from_char(c3))'),
+}
+
+
+def _balanced_call_args(src: str, start: int) -> tuple[str, int] | None:
+    if start >= len(src) or src[start] != '(':
+        return None
+    depth, i, in_str = 1, start + 1, False
+    while i < len(src):
+        c = src[i]
+        if c == '"':
+            in_str = not in_str
+        elif not in_str:
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    return src[start + 1:i], i + 1
+        i += 1
+    return None
+
+
+def _inline_calls(body: str, name: str, params: list[str], template: str) -> str:
+    out, i = [], 0
+    pat = re.compile(rf'\b{re.escape(name)}\b')
+    while i < len(body):
+        m = pat.search(body, i)
+        if not m:
+            out.append(body[i:])
+            break
+        j = m.end()
+        parsed = _balanced_call_args(body, j)
+        if parsed is None:
+            out.append(body[i:j])
+            i = j
+            continue
+        args_str, end = parsed
+        args = balanced_split_args(args_str)
+        if len(args) != len(params):
+            out.append(body[i:j])
+            i = j
+            continue
+        repl = template
+        for idx, arg in enumerate(args):
+            repl = repl.replace(f'(${idx})', f'({arg})')
+        out.append(body[i:m.start()])
+        out.append(repl)
+        i = end
+    return ''.join(out)
+
+
+def _replace_remark_calls(source: str) -> str:
+    """Replace remark() calls: non-essential markers become 0; essential
+    markers become direct perform IO.print() so the remark() helper can be
+    dropped entirely."""
+    out, i = [], 0
+    pat = re.compile(r'\bremark\s*\(')
+    while i < len(source):
+        m = pat.search(source, i)
+        if not m:
+            out.append(source[i:])
+            break
+        # Find matching closing paren, respecting strings and nesting.
+        depth, j, in_str = 1, m.end(), False
+        while j < len(source) and depth > 0:
+            c = source[j]
+            if c == '"':
+                in_str = not in_str
+            elif not in_str:
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+            j += 1
+        arg = source[m.end():j - 1].strip()
+        # Non-essential markers that fixup_hex.py does not need.
+        if arg in ('"and"', '"or"', '"truthiness: check int 0"',
+                   '"truthiness: check bool false"', '"then:"'):
+            repl = '0'
+        elif arg.startswith('"const " + '):
+            repl = f'perform IO.print("; const " + {arg[len("\"const \" + "):].strip()})'
+        elif arg.startswith('"') and arg.endswith('"'):
+            msg = arg[1:-1]
+            repl = f'perform IO.print("; {msg}")'
+        else:
+            # Unrecognized: leave untouched.
+            repl = source[m.start():j]
+        out.append(source[i:m.start()])
+        out.append(repl)
+        i = j
+    return ''.join(out)
+
+
+def inline_simple_functions(fns: list[tuple[str, list[str], str]]) -> list[tuple[str, list[str], str]]:
+    """Inline pure helper functions and drop their let-bindings."""
+    inlineable = {n for n in _INLINEABLE if any(name == n for name, _, _ in fns)}
+    by_name = {n: (n, p, b) for n, p, b in fns}
+    # Apply substitutions repeatedly to handle nested inlineable calls.
+    changed = True
+    while changed:
+        changed = False
+        new_fns = []
+        for name, params, body in fns:
+            if name in inlineable:
+                new_fns.append((name, params, body))
+                continue
+            new_body = body
+            for iname in inlineable:
+                iparams, itemplate = _INLINEABLE[iname]
+                new_body2 = _inline_calls(new_body, iname, iparams, itemplate)
+                if new_body2 != new_body:
+                    changed = True
+                    new_body = new_body2
+            new_fns.append((name, params, new_body))
+        fns = new_fns
+    return [(n, p, b) for n, p, b in fns if n not in inlineable]
+
+
+def convert_to_let_chain(fns: list[tuple[str, list[str], str]], main_expr: str) -> str:
+    """Wrap functions in nested let/in and curry definitions.
+
+    If the final main expression is empty, invoke the `main` function.
+    """
+    main_expr = main_expr.strip()
+    if not main_expr and fns:
+        main_expr = f'{fns[-1][0]}()'
+    expr = transform_perform(main_expr)
+    expr = curry_call_sites(expr)
+    for name, params, body in reversed(fns):
+        body = flatten_blocks(body)
+        body = _flatten_block_body(body)
+        body = convert_operators(body)
+        body = transform_perform(body)
+        body = curry_call_sites(body)
+        defn = curry_fn_definition(name, params, body)
+        expr = f'let {defn} in {expr}'
+    return expr
+
+
+def main():
+    source = sys.stdin.read()
+    source = strip_comments(source)
+    source = _replace_remark_calls(source)
+    fns, main_expr = parse_top_level_fns(source)
+    fns = inline_simple_functions(fns)
+    # remark() has been replaced with direct IO.print/0; drop the helper.
+    fns = [(n, p, b) for n, p, b in fns if n != 'remark']
+    result = convert_to_let_chain(fns, main_expr)
+    # Collapse whitespace to a single line (preserve necessary spaces around identifiers).
+    result = re.sub(r'\s+', ' ', result).strip()
+    print(result)
+
+
+if __name__ == '__main__':
+    main()
