@@ -80,11 +80,21 @@ fn message(payload: &Arc<Vec<Value>>) -> Message {
     }
 }
 
+fn owned_message_one(value: Value) -> Message {
+    Message {
+        behavior_id: 1,
+        payload: Arc::new(vec![value]),
+        sender: 42,
+        priority: MessagePriority::Normal,
+        trace_id: None,
+    }
+}
+
 fn bench_mailbox_hot_paths(c: &mut Criterion) {
     let mut group = c.benchmark_group("runtime_hot_path/mailbox");
     group.throughput(Throughput::Elements(1));
 
-    group.bench_function("local_push_pop", |b| {
+    group.bench_function("local_push_pop_prebuilt_payload", |b| {
         let payload = Arc::new(vec![Value::int(1)]);
         let mut mailbox = Mailbox::new(0);
         b.iter(|| {
@@ -95,7 +105,17 @@ fn bench_mailbox_hot_paths(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("segqueue_push_pop", |b| {
+    group.bench_function("local_push_pop_construct_payload_1", |b| {
+        let mut mailbox = Mailbox::new(0);
+        b.iter(|| {
+            mailbox
+                .push_local(owned_message_one(black_box(Value::int(1))))
+                .expect("unbounded local mailbox push");
+            black_box(mailbox.pop().expect("message just pushed"));
+        });
+    });
+
+    group.bench_function("segqueue_push_pop_prebuilt_payload", |b| {
         let payload = Arc::new(vec![Value::int(1)]);
         let mut mailbox = Mailbox::new(0);
         b.iter(|| {
@@ -114,7 +134,7 @@ fn bench_mailbox_hot_paths(c: &mut Criterion) {
                 .push_local(message(&payload))
                 .expect("unbounded local mailbox push");
             let matched = mailbox
-                .receive_match(black_box(&[1]))
+                .receive_match(black_box(&[1u16]))
                 .expect("matching behavior id");
             black_box(matched);
             mailbox.commit_receive_match();
