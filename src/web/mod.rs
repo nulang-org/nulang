@@ -7,4 +7,5 @@ pub mod modules;
 pub mod package_contracts;
 pub mod reactivity;
 pub mod route_check;
+pub mod runtime_bindings;
 pub mod validation;
