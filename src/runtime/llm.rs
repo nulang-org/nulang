@@ -1,117 +1,191 @@
 //! LLM subsystem for the actor runtime.
 //!
-//! Manages the persistent LLM worker thread, request dispatch, completion
-//! polling, and non-blocking suspension for `perform LLM.ask` in bytecode
-//! behaviors.
+//! Provider execution is isolated behind one process-wide bounded worker pool.
+//! Runtime shards keep only their client/configuration and completion inbox;
+//! each work item carries the originating shard's completion sender. This
+//! avoids both the old single-worker bottleneck and a worker-pool-per-shard
+//! explosion in multi-threaded nodes.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use nulang_ai::{LlmClient, LlmError, LlmRequest, LlmResponse, TokenBudget};
+use nulang_ai::{LlmClient, LlmError, LlmErrorKind, LlmRequest, LlmResponse, TokenBudget};
 
-/// Work item sent to the persistent LLM worker thread.
+/// Default process-wide provider concurrency. Override with
+/// `NULANG_LLM_WORKERS` (1..=64).
+const DEFAULT_LLM_WORKERS: usize = 8;
+const MAX_LLM_WORKERS: usize = 64;
+
+/// Maximum number of provider requests waiting behind active workers.
+/// Override with `NULANG_LLM_QUEUE_CAPACITY` (1..=65536).
+const DEFAULT_LLM_QUEUE_CAPACITY: usize = 1024;
+const MAX_LLM_QUEUE_CAPACITY: usize = 65_536;
+
+type Completion = (u64, Result<LlmResponse, LlmError>);
+
+fn env_bounded_usize(name: &str, default: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=max).contains(value))
+        .unwrap_or(default)
+}
+
+/// Work item submitted to the process-wide provider executor.
 pub(crate) struct LlmWorkItem {
     pub(crate) actor_id: u64,
     pub(crate) request: LlmRequest,
     pub(crate) client: Arc<dyn LlmClient>,
+    completion_tx: std::sync::mpsc::Sender<Completion>,
 }
 
-// Safety: LlmWorkItem is Send because all fields are Send.
-unsafe impl Send for LlmWorkItem {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutorSendFailure {
+    Full,
+    Disconnected,
+}
 
-/// Consolidated LLM subsystem state.
+/// Preserve the work item while classifying a non-blocking queue failure.
+/// Keeping this generic makes the overload/disconnect behavior testable
+/// without constructing an LLM provider request.
+fn classify_try_send<T>(
+    result: Result<(), crossbeam::channel::TrySendError<T>>,
+) -> Result<(), (T, ExecutorSendFailure)> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(crossbeam::channel::TrySendError::Full(item)) => Err((item, ExecutorSendFailure::Full)),
+        Err(crossbeam::channel::TrySendError::Disconnected(item)) => {
+            Err((item, ExecutorSendFailure::Disconnected))
+        }
+    }
+}
+
+fn executor_submission_error(reason: ExecutorSendFailure) -> LlmError {
+    match reason {
+        ExecutorSendFailure::Full => LlmError::new(
+            LlmErrorKind::ProviderError,
+            "LLM executor queue is full; request was not submitted",
+        ),
+        ExecutorSendFailure::Disconnected => LlmError::new(
+            LlmErrorKind::ProviderError,
+            "LLM executor is unavailable; request was not submitted",
+        ),
+    }
+}
+
+/// Route local executor failures through the same asynchronous completion
+/// channel as provider failures. This keeps one decrement/retry/fallback path
+/// and prevents overload from being mistaken for an empty successful model
+/// response by the caller.
+fn report_submission_failure(
+    completion_tx: &std::sync::mpsc::Sender<Completion>,
+    actor_id: u64,
+    reason: ExecutorSendFailure,
+) -> bool {
+    completion_tx
+        .send((actor_id, Err(executor_submission_error(reason))))
+        .is_ok()
+}
+
+static LLM_EXECUTOR_TX: OnceLock<crossbeam::channel::Sender<LlmWorkItem>> = OnceLock::new();
+
+/// Lazily initialize the process-wide bounded provider executor.
+fn executor_tx() -> &'static crossbeam::channel::Sender<LlmWorkItem> {
+    LLM_EXECUTOR_TX.get_or_init(|| {
+        let worker_count =
+            env_bounded_usize("NULANG_LLM_WORKERS", DEFAULT_LLM_WORKERS, MAX_LLM_WORKERS);
+        let queue_capacity = env_bounded_usize(
+            "NULANG_LLM_QUEUE_CAPACITY",
+            DEFAULT_LLM_QUEUE_CAPACITY,
+            MAX_LLM_QUEUE_CAPACITY,
+        );
+        let (request_tx, request_rx) = crossbeam::channel::bounded::<LlmWorkItem>(queue_capacity);
+
+        for worker_id in 0..worker_count {
+            let request_rx = request_rx.clone();
+            let _worker = std::thread::Builder::new()
+                .name(format!("nulang-llm-{worker_id}"))
+                .spawn(move || {
+                    let tokio_rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    while let Ok(item) = request_rx.recv() {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            tokio_rt.block_on(item.client.complete(item.request))
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(LlmError::from_string("LLM worker thread panicked"))
+                        });
+                        let _ = item.completion_tx.send((item.actor_id, result));
+                    }
+                });
+        }
+
+        // Only worker clones retain receivers after initialization. If every
+        // worker fails to start or exits, try_send sees a disconnected channel
+        // instead of accepting work that can never complete.
+        drop(request_rx);
+        request_tx
+    })
+}
+
+/// Per-runtime-shard LLM state.
 ///
-/// Extracted from the Runtime god-object to group related fields and
-/// clarify ownership. The worker thread is spawned in [`LlmState::new`]
-/// and runs for the lifetime of the runtime.
+/// The expensive execution pool is process-wide; a shard owns only its
+/// provider client, token budget, completion channel, and bookkeeping.
 pub struct LlmState {
-    /// Token budget for LLM calls. When set, the runtime rejects
-    /// LLM requests that would exceed the configured token limit.
+    /// Token budget for LLM calls. When set, the runtime rejects requests that
+    /// cannot fit within the remaining estimated budget.
     pub token_budget: Option<Arc<TokenBudget>>,
 
-    /// LLM client for the v0.9 AI Runtime. Shared (Arc) so background worker
-    /// threads can perform non-blocking `perform LLM.ask` calls.
+    /// Provider client installed for this runtime shard.
     pub client: Option<Arc<dyn LlmClient>>,
 
-    /// Channel receiving results from the persistent LLM worker thread.
-    /// Drained by `poll_llm_completions`.
-    pub rx: std::sync::mpsc::Receiver<(u64, Result<LlmResponse, LlmError>)>,
+    /// Completed provider calls destined for this runtime shard.
+    pub rx: std::sync::mpsc::Receiver<Completion>,
+    completion_tx: std::sync::mpsc::Sender<Completion>,
 
-    /// Number of LLM calls currently in flight. Incremented on dispatch,
-    /// decremented when the completion is stored.
+    /// Successfully dispatched calls whose completion has not yet been
+    /// observed by the scheduler.
     pub inflight_count: usize,
-
-    /// Channel to dispatch work to the persistent LLM worker thread.
-    /// `None` after the runtime is dropped (sender half is owned by the
-    /// worker thread, which outlives the runtime).
-    pub(crate) request_tx: Option<crossbeam::channel::Sender<LlmWorkItem>>,
 }
 
 impl LlmState {
-    /// Create the LLM subsystem, spawning the persistent worker thread.
-    ///
-    /// The worker thread owns its own single-threaded tokio runtime and
-    /// processes requests sequentially. Results are sent back through the
-    /// `rx` channel.
+    /// Create dormant per-shard state. This does not create provider workers;
+    /// the process-wide executor starts on the first actual dispatch.
     pub fn new() -> Self {
-        let (llm_tx, llm_rx) = std::sync::mpsc::channel();
-        let llm_tx_worker = llm_tx.clone();
-        let (llm_request_tx, llm_request_rx) = crossbeam::channel::unbounded::<LlmWorkItem>();
-
-        // Spawn a persistent LLM worker thread.
-        let _worker = std::thread::Builder::new()
-            .name("nulang-llm".to_string())
-            .spawn(move || {
-                let tokio_rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(_) => return,
-                };
-                while let Ok(item) = llm_request_rx.recv() {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        tokio_rt.block_on(item.client.complete(item.request))
-                    }))
-                    .unwrap_or_else(|_| Err(LlmError::from_string("LLM worker thread panicked")));
-                    let _ = llm_tx_worker.send((item.actor_id, result));
-                }
-            });
-
+        let (completion_tx, rx) = std::sync::mpsc::channel();
         LlmState {
             token_budget: None,
             client: None,
-            rx: llm_rx,
+            rx,
+            completion_tx,
             inflight_count: 0,
-            request_tx: Some(llm_request_tx),
         }
     }
 
-    /// Set the LLM client provider.
     pub fn set_client(&mut self, client: Box<dyn LlmClient>) {
         self.client = Some(Arc::from(client));
     }
 
-    /// Set a token budget limit. Requests exceeding this are rejected.
     pub fn set_token_budget(&mut self, limit: u64) {
         self.token_budget = Some(Arc::new(TokenBudget::new(limit)));
     }
 
-    /// Remove the token budget limit.
     pub fn clear_token_budget(&mut self) {
         self.token_budget = None;
     }
 
-    /// Check whether the token budget allows the given estimated tokens.
-    /// Returns `true` if the request is allowed (budget not exhausted).
-    pub fn check_token_budget(&self, _estimated_tokens: u64) -> bool {
-        if let Some(budget) = &self.token_budget {
-            !budget.is_exhausted()
-        } else {
-            true
-        }
+    pub fn check_token_budget(&self, estimated_tokens: u64) -> bool {
+        self.token_budget
+            .as_ref()
+            .map(|budget| estimated_tokens <= budget.remaining())
+            .unwrap_or(true)
     }
 
-    /// Record token usage against the budget.
     pub fn record_token_usage(&self, tokens: u64) {
         if let Some(budget) = &self.token_budget {
             budget.charge(tokens);
@@ -146,9 +220,8 @@ pub(crate) fn poll_llm_completions(rt: &mut Runtime) {
     }
 }
 
-/// Record a completed background LLM call on its actor and resume the
-/// actor's suspended behavior, if any. Errors trigger the retry/fallback
-/// pipeline when the actor has a configured agent retry or fallback.
+/// Record a completed background LLM call on its actor and resume the actor's
+/// suspended behavior, if any.
 pub(crate) fn store_llm_completion(
     rt: &mut Runtime,
     actor_id: u64,
@@ -171,22 +244,18 @@ pub(crate) fn store_llm_completion(
                 resume_suspended_llm_step(rt, actor_id);
             }
         }
-        Err(error) => {
-            handle_llm_error(rt, actor_id, error);
-        }
+        Err(error) => handle_llm_error(rt, actor_id, error),
     }
 }
 
 /// Process an LLM error: decide whether to retry, fall back, or fail.
 pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError) {
-    // Only agent actors have retry/fallback config.
     let is_agent = rt
         .actors
         .get(&actor_id)
         .map(|a| matches!(a.role(), Ok(ActorRole::Agent)))
         .unwrap_or(false);
     if !is_agent {
-        // Non-agent actors: store the error and resume.
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
             actor.llm_inflight = false;
             actor.llm_pending_prompt = None;
@@ -199,8 +268,6 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
         return;
     }
 
-    // Read retry/fallback config from cached actor fields (parsed once at
-    // agent init), plus mutable state for attempt tracking and prompt.
     let (retry_config, fallback_config, attempt, fallback_step, prompt) = {
         let actor = match rt.actors.get(&actor_id) {
             Some(a) => a,
@@ -220,14 +287,12 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
         (retry, fallback, attempt_val, fallback_step_val, prompt_val)
     };
 
-    // --- Retry path ---
     if let Some(retry) = &retry_config {
         if attempt < retry.max_attempts {
             let new_attempt = attempt + 1;
-            // Update llm_attempt in actor state.
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
-                actor.llm_inflight = false; // will be set true again on re-dispatch
-                actor.set_state_field("llm_attempt", crate::vm::Value::int(new_attempt as i64));
+                actor.llm_inflight = false;
+                actor.set_state_field("llm_attempt", Value::int(new_attempt as i64));
             }
             let delay_ms = compute_backoff(retry, attempt, actor_id);
             rt.timer_wheel
@@ -236,45 +301,33 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
         }
     }
 
-    // --- Fallback path ---
     if fallback_step < fallback_config.len() {
-        let error_kind_name = format!("{:?}", error.kind); // "Timeout", "RateLimit", etc.
+        let error_kind_name = format!("{:?}", error.kind);
         let fb = &fallback_config[fallback_step];
         let fb_matches = fb.on.is_empty() || fb.on.iter().any(|k| *k == error_kind_name);
         let new_fallback_step = fallback_step + 1;
         if fb_matches {
-            // Swap model and apply context pruning if needed.
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 actor.llm_inflight = false;
                 let model_ptr = actor.allocate_string(&fb.model);
                 actor.set_state_field("model", model_ptr);
-                actor.set_state_field("llm_attempt", crate::vm::Value::int(0));
-                actor.set_state_field(
-                    "llm_fallback_step",
-                    crate::vm::Value::int(new_fallback_step as i64),
-                );
+                actor.set_state_field("llm_attempt", Value::int(0));
+                actor.set_state_field("llm_fallback_step", Value::int(new_fallback_step as i64));
                 if let Some(max_tokens) = fb.max_tokens {
                     prune_episodic_memory(rt, actor_id, max_tokens);
                 }
             }
-            // Re-dispatch the LLM request with the new model.
             redispatch_llm_request(rt, actor_id, &prompt);
             return;
         }
-        // Current fallback entry's `on` list didn't match this error;
-        // advance to the next entry and retry the decision.
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
-            actor.set_state_field("llm_attempt", crate::vm::Value::int(0));
-            actor.set_state_field(
-                "llm_fallback_step",
-                crate::vm::Value::int(new_fallback_step as i64),
-            );
+            actor.set_state_field("llm_attempt", Value::int(0));
+            actor.set_state_field("llm_fallback_step", Value::int(new_fallback_step as i64));
         }
         handle_llm_error(rt, actor_id, error);
         return;
     }
 
-    // --- Terminal: all retries and fallbacks exhausted ---
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.llm_inflight = false;
         actor.llm_pending_prompt = None;
@@ -292,14 +345,13 @@ pub(crate) fn handle_llm_retry_timer(rt: &mut Runtime, actor_id: u64) {
         .get(&actor_id)
         .and_then(|a| a.llm_pending_prompt.clone())
         .unwrap_or_default();
-    // Clear old pending prompt so re-dispatch doesn't duplicate.
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.llm_pending_prompt = None;
     }
     redispatch_llm_request(rt, actor_id, &prompt);
 }
 
-/// Build and dispatch an LLM request for the actor, marking it in-flight.
+/// Build and dispatch an LLM request for the actor.
 pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &str) {
     let is_agent = rt
         .actors
@@ -320,7 +372,6 @@ pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &s
         rt.build_actor_llm_request(actor_id, &model, prompt)
     };
     let Some(request) = request else {
-        // Build failed: store nil error and resume.
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
             actor.llm_completed = Some(Ok(LlmResponse {
                 content: None,
@@ -337,8 +388,13 @@ pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &s
         return;
     };
     if !dispatch_llm_request(rt, actor_id, request, prompt) {
-        // Dispatch failed (e.g. worker thread exited): fail gracefully.
+        // This path is now limited to pre-dispatch failures such as a missing
+        // client. Queue saturation/disconnect are reported asynchronously as
+        // structured LLM errors by `dispatch_llm_request` itself.
+        rt.llm.inflight_count = rt.llm.inflight_count.saturating_sub(1);
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
+            actor.llm_inflight = false;
+            actor.llm_pending_prompt = None;
             actor.llm_completed = Some(Ok(LlmResponse {
                 content: None,
                 tool_calls: Vec::new(),
@@ -353,9 +409,14 @@ pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &s
     }
 }
 
-/// Send an LLM request to the persistent worker thread for execution.
-/// Returns true if the request was dispatched, false if the worker
-/// channel is unavailable (caller should roll back in-flight state).
+/// Try to enqueue an LLM request without blocking the actor scheduler.
+///
+/// Returns `false` only when dispatch cannot begin (currently: no configured
+/// client), preserving the existing caller rollback contract. Once in-flight
+/// bookkeeping has been reserved, either provider work or a structured local
+/// executor failure is delivered through the shard completion channel. This
+/// guarantees exactly one completion/decrement path and prevents queue
+/// saturation from becoming an empty successful LLM response.
 pub(crate) fn dispatch_llm_request(
     rt: &mut Runtime,
     actor_id: u64,
@@ -365,25 +426,32 @@ pub(crate) fn dispatch_llm_request(
     let Some(client) = rt.llm.client.clone() else {
         return false;
     };
-    let Some(tx) = rt.llm.request_tx.as_ref() else {
-        return false;
-    };
+
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.llm_inflight = true;
         actor.llm_pending_prompt = Some(prompt.to_string());
     }
     rt.llm.inflight_count += 1;
-    tx.send(LlmWorkItem {
+
+    let item = LlmWorkItem {
         actor_id,
         request,
         client,
-    })
-    .is_ok()
+        completion_tx: rt.llm.completion_tx.clone(),
+    };
+    match classify_try_send(executor_tx().try_send(item)) {
+        Ok(()) => true,
+        Err((item, reason)) => {
+            // The runtime/shard receiver is alive while this method holds
+            // `&mut Runtime`, so this normally cannot fail. If it ever does,
+            // returning false lets the caller perform its existing rollback.
+            report_submission_failure(&item.completion_tx, item.actor_id, reason)
+        }
+    }
 }
 
 /// Prune an agent's episodic memory to fit within `max_tokens`, using a
-/// character-count heuristic (chars / 4). Always preserves the system
-/// prompt (which lives in its own state field).
+/// character-count heuristic (chars / 4).
 pub(crate) fn prune_episodic_memory(rt: &mut Runtime, actor_id: u64, max_tokens: usize) {
     let memory_json = {
         let actor = match rt.actors.get(&actor_id) {
@@ -397,7 +465,7 @@ pub(crate) fn prune_episodic_memory(rt: &mut Runtime, actor_id: u64, max_tokens:
         Runtime::vm_value_to_string(
             &actor
                 .get_state_field("episodic_memory")
-                .unwrap_or(crate::vm::Value::nil()),
+                .unwrap_or(Value::nil()),
             Some(module),
         )
         .unwrap_or_default()
@@ -406,9 +474,9 @@ pub(crate) fn prune_episodic_memory(rt: &mut Runtime, actor_id: u64, max_tokens:
         serde_json::from_str(&memory_json).unwrap_or_else(|_| nulang_ai::EpisodicMemory::new(50));
 
     let max_chars = max_tokens.saturating_mul(4);
-    let total_chars: usize = memory.turns.iter().map(|t| t.content.len()).sum();
-    while total_chars > max_chars && !memory.turns.is_empty() {
-        // Remove oldest non-system turn.
+    while memory.turns.iter().map(|t| t.content.len()).sum::<usize>() > max_chars
+        && !memory.turns.is_empty()
+    {
         if memory.turns.len() > 1 {
             memory.turns.remove(0);
         } else {
@@ -423,10 +491,7 @@ pub(crate) fn prune_episodic_memory(rt: &mut Runtime, actor_id: u64, max_tokens:
     }
 }
 
-/// Resume an actor whose bytecode behavior suspended on
-/// `perform LLM.ask` once the background worker has delivered the
-/// response. The re-executed `LlmAsk` picks the response up from
-/// `actor.llm_completed` via the VM callback.
+/// Resume an actor whose bytecode behavior suspended on an LLM provider call.
 pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     let suspended = match rt.actors.get_mut(&actor_id) {
         Some(actor) => actor.suspended_execution.take(),
@@ -435,8 +500,6 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     let Some(suspended) = suspended else { return };
 
     if rt.vm.is_none() {
-        // No VM available; put the suspension back so a later message
-        // can re-trigger the step.
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
             actor.suspended_execution = Some(suspended);
         }
@@ -446,8 +509,6 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     let self_ptr: *mut Runtime = rt;
     unsafe {
         let vm = (*self_ptr).vm.as_mut().unwrap();
-        // Re-install callbacks bound to THIS actor: other actors may have
-        // run on the shared VM while this one was suspended.
         vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::new(self_ptr, actor_id)));
         vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks { runtime: self_ptr }));
         vm.restore_suspended_state(suspended.vm_state);
@@ -458,11 +519,6 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         (*self_ptr).suspend_enabled = saved_suspend;
         match result {
             Ok(_) => {
-                // The suspended step ran to completion. For workflow
-                // actors record the completion the same way
-                // resume_suspended_workflow_step does: clear the
-                // suspension marker, advance step_index, append
-                // StepCompleted, and checkpoint.
                 if (*self_ptr).actor_is_workflow(actor_id) {
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.waiting_signal = None;
@@ -484,9 +540,6 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
-                // Suspended again (e.g. a chained `perform LLM.ask` or a
-                // signal wait): re-capture the VM state so the next
-                // completion or signal can resume it.
                 if let Some(vm_state) = vm.take_suspended_state() {
                     let signal_name = vm.suspended_signal_name.take();
                     let receive_timeout = vm.suspended_receive_timeout.take();
@@ -500,24 +553,55 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                                 step_name: suspended.step_name,
                             });
                     }
-                    // A chained receive-after suspend arms its timeout
-                    // here; a no-op for the other sentinels.
                     (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
                 }
             }
-            // Other errors: the send-path result is discarded anyway,
-            // matching step_actor semantics.
             Err(_) => {}
         }
-        // End the VM-execution window only after any suspend-state
-        // re-capture above: draining deferred wakes runs other actors
-        // on the shared VM, which would clobber the frames an
-        // un-captured suspend still needs. Runs on every path, so
-        // wakes of other actors are not lost when THIS one suspends.
         (*self_ptr).vm_exec_end();
     }
-    // The suspension resolved (completed or failed): if messages queued
-    // up while the behavior was suspended, schedule the actor to drain
-    // them — step_actor leaves mail untouched while a suspension is live.
     rt.requeue_if_mail_pending(actor_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturated_executor_submission_becomes_error_completion() {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        tx.try_send(1u8).expect("fill tiny executor queue");
+
+        let (_, reason) = classify_try_send(tx.try_send(2u8))
+            .expect_err("second non-blocking submission must report saturation");
+        assert_eq!(reason, ExecutorSendFailure::Full);
+
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        assert!(report_submission_failure(&completion_tx, 42, reason));
+        let (actor_id, result) = completion_rx.recv().expect("failure completion");
+        assert_eq!(actor_id, 42);
+        let error = result.expect_err("saturation must never look successful");
+        assert_eq!(error.kind, LlmErrorKind::ProviderError);
+        assert!(error.message.contains("queue is full"));
+
+        assert_eq!(rx.recv().unwrap(), 1);
+    }
+
+    #[test]
+    fn disconnected_executor_submission_becomes_error_completion() {
+        let (tx, rx) = crossbeam::channel::bounded::<u8>(1);
+        drop(rx);
+
+        let (_, reason) = classify_try_send(tx.try_send(7u8))
+            .expect_err("submission to disconnected executor must fail");
+        assert_eq!(reason, ExecutorSendFailure::Disconnected);
+
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        assert!(report_submission_failure(&completion_tx, 9, reason));
+        let (actor_id, result) = completion_rx.recv().expect("failure completion");
+        assert_eq!(actor_id, 9);
+        let error = result.expect_err("disconnect must never look successful");
+        assert_eq!(error.kind, LlmErrorKind::ProviderError);
+        assert!(error.message.contains("unavailable"));
+    }
 }
