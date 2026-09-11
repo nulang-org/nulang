@@ -434,13 +434,19 @@ mod tests {
         let first = unsafe { nulang_compile(rt, source.as_ptr()) };
         let second = unsafe { nulang_compile(rt, source.as_ptr()) };
         assert!(first >= 0 && second >= 0);
-        assert_ne!(first, second, "each compile call must retain fresh-handle semantics");
+        assert_ne!(
+            first, second,
+            "each compile call must retain fresh-handle semantics"
+        );
 
         // SAFETY: rt is valid for the duration of this test.
         let runtime = unsafe { &*rt };
         assert_eq!(runtime.compile_cache.len(), 1);
         assert_eq!(runtime.modules.len(), 2);
-        assert_eq!(runtime.modules[first as usize], runtime.modules[second as usize]);
+        assert_eq!(
+            runtime.modules[first as usize],
+            runtime.modules[second as usize]
+        );
 
         let first_value = unsafe { nulang_run(rt, first) };
         let second_value = unsafe { nulang_run(rt, second) };
@@ -462,7 +468,10 @@ mod tests {
 
         let runtime = unsafe { &*rt };
         assert_eq!(runtime.compile_cache.len(), 2);
-        assert_ne!(runtime.modules[first as usize], runtime.modules[second as usize]);
+        assert_ne!(
+            runtime.modules[first as usize],
+            runtime.modules[second as usize]
+        );
 
         unsafe { nulang_runtime_free(rt) };
     }
