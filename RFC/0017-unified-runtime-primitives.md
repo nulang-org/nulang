@@ -1,6 +1,6 @@
 # RFC 0017: Unified Runtime Primitives
 
-- **Status:** Accepted — Phase 1
+- **Status:** Accepted — Phase 2 underway
 - **Tier:** Experimental
 - **Created:** 2026-09-11
 - **Supersedes:** RFC 0004 (Draft) where it proposed that agent/workflow ergonomics must be removed rather than lowered to actors
@@ -60,8 +60,14 @@ seven primitives above.
 
 ## Canonical actor role
 
-Phase 1 introduces `primitives::ActorRole` as the single compatibility view over
+Phase 1 introduced `primitives::ActorRole` as the single compatibility view over
 legacy `is_agent`, `is_workflow`, `is_organization`, and virtual-role flags.
+
+Phase 2 extends that same role interpretation to live runtime actors and migrates the
+workflow runtime subsystem to consume `Actor::role()` instead of reading
+`is_workflow` directly. HIR, serialized `ActorMeta`, and live runtime actors therefore
+share one conflict rule and one semantic vocabulary while the legacy fields remain in
+place for compatibility.
 
 New compiler/runtime code should use the canonical role instead of inventing its
 own precedence rules over boolean metadata. Conflicting specialized roles are an
@@ -105,6 +111,21 @@ agent
 
 Agent-specific runtime optimizations are allowed, but they must preserve ordinary
 actor identity, messaging, supervision, durability, and placement semantics.
+
+## Time
+
+`Time` is one semantic primitive even though the timer wheel uses several internal
+wake-message variants. Phase 2 introduces `TimeOperation` to classify those runtime
+mechanisms as:
+
+- `Sleep` — resume an explicitly sleeping computation;
+- `ScheduledDelivery` — delayed actor delivery, including durable workflow timers;
+- `Deadline` — receive timeout or delayed termination;
+- `RetryBackoff` — wake a retry after a delay.
+
+This keeps workflow timers, actor timers, receive deadlines, and retry sleeps from
+evolving independent scheduling semantics. The timer wheel remains an implementation
+detail behind the `Time` primitive.
 
 ## Queues and mailboxes
 
@@ -167,21 +188,25 @@ customer VPC, or other backend while preserving actor identity and message seman
 
 ## Compatibility
 
-Phase 1 is additive:
+Phases 1 and 2 are additive:
 
 - no source syntax is removed;
 - `agent` and `workflow` continue to lower to actors;
 - legacy role booleans remain serialized for compatibility;
-- `ActorRole` provides one canonical interpretation of those flags;
-- delivery/effect vocabulary is tightened without changing current execution code.
+- HIR, bytecode metadata, and live runtime actors share `ActorRole` interpretation;
+- the workflow subsystem consumes canonical roles without changing persisted state;
+- timer-wheel wake variants map to `TimeOperation` without changing timer formats;
+- delivery/effect vocabulary is tightened without weakening existing execution APIs.
 
 ## Follow-up phases
 
-1. Migrate HIR/MIR/bytecode/runtime consumers from direct role booleans to
-   `ActorRole`.
-2. Replace multiple serialized booleans with a versioned role enum.
+1. Continue migrating remaining direct role-boolean consumers (agent, supervisor,
+   recovery, and distribution paths) to `ActorRole`.
+2. Replace multiple serialized booleans with a versioned role enum in a future format
+   revision.
 3. Make effect-boundary metadata visible in tracing and replay inspection.
-4. Require stable operation IDs for replayable external effects.
+4. Require stable operation IDs for replayable external effects at the Cloud/runtime
+   boundary.
 5. Standardize actor message deduplication and document local FIFO vs remote delivery
    semantics.
 6. Expose placement as policy while keeping actor identity stable across node changes.
