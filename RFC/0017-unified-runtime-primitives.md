@@ -3,6 +3,7 @@
 - **Status:** Accepted — Phase 1
 - **Tier:** Experimental
 - **Created:** 2026-09-11
+- **Supersedes:** RFC 0004 (Draft) where it proposed that agent/workflow ergonomics must be removed rather than lowered to actors
 
 ## Summary
 
@@ -34,6 +35,11 @@ subsystems sometimes branch on those flags independently. That creates three ris
 
 The goal of this RFC is not to remove useful surface syntax. It is to make the
 runtime semantics smaller and more compositional.
+
+RFC 0004 correctly identified the coupling problem but was never accepted. This RFC
+keeps its central architectural insight—agents and workflows are not timeless core
+primitives—while allowing ergonomic syntax to remain as compiler sugar so long as it
+lowers to the canonical actor/effect model.
 
 ## Surface syntax and lowering
 
