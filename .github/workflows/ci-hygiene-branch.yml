@@ -1,0 +1,59 @@
+name: CI Hygiene Branch Repair
+
+on:
+  push:
+    branches:
+      - fix/ci-hygiene-2026-09-11
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: ${{ !contains(github.event.head_commit.message, '[ci-hygiene-applied]') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/ci-hygiene-2026-09-11
+          fetch-depth: 0
+      - name: Install pinned Rust formatter
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt --no-self-update
+      - name: Repair stale fixtures and warning
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          bench = Path('benches/persist_bench.rs')
+          text = bench.read_text()
+          if 'crdt_field_map:' not in text:
+              needle = '                crdt_snapshot: None,\n'
+              if needle not in text:
+                  raise SystemExit('persist_bench.rs snapshot initializer changed; refusing blind edit')
+              text = text.replace(needle, needle + '                crdt_field_map: None,\n', 1)
+              bench.write_text(text)
+
+          actor = Path('src/runtime/actor.rs')
+          text = actor.read_text()
+          old = '            payload_len: payload.len(),\n'
+          if old in text:
+              text = text.replace(old, '            payload_len,\n', 1)
+              actor.write_text(text)
+          elif '            payload_len,\n' not in text:
+              raise SystemExit('actor.rs payload_len initialization changed; refusing blind edit')
+          PY
+          cargo +1.95.0 fmt --all
+      - name: Remove temporary workflow and commit repairs
+        shell: bash
+        run: |
+          rm .github/workflows/ci-hygiene-branch.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'chore(ci): repair stale fixtures and formatting [ci-hygiene-applied]'
+          git push origin HEAD:fix/ci-hygiene-2026-09-11
