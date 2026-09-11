@@ -150,7 +150,22 @@ fn restore_persistent_state(rt: &Runtime, actor: &mut Actor) {
     }
 }
 
-/// Build a bytecode actor's `bytecode_offsets` vector.
+/// Compatibility wrapper for recovery/distribution paths that still carry the
+/// legacy workflow boolean. New semantic code should call
+/// [`bytecode_offsets_for_role`] with the canonical [`ActorRole`].
+pub(crate) fn bytecode_offsets_for(
+    module: &crate::bytecode::CodeModule,
+    is_workflow: bool,
+) -> Vec<usize> {
+    let role = if is_workflow {
+        ActorRole::Workflow
+    } else {
+        ActorRole::Plain
+    };
+    bytecode_offsets_for_role(module, role)
+}
+
+/// Build a bytecode actor's `bytecode_offsets` vector from its canonical role.
 ///
 /// Ordinary bytecode actors are dispatched by WHOLE-MODULE behavior id
 /// (`bytecode_offsets` indexes the module's full behavior list). Workflow
@@ -160,7 +175,7 @@ fn restore_persistent_state(rt: &Runtime, actor: &mut Actor) {
 /// behaviors compressed to local order — a plain actor declared before
 /// the workflow would otherwise shift every step (SPEC2 §10 known-issue
 /// #2, also seen at recover/migrate/hot-reload).
-pub(crate) fn bytecode_offsets_for(
+pub(crate) fn bytecode_offsets_for_role(
     module: &crate::bytecode::CodeModule,
     role: ActorRole,
 ) -> Vec<usize> {
@@ -236,7 +251,7 @@ pub(crate) fn spawn_from_module(
     } else {
         spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
     };
-    let offsets: Vec<usize> = bytecode_offsets_for(module, role);
+    let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
     // step-local indices in run_saga_compensation match.
     let compensation_offsets: Vec<Option<usize>> = if let Some(meta) = meta {
