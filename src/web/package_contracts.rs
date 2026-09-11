@@ -36,7 +36,16 @@ pub fn compile_contracts_from_tree(src_root: &Path) -> ContractCompilation {
 /// semantics testable and gives a future resolved-AST pipeline a direct entry
 /// point without reparsing source files.
 pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
-    let helper_surface_imported = modules.iter().any(imports_web_route_helpers);
+    // Helper recognition is deliberately scoped to the source module that
+    // imports stdlib::web. A package may contain an unrelated local `route()`
+    // function in another file, and a web import elsewhere must not turn that
+    // call into framework metadata.
+    let mut helpers = Vec::new();
+    for module in modules {
+        if imports_web_route_helpers(module) {
+            collect_helper_routes_in_decls(&module.decls, &mut helpers);
+        }
+    }
 
     let mut combined = AstModule {
         name: "__web_contract_package".to_string(),
@@ -46,14 +55,10 @@ pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
             .collect(),
     };
 
-    if helper_surface_imported {
-        let mut helpers = Vec::new();
-        collect_helper_routes_in_decls(&combined.decls, &mut helpers);
-        for (index, helper) in helpers.into_iter().enumerate() {
-            combined
-                .decls
-                .push(synthetic_route_registration(index, helper));
-        }
+    for (index, helper) in helpers.into_iter().enumerate() {
+        combined
+            .decls
+            .push(synthetic_route_registration(index, helper));
     }
 
     let mut compiled = compile_module_contracts(&combined);
@@ -438,5 +443,28 @@ fn main() { route("/not-web", handler) }
 
         let compiled = compile_modules_contracts(&[module]);
         assert!(compiled.routes.is_empty());
+    }
+
+    #[test]
+    fn web_import_in_one_file_does_not_capture_route_call_in_another() {
+        let web_module = parse(
+            r#"
+import stdlib::web::host
+fn home() { "ok" }
+fn web_main() { route("/", home) }
+"#,
+        );
+        let unrelated = parse(
+            r#"
+fn route(path, handler) { nil }
+fn local_handler() { nil }
+fn utility() { route("/not-a-web-route", local_handler) }
+"#,
+        );
+
+        let compiled = compile_modules_contracts(&[web_module, unrelated]);
+        assert_eq!(compiled.routes.len(), 1);
+        assert_eq!(compiled.routes[0].path, "/");
+        assert_eq!(compiled.routes[0].handler.as_deref(), Some("home"));
     }
 }
