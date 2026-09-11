@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod bindings;
 pub mod budget;
 pub mod contracts;
 pub mod ir;
