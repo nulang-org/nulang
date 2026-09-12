@@ -32,10 +32,19 @@ pub struct LeaseRequest {
 }
 
 impl LeaseRequest {
+    /// Stable logical idempotency material. Provider adapters may hash this
+    /// value when their native idempotency-token field has a shorter limit.
     pub fn idempotency_key(&self) -> String {
         format!(
-            "{}:{}:{}:{}",
-            self.job_id, self.placement_token, self.provider, self.offer_id
+            "j{}:{}|t{}:{}|p{}:{}|o{}:{}",
+            self.job_id.len(),
+            self.job_id,
+            self.placement_token.len(),
+            self.placement_token,
+            self.provider.len(),
+            self.provider,
+            self.offer_id.len(),
+            self.offer_id
         )
     }
 }
@@ -90,6 +99,8 @@ pub struct PlacementClaim {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimResult {
     Acquired,
+    /// An earlier retry already acquired the claim with this same token.
+    AlreadyHeldByCaller,
     HeldByOther,
 }
 
@@ -102,7 +113,8 @@ pub type ReleaseClaimFuture<'a> =
 ///
 /// Provider idempotency prevents duplicate allocation within one provider.
 /// This claim prevents two scheduler replicas from concurrently placing the
-/// same job on different providers.
+/// same job on different providers. A repeated claim using the same
+/// `placement_token` must return `AlreadyHeldByCaller`.
 pub trait PlacementClaimStore: Send + Sync {
     fn try_claim<'a>(&'a self, claim: &'a PlacementClaim) -> ClaimFuture<'a>;
 
@@ -150,7 +162,7 @@ pub async fn acquire_ranked_placement(
         .await
         .map_err(PlacementLeaseError::ClaimStore)?
     {
-        ClaimResult::Acquired => {}
+        ClaimResult::Acquired | ClaimResult::AlreadyHeldByCaller => {}
         ClaimResult::HeldByOther => return Err(PlacementLeaseError::ClaimHeld),
     }
 
@@ -203,7 +215,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn idempotency_key_is_offer_scoped() {
+    fn idempotency_key_is_unambiguous_and_offer_scoped() {
         let request = LeaseRequest {
             provider: "aws".into(),
             offer_id: "c7g-spot".into(),
@@ -214,7 +226,7 @@ mod tests {
 
         assert_eq!(
             request.idempotency_key(),
-            "job-1:placement-42:aws:c7g-spot"
+            "j5:job-1|t12:placement-42|p3:aws|o8:c7g-spot"
         );
     }
 }
