@@ -122,12 +122,15 @@ where
     if value.is_empty() {
         return Ok(None);
     }
-    value.parse::<T>().map(Some).map_err(|error| NuError::PackageError {
-        msg: format!(
-            "invalid {field} for locked package '{name}' {version} from {source}: {error}"
-        ),
-        span: Span::default(),
-    })
+    value
+        .parse::<T>()
+        .map(Some)
+        .map_err(|error| NuError::PackageError {
+            msg: format!(
+                "invalid {field} for locked package '{name}' {version} from {source}: {error}"
+            ),
+            span: Span::default(),
+        })
 }
 
 impl Lockfile {
@@ -153,11 +156,9 @@ impl Lockfile {
         source_id: Option<SourceId>,
         semantic_id: Option<SemanticId>,
     ) -> NuResult<()> {
-        if !self
-            .package
-            .iter()
-            .any(|package| package.name == name && package.version == version && package.source == source)
-        {
+        if !self.package.iter().any(|package| {
+            package.name == name && package.version == version && package.source == source
+        }) {
             return Err(NuError::PackageError {
                 msg: format!(
                     "cannot attach identity to unknown locked package '{name}' {version} from {source}"
