@@ -184,15 +184,17 @@ impl DeploymentBundle {
 
         let package_manifest =
             package_manifest.ok_or(DeploymentBundleError::MissingPackageManifest)?;
+        if !is_valid_package_name(&package_manifest.package.name) {
+            return Err(DeploymentBundleError::InvalidPackageName {
+                name: package_manifest.package.name.clone(),
+            });
+        }
         let (artifact_path, artifact_bytes) =
             artifact.ok_or(DeploymentBundleError::MissingArtifact)?;
         // Tar archive paths always use `/`, regardless of the host platform.
         // Construct this identity in tar namespace instead of through `Path`
         // so validation behaves identically on Windows, macOS, and Linux.
-        let expected_artifact = format!(
-            ".nula/dist/{}.nbc",
-            package_manifest.package.name
-        );
+        let expected_artifact = format!(".nula/dist/{}.nbc", package_manifest.package.name);
         if artifact_path != expected_artifact {
             return Err(DeploymentBundleError::ArtifactNameMismatch {
                 expected: expected_artifact,
@@ -236,6 +238,7 @@ pub enum DeploymentBundleError {
     MultiplePackageManifests,
     PackageManifestTooLarge { actual: u64, max: u64 },
     InvalidPackageManifest(String),
+    InvalidPackageName { name: String },
     MissingArtifact,
     MultipleArtifacts,
     ArtifactNameMismatch { expected: String, actual: String },
@@ -274,6 +277,10 @@ impl fmt::Display for DeploymentBundleError {
             Self::InvalidPackageManifest(message) => {
                 write!(f, "invalid Nulang.toml: {message}")
             }
+            Self::InvalidPackageName { name } => write!(
+                f,
+                "invalid package name {name:?}; names may contain only ASCII letters, digits, '-' and '_'"
+            ),
             Self::MissingArtifact => write!(f, "deployment bundle contains no .nula/dist/*.nbc"),
             Self::MultipleArtifacts => {
                 write!(f, "deployment bundle contains multiple .nula/dist/*.nbc artifacts")
@@ -324,6 +331,16 @@ fn validate_archive_path(path: &Path) -> Result<(), DeploymentBundleError> {
 fn is_packaged_nbc(path: &Path) -> bool {
     path.starts_with(Path::new(".nula/dist"))
         && path.extension().and_then(|ext| ext.to_str()) == Some("nbc")
+}
+
+/// Mirror the package-manager naming rule at the trust boundary. `Manifest::parse`
+/// validates TOML shape, while package creation validates this lexical rule.
+/// Uploaded bundles are untrusted, so admission must enforce it independently.
+fn is_valid_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn read_limited<R: Read>(reader: &mut R, max: u64) -> std::io::Result<Vec<u8>> {
@@ -403,6 +420,18 @@ mod tests {
         assert!(matches!(
             DeploymentBundle::parse(&bytes),
             Err(DeploymentBundleError::ArtifactNameMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_package_name_before_identity_binding() {
+        let bytes = make_bundle(vec![
+            ("Nulang.toml", package_manifest("../escape")),
+            (".nula/dist/app.nbc", pure_nbc()),
+        ]);
+        assert!(matches!(
+            DeploymentBundle::parse(&bytes),
+            Err(DeploymentBundleError::InvalidPackageName { .. })
         ));
     }
 
