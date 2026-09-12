@@ -155,9 +155,55 @@ pub trait WasmBackend: Send {
 #[cfg(feature = "wasm-backend")]
 pub struct DefaultWasmBackend;
 
+/// Enforce the semantic profile supported by the plain MIR→WASM backend.
+///
+/// The low-level emitter still contains defensive stubs for handler/resume MIR
+/// from its original MVP implementation. Those stubs return `nil`, which is
+/// not an acceptable interpretation of a resumable Nulang program. The public
+/// backend boundary therefore rejects those constructs before code generation.
+/// This keeps a restricted backend honest: unsupported syntax is a compile
+/// error rather than a different language.
+#[cfg(feature = "wasm-backend")]
+fn validate_default_wasm_semantics(module: &MirModule) -> NuResult<()> {
+    for function in module.functions.iter().chain(module.behaviors.iter()) {
+        for block in &function.blocks {
+            if matches!(block.terminator, crate::mir::Terminator::Resume(_)) {
+                return Err(crate::types::NuError::VMError {
+                    msg: "WASM backend restricted profile: user-defined effect handlers and continuation resume are not supported; use the bytecode backend"
+                        .into(),
+                    span: crate::types::Span::default(),
+                });
+            }
+
+            for stmt in &block.stmts {
+                let unsupported = matches!(
+                    stmt,
+                    crate::mir::Stmt::EnterHandle { .. } | crate::mir::Stmt::PopHandler
+                ) || matches!(
+                    stmt,
+                    crate::mir::Stmt::Assign {
+                        op: crate::mir::RValue::Resume(..),
+                        ..
+                    }
+                );
+
+                if unsupported {
+                    return Err(crate::types::NuError::VMError {
+                        msg: "WASM backend restricted profile: user-defined effect handlers and continuation resume are not supported; use the bytecode backend"
+                            .into(),
+                        span: crate::types::Span::default(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "wasm-backend")]
 impl WasmBackend for DefaultWasmBackend {
     fn compile(&mut self, module: &MirModule, name: &str) -> NuResult<Vec<u8>> {
+        validate_default_wasm_semantics(module)?;
         crate::mir_wasm::WasmBackend::new().compile(module, name)
     }
 
@@ -190,7 +236,7 @@ pub struct ReqwestHttpProvider {
 
 #[cfg(any(feature = "ai-runtime", feature = "http-client"))]
 impl ReqwestHttpProvider {
-    /// Create a new reqwest-backed HTTP provider with a default timeout.
+    /// Create a new reqwest-backed provider with a default timeout.
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
