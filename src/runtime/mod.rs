@@ -2830,7 +2830,7 @@ impl Runtime {
     /// updating the actor's own sequence/dirty tracking.
     fn build_actor_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let mut state = std::collections::HashMap::new();
-        let waiting_signal = {
+        let (waiting_signal, authority_tokens) = {
             let actor = self.actors.get(&actor_id)?;
             for (name, value) in &actor.state_data {
                 let model = actor
@@ -2864,7 +2864,17 @@ impl Runtime {
                     state.insert(name.clone(), persisted);
                 }
             }
-            actor.waiting_signal.clone()
+            let authority_tokens = match actor.authority_manifest() {
+                Ok(manifest) => manifest.canonical_token_set(),
+                Err(err) => {
+                    warn!(
+                        "nulang-persist: refusing to snapshot actor {} with invalid authority: {}",
+                        actor_id, err
+                    );
+                    return None;
+                }
+            };
+            (actor.waiting_signal.clone(), authority_tokens)
         };
         let sequence = self.next_sequence(actor_id);
         let crdt_snapshot = self.crdt_manager.as_ref().map(|m| {
@@ -2887,6 +2897,7 @@ impl Runtime {
             waiting_signal,
             crdt_snapshot,
             crdt_field_map,
+            authority_tokens,
         })
     }
 
@@ -4645,6 +4656,18 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+        let authority_manifest = match crate::authority::AuthorityManifest::from_token_set(
+            &snapshot.authority_tokens,
+        ) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                warn!(
+                    "nulang-recover: refusing actor {} with invalid authority manifest: {}",
+                    actor_id, err
+                );
+                return None;
+            }
+        };
         let workflow_events = self.persistence.read_workflow_events(actor_id);
         let is_workflow = self
             .recovery_modules
@@ -4663,6 +4686,7 @@ impl Runtime {
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal;
+        actor.install_authority_manifest(&authority_manifest);
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
@@ -4923,7 +4947,9 @@ impl Runtime {
         snapshot: &ActorSnapshot,
         is_workflow: bool,
         is_agent: bool,
-    ) -> Actor {
+    ) -> Result<Actor, crate::authority_runtime::RuntimeAuthorityError> {
+        let authority_manifest =
+            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)?;
         let offsets: Vec<usize> = crate::runtime::spawn::bytecode_offsets_for(module, is_workflow);
         let compensation_offsets: Vec<Option<usize>> = if is_workflow {
             module
@@ -4957,6 +4983,7 @@ impl Runtime {
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal.clone();
+        actor.install_authority_manifest(&authority_manifest);
         actor.bytecode_module = Some(module.clone());
         actor.bytecode_offsets = offsets;
         actor.compensation_offsets = compensation_offsets;
@@ -4994,7 +5021,7 @@ impl Runtime {
             actor.set_state_field(name, v);
         }
 
-        actor
+        Ok(actor)
     }
 
     /// Resolve a virtual actor (grain) identity to a resident actor id,
@@ -5036,6 +5063,13 @@ impl Runtime {
                 false,
                 false,
             )
+            .map_err(|err| NuError::RuntimeError {
+                msg: format!(
+                    "invalid authority snapshot for virtual actor {}: {}",
+                    grain_id.actor_name(), err
+                ),
+                span: Span::new(0, 0),
+            })?
         } else {
             let mut actor = Actor::new(stable_actor_id, grain_id.actor_name(), 0);
             actor.persistent = true;
@@ -5144,8 +5178,22 @@ impl Runtime {
         let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
         let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
 
-        let actor =
-            Self::restore_actor_from_snapshot(actor_id, &module, &snapshot, is_workflow, is_agent);
+        let actor = match Self::restore_actor_from_snapshot(
+            actor_id,
+            &module,
+            &snapshot,
+            is_workflow,
+            is_agent,
+        ) {
+            Ok(actor) => actor,
+            Err(err) => {
+                warn!(
+                    "nulang-migrate: invalid authority manifest for actor {}: {}",
+                    actor_id, err
+                );
+                return false;
+            }
+        };
 
         // Register the recovery module.
         let offsets: Vec<usize> = module
