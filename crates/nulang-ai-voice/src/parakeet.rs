@@ -107,7 +107,9 @@ mod tests {
             })
         }
 
-        fn finish<'a>(&'a mut self) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>> {
+        fn finish<'a>(
+            &'a mut self,
+        ) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>> {
             Box::pin(async { Ok(None) })
         }
     }
