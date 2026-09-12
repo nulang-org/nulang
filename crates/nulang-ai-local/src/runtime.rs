@@ -1,6 +1,7 @@
 //! Local agent runtime: Director + Manager + Worker + SQLite + NLAP events.
 
 use crate::config::AgentConfigFile;
+use crate::reservation::{ReservationError, TaskReservationStore};
 use crate::store::{SqliteStore, StoreError};
 use chrono::Utc;
 use nulang_ai_core::{
@@ -20,6 +21,8 @@ pub enum RuntimeError {
     Config(#[from] crate::config::ConfigError),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+    #[error("reservation error: {0}")]
+    Reservation(#[from] ReservationError),
     #[error("worker error: {0}")]
     Worker(#[from] WorkerError),
     #[error("io error: {0}")]
@@ -34,6 +37,7 @@ pub struct LocalRuntime {
     project_dir: PathBuf,
     config: AgentConfigFile,
     store: SqliteStore,
+    reservations: TaskReservationStore,
     conversation_id: Uuid,
     project_id: String,
     director: LocalDirector,
@@ -49,6 +53,7 @@ impl LocalRuntime {
         let config = AgentConfigFile::load(&project_dir)?;
         let data_dir = config.resolve_data_dir(&project_dir);
         let store = SqliteStore::open(&data_dir)?;
+        let reservations = TaskReservationStore::open(store.db_path())?;
         let project_id = project_dir
             .file_name()
             .and_then(|s| s.to_str())
@@ -81,6 +86,7 @@ impl LocalRuntime {
             project_dir,
             config,
             store,
+            reservations,
             conversation_id,
             project_id,
             director: LocalDirector::new("director-local"),
@@ -165,6 +171,22 @@ impl LocalRuntime {
         let tasks = self.engineering.plan_goal(&goal);
         for mut task in tasks {
             let agent_id = self.workers.select_agent_id(&task)?;
+            let max_concurrency = self
+                .workers
+                .get(&agent_id)
+                .map(|record| record.metadata.max_concurrency)
+                .unwrap_or(1);
+            let lease_duration_ms = i64::try_from(task.timeout.as_millis())
+                .unwrap_or(i64::MAX)
+                .max(30_000);
+            let reservation = self.reservations.reserve_with_capacity(
+                task.id,
+                &agent_id,
+                max_concurrency,
+                Utc::now().timestamp_millis(),
+                lease_duration_ms,
+            )?;
+
             task.assigned_agent_id = Some(agent_id.clone());
             self.store.upsert_task(&task)?;
             self.emit(
@@ -187,8 +209,11 @@ impl LocalRuntime {
                 },
             )?;
 
-            let completed = self.workers.execute_on(&agent_id, &running)?;
+            let execution = self.workers.execute_on(&agent_id, &running);
+            let release = self.reservations.release(&reservation);
             self.persist_workers()?;
+            let completed = execution?;
+            release?;
             self.store.upsert_task(&completed)?;
             self.emit(
                 out,
