@@ -3,6 +3,7 @@
 //! Parses a `.nula` file and pretty-prints it with canonical formatting.
 
 use crate::ast::{BinOp, Decl, Expr, Literal, Pattern};
+use crate::authority::AuthorityGrant;
 use crate::types::Type;
 use std::path::Path;
 
@@ -974,14 +975,14 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
                     if i > 0 {
                         out.push_str(", ");
                     }
-                    // Canonical token `Net::TcpOut(host:port)` → source form.
-                    if let Some(dest) = cap
-                        .strip_prefix("Net::TcpOut(")
-                        .and_then(|r| r.strip_suffix(')'))
-                    {
-                        out.push_str(&format!("Net::TcpOut(\"{}\")", dest));
-                    } else {
-                        out.push_str(cap);
+                    match cap.parse::<AuthorityGrant>() {
+                        Ok(grant) => out.push_str(&grant.to_source_syntax()),
+                        Err(_) => {
+                            // Parsed source should never carry malformed authority
+                            // metadata. Refuse to format rather than emit source that
+                            // silently changes or drops authority.
+                            *had_unhandled = true;
+                        }
                     }
                 }
                 out.push(']');
@@ -1348,6 +1349,37 @@ impl Eq Int {
         assert!(out.contains("crdt C {"), "got: {out}");
         assert!(out.contains("gcounter hits: Int = 0"), "got: {out}");
         assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_spawn_authority_roundtrips_all_grant_kinds() {
+        let src = r#"
+actor Worker { behavior ping() { 1 } }
+fn main() {
+    spawn Worker() with [
+        Net::TcpOut("api.example.com:443"),
+        Fs::Read("/tmp/in put"),
+        Fs::Write("C:\\tmp\\\"out\""),
+        Env::Read("HOME"),
+        Secret::Read("stripe\nkey"),
+        Vendor::Use("scope:alpha")
+    ]
+}"#;
+        let out = format_source(src).expect("authority grants format");
+        assert!(
+            out.contains("Net::TcpOut(\"api.example.com:443\")"),
+            "got: {out}"
+        );
+        assert!(out.contains("Fs::Read(\"/tmp/in put\")"), "got: {out}");
+        assert!(out.contains("Env::Read(\"HOME\")"), "got: {out}");
+        assert!(out.contains("Vendor::Use(\"scope:alpha\")"), "got: {out}");
+        let tokens = crate::lexer::Lexer::new(&out)
+            .lex()
+            .expect("formatted source lexes");
+        crate::parser::Parser::new(tokens)
+            .parse_module()
+            .expect("formatted authority source reparses");
+        assert_eq!(format_source(&out).expect("second format succeeds"), out);
     }
 
     #[test]

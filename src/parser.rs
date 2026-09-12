@@ -4,6 +4,7 @@
 //! Entry point: `Parser::parse_module()`.
 
 use crate::ast::*;
+use crate::authority::AuthorityGrant;
 use crate::lexer::{Token, TokenKind};
 use crate::types::{
     Capability, Effect, EffectRow, NuError, NuResult, NuWarning, PrimitiveType, Region, Span, Type,
@@ -4087,7 +4088,53 @@ impl Parser {
             Vec::new()
         };
 
-        // Optional named registration: `spawn Foo() as "name"`
+        // Optional external-authority attenuation for the child. Grants are
+        // intentionally structural and literal-only: authority must be known at
+        // compile time, never computed from ambient runtime data.
+        //
+        //   spawn Worker() with [
+        //       Net::TcpOut("api.example.com:443"),
+        //       Secret::Read("stripe_key"),
+        //   ]
+        let capabilities = if self.consume_if(&TokenKind::With) {
+            self.expect(TokenKind::LBracket)?;
+            self.skip_newlines();
+            let mut grants = Vec::new();
+            while !self.match_token(&TokenKind::RBracket) && !self.is_at_end() {
+                let grant_span = self.current_span();
+                let namespace = self.expect_ident("authority namespace")?;
+                self.expect(TokenKind::DoubleColon)?;
+                let operation = self.expect_ident("authority operation")?;
+                let argument = if self.consume_if(&TokenKind::LParen) {
+                    let argument = self.expect_string("authority argument")?;
+                    self.expect(TokenKind::RParen)?;
+                    Some(argument)
+                } else {
+                    None
+                };
+
+                let grant = AuthorityGrant::from_parts(&namespace, &operation, argument.as_deref())
+                    .map_err(|err| NuError::parse_error(err.to_string(), grant_span))?;
+                grants.push(grant.to_string());
+
+                self.skip_newlines();
+                if !self.consume_if(&TokenKind::Comma) {
+                    break;
+                }
+                self.skip_newlines();
+            }
+            self.expect(TokenKind::RBracket)?;
+            // Canonical metadata makes equivalent source produce identical
+            // artifact identity regardless of grant order or duplication.
+            grants.sort_unstable();
+            grants.dedup();
+            grants
+        } else {
+            Vec::new()
+        };
+
+        // Optional named registration: `spawn Foo() as "name"`.
+        // Canonical order is `spawn Foo() with [...] as "name"`.
         let register_as = if self.consume_if(&TokenKind::As) {
             Some(self.expect_string("actor name")?)
         } else {
@@ -4099,9 +4146,7 @@ impl Parser {
             positional_args,
             register_as,
             target_node,
-            // Spawn-time capability-grant syntax (`with [Net::TcpOut(...)]`) is
-            // not parsed yet; the field is plumbed through as empty.
-            capabilities: Vec::new(),
+            capabilities,
             span,
         };
         Ok(match link_op {
