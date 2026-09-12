@@ -29,6 +29,7 @@ pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
 pub mod durable_effect;
+pub mod durable_effect_persistence;
 pub mod effect_checker;
 pub mod ffi;
 pub mod fmt;
