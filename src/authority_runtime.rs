@@ -59,6 +59,13 @@ impl Actor {
         AuthorityManifest::from_token_set(&self.capabilities)
     }
 
+    /// Replace this actor's compatibility token set from a validated typed
+    /// manifest. Raw token insertion should stay confined to serialization and
+    /// migration code; semantic runtime code should install manifests here.
+    pub fn install_authority_manifest(&mut self, manifest: &AuthorityManifest) {
+        self.capabilities = manifest.canonical_token_set();
+    }
+
     /// Return whether this actor holds an exact typed grant.
     ///
     /// This returns an error, rather than `false`, for malformed manifests so
@@ -115,6 +122,21 @@ impl Actor {
             return Err(RuntimeAuthorityError::Denied(missing.clone()));
         }
         Ok(requested.clone())
+    }
+
+    /// Validate and install a requested manifest on a child actor.
+    ///
+    /// This is the runtime spawn primitive: the caller does not touch the
+    /// child's raw token set, and installation only happens after monotonic
+    /// delegation succeeds in full.
+    pub fn delegate_authority_to(
+        &self,
+        child: &mut Actor,
+        requested: &AuthorityManifest,
+    ) -> Result<(), RuntimeAuthorityError> {
+        let delegated = self.delegate_authority(requested)?;
+        child.install_authority_manifest(&delegated);
+        Ok(())
     }
 }
 
@@ -209,5 +231,26 @@ mod tests {
                 name: "OTHER_KEY".into(),
             }))
         );
+    }
+
+    #[test]
+    fn delegation_installs_only_after_full_validation() {
+        let parent = actor_with(&[
+            "Net::TcpOut(api.stripe.com:443)",
+            "Secret::Read(STRIPE_KEY)",
+        ]);
+        let requested = AuthorityManifest::from_tokens(["Secret::Read(STRIPE_KEY)"]).unwrap();
+        let escalation = AuthorityManifest::from_tokens(["Secret::Read(OTHER_KEY)"]).unwrap();
+        let mut child = Actor::new(8, "child", 16);
+
+        parent.delegate_authority_to(&mut child, &requested).unwrap();
+        assert_eq!(child.authority_manifest().unwrap(), requested);
+
+        let before = child.capabilities.clone();
+        assert!(matches!(
+            parent.delegate_authority_to(&mut child, &escalation),
+            Err(RuntimeAuthorityError::Denied(_))
+        ));
+        assert_eq!(child.capabilities, before);
     }
 }
