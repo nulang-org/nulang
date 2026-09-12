@@ -24,83 +24,101 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path('src/aot/codegen.rs')
+          path = Path("src/aot/codegen.rs")
           text = path.read_text()
 
-          start_marker = '''        mir::Stmt::Assign {
-              dst,
-              op: mir::RValue::ReceiveCommit,
-          } => {'''
-          next_marker = '''        mir::Stmt::Assign { dst, op } => {'''
+          start_marker = "\n".join([
+              "        mir::Stmt::Assign {",
+              "            dst,",
+              "            op: mir::RValue::ReceiveCommit,",
+              "        } => {",
+          ])
+          next_marker = "        mir::Stmt::Assign { dst, op } => {"
           start = text.index(start_marker)
           end = text.index(next_marker, start)
-          replacement = '''        mir::Stmt::Assign {
-              op:
-                  mir::RValue::ReceiveCommit
-                  | mir::RValue::ReceiveMatch { .. }
-                  | mir::RValue::ReceiveWait { .. },
-              ..
-          } => Err(AotCompileError::Unsupported(
-              "selective receive transactions require the bytecode backend (unavailable with --backend native)"
-                  .into(),
-          )),
-          '''
+          replacement = "\n".join([
+              "        mir::Stmt::Assign {",
+              "            op:",
+              "                mir::RValue::ReceiveCommit",
+              "                | mir::RValue::ReceiveMatch { .. }",
+              "                | mir::RValue::ReceiveWait { .. },",
+              "            ..",
+              "        } => Err(AotCompileError::Unsupported(",
+              "            \"selective receive transactions require the bytecode backend (unavailable with --backend native)\"",
+              "                .into(),",
+              "        )),",
+              "",
+          ])
           text = text[:start] + replacement + text[end:]
 
-          test_start_marker = '''    #[test]
-              fn test_aot_native_receive() {'''
-          test_end_marker = '''
-              #[test]
-              fn test_aot_native_spawn() {'''
+          test_start_marker = "\n".join([
+              "    #[test]",
+              "    fn test_aot_native_receive() {",
+          ])
+          test_end_marker = "\n".join([
+              "    #[test]",
+              "    fn test_aot_native_spawn() {",
+          ])
           test_start = text.index(test_start_marker)
           test_end = text.index(test_end_marker, test_start)
-          replacement_test = r'''    #[test]
-              fn test_aot_native_selective_receive_fails_closed() {
-                  use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
-                  use crate::lexer::Lexer;
-                  use crate::parser::Parser;
-                  use crate::typechecker::TypeChecker;
-
-                  let source = r#"
-                      actor Counter {
-                          state total: Int = 0
-                          behavior Add(n: Int) { self.total = self.total + n }
-                          behavior Run() { receive { | Add(n) => self.total = self.total + n } }
-                      }
-                      fn main() { 0 }
-                  "#;
-                  let tokens = Lexer::new(source).lex().unwrap();
-                  let ast = Parser::new(tokens).parse_module().unwrap();
-                  let mut tc = TypeChecker::new();
-                  tc.check_module(&ast).unwrap();
-                  let mut ec = EffectChecker::new();
-                  ec.check_module(&ast.decls).unwrap();
-                  let mut ca = CapabilityAnalyzer::new();
-                  let ctx = CapContext::new();
-                  for d in crate::effect_checker::flatten_decls(&ast.decls) {
-                      if let crate::ast::Decl::Function { body, .. } = d {
-                          ca.infer_cap(&ctx, body).unwrap();
-                      }
-                  }
-                  let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
-                  let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
-                  let err = match crate::aot::AotModule::compile(&mir_module) {
-                      Ok(_) => panic!("native AOT must reject transactional selective receive"),
-                      Err(err) => err.to_string(),
-                  };
-                  assert!(
-                      err.contains("selective receive transactions require the bytecode backend"),
-                      "native AOT must fail closed instead of changing receive semantics, got: {}",
-                      err
-                  );
-              }
-          '''
+          replacement_test = "\n".join([
+              "    #[test]",
+              "    fn test_aot_native_selective_receive_fails_closed() {",
+              "        use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};",
+              "        use crate::lexer::Lexer;",
+              "        use crate::parser::Parser;",
+              "        use crate::typechecker::TypeChecker;",
+              "",
+              "        let source = r#\"",
+              "            actor Counter {",
+              "                state total: Int = 0",
+              "                behavior Add(n: Int) { self.total = self.total + n }",
+              "                behavior Run() { receive { | Add(n) => self.total = self.total + n } }",
+              "            }",
+              "            fn main() { 0 }",
+              "        \"#;",
+              "        let tokens = Lexer::new(source).lex().unwrap();",
+              "        let ast = Parser::new(tokens).parse_module().unwrap();",
+              "        let mut tc = TypeChecker::new();",
+              "        tc.check_module(&ast).unwrap();",
+              "        let mut ec = EffectChecker::new();",
+              "        ec.check_module(&ast.decls).unwrap();",
+              "        let mut ca = CapabilityAnalyzer::new();",
+              "        let ctx = CapContext::new();",
+              "        for d in crate::effect_checker::flatten_decls(&ast.decls) {",
+              "            if let crate::ast::Decl::Function { body, .. } = d {",
+              "                ca.infer_cap(&ctx, body).unwrap();",
+              "            }",
+              "        }",
+              "        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);",
+              "        let mir_module = crate::mir_lower::lower_module(&hir).unwrap();",
+              "        let err = match crate::aot::AotModule::compile(&mir_module) {",
+              "            Ok(_) => panic!(\"native AOT must reject transactional selective receive\"),",
+              "            Err(err) => err.to_string(),",
+              "        };",
+              "        assert!(",
+              "            err.contains(\"selective receive transactions require the bytecode backend\"),",
+              "            \"native AOT must fail closed instead of changing receive semantics, got: {}\",",
+              "            err",
+              "        );",
+              "    }",
+              "",
+          ])
           text = text[:test_start] + replacement_test + text[test_end:]
           path.write_text(text)
           PY
 
-      - name: Verify formatting
-        run: cargo fmt --all -- --check
+      - name: Format patched source
+        shell: bash
+        run: |
+          cargo fmt --all
+          unexpected="$(git diff --name-only | grep -v '^src/aot/codegen.rs$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "cargo fmt changed unexpected files:"
+            echo "$unexpected"
+            exit 1
+          fi
+          git diff --check
 
       - name: Verify focused AOT regression
         run: cargo test test_aot_native_selective_receive_fails_closed --lib
