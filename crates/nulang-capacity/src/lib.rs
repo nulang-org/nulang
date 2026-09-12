@@ -290,9 +290,10 @@ mod tests {
     fn cheap_spot_wins_for_short_ephemeral_work() {
         let spot = offer("spot", Lifecycle::Spot, 0.25);
         let ondemand = offer("ondemand", Lifecycle::OnDemand, 1.00);
+        let offers = [ondemand, spot];
         let ranked = rank_offers(
             &job(WorkloadClass::Ephemeral, 20.0),
-            &[ondemand, spot],
+            &offers,
             ScoreWeights::default(),
         )
         .unwrap();
@@ -311,7 +312,8 @@ mod tests {
             interruption_usd: 2.0,
             ..ScoreWeights::default()
         };
-        let ranked = rank_offers(&workload, &[flaky, reliable], weights).unwrap();
+        let offers = [flaky, reliable];
+        let ranked = rank_offers(&workload, &offers, weights).unwrap();
         assert_eq!(ranked[0].offer.offer_id, "reliable");
     }
 
@@ -322,7 +324,8 @@ mod tests {
         let local = offer("local", Lifecycle::OnDemand, 0.40);
         let mut workload = job(WorkloadClass::Ephemeral, 3600.0);
         workload.data_egress_gib = 10.0;
-        let ranked = rank_offers(&workload, &[remote, local], ScoreWeights::default()).unwrap();
+        let offers = [remote, local];
+        let ranked = rank_offers(&workload, &offers, ScoreWeights::default()).unwrap();
         assert_eq!(ranked[0].offer.offer_id, "local");
     }
 
@@ -346,8 +349,8 @@ mod tests {
         workload.min_accelerator_count = 1;
         workload.min_accelerator_vram_gib_each = 80.0;
         workload.min_trust_tier = TrustTier::CloudProvider;
-        let ranked =
-            rank_offers(&workload, &[marketplace, cloud], ScoreWeights::default()).unwrap();
+        let offers = [marketplace, cloud];
+        let ranked = rank_offers(&workload, &offers, ScoreWeights::default()).unwrap();
         assert!(ranked.is_empty());
     }
 
@@ -355,9 +358,10 @@ mod tests {
     fn critical_jobs_reject_interruptible_capacity_by_default() {
         let spot = offer("spot", Lifecycle::Spot, 0.01);
         let ondemand = offer("ondemand", Lifecycle::OnDemand, 1.00);
+        let offers = [spot, ondemand];
         let ranked = rank_offers(
             &job(WorkloadClass::Critical, 600.0),
-            &[spot, ondemand],
+            &offers,
             ScoreWeights::default(),
         )
         .unwrap();
