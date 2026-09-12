@@ -15,6 +15,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 
+const HOST_CAPABILITIES: &[&str] = &[
+    "DB", "Net", "Realtime", "Http", "Web", "Actor", "Timer", "Job", "IO",
+];
+/// Reserved capability emitted when source metadata could not be derived
+/// completely. Deployment policy must never silently grant this marker.
+pub const INCOMPLETE_METADATA_CAPABILITY: &str = "__nulang_metadata_incomplete__";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IrRoute {
     pub method: String,
@@ -42,11 +49,6 @@ pub struct DeploymentIr {
     pub routes: Vec<IrRoute>,
     pub signals: serde_json::Value,
     pub capabilities: Vec<String>,
-    /// False when any source file could not be read, lexed, or parsed while
-    /// deriving deployment metadata. Cloud runtimes should fail closed when
-    /// this is false rather than trusting an incomplete capability manifest.
-    #[serde(default)]
-    pub metadata_complete: bool,
     pub budgets: BudgetsIr,
     pub middleware: Vec<String>,
     pub cloud_config: Vec<CloudConfigEntry>,
@@ -120,7 +122,17 @@ pub fn generate_deployment_ir(
 
     let mut capabilities = metadata.capabilities;
     capabilities.extend(registry.collect_capabilities(&imports));
-    let capabilities = capabilities.into_iter().collect();
+    if !metadata.complete {
+        // Fail closed without changing the public DeploymentIr struct shape:
+        // never under-report authority when semantic metadata cannot be fully
+        // derived. The reserved marker lets an admission layer reject the
+        // deployment outright, while the full host-capability set prevents a
+        // legacy consumer from treating the incomplete manifest as least-
+        // privilege metadata.
+        capabilities.extend(HOST_CAPABILITIES.iter().map(|cap| (*cap).to_string()));
+        capabilities.insert(INCOMPLETE_METADATA_CAPABILITY.to_string());
+    }
+    let capabilities: Vec<String> = capabilities.into_iter().collect();
 
     let budgets_ir = BudgetsIr {
         initial_js_max_bytes: budgets.initial_js_max_bytes(),
@@ -135,7 +147,6 @@ pub fn generate_deployment_ir(
         routes: ir_routes,
         signals,
         capabilities,
-        metadata_complete: metadata.complete,
         budgets: budgets_ir,
         middleware,
         cloud_config,
@@ -517,10 +528,7 @@ fn collect_expr_metadata(expr: &Expr, metadata: &mut SemanticMetadata) {
 }
 
 fn is_host_capability(effect: &str) -> bool {
-    matches!(
-        effect,
-        "DB" | "Net" | "Realtime" | "Http" | "Web" | "Actor" | "Timer" | "Job" | "IO"
-    )
+    HOST_CAPABILITIES.contains(&effect)
 }
 
 /// Infer cloud config keys required by structurally imported `@nulang/*` modules.
@@ -640,5 +648,12 @@ mod tests {
     fn test_invalid_source_is_rejected() {
         let mut metadata = SemanticMetadata::new();
         assert!(!collect_source_metadata("fn broken( {", &mut metadata));
+    }
+
+    #[test]
+    fn incomplete_metadata_marker_is_reserved_and_not_a_host_capability() {
+        assert!(!is_host_capability(INCOMPLETE_METADATA_CAPABILITY));
+        assert!(HOST_CAPABILITIES.contains(&"DB"));
+        assert!(HOST_CAPABILITIES.contains(&"Net"));
     }
 }
