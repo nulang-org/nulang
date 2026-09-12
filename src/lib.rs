@@ -9,6 +9,7 @@ pub mod aot;
 pub mod artifact_identity;
 pub mod ast;
 pub mod authority;
+pub mod authority_host;
 mod authority_runtime;
 pub use authority_runtime::RuntimeAuthorityError;
 pub mod backends;
