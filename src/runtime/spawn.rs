@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+use crate::authority::AuthorityManifest;
+use crate::authority_runtime::RuntimeAuthorityError;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::{Actor, ActorBackend, BehaviorEntry};
 use crate::runtime::persistence::{PersistedValue, StateModel, WorkflowEvent};
@@ -336,6 +338,44 @@ pub(crate) fn spawn_from_module(
     Value::actor_ref(id)
 }
 
+/// Spawn from a bytecode module while enforcing one validated external-authority
+/// manifest atomically with actor creation.
+///
+/// If a parent actor is currently executing, delegation is validated before
+/// the child is created, so a denied or malformed grant cannot leave a
+/// partially-created privileged actor behind. With no current actor, the
+/// runtime is the root trust boundary and may install the supplied manifest
+/// directly; host policy can further constrain that root boundary later.
+///
+/// This is staged migration plumbing and becomes live once exact spawn
+/// provenance is threaded through the VM callback boundary.
+#[allow(dead_code)]
+pub(crate) fn spawn_from_module_with_authority(
+    rt: &mut Runtime,
+    module: &crate::bytecode::CodeModule,
+    behavior_idx: usize,
+    init: Vec<(String, Value)>,
+    requested: &AuthorityManifest,
+) -> Result<Value, RuntimeAuthorityError> {
+    if let Some(parent_id) = rt.current_actor {
+        if let Some(parent) = rt.actors.get(&parent_id) {
+            parent.delegate_authority(requested)?;
+        } else if let Some(grant) = requested.iter().next() {
+            // A non-empty request with a missing current actor has no valid
+            // authority source. Treat it like an empty parent manifest.
+            return Err(RuntimeAuthorityError::Denied(grant.clone()));
+        }
+    }
+
+    let value = spawn_from_module(rt, module, behavior_idx, init);
+    if let Some(child_id) = value.as_actor_id() {
+        if let Some(child) = rt.actors.get_mut(&child_id) {
+            child.install_authority_manifest(requested);
+        }
+    }
+    Ok(value)
+}
+
 /// Populate a workflow actor's behavior table with placeholder entries for
 /// each bytecode step plus the internal `__timer_fired` handler.
 pub(crate) fn layout_workflow_behavior_table(rt: &mut Runtime, actor_id: u64) {
@@ -368,4 +408,104 @@ pub(crate) fn register_recovery_module(
 ) {
     rt.recovery_modules
         .insert(actor_id, (module, offsets, compensation_offsets));
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use crate::authority::AuthorityGrant;
+    use crate::bytecode::CodeModule;
+
+    fn secret_manifest(name: &str) -> AuthorityManifest {
+        AuthorityManifest::from_tokens([format!("Secret::Read({name})")].iter().map(String::as_str))
+            .unwrap()
+    }
+
+    #[test]
+    fn root_spawn_installs_requested_authority() {
+        let mut rt = Runtime::new();
+        let module = CodeModule::new("root-authority");
+        let requested = secret_manifest("STRIPE_KEY");
+
+        let value =
+            spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested).unwrap();
+        let actor_id = value.as_actor_id().unwrap();
+        let actor = rt.actors.get(&actor_id).unwrap();
+
+        assert!(actor
+            .authority_manifest()
+            .unwrap()
+            .allows(&AuthorityGrant::SecretRead {
+                name: "STRIPE_KEY".into(),
+            }));
+    }
+
+    #[test]
+    fn parent_can_delegate_only_authority_it_holds() {
+        let mut rt = Runtime::new();
+        let parent_id = rt.spawn_actor(Box::new(|| vec![]));
+        let parent_manifest = secret_manifest("STRIPE_KEY");
+        rt.actors
+            .get_mut(&parent_id)
+            .unwrap()
+            .install_authority_manifest(&parent_manifest);
+        rt.current_actor = Some(parent_id);
+
+        let module = CodeModule::new("delegated-authority");
+        let value = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &parent_manifest)
+            .unwrap();
+        let child_id = value.as_actor_id().unwrap();
+
+        assert_eq!(
+            rt.actors
+                .get(&child_id)
+                .unwrap()
+                .authority_manifest()
+                .unwrap(),
+            parent_manifest
+        );
+    }
+
+    #[test]
+    fn denied_delegation_does_not_create_child() {
+        let mut rt = Runtime::new();
+        let parent_id = rt.spawn_actor(Box::new(|| vec![]));
+        rt.current_actor = Some(parent_id);
+        let before = rt.actors.len();
+        let requested = secret_manifest("STRIPE_KEY");
+        let module = CodeModule::new("denied-authority");
+
+        let result = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested);
+
+        assert_eq!(
+            result,
+            Err(RuntimeAuthorityError::Denied(AuthorityGrant::SecretRead {
+                name: "STRIPE_KEY".into(),
+            }))
+        );
+        assert_eq!(rt.actors.len(), before);
+    }
+
+    #[test]
+    fn malformed_parent_manifest_fails_before_child_creation() {
+        let mut rt = Runtime::new();
+        let parent_id = rt.spawn_actor(Box::new(|| vec![]));
+        rt.actors
+            .get_mut(&parent_id)
+            .unwrap()
+            .capabilities
+            .insert("Net::TcpOut(malformed)".to_string());
+        rt.current_actor = Some(parent_id);
+        let before = rt.actors.len();
+        let requested = AuthorityManifest::new();
+        let module = CodeModule::new("malformed-parent-authority");
+
+        let result = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested);
+
+        assert!(matches!(
+            result,
+            Err(RuntimeAuthorityError::InvalidManifest(_))
+        ));
+        assert_eq!(rt.actors.len(), before);
+    }
 }
