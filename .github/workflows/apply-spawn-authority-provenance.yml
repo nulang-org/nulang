@@ -1,0 +1,36 @@
+name: Apply spawn authority provenance patch
+
+on:
+  push:
+    branches:
+      - feat/spawn-authority-provenance
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[authority-patch-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/spawn-authority-provenance
+          fetch-depth: 0
+      - name: Apply exact-provenance patch
+        run: python3 scripts/apply_spawn_authority_provenance.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Run focused regression tests
+        run: cargo test --test spawn_authority_provenance
+      - name: Remove one-shot patch machinery
+        run: |
+          rm scripts/apply_spawn_authority_provenance.py
+          rm .github/workflows/apply-spawn-authority-provenance.yml
+      - name: Commit patched source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(authority): thread exact spawn provenance [authority-patch-applied]"
+          git push origin HEAD:feat/spawn-authority-provenance
