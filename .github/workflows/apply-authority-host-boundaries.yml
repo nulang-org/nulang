@@ -17,8 +17,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply assertion-heavy patch
+      - name: Apply actor host-effect authority patch
         run: python3 scripts/apply_authority_host_boundaries.py
+
+      - name: Apply FFI authority patch
+        run: python3 scripts/apply_authority_ffi_gate.py
 
       - name: Reject whitespace errors
         run: git diff --check
@@ -26,7 +29,7 @@ jobs:
       - name: Run host authority regressions
         run: cargo test --lib host_authority -- --nocapture
 
-      - name: Run authority unit tests
+      - name: Run migration-independent authority unit tests
         run: cargo test --lib authority -- --nocapture
 
       - name: Check library
@@ -41,6 +44,7 @@ jobs:
       - name: Commit validated implementation
         run: |
           rm scripts/apply_authority_host_boundaries.py
+          rm scripts/apply_authority_ffi_gate.py
           rm .github/workflows/apply-authority-host-boundaries.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
