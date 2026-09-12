@@ -18,4 +18,6 @@ The intended data path is:
 
 `LiveKit/WebRTC -> Silero -> Parakeet/Whisper -> Intent IR -> NuLang agent/capabilities -> Kokoro -> LiveKit`
 
+The workspace registration preserves the independently-added `nulang-capacity` crate alongside `nulang-ai-voice`.
+
 Next slices are concrete model-runtime clients, semantic end-of-turn detection, speculative intent/tool prefetch from partial transcripts, and an optional expressive Orpheus TTS tier.
