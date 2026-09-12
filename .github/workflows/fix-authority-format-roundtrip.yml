@@ -1,0 +1,99 @@
+name: Fix authority formatter roundtrip
+
+on:
+  push:
+    branches:
+      - feat/spawn-authority-source-v2
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[authority-fmt-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/spawn-authority-source-v2
+          fetch-depth: 0
+
+      - name: Patch typed source rendering and formatter
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/authority.rs')
+          s = p.read_text()
+          anchor = '''        token.parse()\n    }\n}\n\n/// Deterministically ordered authority set.'''
+          replacement = '''        token.parse()\n    }\n\n    /// Render this grant as valid source syntax. Unlike the canonical token\n    /// representation used for artifact identity, source syntax quotes and\n    /// escapes authority arguments so formatter output always reparses.\n    pub fn to_source_syntax(&self) -> String {\n        match self {\n            AuthorityGrant::NetTcpOut { host, port } => {\n                format!(\"Net::TcpOut({})\", quote_source_string(&format!(\"{host}:{port}\")))\n            }\n            AuthorityGrant::FsRead { path } => {\n                format!(\"Fs::Read({})\", quote_source_string(path))\n            }\n            AuthorityGrant::FsWrite { path } => {\n                format!(\"Fs::Write({})\", quote_source_string(path))\n            }\n            AuthorityGrant::EnvRead { name } => {\n                format!(\"Env::Read({})\", quote_source_string(name))\n            }\n            AuthorityGrant::SecretRead { name } => {\n                format!(\"Secret::Read({})\", quote_source_string(name))\n            }\n            AuthorityGrant::Other {\n                namespace,\n                operation,\n                argument,\n            } => match argument {\n                Some(argument) => format!(\n                    \"{namespace}::{operation}({})\",\n                    quote_source_string(argument)\n                ),\n                None => format!(\"{namespace}::{operation}\"),\n            },\n        }\n    }\n}\n\nfn quote_source_string(value: &str) -> String {\n    let mut out = String::with_capacity(value.len() + 2);\n    out.push('\\\"');\n    for ch in value.chars() {\n        match ch {\n            '\\\\' => out.push_str(\"\\\\\\\\\"),\n            '\\"' => out.push_str(\"\\\\\\\"\"),\n            '\\n' => out.push_str(\"\\\\n\"),\n            '\\t' => out.push_str(\"\\\\t\"),\n            '\\r' => out.push_str(\"\\\\r\"),\n            '\\0' => out.push_str(\"\\\\0\"),\n            c if c.is_control() => out.push_str(&format!(\"\\\\u{{{:x}}}\", c as u32)),\n            c => out.push(c),\n        }\n    }\n    out.push('\\\"');\n    out\n}\n\n/// Deterministically ordered authority set.'''
+          if s.count(anchor) != 1:
+              raise SystemExit(f'authority method anchor count={s.count(anchor)}')
+          p.write_text(s.replace(anchor, replacement, 1))
+
+          p = Path('src/fmt.rs')
+          s = p.read_text()
+          import_anchor = 'use crate::ast::{BinOp, Decl, Expr, Literal, Pattern};\n'
+          if s.count(import_anchor) != 1:
+              raise SystemExit(f'fmt import anchor count={s.count(import_anchor)}')
+          s = s.replace(import_anchor, import_anchor + 'use crate::authority::AuthorityGrant;\n', 1)
+
+          old = '''                    // Canonical token `Net::TcpOut(host:port)` → source form.\n                    if let Some(dest) = cap\n                        .strip_prefix(\"Net::TcpOut(\")\n                        .and_then(|r| r.strip_suffix(')'))\n                    {\n                        out.push_str(&format!(\"Net::TcpOut(\\\"{}\\\")\", dest));\n                    } else {\n                        out.push_str(cap);\n                    }'''
+          new = '''                    match cap.parse::<AuthorityGrant>() {\n                        Ok(grant) => out.push_str(&grant.to_source_syntax()),\n                        Err(_) => {\n                            // Parsed source should never carry malformed authority\n                            // metadata. Refuse to format rather than emit source that\n                            // silently changes or drops authority.\n                            *had_unhandled = true;\n                        }\n                    }'''
+          if s.count(old) != 1:
+              raise SystemExit(f'fmt capability renderer count={s.count(old)}')
+          s = s.replace(old, new, 1)
+
+          test_anchor = '''    #[test]\n    fn test_fmt_spawn_handle_receive() {'''
+          test = r'''    #[test]
+    fn test_fmt_spawn_authority_roundtrips_all_grant_kinds() {
+        let src = r#"
+actor Worker { behavior ping() { 1 } }
+fn main() {
+    spawn Worker() with [
+        Net::TcpOut("api.example.com:443"),
+        Fs::Read("/tmp/in put"),
+        Fs::Write("C:\\tmp\\\"out\""),
+        Env::Read("HOME"),
+        Secret::Read("stripe\nkey"),
+        Vendor::Use("scope:alpha")
+    ]
+}"#;
+        let out = format_source(src).expect("authority grants format");
+        assert!(out.contains("Net::TcpOut(\"api.example.com:443\")"), "got: {out}");
+        assert!(out.contains("Fs::Read(\"/tmp/in put\")"), "got: {out}");
+        assert!(out.contains("Env::Read(\"HOME\")"), "got: {out}");
+        assert!(out.contains("Vendor::Use(\"scope:alpha\")"), "got: {out}");
+        let tokens = crate::lexer::Lexer::new(&out).lex().expect("formatted source lexes");
+        crate::parser::Parser::new(tokens)
+            .parse_module()
+            .expect("formatted authority source reparses");
+        assert_eq!(format_source(&out).expect("second format succeeds"), out);
+    }
+
+'''
+          if s.count(test_anchor) != 1:
+              raise SystemExit(f'fmt test anchor count={s.count(test_anchor)}')
+          p.write_text(s.replace(test_anchor, test + test_anchor, 1))
+          PY
+
+      - name: Validate focused formatter and authority suite
+        run: |
+          rustfmt src/authority.rs src/fmt.rs
+          cargo test fmt::tests::test_fmt_spawn_authority_roundtrips_all_grant_kinds
+          cargo test --test spawn_authority_provenance
+          cargo check --lib
+          rustfmt --check src/authority.rs src/fmt.rs
+          git diff --check
+
+      - name: Remove one-shot workflow
+        run: rm .github/workflows/fix-authority-format-roundtrip.yml
+
+      - name: Commit validated formatter fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix(authority): preserve grants through source formatting [authority-fmt-applied]"
+          git push origin HEAD:feat/spawn-authority-source-v2
