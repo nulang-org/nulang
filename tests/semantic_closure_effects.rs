@@ -1,7 +1,7 @@
 //! Semantic-closure regression tests for algebraic-effect backend parity.
 //!
 //! These tests deliberately distinguish two contracts:
-//! 1. language features accepted by both bytecode and native must agree; and
+//! 1. language features accepted by multiple backends must agree; and
 //! 2. a restricted backend must reject unsupported continuation forms
 //!    deterministically rather than silently changing semantics.
 
@@ -72,7 +72,8 @@ fn run_native(source: &str) -> Result<Value, NuError> {
 #[test]
 fn resumable_handler_matches_bytecode_and_native() {
     let bytecode = run_bytecode(IMPLICIT_RESUME).expect("bytecode should execute resumable handler");
-    let native = run_native(IMPLICIT_RESUME).expect("native should execute supported resumable handler");
+    let native =
+        run_native(IMPLICIT_RESUME).expect("native should execute supported resumable handler");
 
     assert_eq!(bytecode.as_int(), Some(43));
     assert_eq!(native.as_int(), Some(43));
@@ -96,5 +97,24 @@ fn explicit_resume_expression_is_a_deterministic_native_restriction() {
     assert!(
         err.contains("effect-continuation resume requires the bytecode backend"),
         "native must reject explicit resume(expr) with the documented restriction, got: {err}"
+    );
+}
+
+#[cfg(feature = "wasm-backend")]
+#[test]
+fn plain_wasm_rejects_resumable_handlers_instead_of_returning_nil() {
+    use nulang::backends::{DefaultWasmBackend, WasmBackend};
+
+    let mir = lower(IMPLICIT_RESUME).expect("resumable handler should lower to MIR");
+    let mut backend = DefaultWasmBackend;
+    let err = backend
+        .compile(&mir, "semantic-closure-effects")
+        .expect_err("plain WASM must reject unsupported handler/resume semantics");
+    let message = err.to_string();
+
+    assert!(
+        message.contains("WASM backend restricted profile")
+            && message.contains("continuation resume are not supported"),
+        "plain WASM must fail loudly instead of compiling Resume to nil, got: {message}"
     );
 }
