@@ -273,7 +273,10 @@ impl fmt::Display for ProtocolIdParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProtocolIdParseError::InvalidLength(length) => {
-                write!(f, "protocol id must contain 64 hex characters, got {length}")
+                write!(
+                    f,
+                    "protocol id must contain 64 hex characters, got {length}"
+                )
             }
             ProtocolIdParseError::InvalidHex(ch) => {
                 write!(f, "protocol id contains invalid hex character '{ch}'")
