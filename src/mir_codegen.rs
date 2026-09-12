@@ -3453,21 +3453,17 @@ mod optimize_tests {
     fn test_behavior_content_hash_record_field_order_invariant() {
         // Records unify field-order-insensitively; re-declaring the same
         // record fields in a different order must not change the hash.
-        let a = compile_source("actor A { behavior poke(p: {x: Int, y: Int}) { 1 } }")
-            .unwrap();
-        let b = compile_source("actor A { behavior poke(p: {y: Int, x: Int}) { 1 } }")
-            .unwrap();
+        let a = compile_source("actor A { behavior poke(p: {x: Int, y: Int}) { 1 } }").unwrap();
+        let b = compile_source("actor A { behavior poke(p: {y: Int, x: Int}) { 1 } }").unwrap();
         assert_eq!(
-            a.behaviors[0].content_hash,
-            b.behaviors[0].content_hash,
+            a.behaviors[0].content_hash, b.behaviors[0].content_hash,
             "record field order must not change the content hash"
         );
     }
 
     #[test]
     fn test_behavior_content_hash_deterministic() {
-        let source =
-            "actor A { behavior poke(x: Int) { x + 1 } behavior other(s: String) { 1 } }";
+        let source = "actor A { behavior poke(x: Int) { x + 1 } behavior other(s: String) { 1 } }";
         let a = compile_source(source).unwrap();
         let b = compile_source(source).unwrap();
         assert_eq!(a.behaviors.len(), b.behaviors.len());
