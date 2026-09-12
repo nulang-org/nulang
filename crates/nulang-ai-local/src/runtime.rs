@@ -268,11 +268,14 @@ impl LocalRuntime {
 
             match execution {
                 Ok(completed) => {
-                    // Terminal task state must become durable before releasing
-                    // the lease. A crash or store error before this write leaves
-                    // the reservation intact so expiry recovery can requeue it.
-                    self.store.upsert_task(&completed)?;
-                    self.reservations.release(&reservation)?;
+                    // The terminal transition and lease release are fenced in a
+                    // single SQLite transaction. A stale/expired worker cannot
+                    // publish completion after ownership has moved elsewhere.
+                    self.reservations.commit_terminal_and_release(
+                        &reservation,
+                        &completed,
+                        Utc::now().timestamp_millis(),
+                    )?;
                     self.emit(
                         out,
                         SwarmEvent::TaskCompleted {
@@ -282,13 +285,14 @@ impl LocalRuntime {
                     )?;
                 }
                 Err(error) => {
-                    // Persist failure before release for the same reason: never
-                    // leave a durable `running` task without recovery evidence.
                     let mut failed = running;
                     failed.status = TaskStatus::Failed;
                     failed.updated_at = Utc::now();
-                    self.store.upsert_task(&failed)?;
-                    self.reservations.release(&reservation)?;
+                    self.reservations.commit_terminal_and_release(
+                        &reservation,
+                        &failed,
+                        Utc::now().timestamp_millis(),
+                    )?;
                     return Err(error.into());
                 }
             }
