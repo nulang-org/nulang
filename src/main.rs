@@ -1965,8 +1965,8 @@ fn run_source(
             // standalone heap (see `aot::take_aot_result_repr`); without it
             // the payload pointer dangles and string results print as raw
             // `#Value(...)` instead of their content.
-            let result_str = nulang::aot::take_aot_result_repr()
-                .unwrap_or_else(|| result.to_string_repr());
+            let result_str =
+                nulang::aot::take_aot_result_repr().unwrap_or_else(|| result.to_string_repr());
             if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
                 println!("{}", result_str);
             }
