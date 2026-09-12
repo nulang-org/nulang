@@ -186,10 +186,13 @@ impl DeploymentBundle {
             package_manifest.ok_or(DeploymentBundleError::MissingPackageManifest)?;
         let (artifact_path, artifact_bytes) =
             artifact.ok_or(DeploymentBundleError::MissingArtifact)?;
-        let expected_artifact = Path::new(".nula/dist")
-            .join(format!("{}.nbc", package_manifest.package.name))
-            .to_string_lossy()
-            .into_owned();
+        // Tar archive paths always use `/`, regardless of the host platform.
+        // Construct this identity in tar namespace instead of through `Path`
+        // so validation behaves identically on Windows, macOS, and Linux.
+        let expected_artifact = format!(
+            ".nula/dist/{}.nbc",
+            package_manifest.package.name
+        );
         if artifact_path != expected_artifact {
             return Err(DeploymentBundleError::ArtifactNameMismatch {
                 expected: expected_artifact,
