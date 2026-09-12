@@ -8,6 +8,7 @@ pub mod agent;
 pub mod aot;
 pub mod ast;
 pub mod authority;
+mod authority_runtime;
 pub mod backends;
 #[cfg(test)]
 pub mod benchmarks;
