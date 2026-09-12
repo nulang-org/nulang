@@ -9,7 +9,7 @@ use nulang_ai_core::{
 use nulang_ai_director::{Director, LocalDirector};
 use nulang_ai_manager::{EngineeringManager, Manager};
 use nulang_ai_protocol::format_event_line;
-use nulang_ai_worker::{LocalWorker, Worker};
+use nulang_ai_worker::{LocalWorker, Worker, WorkerError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -20,6 +20,8 @@ pub enum RuntimeError {
     Config(#[from] crate::config::ConfigError),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+    #[error("worker error: {0}")]
+    Worker(#[from] WorkerError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
@@ -127,9 +129,7 @@ impl LocalRuntime {
         conv.updated_at = Utc::now();
         self.store.upsert_conversation(&conv)?;
 
-        let tasks =
-            self.engineering
-                .plan_tasks(goal_id, text, self.config.director.default_budget_usd);
+        let tasks = self.engineering.plan_goal(&goal);
         for task in tasks {
             self.store.upsert_task(&task)?;
             self.emit(
@@ -156,7 +156,7 @@ impl LocalRuntime {
                 },
             )?;
 
-            let completed = self.worker.execute(&running);
+            let completed = self.worker.execute(&running)?;
             self.store.upsert_task(&completed)?;
             self.emit(
                 out,
