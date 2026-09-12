@@ -1915,59 +1915,15 @@ fn compile_stmt(
 ) -> AotResult<()> {
     match stmt {
         mir::Stmt::Assign {
-            dst,
-            op: mir::RValue::ReceiveCommit,
-        } => {
-            // No-op in AOT: the standalone receive_match already removed the
-            // matched message from the mailbox.
-            let dst_reg = mir::FunctionBuilder::LOCAL_BASE + dst.0;
-            local_vals.insert(dst_reg, builder.ins().iconst(types::I64, 0));
-            Ok(())
-        }
-        mir::Stmt::Assign {
-            dst,
             op:
-                mir::RValue::ReceiveMatch {
-                    behavior_ids,
-                    max_params,
-                }
-                | mir::RValue::ReceiveWait {
-                    behavior_ids,
-                    max_params,
-                    ..
-                },
-        } => {
-            let helper_name = match behavior_ids.len() {
-                1 => "nulang_aot_receive_match_1",
-                2 => "nulang_aot_receive_match_2",
-                3 => "nulang_aot_receive_match_3",
-                4 => "nulang_aot_receive_match_4",
-                5 => "nulang_aot_receive_match_5",
-                6 => "nulang_aot_receive_match_6",
-                7 => "nulang_aot_receive_match_7",
-                8 => "nulang_aot_receive_match_8",
-                n => {
-                    return Err(AotCompileError::Unsupported(format!(
-                        "receive with {} candidate behaviors (max 8 in AOT)",
-                        n
-                    )))
-                }
-            };
-            let call_args: Vec<Value> = behavior_ids
-                .iter()
-                .map(|id| builder.ins().iconst(types::I64, *id as i64))
-                .collect();
-            let arm_val = call_helper(builder, helpers, helper_name, &call_args)?;
-            let dst_reg = mir::FunctionBuilder::LOCAL_BASE + dst.0;
-            local_vals.insert(dst_reg, arm_val);
-            // Payload temps are the contiguous locals dst+1 .. dst+max_params.
-            for i in 0..*max_params {
-                let idx_const = builder.ins().iconst(types::I64, i as i64);
-                let pv = call_helper(builder, helpers, "nulang_aot_receive_payload", &[idx_const])?;
-                local_vals.insert(dst_reg + 1 + i as u32, pv);
-            }
-            Ok(())
-        }
+                mir::RValue::ReceiveCommit
+                | mir::RValue::ReceiveMatch { .. }
+                | mir::RValue::ReceiveWait { .. },
+            ..
+        } => Err(AotCompileError::Unsupported(
+            "selective receive transactions require the bytecode backend (unavailable with --backend native)"
+                .into(),
+        )),
         mir::Stmt::Assign { dst, op } => {
             // Resuming PerformDirect: an effect with a statically-resolved,
             // resuming handler compiles as intra-function continuation. The
@@ -3790,14 +3746,12 @@ mod tests {
     }
 
     #[test]
-    fn test_aot_native_receive() {
-        // Selective receive in native code: Run() executes a `receive` that
-        // pops a queued Add(5) from the actor's mailbox, binds n, and
-        // accumulates it — all through AOT-compiled code + callbacks.
+    fn test_aot_native_selective_receive_fails_closed() {
         use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
         use crate::lexer::Lexer;
         use crate::parser::Parser;
         use crate::typechecker::TypeChecker;
+
         let source = r#"
             actor Counter {
                 state total: Int = 0
@@ -3821,37 +3775,16 @@ mod tests {
         }
         let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
         let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
-        let aot = crate::aot::AotModule::compile(&mir_module)
-            .expect("AOT compile of receive behavior should succeed");
-        let run = aot
-            .fn_ptr_for_behavior("Counter.Run")
-            .expect("behavior 'Counter.Run' should be compiled");
-
-        let mut c = crate::runtime::Actor::new(1, "Counter", 64);
-        c.set_state_field("total", crate::vm::Value::int(0));
-        c.register_behavior("Add", crate::aot::aot_behavior_adapter);
-        c.register_behavior("Run", crate::aot::aot_behavior_adapter);
-        crate::aot::register_aot_actor(&mut c);
-
-        // Queue an Add(5) message (behavior_id 0 = module index of Add).
-        let _ = c.mailbox.push_local(crate::runtime::Message {
-            behavior_id: 0,
-            payload: std::sync::Arc::new(vec![crate::vm::Value::int(5)]),
-            sender: 0,
-            priority: crate::runtime::MessagePriority::Normal,
-            trace_id: None,
-        });
-
-        // Dispatch Run(): its native body selectively receives the message.
-        crate::aot::set_aot_dispatch(Some(crate::aot::AotDispatchTarget::standalone(run, &aot)));
-        (c.behavior_table[1].handler_fn)(&mut c, &[]);
-
-        let total = c.get_state_field("total").and_then(|v| v.as_int());
-        assert_eq!(total, Some(5), "native receive must deliver the payload");
-
-        crate::aot::unregister_aot_actor(1);
+        let err = match crate::aot::AotModule::compile(&mir_module) {
+            Ok(_) => panic!("native AOT must reject transactional selective receive"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("selective receive transactions require the bytecode backend"),
+            "native AOT must fail closed instead of changing receive semantics, got: {}",
+            err
+        );
     }
-
     #[test]
     fn test_aot_native_spawn() {
         // Spawn in native code: Factory.make(base) runs `spawn Counter {
