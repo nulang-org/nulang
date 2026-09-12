@@ -1,0 +1,47 @@
+name: Apply authority migration sender
+
+on:
+  push:
+    branches:
+      - fix/authority-migration-sender
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    if: ${{ !contains(github.event.head_commit.message, '[authority-migration-sender-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply assertion-heavy patch
+        run: python3 scripts/apply_authority_migration_sender.py
+
+      - name: Reject whitespace errors
+        run: git diff --check
+
+      - name: Run migration authority regressions
+        run: cargo test --lib migration_authority -- --nocapture
+
+      - name: Run authority unit tests
+        run: cargo test --lib authority -- --nocapture
+
+      - name: Check library
+        run: cargo check --lib
+
+      - name: Check all targets
+        run: cargo check --all-targets
+
+      - name: Commit validated implementation
+        run: |
+          rm scripts/apply_authority_migration_sender.py
+          rm .github/workflows/apply-authority-migration-sender.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix(authority): preserve manifest in migration packets [authority-migration-sender-applied]"
+          git push origin HEAD:fix/authority-migration-sender
