@@ -11,7 +11,9 @@ This crate is deliberately separated from the Nulang language/runtime and from c
 3. **Optimize completed-job economics.** Ranking includes observed throughput, interruption recovery, startup latency, acquisition confidence, storage, and egress rather than comparing hourly price alone.
 4. **Interruptibility is explicit policy.** Critical workloads can reject Spot/preemptible capacity entirely; checkpointable and ephemeral workloads can opt in.
 5. **Provider failures are isolated.** The broker continues ranking healthy providers when one provider endpoint fails.
-6. **Telemetry replaces static assumptions.** Observed fleet data can update throughput, interruption probability, startup percentiles, and acquisition confidence before scoring.
+6. **Stale capacity does not compete.** Production callers can reject provider snapshots older than a configured maximum age before ranking.
+7. **Provider health stays explicit.** Caller-owned circuit-breaker state handles retryable failures with bounded backoff and non-retryable failures with a long cooldown; the scheduler itself has no hidden global state.
+8. **Telemetry replaces static assumptions.** Observed fleet data can update throughput, interruption probability, startup percentiles, and acquisition confidence before scoring.
 
 ## Current scope
 
@@ -19,14 +21,16 @@ Implemented:
 
 - normalized CPU/GPU capacity offers and workload requirements
 - deterministic hard-constraint filtering and effective-cost scoring
-- multi-provider fallback broker
+- multi-provider fallback broker with provider-error isolation
+- stale-snapshot rejection and reporting
+- caller-owned provider circuit-breaker state
 - provider-neutral interruption/drain/checkpoint state machine
 - async provider adapter boundary with no cloud SDK dependency
 - AWS Spot/on-demand normalizer and interruption normalization
 - GCP Spot/standard normalizer and preemption normalization
 - Nebius preemptible/regular normalizer and preemption normalization
 - observed fleet telemetry estimates for dynamic scheduler inputs
-- tests covering Spot economics, long-running interruption risk, egress, GPU/trust constraints, critical workload policy, cross-provider ranking, interruption transitions, and telemetry
+- tests covering Spot economics, long-running interruption risk, egress, GPU/trust constraints, critical workload policy, cross-provider ranking, stale snapshots, provider health, interruption transitions, and telemetry
 
 ## Adapter architecture
 
@@ -38,7 +42,6 @@ The capacity core must remain usable without any provider SDK dependency.
 
 - production AWS/GCP/Nebius API source clients in the Nulang Cloud control plane
 - persistent rolling telemetry keyed by provider/region/offer
-- stale-snapshot rejection and circuit breaking
-- lease acquisition/retry orchestration
+- lease acquisition/retry orchestration and idempotent placement leases
 - CoreWeave and RunPod adapters
 - Vast adapter for explicitly lower-trust opportunistic workloads
