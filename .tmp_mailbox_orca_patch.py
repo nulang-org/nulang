@@ -1,0 +1,296 @@
+from pathlib import Path
+
+mod = Path("src/runtime/mod.rs")
+text = mod.read_text()
+
+old = "    pub coordinator: OrcaCoordinator,\n    pub cycle_detector: CycleDetector,"
+new = """    pub coordinator: OrcaCoordinator,
+    /// Send-side ORCA decrements whose pointer-bearing messages are still
+    /// resident in a target mailbox. Each send-side +1 stays here until the
+    /// exact payload is consumed (then it is published to the coordinator) or
+    /// the target actor exits and discards its queued messages.
+    pending_mailbox_ref_ops: HashMap<u64, Vec<ForeignRefOp>>,
+    pub cycle_detector: CycleDetector,"""
+assert old in text, "Runtime coordinator field marker missing"
+text = text.replace(old, new, 1)
+
+old = "            coordinator: OrcaCoordinator::new(),\n            cycle_detector: CycleDetector::new(),"
+new = """            coordinator: OrcaCoordinator::new(),
+            pending_mailbox_ref_ops: HashMap::new(),
+            cycle_detector: CycleDetector::new(),"""
+assert old in text, "Runtime initializer marker missing"
+text = text.replace(old, new, 1)
+
+fn_start = text.index("    fn deliver_local_message(")
+fn_end = text.index(
+    "    #[tracing::instrument(level = \"trace\", skip(self))]\n    pub fn process_gc_ops",
+    fn_start,
+)
+section = text[fn_start:fn_end]
+
+old = """        if let Some(actor) = self.actors.get_mut(&target_id) {
+            actor
+                .flight_recorder"""
+new = """        let mut enqueued = false;
+        if let Some(actor) = self.actors.get_mut(&target_id) {
+            actor
+                .flight_recorder"""
+assert old in section, "deliver enqueue marker missing"
+section = section.replace(old, new, 1)
+
+old = """            if actor.mailbox.push_local(msg).is_ok() {
+                // Activity resets the dehydration idle timer."""
+new = """            if actor.mailbox.push_local(msg).is_ok() {
+                enqueued = true;
+                // Activity resets the dehydration idle timer."""
+assert old in section, "deliver success marker missing"
+section = section.replace(old, new, 1)
+
+old = """        }
+        for arg in args {
+            if let Some(ptr) = arg.as_ptr() {"""
+new = """        }
+        if !enqueued {
+            // No mailbox owns these values, so no send-side ORCA transfer hold
+            // may be created. Preserve the old enqueue attempt for behavioral
+            // compatibility, then stop before reference tracking/wake logic.
+            self.enqueue_actor(target_id);
+            return;
+        }
+        for arg in args {
+            if let Some(ptr) = arg.as_ptr() {"""
+assert old in section, "deliver arg-loop marker missing"
+section = section.replace(old, new, 1)
+
+old = """                        let op = unsafe { owner.orca_gc.send_ref_to(&owner.heap, ptr, target_id) };
+                        self.coordinator.submit_op(op);"""
+new = """                        let op = unsafe { owner.orca_gc.send_ref_to(&owner.heap, ptr, target_id) };
+                        self.pending_mailbox_ref_ops
+                            .entry(target_id)
+                            .or_default()
+                            .push(op);"""
+assert old in section, "live-owner ORCA submit marker missing"
+section = section.replace(old, new, 1)
+
+old = """                        self.coordinator.submit_op(ForeignRefOp {
+                            target_actor: target_id,
+                            owner_actor: owner_id,
+                            object_header: source_header,
+                            delta: -1,
+                        });"""
+new = """                        self.pending_mailbox_ref_ops
+                            .entry(target_id)
+                            .or_default()
+                            .push(ForeignRefOp {
+                                target_actor: target_id,
+                                owner_actor: owner_id,
+                                object_header: source_header,
+                                delta: -1,
+                            });"""
+assert old in section, "retired-owner ORCA submit marker missing"
+section = section.replace(old, new, 1)
+
+helper = r'''
+    /// Publish the one send-side ORCA decrement associated with a payload
+    /// pointer that has just left `target_id`'s mailbox. The receiver hold
+    /// must be established before this is called so foreign_count never has a
+    /// zero-count gap between mailbox residency and receiver ownership.
+    fn release_mailbox_transfer_ref(
+        &mut self,
+        target_id: u64,
+        object_header: *mut crate::runtime::heap::OrcaHeader,
+    ) {
+        let mut remove_bucket = false;
+        let op = self.pending_mailbox_ref_ops.get_mut(&target_id).and_then(|ops| {
+            let idx = ops
+                .iter()
+                .position(|op| op.object_header == object_header)?;
+            let op = ops.swap_remove(idx);
+            remove_bucket = ops.is_empty();
+            Some(op)
+        });
+        if remove_bucket {
+            self.pending_mailbox_ref_ops.remove(&target_id);
+        }
+        if let Some(op) = op {
+            self.coordinator.submit_op(op);
+        }
+    }
+
+    /// Release all mailbox-resident send-side holds for an actor whose queued
+    /// messages are being discarded during exit.
+    pub(crate) fn release_pending_mailbox_refs(&mut self, target_id: u64) {
+        if let Some(ops) = self.pending_mailbox_ref_ops.remove(&target_id) {
+            for op in ops {
+                self.coordinator.submit_op(op);
+            }
+        }
+    }
+
+'''
+section = section + helper
+text = text[:fn_start] + section + text[fn_end:]
+
+old = "    fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value]) {"
+new = "    pub(crate) fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value]) {"
+assert old in text, "hold_payload_refs visibility marker missing"
+text = text.replace(old, new, 1)
+
+old = """            if let Some(receiver) = self.actors.get_mut(&receiver_id) {
+                receiver.orca_gc.record_held_ref(owner_id, header);
+            }
+        }
+    }"""
+new = """            if let Some(receiver) = self.actors.get_mut(&receiver_id) {
+                receiver.orca_gc.record_held_ref(owner_id, header);
+            }
+            // Convert mailbox residency into receiver ownership only after the
+            // receiver-side +1 is established, so process_gc_ops can never
+            // expose a zero-count gap for this pointer.
+            self.release_mailbox_transfer_ref(receiver_id, header);
+        }
+    }"""
+assert old in text, "receiver hold marker missing"
+text = text.replace(old, new, 1)
+mod.write_text(text)
+
+exit_rs = Path("src/runtime/exit.rs")
+text = exit_rs.read_text()
+old = """    rt.release_held_foreign_refs(actor_id);
+
+    rt.registry.unregister_by_actor(actor_id);"""
+new = """    // Queued pointer-bearing messages are discarded with the actor. Their
+    // send-side mailbox transfer holds can now be published safely.
+    rt.release_pending_mailbox_refs(actor_id);
+    rt.release_held_foreign_refs(actor_id);
+
+    rt.registry.unregister_by_actor(actor_id);"""
+assert old in text, "exit ORCA marker missing"
+exit_rs.write_text(text.replace(old, new, 1))
+
+aot = Path("src/aot/mod.rs")
+text = aot.read_text()
+impl_start = text.index("impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks")
+try_start = text.index(
+    "    fn try_receive(&mut self) -> Option<(u16, crate::vm::Value)> {", impl_start
+)
+try_end = text.index("\n    fn try_receive_match(", try_start)
+new = r'''    fn try_receive(&mut self) -> Option<(u16, crate::vm::Value)> {
+        // SAFETY: as above; mailbox access and ORCA ownership transfer both
+        // run on the owning scheduler thread.
+        unsafe {
+            let msg = {
+                let actor = (*self.runtime).actors.get_mut(&self.actor_id)?;
+                actor.mailbox.pop()?
+            };
+            (*self.runtime).hold_payload_refs(self.actor_id, &msg.payload);
+            let first = msg
+                .payload
+                .first()
+                .copied()
+                .unwrap_or(crate::vm::Value::nil());
+            Some((msg.behavior_id, first))
+        }
+    }
+'''
+aot.write_text(text[:try_start] + new + text[try_end:])
+
+tests = Path("src/runtime/tests.rs")
+text = tests.read_text()
+marker = "fn test_orca_mailbox_transfer_hold_survives_gc_until_consumed()"
+assert marker not in text, "mailbox transfer regression already present"
+test = r'''
+
+#[test]
+fn test_orca_mailbox_transfer_hold_survives_gc_until_consumed() {
+    let mut rt = Runtime::new();
+    let owner_id = rt.spawn_actor(Box::new(|| vec![]));
+    let receiver_id = rt.spawn_actor(Box::new(|| vec![]));
+    let ptr = {
+        let owner = rt.actors.get_mut(&owner_id).expect("owner actor");
+        owner
+            .orca_gc
+            .alloc_object(&mut owner.heap, 8, TypeTag::Raw)
+            .expect("owner allocation")
+    };
+    let header = unsafe { ActorHeap::header_of(ptr) };
+
+    rt.current_actor = Some(owner_id);
+    rt.send_message_by_id(receiver_id, 0, &[Value::ptr(ptr)]);
+    rt.current_actor = None;
+    assert_eq!(unsafe { (*header).foreign_count }, 1);
+    assert_eq!(rt.actors[&receiver_id].mailbox.len(), 1);
+
+    // Simulate the sender dropping its last local reference while the target
+    // is suspended/idle with the message still queued.
+    {
+        let owner = rt.actors.get_mut(&owner_id).expect("owner actor");
+        unsafe {
+            owner.orca_gc.drop_local_ref(&mut owner.heap, ptr);
+        }
+    }
+    assert_eq!(unsafe { (*header).ref_count }, 0);
+    assert_eq!(unsafe { (*header).foreign_count }, 1);
+
+    // This was the bug: scheduler quiescence used to publish the send-side -1
+    // even though the pointer was still resident in the mailbox.
+    rt.process_gc_ops();
+    rt.process_deferred_all();
+    assert_eq!(
+        unsafe { (*header).foreign_count },
+        1,
+        "queued message must retain its in-flight ORCA hold across GC drain"
+    );
+    assert_eq!(rt.actors[&receiver_id].mailbox.len(), 1);
+
+    // Normal delivery establishes a receiver hold first and only then releases
+    // the mailbox-transfer hold into the GC coordinator.
+    rt.step_actor(receiver_id);
+    assert_eq!(unsafe { (*header).foreign_count }, 2);
+    assert_eq!(rt.actors[&receiver_id].mailbox.len(), 0);
+    rt.process_gc_ops();
+    assert_eq!(
+        unsafe { (*header).foreign_count },
+        1,
+        "after delivery only the receiver-side hold should remain"
+    );
+}
+
+#[test]
+fn test_orca_mailbox_transfer_hold_released_when_receiver_exits() {
+    let mut rt = Runtime::new();
+    let owner_id = rt.spawn_actor(Box::new(|| vec![]));
+    let receiver_id = rt.spawn_actor(Box::new(|| vec![]));
+    let ptr = {
+        let owner = rt.actors.get_mut(&owner_id).expect("owner actor");
+        owner
+            .orca_gc
+            .alloc_object(&mut owner.heap, 8, TypeTag::Raw)
+            .expect("owner allocation")
+    };
+
+    rt.current_actor = Some(owner_id);
+    rt.send_message_by_id(receiver_id, 0, &[Value::ptr(ptr)]);
+    rt.current_actor = None;
+    {
+        let owner = rt.actors.get_mut(&owner_id).expect("owner actor");
+        unsafe {
+            owner.orca_gc.drop_local_ref(&mut owner.heap, ptr);
+        }
+    }
+
+    assert_eq!(
+        rt.pending_mailbox_ref_ops.get(&receiver_id).map(Vec::len),
+        Some(1)
+    );
+    let freed_before = rt.gc_stats().objects_freed;
+    crate::runtime::exit::exit_actor(&mut rt, receiver_id, ExitReason::Normal);
+    assert!(!rt.pending_mailbox_ref_ops.contains_key(&receiver_id));
+    rt.process_gc_ops();
+    assert!(
+        rt.gc_stats().objects_freed > freed_before,
+        "discarding the receiver mailbox must eventually release its transfer hold"
+    );
+}
+'''
+tests.write_text(text.rstrip() + test + "\n")
