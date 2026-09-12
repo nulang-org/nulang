@@ -121,7 +121,10 @@ mod tests {
         let session_id = Uuid::new_v4();
         let bridge = LiveKitSessionBridge::new(session_id, audio_tx, event_tx);
 
-        bridge.handle_event(LiveKitEvent::Disconnected).await.unwrap();
+        bridge
+            .handle_event(LiveKitEvent::Disconnected)
+            .await
+            .unwrap();
 
         assert_eq!(
             event_rx.recv().await,
