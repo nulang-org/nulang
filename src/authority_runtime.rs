@@ -76,10 +76,7 @@ impl Actor {
     /// This returns an error, rather than `false`, for malformed manifests so
     /// callers cannot accidentally hide corrupted or attacker-controlled
     /// authority metadata behind an ordinary denial.
-    pub fn allows_authority(
-        &self,
-        grant: &AuthorityGrant,
-    ) -> Result<bool, AuthorityParseError> {
+    pub fn allows_authority(&self, grant: &AuthorityGrant) -> Result<bool, AuthorityParseError> {
         Ok(self.authority_manifest()?.allows(grant))
     }
 
@@ -88,10 +85,7 @@ impl Actor {
     /// Host integrations should prefer this method to direct access to
     /// `Actor::capabilities`: it parses the complete manifest first and only
     /// then performs the typed exact-match authorization decision.
-    pub fn require_authority(
-        &self,
-        grant: &AuthorityGrant,
-    ) -> Result<(), RuntimeAuthorityError> {
+    pub fn require_authority(&self, grant: &AuthorityGrant) -> Result<(), RuntimeAuthorityError> {
         let manifest = self.authority_manifest()?;
         if manifest.allows(grant) {
             Ok(())
@@ -101,11 +95,7 @@ impl Actor {
     }
 
     /// Require permission to open one outbound TCP connection.
-    pub fn require_tcp_out(
-        &self,
-        host: &str,
-        port: u16,
-    ) -> Result<(), RuntimeAuthorityError> {
+    pub fn require_tcp_out(&self, host: &str, port: u16) -> Result<(), RuntimeAuthorityError> {
         self.require_authority(&AuthorityGrant::NetTcpOut {
             host: host.to_string(),
             port,
@@ -188,10 +178,7 @@ mod tests {
 
     #[test]
     fn malformed_actor_manifest_fails_closed_before_authorization() {
-        let actor = actor_with(&[
-            "Net::TcpOut(api.stripe.com:443)",
-            "Net::TcpOut(malformed)",
-        ]);
+        let actor = actor_with(&["Net::TcpOut(api.stripe.com:443)", "Net::TcpOut(malformed)"]);
 
         // Even though the exact requested grant is also present, the malformed
         // sibling token invalidates the manifest. Partial parsing must never
@@ -221,8 +208,7 @@ mod tests {
             "Net::TcpOut(api.stripe.com:443)",
             "Secret::Read(STRIPE_KEY)",
         ]);
-        let allowed = AuthorityManifest::from_tokens(["Net::TcpOut(api.stripe.com:443)"])
-            .unwrap();
+        let allowed = AuthorityManifest::from_tokens(["Net::TcpOut(api.stripe.com:443)"]).unwrap();
         let escalation = AuthorityManifest::from_tokens([
             "Net::TcpOut(api.stripe.com:443)",
             "Secret::Read(OTHER_KEY)",
@@ -248,7 +234,9 @@ mod tests {
         let escalation = AuthorityManifest::from_tokens(["Secret::Read(OTHER_KEY)"]).unwrap();
         let mut child = Actor::new(8, "child", 16);
 
-        parent.delegate_authority_to(&mut child, &requested).unwrap();
+        parent
+            .delegate_authority_to(&mut child, &requested)
+            .unwrap();
         assert_eq!(child.authority_manifest().unwrap(), requested);
         assert_eq!(
             child.capabilities,
@@ -265,10 +253,7 @@ mod tests {
 
     #[test]
     fn malformed_parent_cannot_delegate_even_an_exact_present_grant() {
-        let parent = actor_with(&[
-            "Secret::Read(STRIPE_KEY)",
-            "Net::TcpOut(malformed)",
-        ]);
+        let parent = actor_with(&["Secret::Read(STRIPE_KEY)", "Net::TcpOut(malformed)"]);
         let requested = AuthorityManifest::from_tokens(["Secret::Read(STRIPE_KEY)"]).unwrap();
         let mut child = Actor::new(8, "child", 16);
 
