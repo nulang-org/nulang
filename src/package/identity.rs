@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use crate::content_identity::{SemanticId, SourceId};
 
@@ -40,15 +40,21 @@ pub fn source_id_for_package_dir(root: &Path) -> io::Result<SourceId> {
         ));
     }
 
-    let mut files = vec![manifest];
-    collect_nula_files(root, root, &mut files)?;
-    files.sort_by(|left, right| canonical_relative_path(root, left).cmp(&canonical_relative_path(root, right)));
+    let mut paths = vec![manifest];
+    collect_nula_files(root, &mut paths)?;
+    let mut files = paths
+        .into_iter()
+        .map(|path| {
+            let relative = canonical_relative_path(root, &path)?;
+            Ok((relative, path))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut canonical = Vec::new();
     canonical.extend_from_slice(PACKAGE_SOURCE_CANONICAL_VERSION);
     put_u32(&mut canonical, files.len() as u32);
-    for file in files {
-        let relative = canonical_relative_path(root, &file)?;
+    for (relative, file) in files {
         let contents = fs::read(&file)?;
         put_bytes(&mut canonical, relative.as_bytes());
         put_bytes(&mut canonical, &contents);
@@ -93,7 +99,7 @@ where
     ))
 }
 
-fn collect_nula_files(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+fn collect_nula_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -112,7 +118,7 @@ fn collect_nula_files(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> io::
             if name == ".git" || name == ".nula" || name == "target" {
                 continue;
             }
-            collect_nula_files(root, &path, files)?;
+            collect_nula_files(&path, files)?;
         } else if file_type.is_file()
             && path.extension().and_then(|extension| extension.to_str()) == Some("nula")
         {
@@ -136,12 +142,24 @@ fn canonical_relative_path(root: &Path, path: &Path) -> io::Result<String> {
     let mut parts = Vec::new();
     for component in relative.components() {
         match component {
-            Component::Normal(part) => parts.push(part.to_str().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("package path is not valid UTF-8: {}", relative.display()),
-                )
-            })?),
+            Component::Normal(part) => {
+                let part = part.to_str().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("package path is not valid UTF-8: {}", relative.display()),
+                    )
+                })?;
+                if part.contains('\\') {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "package path component contains ambiguous separator: {}",
+                            relative.display()
+                        ),
+                    ));
+                }
+                parts.push(part);
+            }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(io::Error::new(
@@ -151,9 +169,8 @@ fn canonical_relative_path(root: &Path, path: &Path) -> io::Result<String> {
             }
         }
     }
-    normalize_logical_path(&parts.join("/")).map_err(|error| {
-        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-    })
+    normalize_logical_path(&parts.join("/"))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
 fn normalize_logical_path(path: &str) -> Result<String, PackageIdentityError> {
@@ -162,7 +179,9 @@ fn normalize_logical_path(path: &str) -> Result<String, PackageIdentityError> {
     }
     let normalized = path.replace('\\', "/");
     if normalized.starts_with('/')
-        || normalized.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
     {
         return Err(PackageIdentityError::InvalidModulePath(path.to_string()));
     }
@@ -188,7 +207,9 @@ impl std::fmt::Display for PackageIdentityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidModulePath(path) => write!(f, "invalid canonical module path '{path}'"),
-            Self::DuplicateModulePath(path) => write!(f, "duplicate canonical module path '{path}'"),
+            Self::DuplicateModulePath(path) => {
+                write!(f, "duplicate canonical module path '{path}'")
+            }
         }
     }
 }
@@ -199,7 +220,7 @@ impl std::error::Error for PackageIdentityError {}
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
+    fn scratch(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "nulang_package_identity_{name}_{}",
             std::process::id()
@@ -225,7 +246,10 @@ mod tests {
         write_package(
             &root,
             "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
-            &[("src/main.nula", "fn main() { 1 }"), ("src/util.nula", "fn util() { 2 }")],
+            &[
+                ("src/main.nula", "fn main() { 1 }"),
+                ("src/util.nula", "fn util() { 2 }"),
+            ],
         );
         let first = source_id_for_package_dir(&root).unwrap();
         let same = source_id_for_package_dir(&root).unwrap();
