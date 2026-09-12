@@ -196,22 +196,22 @@ impl DurableEffectRecord {
         }
     }
 
-    /// Commit a result for the already-prepared logical operation.
+    /// Commit the first durable result for this logical operation.
+    ///
+    /// Completion is monotonic. If recovery or a duplicate acknowledgement
+    /// tries to complete an already-completed record again, the original
+    /// durable result wins instead of being silently overwritten.
     pub fn complete(self, result: Vec<u8>) -> Self {
         match self {
             Self::Prepared {
                 spec,
                 request_digest,
-            }
-            | Self::Completed {
-                spec,
-                request_digest,
-                ..
             } => Self::Completed {
                 spec,
                 request_digest,
                 result,
             },
+            completed @ Self::Completed { .. } => completed,
         }
     }
 
@@ -221,15 +221,12 @@ impl DurableEffectRecord {
             Self::Completed { result, .. } => {
                 DurableEffectRecoveryAction::ReplayRecordedResult(result.as_slice())
             }
-            Self::Prepared { spec, .. } => match (spec.boundary, spec.delivery) {
-                (EffectBoundary::BackendOwned, DeliverySemantics::BackendDefined)
-                | (_, DeliverySemantics::BackendDefined) => {
-                    DurableEffectRecoveryAction::DelegateToBackend
-                }
-                (_, DeliverySemantics::AtLeastOnce) => {
+            Self::Prepared { spec, .. } => match spec.delivery {
+                DeliverySemantics::BackendDefined => DurableEffectRecoveryAction::DelegateToBackend,
+                DeliverySemantics::AtLeastOnce => {
                     DurableEffectRecoveryAction::RetryAtLeastOnce { operation_id: spec.id }
                 }
-                (_, DeliverySemantics::EffectivelyOnceWithDeduplication) => {
+                DeliverySemantics::EffectivelyOnceWithDeduplication => {
                     DurableEffectRecoveryAction::RetryWithDeduplication {
                         operation_id: spec.id,
                     }
@@ -330,6 +327,20 @@ mod tests {
         .complete(b"charged".to_vec());
         assert_eq!(
             record.recovery_action(),
+            DurableEffectRecoveryAction::ReplayRecordedResult(b"charged")
+        );
+    }
+
+    #[test]
+    fn completion_is_monotonic_and_cannot_replace_recorded_result() {
+        let completed = DurableEffectRecord::prepare(
+            spec(DeliverySemantics::EffectivelyOnceWithDeduplication),
+            b"$10",
+        )
+        .complete(b"charged".to_vec())
+        .complete(b"different-result".to_vec());
+        assert_eq!(
+            completed.recovery_action(),
             DurableEffectRecoveryAction::ReplayRecordedResult(b"charged")
         );
     }
