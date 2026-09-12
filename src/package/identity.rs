@@ -25,7 +25,17 @@ const PACKAGE_SEMANTIC_CANONICAL_VERSION: &[u8] = b"nulang.package-semantic.v1\0
 /// are excluded. Symlinks are rejected rather than followed outside the
 /// package boundary.
 pub fn source_id_for_package_dir(root: &Path) -> io::Result<SourceId> {
-    if !root.is_dir() {
+    let root_metadata = fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "package source identity does not accept symlinked root: {}",
+                root.display()
+            ),
+        ));
+    }
+    if !root_metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("package source directory does not exist: {}", root.display()),
@@ -33,7 +43,25 @@ pub fn source_id_for_package_dir(root: &Path) -> io::Result<SourceId> {
     }
 
     let manifest = root.join("Nulang.toml");
-    if !manifest.is_file() {
+    let manifest_metadata = fs::symlink_metadata(&manifest).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot inspect package manifest {}: {error}",
+                manifest.display()
+            ),
+        )
+    })?;
+    if manifest_metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "package source identity does not follow symlinked manifest: {}",
+                manifest.display()
+            ),
+        ));
+    }
+    if !manifest_metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("package manifest does not exist: {}", manifest.display()),
@@ -115,7 +143,10 @@ fn collect_nula_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> io::Re
         }
         if file_type.is_dir() {
             let name = entry.file_name();
-            if name == ".git" || name == ".nula" || name == "target" {
+            if matches!(
+                name.to_str(),
+                Some(".git") | Some(".nula") | Some("target")
+            ) {
                 continue;
             }
             collect_nula_files(&path, files)?;
