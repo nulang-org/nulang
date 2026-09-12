@@ -67,7 +67,7 @@ jit = jit_path.read_text()
 jit = replace_once(
     jit,
     '''fn aot_ffi_call_impl(lib_raw: u64, sym_raw: u64, sig: u64, args: &[u64]) -> Value {\n    let library = resolve_string_coerce(lib_raw).unwrap_or_default();\n    let symbol = resolve_string_coerce(sym_raw).unwrap_or_default();\n    let ret_tag = sig & 0b111;''',
-    '''fn aot_ffi_call_impl(lib_raw: u64, sym_raw: u64, sig: u64, args: &[u64]) -> Value {\n    let library = resolve_string_coerce(lib_raw).unwrap_or_default();\n    let symbol = resolve_string_coerce(sym_raw).unwrap_or_default();\n    // Match interpreter FFICall: fail closed before dynamic library loading\n    // or symbol resolution when an actor lacks the exact typed grant.\n    if !try_with_callbacks(|cb| cb.authorize_ffi(&library, &symbol)).unwrap_or(true) {\n        return Value::nil();\n    }\n    let ret_tag = sig & 0b111;''',
+    '''fn aot_ffi_call_impl(lib_raw: u64, sym_raw: u64, sig: u64, args: &[u64]) -> Value {\n    let library = resolve_string_coerce(lib_raw).unwrap_or_default();\n    let symbol = resolve_string_coerce(sym_raw).unwrap_or_default();\n    // Match interpreter FFICall: fail closed before dynamic library loading\n    // or symbol resolution when an actor lacks the exact typed grant.\n    if !unsafe { try_with_callbacks(|cb| cb.authorize_ffi(&library, &symbol)) }.unwrap_or(true) {\n        return Value::nil();\n    }\n    let ret_tag = sig & 0b111;''',
     "AOT FFI authority gate",
 )
 jit_path.write_text(jit)
