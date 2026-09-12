@@ -24,9 +24,8 @@ pub struct InterruptionNotice {
 
 impl InterruptionNotice {
     pub fn remaining_seconds(&self, now_unix_ms: u64) -> Option<f64> {
-        self.terminate_at_unix_ms.map(|deadline| {
-            deadline.saturating_sub(now_unix_ms) as f64 / 1000.0
-        })
+        self.terminate_at_unix_ms
+            .map(|deadline| deadline.saturating_sub(now_unix_ms) as f64 / 1000.0)
     }
 }
 
