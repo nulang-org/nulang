@@ -71,7 +71,9 @@ mod tests {
             Box::pin(async { Ok(Vec::new()) })
         }
 
-        fn finish<'a>(&'a mut self) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>> {
+        fn finish<'a>(
+            &'a mut self,
+        ) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>> {
             Box::pin(async { Ok(None) })
         }
     }
@@ -84,8 +86,7 @@ mod tests {
         fn start_session<'a>(
             &'a self,
             _config: RecognitionConfig,
-        ) -> VoiceFuture<'a, Result<Box<dyn SpeechRecognitionSession>, VoiceProviderError>>
-        {
+        ) -> VoiceFuture<'a, Result<Box<dyn SpeechRecognitionSession>, VoiceProviderError>> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 match &self.error {
