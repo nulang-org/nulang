@@ -17,13 +17,16 @@ use crate::runtime::Actor;
 use std::error::Error;
 use std::fmt;
 
-/// Failure while authorizing or delegating external authority for an actor.
+/// Failure while authorizing, decoding, or delegating external authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAuthorityError {
     /// The persisted/runtime token set is malformed. Treating malformed state
     /// as an empty or partially valid manifest would be ambiguous, so the
     /// entire manifest is rejected.
     InvalidManifest(AuthorityParseError),
+    /// More than one grant record targets the same spawn instruction. The
+    /// metadata is ambiguous and therefore cannot safely authorize anything.
+    AmbiguousSpawnMetadata { pc: usize },
     /// The manifest is structurally valid but does not contain the exact grant
     /// required for the requested external action or delegation.
     Denied(AuthorityGrant),
@@ -34,6 +37,9 @@ impl fmt::Display for RuntimeAuthorityError {
         match self {
             RuntimeAuthorityError::InvalidManifest(err) => {
                 write!(f, "invalid actor authority manifest: {err}")
+            }
+            RuntimeAuthorityError::AmbiguousSpawnMetadata { pc } => {
+                write!(f, "ambiguous spawn authority metadata at bytecode pc {pc}")
             }
             RuntimeAuthorityError::Denied(grant) => {
                 write!(f, "capability denied: {grant}")
@@ -46,7 +52,8 @@ impl Error for RuntimeAuthorityError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             RuntimeAuthorityError::InvalidManifest(err) => Some(err),
-            RuntimeAuthorityError::Denied(_) => None,
+            RuntimeAuthorityError::AmbiguousSpawnMetadata { .. }
+            | RuntimeAuthorityError::Denied(_) => None,
         }
     }
 }
@@ -55,6 +62,33 @@ impl From<AuthorityParseError> for RuntimeAuthorityError {
     fn from(value: AuthorityParseError) -> Self {
         Self::InvalidManifest(value)
     }
+}
+
+/// Decode the authority attached to one bytecode `Spawn` instruction.
+///
+/// Missing metadata is an empty manifest (deny by default). Exactly one entry
+/// is parsed through the typed authority boundary. Multiple entries for the
+/// same PC are rejected instead of choosing one arbitrarily, because metadata
+/// ambiguity at a security boundary must fail closed.
+pub fn spawn_authority_manifest(
+    module: &crate::bytecode::CodeModule,
+    spawn_pc: usize,
+) -> Result<AuthorityManifest, RuntimeAuthorityError> {
+    let mut matches = module
+        .spawn_capability_grants
+        .iter()
+        .filter(|(pc, _)| *pc == spawn_pc);
+
+    let Some((_, tokens)) = matches.next() else {
+        return Ok(AuthorityManifest::new());
+    };
+    if matches.next().is_some() {
+        return Err(RuntimeAuthorityError::AmbiguousSpawnMetadata { pc: spawn_pc });
+    }
+
+    Ok(AuthorityManifest::from_tokens(
+        tokens.iter().map(String::as_str),
+    )?)
 }
 
 impl Actor {
@@ -143,6 +177,60 @@ mod tests {
         let mut actor = Actor::new(7, "authority-test", 16);
         actor.capabilities = tokens.iter().map(|token| (*token).to_string()).collect();
         actor
+    }
+
+    #[test]
+    fn missing_spawn_metadata_is_deny_by_default() {
+        let module = crate::bytecode::CodeModule::new("authority-metadata");
+        let manifest = spawn_authority_manifest(&module, 12).unwrap();
+        assert!(manifest.is_empty());
+    }
+
+    #[test]
+    fn spawn_metadata_decodes_to_typed_manifest() {
+        let mut module = crate::bytecode::CodeModule::new("authority-metadata");
+        module.spawn_capability_grants.push((
+            12,
+            vec![
+                "Net::TcpOut(api.stripe.com:443)".to_string(),
+                "Secret::Read(STRIPE_KEY)".to_string(),
+            ],
+        ));
+
+        let manifest = spawn_authority_manifest(&module, 12).unwrap();
+        assert!(manifest.allows_tcp_out("api.stripe.com", 443));
+        assert!(manifest.allows(&AuthorityGrant::SecretRead {
+            name: "STRIPE_KEY".into(),
+        }));
+    }
+
+    #[test]
+    fn malformed_spawn_metadata_fails_closed() {
+        let mut module = crate::bytecode::CodeModule::new("authority-metadata");
+        module
+            .spawn_capability_grants
+            .push((12, vec!["Net::TcpOut(malformed)".to_string()]));
+
+        assert!(matches!(
+            spawn_authority_manifest(&module, 12),
+            Err(RuntimeAuthorityError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_spawn_metadata_for_same_pc_is_rejected() {
+        let mut module = crate::bytecode::CodeModule::new("authority-metadata");
+        module
+            .spawn_capability_grants
+            .push((12, vec!["Secret::Read(FIRST)".to_string()]));
+        module
+            .spawn_capability_grants
+            .push((12, vec!["Secret::Read(SECOND)".to_string()]));
+
+        assert_eq!(
+            spawn_authority_manifest(&module, 12),
+            Err(RuntimeAuthorityError::AmbiguousSpawnMetadata { pc: 12 })
+        );
     }
 
     #[test]
