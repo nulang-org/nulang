@@ -29,8 +29,11 @@ pub struct CompiledExecutionManifest {
     pub external_effect_roots: Vec<String>,
     /// Explicit authority tokens attached to compiled spawn sites.
     pub spawn_capabilities: Vec<String>,
-    /// Native libraries named by compiled FFI declarations.
+    /// Native libraries named by compiled FFI declarations. Useful for runtime
+    /// availability/scheduling; admission can enforce the narrower function list.
     pub ffi_libraries: Vec<String>,
+    /// Exact native call authorities in canonical `library::symbol` form.
+    pub ffi_functions: Vec<String>,
     /// True when the artifact can cross a host/authority boundary.
     pub reaches_host_boundary: bool,
     /// True when no durable/persistent actor runtime is required.
@@ -60,8 +63,10 @@ impl CompiledExecutionManifest {
         }
 
         let mut ffi_libraries = BTreeSet::new();
+        let mut ffi_functions = BTreeSet::new();
         for function in &module.foreign_functions {
             ffi_libraries.insert(function.library.clone());
+            ffi_functions.insert(format!("{}::{}", function.library, function.symbol));
         }
 
         Self {
@@ -72,6 +77,7 @@ impl CompiledExecutionManifest {
             external_effect_roots,
             spawn_capabilities: spawn_capabilities.into_iter().collect(),
             ffi_libraries: ffi_libraries.into_iter().collect(),
+            ffi_functions: ffi_functions.into_iter().collect(),
             reaches_host_boundary: profile.reaches_host_boundary(),
             ephemeral: profile.is_ephemeral(),
             local_only: profile.is_local_only(),
@@ -87,7 +93,7 @@ impl CompiledExecutionManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::{Constant, Instruction, OpCode};
+    use crate::bytecode::{Constant, FfiType, ForeignFunctionDef, Instruction, OpCode};
 
     fn emit_effect(module: &mut CodeModule, name: &str) {
         let idx = module.add_constant(Constant::String(name.to_string()));
@@ -132,6 +138,31 @@ mod tests {
     }
 
     #[test]
+    fn manifest_exposes_exact_ffi_authority() {
+        let mut module = CodeModule::new("manifest-test");
+        module.foreign_functions.push(ForeignFunctionDef {
+            library: "libc.so.6".to_string(),
+            symbol: "getpid".to_string(),
+            params: vec![],
+            ret: FfiType::Int,
+        });
+        module.foreign_functions.push(ForeignFunctionDef {
+            library: "libc.so.6".to_string(),
+            symbol: "getuid".to_string(),
+            params: vec![],
+            ret: FfiType::Int,
+        });
+
+        let manifest = CompiledExecutionManifest::from_module_and_bytes(&module, b"nbc");
+        assert_eq!(manifest.ffi_libraries, vec!["libc.so.6"]);
+        assert_eq!(
+            manifest.ffi_functions,
+            vec!["libc.so.6::getpid", "libc.so.6::getuid"]
+        );
+        assert!(manifest.reaches_host_boundary);
+    }
+
+    #[test]
     fn manifest_round_trips_from_real_nbc_bytes() {
         let mut module = CodeModule::new("manifest-test");
         emit_effect(&mut module, "Net.fetch");
@@ -154,5 +185,6 @@ mod tests {
         assert!(json.contains("\"artifact_blake3\""));
         assert!(json.contains("\"runtime_features\""));
         assert!(json.contains("\"external_effects\""));
+        assert!(json.contains("\"ffi_functions\""));
     }
 }
