@@ -63,7 +63,8 @@ impl Manager for EngineeringManager {
             budget_usd: budget_usd * 0.5,
             timeout: Duration::from_secs(3600),
             status: TaskStatus::Created,
-            assigned_agent_id: Some("worker-local".into()),
+            // Assignment belongs to the capability-aware scheduler, not the planner.
+            assigned_agent_id: None,
             created_at: now,
             updated_at: now,
         }]
@@ -88,6 +89,7 @@ mod tests {
         assert!(tasks[0]
             .required_capabilities
             .contains(&"deploy.execute".into()));
+        assert!(tasks[0].assigned_agent_id.is_none());
     }
 
     #[test]
