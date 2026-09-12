@@ -27,15 +27,20 @@ pub const MAX_PACKAGE_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_DEPLOYMENT_IR_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Validated deployment inputs extracted from a bundle without writing to disk.
+///
+/// Fields are deliberately private: construction through [`DeploymentBundle::parse`]
+/// is the security boundary. Downstream callers can inspect validated state through
+/// read-only accessors but cannot manufacture a bundle that bypasses archive,
+/// identity, artifact, or metadata validation.
 #[derive(Debug)]
 pub struct DeploymentBundle {
-    pub package_manifest: Manifest,
-    pub artifact_path: String,
-    pub artifact_bytes: Vec<u8>,
-    pub execution_manifest: CompiledExecutionManifest,
-    pub web_ir: Option<DeploymentIr>,
-    pub entry_count: usize,
-    pub expanded_bytes: u64,
+    package_manifest: Manifest,
+    artifact_path: String,
+    artifact_bytes: Vec<u8>,
+    execution_manifest: CompiledExecutionManifest,
+    web_ir: Option<DeploymentIr>,
+    entry_count: usize,
+    expanded_bytes: u64,
 }
 
 impl DeploymentBundle {
@@ -214,6 +219,46 @@ impl DeploymentBundle {
             entry_count,
             expanded_bytes,
         })
+    }
+
+    /// Parsed and identity-validated package manifest.
+    pub fn package_manifest(&self) -> &Manifest {
+        &self.package_manifest
+    }
+
+    /// Canonical validated package name.
+    pub fn package_name(&self) -> &str {
+        &self.package_manifest.package.name
+    }
+
+    /// Canonical tar path of the single compiled artifact.
+    pub fn artifact_path(&self) -> &str {
+        &self.artifact_path
+    }
+
+    /// Exact validated `.nbc` bytes used for manifest derivation and admission.
+    pub fn artifact_bytes(&self) -> &[u8] {
+        &self.artifact_bytes
+    }
+
+    /// Manifest derived from the exact validated artifact bytes.
+    pub fn execution_manifest(&self) -> &CompiledExecutionManifest {
+        &self.execution_manifest
+    }
+
+    /// Optional complete web deployment metadata from the bundle.
+    pub fn web_ir(&self) -> Option<&DeploymentIr> {
+        self.web_ir.as_ref()
+    }
+
+    /// Number of tar entries inspected while validating the bundle.
+    pub fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    /// Sum of declared uncompressed tar entry sizes.
+    pub fn expanded_bytes(&self) -> u64 {
+        self.expanded_bytes
     }
 
     /// Run fail-closed Cloud admission against the exact artifact bytes from
@@ -400,12 +445,15 @@ mod tests {
     fn parses_current_deploy_bundle_and_binds_package_identity() {
         let bytes = make_bundle(vec![(".nula/dist/app.nbc", pure_nbc())]);
         let bundle = DeploymentBundle::parse(&bytes).expect("parse bundle");
-        assert_eq!(bundle.package_manifest.package.name, "app");
-        assert_eq!(bundle.artifact_path, ".nula/dist/app.nbc");
+        assert_eq!(bundle.package_name(), "app");
+        assert_eq!(bundle.package_manifest().package.name, "app");
+        assert_eq!(bundle.artifact_path(), ".nula/dist/app.nbc");
         assert_eq!(
-            bundle.execution_manifest.artifact_blake3,
-            blake3::hash(&bundle.artifact_bytes).to_hex().to_string()
+            bundle.execution_manifest().artifact_blake3,
+            blake3::hash(bundle.artifact_bytes()).to_hex().to_string()
         );
+        assert!(bundle.entry_count() >= 2);
+        assert!(bundle.expanded_bytes() >= bundle.artifact_bytes().len() as u64);
 
         let decision = bundle.evaluate_admission(
             &AdmissionPolicy::new("tenant/default", 1),
@@ -529,6 +577,6 @@ mod tests {
             ),
         ]);
         let bundle = DeploymentBundle::parse(&bytes).expect("parse bundle");
-        assert!(bundle.web_ir.is_some());
+        assert!(bundle.web_ir().is_some());
     }
 }
