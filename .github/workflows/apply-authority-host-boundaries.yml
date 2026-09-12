@@ -20,6 +20,9 @@ jobs:
       - name: Apply actor host-effect authority patch
         run: python3 scripts/apply_authority_host_boundaries.py
 
+      - name: Close Web and realtime host bypasses
+        run: python3 scripts/apply_authority_web_bypass_gate.py
+
       - name: Apply FFI authority patch
         run: python3 scripts/apply_authority_ffi_gate.py
 
@@ -50,6 +53,7 @@ jobs:
       - name: Commit validated implementation
         run: |
           rm scripts/apply_authority_host_boundaries.py
+          rm scripts/apply_authority_web_bypass_gate.py
           rm scripts/apply_authority_ffi_gate.py
           rm scripts/apply_authority_top_level_scope.py
           rm scripts/apply_authority_host_integration_test.py
