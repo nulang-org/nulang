@@ -1,5 +1,7 @@
 use crate::interruption::{InterruptionNotice, InterruptionReason};
-use crate::provider::{CapacityProvider, CapacityQuery, ProviderError, ProviderFuture, ProviderSnapshot};
+use crate::provider::{
+    CapacityProvider, CapacityQuery, ProviderError, ProviderFuture, ProviderSnapshot,
+};
 use crate::{AcceleratorSpec, Architecture, CapacityOffer, Lifecycle, TrustTier};
 use serde::{Deserialize, Serialize};
 use std::{future::Future, pin::Pin};
@@ -80,7 +82,8 @@ pub struct AwsSnapshot {
     pub offers: Vec<AwsOffer>,
 }
 
-pub type AwsSourceFuture<'a> = Pin<Box<dyn Future<Output = Result<AwsSnapshot, ProviderError>> + Send + 'a>>;
+pub type AwsSourceFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AwsSnapshot, ProviderError>> + Send + 'a>>;
 
 pub trait AwsOfferSource: Send + Sync {
     fn fetch<'a>(&'a self, query: &'a CapacityQuery) -> AwsSourceFuture<'a>;
@@ -139,7 +142,11 @@ impl AwsInterruptionEvent {
             } else {
                 InterruptionReason::CapacityReclaim
             },
-            confidence: if self.terminate_at_unix_ms.is_some() { 1.0 } else { 0.5 },
+            confidence: if self.terminate_at_unix_ms.is_some() {
+                1.0
+            } else {
+                0.5
+            },
         }
     }
 }
