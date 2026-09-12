@@ -1,0 +1,66 @@
+name: CI Baseline Repair
+
+on:
+  push:
+    branches:
+      - fix/ci-baseline-171
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/ci-baseline-171
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - name: Apply targeted baseline fixes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          actor = Path("src/runtime/actor.rs")
+          text = actor.read_text()
+          old = "            payload_len: payload.len(),"
+          if old not in text:
+              raise SystemExit("expected FlightRecorder payload_len initializer not found")
+          actor.write_text(text.replace(old, "            payload_len,", 1))
+
+          bench = Path("benches/persist_bench.rs")
+          text = bench.read_text()
+          old = "                crdt_snapshot: None,\n            };"
+          if old not in text:
+              raise SystemExit("expected ActorSnapshot benchmark initializer not found")
+          bench.write_text(text.replace(old, "                crdt_snapshot: None,\n                crdt_field_map: None,\n            };", 1))
+
+      - name: Format workspace
+        run: cargo fmt
+
+      - name: Verify formatting
+        run: cargo fmt --check
+
+      - name: Verify no-default all-targets build
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo build --all-targets --no-default-features
+
+      - name: Commit repaired baseline
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src benches
+          git commit -m "fix(ci): restore all-targets and rustfmt baseline"
+          git push origin HEAD:fix/ci-baseline-171
