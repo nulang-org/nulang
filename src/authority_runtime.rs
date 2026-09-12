@@ -86,6 +86,10 @@ impl From<AuthorityParseError> for RuntimeAuthorityError {
 /// is parsed through the typed authority boundary. Multiple entries for the
 /// same PC are rejected instead of choosing one arbitrarily, because metadata
 /// ambiguity at a security boundary must fail closed.
+///
+/// This is staged migration plumbing and becomes a normal runtime call once
+/// exact spawn provenance is carried through `ActorVmCallbacks::spawn_actor`.
+#[allow(dead_code)]
 pub fn spawn_authority_manifest(
     module: &CodeModule,
     spawn_pc: usize,
@@ -116,6 +120,7 @@ pub fn spawn_authority_manifest(
 /// empty manifest. Once authority metadata targets one of those sites, however,
 /// the target behavior must have exactly one local spawn site; otherwise the
 /// callback cannot know which site executed and the lookup fails closed.
+#[allow(dead_code)]
 pub fn spawn_authority_manifest_for_behavior(
     module: &CodeModule,
     behavior_idx: usize,
