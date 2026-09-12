@@ -5,6 +5,10 @@ use crate::reservation::{ReservationError, TaskReservationStore};
 use crate::store::{SqliteStore, StoreError};
 use chrono::Utc;
 use nulang_ai_core::{
+    capability::{
+        IntentCapabilityClassifier, IntentClassificationError, RuleBasedIntentClassifier,
+    },
+    intent::{IntentExecutionError, IntentIr, IntentModality},
     ConversationMessage, ConversationState, GoalStatus, SwarmEvent, SwarmEventEnvelope, TaskStatus,
 };
 use nulang_ai_director::{Director, LocalDirector};
@@ -25,6 +29,10 @@ pub enum RuntimeError {
     Reservation(#[from] ReservationError),
     #[error("worker error: {0}")]
     Worker(#[from] WorkerError),
+    #[error("intent classification error: {0:?}")]
+    IntentClassification(IntentClassificationError),
+    #[error("intent execution error: {0:?}")]
+    IntentExecution(IntentExecutionError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
@@ -80,7 +88,10 @@ impl LocalRuntime {
             snapshots,
         );
         if workers.workers().is_empty() {
-            workers.register(LocalWorker::new("worker-local"));
+            workers.register(LocalWorker::with_capabilities(
+                "worker-local",
+                ["code", "test", "repo.read", "repo.write"],
+            ));
             store.replace_worker_snapshots(&workers.snapshots())?;
         }
 
@@ -146,12 +157,23 @@ impl LocalRuntime {
         conv.updated_at = now;
         self.store.upsert_conversation(&conv)?;
 
-        let mut goal = self.director.create_goal(
-            &self.project_id,
-            self.conversation_id,
-            text,
-            self.config.director.default_budget_usd,
-        );
+        // Text enters the same semantic boundary as voice/API/IDE input. Raw
+        // user text must never bypass classification or explicit confirmation.
+        let mut intent = IntentIr::confirmed(IntentModality::Text, text);
+        intent.conversation_id = Some(self.conversation_id);
+        let classification = RuleBasedIntentClassifier
+            .classify(&intent)
+            .map_err(RuntimeError::IntentClassification)?;
+        intent.apply_classification(classification);
+
+        let mut goal = self
+            .director
+            .create_goal_from_intent(
+                &self.project_id,
+                intent,
+                self.config.director.default_budget_usd,
+            )
+            .map_err(RuntimeError::IntentExecution)?;
         let goal_id = goal.id;
         self.store.upsert_goal(&goal)?;
         self.emit(
@@ -291,14 +313,25 @@ mod tests {
         init_project(&tmp).unwrap();
         let mut rt = LocalRuntime::open(tmp.clone()).unwrap();
         let mut buf = Cursor::new(Vec::new());
-        let goal_id = rt.handle_user_message("ship feature X", &mut buf).unwrap();
+        let goal_id = rt
+            .handle_user_message("implement feature X", &mut buf)
+            .unwrap();
         assert!(!goal_id.is_nil());
         let text = String::from_utf8(buf.into_inner()).unwrap();
         assert!(text.contains("goal_created"));
         assert!(text.contains("task_created"));
         let graph = rt.store().get_goal_graph(goal_id).unwrap();
         assert_eq!(graph.goal.status, GoalStatus::Completed);
+        assert_eq!(graph.goal.constraints["execution_risk"], "medium");
+        assert!(graph.goal.constraints["requested_capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "repo.write"));
         assert_eq!(graph.tasks[0].status, TaskStatus::Completed);
+        assert!(graph.tasks[0]
+            .required_capabilities
+            .contains(&"repo.write".into()));
         assert_eq!(
             graph.tasks[0].assigned_agent_id.as_deref(),
             Some("worker-local")
@@ -312,24 +345,53 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         init_project(&tmp).unwrap();
         let mut rt = LocalRuntime::open(tmp.clone()).unwrap();
+        rt.set_worker_available("worker-local", false).unwrap();
         rt.register_worker(LocalWorker::with_capabilities(
             "worker-admin",
-            ["code", "test", "repo.write", "deploy.execute"],
+            [
+                "code",
+                "test",
+                "repo.read",
+                "repo.write",
+                "deploy.execute",
+            ],
         ))
         .unwrap();
         rt.register_worker(LocalWorker::with_capabilities(
             "worker-specialist",
-            ["code", "test"],
+            ["code", "test", "repo.read", "repo.write"],
         ))
         .unwrap();
 
         let mut buf = Cursor::new(Vec::new());
-        let goal_id = rt.handle_user_message("ship feature X", &mut buf).unwrap();
+        let goal_id = rt
+            .handle_user_message("implement feature X", &mut buf)
+            .unwrap();
         let graph = rt.store().get_goal_graph(goal_id).unwrap();
         assert_eq!(
             graph.tasks[0].assigned_agent_id.as_deref(),
-            Some("worker-local")
+            Some("worker-specialist")
         );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn high_risk_text_is_blocked_without_explicit_confirmation() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+        let mut rt = LocalRuntime::open(tmp.clone()).unwrap();
+        let mut buf = Cursor::new(Vec::new());
+
+        let error = rt
+            .handle_user_message("deploy to production", &mut buf)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::IntentExecution(IntentExecutionError::ExplicitConfirmationRequired)
+        ));
+        assert!(buf.into_inner().is_empty());
+
         let _ = std::fs::remove_dir_all(tmp);
     }
 
