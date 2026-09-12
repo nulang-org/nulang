@@ -92,7 +92,10 @@ mod tests {
     #[tokio::test]
     async fn classifies_speech_using_configured_threshold() {
         let vad = SileroVadAdapter::new(FakeRuntime(0.9), SileroVadConfig::default());
-        let activity = vad.detect(&AudioFrame::mono_16khz(0, vec![0; 160])).await.unwrap();
+        let activity = vad
+            .detect(&AudioFrame::mono_16khz(0, vec![0; 160]))
+            .await
+            .unwrap();
         assert_eq!(activity, VoiceActivity::Speech);
         assert_eq!(vad.provider_name(), "silero");
     }
