@@ -51,8 +51,7 @@ impl DurableEffectPersistenceRecord {
         match self {
             Self::Effect(_) => None,
             Self::Compensation {
-                original_effect_id,
-                ..
+                original_effect_id, ..
             } => Some(*original_effect_id),
         }
     }
@@ -180,20 +179,21 @@ impl PersistedRecordKindV1 {
                 compensation_ordinal,
                 effect,
             } => {
-                let original_effect_id = DurableEffectId::from_str(&original_effect_id).map_err(
-                    |_| DurableEffectPersistenceError::InvalidEffectId(original_effect_id.clone()),
-                )?;
+                let original_effect_id =
+                    DurableEffectId::from_str(&original_effect_id).map_err(|_| {
+                        DurableEffectPersistenceError::InvalidEffectId(original_effect_id.clone())
+                    })?;
                 let effect = effect.into_runtime()?;
                 let actual = effect.spec().id;
-                let expected = original_effect_id.derive_compensation(
-                    compensation_ordinal,
-                    &effect.spec().effect_operation,
-                );
+                let expected = original_effect_id
+                    .derive_compensation(compensation_ordinal, &effect.spec().effect_operation);
                 if actual != expected {
-                    return Err(DurableEffectPersistenceError::CompensationIdentityMismatch {
-                        expected,
-                        actual,
-                    });
+                    return Err(
+                        DurableEffectPersistenceError::CompensationIdentityMismatch {
+                            expected,
+                            actual,
+                        },
+                    );
                 }
                 Ok(DurableEffectPersistenceRecord::Compensation {
                     original_effect_id,
@@ -359,8 +359,7 @@ mod tests {
             EffectBoundary::External,
             DeliverySemantics::EffectivelyOnceWithDeduplication,
         );
-        DurableEffectRecord::prepare(spec, b"order=7&amount=10")
-            .complete(b"charged".to_vec())
+        DurableEffectRecord::prepare(spec, b"order=7&amount=10").complete(b"charged".to_vec())
     }
 
     #[test]
