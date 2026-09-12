@@ -250,6 +250,10 @@ mod tests {
 
         parent.delegate_authority_to(&mut child, &requested).unwrap();
         assert_eq!(child.authority_manifest().unwrap(), requested);
+        assert_eq!(
+            child.capabilities,
+            std::collections::BTreeSet::from(["Secret::Read(STRIPE_KEY)".to_string()])
+        );
 
         let before = child.capabilities.clone();
         assert!(matches!(
