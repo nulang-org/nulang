@@ -173,10 +173,10 @@ mod tests {
                 error: None,
             }),
         );
-        let error = router
-            .start_session(RecognitionConfig::default())
-            .await
-            .unwrap_err();
+        let error = match router.start_session(RecognitionConfig::default()).await {
+            Ok(_) => panic!("expected non-retryable Parakeet error"),
+            Err(error) => error,
+        };
         assert_eq!(error.code, "bad_config");
         assert_eq!(w.load(Ordering::SeqCst), 0);
     }
