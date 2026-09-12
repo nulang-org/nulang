@@ -62,7 +62,10 @@ impl RuleBasedIntentClassifier {
         IntentClassification {
             safety,
             risk,
-            required_capabilities: capabilities.iter().map(|value| (*value).to_string()).collect(),
+            required_capabilities: capabilities
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
             requires_confirmation,
             rationale: rationale.to_string(),
         }
@@ -85,7 +88,14 @@ impl IntentCapabilityClassifier for RuleBasedIntentClassifier {
 
         if Self::contains_any(
             &text,
-            &["delete", "destroy", "drop database", "wipe", "purge", "terminate environment"],
+            &[
+                "delete",
+                "destroy",
+                "drop database",
+                "wipe",
+                "purge",
+                "terminate environment",
+            ],
         ) {
             return Ok(Self::classification(
                 IntentSafety::Irreversible,
@@ -98,7 +108,13 @@ impl IntentCapabilityClassifier for RuleBasedIntentClassifier {
 
         if Self::contains_any(
             &text,
-            &["deploy", "release", "publish", "promote to production", "roll out"],
+            &[
+                "deploy",
+                "release",
+                "publish",
+                "promote to production",
+                "roll out",
+            ],
         ) {
             return Ok(Self::classification(
                 IntentSafety::Reversible,
@@ -111,7 +127,12 @@ impl IntentCapabilityClassifier for RuleBasedIntentClassifier {
 
         if Self::contains_any(
             &text,
-            &["merge pull request", "merge pr", "merge this pr", "merge the pr"],
+            &[
+                "merge pull request",
+                "merge pr",
+                "merge this pr",
+                "merge the pr",
+            ],
         ) {
             return Ok(Self::classification(
                 IntentSafety::Reversible,
@@ -124,7 +145,13 @@ impl IntentCapabilityClassifier for RuleBasedIntentClassifier {
 
         if Self::contains_any(
             &text,
-            &["open a pr", "open pr", "create a pr", "create pr", "pull request"],
+            &[
+                "open a pr",
+                "open pr",
+                "create a pr",
+                "create pr",
+                "pull request",
+            ],
         ) {
             return Ok(Self::classification(
                 IntentSafety::Reversible,
@@ -137,7 +164,16 @@ impl IntentCapabilityClassifier for RuleBasedIntentClassifier {
 
         if Self::contains_any(
             &text,
-            &["commit", "push", "edit", "modify", "change", "implement", "fix", "refactor"],
+            &[
+                "commit",
+                "push",
+                "edit",
+                "modify",
+                "change",
+                "implement",
+                "fix",
+                "refactor",
+            ],
         ) {
             return Ok(Self::classification(
                 IntentSafety::Reversible,
@@ -150,7 +186,18 @@ impl IntentCapabilityClassifier for RuleBasedIntentClassifier {
 
         if Self::contains_any(
             &text,
-            &["inspect", "review", "search", "find", "list", "read", "summarize", "explain", "analyze", "check"],
+            &[
+                "inspect",
+                "review",
+                "search",
+                "find",
+                "list",
+                "read",
+                "summarize",
+                "explain",
+                "analyze",
+                "check",
+            ],
         ) {
             return Ok(Self::classification(
                 IntentSafety::ReadOnly,
@@ -196,7 +243,9 @@ mod tests {
         let result = classify("open a PR with the fix");
         assert_eq!(result.safety, IntentSafety::Reversible);
         assert_eq!(result.risk, ExecutionRisk::Medium);
-        assert!(result.required_capabilities.contains(&"repo.pull_request.write".into()));
+        assert!(result
+            .required_capabilities
+            .contains(&"repo.pull_request.write".into()));
     }
 
     #[test]
