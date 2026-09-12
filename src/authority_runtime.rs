@@ -311,10 +311,9 @@ mod tests {
     fn callback_compatibility_resolves_unique_spawn_site() {
         let mut module = CodeModule::new("authority-callback-bridge");
         let spawn_pc = emit_spawn(&mut module, 42);
-        module.spawn_capability_grants.push((
-            spawn_pc,
-            vec!["Secret::Read(STRIPE_KEY)".to_string()],
-        ));
+        module
+            .spawn_capability_grants
+            .push((spawn_pc, vec!["Secret::Read(STRIPE_KEY)".to_string()]));
 
         let manifest = spawn_authority_manifest_for_behavior(&module, 42).unwrap();
         assert!(manifest.allows(&AuthorityGrant::SecretRead {
@@ -345,10 +344,9 @@ mod tests {
         let privileged_pc = emit_spawn(&mut module, 42);
         emit_spawn(&mut module, 7);
         emit_spawn(&mut module, 42);
-        module.spawn_capability_grants.push((
-            privileged_pc,
-            vec!["Secret::Read(STRIPE_KEY)".to_string()],
-        ));
+        module
+            .spawn_capability_grants
+            .push((privileged_pc, vec!["Secret::Read(STRIPE_KEY)".to_string()]));
 
         assert_eq!(
             spawn_authority_manifest_for_behavior(&module, 42),
