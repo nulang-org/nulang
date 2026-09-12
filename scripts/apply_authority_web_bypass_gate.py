@@ -18,7 +18,7 @@ text = path.read_text()
 text = replace_once(
     text,
     '''        ("FS", Some("write" | "append")) => AuthorityGrant::FsWrite {\n            path: string_arg(0)?,\n        },\n        ("Env", Some("get")) => AuthorityGrant::EnvRead {''',
-    '''        ("FS", Some("write" | "append")) => AuthorityGrant::FsWrite {\n            path: string_arg(0)?,\n        },\n        ("Web", Some("serve_static")) => AuthorityGrant::FsRead {\n            path: string_arg(0)?,\n        },\n        ("Realtime", Some("broadcast")) => {\n            other("Realtime", "Broadcast", Some(string_arg(0)?))\n        }\n        ("Env", Some("get")) => AuthorityGrant::EnvRead {''',
+    '''        ("FS", Some("write" | "append")) => AuthorityGrant::FsWrite {\n            path: string_arg(0)?,\n        },\n        ("Web", Some("serve_static")) => AuthorityGrant::FsRead {\n            path: string_arg(0)?,\n        },\n        ("Realtime", Some("broadcast")) => {\n            other("Realtime", "Broadcast", Some(string_arg(0)?))\n        },\n        ("Env", Some("get")) => AuthorityGrant::EnvRead {''',
     "Web/Realtime authority mapping",
 )
 
@@ -86,8 +86,8 @@ extra_tests = r'''    #[test]
 
         {
             let mut rt = runtime.borrow_mut();
-            let manifest = AuthorityManifest::from_tokens([format!("Fs::Read({file_string})")])
-                .unwrap();
+            let token = format!("Fs::Read({file_string})");
+            let manifest = AuthorityManifest::from_tokens([token.as_str()]).unwrap();
             rt.actors
                 .get_mut(&actor_id)
                 .unwrap()
