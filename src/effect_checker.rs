@@ -1339,8 +1339,7 @@ impl<'a> DurableEffectWalker<'a> {
                             WorkflowItem::Parallel(steps) => steps,
                         };
                         for step in steps {
-                            let scope =
-                                format!("workflow '{name}' step '{}'", step.name);
+                            let scope = format!("workflow '{name}' step '{}'", step.name);
                             self.walk(&scope, &step.body, &[])?;
                             if let Some(comp) = &step.compensate {
                                 self.walk(&scope, comp, &[])?;
@@ -1348,11 +1347,7 @@ impl<'a> DurableEffectWalker<'a> {
                         }
                     }
                     if let Some(comp) = compensate {
-                        self.walk(
-                            &format!("workflow '{name}' compensate"),
-                            comp,
-                            &[],
-                        )?;
+                        self.walk(&format!("workflow '{name}' compensate"), comp, &[])?;
                     }
                 }
                 Decl::Actor {
@@ -1371,16 +1366,17 @@ impl<'a> DurableEffectWalker<'a> {
                     if !*persistent && !is_entity {
                         continue;
                     }
-                    let kind = if is_entity { "entity" } else { "persistent actor" };
+                    let kind = if is_entity {
+                        "entity"
+                    } else {
+                        "persistent actor"
+                    };
                     for b in behaviors {
                         let scope = format!("behavior '{}' of {kind} '{name}'", b.name);
                         self.walk(&scope, &b.body, &[])?;
                     }
                     for h in apply_handlers {
-                        let scope = format!(
-                            "apply handler '{}' of entity '{name}'",
-                            h.event
-                        );
+                        let scope = format!("apply handler '{}' of entity '{name}'", h.event);
                         self.walk(&scope, &h.body, &[])?;
                     }
                 }
@@ -1421,8 +1417,7 @@ impl<'a> DurableEffectWalker<'a> {
                 args,
                 span,
             } => {
-                if is_forbidden_in_durable(effect, op) && !is_handled_by_user(effect, op, handled)
-                {
+                if is_forbidden_in_durable(effect, op) && !is_handled_by_user(effect, op, handled) {
                     return Err(NuError::EffectError {
                         msg: format!(
                             "{scope}: effect '{effect}.{op}' is not allowed in durable replay surfaces — a re-run after a crash (signal/LLM suspend) would execute it again with different results; handle it locally with `handle ... with` (deterministic implementation) or move it outside the durable context"
@@ -1437,9 +1432,7 @@ impl<'a> DurableEffectWalker<'a> {
                 }
                 Ok(())
             }
-            Expr::Handle {
-                body, handlers, ..
-            } => {
+            Expr::Handle { body, handlers, .. } => {
                 // Performs inside the handled body that an arm binds are
                 // intercepted by user code — extend the handled set for the
                 // body walk only.
@@ -1591,9 +1584,7 @@ impl<'a> DurableEffectWalker<'a> {
                 self.walk(scope, left, handled)?;
                 self.walk(scope, right, handled)
             }
-            Expr::For {
-                iterable, body, ..
-            } => {
+            Expr::For { iterable, body, .. } => {
                 self.walk(scope, iterable, handled)?;
                 self.walk(scope, body, handled)
             }
@@ -2421,9 +2412,7 @@ impl CapabilityAnalyzer {
             // exactly-once obligation for bindings used only inside arms —
             // previously arms were never walked, so a `g(x)` in an arm plus a
             // `g(x)` after `resume` both passed.
-            Expr::Handle {
-                body, handlers, ..
-            } => {
+            Expr::Handle { body, handlers, .. } => {
                 let base = consumed.clone();
                 for h in handlers {
                     let mut arm_consumed = base.clone();
