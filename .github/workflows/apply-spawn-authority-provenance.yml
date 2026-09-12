@@ -77,25 +77,12 @@ jobs:
               raise SystemExit(f'private authority import count={s.count(private_import)}')
           s = s.replace(private_import, '', 1)
           helper_anchor = "fn two_spawn_source() -> &'static str {\n"
-          helper = '''fn spawn_grants(module: &nulang::bytecode::CodeModule, pc: usize) -> Vec<String> {
-    module
-        .spawn_capability_grants
-        .iter()
-        .find(|(site, _)| *site == pc)
-        .map(|(_, grants)| grants.clone())
-        .unwrap_or_default()
-}
-
-'''
+          helper = "fn spawn_grants(module: &nulang::bytecode::CodeModule, pc: usize) -> Vec<String> {\n    module\n        .spawn_capability_grants\n        .iter()\n        .find(|(site, _)| *site == pc)\n        .map(|(_, grants)| grants.clone())\n        .unwrap_or_default()\n}\n\n"
           if s.count(helper_anchor) != 1:
               raise SystemExit(f'test helper anchor count={s.count(helper_anchor)}')
           s = s.replace(helper_anchor, helper + helper_anchor, 1)
-          first = '''spawn_authority_manifest(&module, spawn_pcs[0])
-            .unwrap()
-            .canonical_tokens()'''
-          second = '''spawn_authority_manifest(&module, spawn_pcs[1])
-            .unwrap()
-            .canonical_tokens()'''
+          first = '''spawn_authority_manifest(&module, spawn_pcs[0])\n            .unwrap()\n            .canonical_tokens()'''
+          second = '''spawn_authority_manifest(&module, spawn_pcs[1])\n            .unwrap()\n            .canonical_tokens()'''
           if s.count(first) != 1 or s.count(second) != 1:
               raise SystemExit('spawn authority assertions moved')
           s = s.replace(first, 'spawn_grants(&module, spawn_pcs[0])', 1)
