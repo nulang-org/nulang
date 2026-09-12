@@ -3,6 +3,7 @@
 //! This crate intentionally keeps external media/STT/TTS/VAD providers behind
 //! narrow interfaces so the agent runtime remains provider-neutral.
 
+pub mod intent;
 pub mod kokoro;
 pub mod livekit;
 pub mod parakeet;
@@ -13,6 +14,7 @@ pub mod speculation;
 pub mod turn;
 pub mod whisper;
 
+pub use intent::VoiceIntentBridge;
 pub use kokoro::{KokoroRuntime, KokoroRuntimeStream, KokoroSynthesizer};
 pub use livekit::{LiveKitEvent, LiveKitSessionBridge, LiveKitSessionConfig};
 pub use parakeet::{ParakeetRecognizer, ParakeetRuntime, ParakeetRuntimeSession};
