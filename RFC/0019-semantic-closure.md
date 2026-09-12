@@ -93,6 +93,16 @@ VM | JIT | AOT | WASM
 
 The preferred end state is that backend code generators consume already-lowered continuation semantics rather than independently implementing algebraic effects.
 
+### Current backend profiles
+
+The bytecode VM is the reference implementation for user-defined effect handlers and explicit continuation resume.
+
+Native AOT currently supports handler-mediated resume control flow for the supported MIR profile, but explicit `resume(expr)` lowering through `RValue::Resume` remains a restricted feature and MUST be rejected deterministically until native lowering is complete.
+
+The plain WASM backend is currently a restricted profile for user-defined effect handlers and continuation resume. Its public backend boundary MUST reject handler/resume MIR before code generation rather than allowing defensive emitter stubs to return `nil`.
+
+WasmFX provides real stack-switching suspension/resumption for supported built-in asynchronous effects, but user-defined effect-handler resume is still a restricted profile. It likewise MUST reject that MIR before CIR/code generation until the user-handler path has complete semantics.
+
 ### Acceptance tests
 
 For each backend advertised as semantically complete:
@@ -104,7 +114,7 @@ For each backend advertised as semantically complete:
 - one-shot violation is rejected consistently;
 - durable-effect restrictions are backend-independent.
 
-A differential test harness SHOULD run the same source program against every complete backend and compare structured results/errors.
+A differential test harness SHOULD run the same source program against every complete backend and compare structured results/errors. Restricted profiles MUST have blocking tests that verify unsupported constructs fail loudly rather than silently returning a different value.
 
 ## Contract 2 — Affine continuations
 
@@ -138,7 +148,9 @@ Multi-shot continuations can be reconsidered later as an explicit opt-in abstrac
 
 ### Existing implementation direction
 
-The current `single_shot` analysis becomes part of enforcement and optimization, not merely an allocation hint.
+The runtime bytecode paths already consume captured continuation state with move-like semantics and trap if `Resume` executes without a captured continuation. That dynamic behavior is part of the affine safety net, not merely an allocation optimization.
+
+The current `single_shot` analysis remains useful for choosing the lightweight `SingleShotState` fast path, but Semantic Closure requires the one-shot rule to remain true independently of whether that optimization proves a handler single-shot. Static analysis should reject provable duplication when Nulang exposes a path that can duplicate a continuation; dynamic consumption remains the backstop for cases that cannot be proven statically.
 
 ## Contract 3 — Actor turn isolation during suspension
 
@@ -280,8 +292,8 @@ Required policy:
 The Semantic Closure milestone is complete when all of the following are true:
 
 - [ ] Complete backends pass an effect/continuation differential suite.
-- [ ] Native AOT either implements continuation resume semantics or is explicitly classified as a restricted backend.
-- [ ] Continuations are enforced as affine/one-shot.
+- [ ] Native AOT either implements explicit continuation-resume semantics or is explicitly classified as a restricted backend for that surface.
+- [ ] Continuations are enforced as affine/one-shot, with runtime consumption tests and static rejection where duplication is representable/provable.
 - [ ] Actor suspension has tested non-reentrant turn semantics.
 - [ ] Spawn authority syntax parses and round-trips through AST/HIR/MIR/runtime.
 - [ ] Security-sensitive runtime authority checks consume typed grants/manifests rather than ad-hoc strings.
@@ -311,8 +323,8 @@ Those may be valuable later, but they should not expand the semantic state space
 
 1. Restore reproducible green CI and keep `scripts/ci-local.sh` aligned with it.
 2. Finish spawn authority parsing/lowering/runtime enforcement using `AuthorityGrant`.
-3. Convert one-shot continuation analysis into a semantic affine invariant.
-4. Add backend differential effect tests; close native/JIT/AOT gaps or mark restricted profiles.
+3. Pin backend profiles with differential/restriction tests and eliminate silent semantic reinterpretation.
+4. Make affine continuation consumption an explicit tested invariant and add static rejection wherever duplication is representable.
 5. Specify and test actor suspension/non-reentrancy.
 6. Introduce `ProtocolId` and protocol-typed actor-reference metadata.
 7. Split semantic identity from artifact identity.
