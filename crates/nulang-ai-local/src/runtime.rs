@@ -62,7 +62,8 @@ impl LocalRuntime {
         let data_dir = config.resolve_data_dir(&project_dir);
         let store = SqliteStore::open(&data_dir)?;
         let reservations = TaskReservationStore::open(store.db_path())?;
-        reservations.reclaim_expired_running_tasks(Utc::now().timestamp_millis())?;
+        let now_ms = Utc::now().timestamp_millis();
+        reservations.reclaim_expired_running_tasks(now_ms)?;
 
         let project_id = project_dir
             .file_name()
@@ -92,8 +93,28 @@ impl LocalRuntime {
                 "worker-local",
                 ["code", "test", "repo.read", "repo.write"],
             ));
-            store.replace_worker_snapshots(&workers.snapshots())?;
         }
+
+        // The built-in worker lives in this process, so reopening the runtime is
+        // itself proof of liveness. Remote workers are deliberately not renewed;
+        // they must send their own heartbeat before becoming schedulable again.
+        if workers.get("worker-local").is_some() {
+            workers.heartbeat("worker-local")?;
+        }
+
+        // Reservation rows, not persisted snapshots, are the durable source of
+        // truth for concurrent load. Reconcile restored workers before the first
+        // scheduling decision so a restart cannot carry stale active-task counts.
+        let worker_ids: Vec<String> = workers
+            .workers()
+            .iter()
+            .map(|record| record.agent_id().to_string())
+            .collect();
+        for agent_id in worker_ids {
+            let active = reservations.active_count_for_worker(&agent_id, now_ms)?;
+            workers.update_load(&agent_id, active)?;
+        }
+        store.replace_worker_snapshots(&workers.snapshots())?;
 
         Ok(Self {
             project_dir,
@@ -327,7 +348,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|capability| capability == "repo.write"));
+            .any(|capability| capability.as_str() == Some("repo.write")));
         assert_eq!(graph.tasks[0].status, TaskStatus::Completed);
         assert!(graph.tasks[0]
             .required_capabilities
@@ -419,6 +440,36 @@ mod tests {
             .unwrap();
         assert!(persisted.capabilities.contains(&"repo.write".into()));
         assert!(!persisted.available);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn local_worker_heartbeat_and_load_are_reconciled_on_restart() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+
+        {
+            let rt = LocalRuntime::open(tmp.clone()).unwrap();
+            let mut snapshots = rt.store().list_worker_snapshots().unwrap();
+            let local = snapshots
+                .iter_mut()
+                .find(|snapshot| snapshot.agent_id == "worker-local")
+                .unwrap();
+            local.last_heartbeat_ms = 0;
+            local.active_tasks = 99;
+            rt.store().replace_worker_snapshots(&snapshots).unwrap();
+        }
+
+        let reopened = LocalRuntime::open(tmp.clone()).unwrap();
+        let snapshots = reopened.store().list_worker_snapshots().unwrap();
+        let local = snapshots
+            .iter()
+            .find(|snapshot| snapshot.agent_id == "worker-local")
+            .unwrap();
+        assert!(local.last_heartbeat_ms > 0);
+        assert_eq!(local.active_tasks, 0);
 
         let _ = std::fs::remove_dir_all(tmp);
     }
