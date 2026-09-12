@@ -46,6 +46,20 @@ jobs:
           aot_mod.write_text(text.replace(old, new, 1))
           PY
 
+      - name: Arm real runtime for top-level native spawn
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/aot/mod.rs")
+          text = path.read_text()
+          old = '''        let mut callbacks = AotTopLevelCallbacks { runtime: rt };\n        unsafe {\n            crate::jit::runtime::set_jit_callbacks(&mut callbacks);\n        }\n        let func: extern "C" fn() -> u64 = unsafe { std::mem::transmute(ptr) };\n        let result = func();\n\n        // Clear helper context before running the scheduler.\n        crate::jit::runtime::clear_jit_callbacks();\n'''
+          new = '''        let mut callbacks = AotTopLevelCallbacks { runtime: rt };\n        unsafe {\n            crate::jit::runtime::set_jit_callbacks(&mut callbacks);\n            set_aot_dispatch(Some(AotDispatchTarget {\n                fn_ptr: ptr,\n                module: module_ptr,\n                runtime: rt,\n            }));\n        }\n        let func: extern "C" fn() -> u64 = unsafe { std::mem::transmute(ptr) };\n        let result = func();\n\n        // Clear helper context before running the scheduler.\n        crate::jit::runtime::clear_jit_callbacks();\n        clear_aot_dispatch();\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"top-level native runtime context drift: {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+          PY
+
       - name: Reject whitespace errors
         run: git diff --check
 
