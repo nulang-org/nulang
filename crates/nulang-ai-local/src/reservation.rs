@@ -5,6 +5,7 @@
 //! opaque token plus a monotonically increasing version for CAS-style renewals
 //! and releases.
 
+use nulang_ai_core::{Task, TaskStatus};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -32,6 +33,10 @@ pub enum ReservationError {
     WorkerCapacityExhausted { agent_id: String },
     #[error("reservation lease was lost for task {task_id}")]
     ReservationLost { task_id: Uuid },
+    #[error("task {task_id} is not in a terminal state")]
+    InvalidTerminalState { task_id: Uuid },
+    #[error("task {task_id} durable state no longer matches its reservation")]
+    TaskStateConflict { task_id: Uuid },
 }
 
 pub struct TaskReservationStore {
@@ -178,6 +183,92 @@ impl TaskReservationStore {
         Ok(())
     }
 
+    /// Atomically commits a terminal task state and releases the exact lease
+    /// that authorized the execution.
+    ///
+    /// This is the fencing boundary for local execution: an expired, renewed,
+    /// reclaimed, or otherwise stale lease cannot publish `completed`/`failed`
+    /// state after another scheduler has taken ownership.
+    pub fn commit_terminal_and_release(
+        &self,
+        reservation: &TaskReservation,
+        task: &Task,
+        now_ms: i64,
+    ) -> Result<(), ReservationError> {
+        if task.id != reservation.task_id
+            || task.assigned_agent_id.as_deref() != Some(reservation.agent_id.as_str())
+        {
+            return Err(ReservationError::TaskStateConflict {
+                task_id: reservation.task_id,
+            });
+        }
+        let Some(status) = terminal_task_status(task.status) else {
+            return Err(ReservationError::InvalidTerminalState {
+                task_id: reservation.task_id,
+            });
+        };
+
+        let mut conn = Connection::open(&self.path)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owns_live_lease: bool = tx.query_row(
+            r#"SELECT EXISTS(
+                SELECT 1 FROM task_reservations
+                WHERE task_id = ?1
+                  AND agent_id = ?2
+                  AND lease_token = ?3
+                  AND version = ?4
+                  AND lease_expires_at_ms > ?5
+            )"#,
+            params![
+                reservation.task_id.to_string(),
+                reservation.agent_id,
+                reservation.lease_token.to_string(),
+                reservation.version,
+                now_ms,
+            ],
+            |row| row.get(0),
+        )?;
+        if !owns_live_lease {
+            return Err(ReservationError::ReservationLost {
+                task_id: reservation.task_id,
+            });
+        }
+
+        let changed = tx.execute(
+            r#"UPDATE tasks
+            SET status = ?1, updated_at = ?2
+            WHERE id = ?3 AND assigned_agent_id = ?4 AND status = 'running'"#,
+            params![
+                status,
+                task.updated_at.to_rfc3339(),
+                task.id.to_string(),
+                reservation.agent_id,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ReservationError::TaskStateConflict {
+                task_id: reservation.task_id,
+            });
+        }
+
+        let released = tx.execute(
+            "DELETE FROM task_reservations WHERE task_id = ?1 AND lease_token = ?2 AND version = ?3",
+            params![
+                reservation.task_id.to_string(),
+                reservation.lease_token.to_string(),
+                reservation.version,
+            ],
+        )?;
+        if released != 1 {
+            return Err(ReservationError::ReservationLost {
+                task_id: reservation.task_id,
+            });
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Reclaims expired leases and makes stranded assigned/running tasks schedulable again.
     ///
     /// Selection, task-state reset, and reservation deletion happen under one
@@ -206,6 +297,15 @@ impl TaskReservationStore {
             |row| row.get(0),
         )?;
         Ok(count.max(0) as usize)
+    }
+}
+
+fn terminal_task_status(status: TaskStatus) -> Option<&'static str> {
+    match status {
+        TaskStatus::Completed => Some("completed"),
+        TaskStatus::Failed => Some("failed"),
+        TaskStatus::Cancelled => Some("cancelled"),
+        _ => None,
     }
 }
 
@@ -246,6 +346,7 @@ fn reclaim_expired_in_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nulang_ai_core::ManagerKind;
 
     fn store() -> (TaskReservationStore, PathBuf) {
         let path = std::env::temp_dir().join(format!("nulang-reservations-{}.db", Uuid::new_v4()));
@@ -263,6 +364,15 @@ mod tests {
                 updated_at TEXT NOT NULL
             );
             "#,
+        )
+        .unwrap();
+    }
+
+    fn insert_running_task(path: &Path, task_id: Uuid, agent_id: &str) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, status, assigned_agent_id, updated_at) VALUES (?1, 'running', ?2, 'old')",
+            params![task_id.to_string(), agent_id],
         )
         .unwrap();
     }
@@ -312,6 +422,70 @@ mod tests {
             Err(ReservationError::ReservationLost { .. })
         ));
         store.release(&renewed).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_state_and_lease_release_commit_atomically() {
+        let (store, path) = store();
+        create_tasks_table(&path);
+        let task_id = Uuid::new_v4();
+        insert_running_task(&path, task_id, "worker-a");
+        let reservation = store
+            .reserve_with_capacity(task_id, "worker-a", 1, 1_000, 500)
+            .unwrap();
+        let mut task = Task::new(Uuid::new_v4(), "work", ManagerKind::Engineering);
+        task.id = task_id;
+        task.status = TaskStatus::Completed;
+        task.assigned_agent_id = Some("worker-a".into());
+        task.updated_at = chrono::Utc::now();
+
+        store
+            .commit_terminal_and_release(&reservation, &task, 1_100)
+            .unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                params![task_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(store.active_count_for_worker("worker-a", 1_100).unwrap(), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expired_worker_cannot_publish_terminal_state() {
+        let (store, path) = store();
+        create_tasks_table(&path);
+        let task_id = Uuid::new_v4();
+        insert_running_task(&path, task_id, "worker-a");
+        let reservation = store
+            .reserve_with_capacity(task_id, "worker-a", 1, 1_000, 100)
+            .unwrap();
+        let mut task = Task::new(Uuid::new_v4(), "work", ManagerKind::Engineering);
+        task.id = task_id;
+        task.status = TaskStatus::Completed;
+        task.assigned_agent_id = Some("worker-a".into());
+        task.updated_at = chrono::Utc::now();
+
+        assert!(matches!(
+            store.commit_terminal_and_release(&reservation, &task, 1_101),
+            Err(ReservationError::ReservationLost { .. })
+        ));
+
+        let conn = Connection::open(&path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                params![task_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
         let _ = std::fs::remove_file(path);
     }
 
