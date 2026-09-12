@@ -5,11 +5,14 @@
 //! budgets, and middleware. Adapters consume this IR to deploy to Nulang Cloud,
 //! static hosts, or Docker.
 
+use crate::ast::{AstModule, Decl, Expr, WorkflowItem};
+use crate::lexer::Lexer;
 use crate::package::manifest::BudgetsSection;
+use crate::parser::Parser;
 use crate::runtime::WebRoute;
 use crate::web::modules::ModuleRegistry;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +42,11 @@ pub struct DeploymentIr {
     pub routes: Vec<IrRoute>,
     pub signals: serde_json::Value,
     pub capabilities: Vec<String>,
+    /// False when any source file could not be read, lexed, or parsed while
+    /// deriving deployment metadata. Cloud runtimes should fail closed when
+    /// this is false rather than trusting an incomplete capability manifest.
+    #[serde(default)]
+    pub metadata_complete: bool,
     pub budgets: BudgetsIr,
     pub middleware: Vec<String>,
     pub cloud_config: Vec<CloudConfigEntry>,
@@ -50,12 +58,30 @@ impl DeploymentIr {
     }
 }
 
+#[derive(Debug, Default)]
+struct SemanticMetadata {
+    capabilities: BTreeSet<String>,
+    imports: BTreeSet<String>,
+    complete: bool,
+}
+
+impl SemanticMetadata {
+    fn new() -> Self {
+        Self {
+            capabilities: BTreeSet::new(),
+            imports: BTreeSet::new(),
+            complete: true,
+        }
+    }
+}
+
 /// Generate the deployment IR for a web package.
 ///
 /// `routes` are the routes collected by running the compiled entry point.
 /// `signal_graph_path` is the optional path to `app.signals.json` emitted by
-/// the reactivity pass. `src_root` is the package `src/` directory used to scan
-/// for performed capabilities. `budgets` are parsed from `Nulang.toml`.
+/// the reactivity pass. `src_root` is the package `src/` directory. Deployment
+/// capabilities and first-party module imports are derived from parsed syntax,
+/// never substring matching. `budgets` are parsed from `Nulang.toml`.
 pub fn generate_deployment_ir(
     routes: &[WebRoute],
     signal_graph_path: Option<&Path>,
@@ -88,29 +114,28 @@ pub fn generate_deployment_ir(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
 
-    let source_text = collect_source_text(src_root);
-    let mut capabilities = BTreeSet::new();
-    for cap in infer_capabilities(&source_text) {
-        capabilities.insert(cap);
-    }
-    for cap in infer_module_capabilities(&source_text) {
-        capabilities.insert(cap);
-    }
-    let capabilities: Vec<String> = capabilities.into_iter().collect();
+    let metadata = collect_semantic_metadata(src_root);
+    let imports: Vec<String> = metadata.imports.iter().cloned().collect();
+    let registry = ModuleRegistry::builtin();
+
+    let mut capabilities = metadata.capabilities;
+    capabilities.extend(registry.collect_capabilities(&imports));
+    let capabilities = capabilities.into_iter().collect();
 
     let budgets_ir = BudgetsIr {
         initial_js_max_bytes: budgets.initial_js_max_bytes(),
         lcp_seconds: budgets.lcp_seconds(),
     };
 
-    let cloud_config = infer_module_cloud_config(&source_text);
-    let middleware = infer_middleware(&source_text);
+    let cloud_config = infer_module_cloud_config(&registry, &imports);
+    let middleware = infer_middleware(&imports);
 
     DeploymentIr {
         version: 1,
         routes: ir_routes,
         signals,
         capabilities,
+        metadata_complete: metadata.complete,
         budgets: budgets_ir,
         middleware,
         cloud_config,
@@ -126,70 +151,386 @@ fn route_path_to_artifact(path: &str) -> String {
     }
 }
 
-/// Concatenate all `.nula` source files under `src_root` into a single string
-/// so capability scanning can see effects performed anywhere in the package.
-fn collect_source_text(src_root: &Path) -> String {
-    let mut out = String::new();
-    if !src_root.is_dir() {
-        return out;
+/// Parse every `.nula` source file below `src_root` and derive deployment
+/// metadata from the AST. Text in comments and string literals must never
+/// grant a Cloud capability.
+fn collect_semantic_metadata(src_root: &Path) -> SemanticMetadata {
+    let mut metadata = SemanticMetadata::new();
+    collect_semantic_metadata_recursive(src_root, &mut metadata);
+    metadata
+}
+
+fn collect_semantic_metadata_recursive(path: &Path, metadata: &mut SemanticMetadata) {
+    if !path.is_dir() {
+        metadata.complete = false;
+        return;
     }
-    let entries = match std::fs::read_dir(src_root) {
-        Ok(e) => e,
-        Err(_) => return out,
+
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => {
+            metadata.complete = false;
+            return;
+        }
     };
-    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    entries.sort_by_key(|e| e.path());
+    let mut entries: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+    entries.sort_by_key(|entry| entry.path());
+
     for entry in entries {
-        let p = entry.path();
-        if p.is_dir() {
-            out.push_str(&collect_source_text(&p));
-        } else if p.extension().and_then(|e| e.to_str()) == Some("nula") {
-            if let Ok(s) = std::fs::read_to_string(&p) {
-                out.push_str(&s);
-                out.push('\n');
+        let path = entry.path();
+        if path.is_dir() {
+            collect_semantic_metadata_recursive(&path, metadata);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("nula") {
+            continue;
+        }
+
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(_) => {
+                metadata.complete = false;
+                continue;
+            }
+        };
+        if !collect_source_metadata(&source, metadata) {
+            metadata.complete = false;
+        }
+    }
+}
+
+fn collect_source_metadata(source: &str, metadata: &mut SemanticMetadata) -> bool {
+    let mut lexer = Lexer::new(source);
+    let tokens = match lexer.lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return false,
+    };
+    let mut parser = Parser::new(tokens);
+    let module = match parser.parse_module() {
+        Ok(module) => module,
+        Err(_) => return false,
+    };
+    collect_module_metadata(&module, metadata);
+    true
+}
+
+fn collect_module_metadata(module: &AstModule, metadata: &mut SemanticMetadata) {
+    for decl in &module.decls {
+        collect_decl_metadata(decl, metadata);
+    }
+}
+
+fn collect_decl_metadata(decl: &Decl, metadata: &mut SemanticMetadata) {
+    match decl {
+        Decl::Function {
+            default_values,
+            requires,
+            ensures,
+            body,
+            ..
+        } => {
+            for expr in default_values.iter().flatten() {
+                collect_expr_metadata(expr, metadata);
+            }
+            for expr in requires.iter().chain(ensures.iter()) {
+                collect_expr_metadata(expr, metadata);
+            }
+            collect_expr_metadata(body, metadata);
+        }
+        Decl::Actor {
+            state_fields,
+            behaviors,
+            init,
+            initializer,
+            apply_handlers,
+            migrations,
+            ..
+        } => {
+            for (_, _, _, expr) in state_fields {
+                collect_expr_metadata(expr, metadata);
+            }
+            for behavior in behaviors {
+                collect_expr_metadata(&behavior.body, metadata);
+            }
+            for (_, expr) in init {
+                collect_expr_metadata(expr, metadata);
+            }
+            if let Some((_, _, body)) = initializer {
+                collect_expr_metadata(body, metadata);
+            }
+            for handler in apply_handlers {
+                collect_expr_metadata(&handler.body, metadata);
+            }
+            for migration in migrations {
+                if let Some(body) = &migration.state_body {
+                    collect_expr_metadata(body, metadata);
+                }
+                for (_, _, body) in &migration.event_migrations {
+                    collect_expr_metadata(body, metadata);
+                }
+            }
+        }
+        Decl::StateMachine {
+            entry_hooks,
+            exit_hooks,
+            ..
+        } => {
+            for (_, expr) in entry_hooks.iter().chain(exit_hooks.iter()) {
+                collect_expr_metadata(expr, metadata);
+            }
+        }
+        Decl::Module { decls, .. } => {
+            for decl in decls {
+                collect_decl_metadata(decl, metadata);
+            }
+        }
+        Decl::Import { path, .. } => {
+            if path.starts_with("@nulang/") {
+                metadata.imports.insert(path.clone());
+            }
+        }
+        Decl::Workflow {
+            items, compensate, ..
+        } => {
+            for item in items {
+                match item {
+                    WorkflowItem::Step(step) => collect_workflow_step_metadata(step, metadata),
+                    WorkflowItem::Parallel(steps) => {
+                        for step in steps {
+                            collect_workflow_step_metadata(step, metadata);
+                        }
+                    }
+                }
+            }
+            if let Some(expr) = compensate {
+                collect_expr_metadata(expr, metadata);
+            }
+        }
+        Decl::CrdtDecl { fields, .. } => {
+            for (_, _, _, expr) in fields {
+                collect_expr_metadata(expr, metadata);
+            }
+        }
+        Decl::NamedHandler { handlers, .. } => {
+            for handler in handlers {
+                collect_expr_metadata(&handler.body, metadata);
+            }
+        }
+        Decl::Class { methods, .. } => {
+            for method in methods {
+                if let Some(body) = &method.default_body {
+                    collect_expr_metadata(body, metadata);
+                }
+            }
+        }
+        Decl::Impl { methods, .. } => {
+            for method in methods {
+                collect_expr_metadata(&method.body, metadata);
+            }
+        }
+        Decl::LetBinding { value, .. }
+        | Decl::Signal { init: value, .. }
+        | Decl::Given { value, .. } => collect_expr_metadata(value, metadata),
+        Decl::TypeAlias { .. }
+        | Decl::RecordType { .. }
+        | Decl::VariantType { .. }
+        | Decl::EffectDecl { .. }
+        | Decl::Extern { .. }
+        | Decl::Agent { .. }
+        | Decl::Database { .. } => {}
+    }
+}
+
+fn collect_workflow_step_metadata(
+    step: &crate::ast::WorkflowStep,
+    metadata: &mut SemanticMetadata,
+) {
+    collect_expr_metadata(&step.body, metadata);
+    if let Some(expr) = &step.compensate {
+        collect_expr_metadata(expr, metadata);
+    }
+}
+
+fn collect_expr_metadata(expr: &Expr, metadata: &mut SemanticMetadata) {
+    match expr {
+        Expr::Literal(_, _) | Expr::Var(_, _) | Expr::SelfRef(_) | Expr::Panic(_, _) => {}
+        Expr::FString(exprs, _) | Expr::Tuple(exprs, _) | Expr::Array(exprs, _) => {
+            for expr in exprs {
+                collect_expr_metadata(expr, metadata);
+            }
+        }
+        Expr::Lambda { body, .. }
+        | Expr::Unary { expr: body, .. }
+        | Expr::FieldAccess { expr: body, .. }
+        | Expr::Resume { value: body, .. }
+        | Expr::GrainRef { key: body, .. }
+        | Expr::CapAnnotate { expr: body, .. }
+        | Expr::TypeAnnotate { expr: body, .. }
+        | Expr::Consume { expr: body, .. }
+        | Expr::Recover { body, .. }
+        | Expr::Defer { expr: body, .. }
+        | Expr::Hide { body, .. }
+        | Expr::Seal { body, .. } => collect_expr_metadata(body, metadata),
+        Expr::App { func, args, .. } => {
+            collect_expr_metadata(func, metadata);
+            for arg in args {
+                collect_expr_metadata(arg, metadata);
+            }
+        }
+        Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+            collect_expr_metadata(value, metadata);
+            collect_expr_metadata(body, metadata);
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_expr_metadata(cond, metadata);
+            collect_expr_metadata(then_branch, metadata);
+            if let Some(expr) = else_branch {
+                collect_expr_metadata(expr, metadata);
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_expr_metadata(scrutinee, metadata);
+            for (_, guard, body) in arms {
+                if let Some(guard) = guard {
+                    collect_expr_metadata(guard, metadata);
+                }
+                collect_expr_metadata(body, metadata);
+            }
+        }
+        Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => {
+            for expr in exprs {
+                collect_expr_metadata(expr, metadata);
+            }
+        }
+        Expr::Record(fields, _) => {
+            for (_, expr) in fields {
+                collect_expr_metadata(expr, metadata);
+            }
+        }
+        Expr::RecordUpdate { base, fields, .. } => {
+            collect_expr_metadata(base, metadata);
+            for (_, expr) in fields {
+                collect_expr_metadata(expr, metadata);
+            }
+        }
+        Expr::Index { arr, idx, .. }
+        | Expr::Binary {
+            left: arr,
+            right: idx,
+            ..
+        }
+        | Expr::Pipe {
+            left: arr,
+            right: idx,
+            ..
+        }
+        | Expr::Migrate {
+            actor: arr,
+            node: idx,
+            ..
+        } => {
+            collect_expr_metadata(arr, metadata);
+            collect_expr_metadata(idx, metadata);
+        }
+        Expr::Assign { target, value, .. } => {
+            collect_expr_metadata(target, metadata);
+            collect_expr_metadata(value, metadata);
+        }
+        Expr::Spawn {
+            actor_type,
+            init,
+            positional_args,
+            target_node,
+            ..
+        } => {
+            collect_expr_metadata(actor_type, metadata);
+            for (_, expr) in init {
+                collect_expr_metadata(expr, metadata);
+            }
+            if let Some(args) = positional_args {
+                for arg in args {
+                    collect_expr_metadata(arg, metadata);
+                }
+            }
+            if let Some(node) = target_node {
+                collect_expr_metadata(node, metadata);
+            }
+        }
+        Expr::Send { actor, args, .. } | Expr::Ask { actor, args, .. } => {
+            collect_expr_metadata(actor, metadata);
+            for arg in args {
+                collect_expr_metadata(arg, metadata);
+            }
+        }
+        Expr::Receive { arms, after, .. } => {
+            for (_, _, guard, body) in arms {
+                if let Some(guard) = guard {
+                    collect_expr_metadata(guard, metadata);
+                }
+                collect_expr_metadata(body, metadata);
+            }
+            if let Some((timeout, body)) = after {
+                collect_expr_metadata(timeout, metadata);
+                collect_expr_metadata(body, metadata);
+            }
+        }
+        Expr::Emit { args, .. } => {
+            for arg in args {
+                collect_expr_metadata(arg, metadata);
+            }
+        }
+        Expr::Perform { effect, args, .. } => {
+            if is_host_capability(effect) {
+                metadata.capabilities.insert(effect.clone());
+            }
+            for arg in args {
+                collect_expr_metadata(arg, metadata);
+            }
+        }
+        Expr::Handle { body, handlers, .. } => {
+            collect_expr_metadata(body, metadata);
+            for handler in handlers {
+                collect_expr_metadata(&handler.body, metadata);
+            }
+        }
+        Expr::For { iterable, body, .. } => {
+            collect_expr_metadata(iterable, metadata);
+            collect_expr_metadata(body, metadata);
+        }
+        Expr::While { cond, body, .. } => {
+            collect_expr_metadata(cond, metadata);
+            collect_expr_metadata(body, metadata);
+        }
+        Expr::Return(value, _) | Expr::Break(value, _) => {
+            if let Some(value) = value {
+                collect_expr_metadata(value, metadata);
             }
         }
     }
-    out
 }
 
-fn infer_capabilities(source: &str) -> Vec<String> {
-    let mut caps: HashSet<&str> = HashSet::new();
-    let pairs = [
-        ("DB", "perform DB."),
-        ("Net", "perform Net."),
-        ("Realtime", "perform Realtime."),
-        ("Http", "perform Http."),
-        ("Web", "perform Web."),
-        ("Actor", "perform Actor."),
-        ("Timer", "perform Timer."),
-        ("Job", "perform Job."),
-        ("IO", "perform IO."),
-    ];
-    for (cap, needle) in pairs {
-        if source.contains(needle) {
-            caps.insert(cap);
-        }
-    }
-    let mut caps: Vec<String> = caps.into_iter().map(|s| s.to_string()).collect();
-    caps.sort();
-    caps
+fn is_host_capability(effect: &str) -> bool {
+    matches!(
+        effect,
+        "DB" | "Net" | "Realtime" | "Http" | "Web" | "Actor" | "Timer" | "Job" | "IO"
+    )
 }
 
-/// Infer capabilities contributed by imported `@nulang/*` modules.
-fn infer_module_capabilities(source: &str) -> Vec<String> {
-    let registry = ModuleRegistry::builtin();
-    let imports = collect_nulang_imports(source);
-    registry.collect_capabilities(&imports)
-}
-
-/// Infer cloud config keys required by imported `@nulang/*` modules.
-fn infer_module_cloud_config(source: &str) -> Vec<CloudConfigEntry> {
-    let registry = ModuleRegistry::builtin();
-    let imports = collect_nulang_imports(source);
+/// Infer cloud config keys required by structurally imported `@nulang/*` modules.
+fn infer_module_cloud_config(
+    registry: &ModuleRegistry,
+    imports: &[String],
+) -> Vec<CloudConfigEntry> {
     let mut entries = Vec::new();
     for name in imports {
-        if let Some(spec) = registry.get(&name) {
+        if let Some(spec) = registry.get(name) {
             for key in &spec.cloud_config_keys {
                 entries.push(CloudConfigEntry {
                     key: key.clone(),
@@ -203,37 +544,27 @@ fn infer_module_cloud_config(source: &str) -> Vec<CloudConfigEntry> {
 
 /// Infer default middleware stack, extending it when imported modules
 /// contribute security concerns (e.g., auth sessions).
-fn infer_middleware(source: &str) -> Vec<String> {
+fn infer_middleware(imports: &[String]) -> Vec<String> {
     let mut stack = vec![
         "security_headers".to_string(),
         "request_log".to_string(),
         "csrf".to_string(),
     ];
-    let imports = collect_nulang_imports(source);
     if imports.iter().any(|name| name == "@nulang/auth") {
         stack.push("auth".to_string());
     }
     stack
 }
 
-/// Collect all `@nulang/*` import names from the source text.
-fn collect_nulang_imports(source: &str) -> Vec<String> {
-    let mut imports = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("import ") {
-            let name = rest.split_whitespace().next().unwrap_or("");
-            if name.starts_with("@nulang/") && !imports.contains(&name.to_string()) {
-                imports.push(name.to_string());
-            }
-        }
-    }
-    imports
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_from_source(source: &str) -> SemanticMetadata {
+        let mut metadata = SemanticMetadata::new();
+        assert!(collect_source_metadata(source, &mut metadata));
+        metadata
+    }
 
     #[test]
     fn test_route_path_to_artifact() {
@@ -246,66 +577,68 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_capabilities() {
-        let src = r#"
+    fn test_semantic_capability_collection() {
+        let metadata = metadata_from_source(
+            r#"
             fn foo() {
                 perform DB.query("...")
                 perform Realtime.broadcast("room", "hi")
             }
-        "#;
-        let caps = infer_capabilities(src);
-        assert!(caps.contains(&"DB".to_string()));
-        assert!(caps.contains(&"Realtime".to_string()));
-        assert!(!caps.contains(&"Net".to_string()));
+            "#,
+        );
+        assert!(metadata.capabilities.contains("DB"));
+        assert!(metadata.capabilities.contains("Realtime"));
+        assert!(!metadata.capabilities.contains("Net"));
     }
 
     #[test]
-    fn test_infer_module_capabilities_from_imports() {
-        let src = r#"
-            import stdlib::web::html
+    fn test_comments_and_strings_do_not_grant_capabilities() {
+        let metadata = metadata_from_source(
+            r#"
+            fn main() {
+                // perform DB.query("must not count")
+                let example = "perform Net.connect must not count"
+                perform IO.print(example)
+            }
+            "#,
+        );
+        assert!(metadata.capabilities.contains("IO"));
+        assert!(!metadata.capabilities.contains("DB"));
+        assert!(!metadata.capabilities.contains("Net"));
+    }
+
+    #[test]
+    fn test_module_metadata_from_structured_imports() {
+        let metadata = metadata_from_source(
+            r#"
             import @nulang/auth
             import @nulang/postgres
-
             fn main() {}
-        "#;
-        let caps = infer_module_capabilities(src);
+            "#,
+        );
+        let imports: Vec<String> = metadata.imports.iter().cloned().collect();
+        let registry = ModuleRegistry::builtin();
+        let caps = registry.collect_capabilities(&imports);
         assert!(caps.contains(&"auth".to_string()));
         assert!(caps.contains(&"DB".to_string()));
         assert!(!caps.contains(&"payments".to_string()));
+
+        let entries = infer_module_cloud_config(&registry, &imports);
+        assert!(entries.iter().any(|entry| {
+            entry.key == "AUTH_COOKIE_SECRET" && entry.required_by == "@nulang/auth"
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.key == "DATABASE_URL" && entry.required_by == "@nulang/postgres"
+        }));
+
+        let middleware = infer_middleware(&imports);
+        assert!(middleware.contains(&"auth".to_string()));
+        assert!(middleware.contains(&"csrf".to_string()));
     }
 
     #[test]
-    fn test_infer_module_cloud_config_from_imports() {
-        let src = r#"
-            import @nulang/auth
-            import @nulang/postgres
-
-            fn main() {}
-        "#;
-        let entries = infer_module_cloud_config(src);
-        let keys: Vec<String> = entries.iter().map(|e| e.key.clone()).collect();
-        assert!(keys.contains(&"AUTH_COOKIE_SECRET".to_string()));
-        assert!(keys.contains(&"DATABASE_URL".to_string()));
-        assert!(entries
-            .iter()
-            .any(|e| e.key == "AUTH_COOKIE_SECRET" && e.required_by == "@nulang/auth"));
-    }
-
-    #[test]
-    fn test_infer_middleware_adds_auth_when_imported() {
-        let src = r#"
-            import @nulang/auth
-            fn main() {}
-        "#;
-        let stack = infer_middleware(src);
-        assert!(stack.contains(&"auth".to_string()));
-        assert!(stack.contains(&"csrf".to_string()));
-
-        let src_no_auth = r#"
-            import stdlib::web::html
-            fn main() {}
-        "#;
-        let stack_no_auth = infer_middleware(src_no_auth);
-        assert!(!stack_no_auth.contains(&"auth".to_string()));
+    fn test_invalid_source_is_rejected() {
+        let mut metadata = SemanticMetadata::new();
+        assert!(!collect_source_metadata("fn broken( {", &mut metadata));
     }
 }
