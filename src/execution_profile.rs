@@ -131,8 +131,7 @@ impl ExecutionProfile {
     }
 
     fn close_dependencies(&mut self) {
-        if self.requires(RuntimeFeature::Persistence)
-            || self.requires(RuntimeFeature::Distribution)
+        if self.requires(RuntimeFeature::Persistence) || self.requires(RuntimeFeature::Distribution)
         {
             self.require(RuntimeFeature::Actors);
         }
@@ -156,8 +155,8 @@ impl ExecutionProfile {
 
         match opcode {
             Alloc | FieldL | FieldS | ArrAlloc | ArrLoad | ArrStore | ArrLen | TupleMk | TupleL
-            | RecMk | RecL | RecS | RecCopy | Copy | Drop | Closure | CapLoad | CapStore
-            | FToS | SConcat => {
+            | RecMk | RecL | RecS | RecCopy | Copy | Drop | Closure | CapLoad | CapStore | FToS
+            | SConcat => {
                 self.require(RuntimeFeature::Heap);
             }
 
@@ -215,12 +214,9 @@ mod tests {
 
     fn module_with(opcodes: &[OpCode]) -> CodeModule {
         let mut module = CodeModule::new("profile-test");
-        module.instructions.extend(
-            opcodes
-                .iter()
-                .copied()
-                .map(Instruction::new0),
-        );
+        module
+            .instructions
+            .extend(opcodes.iter().copied().map(Instruction::new0));
         module
     }
 
@@ -284,10 +280,9 @@ mod tests {
     #[test]
     fn authority_metadata_is_never_treated_as_pure_compute() {
         let mut module = module_with(&[OpCode::Spawn]);
-        module.spawn_capability_grants.push((
-            0,
-            vec!["Net::TcpOut(api.example.com:443)".to_string()],
-        ));
+        module
+            .spawn_capability_grants
+            .push((0, vec!["Net::TcpOut(api.example.com:443)".to_string()]));
 
         let profile = ExecutionProfile::analyze(&module);
         assert!(profile.requires(RuntimeFeature::ExternalAuthority));
