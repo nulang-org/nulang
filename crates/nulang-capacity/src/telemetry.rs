@@ -75,9 +75,7 @@ pub fn apply_estimate(offer: &mut CapacityOffer, estimate: OfferEstimate) {
     offer.interruption_rate_per_hour = estimate.interruption_rate_per_hour.clamp(0.0, 1.0);
     offer.throughput_score = estimate.throughput_score.max(f64::EPSILON);
     offer.startup_p50_seconds = estimate.startup_p50_seconds.max(0.0);
-    offer.startup_p95_seconds = estimate
-        .startup_p95_seconds
-        .max(offer.startup_p50_seconds);
+    offer.startup_p95_seconds = estimate.startup_p95_seconds.max(offer.startup_p50_seconds);
 }
 
 fn percentile(sorted: &[f64], quantile: f64) -> Option<f64> {
