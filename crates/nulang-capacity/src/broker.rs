@@ -1,6 +1,12 @@
 use crate::provider::{CapacityProvider, CapacityQuery, ProviderError, ProviderSnapshot};
 use crate::{rank_offers, CapacityError, CapacityOffer, ScoreWeights};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BrokerPolicy {
+    /// Reject capacity snapshots older than this age. `None` disables expiry.
+    pub max_snapshot_age_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlacementCandidate {
     pub offer: CapacityOffer,
@@ -13,6 +19,7 @@ pub struct PlacementCandidate {
 pub struct BrokerResult {
     pub candidates: Vec<PlacementCandidate>,
     pub provider_errors: Vec<ProviderError>,
+    pub stale_providers: Vec<String>,
 }
 
 impl BrokerResult {
@@ -29,14 +36,66 @@ impl BrokerResult {
 pub struct CapacityBroker<'a> {
     providers: Vec<&'a dyn CapacityProvider>,
     weights: ScoreWeights,
+    policy: BrokerPolicy,
 }
 
 impl<'a> CapacityBroker<'a> {
     pub fn new(providers: Vec<&'a dyn CapacityProvider>, weights: ScoreWeights) -> Self {
-        Self { providers, weights }
+        Self {
+            providers,
+            weights,
+            policy: BrokerPolicy::default(),
+        }
     }
 
+    pub fn with_policy(mut self, policy: BrokerPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Rank without applying snapshot freshness. Useful for deterministic
+    /// replay/tests where wall-clock time is intentionally absent.
     pub async fn rank(&self, query: &CapacityQuery) -> Result<BrokerResult, CapacityError> {
+        let (snapshots, provider_errors) = self.collect_snapshots(query).await;
+        let candidates = rank_snapshots(query, &snapshots, self.weights)?;
+        Ok(BrokerResult {
+            candidates,
+            provider_errors,
+            stale_providers: Vec::new(),
+        })
+    }
+
+    /// Production ranking entry point. Capacity snapshots that exceed the
+    /// configured maximum age are excluded before economic scoring.
+    pub async fn rank_at(
+        &self,
+        query: &CapacityQuery,
+        now_unix_ms: u64,
+    ) -> Result<BrokerResult, CapacityError> {
+        let (snapshots, provider_errors) = self.collect_snapshots(query).await;
+        let mut fresh = Vec::with_capacity(snapshots.len());
+        let mut stale_providers = Vec::new();
+
+        for snapshot in snapshots {
+            if snapshot_is_fresh(&snapshot, now_unix_ms, self.policy) {
+                fresh.push(snapshot);
+            } else {
+                stale_providers.push(snapshot.provider);
+            }
+        }
+
+        let candidates = rank_snapshots(query, &fresh, self.weights)?;
+        Ok(BrokerResult {
+            candidates,
+            provider_errors,
+            stale_providers,
+        })
+    }
+
+    async fn collect_snapshots(
+        &self,
+        query: &CapacityQuery,
+    ) -> (Vec<ProviderSnapshot>, Vec<ProviderError>) {
         let mut snapshots = Vec::with_capacity(self.providers.len());
         let mut provider_errors = Vec::new();
 
@@ -47,11 +106,18 @@ impl<'a> CapacityBroker<'a> {
             }
         }
 
-        let candidates = rank_snapshots(query, &snapshots, self.weights)?;
-        Ok(BrokerResult {
-            candidates,
-            provider_errors,
-        })
+        (snapshots, provider_errors)
+    }
+}
+
+pub fn snapshot_is_fresh(
+    snapshot: &ProviderSnapshot,
+    now_unix_ms: u64,
+    policy: BrokerPolicy,
+) -> bool {
+    match policy.max_snapshot_age_ms {
+        None => true,
+        Some(max_age) => now_unix_ms.saturating_sub(snapshot.observed_at_unix_ms) <= max_age,
     }
 }
 
@@ -80,7 +146,6 @@ pub fn rank_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ProviderSnapshot;
     use crate::{Architecture, CapacityOffer, JobSpec, Lifecycle, TrustTier, WorkloadClass};
 
     fn offer(provider: &str, id: &str, lifecycle: Lifecycle, hourly_usd: f64) -> CapacityOffer {
@@ -99,8 +164,16 @@ mod tests {
             egress_usd_per_gib: 0.0,
             startup_p50_seconds: 2.0,
             startup_p95_seconds: 5.0,
-            interruption_rate_per_hour: if lifecycle == Lifecycle::OnDemand { 0.0 } else { 0.01 },
-            interruption_notice_seconds: if lifecycle == Lifecycle::OnDemand { 0 } else { 60 },
+            interruption_rate_per_hour: if lifecycle == Lifecycle::OnDemand {
+                0.0
+            } else {
+                0.01
+            },
+            interruption_notice_seconds: if lifecycle == Lifecycle::OnDemand {
+                0
+            } else {
+                60
+            },
             capacity_confidence: 1.0,
             throughput_score: 1.0,
             trust_tier: TrustTier::CloudProvider,
@@ -149,7 +222,12 @@ mod tests {
             ProviderSnapshot {
                 provider: "nebius".into(),
                 observed_at_unix_ms: 1,
-                offers: vec![offer("nebius", "nebius-regular", Lifecycle::OnDemand, 0.50)],
+                offers: vec![offer(
+                    "nebius",
+                    "nebius-regular",
+                    Lifecycle::OnDemand,
+                    0.50,
+                )],
             },
         ];
 
@@ -177,5 +255,20 @@ mod tests {
         let ranked = rank_snapshots(&query(false), &snapshots, ScoreWeights::default()).unwrap();
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].offer.offer_id, "regular");
+    }
+
+    #[test]
+    fn stale_snapshot_is_rejected() {
+        let snapshot = ProviderSnapshot {
+            provider: "aws".into(),
+            observed_at_unix_ms: 1_000,
+            offers: vec![],
+        };
+        let policy = BrokerPolicy {
+            max_snapshot_age_ms: Some(5_000),
+        };
+
+        assert!(snapshot_is_fresh(&snapshot, 6_000, policy));
+        assert!(!snapshot_is_fresh(&snapshot, 6_001, policy));
     }
 }
