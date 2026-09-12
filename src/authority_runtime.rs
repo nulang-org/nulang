@@ -6,6 +6,11 @@
 //! helpers parse the complete set into [`AuthorityManifest`] first, so one
 //! malformed persisted token invalidates the manifest and therefore fails
 //! authorization closed.
+//!
+//! This module is a migration boundary, not proof that spawn authority is
+//! end-to-end wired. Parser, MIR-codegen metadata emission, VM spawn callback
+//! plumbing, and host-boundary enforcement must all preserve/use the manifest
+//! before source-level grants are security-effective.
 
 use crate::authority::{AuthorityGrant, AuthorityManifest, AuthorityParseError};
 use crate::runtime::Actor;
