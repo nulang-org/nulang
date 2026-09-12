@@ -1841,9 +1841,17 @@ impl Value {
     }
 
     /// Create a pointer value (for strings, lists, etc.).
+    ///
+    /// The legacy NaN-boxed representation has only a 48-bit payload. Never
+    /// silently truncate a wider virtual address: doing so would manufacture
+    /// a different pointer and make later dereferences undefined behavior.
     pub fn ptr(p: *mut u8) -> Self {
+        assert!(
+            crate::value_layout::ptr_fits_payload(p as u64),
+            "pointer address does not fit the 48-bit Value payload"
+        );
         Value {
-            raw: TAG_PTR | (p as u64 & PAYLOAD_MASK),
+            raw: TAG_PTR | p as u64,
         }
     }
 
