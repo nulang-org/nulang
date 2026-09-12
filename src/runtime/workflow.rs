@@ -61,6 +61,16 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
             state.insert(name.clone(), persisted);
         }
     }
+    let authority_tokens = match actor.authority_manifest() {
+        Ok(manifest) => manifest.canonical_token_set(),
+        Err(err) => {
+            tracing::warn!(
+                "nulang-persist: refusing to checkpoint actor {} with invalid authority: {}",
+                actor_id, err
+            );
+            return;
+        }
+    };
     // Snapshot the global CRDT state alongside durable actor fields.
     let crdt_snapshot = rt.crdt_manager.as_ref().map(|m| {
         m.snapshot()
@@ -82,6 +92,7 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
         waiting_signal: actor.waiting_signal.clone(),
         crdt_snapshot,
         crdt_field_map,
+        authority_tokens,
     };
     // RFC 0014 §3: re-spawn-opted actors replicate the snapshot to their
     // deterministic shadow node before the local save, so the replica is a
