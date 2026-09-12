@@ -33,6 +33,39 @@ jobs:
           PY
       - name: Apply exact-provenance patch
         run: python3 scripts/apply_spawn_authority_provenance.py
+      - name: Thread provenance through AOT callback implementations
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/runtime/callbacks.rs')
+          s = p.read_text()
+          old = 'fn spawn_with_site_authority(\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'callback helper count={s.count(old)}')
+          p.write_text(s.replace(old, 'pub(crate) fn spawn_with_site_authority(\n', 1))
+
+          p = Path('src/aot/mod.rs')
+          s = p.read_text()
+
+          stub = '''    fn spawn_actor(\n        &mut self,\n        _module: &crate::bytecode::CodeModule,\n        _behavior_idx: usize,\n        _init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'''
+          stub_new = '''    fn spawn_actor(\n        &mut self,\n        _module: &crate::bytecode::CodeModule,\n        _spawn_pc: usize,\n        _behavior_idx: usize,\n        _init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'''
+          if s.count(stub) != 1:
+              raise SystemExit(f'AOT stub signature count={s.count(stub)}')
+          s = s.replace(stub, stub_new, 1)
+
+          real_sig = '''    fn spawn_actor(\n        &mut self,\n        module: &crate::bytecode::CodeModule,\n        behavior_idx: usize,\n        init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'''
+          real_sig_new = '''    fn spawn_actor(\n        &mut self,\n        module: &crate::bytecode::CodeModule,\n        spawn_pc: usize,\n        behavior_idx: usize,\n        init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'''
+          if s.count(real_sig) != 2:
+              raise SystemExit(f'AOT real signature count={s.count(real_sig)}')
+          s = s.replace(real_sig, real_sig_new)
+
+          body = '''unsafe { (*self.runtime).spawn_from_module(module, behavior_idx, init) }'''
+          body_new = '''unsafe {\n            crate::runtime::callbacks::spawn_with_site_authority(\n                &mut *self.runtime,\n                module,\n                spawn_pc,\n                behavior_idx,\n                init,\n            )\n        }'''
+          if s.count(body) != 2:
+              raise SystemExit(f'AOT spawn body count={s.count(body)}')
+          s = s.replace(body, body_new)
+          p.write_text(s)
+          PY
       - name: Format
         run: cargo fmt --all
       - name: Run focused regression tests
@@ -46,5 +79,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
+          git diff --cached --check
           git commit -m "feat(authority): thread exact spawn provenance [authority-patch-applied]"
           git push origin HEAD:feat/spawn-authority-provenance
