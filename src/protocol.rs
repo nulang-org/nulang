@@ -138,7 +138,9 @@ impl ProtocolId {
                     hasher.update(&[1]);
                     hasher.update(response.as_bytes());
                 }
-                None => hasher.update(&[0]),
+                None => {
+                    hasher.update(&[0]);
+                }
             }
         }
 
@@ -187,7 +189,9 @@ pub enum ProtocolSchemaError {
 impl fmt::Display for ProtocolSchemaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProtocolSchemaError::EmptyBehaviorName => f.write_str("protocol behavior name is empty"),
+            ProtocolSchemaError::EmptyBehaviorName => {
+                f.write_str("protocol behavior name is empty")
+            }
             ProtocolSchemaError::DuplicateBehavior(name) => {
                 write!(f, "duplicate protocol behavior '{name}'")
             }
@@ -302,17 +306,29 @@ mod tests {
     fn signature_changes_change_protocol_id() {
         let one = ProtocolSchema::new(
             "Account",
-            [ProtocolMember::request_reply("Withdraw", vec![money()], receipt())],
+            [ProtocolMember::request_reply(
+                "Withdraw",
+                vec![money()],
+                receipt(),
+            )],
         )
         .unwrap();
         let changed_param = ProtocolSchema::new(
             "Account",
-            [ProtocolMember::request_reply("Withdraw", vec![int()], receipt())],
+            [ProtocolMember::request_reply(
+                "Withdraw",
+                vec![int()],
+                receipt(),
+            )],
         )
         .unwrap();
         let changed_response = ProtocolSchema::new(
             "Account",
-            [ProtocolMember::request_reply("Withdraw", vec![money()], money())],
+            [ProtocolMember::request_reply(
+                "Withdraw",
+                vec![money()],
+                money(),
+            )],
         )
         .unwrap();
         assert_ne!(one.id(), changed_param.id());
@@ -328,7 +344,11 @@ mod tests {
         .unwrap();
         let request = ProtocolSchema::new(
             "Account",
-            [ProtocolMember::request_reply("Deposit", vec![money()], receipt())],
+            [ProtocolMember::request_reply(
+                "Deposit",
+                vec![money()],
+                receipt(),
+            )],
         )
         .unwrap();
         assert_ne!(message.id(), request.id());
