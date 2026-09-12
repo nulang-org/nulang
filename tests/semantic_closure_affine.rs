@@ -11,8 +11,8 @@ use nulang::vm::VM;
 #[test]
 fn resume_without_live_continuation_traps_deterministically() {
     let mut module = CodeModule::new("affine-resume-without-capture");
-    let one = module.add_constant(Constant::Int(1));
-    module.emit(Instruction::new2(OpCode::ConstU, 0, one as u8));
+    module.constants.push(Constant::Int(1));
+    module.emit(Instruction::new2(OpCode::ConstU, 0, 0));
     module.emit(Instruction::new1(OpCode::Resume, 0));
     module.entry_point = Some(0);
 
