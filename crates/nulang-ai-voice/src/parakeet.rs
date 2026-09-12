@@ -19,7 +19,9 @@ pub trait ParakeetRuntimeSession: Send {
         frame: AudioFrame,
     ) -> VoiceFuture<'a, Result<Vec<Transcript>, VoiceProviderError>>;
 
-    fn finish<'a>(&'a mut self) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>>;
+    fn finish<'a>(
+        &'a mut self,
+    ) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>>;
 }
 
 pub struct ParakeetRecognizer<R> {
@@ -49,7 +51,9 @@ impl SpeechRecognitionSession for ParakeetSession {
         self.inner.push(frame)
     }
 
-    fn finish<'a>(&'a mut self) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>> {
+    fn finish<'a>(
+        &'a mut self,
+    ) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>> {
         self.inner.finish()
     }
 }
@@ -107,7 +111,9 @@ mod tests {
             })
         }
 
-        fn finish<'a>(&'a mut self) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>> {
+        fn finish<'a>(
+            &'a mut self,
+        ) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>> {
             Box::pin(async { Ok(None) })
         }
     }
