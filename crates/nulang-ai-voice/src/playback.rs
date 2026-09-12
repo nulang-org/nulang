@@ -1,6 +1,4 @@
-use nulang_ai_core::voice::{
-    AudioFrame, SpeechSynthesisStream, VoiceEvent, VoiceProviderError,
-};
+use nulang_ai_core::voice::{AudioFrame, SpeechSynthesisStream, VoiceEvent, VoiceProviderError};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -31,10 +29,7 @@ impl PlaybackController {
         stream: Box<dyn SpeechSynthesisStream>,
     ) -> Result<(), PlaybackError> {
         if let Some(mut current) = self.current.take() {
-            current
-                .cancel()
-                .await
-                .map_err(PlaybackError::Provider)?;
+            current.cancel().await.map_err(PlaybackError::Provider)?;
         }
         self.current = Some(stream);
         self.event_tx
