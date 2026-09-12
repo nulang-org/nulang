@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::admission_policy::{
     evaluate_artifact_admission, AdmissionDecision, AdmissionEnvironment, AdmissionPolicy,
@@ -19,11 +19,12 @@ pub const DEPLOYMENT_AUDIT_SCHEMA_VERSION: u32 = 1;
 
 /// Immutable evidence for one admission decision.
 ///
-/// Fields are private so callers cannot mutate security evidence after record
-/// construction. Timestamps intentionally do not live in this value: the
+/// Fields are private and the type is serialize-only so callers cannot bypass
+/// [`DeploymentAdmissionRecord::new`] via struct literals or generic serde
+/// deserialization. Timestamps intentionally do not live in this value: the
 /// persistence layer may attach receipt/commit time while this record remains
 /// deterministic and content-addressable from the security inputs themselves.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeploymentAdmissionRecord {
     schema_version: u32,
     deployment_id: String,
@@ -316,13 +317,13 @@ mod tests {
 
     fn bundle_from_module(module: CodeModule) -> DeploymentBundle {
         let artifact = module.to_nbc(None).expect("encode nbc");
-        let package = b"[package]\nname = \"app\"\nversion = \"0.1.0\"\n";
+        let package: &[u8] = b"[package]\nname = \"app\"\nversion = \"0.1.0\"\n";
         let mut output = Vec::new();
         {
             let gzip = GzEncoder::new(&mut output, Compression::default());
             let mut builder = tar::Builder::new(gzip);
             for (path, data) in [
-                ("Nulang.toml", package.as_slice()),
+                ("Nulang.toml", package),
                 (".nula/dist/app.nbc", artifact.as_slice()),
             ] {
                 let mut header = tar::Header::new_gnu();
