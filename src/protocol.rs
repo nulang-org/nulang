@@ -183,6 +183,65 @@ impl FromStr for ProtocolId {
     }
 }
 
+/// Runtime/wire-ready actor address carrying its exact protocol identity.
+///
+/// This is intentionally independent of `runtime::NodeId` so compiler,
+/// package, and serialization code can use protocol metadata without depending
+/// on the actor runtime. The runtime can losslessly convert its `NodeId(u64)`
+/// and actor id into this envelope when distributed dispatch becomes typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProtocolActorRef {
+    pub node_id: u64,
+    pub actor_id: u64,
+    pub protocol_id: ProtocolId,
+}
+
+impl ProtocolActorRef {
+    pub fn new(node_id: u64, actor_id: u64, protocol_id: ProtocolId) -> Self {
+        Self {
+            node_id,
+            actor_id,
+            protocol_id,
+        }
+    }
+
+    pub fn matches_protocol(&self, expected: ProtocolId) -> bool {
+        self.protocol_id == expected
+    }
+
+    /// Exact compatibility is the initial distributed protocol rule.
+    /// Subtyping/schema-evolution compatibility must be explicit later rather
+    /// than silently weakening this check.
+    pub fn require_protocol(&self, expected: ProtocolId) -> Result<(), ProtocolMismatch> {
+        if self.matches_protocol(expected) {
+            Ok(())
+        } else {
+            Err(ProtocolMismatch {
+                expected,
+                actual: self.protocol_id,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolMismatch {
+    pub expected: ProtocolId,
+    pub actual: ProtocolId,
+}
+
+impl fmt::Display for ProtocolMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "actor protocol mismatch: expected {}, got {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl Error for ProtocolMismatch {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolSchemaError {
     EmptyBehaviorName,
@@ -381,6 +440,34 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ProtocolSchemaError::DuplicateBehavior("Ping".into()));
+    }
+
+    #[test]
+    fn protocol_actor_ref_requires_exact_protocol() {
+        let account = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Balance", vec![], money())],
+        )
+        .unwrap()
+        .id();
+        let inventory = ProtocolSchema::new(
+            "Inventory",
+            [ProtocolMember::request_reply("Count", vec![], int())],
+        )
+        .unwrap()
+        .id();
+
+        let actor = ProtocolActorRef::new(7, 42, account);
+        assert_eq!(actor.node_id, 7);
+        assert_eq!(actor.actor_id, 42);
+        assert!(actor.require_protocol(account).is_ok());
+        assert_eq!(
+            actor.require_protocol(inventory),
+            Err(ProtocolMismatch {
+                expected: inventory,
+                actual: account,
+            })
+        );
     }
 
     #[test]
