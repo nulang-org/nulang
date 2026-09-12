@@ -177,6 +177,49 @@ impl TaskReservationStore {
         Ok(())
     }
 
+    /// Reclaims expired leases and makes stranded assigned/running tasks schedulable again.
+    ///
+    /// Selection, task-state reset, and reservation deletion happen under one
+    /// `BEGIN IMMEDIATE` transaction so another scheduler cannot observe an
+    /// expired task as unreserved before its durable task state is reset.
+    pub fn reclaim_expired_running_tasks(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<Uuid>, ReservationError> {
+        let mut conn = Connection::open(&self.path)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let expired_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT task_id FROM task_reservations WHERE lease_expires_at_ms <= ?1 ORDER BY task_id",
+            )?;
+            let rows = stmt.query_map(params![now_ms], |row| row.get::<_, String>(0))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                if let Ok(id) = Uuid::parse_str(&row?) {
+                    ids.push(id);
+                }
+            }
+            ids
+        };
+
+        for task_id in &expired_ids {
+            tx.execute(
+                r#"UPDATE tasks
+                SET status = 'ready', assigned_agent_id = NULL, updated_at = ?1
+                WHERE id = ?2 AND status IN ('assigned', 'running')"#,
+                params![chrono::Utc::now().to_rfc3339(), task_id.to_string()],
+            )?;
+        }
+
+        tx.execute(
+            "DELETE FROM task_reservations WHERE lease_expires_at_ms <= ?1",
+            params![now_ms],
+        )?;
+        tx.commit()?;
+        Ok(expired_ids)
+    }
+
     pub fn active_count_for_worker(
         &self,
         agent_id: &str,
@@ -245,6 +288,47 @@ mod tests {
             Err(ReservationError::ReservationLost { .. })
         ));
         store.release(&renewed).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expired_running_task_is_requeued_atomically() {
+        let (store, path) = store();
+        let task_id = Uuid::new_v4();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                assigned_agent_id TEXT,
+                updated_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, status, assigned_agent_id, updated_at) VALUES (?1, 'running', 'worker-a', 'old')",
+            params![task_id.to_string()],
+        )
+        .unwrap();
+        store
+            .reserve_with_capacity(task_id, "worker-a", 1, 1_000, 100)
+            .unwrap();
+
+        let recovered = store.reclaim_expired_running_tasks(1_101).unwrap();
+        assert_eq!(recovered, vec![task_id]);
+
+        let (status, assigned): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, assigned_agent_id FROM tasks WHERE id = ?1",
+                params![task_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "ready");
+        assert_eq!(assigned, None);
+        assert_eq!(store.active_count_for_worker("worker-a", 1_101).unwrap(), 0);
         let _ = std::fs::remove_file(path);
     }
 }
