@@ -60,11 +60,7 @@ impl DurableEffectId {
     /// Compensation identity is domain-separated from ordinary effect identity
     /// and includes the original effect ID, so compensating two otherwise
     /// identical operations cannot collide.
-    pub fn derive_compensation(
-        self,
-        compensation_ordinal: u32,
-        effect_operation: &str,
-    ) -> Self {
+    pub fn derive_compensation(self, compensation_ordinal: u32, effect_operation: &str) -> Self {
         let mut hasher = Hasher::new();
         hasher.update(COMPENSATION_ID_DOMAIN);
         hasher.update(&self.0);
@@ -145,11 +141,10 @@ impl FromStr for DurableEffectId {
         for (index, slot) in out.iter_mut().enumerate() {
             let hi = decode_hex(bytes[index * 2])
                 .ok_or(DurableEffectIdParseError::InvalidHex { index: index * 2 })?;
-            let lo = decode_hex(bytes[index * 2 + 1]).ok_or(
-                DurableEffectIdParseError::InvalidHex {
+            let lo =
+                decode_hex(bytes[index * 2 + 1]).ok_or(DurableEffectIdParseError::InvalidHex {
                     index: index * 2 + 1,
-                },
-            )?;
+                })?;
             *slot = (hi << 4) | lo;
         }
         Ok(Self(out))
@@ -245,17 +240,15 @@ impl DurableEffectRecord {
 
     pub fn request_digest(&self) -> &[u8; 32] {
         match self {
-            Self::Prepared { request_digest, .. }
-            | Self::Completed { request_digest, .. } => request_digest,
+            Self::Prepared { request_digest, .. } | Self::Completed { request_digest, .. } => {
+                request_digest
+            }
         }
     }
 
     /// Verify that recovery is replaying the exact request originally bound to
     /// this logical effect ID.
-    pub fn validate_request(
-        &self,
-        request: &[u8],
-    ) -> Result<(), DurableEffectRequestMismatch> {
+    pub fn validate_request(&self, request: &[u8]) -> Result<(), DurableEffectRequestMismatch> {
         let actual_digest = request_digest(request);
         let expected_digest = *self.request_digest();
         if actual_digest == expected_digest {
@@ -295,9 +288,9 @@ impl DurableEffectRecord {
             }
             Self::Prepared { spec, .. } => match spec.delivery {
                 DeliverySemantics::BackendDefined => DurableEffectRecoveryAction::DelegateToBackend,
-                DeliverySemantics::AtLeastOnce => {
-                    DurableEffectRecoveryAction::RetryAtLeastOnce { operation_id: spec.id }
-                }
+                DeliverySemantics::AtLeastOnce => DurableEffectRecoveryAction::RetryAtLeastOnce {
+                    operation_id: spec.id,
+                },
                 DeliverySemantics::EffectivelyOnceWithDeduplication => {
                     DurableEffectRecoveryAction::RetryWithDeduplication {
                         operation_id: spec.id,
@@ -338,14 +331,9 @@ impl DurableEffectRecord {
             Self::Prepared { .. } => return Err(DurableCompensationError::OriginalNotCompleted),
         };
         let effect_operation = effect_operation.into();
-        let compensation_id = original_effect_id
-            .derive_compensation(compensation_ordinal, &effect_operation);
-        let spec = DurableEffectSpec::new(
-            compensation_id,
-            effect_operation,
-            boundary,
-            delivery,
-        );
+        let compensation_id =
+            original_effect_id.derive_compensation(compensation_ordinal, &effect_operation);
+        let spec = DurableEffectSpec::new(compensation_id, effect_operation, boundary, delivery);
         Ok(DurableCompensationRecord {
             original_effect_id,
             compensation_ordinal,
@@ -420,10 +408,7 @@ impl DurableCompensationRecord {
         self.effect.spec().id
     }
 
-    pub fn validate_request(
-        &self,
-        request: &[u8],
-    ) -> Result<(), DurableEffectRequestMismatch> {
+    pub fn validate_request(&self, request: &[u8]) -> Result<(), DurableEffectRequestMismatch> {
         self.effect.validate_request(request)
     }
 
@@ -474,10 +459,7 @@ mod tests {
             base,
             DurableEffectId::derive(42, "step", 1, "Payment.charge")
         );
-        assert_ne!(
-            base,
-            DurableEffectId::derive(42, "step", 0, "Email.send")
-        );
+        assert_ne!(base, DurableEffectId::derive(42, "step", 0, "Email.send"));
         assert_ne!(
             base,
             DurableEffectId::derive(43, "step", 0, "Payment.charge")
@@ -612,9 +594,7 @@ mod tests {
         assert_eq!(compensation.compensation_ordinal(), 0);
         assert_ne!(compensation_id, original_id);
         assert_eq!(
-            compensation
-                .recovery_action_for_request(b"refund")
-                .unwrap(),
+            compensation.recovery_action_for_request(b"refund").unwrap(),
             DurableEffectRecoveryAction::RetryWithDeduplication {
                 operation_id: compensation_id,
             }
@@ -639,9 +619,7 @@ mod tests {
             .unwrap()
             .complete(b"refunded".to_vec());
         assert_eq!(
-            compensation
-                .recovery_action_for_request(b"refund")
-                .unwrap(),
+            compensation.recovery_action_for_request(b"refund").unwrap(),
             DurableEffectRecoveryAction::ReplayRecordedResult(b"refunded")
         );
     }
