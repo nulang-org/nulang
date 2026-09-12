@@ -95,7 +95,6 @@ impl FlightRecorder {
         let seq = self.next_seq;
         self.next_seq += 1;
 
-        let payload_len = payload.len();
         let payload_summary = payload
             .iter()
             .take(3)
