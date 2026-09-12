@@ -303,7 +303,10 @@ mod tests {
             .observe_partial("review billing", PrefetchSafety::ReadOnly)
             .await
             .unwrap();
-        let result = controller.observe_final("delete billing account").await.unwrap();
+        let result = controller
+            .observe_final("delete billing account")
+            .await
+            .unwrap();
         assert_eq!(result, SpeculationOutcome::Cancelled);
     }
 
