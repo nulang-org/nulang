@@ -74,8 +74,7 @@ pub struct LeaseError {
 
 pub type AcquireLeaseFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CapacityLease, LeaseError>> + Send + 'a>>;
-pub type ReleaseLeaseFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), LeaseError>> + Send + 'a>>;
+pub type ReleaseLeaseFuture<'a> = Pin<Box<dyn Future<Output = Result<(), LeaseError>> + Send + 'a>>;
 
 /// Provider-side capacity acquisition boundary.
 ///
@@ -104,10 +103,8 @@ pub enum ClaimResult {
     HeldByOther,
 }
 
-pub type ClaimFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<ClaimResult, String>> + Send + 'a>>;
-pub type ReleaseClaimFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+pub type ClaimFuture<'a> = Pin<Box<dyn Future<Output = Result<ClaimResult, String>> + Send + 'a>>;
+pub type ReleaseClaimFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 /// Durable compare-and-set boundary owned by the Cloud control plane.
 ///
