@@ -1,0 +1,155 @@
+name: Temporary selective receive ORCA regression
+
+on:
+  push:
+    branches:
+      - fix/selective-receive-semantic-closure
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/selective-receive-semantic-closure
+          fetch-depth: 0
+
+      - name: Add pointer-bearing ORCA regression
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/runtime/tests.rs")
+          text = path.read_text()
+          marker = "fn test_selective_receive_orca_hold_begins_only_on_commit()"
+          if marker in text:
+              raise SystemExit("regression already present")
+
+          test = r'''
+
+#[test]
+fn test_selective_receive_orca_hold_begins_only_on_commit() {
+    use crate::vm::ActorVmCallbacks;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let runtime = Rc::new(RefCell::new(Runtime::new()));
+    let (receiver_id, ptr) = {
+        let mut rt = runtime.borrow_mut();
+        let owner_id = rt.spawn_actor(Box::new(|| vec![]));
+        let receiver_id = rt.spawn_actor(Box::new(|| vec![]));
+        let ptr = {
+            let owner = rt.actors.get_mut(&owner_id).expect("owner actor");
+            owner
+                .orca_gc
+                .alloc_object(&mut owner.heap, 8, TypeTag::Raw)
+                .expect("owner allocation")
+        };
+
+        rt.current_actor = Some(receiver_id);
+        rt.actors
+            .get_mut(&receiver_id)
+            .expect("receiver actor")
+            .mailbox
+            .push_local(Message {
+                behavior_id: 7,
+                payload: Arc::new(vec![Value::ptr(ptr)]),
+                sender: owner_id,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .expect("queue pointer-bearing message");
+        (receiver_id, ptr)
+    };
+
+    let header = unsafe { ActorHeap::header_of(ptr) };
+    assert_eq!(unsafe { (*header).foreign_count }, 0);
+
+    let mut callbacks = RuntimeVmCallbacks::new(Rc::clone(&runtime));
+    let (_, first_payload) = ActorVmCallbacks::try_receive_match(&mut callbacks, &[7])
+        .expect("first selective-receive candidate");
+    assert_eq!(first_payload, vec![Value::ptr(ptr)]);
+    assert_eq!(
+        unsafe { (*header).foreign_count },
+        0,
+        "candidate discovery must not establish receiver ownership"
+    );
+
+    ActorVmCallbacks::reset_receive_match(&mut callbacks);
+    assert_eq!(
+        unsafe { (*header).foreign_count },
+        0,
+        "guard rejection/reset must not leak a receiver hold"
+    );
+    assert_eq!(
+        runtime
+            .borrow()
+            .actors
+            .get(&receiver_id)
+            .expect("receiver actor")
+            .mailbox
+            .len(),
+        1,
+        "rejected candidate must remain logically queued"
+    );
+
+    ActorVmCallbacks::try_receive_match(&mut callbacks, &[7])
+        .expect("candidate after reset");
+    ActorVmCallbacks::commit_receive_match(&mut callbacks);
+
+    assert_eq!(
+        unsafe { (*header).foreign_count },
+        1,
+        "commit must establish exactly one receiver-side ORCA hold"
+    );
+    assert_eq!(
+        runtime
+            .borrow()
+            .actors
+            .get(&receiver_id)
+            .expect("receiver actor")
+            .mailbox
+            .len(),
+        0,
+        "committed candidate must be consumed exactly once"
+    );
+}
+'''
+          path.write_text(text.rstrip() + test + "\n")
+          PY
+
+      - name: Format patched source
+        shell: bash
+        run: |
+          cargo fmt --all
+          unexpected="$(git diff --name-only | grep -v '^src/runtime/tests.rs$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "cargo fmt changed unexpected files:"
+            echo "$unexpected"
+            exit 1
+          fi
+          git diff --check
+
+      - name: Verify pointer-bearing ORCA regression
+        run: cargo test test_selective_receive_orca_hold_begins_only_on_commit --lib
+
+      - name: Verify mailbox transaction regressions
+        run: cargo test transactional_receive_tests --lib
+
+      - name: Verify all targets compile
+        run: cargo check --all-targets
+
+      - name: Commit verified regression and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/runtime/tests.rs
+          git rm .github/workflows/tmp-selective-receive-orca-regression.yml
+          git commit -m "test(runtime): pin selective receive ORCA ownership"
+          git push origin HEAD:fix/selective-receive-semantic-closure
