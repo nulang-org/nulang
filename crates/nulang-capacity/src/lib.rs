@@ -6,6 +6,7 @@ pub mod broker;
 pub mod interruption;
 pub mod provider;
 pub mod providers;
+pub mod telemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
