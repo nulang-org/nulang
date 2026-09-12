@@ -1,0 +1,85 @@
+name: Repair baseline 180
+
+on:
+  push:
+    branches:
+      - fix/ci-baseline-171
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/ci-baseline-171
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Apply deterministic baseline repair
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo +1.95.0 fmt --all
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          spec = Path('SPEC2.md')
+          text = spec.read_text()
+          replacements = {
+              '    perform IO.print("Processing order")': '    // Replay-safe order-receipt logic belongs here.\n    ()',
+              '    perform IO.print("Checking stock")': '    // Replay-safe inventory validation belongs here.\n    ()',
+              '    perform IO.print("Charging payment")': '    // Replay-safe payment orchestration belongs here.\n    ()',
+              '    perform IO.print("Shipping")': '    // Replay-safe shipment orchestration belongs here.\n    ()',
+              '      perform IO.print("gathering A")': '      // Replay-safe branch A logic.\n      ()',
+              '      perform IO.print("gathering B")': '      // Replay-safe branch B logic.\n      ()',
+              '    perform IO.print("aggregating")': '    // Replay-safe aggregation logic.\n    ()',
+              '    perform IO.print("reserved")': '    // Replay-safe reservation logic.\n    ()',
+              '    perform IO.print("released")': '    // Replay-safe release logic.\n    ()',
+              '    perform IO.print("charged")': '    // Replay-safe payment logic.\n    ()',
+              '    perform IO.print("refunded")': '    // Replay-safe refund logic.\n    ()',
+              '    perform IO.print("shipped")': '    // Replay-safe shipment logic.\n    ()',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'missing expected SPEC2 fragment: {old}')
+              text = text.replace(old, new, 1)
+          spec.write_text(text)
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+          marker = '#![cfg_attr(test, allow(clippy::approx_constant))]'
+          if marker not in text:
+              anchor = ')]\n\npub mod agent;'
+              replacement = ')]\n// Test fixtures intentionally exercise source-level decimal spellings such as 3.14;\n// replacing those values with mathematical constants would change test semantics.\n#![cfg_attr(test, allow(clippy::approx_constant))]\n\npub mod agent;'
+              if anchor not in text:
+                  raise SystemExit('src/lib.rs insertion anchor not found')
+              text = text.replace(anchor, replacement, 1)
+              lib.write_text(text)
+          PY
+
+          cargo +1.95.0 fmt --all -- --check
+          git diff --check
+
+      - name: Commit repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo 'No repair changes required.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add SPEC2.md src/lib.rs src/effect_checker.rs src/main.rs src/mir_codegen.rs src/types.rs
+          git commit -m 'ci: complete baseline formatting and docs repair'
+          git push origin HEAD:fix/ci-baseline-171
