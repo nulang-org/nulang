@@ -423,8 +423,8 @@ mod authority_tests {
         let module = CodeModule::new("root-authority");
         let requested = secret_manifest("STRIPE_KEY");
 
-        let value = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested)
-            .unwrap();
+        let value =
+            spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested).unwrap();
         let actor_id = value.as_actor_id().unwrap();
         let actor = rt.actors.get(&actor_id).unwrap();
 
@@ -448,18 +448,16 @@ mod authority_tests {
         rt.current_actor = Some(parent_id);
 
         let module = CodeModule::new("delegated-authority");
-        let value = spawn_from_module_with_authority(
-            &mut rt,
-            &module,
-            0,
-            vec![],
-            &parent_manifest,
-        )
-        .unwrap();
+        let value = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &parent_manifest)
+            .unwrap();
         let child_id = value.as_actor_id().unwrap();
 
         assert_eq!(
-            rt.actors.get(&child_id).unwrap().authority_manifest().unwrap(),
+            rt.actors
+                .get(&child_id)
+                .unwrap()
+                .authority_manifest()
+                .unwrap(),
             parent_manifest
         );
     }
@@ -473,8 +471,7 @@ mod authority_tests {
         let requested = secret_manifest("STRIPE_KEY");
         let module = CodeModule::new("denied-authority");
 
-        let result =
-            spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested);
+        let result = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested);
 
         assert_eq!(
             result,
@@ -499,8 +496,7 @@ mod authority_tests {
         let requested = AuthorityManifest::new();
         let module = CodeModule::new("malformed-parent-authority");
 
-        let result =
-            spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested);
+        let result = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested);
 
         assert!(matches!(
             result,
