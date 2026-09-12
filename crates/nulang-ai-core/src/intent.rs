@@ -96,7 +96,8 @@ impl IntentIr {
         self.requested_capabilities = classification.required_capabilities;
         self.requires_confirmation = classification.requires_confirmation;
         self.execution_confirmed = !classification.requires_confirmation;
-        self.metadata["classification_rationale"] = serde_json::Value::String(classification.rationale);
+        self.metadata["classification_rationale"] =
+            serde_json::Value::String(classification.rationale);
     }
 
     pub fn confirm_execution(&mut self) -> Result<(), IntentExecutionError> {
