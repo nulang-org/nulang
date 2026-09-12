@@ -13,12 +13,12 @@ def replace_once(path: str, old: str, new: str) -> None:
 
 replace_once(
     "src/authority.rs",
-    """        token.parse()
+    r'''        token.parse()
     }
 }
 
-/// Deterministically ordered authority set.""",
-    """        token.parse()
+/// Deterministically ordered authority set.''',
+    r'''        token.parse()
     }
 
     /// Render this grant as valid source syntax. Unlike the canonical token
@@ -75,7 +75,7 @@ fn quote_source_string(value: &str) -> String {
     out
 }
 
-/// Deterministically ordered authority set.""",
+/// Deterministically ordered authority set.''',
 )
 
 replace_once(
@@ -86,7 +86,7 @@ replace_once(
 
 replace_once(
     "src/fmt.rs",
-    """                    // Canonical token `Net::TcpOut(host:port)` → source form.
+    r'''                    // Canonical token `Net::TcpOut(host:port)` → source form.
                     if let Some(dest) = cap
                         .strip_prefix("Net::TcpOut(")
                         .and_then(|r| r.strip_suffix(')'))
@@ -94,8 +94,8 @@ replace_once(
                         out.push_str(&format!("Net::TcpOut(\"{}\")", dest));
                     } else {
                         out.push_str(cap);
-                    }""",
-    """                    match cap.parse::<AuthorityGrant>() {
+                    }''',
+    r'''                    match cap.parse::<AuthorityGrant>() {
                         Ok(grant) => out.push_str(&grant.to_source_syntax()),
                         Err(_) => {
                             // Parsed source should never carry malformed authority
@@ -103,7 +103,7 @@ replace_once(
                             // silently changes or drops authority.
                             *had_unhandled = true;
                         }
-                    }""",
+                    }''',
 )
 
 roundtrip_test = r'''    #[test]
@@ -137,8 +137,8 @@ fn main() {
 '''
 replace_once(
     "src/fmt.rs",
-    """    #[test]
-    fn test_fmt_spawn_handle_receive() {""",
-    roundtrip_test + """    #[test]
-    fn test_fmt_spawn_handle_receive() {""",
+    r'''    #[test]
+    fn test_fmt_spawn_handle_receive() {''',
+    roundtrip_test + r'''    #[test]
+    fn test_fmt_spawn_handle_receive() {''',
 )
