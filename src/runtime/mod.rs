@@ -45,6 +45,7 @@ mod persistence;
 mod process_groups;
 mod registry;
 mod spawn;
+pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
 mod trace;
 mod workflow;
