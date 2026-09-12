@@ -76,7 +76,7 @@ jobs:
           if s.count(private_import) != 1:
               raise SystemExit(f'private authority import count={s.count(private_import)}')
           s = s.replace(private_import, '', 1)
-          helper_anchor = 'fn two_spawn_source() -> \'static str {\n'
+          helper_anchor = "fn two_spawn_source() -> &'static str {\n"
           helper = '''fn spawn_grants(module: &nulang::bytecode::CodeModule, pc: usize) -> Vec<String> {
     module
         .spawn_capability_grants
