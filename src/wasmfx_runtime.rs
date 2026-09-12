@@ -145,7 +145,7 @@ impl WasmFxRuntime {
             self.init_func.call(&mut self.store, ())
         }));
         match result {
-            Ok(Ok(raw)) => Ok(crate::vm::Value::from_raw(raw as u64)),
+            Ok(Ok(raw)) => guest_result_value(raw as u64),
             Ok(Err(trap)) => {
                 let msg = format!(
                     "wasm module suspended or trapped: {} \
@@ -167,6 +167,19 @@ impl WasmFxRuntime {
             }),
         }
     }
+}
+
+/// Decode a guest-produced tagged value without allowing a WASM linear-memory
+/// offset or arbitrary integer to masquerade as a host heap pointer. `TAG_PTR`
+/// is process-local host provenance in `Value`; a guest cannot establish it.
+fn guest_result_value(raw: u64) -> NuResult<crate::vm::Value> {
+    if value_layout::is_ptr_raw(raw) {
+        return Err(NuError::VMError {
+            msg: "wasmfx guest returned a host pointer-tagged value".into(),
+            span: crate::types::Span::default(),
+        });
+    }
+    Ok(crate::vm::Value::from_raw(raw))
 }
 
 // ── Host import functions ──────────────────────────────────────────────
@@ -263,6 +276,18 @@ mod tests {
         let mir = crate::mir_lower::lower_module(&hir).unwrap();
         let mut backend = crate::wasmfx_backend::WasmFxBackend::new();
         backend.compile(&mir, "test").unwrap()
+    }
+
+    #[test]
+    fn guest_result_rejects_host_pointer_tag() {
+        let err = guest_result_value(crate::value_layout::TAG_PTR | 0x1234).unwrap_err();
+        assert!(err.to_string().contains("host pointer-tagged"));
+    }
+
+    #[test]
+    fn guest_result_accepts_scalar_value() {
+        let value = guest_result_value(crate::value_layout::tag_int(42)).unwrap();
+        assert_eq!(value.as_int(), Some(42));
     }
 
     #[test]
