@@ -1,0 +1,44 @@
+name: Value pointer provenance audit
+
+on:
+  push:
+    branches:
+      - audit/value-ptr-provenance
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: audit/value-ptr-provenance
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: Enumerate Value::ptr provenance call sites
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/vm.rs')
+          s = p.read_text()
+          old = '    pub fn ptr(p: *mut u8) -> Self {'
+          new = '    pub unsafe fn ptr(p: *mut u8) -> Self {'
+          if old not in s:
+              raise SystemExit('Value::ptr source shape changed')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          set +e
+          cargo +1.95.0 check --all-targets --all-features 2>&1 | tee /tmp/value-ptr-audit.log
+          status=${PIPESTATUS[0]}
+          set -e
+          echo '--- unsafe Value::ptr diagnostics ---'
+          grep -n -B2 -A5 'call to unsafe function.*Value::ptr' /tmp/value-ptr-audit.log || true
+          echo '--- textual callsites ---'
+          grep -RIn --include='*.rs' 'Value::ptr(' src tests crates || true
+          # The audit intentionally succeeds after collecting diagnostics.
+          exit 0
