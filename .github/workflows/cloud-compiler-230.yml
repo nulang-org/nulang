@@ -1,0 +1,82 @@
+name: Cloud compiler #230 integration
+
+on:
+  push:
+    branches:
+      - ci/cloud-compiler-230
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate-cloud-compiler:
+    name: Validate Cloud compiler guest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout pinned Nulang compiler
+        uses: actions/checkout@v7
+        with:
+          path: nulang
+
+      - name: Checkout Nulang Cloud compiler branch
+        uses: actions/checkout@v7
+        with:
+          repository: dporkka/nulang-cloud
+          ref: build/real-firecracker-execution
+          path: nulang-cloud
+
+      - name: Verify Nulang revision
+        run: |
+          test "$(git -C nulang rev-parse HEAD)" = "ac4af2cc084b3684ac61d58afb78912529079ef4"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev cmake libssl-dev pkg-config protobuf-compiler
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nulang-cloud
+          shared-key: cloud-compiler-230
+
+      - name: Check compiler guest formatting
+        working-directory: nulang-cloud
+        run: cargo fmt --check -p ephemeral-compiler
+
+      - name: Check compiler guest
+        working-directory: nulang-cloud
+        run: cargo check -p ephemeral-compiler
+
+      - name: Test embedded compiler and sandbox
+        working-directory: nulang-cloud
+        run: cargo test -p ephemeral-compiler --lib
+
+      - name: Check host compiler spawner
+        working-directory: nulang-cloud
+        run: cargo check -p host-agent
+
+      - name: Test host compiler spawner
+        working-directory: nulang-cloud
+        run: cargo test -p host-agent compiler_spawner --lib
+
+      - name: Show lockfile delta
+        if: always()
+        working-directory: nulang-cloud
+        run: git diff -- Cargo.lock || true
+
+      - name: Upload generated lockfile
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cloud-compiler-230-cargo-lock
+          path: nulang-cloud/Cargo.lock
+          if-no-files-found: error
