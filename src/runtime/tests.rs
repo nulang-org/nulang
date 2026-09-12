@@ -6940,3 +6940,90 @@ fn test_send_to_grain_cross_shard_routes_and_hydrates() {
         "inc message should be processed on shard 1"
     );
 }
+
+#[test]
+fn test_selective_receive_orca_hold_begins_only_on_commit() {
+    use crate::vm::ActorVmCallbacks;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let runtime = Rc::new(RefCell::new(Runtime::new()));
+    let (receiver_id, ptr) = {
+        let mut rt = runtime.borrow_mut();
+        let owner_id = rt.spawn_actor(Box::new(|| vec![]));
+        let receiver_id = rt.spawn_actor(Box::new(|| vec![]));
+        let ptr = {
+            let owner = rt.actors.get_mut(&owner_id).expect("owner actor");
+            owner
+                .orca_gc
+                .alloc_object(&mut owner.heap, 8, TypeTag::Raw)
+                .expect("owner allocation")
+        };
+
+        rt.current_actor = Some(receiver_id);
+        rt.actors
+            .get_mut(&receiver_id)
+            .expect("receiver actor")
+            .mailbox
+            .push_local(Message {
+                behavior_id: 7,
+                payload: Arc::new(vec![Value::ptr(ptr)]),
+                sender: owner_id,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .expect("queue pointer-bearing message");
+        (receiver_id, ptr)
+    };
+
+    let header = unsafe { ActorHeap::header_of(ptr) };
+    assert_eq!(unsafe { (*header).foreign_count }, 0);
+
+    let mut callbacks = RuntimeVmCallbacks::new(Rc::clone(&runtime));
+    let (_, first_payload) = ActorVmCallbacks::try_receive_match(&mut callbacks, &[7])
+        .expect("first selective-receive candidate");
+    assert_eq!(first_payload, vec![Value::ptr(ptr)]);
+    assert_eq!(
+        unsafe { (*header).foreign_count },
+        0,
+        "candidate discovery must not establish receiver ownership"
+    );
+
+    ActorVmCallbacks::reset_receive_match(&mut callbacks);
+    assert_eq!(
+        unsafe { (*header).foreign_count },
+        0,
+        "guard rejection/reset must not leak a receiver hold"
+    );
+    assert_eq!(
+        runtime
+            .borrow()
+            .actors
+            .get(&receiver_id)
+            .expect("receiver actor")
+            .mailbox
+            .len(),
+        1,
+        "rejected candidate must remain logically queued"
+    );
+
+    ActorVmCallbacks::try_receive_match(&mut callbacks, &[7]).expect("candidate after reset");
+    ActorVmCallbacks::commit_receive_match(&mut callbacks);
+
+    assert_eq!(
+        unsafe { (*header).foreign_count },
+        1,
+        "commit must establish exactly one receiver-side ORCA hold"
+    );
+    assert_eq!(
+        runtime
+            .borrow()
+            .actors
+            .get(&receiver_id)
+            .expect("receiver actor")
+            .mailbox
+            .len(),
+        0,
+        "committed candidate must be consumed exactly once"
+    );
+}
