@@ -2,6 +2,7 @@
 
 use chrono::Utc;
 use nulang_ai_core::{Task, TaskStatus};
+use serde::{Deserialize, Serialize};
 
 pub trait Worker: Send + Sync {
     fn agent_id(&self) -> &str;
@@ -72,7 +73,7 @@ impl Worker for LocalWorker {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerMetadata {
     pub max_concurrency: usize,
     pub estimated_latency_ms: u64,
@@ -91,6 +92,16 @@ impl Default for WorkerMetadata {
             accelerator: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerSnapshot {
+    pub agent_id: String,
+    pub capabilities: Vec<String>,
+    pub metadata: WorkerMetadata,
+    pub last_heartbeat_ms: i64,
+    pub active_tasks: usize,
+    pub available: bool,
 }
 
 pub struct WorkerRecord {
@@ -116,6 +127,17 @@ impl WorkerRecord {
 
     pub fn has_capacity(&self) -> bool {
         self.available && self.active_tasks < self.metadata.max_concurrency.max(1)
+    }
+
+    pub fn snapshot(&self) -> WorkerSnapshot {
+        WorkerSnapshot {
+            agent_id: self.agent_id().to_string(),
+            capabilities: self.capabilities().to_vec(),
+            metadata: self.metadata.clone(),
+            last_heartbeat_ms: self.last_heartbeat_ms,
+            active_tasks: self.active_tasks,
+            available: self.available,
+        }
     }
 }
 
@@ -143,6 +165,17 @@ impl WorkerRegistry {
         }
     }
 
+    pub fn from_snapshots<I>(lease_timeout_ms: i64, snapshots: I) -> Self
+    where
+        I: IntoIterator<Item = WorkerSnapshot>,
+    {
+        let mut registry = Self::with_lease_timeout(lease_timeout_ms);
+        for snapshot in snapshots {
+            registry.restore(snapshot);
+        }
+        registry
+    }
+
     pub fn register(&mut self, worker: LocalWorker) {
         self.register_with_metadata(worker, WorkerMetadata::default());
     }
@@ -164,15 +197,23 @@ impl WorkerRegistry {
             active_tasks: 0,
             available: true,
         };
-        if let Some(existing) = self
-            .workers
-            .iter_mut()
-            .find(|existing| existing.agent_id() == record.agent_id())
-        {
-            *existing = record;
-        } else {
-            self.workers.push(record);
-        }
+        self.upsert_record(record);
+    }
+
+    pub fn restore(&mut self, snapshot: WorkerSnapshot) {
+        let worker = LocalWorker::with_capabilities(snapshot.agent_id, snapshot.capabilities);
+        let record = WorkerRecord {
+            worker,
+            metadata: snapshot.metadata,
+            last_heartbeat_ms: snapshot.last_heartbeat_ms,
+            active_tasks: snapshot.active_tasks,
+            available: snapshot.available,
+        };
+        self.upsert_record(record);
+    }
+
+    pub fn snapshots(&self) -> Vec<WorkerSnapshot> {
+        self.workers.iter().map(WorkerRecord::snapshot).collect()
     }
 
     pub fn workers(&self) -> &[WorkerRecord] {
@@ -256,6 +297,18 @@ impl WorkerRegistry {
         let result = self.workers[index].worker.execute(task);
         self.workers[index].active_tasks = self.workers[index].active_tasks.saturating_sub(1);
         result
+    }
+
+    fn upsert_record(&mut self, record: WorkerRecord) {
+        if let Some(existing) = self
+            .workers
+            .iter_mut()
+            .find(|existing| existing.agent_id() == record.agent_id())
+        {
+            *existing = record;
+        } else {
+            self.workers.push(record);
+        }
     }
 
     fn get_mut(&mut self, agent_id: &str) -> Result<&mut WorkerRecord, WorkerError> {
@@ -471,5 +524,31 @@ mod tests {
 
         assert_eq!(registry.workers().len(), 1);
         assert_eq!(registry.get("worker").unwrap().capabilities().len(), 2);
+    }
+
+    #[test]
+    fn registry_roundtrips_durable_snapshots() {
+        let mut registry = WorkerRegistry::with_lease_timeout(1_000);
+        registry.register_at(
+            LocalWorker::with_capabilities("gpu", ["code", "test", "gpu"]),
+            WorkerMetadata {
+                max_concurrency: 4,
+                estimated_latency_ms: 20,
+                cost_microusd_per_task: 7,
+                locality: Some("us-east".into()),
+                accelerator: Some("l4".into()),
+            },
+            9_000,
+        );
+        registry.update_load("gpu", 2).unwrap();
+        registry.set_available("gpu", false).unwrap();
+
+        let restored = WorkerRegistry::from_snapshots(1_000, registry.snapshots());
+        let worker = restored.get("gpu").unwrap();
+        assert_eq!(worker.capabilities(), &["code", "gpu", "test"]);
+        assert_eq!(worker.active_tasks, 2);
+        assert!(!worker.available);
+        assert_eq!(worker.metadata.accelerator.as_deref(), Some("l4"));
+        assert_eq!(worker.last_heartbeat_ms, 9_000);
     }
 }
