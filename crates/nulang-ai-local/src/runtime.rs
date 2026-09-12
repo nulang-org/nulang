@@ -67,8 +67,15 @@ impl LocalRuntime {
         };
         store.upsert_conversation(&conv)?;
 
-        let mut workers = WorkerRegistry::new();
-        workers.register(LocalWorker::new("worker-local"));
+        let snapshots = store.list_worker_snapshots()?;
+        let mut workers = WorkerRegistry::from_snapshots(
+            WorkerRegistry::DEFAULT_LEASE_TIMEOUT_MS,
+            snapshots,
+        );
+        if workers.workers().is_empty() {
+            workers.register(LocalWorker::new("worker-local"));
+            store.replace_worker_snapshots(&workers.snapshots())?;
+        }
 
         Ok(Self {
             project_dir,
@@ -94,8 +101,26 @@ impl LocalRuntime {
         self.conversation_id
     }
 
-    pub fn register_worker(&mut self, worker: LocalWorker) {
+    pub fn register_worker(&mut self, worker: LocalWorker) -> Result<(), RuntimeError> {
         self.workers.register(worker);
+        self.persist_workers()?;
+        Ok(())
+    }
+
+    pub fn heartbeat_worker(&mut self, agent_id: &str) -> Result<(), RuntimeError> {
+        self.workers.heartbeat(agent_id)?;
+        self.persist_workers()?;
+        Ok(())
+    }
+
+    pub fn set_worker_available(
+        &mut self,
+        agent_id: &str,
+        available: bool,
+    ) -> Result<(), RuntimeError> {
+        self.workers.set_available(agent_id, available)?;
+        self.persist_workers()?;
+        Ok(())
     }
 
     pub fn handle_user_message(
@@ -163,6 +188,7 @@ impl LocalRuntime {
             )?;
 
             let completed = self.workers.execute_on(&agent_id, &running)?;
+            self.persist_workers()?;
             self.store.upsert_task(&completed)?;
             self.emit(
                 out,
@@ -179,6 +205,11 @@ impl LocalRuntime {
         self.emit(out, SwarmEvent::GoalCompleted { goal_id })?;
 
         Ok(goal_id)
+    }
+
+    fn persist_workers(&self) -> Result<(), RuntimeError> {
+        self.store.replace_worker_snapshots(&self.workers.snapshots())?;
+        Ok(())
     }
 
     fn emit(&self, out: &mut dyn Write, event: SwarmEvent) -> Result<(), RuntimeError> {
@@ -230,11 +261,13 @@ mod tests {
         rt.register_worker(LocalWorker::with_capabilities(
             "worker-admin",
             ["code", "test", "repo.write", "deploy.execute"],
-        ));
+        ))
+        .unwrap();
         rt.register_worker(LocalWorker::with_capabilities(
             "worker-specialist",
             ["code", "test"],
-        ));
+        ))
+        .unwrap();
 
         let mut buf = Cursor::new(Vec::new());
         let goal_id = rt.handle_user_message("ship feature X", &mut buf).unwrap();
@@ -243,6 +276,34 @@ mod tests {
             graph.tasks[0].assigned_agent_id.as_deref(),
             Some("worker-local")
         );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn worker_registry_survives_runtime_restart() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+
+        {
+            let mut rt = LocalRuntime::open(tmp.clone()).unwrap();
+            rt.register_worker(LocalWorker::with_capabilities(
+                "worker-persistent",
+                ["code", "test", "repo.write"],
+            ))
+            .unwrap();
+            rt.set_worker_available("worker-persistent", false).unwrap();
+        }
+
+        let reopened = LocalRuntime::open(tmp.clone()).unwrap();
+        let snapshots = reopened.store().list_worker_snapshots().unwrap();
+        let persisted = snapshots
+            .iter()
+            .find(|snapshot| snapshot.agent_id == "worker-persistent")
+            .unwrap();
+        assert!(persisted.capabilities.contains(&"repo.write".into()));
+        assert!(!persisted.available);
+
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
