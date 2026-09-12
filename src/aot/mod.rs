@@ -1182,6 +1182,18 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
         Some(self.actor_id)
     }
 
+    fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
+        unsafe {
+            crate::runtime::callbacks::authorize_actor_ffi(
+                &*self.runtime,
+                Some(self.actor_id),
+                library,
+                symbol,
+            )
+            .is_ok()
+        }
+    }
+
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
         // SAFETY: the scheduler holds `&mut Runtime`; re-borrow through the
         // raw pointer, mirroring `BytecodeRuntimeCallbacks`.
@@ -1372,6 +1384,19 @@ impl std::fmt::Debug for AotTopLevelCallbacks {
 impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
     fn current_actor_id(&self) -> Option<u64> {
         self.current_actor_id()
+    }
+
+    fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
+        unsafe {
+            let rt = &*self.runtime;
+            crate::runtime::callbacks::authorize_actor_ffi(
+                rt,
+                rt.current_actor,
+                library,
+                symbol,
+            )
+            .is_ok()
+        }
     }
 
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
