@@ -38,6 +38,18 @@ pub enum MessagePriority {
     Bulk = 2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiveBuffer {
+    System,
+    Normal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReceiveSelection {
+    buffer: ReceiveBuffer,
+    index: usize,
+}
+
 /// MPSC mailbox with priority bands and optional capacity.
 ///
 /// Concurrent producers may call [`Mailbox::push`] through shared references;
@@ -53,9 +65,16 @@ pub struct Mailbox {
     local_queue: VecDeque<Message>,
     capacity: usize,
     queued_count: AtomicUsize,
-    /// Non-matching normal messages staged during selective receive.
-    /// The boolean marks candidates already tried by the current receive.
+    /// System-priority messages staged during selective receive. Staging is
+    /// transactional: candidates remain logically queued until commit.
+    system_skip_buffer: VecDeque<(Message, bool)>,
+    /// Normal/bulk messages staged during selective receive. The boolean marks
+    /// candidates already tried by the current receive expression.
     skip_buffer: VecDeque<(Message, bool)>,
+    /// Exact candidate most recently returned to the VM. Earlier rejected
+    /// candidates remain marked tried, but commit must consume this selection,
+    /// not the first tried candidate.
+    receive_selection: Option<ReceiveSelection>,
 }
 
 impl Mailbox {
@@ -70,7 +89,9 @@ impl Mailbox {
             local_queue: VecDeque::new(),
             capacity,
             queued_count: AtomicUsize::new(0),
+            system_skip_buffer: VecDeque::new(),
             skip_buffer: VecDeque::new(),
+            receive_selection: None,
         }
     }
 
@@ -133,104 +154,102 @@ impl Mailbox {
 
     /// Pop the highest-priority message.
     pub fn pop(&mut self) -> Option<Message> {
+        // Messages already staged by a previous selective receive are older
+        // than subsequently-arrived concurrent traffic at the same priority,
+        // so consume staged system messages before the live system queue and
+        // staged normal messages before the live normal queue.
         let result = self
-            .system_queue
-            .pop()
+            .system_skip_buffer
+            .pop_front()
+            .map(|(m, _)| m)
+            .or_else(|| self.system_queue.pop())
             .or_else(|| self.local_queue.pop_front())
             .or_else(|| self.skip_buffer.pop_front().map(|(m, _)| m))
             .or_else(|| self.normal_queue.pop());
         if result.is_some() {
+            self.receive_selection = None;
             self.release_slot();
         }
         result
     }
 
-    /// Selective receive: scan for the first message whose behavior id
-    /// appears in `behavior_ids`.
+    /// Selective receive: reserve the first untried message whose behavior id
+    /// appears in `behavior_ids` without consuming it.
     ///
-    /// This intentionally preserves the existing selective-receive lifecycle:
-    /// local/system candidates are consumed when returned, while normal
-    /// candidates staged in `skip_buffer` are removed by
-    /// `commit_receive_match`. Transactional guard handling is a separate
-    /// runtime/ORCA concern and is not changed here.
+    /// Every source follows the same transaction lifecycle:
+    ///
+    /// 1. concurrent/system/local traffic is staged into priority buffers;
+    /// 2. the candidate returned to the VM remains logically queued;
+    /// 3. a guard rejection simply calls this method again, leaving the prior
+    ///    candidate marked tried and selecting the next eligible message;
+    /// 4. [`Mailbox::commit_receive_match`] consumes exactly the most recently
+    ///    selected candidate;
+    /// 5. [`Mailbox::reset_receive_match`] changes no ownership or queue count.
+    ///
+    /// System-priority candidates are always considered before normal/bulk
+    /// candidates. Within each staged buffer FIFO order is preserved.
     pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, Arc<Vec<Value>>)> {
-        // 1. Scan scheduler-local messages first.
-        for i in 0..self.local_queue.len() {
-            let bid = self.local_queue[i].behavior_id;
-            if let Some(pos) = behavior_ids.iter().position(|&id| id == bid) {
-                let msg = self.local_queue.remove(i).expect("mailbox index was valid");
-                self.release_slot();
-                return Some((pos, msg.payload));
-            }
+        self.stage_receive_candidates();
+
+        if let Some((index, arm, payload)) =
+            Self::scan_staged(&mut self.system_skip_buffer, behavior_ids)
+        {
+            self.receive_selection = Some(ReceiveSelection {
+                buffer: ReceiveBuffer::System,
+                index,
+            });
+            return Some((arm, payload));
         }
 
-        // Stage unmatched local traffic. System messages retain priority;
-        // normal/bulk messages enter the selective-receive skip buffer.
+        if let Some((index, arm, payload)) = Self::scan_staged(&mut self.skip_buffer, behavior_ids)
+        {
+            self.receive_selection = Some(ReceiveSelection {
+                buffer: ReceiveBuffer::Normal,
+                index,
+            });
+            return Some((arm, payload));
+        }
+
+        self.receive_selection = None;
+        None
+    }
+
+    fn stage_receive_candidates(&mut self) {
+        // Preserve same-priority FIFO across retries: previously staged
+        // candidates stay at the front; newly-arrived candidates append.
+        while let Some(msg) = self.system_queue.pop() {
+            self.system_skip_buffer.push_back((msg, false));
+        }
+
+        // Scheduler-local traffic is classified into the same two transaction
+        // buffers so local candidates no longer have different consume timing.
         while let Some(msg) = self.local_queue.pop_front() {
             if msg.priority == MessagePriority::System {
-                self.system_queue.push(msg);
+                self.system_skip_buffer.push_back((msg, false));
             } else {
                 self.skip_buffer.push_back((msg, false));
             }
         }
 
-        // 2. Scan system queue.
-        if let Some(result) = Self::scan_queue(&self.system_queue, behavior_ids) {
-            self.release_slot();
-            return Some(result);
-        }
-
-        // 3. Try already staged normal messages.
-        for i in 0..self.skip_buffer.len() {
-            let (tried, bid) = (self.skip_buffer[i].1, self.skip_buffer[i].0.behavior_id);
-            if !tried {
-                if let Some(pos) = behavior_ids.iter().position(|&id| id == bid) {
-                    self.skip_buffer[i].1 = true;
-                    return Some((pos, Arc::clone(&self.skip_buffer[i].0.payload)));
-                }
-            }
-        }
-
-        // 4. Drain newly arrived normal messages into the skip buffer.
         while let Some(msg) = self.normal_queue.pop() {
             self.skip_buffer.push_back((msg, false));
         }
-        for i in 0..self.skip_buffer.len() {
-            let (tried, bid) = (self.skip_buffer[i].1, self.skip_buffer[i].0.behavior_id);
-            if !tried {
-                if let Some(pos) = behavior_ids.iter().position(|&id| id == bid) {
-                    self.skip_buffer[i].1 = true;
-                    return Some((pos, Arc::clone(&self.skip_buffer[i].0.payload)));
-                }
+    }
+
+    fn scan_staged(
+        buffer: &mut VecDeque<(Message, bool)>,
+        behavior_ids: &[u16],
+    ) -> Option<(usize, usize, Arc<Vec<Value>>)> {
+        for (index, (msg, tried)) in buffer.iter_mut().enumerate() {
+            if *tried {
+                continue;
+            }
+            if let Some(arm) = behavior_ids.iter().position(|&id| id == msg.behavior_id) {
+                *tried = true;
+                return Some((index, arm, Arc::clone(&msg.payload)));
             }
         }
         None
-    }
-
-    /// Drain and scan a concurrent queue for a matching message.
-    fn scan_queue(
-        queue: &SegQueue<Message>,
-        behavior_ids: &[u16],
-    ) -> Option<(usize, Arc<Vec<Value>>)> {
-        let mut drained: Vec<Message> = Vec::new();
-        while let Some(msg) = queue.pop() {
-            drained.push(msg);
-        }
-        let mut found = None;
-        let mut requeue: Vec<Message> = Vec::with_capacity(drained.len());
-        for msg in drained {
-            if found.is_none() {
-                if let Some(pos) = behavior_ids.iter().position(|&id| id == msg.behavior_id) {
-                    found = Some((pos, msg.payload));
-                    continue;
-                }
-            }
-            requeue.push(msg);
-        }
-        for msg in requeue {
-            queue.push(msg);
-        }
-        found
     }
 
     /// Total logical message count. Safe to query concurrently.
@@ -246,7 +265,11 @@ impl Mailbox {
     /// The logical count is intentionally unchanged because this is
     /// observational.
     pub fn drain(&mut self) -> Vec<Message> {
+        self.receive_selection = None;
         let mut snapshot = Vec::with_capacity(self.len());
+        while let Some((msg, _)) = self.system_skip_buffer.pop_front() {
+            snapshot.push(msg);
+        }
         while let Some(msg) = self.system_queue.pop() {
             snapshot.push(msg);
         }
@@ -270,6 +293,10 @@ impl Mailbox {
     }
 
     pub fn flush_skip_buffer(&mut self) {
+        self.receive_selection = None;
+        while let Some((msg, _)) = self.system_skip_buffer.pop_front() {
+            self.system_queue.push(msg);
+        }
         while let Some((msg, _)) = self.skip_buffer.pop_front() {
             self.normal_queue.push(msg);
         }
@@ -279,19 +306,34 @@ impl Mailbox {
         self.capacity
     }
 
-    /// Commit the first candidate tried by the existing selective-receive
-    /// protocol. The candidate remains counted until it is physically removed.
-    pub fn commit_receive_match(&mut self) {
-        if let Some(idx) = self.skip_buffer.iter().position(|(_, tried)| *tried) {
-            self.skip_buffer.remove(idx);
+    /// Commit exactly the candidate most recently returned by
+    /// [`Mailbox::receive_match`]. The payload is returned to the runtime so it
+    /// can establish receiver-side ORCA ownership after physical consumption.
+    pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
+        let selection = self.receive_selection.take()?;
+        let removed = match selection.buffer {
+            ReceiveBuffer::System => self.system_skip_buffer.remove(selection.index),
+            ReceiveBuffer::Normal => self.skip_buffer.remove(selection.index),
+        };
+        let payload = removed.map(|(message, _)| message.payload);
+        if payload.is_some() {
             self.release_slot();
         }
-        for (_, tried) in self.skip_buffer.iter_mut() {
-            *tried = false;
-        }
+        self.clear_receive_attempts();
+        payload
     }
 
+    /// Abort the current selective-receive transaction. No message is consumed
+    /// and the logical mailbox count is unchanged.
     pub fn reset_receive_match(&mut self) {
+        self.receive_selection = None;
+        self.clear_receive_attempts();
+    }
+
+    fn clear_receive_attempts(&mut self) {
+        for (_, tried) in self.system_skip_buffer.iter_mut() {
+            *tried = false;
+        }
         for (_, tried) in self.skip_buffer.iter_mut() {
             *tried = false;
         }
@@ -303,11 +345,20 @@ mod tests {
     use super::*;
 
     fn make_msg(behavior_id: u16, sender: u64) -> Message {
+        make_msg_with(behavior_id, sender, 42, MessagePriority::Normal)
+    }
+
+    fn make_msg_with(
+        behavior_id: u16,
+        sender: u64,
+        value: i64,
+        priority: MessagePriority,
+    ) -> Message {
         Message {
             behavior_id,
-            payload: Arc::new(vec![Value::int(42)]),
+            payload: Arc::new(vec![Value::int(value)]),
             sender,
-            priority: MessagePriority::Normal,
+            priority,
             trace_id: None,
         }
     }
@@ -455,10 +506,78 @@ mod tests {
         mb.push(make_msg(3, 300)).unwrap();
         let found = mb.receive_match(&[2]);
         assert_eq!(found, Some((0, Arc::new(vec![Value::int(42)]))));
-        mb.commit_receive_match();
+        assert!(mb.commit_receive_match().is_some());
         assert_eq!(mb.len(), 2);
         assert_eq!(mb.pop().unwrap().behavior_id, 1);
         assert_eq!(mb.pop().unwrap().behavior_id, 3);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn guard_rejection_then_success_commits_only_successful_candidate() {
+        let mut mb = Mailbox::new(0);
+        mb.push(make_msg_with(2, 100, 11, MessagePriority::Normal))
+            .unwrap();
+        mb.push(make_msg_with(2, 200, 22, MessagePriority::Normal))
+            .unwrap();
+
+        let first = mb.receive_match(&[2]).unwrap();
+        assert_eq!(first.1[0], Value::int(11));
+        // Simulate pattern/guard rejection: retry without commit.
+        let second = mb.receive_match(&[2]).unwrap();
+        assert_eq!(second.1[0], Value::int(22));
+
+        let committed = mb.commit_receive_match().unwrap();
+        assert_eq!(committed[0], Value::int(22));
+        assert_eq!(mb.len(), 1);
+        let remaining = mb.pop().unwrap();
+        assert_eq!(remaining.sender, 100);
+        assert_eq!(remaining.payload[0], Value::int(11));
+    }
+
+    #[test]
+    fn reset_preserves_rejected_candidates_and_count() {
+        let mut mb = Mailbox::new(0);
+        mb.push(make_msg_with(2, 100, 11, MessagePriority::Normal))
+            .unwrap();
+        mb.push(make_msg_with(2, 200, 22, MessagePriority::Normal))
+            .unwrap();
+
+        assert_eq!(mb.receive_match(&[2]).unwrap().1[0], Value::int(11));
+        assert_eq!(mb.receive_match(&[2]).unwrap().1[0], Value::int(22));
+        assert!(mb.receive_match(&[2]).is_none());
+        assert_eq!(mb.len(), 2);
+        mb.reset_receive_match();
+        assert_eq!(mb.len(), 2);
+        assert_eq!(mb.receive_match(&[2]).unwrap().1[0], Value::int(11));
+    }
+
+    #[test]
+    fn local_system_and_normal_candidates_share_commit_lifecycle() {
+        let mut mb = Mailbox::new(0);
+        mb.push_local(make_msg_with(7, 1, 10, MessagePriority::Normal))
+            .unwrap();
+        mb.push(make_msg_with(7, 2, 20, MessagePriority::System))
+            .unwrap();
+        mb.push(make_msg_with(7, 3, 30, MessagePriority::Normal))
+            .unwrap();
+
+        // System priority wins, but the message remains counted until commit.
+        let system = mb.receive_match(&[7]).unwrap();
+        assert_eq!(system.1[0], Value::int(20));
+        assert_eq!(mb.len(), 3);
+        assert_eq!(mb.commit_receive_match().unwrap()[0], Value::int(20));
+        assert_eq!(mb.len(), 2);
+
+        // Local normal was staged before the concurrently queued normal.
+        let local = mb.receive_match(&[7]).unwrap();
+        assert_eq!(local.1[0], Value::int(10));
+        assert_eq!(mb.commit_receive_match().unwrap()[0], Value::int(10));
+        assert_eq!(mb.len(), 1);
+
+        let normal = mb.receive_match(&[7]).unwrap();
+        assert_eq!(normal.1[0], Value::int(30));
+        assert_eq!(mb.commit_receive_match().unwrap()[0], Value::int(30));
         assert!(mb.is_empty());
     }
 }
