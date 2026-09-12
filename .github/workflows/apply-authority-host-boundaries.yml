@@ -23,6 +23,9 @@ jobs:
       - name: Apply FFI authority patch
         run: python3 scripts/apply_authority_ffi_gate.py
 
+      - name: Preserve actor-free top-level scope
+        run: python3 scripts/apply_authority_top_level_scope.py
+
       - name: Add host-action execution regression
         run: python3 scripts/apply_authority_host_integration_test.py
 
@@ -48,6 +51,7 @@ jobs:
         run: |
           rm scripts/apply_authority_host_boundaries.py
           rm scripts/apply_authority_ffi_gate.py
+          rm scripts/apply_authority_top_level_scope.py
           rm scripts/apply_authority_host_integration_test.py
           rm .github/workflows/apply-authority-host-boundaries.yml
           git config user.name "github-actions[bot]"
