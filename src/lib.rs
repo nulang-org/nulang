@@ -28,6 +28,7 @@ pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
 pub mod effect_checker;
+pub mod execution_profile;
 pub mod ffi;
 pub mod fmt;
 pub mod format;
@@ -78,7 +79,3 @@ pub mod wasm_runtime;
 pub mod wasm_types;
 #[cfg(feature = "wasmfx-backend")]
 pub mod wasmfx_backend;
-#[cfg(feature = "wasmfx-backend")]
-pub mod wasmfx_runtime;
-pub mod web;
-pub mod witgen;
