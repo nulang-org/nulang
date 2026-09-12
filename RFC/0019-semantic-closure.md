@@ -177,12 +177,12 @@ Source-level spawn authority should be explicit, for example:
 
 ```nulang
 spawn Worker() with [
-  Net::TcpOut(api.stripe.com:443),
-  Fs::Read(/uploads/**)
+  Net::TcpOut("api.stripe.com:443"),
+  Fs::Read("/uploads/**")
 ]
 ```
 
-Exact final grammar is subject to parser constraints, but the semantic rule is fixed:
+The semantic rule is fixed:
 
 - no grant means no external authority;
 - grants are structural values, not unchecked runtime strings;
@@ -192,15 +192,19 @@ Exact final grammar is subject to parser constraints, but the semantic rule is f
 
 ### Migration
 
-`src/authority.rs` provides the typed migration boundary while existing metadata still uses canonical tokens.
+`src/authority.rs` provides the typed migration boundary while existing metadata still uses canonical tokens. The actor runtime bridge parses the legacy `BTreeSet<String>` into `AuthorityManifest`, fails closed if any persisted token is malformed, exposes typed exact-grant checks, and enforces exact-subset monotonic delegation.
 
 The migration sequence is:
 
 1. parse source syntax into `AuthorityGrant` values;
 2. use typed grants in AST/HIR/MIR;
 3. encode canonical tokens only at stable serialization boundaries if required for backward compatibility;
-4. convert runtime manifests to `AuthorityManifest`;
-5. remove ad-hoc string matching from security-sensitive checks.
+4. populate bytecode spawn-authority metadata from MIR;
+5. pass the selected spawn grant set through the VM callback into the child actor;
+6. have runtime host functions call the typed actor authorization boundary before external access;
+7. remove ad-hoc string matching from security-sensitive checks.
+
+Current plumbing gaps are explicit: the parser still initializes spawn capabilities to an empty vector; MIR codegen currently destructures `capabilities: _`, so it drops even programmatically constructed grants instead of filling `CodeModule::spawn_capability_grants`; and the current `spawn_actor` callback API carries no spawn-PC/grant argument for installing those grants on the child. The existence of AST/HIR/MIR fields or bytecode metadata therefore must not be treated as end-to-end enforcement yet.
 
 ## Contract 5 — Protocol-typed actor references
 
