@@ -236,9 +236,9 @@ impl FromStr for AuthorityGrant {
         match (namespace, operation) {
             ("Net", "TcpOut") => {
                 let endpoint = require_argument(token, argument)?;
-                let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
-                    AuthorityParseError::new(token, "TcpOut expects host:port")
-                })?;
+                let (host, port) = endpoint
+                    .rsplit_once(':')
+                    .ok_or_else(|| AuthorityParseError::new(token, "TcpOut expects host:port"))?;
                 if host.is_empty() {
                     return Err(AuthorityParseError::new(token, "host must be non-empty"));
                 }
@@ -315,7 +315,10 @@ fn require_nonempty_argument<'a>(
 ) -> Result<&'a str, AuthorityParseError> {
     let argument = require_argument(token, argument)?;
     if argument.is_empty() {
-        return Err(AuthorityParseError::new(token, "argument must be non-empty"));
+        return Err(AuthorityParseError::new(
+            token,
+            "argument must be non-empty",
+        ));
     }
     Ok(argument)
 }
@@ -339,8 +342,8 @@ mod tests {
 
     #[test]
     fn source_parts_share_the_same_validation_path() {
-        let grant = AuthorityGrant::from_parts("Net", "TcpOut", Some("api.stripe.com:443"))
-            .unwrap();
+        let grant =
+            AuthorityGrant::from_parts("Net", "TcpOut", Some("api.stripe.com:443")).unwrap();
         assert_eq!(grant.to_string(), "Net::TcpOut(api.stripe.com:443)");
         assert!(AuthorityGrant::from_parts("Net", "TcpOut", Some("api.stripe.com:0")).is_err());
         assert!(AuthorityGrant::from_parts("Fs", "Read", Some("")).is_err());
@@ -354,8 +357,7 @@ mod tests {
 
     #[test]
     fn manifest_allows_only_exact_tcp_grant() {
-        let manifest =
-            AuthorityManifest::from_tokens(["Net::TcpOut(api.stripe.com:443)"]).unwrap();
+        let manifest = AuthorityManifest::from_tokens(["Net::TcpOut(api.stripe.com:443)"]).unwrap();
         assert!(manifest.allows_tcp_out("api.stripe.com", 443));
         assert!(!manifest.allows_tcp_out("api.stripe.com", 80));
         assert!(!manifest.allows_tcp_out("example.com", 443));
