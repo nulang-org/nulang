@@ -52,28 +52,20 @@ jobs:
 
           p = Path('src/aot/mod.rs')
           s = p.read_text()
-          stub = '''    fn spawn_actor(\n        &mut self,\n        _module: &crate::bytecode::CodeModule,\n        _behavior_idx: usize,\n        _init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'''
-          stub_new = '''    fn spawn_actor(\n        &mut self,\n        _module: &crate::bytecode::CodeModule,\n        _spawn_pc: usize,\n        _behavior_idx: usize,\n        _init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'''
+          stub = '    fn spawn_actor(\n        &mut self,\n        _module: &crate::bytecode::CodeModule,\n        _behavior_idx: usize,\n        _init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'
+          stub_new = '    fn spawn_actor(\n        &mut self,\n        _module: &crate::bytecode::CodeModule,\n        _spawn_pc: usize,\n        _behavior_idx: usize,\n        _init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'
           if s.count(stub) != 1:
               raise SystemExit(f'AOT stub signature count={s.count(stub)}')
           s = s.replace(stub, stub_new, 1)
 
-          real_sig = '''    fn spawn_actor(\n        &mut self,\n        module: &crate::bytecode::CodeModule,\n        behavior_idx: usize,\n        init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'''
-          real_sig_new = '''    fn spawn_actor(\n        &mut self,\n        module: &crate::bytecode::CodeModule,\n        spawn_pc: usize,\n        behavior_idx: usize,\n        init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'''
+          real_sig = '    fn spawn_actor(\n        &mut self,\n        module: &crate::bytecode::CodeModule,\n        behavior_idx: usize,\n        init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'
+          real_sig_new = '    fn spawn_actor(\n        &mut self,\n        module: &crate::bytecode::CodeModule,\n        spawn_pc: usize,\n        behavior_idx: usize,\n        init: Vec<(String, crate::vm::Value)>,\n    ) -> crate::vm::Value {'
           if s.count(real_sig) != 2:
               raise SystemExit(f'AOT real signature count={s.count(real_sig)}')
           s = s.replace(real_sig, real_sig_new)
 
           body = 'unsafe { (*self.runtime).spawn_from_module(module, behavior_idx, init) }'
-          body_new = '''unsafe {
-            crate::runtime::callbacks::spawn_with_site_authority(
-                &mut *self.runtime,
-                module,
-                spawn_pc,
-                behavior_idx,
-                init,
-            )
-        }'''
+          body_new = 'unsafe {\n            crate::runtime::callbacks::spawn_with_site_authority(\n                &mut *self.runtime,\n                module,\n                spawn_pc,\n                behavior_idx,\n                init,\n            )\n        }'
           if s.count(body) != 2:
               raise SystemExit(f'AOT spawn body count={s.count(body)}')
           p.write_text(s.replace(body, body_new))
@@ -94,12 +86,8 @@ jobs:
           if s.count(helper_anchor) != 1:
               raise SystemExit(f'test helper anchor count={s.count(helper_anchor)}')
           s = s.replace(helper_anchor, helper + helper_anchor, 1)
-          first = '''spawn_authority_manifest(&module, spawn_pcs[0])
-            .unwrap()
-            .canonical_tokens()'''
-          second = '''spawn_authority_manifest(&module, spawn_pcs[1])
-            .unwrap()
-            .canonical_tokens()'''
+          first = 'spawn_authority_manifest(&module, spawn_pcs[0])\n            .unwrap()\n            .canonical_tokens()'
+          second = 'spawn_authority_manifest(&module, spawn_pcs[1])\n            .unwrap()\n            .canonical_tokens()'
           if s.count(first) != 1 or s.count(second) != 1:
               raise SystemExit('spawn authority assertions moved')
           s = s.replace(first, 'spawn_grants(&module, spawn_pcs[0])', 1)
