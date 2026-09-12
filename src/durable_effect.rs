@@ -348,6 +348,7 @@ impl DurableEffectRecord {
         );
         Ok(DurableCompensationRecord {
             original_effect_id,
+            compensation_ordinal,
             effect: DurableEffectRecord::prepare(spec, request),
         })
     }
@@ -398,12 +399,17 @@ impl std::error::Error for DurableCompensationError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableCompensationRecord {
     original_effect_id: DurableEffectId,
+    compensation_ordinal: u32,
     effect: DurableEffectRecord,
 }
 
 impl DurableCompensationRecord {
     pub fn original_effect_id(&self) -> DurableEffectId {
         self.original_effect_id
+    }
+
+    pub fn compensation_ordinal(&self) -> u32 {
+        self.compensation_ordinal
     }
 
     pub fn effect(&self) -> &DurableEffectRecord {
@@ -603,6 +609,7 @@ mod tests {
             .unwrap();
         let compensation_id = compensation.compensation_id();
         assert_eq!(compensation.original_effect_id(), original_id);
+        assert_eq!(compensation.compensation_ordinal(), 0);
         assert_ne!(compensation_id, original_id);
         assert_eq!(
             compensation
