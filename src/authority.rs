@@ -38,6 +38,26 @@ pub enum AuthorityGrant {
     },
 }
 
+impl AuthorityGrant {
+    /// Build and validate a grant from the source-level structural pieces.
+    ///
+    /// Parser code should use this rather than constructing an unchecked
+    /// canonical token by hand. The canonical string representation remains
+    /// an encoding boundary for bytecode/persistence compatibility, not the
+    /// semantic representation of authority.
+    pub fn from_parts(
+        namespace: &str,
+        operation: &str,
+        argument: Option<&str>,
+    ) -> Result<Self, AuthorityParseError> {
+        let token = match argument {
+            Some(argument) => format!("{namespace}::{operation}({argument})"),
+            None => format!("{namespace}::{operation}"),
+        };
+        token.parse()
+    }
+}
+
 /// Deterministically ordered authority set. Empty means no external authority.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthorityManifest {
@@ -55,6 +75,9 @@ impl AuthorityManifest {
         }
     }
 
+    /// Compatibility bridge for existing bytecode/persistence/runtime token
+    /// sets. Invalid persisted authority fails closed instead of being kept as
+    /// an opaque string that a host function could accidentally authorize.
     pub fn from_tokens<'a>(
         tokens: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, AuthorityParseError> {
@@ -63,6 +86,12 @@ impl AuthorityManifest {
             grants.insert(token.parse()?);
         }
         Ok(Self { grants })
+    }
+
+    /// Convenience bridge for the runtime's current `BTreeSet<String>` actor
+    /// field while it migrates to `AuthorityManifest` directly.
+    pub fn from_token_set(tokens: &BTreeSet<String>) -> Result<Self, AuthorityParseError> {
+        Self::from_tokens(tokens.iter().map(String::as_str))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -77,8 +106,15 @@ impl AuthorityManifest {
         self.grants.contains(grant)
     }
 
+    /// Generic typed authorization check. Host boundaries should construct
+    /// the exact grant they require and call this method; category-specific
+    /// helpers are ergonomic wrappers around the same exact-match rule.
+    pub fn allows(&self, grant: &AuthorityGrant) -> bool {
+        self.contains(grant)
+    }
+
     pub fn allows_tcp_out(&self, host: &str, port: u16) -> bool {
-        self.grants.contains(&AuthorityGrant::NetTcpOut {
+        self.allows(&AuthorityGrant::NetTcpOut {
             host: host.to_string(),
             port,
         })
@@ -275,6 +311,15 @@ mod tests {
     }
 
     #[test]
+    fn source_parts_share_the_same_validation_path() {
+        let grant = AuthorityGrant::from_parts("Net", "TcpOut", Some("api.stripe.com:443"))
+            .unwrap();
+        assert_eq!(grant.to_string(), "Net::TcpOut(api.stripe.com:443)");
+        assert!(AuthorityGrant::from_parts("Net", "TcpOut", Some("api.stripe.com:0")).is_err());
+        assert!(AuthorityGrant::from_parts("Fs", "Read", Some("")).is_err());
+    }
+
+    #[test]
     fn manifest_is_deny_by_default() {
         let manifest = AuthorityManifest::new();
         assert!(!manifest.allows_tcp_out("api.stripe.com", 443));
@@ -287,6 +332,16 @@ mod tests {
         assert!(manifest.allows_tcp_out("api.stripe.com", 443));
         assert!(!manifest.allows_tcp_out("api.stripe.com", 80));
         assert!(!manifest.allows_tcp_out("example.com", 443));
+    }
+
+    #[test]
+    fn current_runtime_token_set_converts_fail_closed() {
+        let tokens = BTreeSet::from(["Net::TcpOut(api.stripe.com:443)".to_string()]);
+        let manifest = AuthorityManifest::from_token_set(&tokens).unwrap();
+        assert!(manifest.allows_tcp_out("api.stripe.com", 443));
+
+        let malformed = BTreeSet::from(["Net::TcpOut(api.stripe.com)".to_string()]);
+        assert!(AuthorityManifest::from_token_set(&malformed).is_err());
     }
 
     #[test]
