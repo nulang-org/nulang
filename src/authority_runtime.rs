@@ -28,12 +28,13 @@ pub enum RuntimeAuthorityError {
     /// More than one grant record targets the same spawn instruction. The
     /// metadata is ambiguous and therefore cannot safely authorize anything.
     AmbiguousSpawnMetadata { pc: usize },
-    /// More than one local `Spawn` instruction targets the same behavior.
+    /// More than one local `Spawn` instruction targets the same behavior and
+    /// at least one of those sites carries authority metadata.
     ///
     /// The current VM callback receives `(module, behavior_idx, init)` but not
     /// the executing spawn PC. Until that PC is threaded through the callback,
-    /// per-site authority can only be inferred safely when the target behavior
-    /// has exactly one local spawn instruction in the module.
+    /// per-site authority can only be inferred safely when a privileged target
+    /// behavior has exactly one local spawn instruction in the module.
     AmbiguousSpawnSite { behavior_idx: usize },
     /// The manifest is structurally valid but does not contain the exact grant
     /// required for the requested external action or delegation.
@@ -111,31 +112,47 @@ pub fn spawn_authority_manifest(
 ///
 /// This is a deliberately conservative compatibility bridge until the VM
 /// threads the executing spawn PC through `ActorVmCallbacks::spawn_actor`.
-/// Exactly one local `Spawn` instruction for `behavior_idx` is required. If
-/// there is no matching local spawn instruction, the result is an empty
-/// manifest. If more than one matching site exists, the lookup fails closed
-/// rather than borrowing authority from the wrong call site.
+/// Multiple ordinary, unprivileged spawn sites remain valid and resolve to an
+/// empty manifest. Once authority metadata targets one of those sites, however,
+/// the target behavior must have exactly one local spawn site; otherwise the
+/// callback cannot know which site executed and the lookup fails closed.
 pub fn spawn_authority_manifest_for_behavior(
     module: &CodeModule,
     behavior_idx: usize,
 ) -> Result<AuthorityManifest, RuntimeAuthorityError> {
-    let mut matching_sites = module
+    let matching_sites: Vec<usize> = module
         .instructions
         .iter()
         .enumerate()
         .filter(|(_, instr)| {
             instr.opcode == OpCode::Spawn && instr.imm16() as usize == behavior_idx
         })
-        .map(|(pc, _)| pc);
+        .map(|(pc, _)| pc)
+        .collect();
 
-    let Some(spawn_pc) = matching_sites.next() else {
+    if matching_sites.is_empty() {
         return Ok(AuthorityManifest::new());
-    };
-    if matching_sites.next().is_some() {
+    }
+
+    let privileged_sites: Vec<usize> = matching_sites
+        .iter()
+        .copied()
+        .filter(|spawn_pc| {
+            module
+                .spawn_capability_grants
+                .iter()
+                .any(|(grant_pc, _)| grant_pc == spawn_pc)
+        })
+        .collect();
+
+    if privileged_sites.is_empty() {
+        return Ok(AuthorityManifest::new());
+    }
+    if matching_sites.len() != 1 {
         return Err(RuntimeAuthorityError::AmbiguousSpawnSite { behavior_idx });
     }
 
-    spawn_authority_manifest(module, spawn_pc)
+    spawn_authority_manifest(module, privileged_sites[0])
 }
 
 impl Actor {
@@ -313,11 +330,25 @@ mod tests {
     }
 
     #[test]
-    fn callback_compatibility_rejects_same_behavior_site_ambiguity() {
+    fn multiple_unprivileged_spawn_sites_remain_unprivileged() {
         let mut module = CodeModule::new("authority-callback-bridge");
         emit_spawn(&mut module, 42);
+        emit_spawn(&mut module, 42);
+
+        let manifest = spawn_authority_manifest_for_behavior(&module, 42).unwrap();
+        assert!(manifest.is_empty());
+    }
+
+    #[test]
+    fn callback_compatibility_rejects_privileged_same_behavior_site_ambiguity() {
+        let mut module = CodeModule::new("authority-callback-bridge");
+        let privileged_pc = emit_spawn(&mut module, 42);
         emit_spawn(&mut module, 7);
         emit_spawn(&mut module, 42);
+        module.spawn_capability_grants.push((
+            privileged_pc,
+            vec!["Secret::Read(STRIPE_KEY)".to_string()],
+        ));
 
         assert_eq!(
             spawn_authority_manifest_for_behavior(&module, 42),
