@@ -60,6 +60,7 @@ pub mod parser;
 pub mod prelude_source;
 pub mod primitives;
 pub mod protocol;
+pub mod protocol_wire;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod registry;
