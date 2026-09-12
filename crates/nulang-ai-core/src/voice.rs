@@ -75,14 +75,32 @@ impl VoiceSession {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VoiceEvent {
-    SessionStarted { session_id: Uuid },
-    AudioStarted { session_id: Uuid },
-    SpeechStarted { session_id: Uuid },
-    TranscriptUpdated { session_id: Uuid, transcript: Transcript },
-    TurnCompleted { session_id: Uuid, transcript: Transcript },
-    ResponseStarted { session_id: Uuid },
-    ResponseInterrupted { session_id: Uuid },
-    SessionEnded { session_id: Uuid },
+    SessionStarted {
+        session_id: Uuid,
+    },
+    AudioStarted {
+        session_id: Uuid,
+    },
+    SpeechStarted {
+        session_id: Uuid,
+    },
+    TranscriptUpdated {
+        session_id: Uuid,
+        transcript: Transcript,
+    },
+    TurnCompleted {
+        session_id: Uuid,
+        transcript: Transcript,
+    },
+    ResponseStarted {
+        session_id: Uuid,
+    },
+    ResponseInterrupted {
+        session_id: Uuid,
+    },
+    SessionEnded {
+        session_id: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,9 +180,7 @@ pub trait SpeechRecognitionSession: Send {
         frame: AudioFrame,
     ) -> VoiceFuture<'a, Result<Vec<Transcript>, VoiceProviderError>>;
 
-    fn finish<'a>(
-        &'a mut self,
-    ) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>>;
+    fn finish<'a>(&'a mut self) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>>;
 }
 
 pub trait SpeechRecognizer: Send + Sync {
