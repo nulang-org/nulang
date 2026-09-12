@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: authority-ai-runtime-boundary
+  cancel-in-progress: true
+
 jobs:
   validate-and-publish:
     runs-on: ubuntu-latest
@@ -16,13 +20,25 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply AI runtime boundary correction
+      - name: Apply logical AI boundary correction
         run: |
           python3 scripts/fix_authority_ai_runtime_boundary.py
+
+      - name: Apply provider endpoint authority hardening
+        run: |
+          python3 scripts/harden_llm_network_authority.py
 
       - name: Reject whitespace errors
         run: |
           git diff --check
+
+      - name: Run nulang-ai provider tests
+        run: |
+          cargo test -p nulang-ai -- --nocapture
+
+      - name: Run LLM authority regressions
+        run: |
+          cargo test --lib llm_authority_tests -- --nocapture
 
       - name: Run host authority regressions
         run: |
@@ -47,11 +63,28 @@ jobs:
       - name: Publish validated correction
         run: |
           rm scripts/fix_authority_ai_runtime_boundary.py
+          rm scripts/harden_llm_network_authority.py
           rm .github/workflows/validate-authority-ai-runtime-boundary.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git diff --cached --check
-          test "$(git diff --cached --name-only | sort)" = "src/runtime/callbacks.rs"
-          git commit -m "fix(authority): keep logical AI services above host boundary [authority-ai-boundary-applied]"
+          git diff --cached --name-only | sort > /tmp/actual-files
+          cat > /tmp/expected-files <<'EOF'
+          .github/workflows/validate-authority-ai-runtime-boundary.yml
+          crates/nulang-ai/src/client.rs
+          crates/nulang-ai/src/mock.rs
+          crates/nulang-ai/src/mod.rs
+          crates/nulang-ai/src/providers/ollama.rs
+          crates/nulang-ai/src/providers/openai.rs
+          scripts/fix_authority_ai_runtime_boundary.py
+          scripts/harden_llm_network_authority.py
+          src/backends/mod.rs
+          src/runtime/agent.rs
+          src/runtime/callbacks.rs
+          src/runtime/llm.rs
+          EOF
+          sed -i 's/^          //' /tmp/expected-files
+          diff -u /tmp/expected-files /tmp/actual-files
+          git commit -m "fix(authority): enforce concrete LLM network boundaries [authority-ai-boundary-applied]"
           git push origin HEAD:fix/authority-ai-runtime-boundary
