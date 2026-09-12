@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   validate-and-publish:
-    if: ${{ !contains(github.event.head_commit.message, '[authority-ai-boundary-applied]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
