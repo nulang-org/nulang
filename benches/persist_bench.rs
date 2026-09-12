@@ -13,6 +13,7 @@ fn bench_memory_store(c: &mut Criterion) {
                 state: std::collections::HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
+                crdt_field_map: None,
             };
             store.save_snapshot(snapshot).ok();
             let _loaded = store.load_snapshot(1);
