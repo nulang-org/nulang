@@ -118,9 +118,7 @@ pub fn best_eligible_execution_target<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Architecture, CapacityOffer, Lifecycle, TrustTier,
-    };
+    use crate::{Architecture, CapacityOffer, Lifecycle, TrustTier};
 
     fn placement(id: &str, effective_cost_usd: f64) -> PlacementCandidate {
         PlacementCandidate {
