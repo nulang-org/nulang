@@ -13,6 +13,7 @@ fn bench_memory_store(c: &mut Criterion) {
                 state: std::collections::HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
+                // Keep this fixture forward-compatible with new snapshot metadata.
                 ..ActorSnapshot::default()
             };
             store.save_snapshot(snapshot).ok();
