@@ -9,6 +9,8 @@ pub mod parakeet;
 pub mod playback;
 pub mod routing;
 pub mod silero;
+pub mod speculation;
+pub mod turn;
 pub mod whisper;
 
 pub use kokoro::{KokoroRuntime, KokoroRuntimeStream, KokoroSynthesizer};
@@ -17,4 +19,11 @@ pub use parakeet::{ParakeetRecognizer, ParakeetRuntime, ParakeetRuntimeSession};
 pub use playback::{PlaybackController, PlaybackError};
 pub use routing::AutoSpeechRecognizer;
 pub use silero::{SileroVadAdapter, SileroVadConfig, SileroVadRuntime};
+pub use speculation::{
+    PrefetchSafety, SpeculationHandle, SpeculationOutcome, SpeculativeIntentController,
+    SpeculativeIntentRuntime,
+};
+pub use turn::{
+    SemanticTurnDetector, TurnCompletionReason, TurnDecision, TurnDetectorConfig, TurnObservation,
+};
 pub use whisper::{WhisperRecognizer, WhisperRuntime, WhisperRuntimeSession};
