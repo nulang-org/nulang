@@ -5,6 +5,7 @@ use thiserror::Error;
 pub mod broker;
 pub mod health;
 pub mod interruption;
+pub mod lease;
 pub mod provider;
 pub mod providers;
 pub mod telemetry;
