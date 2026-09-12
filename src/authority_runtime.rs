@@ -13,6 +13,7 @@
 //! before source-level grants are security-effective.
 
 use crate::authority::{AuthorityGrant, AuthorityManifest, AuthorityParseError};
+use crate::bytecode::{CodeModule, OpCode};
 use crate::runtime::Actor;
 use std::error::Error;
 use std::fmt;
@@ -27,6 +28,13 @@ pub enum RuntimeAuthorityError {
     /// More than one grant record targets the same spawn instruction. The
     /// metadata is ambiguous and therefore cannot safely authorize anything.
     AmbiguousSpawnMetadata { pc: usize },
+    /// More than one local `Spawn` instruction targets the same behavior.
+    ///
+    /// The current VM callback receives `(module, behavior_idx, init)` but not
+    /// the executing spawn PC. Until that PC is threaded through the callback,
+    /// per-site authority can only be inferred safely when the target behavior
+    /// has exactly one local spawn instruction in the module.
+    AmbiguousSpawnSite { behavior_idx: usize },
     /// The manifest is structurally valid but does not contain the exact grant
     /// required for the requested external action or delegation.
     Denied(AuthorityGrant),
@@ -41,6 +49,12 @@ impl fmt::Display for RuntimeAuthorityError {
             RuntimeAuthorityError::AmbiguousSpawnMetadata { pc } => {
                 write!(f, "ambiguous spawn authority metadata at bytecode pc {pc}")
             }
+            RuntimeAuthorityError::AmbiguousSpawnSite { behavior_idx } => {
+                write!(
+                    f,
+                    "cannot infer spawn authority: behavior {behavior_idx} has multiple local spawn sites"
+                )
+            }
             RuntimeAuthorityError::Denied(grant) => {
                 write!(f, "capability denied: {grant}")
             }
@@ -53,6 +67,7 @@ impl Error for RuntimeAuthorityError {
         match self {
             RuntimeAuthorityError::InvalidManifest(err) => Some(err),
             RuntimeAuthorityError::AmbiguousSpawnMetadata { .. }
+            | RuntimeAuthorityError::AmbiguousSpawnSite { .. }
             | RuntimeAuthorityError::Denied(_) => None,
         }
     }
@@ -71,7 +86,7 @@ impl From<AuthorityParseError> for RuntimeAuthorityError {
 /// same PC are rejected instead of choosing one arbitrarily, because metadata
 /// ambiguity at a security boundary must fail closed.
 pub fn spawn_authority_manifest(
-    module: &crate::bytecode::CodeModule,
+    module: &CodeModule,
     spawn_pc: usize,
 ) -> Result<AuthorityManifest, RuntimeAuthorityError> {
     let mut matches = module
@@ -89,6 +104,38 @@ pub fn spawn_authority_manifest(
     Ok(AuthorityManifest::from_tokens(
         tokens.iter().map(String::as_str),
     )?)
+}
+
+/// Resolve spawn authority using only the context exposed by the current VM
+/// callback: the module and target behavior index.
+///
+/// This is a deliberately conservative compatibility bridge until the VM
+/// threads the executing spawn PC through `ActorVmCallbacks::spawn_actor`.
+/// Exactly one local `Spawn` instruction for `behavior_idx` is required. If
+/// there is no matching local spawn instruction, the result is an empty
+/// manifest. If more than one matching site exists, the lookup fails closed
+/// rather than borrowing authority from the wrong call site.
+pub fn spawn_authority_manifest_for_behavior(
+    module: &CodeModule,
+    behavior_idx: usize,
+) -> Result<AuthorityManifest, RuntimeAuthorityError> {
+    let mut matching_sites = module
+        .instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, instr)| {
+            instr.opcode == OpCode::Spawn && instr.imm16() as usize == behavior_idx
+        })
+        .map(|(pc, _)| pc);
+
+    let Some(spawn_pc) = matching_sites.next() else {
+        return Ok(AuthorityManifest::new());
+    };
+    if matching_sites.next().is_some() {
+        return Err(RuntimeAuthorityError::AmbiguousSpawnSite { behavior_idx });
+    }
+
+    spawn_authority_manifest(module, spawn_pc)
 }
 
 impl Actor {
@@ -172,6 +219,7 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytecode::Instruction;
 
     fn actor_with(tokens: &[&str]) -> Actor {
         let mut actor = Actor::new(7, "authority-test", 16);
@@ -179,16 +227,25 @@ mod tests {
         actor
     }
 
+    fn emit_spawn(module: &mut CodeModule, behavior_idx: u16) -> usize {
+        module.emit(Instruction::new3(
+            OpCode::Spawn,
+            (behavior_idx >> 8) as u8,
+            (behavior_idx & 0xff) as u8,
+            0,
+        ))
+    }
+
     #[test]
     fn missing_spawn_metadata_is_deny_by_default() {
-        let module = crate::bytecode::CodeModule::new("authority-metadata");
+        let module = CodeModule::new("authority-metadata");
         let manifest = spawn_authority_manifest(&module, 12).unwrap();
         assert!(manifest.is_empty());
     }
 
     #[test]
     fn spawn_metadata_decodes_to_typed_manifest() {
-        let mut module = crate::bytecode::CodeModule::new("authority-metadata");
+        let mut module = CodeModule::new("authority-metadata");
         module.spawn_capability_grants.push((
             12,
             vec![
@@ -206,7 +263,7 @@ mod tests {
 
     #[test]
     fn malformed_spawn_metadata_fails_closed() {
-        let mut module = crate::bytecode::CodeModule::new("authority-metadata");
+        let mut module = CodeModule::new("authority-metadata");
         module
             .spawn_capability_grants
             .push((12, vec!["Net::TcpOut(malformed)".to_string()]));
@@ -219,7 +276,7 @@ mod tests {
 
     #[test]
     fn duplicate_spawn_metadata_for_same_pc_is_rejected() {
-        let mut module = crate::bytecode::CodeModule::new("authority-metadata");
+        let mut module = CodeModule::new("authority-metadata");
         module
             .spawn_capability_grants
             .push((12, vec!["Secret::Read(FIRST)".to_string()]));
@@ -231,6 +288,55 @@ mod tests {
             spawn_authority_manifest(&module, 12),
             Err(RuntimeAuthorityError::AmbiguousSpawnMetadata { pc: 12 })
         );
+    }
+
+    #[test]
+    fn callback_compatibility_resolves_unique_spawn_site() {
+        let mut module = CodeModule::new("authority-callback-bridge");
+        let spawn_pc = emit_spawn(&mut module, 42);
+        module.spawn_capability_grants.push((
+            spawn_pc,
+            vec!["Secret::Read(STRIPE_KEY)".to_string()],
+        ));
+
+        let manifest = spawn_authority_manifest_for_behavior(&module, 42).unwrap();
+        assert!(manifest.allows(&AuthorityGrant::SecretRead {
+            name: "STRIPE_KEY".into(),
+        }));
+    }
+
+    #[test]
+    fn callback_compatibility_missing_spawn_site_is_deny_by_default() {
+        let module = CodeModule::new("authority-callback-bridge");
+        let manifest = spawn_authority_manifest_for_behavior(&module, 42).unwrap();
+        assert!(manifest.is_empty());
+    }
+
+    #[test]
+    fn callback_compatibility_rejects_same_behavior_site_ambiguity() {
+        let mut module = CodeModule::new("authority-callback-bridge");
+        emit_spawn(&mut module, 42);
+        emit_spawn(&mut module, 7);
+        emit_spawn(&mut module, 42);
+
+        assert_eq!(
+            spawn_authority_manifest_for_behavior(&module, 42),
+            Err(RuntimeAuthorityError::AmbiguousSpawnSite { behavior_idx: 42 })
+        );
+    }
+
+    #[test]
+    fn callback_compatibility_ignores_other_behavior_spawn_sites() {
+        let mut module = CodeModule::new("authority-callback-bridge");
+        let spawn_pc = emit_spawn(&mut module, 42);
+        emit_spawn(&mut module, 7);
+        module.spawn_capability_grants.push((
+            spawn_pc,
+            vec!["Net::TcpOut(api.stripe.com:443)".to_string()],
+        ));
+
+        let manifest = spawn_authority_manifest_for_behavior(&module, 42).unwrap();
+        assert!(manifest.allows_tcp_out("api.stripe.com", 443));
     }
 
     #[test]
