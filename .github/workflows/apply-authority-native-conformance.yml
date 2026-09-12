@@ -20,6 +20,32 @@ jobs:
       - name: Apply assertion-heavy patch
         run: python3 scripts/apply_authority_native_conformance.py
 
+      - name: Expose narrow spawn authority bridge to sibling backends
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          runtime_mod = Path("src/runtime/mod.rs")
+          text = runtime_mod.read_text()
+          needle = "mod spawn;\n"
+          if text.count(needle) != 1:
+              raise SystemExit(f"runtime spawn module declaration drift: {text.count(needle)}")
+          text = text.replace(
+              needle,
+              needle + "pub(crate) use spawn::spawn_from_module_with_authority;\n",
+              1,
+          )
+          runtime_mod.write_text(text)
+
+          aot_mod = Path("src/aot/mod.rs")
+          text = aot_mod.read_text()
+          old = "crate::runtime::spawn::spawn_from_module_with_authority("
+          new = "crate::runtime::spawn_from_module_with_authority("
+          if text.count(old) != 1:
+              raise SystemExit(f"native spawn authority call drift: {text.count(old)}")
+          aot_mod.write_text(text.replace(old, new, 1))
+          PY
+
       - name: Reject whitespace errors
         run: git diff --check
 
