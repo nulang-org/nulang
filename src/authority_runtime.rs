@@ -253,4 +253,20 @@ mod tests {
         ));
         assert_eq!(child.capabilities, before);
     }
+
+    #[test]
+    fn malformed_parent_cannot_delegate_even_an_exact_present_grant() {
+        let parent = actor_with(&[
+            "Secret::Read(STRIPE_KEY)",
+            "Net::TcpOut(malformed)",
+        ]);
+        let requested = AuthorityManifest::from_tokens(["Secret::Read(STRIPE_KEY)"]).unwrap();
+        let mut child = Actor::new(8, "child", 16);
+
+        assert!(matches!(
+            parent.delegate_authority_to(&mut child, &requested),
+            Err(RuntimeAuthorityError::InvalidManifest(_))
+        ));
+        assert!(child.capabilities.is_empty());
+    }
 }
