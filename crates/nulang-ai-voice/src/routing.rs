@@ -4,7 +4,7 @@ use nulang_ai_core::voice::{
 use std::sync::Arc;
 
 /// Routes English realtime recognition to Parakeet and multilingual sessions
-/// to Whisper, while falling back to Whisper if Parakeet cannot start.
+/// to Whisper, while falling back to Whisper if Parakeet is transiently unavailable.
 pub struct AutoSpeechRecognizer {
     parakeet: Arc<dyn SpeechRecognizer>,
     whisper: Arc<dyn SpeechRecognizer>,
@@ -22,7 +22,9 @@ impl AutoSpeechRecognizer {
         config
             .language
             .as_deref()
-            .map(|lang| lang.eq_ignore_ascii_case("en") || lang.to_ascii_lowercase().starts_with("en-"))
+            .map(|lang| {
+                lang.eq_ignore_ascii_case("en") || lang.to_ascii_lowercase().starts_with("en-")
+            })
             .unwrap_or(true)
     }
 }
@@ -40,7 +42,8 @@ impl SpeechRecognizer for AutoSpeechRecognizer {
             if Self::prefer_parakeet(&config) {
                 match self.parakeet.start_session(config.clone()).await {
                     Ok(session) => Ok(session),
-                    Err(_) => self.whisper.start_session(config).await,
+                    Err(error) if error.retryable => self.whisper.start_session(config).await,
+                    Err(error) => Err(error),
                 }
             } else {
                 self.whisper.start_session(config).await
@@ -58,7 +61,7 @@ mod tests {
     struct FakeRecognizer {
         name: &'static str,
         starts: Arc<AtomicUsize>,
-        fail: bool,
+        error: Option<VoiceProviderError>,
     }
 
     struct FakeSession;
@@ -89,10 +92,9 @@ mod tests {
         ) -> VoiceFuture<'a, Result<Box<dyn SpeechRecognitionSession>, VoiceProviderError>> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
-                if self.fail {
-                    Err(VoiceProviderError::new(self.name, "unavailable", "down", true))
-                } else {
-                    Ok(Box::new(FakeSession) as Box<dyn SpeechRecognitionSession>)
+                match &self.error {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(Box::new(FakeSession) as Box<dyn SpeechRecognitionSession>),
                 }
             })
         }
@@ -103,8 +105,16 @@ mod tests {
         let p = Arc::new(AtomicUsize::new(0));
         let w = Arc::new(AtomicUsize::new(0));
         let router = AutoSpeechRecognizer::new(
-            Arc::new(FakeRecognizer { name: "parakeet", starts: p.clone(), fail: false }),
-            Arc::new(FakeRecognizer { name: "whisper", starts: w.clone(), fail: false }),
+            Arc::new(FakeRecognizer {
+                name: "parakeet",
+                starts: p.clone(),
+                error: None,
+            }),
+            Arc::new(FakeRecognizer {
+                name: "whisper",
+                starts: w.clone(),
+                error: None,
+            }),
         );
         let mut config = RecognitionConfig::default();
         config.language = Some("pt-BR".into());
@@ -114,15 +124,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_when_parakeet_start_fails() {
+    async fn falls_back_when_parakeet_is_transiently_unavailable() {
         let p = Arc::new(AtomicUsize::new(0));
         let w = Arc::new(AtomicUsize::new(0));
         let router = AutoSpeechRecognizer::new(
-            Arc::new(FakeRecognizer { name: "parakeet", starts: p.clone(), fail: true }),
-            Arc::new(FakeRecognizer { name: "whisper", starts: w.clone(), fail: false }),
+            Arc::new(FakeRecognizer {
+                name: "parakeet",
+                starts: p.clone(),
+                error: Some(VoiceProviderError::new(
+                    "parakeet",
+                    "unavailable",
+                    "down",
+                    true,
+                )),
+            }),
+            Arc::new(FakeRecognizer {
+                name: "whisper",
+                starts: w.clone(),
+                error: None,
+            }),
         );
-        router.start_session(RecognitionConfig::default()).await.unwrap();
+        router
+            .start_session(RecognitionConfig::default())
+            .await
+            .unwrap();
         assert_eq!(p.load(Ordering::SeqCst), 1);
         assert_eq!(w.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn preserves_non_retryable_parakeet_errors() {
+        let p = Arc::new(AtomicUsize::new(0));
+        let w = Arc::new(AtomicUsize::new(0));
+        let router = AutoSpeechRecognizer::new(
+            Arc::new(FakeRecognizer {
+                name: "parakeet",
+                starts: p.clone(),
+                error: Some(VoiceProviderError::new(
+                    "parakeet",
+                    "bad_config",
+                    "invalid model configuration",
+                    false,
+                )),
+            }),
+            Arc::new(FakeRecognizer {
+                name: "whisper",
+                starts: w.clone(),
+                error: None,
+            }),
+        );
+        let error = router
+            .start_session(RecognitionConfig::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "bad_config");
+        assert_eq!(w.load(Ordering::SeqCst), 0);
     }
 }
