@@ -34,9 +34,8 @@ pub struct ProviderError {
     pub retryable: bool,
 }
 
-pub type ProviderFuture<'a> = Pin<
-    Box<dyn Future<Output = Result<ProviderSnapshot, ProviderError>> + Send + 'a>,
->;
+pub type ProviderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProviderSnapshot, ProviderError>> + Send + 'a>>;
 
 /// Async boundary implemented by cloud-specific adapter crates.
 ///
