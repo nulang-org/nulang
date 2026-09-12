@@ -1,0 +1,61 @@
+name: Validate Selective Receive No-Match
+
+on:
+  push:
+    branches: [fix/selective-receive-transaction]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/selective-receive-transaction
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply selective no-match correction
+        run: python3 scripts/apply_selective_receive_no_match.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Selective receive codegen regression
+        run: cargo test test_receive_without_after_emits_receivematch_not_receivewait
+
+      - name: Transactional mailbox regressions
+        run: |
+          cargo test rejected_candidate_stays_queued_and_commit_consumes_current_candidate
+          cargo test reset_makes_rejected_candidate_visible_without_consuming_it
+          cargo test system_local_and_normal_candidates_share_commit_semantics
+
+      - name: Transactional ORCA regressions
+        run: |
+          cargo test selective_receive_rejected_pointer_candidate_takes_no_hold
+          cargo test selective_receive_commit_establishes_exactly_one_receiver_hold
+          cargo test selective_receive_reset_preserves_pointer_ownership_and_message
+
+      - name: Validate minimal all-targets build
+        run: cargo check --all-targets --no-default-features
+
+      - name: Validate default all-targets build
+        run: cargo check --all-targets
+
+      - name: Commit validated correction
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src
+          if git diff --cached --quiet; then
+            echo 'No generated source changes to commit.'
+            exit 0
+          fi
+          git commit -m 'fix(runtime): preserve rejected selective receive messages'
+          git push origin HEAD:fix/selective-receive-transaction
