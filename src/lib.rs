@@ -17,6 +17,7 @@ pub mod cir;
 pub mod cir_analysis;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir_lower;
+pub mod compiler_api;
 pub mod core_vm;
 pub mod cranelift_utils;
 pub mod dap;
