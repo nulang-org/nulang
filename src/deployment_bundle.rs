@@ -1,9 +1,10 @@
 //! Hardened parser for the gzip/tar deployment bundle produced by `nula deploy`.
 //!
 //! The parser never extracts archive contents to disk. It validates archive
-//! paths and entry types, enforces compressed/expanded/resource limits, requires
-//! exactly one packaged `.nbc`, derives its compiled execution manifest, and can
-//! feed the artifact directly into the Cloud admission engine.
+//! paths and entry types, enforces compressed/expanded/resource limits, binds
+//! `Nulang.toml` package identity to exactly one packaged `.nbc`, derives the
+//! compiled execution manifest, and can feed the artifact directly into the
+//! Cloud admission engine.
 
 use std::fmt;
 use std::io::{Cursor, Read};
@@ -15,17 +16,20 @@ use crate::admission_policy::{
     evaluate_artifact_admission, AdmissionDecision, AdmissionEnvironment, AdmissionPolicy,
 };
 use crate::deployment_manifest::CompiledExecutionManifest;
+use crate::package::manifest::Manifest;
 use crate::web::ir::{DeploymentIr, INCOMPLETE_METADATA_CAPABILITY};
 
 pub const MAX_DEPLOYMENT_BUNDLE_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_DEPLOYMENT_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_DEPLOYMENT_ENTRIES: usize = 100_000;
 pub const MAX_NBC_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_PACKAGE_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_DEPLOYMENT_IR_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Validated deployment inputs extracted from a bundle without writing to disk.
 #[derive(Debug)]
 pub struct DeploymentBundle {
+    pub package_manifest: Manifest,
     pub artifact_path: String,
     pub artifact_bytes: Vec<u8>,
     pub execution_manifest: CompiledExecutionManifest,
@@ -52,6 +56,7 @@ impl DeploymentBundle {
 
         let mut entry_count = 0usize;
         let mut expanded_bytes = 0u64;
+        let mut package_manifest: Option<Manifest> = None;
         let mut artifact: Option<(String, Vec<u8>)> = None;
         let mut web_ir: Option<DeploymentIr> = None;
 
@@ -105,6 +110,31 @@ impl DeploymentBundle {
                 continue;
             }
 
+            if path == Path::new("Nulang.toml") {
+                if package_manifest.is_some() {
+                    return Err(DeploymentBundleError::MultiplePackageManifests);
+                }
+                if size > MAX_PACKAGE_MANIFEST_BYTES {
+                    return Err(DeploymentBundleError::PackageManifestTooLarge {
+                        actual: size,
+                        max: MAX_PACKAGE_MANIFEST_BYTES,
+                    });
+                }
+                let data = read_limited(&mut entry, MAX_PACKAGE_MANIFEST_BYTES).map_err(|err| {
+                    DeploymentBundleError::Archive(format!(
+                        "cannot read {path_string}: {err}"
+                    ))
+                })?;
+                let source = std::str::from_utf8(&data).map_err(|err| {
+                    DeploymentBundleError::InvalidPackageManifest(err.to_string())
+                })?;
+                let parsed = Manifest::parse(source).map_err(|err| {
+                    DeploymentBundleError::InvalidPackageManifest(err.to_string())
+                })?;
+                package_manifest = Some(parsed);
+                continue;
+            }
+
             if is_packaged_nbc(&path) {
                 if artifact.is_some() {
                     return Err(DeploymentBundleError::MultipleArtifacts);
@@ -152,12 +182,26 @@ impl DeploymentBundle {
             }
         }
 
+        let package_manifest =
+            package_manifest.ok_or(DeploymentBundleError::MissingPackageManifest)?;
         let (artifact_path, artifact_bytes) =
             artifact.ok_or(DeploymentBundleError::MissingArtifact)?;
+        let expected_artifact = Path::new(".nula/dist")
+            .join(format!("{}.nbc", package_manifest.package.name))
+            .to_string_lossy()
+            .into_owned();
+        if artifact_path != expected_artifact {
+            return Err(DeploymentBundleError::ArtifactNameMismatch {
+                expected: expected_artifact,
+                actual: artifact_path,
+            });
+        }
+
         let execution_manifest = CompiledExecutionManifest::from_nbc_bytes(&artifact_bytes)
             .map_err(DeploymentBundleError::InvalidArtifact)?;
 
         Ok(Self {
+            package_manifest,
             artifact_path,
             artifact_bytes,
             execution_manifest,
@@ -185,8 +229,13 @@ pub enum DeploymentBundleError {
     TooManyEntries { actual: usize, max: usize },
     UnsafePath { path: String },
     UnsupportedEntryType { path: String },
+    MissingPackageManifest,
+    MultiplePackageManifests,
+    PackageManifestTooLarge { actual: u64, max: u64 },
+    InvalidPackageManifest(String),
     MissingArtifact,
     MultipleArtifacts,
+    ArtifactNameMismatch { expected: String, actual: String },
     ArtifactTooLarge { actual: u64, max: u64 },
     InvalidArtifact(String),
     MultipleDeploymentIr,
@@ -212,10 +261,24 @@ impl fmt::Display for DeploymentBundleError {
             Self::UnsupportedEntryType { path } => {
                 write!(f, "unsupported archive entry type at {path}")
             }
+            Self::MissingPackageManifest => write!(f, "deployment bundle is missing Nulang.toml"),
+            Self::MultiplePackageManifests => {
+                write!(f, "deployment bundle contains multiple Nulang.toml entries")
+            }
+            Self::PackageManifestTooLarge { actual, max } => {
+                write!(f, "Nulang.toml is {actual} bytes; maximum is {max}")
+            }
+            Self::InvalidPackageManifest(message) => {
+                write!(f, "invalid Nulang.toml: {message}")
+            }
             Self::MissingArtifact => write!(f, "deployment bundle contains no .nula/dist/*.nbc"),
             Self::MultipleArtifacts => {
                 write!(f, "deployment bundle contains multiple .nula/dist/*.nbc artifacts")
             }
+            Self::ArtifactNameMismatch { expected, actual } => write!(
+                f,
+                "compiled artifact path {actual} does not match package manifest; expected {expected}"
+            ),
             Self::ArtifactTooLarge { actual, max } => {
                 write!(f, ".nbc artifact is {actual} bytes; maximum is {max}")
             }
@@ -280,7 +343,14 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
 
-    fn make_bundle(entries: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
+    fn package_manifest(name: &str) -> Vec<u8> {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n").into_bytes()
+    }
+
+    fn make_bundle(mut entries: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
+        if !entries.iter().any(|(path, _)| *path == "Nulang.toml") {
+            entries.insert(0, ("Nulang.toml", package_manifest("app")));
+        }
         let mut output = Vec::new();
         {
             let gzip = GzEncoder::new(&mut output, Compression::default());
@@ -307,9 +377,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_current_deploy_bundle_and_derives_manifest() {
+    fn parses_current_deploy_bundle_and_binds_package_identity() {
         let bytes = make_bundle(vec![(".nula/dist/app.nbc", pure_nbc())]);
         let bundle = DeploymentBundle::parse(&bytes).expect("parse bundle");
+        assert_eq!(bundle.package_manifest.package.name, "app");
         assert_eq!(bundle.artifact_path, ".nula/dist/app.nbc");
         assert_eq!(
             bundle.execution_manifest.artifact_blake3,
@@ -324,10 +395,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_artifact_name_that_does_not_match_package() {
+        let bytes = make_bundle(vec![(".nula/dist/other.nbc", pure_nbc())]);
+        assert!(matches!(
+            DeploymentBundle::parse(&bytes),
+            Err(DeploymentBundleError::ArtifactNameMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn rejects_multiple_compiled_artifacts() {
         let bytes = make_bundle(vec![
-            (".nula/dist/a.nbc", pure_nbc()),
-            (".nula/dist/b.nbc", pure_nbc()),
+            (".nula/dist/app.nbc", pure_nbc()),
+            (".nula/dist/other.nbc", pure_nbc()),
         ]);
         assert!(matches!(
             DeploymentBundle::parse(&bytes),
@@ -337,10 +417,33 @@ mod tests {
 
     #[test]
     fn rejects_missing_compiled_artifact() {
-        let bytes = make_bundle(vec![("Nulang.toml", b"[package]".to_vec())]);
+        let bytes = make_bundle(vec![]);
         assert!(matches!(
             DeploymentBundle::parse(&bytes),
             Err(DeploymentBundleError::MissingArtifact)
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_package_manifest() {
+        let mut output = Vec::new();
+        {
+            let gzip = GzEncoder::new(&mut output, Compression::default());
+            let mut builder = tar::Builder::new(gzip);
+            let data = pure_nbc();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, ".nula/dist/app.nbc", data.as_slice())
+                .expect("append entry");
+            let gzip = builder.into_inner().expect("finish tar");
+            gzip.finish().expect("finish gzip");
+        }
+        assert!(matches!(
+            DeploymentBundle::parse(&output),
+            Err(DeploymentBundleError::MissingPackageManifest)
         ));
     }
 
