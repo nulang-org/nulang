@@ -3114,11 +3114,11 @@ mod tests {
             "plain receive must emit ReceiveMatch"
         );
         assert!(
-            module
+            !module
                 .instructions
                 .iter()
                 .any(|i| i.opcode == OpCode::Receive),
-            "plain receive must keep the legacy fallback"
+            "selective receive must not consume a rejected/nonmatching message via legacy Receive"
         );
         assert!(
             !module

@@ -249,10 +249,11 @@ pub enum RValue {
     SignalWait {
         name: String,
     },
-    /// `receive { | Behavior(params) => expr ... }` with no arms (or in the
-    /// no-match fallback block): pop the next message from the actor's
-    /// mailbox; evaluates to its first payload value (nil when the mailbox
-    /// is empty or outside an actor context).
+    /// Legacy pop-any receive used by an arm-less `receive`: pop the next
+    /// message from the actor's mailbox; evaluates to its first payload value
+    /// (nil when the mailbox is empty or outside an actor context). Selective
+    /// receive no-match paths must not use this operation because rejected or
+    /// unrelated messages must remain queued.
     Receive,
     /// Selective receive: scan the mailbox for the first message whose
     /// behavior id is in `behavior_ids` (bytecode `ReceiveMatch`). Writes

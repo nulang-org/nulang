@@ -1630,9 +1630,10 @@ impl<'c> FnLowerer<'c> {
     /// block that re-emits the `ReceiveMatch` scan, which skips the
     /// already-tried message in the skip-buffer.
     ///
-    /// When nothing matches (scan returns None → arm-count sentinel), the
-    /// no-match block runs the legacy pop-any `Receive` or, with `after`,
-    /// the timeout body.
+    /// When nothing matches (scan returns None → arm-count sentinel), an
+    /// untimed selective receive yields nil without consuming any queued
+    /// message; with `after`, the timeout body runs. Plain arm-less `receive`
+    /// still uses the legacy pop-any `Receive` path above.
     fn lower_receive(
         &mut self,
         dst: mir::LocalId,
@@ -1780,7 +1781,11 @@ impl<'c> FnLowerer<'c> {
                 self.lower_body_into(timeout_body, dst, join)?;
             }
             None => {
-                self.b.assign(dst, mir::RValue::Receive);
+                // Selective receive is non-consuming on no match. In
+                // particular, a candidate rejected by a pattern/guard must
+                // remain queued for a future receive rather than falling
+                // through to the legacy pop-any Receive operation.
+                self.b.assign(dst, mir::RValue::Const(Constant::Nil));
                 self.b.terminate(mir::Terminator::Jump(join));
             }
         }
