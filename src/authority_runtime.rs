@@ -12,7 +12,7 @@ use crate::runtime::Actor;
 use std::error::Error;
 use std::fmt;
 
-/// Failure while authorizing an external action for an actor.
+/// Failure while authorizing or delegating external authority for an actor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAuthorityError {
     /// The persisted/runtime token set is malformed. Treating malformed state
@@ -20,7 +20,7 @@ pub enum RuntimeAuthorityError {
     /// entire manifest is rejected.
     InvalidManifest(AuthorityParseError),
     /// The manifest is structurally valid but does not contain the exact grant
-    /// required for the requested external action.
+    /// required for the requested external action or delegation.
     Denied(AuthorityGrant),
 }
 
@@ -99,6 +99,23 @@ impl Actor {
             port,
         })
     }
+
+    /// Validate a child/delegated manifest against this actor's authority.
+    ///
+    /// Delegation is monotonic: the child may receive equal or less exact
+    /// authority, never a grant the parent does not already hold. Returning an
+    /// error for the first missing grant makes accidental privilege escalation
+    /// observable instead of silently intersecting the request.
+    pub fn delegate_authority(
+        &self,
+        requested: &AuthorityManifest,
+    ) -> Result<AuthorityManifest, RuntimeAuthorityError> {
+        let parent = self.authority_manifest()?;
+        if let Some(missing) = requested.iter().find(|grant| !parent.allows(grant)) {
+            return Err(RuntimeAuthorityError::Denied(missing.clone()));
+        }
+        Ok(requested.clone())
+    }
 }
 
 #[cfg(test)]
@@ -167,7 +184,30 @@ mod tests {
         let denied = AuthorityGrant::SecretRead {
             name: "OTHER_KEY".into(),
         };
-        assert_eq!(actor.allows_authority(&allowed).unwrap(), true);
-        assert_eq!(actor.allows_authority(&denied).unwrap(), false);
+        assert!(actor.allows_authority(&allowed).unwrap());
+        assert!(!actor.allows_authority(&denied).unwrap());
+    }
+
+    #[test]
+    fn delegation_cannot_manufacture_authority() {
+        let parent = actor_with(&[
+            "Net::TcpOut(api.stripe.com:443)",
+            "Secret::Read(STRIPE_KEY)",
+        ]);
+        let allowed = AuthorityManifest::from_tokens(["Net::TcpOut(api.stripe.com:443)"])
+            .unwrap();
+        let escalation = AuthorityManifest::from_tokens([
+            "Net::TcpOut(api.stripe.com:443)",
+            "Secret::Read(OTHER_KEY)",
+        ])
+        .unwrap();
+
+        assert_eq!(parent.delegate_authority(&allowed).unwrap(), allowed);
+        assert_eq!(
+            parent.delegate_authority(&escalation),
+            Err(RuntimeAuthorityError::Denied(AuthorityGrant::SecretRead {
+                name: "OTHER_KEY".into(),
+            }))
+        );
     }
 }
