@@ -18,9 +18,7 @@ pub trait WhisperRuntimeSession: Send {
         frame: AudioFrame,
     ) -> VoiceFuture<'a, Result<Vec<Transcript>, VoiceProviderError>>;
 
-    fn finish<'a>(
-        &'a mut self,
-    ) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>>;
+    fn finish<'a>(&'a mut self) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>>;
 }
 
 pub struct WhisperRecognizer<R> {
@@ -50,9 +48,7 @@ impl SpeechRecognitionSession for WhisperSession {
         self.inner.push(frame)
     }
 
-    fn finish<'a>(
-        &'a mut self,
-    ) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>> {
+    fn finish<'a>(&'a mut self) -> VoiceFuture<'a, Result<Option<Transcript>, VoiceProviderError>> {
         self.inner.finish()
     }
 }
