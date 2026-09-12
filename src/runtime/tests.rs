@@ -6940,3 +6940,95 @@ fn test_send_to_grain_cross_shard_routes_and_hydrates() {
         "inc message should be processed on shard 1"
     );
 }
+
+#[test]
+fn test_orca_mailbox_transfer_hold_survives_gc_until_consumed() {
+    let mut rt = Runtime::new();
+    let owner_id = rt.spawn_actor(Box::new(|| vec![]));
+    let receiver_id = rt.spawn_actor(Box::new(|| vec![]));
+    let ptr = {
+        let owner = rt.actors.get_mut(&owner_id).expect("owner actor");
+        owner
+            .orca_gc
+            .alloc_object(&mut owner.heap, 8, TypeTag::Raw)
+            .expect("owner allocation")
+    };
+    let header = unsafe { ActorHeap::header_of(ptr) };
+
+    rt.current_actor = Some(owner_id);
+    rt.send_message_by_id(receiver_id, 0, &[Value::ptr(ptr)]);
+    rt.current_actor = None;
+    assert_eq!(unsafe { (*header).foreign_count }, 1);
+    assert_eq!(rt.actors[&receiver_id].mailbox.len(), 1);
+
+    // Simulate the sender dropping its last local reference while the target
+    // is suspended/idle with the message still queued.
+    {
+        let owner = rt.actors.get_mut(&owner_id).expect("owner actor");
+        unsafe {
+            owner.orca_gc.drop_local_ref(&mut owner.heap, ptr);
+        }
+    }
+    assert_eq!(unsafe { (*header).ref_count }, 0);
+    assert_eq!(unsafe { (*header).foreign_count }, 1);
+
+    // This was the bug: scheduler quiescence used to publish the send-side -1
+    // even though the pointer was still resident in the mailbox.
+    rt.process_gc_ops();
+    rt.process_deferred_all();
+    assert_eq!(
+        unsafe { (*header).foreign_count },
+        1,
+        "queued message must retain its in-flight ORCA hold across GC drain"
+    );
+    assert_eq!(rt.actors[&receiver_id].mailbox.len(), 1);
+
+    // Normal delivery establishes a receiver hold first and only then releases
+    // the mailbox-transfer hold into the GC coordinator.
+    rt.step_actor(receiver_id);
+    assert_eq!(unsafe { (*header).foreign_count }, 2);
+    assert_eq!(rt.actors[&receiver_id].mailbox.len(), 0);
+    rt.process_gc_ops();
+    assert_eq!(
+        unsafe { (*header).foreign_count },
+        1,
+        "after delivery only the receiver-side hold should remain"
+    );
+}
+
+#[test]
+fn test_orca_mailbox_transfer_hold_released_when_receiver_exits() {
+    let mut rt = Runtime::new();
+    let owner_id = rt.spawn_actor(Box::new(|| vec![]));
+    let receiver_id = rt.spawn_actor(Box::new(|| vec![]));
+    let ptr = {
+        let owner = rt.actors.get_mut(&owner_id).expect("owner actor");
+        owner
+            .orca_gc
+            .alloc_object(&mut owner.heap, 8, TypeTag::Raw)
+            .expect("owner allocation")
+    };
+
+    rt.current_actor = Some(owner_id);
+    rt.send_message_by_id(receiver_id, 0, &[Value::ptr(ptr)]);
+    rt.current_actor = None;
+    {
+        let owner = rt.actors.get_mut(&owner_id).expect("owner actor");
+        unsafe {
+            owner.orca_gc.drop_local_ref(&mut owner.heap, ptr);
+        }
+    }
+
+    assert_eq!(
+        rt.pending_mailbox_ref_ops.get(&receiver_id).map(Vec::len),
+        Some(1)
+    );
+    let freed_before = rt.gc_stats().objects_freed;
+    crate::runtime::exit::exit_actor(&mut rt, receiver_id, ExitReason::Normal);
+    assert!(!rt.pending_mailbox_ref_ops.contains_key(&receiver_id));
+    rt.process_gc_ops();
+    assert!(
+        rt.gc_stats().objects_freed > freed_before,
+        "discarding the receiver mailbox must eventually release its transfer hold"
+    );
+}

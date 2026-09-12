@@ -252,6 +252,11 @@ pub struct Runtime {
     pub main_gc: OrcaGc,
     pub next_reductions: u32,
     pub coordinator: OrcaCoordinator,
+    /// Send-side ORCA decrements whose pointer-bearing messages are still
+    /// resident in a target mailbox. Each send-side +1 stays here until the
+    /// exact payload is consumed (then it is published to the coordinator) or
+    /// the target actor exits and discards its queued messages.
+    pending_mailbox_ref_ops: HashMap<u64, Vec<ForeignRefOp>>,
     pub cycle_detector: CycleDetector,
 
     // Heaps of exited actors that still have outstanding foreign
@@ -520,6 +525,7 @@ impl Runtime {
             main_gc: OrcaGc::new(MAIN_HEAP_ACTOR_ID),
             next_reductions: 1000,
             coordinator: OrcaCoordinator::new(),
+            pending_mailbox_ref_ops: HashMap::new(),
             cycle_detector: CycleDetector::new(),
             vm_execution_depth: 0,
             suspend_enabled: false,
@@ -2272,11 +2278,13 @@ impl Runtime {
             priority: MessagePriority::Normal,
             trace_id: out_trace.clone(),
         };
+        let mut enqueued = false;
         if let Some(actor) = self.actors.get_mut(&target_id) {
             actor
                 .flight_recorder
                 .record(self.current_actor.unwrap_or(0), behavior_id, args);
             if actor.mailbox.push_local(msg).is_ok() {
+                enqueued = true;
                 // Activity resets the dehydration idle timer.
                 actor.idle_ms = 0;
             } else {
@@ -2304,6 +2312,13 @@ impl Runtime {
                 "target actor not found",
             );
         }
+        if !enqueued {
+            // No mailbox owns these values, so no send-side ORCA transfer hold
+            // may be created. Preserve the old enqueue attempt for behavioral
+            // compatibility, then stop before reference tracking/wake logic.
+            self.enqueue_actor(target_id);
+            return;
+        }
         for arg in args {
             if let Some(ptr) = arg.as_ptr() {
                 if ptr.is_null() {
@@ -2324,7 +2339,10 @@ impl Runtime {
 
                     if let Some(owner) = self.actors.get_mut(&owner_id) {
                         let op = unsafe { owner.orca_gc.send_ref_to(&owner.heap, ptr, target_id) };
-                        self.coordinator.submit_op(op);
+                        self.pending_mailbox_ref_ops
+                            .entry(target_id)
+                            .or_default()
+                            .push(op);
                     } else {
                         // The owner has exited: its heap is retired (kept
                         // alive by the sender's hold), so the header is
@@ -2334,12 +2352,15 @@ impl Runtime {
                         // SAFETY: as above; the single scheduler thread is
                         // the only mutator of any header.
                         unsafe { (*source_header).foreign_count += 1 };
-                        self.coordinator.submit_op(ForeignRefOp {
-                            target_actor: target_id,
-                            owner_actor: owner_id,
-                            object_header: source_header,
-                            delta: -1,
-                        });
+                        self.pending_mailbox_ref_ops
+                            .entry(target_id)
+                            .or_default()
+                            .push(ForeignRefOp {
+                                target_actor: target_id,
+                                owner_actor: owner_id,
+                                object_header: source_header,
+                                delta: -1,
+                            });
                     }
                     // Register the cross-actor reference with the cycle detector.
                     // The receiving actor is represented by its pinned sentinel;
@@ -2385,6 +2406,45 @@ impl Runtime {
                 }
             } else {
                 self.resume_suspended_receive_wait(target_id);
+            }
+        }
+    }
+
+    /// Publish the one send-side ORCA decrement associated with a payload
+    /// pointer that has just left `target_id`'s mailbox. The receiver hold
+    /// must be established before this is called so foreign_count never has a
+    /// zero-count gap between mailbox residency and receiver ownership.
+    fn release_mailbox_transfer_ref(
+        &mut self,
+        target_id: u64,
+        object_header: *mut crate::runtime::heap::OrcaHeader,
+    ) {
+        let mut remove_bucket = false;
+        let op = self
+            .pending_mailbox_ref_ops
+            .get_mut(&target_id)
+            .and_then(|ops| {
+                let idx = ops
+                    .iter()
+                    .position(|op| op.object_header == object_header)?;
+                let op = ops.swap_remove(idx);
+                remove_bucket = ops.is_empty();
+                Some(op)
+            });
+        if remove_bucket {
+            self.pending_mailbox_ref_ops.remove(&target_id);
+        }
+        if let Some(op) = op {
+            self.coordinator.submit_op(op);
+        }
+    }
+
+    /// Release all mailbox-resident send-side holds for an actor whose queued
+    /// messages are being discarded during exit.
+    pub(crate) fn release_pending_mailbox_refs(&mut self, target_id: u64) {
+        if let Some(ops) = self.pending_mailbox_ref_ops.remove(&target_id) {
+            for op in ops {
+                self.coordinator.submit_op(op);
             }
         }
     }
@@ -3067,7 +3127,7 @@ impl Runtime {
     /// object survives until the receiver exits - even if the sender drops
     /// its local references or exits first.  Holds are recorded on the
     /// receiver's `OrcaGc` and released by [`release_held_foreign_refs`].
-    fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value]) {
+    pub(crate) fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value]) {
         for value in payload {
             if let Some(id) = value.as_object_id() {
                 // Object-store ref: increment the node-local refcount and
@@ -3101,6 +3161,10 @@ impl Runtime {
             if let Some(receiver) = self.actors.get_mut(&receiver_id) {
                 receiver.orca_gc.record_held_ref(owner_id, header);
             }
+            // Convert mailbox residency into receiver ownership only after the
+            // receiver-side +1 is established, so process_gc_ops can never
+            // expose a zero-count gap for this pointer.
+            self.release_mailbox_transfer_ref(receiver_id, header);
         }
     }
 

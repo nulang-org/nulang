@@ -1302,22 +1302,21 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
     }
 
     fn try_receive(&mut self) -> Option<(u16, crate::vm::Value)> {
-        // SAFETY: as above; mailbox access runs on the owning scheduler thread.
+        // SAFETY: as above; mailbox access and ORCA ownership transfer both
+        // run on the owning scheduler thread.
         unsafe {
-            (*self.runtime)
-                .actors
-                .get_mut(&self.actor_id)?
-                .mailbox
-                .pop()
-        }
-        .map(|msg| {
+            let msg = {
+                let actor = (*self.runtime).actors.get_mut(&self.actor_id)?;
+                actor.mailbox.pop()?
+            };
+            (*self.runtime).hold_payload_refs(self.actor_id, &msg.payload);
             let first = msg
                 .payload
                 .first()
                 .copied()
                 .unwrap_or(crate::vm::Value::nil());
-            (msg.behavior_id, first)
-        })
+            Some((msg.behavior_id, first))
+        }
     }
 
     fn try_receive_match(

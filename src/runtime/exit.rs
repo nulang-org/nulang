@@ -88,6 +88,9 @@ pub(crate) fn reap_living_actor(rt: &mut Runtime, actor_id: u64, reason: ExitRea
         actor.state = ActorState::Terminated;
     }
 
+    // Queued pointer-bearing messages are discarded with the actor. Their
+    // send-side mailbox transfer holds can now be published safely.
+    rt.release_pending_mailbox_refs(actor_id);
     rt.release_held_foreign_refs(actor_id);
 
     rt.registry.unregister_by_actor(actor_id);
