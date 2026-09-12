@@ -54,6 +54,8 @@ impl LocalRuntime {
         let data_dir = config.resolve_data_dir(&project_dir);
         let store = SqliteStore::open(&data_dir)?;
         let reservations = TaskReservationStore::open(store.db_path())?;
+        reservations.reclaim_expired_running_tasks(Utc::now().timestamp_millis())?;
+
         let project_id = project_dir
             .file_name()
             .and_then(|s| s.to_str())
@@ -254,6 +256,7 @@ pub fn init_project(dir: &Path) -> Result<(), RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nulang_ai_core::{Goal, ManagerKind, Task};
     use std::io::Cursor;
 
     #[test]
@@ -328,6 +331,39 @@ mod tests {
             .unwrap();
         assert!(persisted.capabilities.contains(&"repo.write".into()));
         assert!(!persisted.available);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn runtime_restart_requeues_task_with_expired_reservation() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+
+        let goal_id;
+        let task_id;
+        {
+            let rt = LocalRuntime::open(tmp.clone()).unwrap();
+            let goal = Goal::new("recovery-test", "recover task", 1.0);
+            goal_id = goal.id;
+            rt.store.upsert_goal(&goal).unwrap();
+
+            let mut task = Task::new(goal_id, "recover me", ManagerKind::Engineering);
+            task.status = TaskStatus::Running;
+            task.assigned_agent_id = Some("worker-local".into());
+            task_id = task.id;
+            rt.store.upsert_task(&task).unwrap();
+            rt.reservations
+                .reserve_with_capacity(task_id, "worker-local", 1, 1_000, 100)
+                .unwrap();
+        }
+
+        let reopened = LocalRuntime::open(tmp.clone()).unwrap();
+        let graph = reopened.store().get_goal_graph(goal_id).unwrap();
+        let recovered = graph.tasks.iter().find(|task| task.id == task_id).unwrap();
+        assert_eq!(recovered.status, TaskStatus::Ready);
+        assert_eq!(recovered.assigned_agent_id, None);
 
         let _ = std::fs::remove_dir_all(tmp);
     }
