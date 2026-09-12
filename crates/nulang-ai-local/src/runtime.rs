@@ -9,7 +9,7 @@ use nulang_ai_core::{
 use nulang_ai_director::{Director, LocalDirector};
 use nulang_ai_manager::{EngineeringManager, Manager};
 use nulang_ai_protocol::format_event_line;
-use nulang_ai_worker::{LocalWorker, Worker, WorkerError};
+use nulang_ai_worker::{LocalWorker, WorkerRegistry, WorkerError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -38,7 +38,7 @@ pub struct LocalRuntime {
     project_id: String,
     director: LocalDirector,
     engineering: EngineeringManager,
-    worker: LocalWorker,
+    workers: WorkerRegistry,
 }
 
 impl LocalRuntime {
@@ -66,6 +66,10 @@ impl LocalRuntime {
             updated_at: now,
         };
         store.upsert_conversation(&conv)?;
+
+        let mut workers = WorkerRegistry::new();
+        workers.register(LocalWorker::new("worker-local"));
+
         Ok(Self {
             project_dir,
             config,
@@ -74,7 +78,7 @@ impl LocalRuntime {
             project_id,
             director: LocalDirector::new("director-local"),
             engineering: EngineeringManager,
-            worker: LocalWorker::new("worker-local"),
+            workers,
         })
     }
 
@@ -88,6 +92,10 @@ impl LocalRuntime {
 
     pub fn conversation_id(&self) -> Uuid {
         self.conversation_id
+    }
+
+    pub fn register_worker(&mut self, worker: LocalWorker) {
+        self.workers.register(worker);
     }
 
     pub fn handle_user_message(
@@ -130,7 +138,9 @@ impl LocalRuntime {
         self.store.upsert_conversation(&conv)?;
 
         let tasks = self.engineering.plan_goal(&goal);
-        for task in tasks {
+        for mut task in tasks {
+            let agent_id = self.workers.select_agent_id(&task)?;
+            task.assigned_agent_id = Some(agent_id.clone());
             self.store.upsert_task(&task)?;
             self.emit(
                 out,
@@ -140,10 +150,6 @@ impl LocalRuntime {
                 },
             )?;
 
-            let agent_id = task
-                .assigned_agent_id
-                .clone()
-                .unwrap_or_else(|| self.worker.agent_id().to_string());
             let mut running = task;
             running.status = TaskStatus::Running;
             running.updated_at = Utc::now();
@@ -156,7 +162,7 @@ impl LocalRuntime {
                 },
             )?;
 
-            let completed = self.worker.execute(&running)?;
+            let completed = self.workers.execute_on(&agent_id, &running)?;
             self.store.upsert_task(&completed)?;
             self.emit(
                 out,
@@ -208,6 +214,35 @@ mod tests {
         assert!(text.contains("task_created"));
         let graph = rt.store().get_goal_graph(goal_id).unwrap();
         assert_eq!(graph.goal.status, GoalStatus::Completed);
+        assert_eq!(
+            graph.tasks[0].assigned_agent_id.as_deref(),
+            Some("worker-local")
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn scheduler_prefers_least_privileged_eligible_worker() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+        let mut rt = LocalRuntime::open(tmp.clone()).unwrap();
+        rt.register_worker(LocalWorker::with_capabilities(
+            "worker-admin",
+            ["code", "test", "repo.write", "deploy.execute"],
+        ));
+        rt.register_worker(LocalWorker::with_capabilities(
+            "worker-specialist",
+            ["code", "test"],
+        ));
+
+        let mut buf = Cursor::new(Vec::new());
+        let goal_id = rt.handle_user_message("ship feature X", &mut buf).unwrap();
+        let graph = rt.store().get_goal_graph(goal_id).unwrap();
+        assert_eq!(
+            graph.tasks[0].assigned_agent_id.as_deref(),
+            Some("worker-local")
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
