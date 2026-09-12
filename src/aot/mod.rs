@@ -1104,6 +1104,7 @@ impl crate::vm::ActorVmCallbacks for AotActorCallbacks {
     fn spawn_actor(
         &mut self,
         _module: &crate::bytecode::CodeModule,
+        _spawn_pc: usize,
         _behavior_idx: usize,
         _init: Vec<(String, crate::vm::Value)>,
     ) -> crate::vm::Value {
@@ -1227,12 +1228,21 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
     fn spawn_actor(
         &mut self,
         module: &crate::bytecode::CodeModule,
+        spawn_pc: usize,
         behavior_idx: usize,
         init: Vec<(String, crate::vm::Value)>,
     ) -> crate::vm::Value {
         // SAFETY: as above; spawning mutates runtime state but never re-enters
         // the VM.
-        unsafe { (*self.runtime).spawn_from_module(module, behavior_idx, init) }
+        unsafe {
+            crate::runtime::callbacks::spawn_with_site_authority(
+                &mut *self.runtime,
+                module,
+                spawn_pc,
+                behavior_idx,
+                init,
+            )
+        }
     }
 
     fn send_message(
@@ -1460,10 +1470,19 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
     fn spawn_actor(
         &mut self,
         module: &crate::bytecode::CodeModule,
+        spawn_pc: usize,
         behavior_idx: usize,
         init: Vec<(String, crate::vm::Value)>,
     ) -> crate::vm::Value {
-        unsafe { (*self.runtime).spawn_from_module(module, behavior_idx, init) }
+        unsafe {
+            crate::runtime::callbacks::spawn_with_site_authority(
+                &mut *self.runtime,
+                module,
+                spawn_pc,
+                behavior_idx,
+                init,
+            )
+        }
     }
 
     fn send_message(

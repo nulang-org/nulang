@@ -89,7 +89,6 @@ impl From<AuthorityParseError> for RuntimeAuthorityError {
 ///
 /// This is staged migration plumbing and becomes a normal runtime call once
 /// exact spawn provenance is carried through `ActorVmCallbacks::spawn_actor`.
-#[allow(dead_code)]
 pub fn spawn_authority_manifest(
     module: &CodeModule,
     spawn_pc: usize,
