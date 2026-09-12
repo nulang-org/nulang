@@ -1,5 +1,7 @@
 use crate::interruption::{InterruptionNotice, InterruptionReason};
-use crate::provider::{CapacityProvider, CapacityQuery, ProviderError, ProviderFuture, ProviderSnapshot};
+use crate::provider::{
+    CapacityProvider, CapacityQuery, ProviderError, ProviderFuture, ProviderSnapshot,
+};
 use crate::{AcceleratorSpec, Architecture, CapacityOffer, Lifecycle, TrustTier};
 use serde::{Deserialize, Serialize};
 use std::{future::Future, pin::Pin};
@@ -66,7 +68,11 @@ impl NebiusOffer {
             } else {
                 0.0
             },
-            interruption_notice_seconds: if lifecycle == Lifecycle::Preemptible { 60 } else { 0 },
+            interruption_notice_seconds: if lifecycle == Lifecycle::Preemptible {
+                60
+            } else {
+                0
+            },
             capacity_confidence: self.capacity_confidence,
             throughput_score: self.throughput_score,
             trust_tier: TrustTier::CloudProvider,
@@ -80,7 +86,8 @@ pub struct NebiusSnapshot {
     pub offers: Vec<NebiusOffer>,
 }
 
-pub type NebiusSourceFuture<'a> = Pin<Box<dyn Future<Output = Result<NebiusSnapshot, ProviderError>> + Send + 'a>>;
+pub type NebiusSourceFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<NebiusSnapshot, ProviderError>> + Send + 'a>>;
 
 pub trait NebiusOfferSource: Send + Sync {
     fn fetch<'a>(&'a self, query: &'a CapacityQuery) -> NebiusSourceFuture<'a>;
