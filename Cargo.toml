@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nulang-ai", "crates/nulang-ai-core", "crates/nulang-ai-protocol", "crates/nulang-ai-local", "crates/nulang-ai-director", "crates/nulang-ai-manager", "crates/nulang-ai-worker", "crates/nulang-ai-mcp", "crates/nulang-ai-voice"]
+members = ["crates/nulang-ai", "crates/nulang-ai-core", "crates/nulang-ai-protocol", "crates/nulang-ai-local", "crates/nulang-ai-director", "crates/nulang-ai-manager", "crates/nulang-ai-worker", "crates/nulang-ai-mcp", "crates/nulang-capacity", "crates/nulang-ai-voice"]
 # The browser-playground crate re-uses compiler sources via #[path] includes
 # and builds only for wasm32-unknown-unknown; it is intentionally standalone
 # (its own lockfile, minimal pure-Rust dep set) and excluded from workspace
