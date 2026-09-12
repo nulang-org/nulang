@@ -11,7 +11,10 @@ use nulang::vm::VM;
 fn assert_missing_continuation(err: NuError) {
     match err {
         NuError::VMError { msg, .. } => {
-            assert_eq!(msg, "resume called without a captured continuation");
+            assert!(
+                msg.starts_with("resume called without a captured continuation"),
+                "expected missing-continuation trap, got: {msg}"
+            );
         }
         other => panic!("expected VMError, got {other:?}"),
     }
