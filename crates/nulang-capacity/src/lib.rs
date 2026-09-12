@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use thiserror::Error;
 
 pub mod broker;
+pub mod execution;
 pub mod health;
 pub mod interruption;
 pub mod lease;
