@@ -5,37 +5,40 @@
 //! This module provides that boundary without changing the existing actor-ref
 //! representation yet.
 //!
-//! `ProtocolTypeId` is derived from a canonical type encoding (for example the
-//! typed/Core IR encoding). `ProtocolId` is then derived from the set of
-//! behavior signatures. Human-readable protocol names are deliberately not
-//! hashed, so a source-level rename does not break wire compatibility when the
-//! protocol shape is unchanged.
+//! `ProtocolTypeId` reuses Nulang's canonical NTIR type hash. `ProtocolId` is
+//! then derived from the set of behavior signatures. Human-readable protocol
+//! names are deliberately not hashed, so a source-level rename does not break
+//! wire compatibility when the protocol shape is unchanged.
 
+use crate::type_ir::NtirNode;
+use crate::types::Type;
 use blake3::Hasher;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
 
-const TYPE_DOMAIN: &[u8] = b"nulang.protocol.type.v1\0";
 const PROTOCOL_DOMAIN: &[u8] = b"nulang.protocol.v1\0";
 
 /// Stable identity of one canonical parameter/response type.
+///
+/// This is exactly the existing NTIR structural hash wrapped in a protocol
+/// vocabulary type. Reusing NTIR prevents actor protocols from inventing a
+/// second, subtly different notion of semantic type identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolTypeId([u8; 32]);
 
 impl ProtocolTypeId {
-    /// Hash a canonical type representation.
-    ///
-    /// Callers must pass a stable semantic encoding, never source pretty text
-    /// or Rust `Debug` output. Keeping this API byte-oriented makes that
-    /// requirement explicit and lets the compiler later feed its canonical
-    /// typed/Core IR encoding directly.
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Self {
-        let mut hasher = Hasher::new();
-        hasher.update(TYPE_DOMAIN);
-        put_bytes(&mut hasher, bytes);
-        Self(*hasher.finalize().as_bytes())
+    pub fn from_type(ty: &Type) -> Self {
+        Self::from_ntir(&ty.to_ntir())
+    }
+
+    pub fn from_ntir(ntir: &NtirNode) -> Self {
+        Self(ntir.hash())
+    }
+
+    pub fn from_ntir_hash(hash: [u8; 32]) -> Self {
+        Self(hash)
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -253,17 +256,30 @@ fn decode_hex_nibble(byte: u8) -> Result<u8, ProtocolIdParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PrimitiveType;
 
     fn int() -> ProtocolTypeId {
-        ProtocolTypeId::from_canonical_bytes(b"core-type:int-v1")
+        ProtocolTypeId::from_type(&Type::Primitive(PrimitiveType::Int))
     }
 
     fn money() -> ProtocolTypeId {
-        ProtocolTypeId::from_canonical_bytes(b"core-type:money-v1")
+        ProtocolTypeId::from_type(&Type::Record(vec![(
+            "cents".to_string(),
+            Type::Primitive(PrimitiveType::Int),
+        )]))
     }
 
     fn receipt() -> ProtocolTypeId {
-        ProtocolTypeId::from_canonical_bytes(b"core-type:receipt-v1")
+        ProtocolTypeId::from_type(&Type::Record(vec![(
+            "id".to_string(),
+            Type::Primitive(PrimitiveType::String),
+        )]))
+    }
+
+    #[test]
+    fn protocol_type_id_reuses_ntir_hash() {
+        let ty = Type::Primitive(PrimitiveType::Int);
+        assert_eq!(ProtocolTypeId::from_type(&ty).0, ty.to_ntir().hash());
     }
 
     #[test]
