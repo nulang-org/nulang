@@ -9,6 +9,7 @@ pub mod aot;
 pub mod ast;
 pub mod authority;
 mod authority_runtime;
+pub use authority_runtime::RuntimeAuthorityError;
 pub mod backends;
 #[cfg(test)]
 pub mod benchmarks;
