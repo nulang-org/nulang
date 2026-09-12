@@ -321,12 +321,7 @@ mod tests {
         let local = offer("local", Lifecycle::OnDemand, 0.40);
         let mut workload = job(WorkloadClass::Ephemeral, 3600.0);
         workload.data_egress_gib = 10.0;
-        let ranked = rank_offers(
-            &workload,
-            &[remote, local],
-            ScoreWeights::default(),
-        )
-        .unwrap();
+        let ranked = rank_offers(&workload, &[remote, local], ScoreWeights::default()).unwrap();
         assert_eq!(ranked[0].offer.offer_id, "local");
     }
 
@@ -350,12 +345,8 @@ mod tests {
         workload.min_accelerator_count = 1;
         workload.min_accelerator_vram_gib_each = 80.0;
         workload.min_trust_tier = TrustTier::CloudProvider;
-        let ranked = rank_offers(
-            &workload,
-            &[marketplace, cloud],
-            ScoreWeights::default(),
-        )
-        .unwrap();
+        let ranked =
+            rank_offers(&workload, &[marketplace, cloud], ScoreWeights::default()).unwrap();
         assert!(ranked.is_empty());
     }
 
