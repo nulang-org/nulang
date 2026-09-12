@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod aot;
+pub mod artifact_identity;
 pub mod ast;
 pub mod authority;
 mod authority_runtime;
