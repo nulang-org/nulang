@@ -1,0 +1,47 @@
+name: Apply authority legacy recovery
+
+on:
+  push:
+    branches:
+      - feat/authority-legacy-recovery
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    if: ${{ !contains(github.event.head_commit.message, '[authority-legacy-recovery-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply assertion-heavy patch
+        run: python3 scripts/apply_authority_legacy_recovery.py
+
+      - name: Reject whitespace errors
+        run: git diff --check
+
+      - name: Run legacy authority recovery regressions
+        run: cargo test --lib legacy_restart -- --nocapture
+
+      - name: Run authority unit tests
+        run: cargo test --lib authority -- --nocapture
+
+      - name: Check library
+        run: cargo check --lib
+
+      - name: Check all targets
+        run: cargo check --all-targets
+
+      - name: Commit validated implementation
+        run: |
+          rm scripts/apply_authority_legacy_recovery.py
+          rm .github/workflows/apply-authority-legacy-recovery.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix(authority): fail closed on legacy durable restart [authority-legacy-recovery-applied]"
+          git push origin HEAD:feat/authority-legacy-recovery
