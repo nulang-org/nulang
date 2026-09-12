@@ -25,6 +25,7 @@ pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
 pub mod effect_checker;
+pub mod execution_profile;
 pub mod ffi;
 pub mod fmt;
 pub mod format;
