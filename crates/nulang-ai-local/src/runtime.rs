@@ -10,7 +10,7 @@ use nulang_ai_core::{
 use nulang_ai_director::{Director, LocalDirector};
 use nulang_ai_manager::{EngineeringManager, Manager};
 use nulang_ai_protocol::format_event_line;
-use nulang_ai_worker::{LocalWorker, WorkerRegistry, WorkerError};
+use nulang_ai_worker::{LocalWorker, WorkerError, WorkerRegistry};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -172,6 +172,20 @@ impl LocalRuntime {
 
         let tasks = self.engineering.plan_goal(&goal);
         for mut task in tasks {
+            // Persist the task as schedulable before acquiring a lease. If the
+            // process crashes during assignment, durable recovery still has a
+            // task record to resume instead of a lease pointing at no task.
+            task.status = TaskStatus::Ready;
+            task.updated_at = Utc::now();
+            self.store.upsert_task(&task)?;
+            self.emit(
+                out,
+                SwarmEvent::TaskCreated {
+                    task_id: task.id,
+                    goal_id,
+                },
+            )?;
+
             let agent_id = self.workers.select_agent_id(&task)?;
             let max_concurrency = self
                 .workers
@@ -189,15 +203,10 @@ impl LocalRuntime {
                 lease_duration_ms,
             )?;
 
+            task.status = TaskStatus::Assigned;
             task.assigned_agent_id = Some(agent_id.clone());
+            task.updated_at = Utc::now();
             self.store.upsert_task(&task)?;
-            self.emit(
-                out,
-                SwarmEvent::TaskCreated {
-                    task_id: task.id,
-                    goal_id,
-                },
-            )?;
 
             let mut running = task;
             running.status = TaskStatus::Running;
@@ -212,18 +221,34 @@ impl LocalRuntime {
             )?;
 
             let execution = self.workers.execute_on(&agent_id, &running);
-            let release = self.reservations.release(&reservation);
             self.persist_workers()?;
-            let completed = execution?;
-            release?;
-            self.store.upsert_task(&completed)?;
-            self.emit(
-                out,
-                SwarmEvent::TaskCompleted {
-                    task_id: completed.id,
-                    agent_id,
-                },
-            )?;
+
+            match execution {
+                Ok(completed) => {
+                    // Terminal task state must become durable before releasing
+                    // the lease. A crash or store error before this write leaves
+                    // the reservation intact so expiry recovery can requeue it.
+                    self.store.upsert_task(&completed)?;
+                    self.reservations.release(&reservation)?;
+                    self.emit(
+                        out,
+                        SwarmEvent::TaskCompleted {
+                            task_id: completed.id,
+                            agent_id,
+                        },
+                    )?;
+                }
+                Err(error) => {
+                    // Persist failure before release for the same reason: never
+                    // leave a durable `running` task without recovery evidence.
+                    let mut failed = running;
+                    failed.status = TaskStatus::Failed;
+                    failed.updated_at = Utc::now();
+                    self.store.upsert_task(&failed)?;
+                    self.reservations.release(&reservation)?;
+                    return Err(error.into());
+                }
+            }
         }
 
         goal.status = GoalStatus::Completed;
@@ -273,6 +298,7 @@ mod tests {
         assert!(text.contains("task_created"));
         let graph = rt.store().get_goal_graph(goal_id).unwrap();
         assert_eq!(graph.goal.status, GoalStatus::Completed);
+        assert_eq!(graph.tasks[0].status, TaskStatus::Completed);
         assert_eq!(
             graph.tasks[0].assigned_agent_id.as_deref(),
             Some("worker-local")
