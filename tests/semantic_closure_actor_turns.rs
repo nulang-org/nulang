@@ -44,8 +44,7 @@ fn compile_module(source: &str) -> nulang::bytecode::CodeModule {
         .expect("source should type-check");
     let hir = hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
     let mut mir = mir_lower::lower_module(&hir).expect("source should lower to MIR");
-    mir_codegen::compile_mir(&mut mir, "semantic-closure-actor-turns")
-        .expect("MIR should compile")
+    mir_codegen::compile_mir(&mut mir, "semantic-closure-actor-turns").expect("MIR should compile")
 }
 
 fn state_int(runtime: &Runtime, actor_id: u64, field: &str) -> i64 {
