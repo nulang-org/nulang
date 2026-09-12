@@ -1,24 +1,17 @@
-//! Director agent: turns user intent into durable goals.
+//! Director agent: turns classified user intent into durable goals.
 
-use chrono::Utc;
 use nulang_ai_core::{
     intent::{IntentExecutionError, IntentIr},
-    Goal, GoalStatus,
+    Goal,
 };
-use uuid::Uuid;
 
 pub trait Director: Send + Sync {
-    fn create_goal(
-        &self,
-        project_id: &str,
-        conversation_id: Uuid,
-        intent: &str,
-        budget_usd: f64,
-    ) -> Goal;
-
-    /// Preferred modality-neutral entry point. Intent IR enforces that the
-    /// request is confirmed, classified, and explicitly approved when the
-    /// risk policy requires confirmation before a durable goal is created.
+    /// Modality-neutral goal creation boundary.
+    ///
+    /// Intent IR enforces that the request is confirmed, classified, and
+    /// explicitly approved when the risk policy requires confirmation before a
+    /// durable goal can exist. There is intentionally no raw-text goal creation
+    /// method on this trait: callers must cross the semantic safety boundary.
     fn create_goal_from_intent(
         &self,
         project_id: &str,
@@ -39,31 +32,7 @@ impl LocalDirector {
     }
 }
 
-impl Director for LocalDirector {
-    fn create_goal(
-        &self,
-        project_id: &str,
-        conversation_id: Uuid,
-        intent: &str,
-        budget_usd: f64,
-    ) -> Goal {
-        let now = Utc::now();
-        Goal {
-            id: Uuid::new_v4(),
-            project_id: project_id.to_string(),
-            conversation_id: Some(conversation_id),
-            intent: intent.to_string(),
-            desired_state: serde_json::json!({"summary": intent}),
-            constraints: serde_json::json!({}),
-            success_criteria: vec![format!("Deliver outcome for: {}", intent)],
-            budget_usd,
-            deadline: None,
-            status: GoalStatus::Created,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-}
+impl Director for LocalDirector {}
 
 #[cfg(test)]
 mod tests {
