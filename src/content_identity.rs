@@ -136,7 +136,10 @@ impl fmt::Display for ContentIdentityParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ContentIdentityParseError::InvalidLength(length) => {
-                write!(f, "content identity must contain 64 hex characters, got {length}")
+                write!(
+                    f,
+                    "content identity must contain 64 hex characters, got {length}"
+                )
             }
             ContentIdentityParseError::InvalidHex(value) => {
                 write!(f, "content identity is not valid hex: {value}")
@@ -151,8 +154,8 @@ fn parse_hash(value: &str) -> Result<[u8; 32], ContentIdentityParseError> {
     if value.len() != 64 {
         return Err(ContentIdentityParseError::InvalidLength(value.len()));
     }
-    let decoded = hex::decode(value)
-        .map_err(|_| ContentIdentityParseError::InvalidHex(value.to_string()))?;
+    let decoded =
+        hex::decode(value).map_err(|_| ContentIdentityParseError::InvalidHex(value.to_string()))?;
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&decoded);
     Ok(bytes)
@@ -269,8 +272,14 @@ mod tests {
             std::iter::empty::<&str>(),
         );
         assert_eq!(source.to_string().parse::<SourceId>().unwrap(), source);
-        assert_eq!(semantic.to_string().parse::<SemanticId>().unwrap(), semantic);
-        assert_eq!(artifact.to_string().parse::<ArtifactId>().unwrap(), artifact);
+        assert_eq!(
+            semantic.to_string().parse::<SemanticId>().unwrap(),
+            semantic
+        );
+        assert_eq!(
+            artifact.to_string().parse::<ArtifactId>().unwrap(),
+            artifact
+        );
         assert!("abcd".parse::<ArtifactId>().is_err());
     }
 }
