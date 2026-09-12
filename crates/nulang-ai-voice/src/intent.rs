@@ -70,14 +70,15 @@ mod tests {
     }
 
     #[test]
-    fn final_voice_transcript_becomes_confirmed_intent() {
+    fn final_voice_transcript_becomes_confirmed_but_unclassified_intent() {
         let conversation_id = Uuid::new_v4();
         let bridge = VoiceIntentBridge::new(Uuid::new_v4(), Some(conversation_id));
         let intent = bridge.to_intent(&transcript(TranscriptKind::Final));
 
         assert_eq!(intent.phase, IntentPhase::Confirmed);
         assert_eq!(intent.safety, IntentSafety::Unknown);
+        assert_eq!(intent.execution_risk, None);
         assert_eq!(intent.conversation_id, Some(conversation_id));
-        assert!(intent.is_executable());
+        assert!(!intent.is_executable());
     }
 }
