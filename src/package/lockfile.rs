@@ -28,6 +28,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::content_identity::{SemanticId, SourceId};
+use crate::package::identity::source_id_for_package_dir;
 use crate::types::{NuError, NuResult, Span};
 
 /// Lockfile name, written next to the root package's manifest.
@@ -50,8 +51,8 @@ pub struct Lockfile {
     ///
     /// These records are sidecars rather than fields on `LockedPackage` so the
     /// existing resolver and legacy lockfile writers do not silently assign a
-    /// new meaning to `content_hash`. A future canonical package-identity pass
-    /// can populate them independently.
+    /// new meaning to `content_hash`. Path-source IDs can be populated from
+    /// canonical package inputs independently of that legacy field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub identity: Vec<LockedPackageIdentity>,
 }
@@ -197,6 +198,56 @@ impl Lockfile {
         })
     }
 
+    /// Populate canonical source identities for path dependencies whose source
+    /// directories are currently available.
+    ///
+    /// Existing semantic identities are retained. Missing path sources are
+    /// left unchanged so an already-resolved lockfile can still be copied or
+    /// rewritten on a machine where that local dependency is unavailable.
+    /// If an available package cannot be canonicalized safely, the operation
+    /// fails rather than writing a misleading identity.
+    pub fn populate_available_source_identities(&mut self) -> NuResult<()> {
+        let packages = self.package.clone();
+        for package in packages {
+            let Some(path) = package.source.strip_prefix("path+") else {
+                continue;
+            };
+            let path = Path::new(path);
+            if !path.exists() {
+                continue;
+            }
+
+            let source_id = source_id_for_package_dir(path).map_err(|error| NuError::PackageError {
+                msg: format!(
+                    "cannot compute source identity for locked package '{}' {} from {}: {}",
+                    package.name, package.version, package.source, error
+                ),
+                span: Span::default(),
+            })?;
+            let semantic_id = self
+                .package_identity(&package.name, &package.version, &package.source)
+                .map(LockedPackageIdentity::parsed_semantic_id)
+                .transpose()?
+                .flatten();
+            self.set_package_identity(
+                &package.name,
+                &package.version,
+                &package.source,
+                Some(source_id),
+                semantic_id,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Return a clone enriched with every source identity that can be computed
+    /// from currently available path dependencies.
+    pub fn with_available_source_identities(&self) -> NuResult<Self> {
+        let mut enriched = self.clone();
+        enriched.populate_available_source_identities()?;
+        Ok(enriched)
+    }
+
     /// Serialize to TOML text.
     pub fn to_toml(&self) -> NuResult<String> {
         self.validate_identities()?;
@@ -262,9 +313,15 @@ impl Lockfile {
     }
 
     /// Write the lockfile into `dir`.
+    ///
+    /// Available local path dependencies are enriched with canonical
+    /// [`SourceId`] sidecars immediately before serialization. This changes
+    /// only additive identity metadata; legacy package pins and `content_hash`
+    /// retain their existing values.
     pub fn save(&self, dir: &Path) -> NuResult<()> {
         let path = dir.join(LOCKFILE_FILE);
-        std::fs::write(&path, self.to_toml()?).map_err(|e| NuError::PackageError {
+        let enriched = self.with_available_source_identities()?;
+        std::fs::write(&path, enriched.to_toml()?).map_err(|e| NuError::PackageError {
             msg: format!("cannot write {}: {}", path.display(), e),
             span: Span::default(),
         })
@@ -347,6 +404,49 @@ content_hash = "legacy-hash"
         assert_eq!(lockfile, loaded);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_adds_source_identity_for_available_path_dependency() {
+        let root = std::env::temp_dir().join(format!(
+            "nulang_lockfile_identity_save_{}",
+            std::process::id()
+        ));
+        let dependency = root.join("util");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(dependency.join("src")).unwrap();
+        std::fs::write(
+            dependency.join("Nulang.toml"),
+            "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dependency.join("src/main.nula"), "fn main() { 42 }").unwrap();
+
+        let mut lockfile = Lockfile::new();
+        let source = format!("path+{}", dependency.display());
+        lockfile.package.push(LockedPackage {
+            name: "util".to_string(),
+            version: "0.1.0".to_string(),
+            source: source.clone(),
+            content_hash: "legacy-stays-legacy".to_string(),
+            commit: String::new(),
+        });
+        let semantic_id = SemanticId::from_canonical_bytes(b"util semantics", []);
+        lockfile
+            .set_package_identity("util", "0.1.0", &source, None, Some(semantic_id))
+            .unwrap();
+
+        let expected_source_id = source_id_for_package_dir(&dependency).unwrap();
+        lockfile.save(&root).unwrap();
+        let loaded = Lockfile::load(&root).unwrap();
+        let identity = loaded
+            .package_identity("util", "0.1.0", &source)
+            .expect("save should populate available path source identity");
+        assert_eq!(identity.parsed_source_id().unwrap(), Some(expected_source_id));
+        assert_eq!(identity.parsed_semantic_id().unwrap(), Some(semantic_id));
+        assert_eq!(loaded.package[0].content_hash, "legacy-stays-legacy");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
