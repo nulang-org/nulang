@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use thiserror::Error;
 
 pub mod interruption;
+pub mod provider;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +81,8 @@ pub struct JobSpec {
     pub min_accelerator_vram_gib_each: f64,
     pub allowed_regions: Vec<String>,
     pub min_trust_tier: TrustTier,
+    /// Explicit workload policy. If false, Spot/preemptible offers are rejected.
+    pub allow_interruptible: bool,
     pub nominal_runtime_seconds: f64,
     pub checkpoint_interval_seconds: Option<f64>,
     pub restart_overhead_seconds: f64,
@@ -91,7 +94,6 @@ pub struct ScoreWeights {
     pub startup_seconds_usd: f64,
     pub acquisition_failure_usd: f64,
     pub interruption_usd: f64,
-    pub critical_spot_usd: f64,
 }
 
 impl Default for ScoreWeights {
@@ -100,7 +102,6 @@ impl Default for ScoreWeights {
             startup_seconds_usd: 0.00002,
             acquisition_failure_usd: 0.10,
             interruption_usd: 0.05,
-            critical_spot_usd: 10.0,
         }
     }
 }
@@ -130,6 +131,11 @@ pub fn is_eligible(job: &JobSpec, offer: &CapacityOffer) -> bool {
         }
     }
     if offer.vcpus < job.min_vcpus || offer.memory_gib < job.min_memory_gib {
+        return false;
+    }
+    if !job.allow_interruptible
+        && matches!(offer.lifecycle, Lifecycle::Spot | Lifecycle::Preemptible)
+    {
         return false;
     }
     if offer.trust_tier < job.min_trust_tier {
@@ -194,13 +200,6 @@ pub fn score_offer<'a>(
     let startup_penalty = offer.startup_p95_seconds.max(0.0) * weights.startup_seconds_usd;
     let acquisition_penalty = (1.0 - offer.capacity_confidence) * weights.acquisition_failure_usd;
     let interruption_penalty = expected_interruptions * weights.interruption_usd;
-    let critical_spot_penalty = if job.workload_class == WorkloadClass::Critical
-        && matches!(offer.lifecycle, Lifecycle::Spot | Lifecycle::Preemptible)
-    {
-        weights.critical_spot_usd
-    } else {
-        0.0
-    };
 
     Ok(RankedOffer {
         offer,
@@ -208,8 +207,7 @@ pub fn score_offer<'a>(
             + data_cost
             + startup_penalty
             + acquisition_penalty
-            + interruption_penalty
-            + critical_spot_penalty,
+            + interruption_penalty,
         expected_runtime_seconds: runtime,
         expected_recovery_seconds: recovery_seconds,
     })
@@ -275,6 +273,7 @@ mod tests {
             min_accelerator_vram_gib_each: 0.0,
             allowed_regions: vec![],
             min_trust_tier: TrustTier::CloudProvider,
+            allow_interruptible: class != WorkloadClass::Critical,
             nominal_runtime_seconds: runtime,
             checkpoint_interval_seconds: Some(60.0),
             restart_overhead_seconds: 15.0,
@@ -357,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn critical_jobs_prefer_on_demand_by_default() {
+    fn critical_jobs_reject_interruptible_capacity_by_default() {
         let spot = offer("spot", Lifecycle::Spot, 0.01);
         let ondemand = offer("ondemand", Lifecycle::OnDemand, 1.00);
         let ranked = rank_offers(
@@ -366,6 +365,7 @@ mod tests {
             ScoreWeights::default(),
         )
         .unwrap();
+        assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].offer.offer_id, "ondemand");
     }
 }
