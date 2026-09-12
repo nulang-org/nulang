@@ -222,12 +222,7 @@ mod tests {
             ProviderSnapshot {
                 provider: "nebius".into(),
                 observed_at_unix_ms: 1,
-                offers: vec![offer(
-                    "nebius",
-                    "nebius-regular",
-                    Lifecycle::OnDemand,
-                    0.50,
-                )],
+                offers: vec![offer("nebius", "nebius-regular", Lifecycle::OnDemand, 0.50)],
             },
         ];
 
