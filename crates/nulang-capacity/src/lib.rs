@@ -157,11 +157,11 @@ pub fn is_eligible(job: &JobSpec, offer: &CapacityOffer) -> bool {
     true
 }
 
-pub fn score_offer(
+pub fn score_offer<'a>(
     job: &JobSpec,
-    offer: &CapacityOffer,
+    offer: &'a CapacityOffer,
     weights: ScoreWeights,
-) -> Result<RankedOffer<'_>, CapacityError> {
+) -> Result<RankedOffer<'a>, CapacityError> {
     if job.nominal_runtime_seconds < 0.0 {
         return Err(CapacityError::NegativeRuntime);
     }
