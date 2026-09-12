@@ -66,6 +66,210 @@ pub(crate) fn spawn_with_site_authority(
     }
 }
 
+/// Resolve the exact typed authority required before an actor-backed host
+/// effect may cross the runtime boundary. `None` means the effect is not an
+/// external-authority operation handled by this gate. Invalid resource
+/// descriptions are errors rather than permissive fallbacks.
+fn required_host_authority(
+    effect_name: &str,
+    op_name: Option<&str>,
+    constants: &[crate::bytecode::Constant],
+    regs: &[crate::vm::Value],
+) -> Result<Option<crate::authority::AuthorityGrant>, String> {
+    use crate::authority::AuthorityGrant;
+
+    let string_arg = |idx: usize| -> Result<String, String> {
+        let value = regs
+            .get(idx)
+            .copied()
+            .ok_or_else(|| format!("missing host-effect argument {idx}"))?;
+        let value = crate::vm::resolve_value_string(constants, value);
+        if value.is_empty() {
+            return Err(format!("host-effect argument {idx} must be non-empty"));
+        }
+        Ok(value)
+    };
+    let other = |namespace: &str, operation: &str, argument: Option<String>| {
+        AuthorityGrant::Other {
+            namespace: namespace.to_string(),
+            operation: operation.to_string(),
+            argument,
+        }
+    };
+
+    let grant = match (effect_name, op_name) {
+        ("FS", Some("read" | "exists")) => AuthorityGrant::FsRead {
+            path: string_arg(0)?,
+        },
+        ("FS", Some("write" | "append")) => AuthorityGrant::FsWrite {
+            path: string_arg(0)?,
+        },
+        ("Web", Some("serve_static")) => AuthorityGrant::FsRead {
+            path: string_arg(0)?,
+        },
+        ("Realtime", Some("broadcast")) => {
+            other("Realtime", "Broadcast", Some(string_arg(0)?))
+        },
+        ("Env", Some("get")) => AuthorityGrant::EnvRead {
+            name: string_arg(0)?,
+        },
+        ("Secret", Some("read" | "get")) => AuthorityGrant::SecretRead {
+            name: string_arg(0)?,
+        },
+        ("Http", Some("get" | "post")) => http_outbound_authority(&string_arg(0)?)?,
+        ("Http", Some("serve")) => {
+            let port = regs
+                .first()
+                .and_then(|v| v.as_int())
+                .ok_or_else(|| "Http.serve requires an integer port".to_string())?;
+            if !(0..=u16::MAX as i64).contains(&port) {
+                return Err("Http.serve port is outside u16 range".to_string());
+            }
+            other("Net", "Listen", Some(port.to_string()))
+        }
+        ("Process", Some("run")) => other("Process", "Run", Some(string_arg(0)?)),
+        ("System", Some("arg")) => {
+            let index = regs
+                .first()
+                .and_then(|v| v.as_int())
+                .ok_or_else(|| "System.arg requires an integer index".to_string())?;
+            if index < 0 {
+                return Err("System.arg index must be non-negative".to_string());
+            }
+            other("System", "Arg", Some(index.to_string()))
+        }
+        ("DB", Some("query")) => other("DB", "Query", None),
+        ("Python", Some(op)) if !op.is_empty() => other("Python", op, None),
+        ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
+        ("Inference" | "LLM", Some("ask")) => other("Inference", "Ask", None),
+        _ => return Ok(None),
+    };
+    Ok(Some(grant))
+}
+
+/// Parse an outbound HTTP URL into the exact TCP authority it needs. This is
+/// deliberately small and fail-closed: only lowercase `http://` and
+/// `https://` URLs are accepted, userinfo is rejected, and an ambiguous or
+/// malformed authority never turns into a broader grant.
+fn http_outbound_authority(url: &str) -> Result<crate::authority::AuthorityGrant, String> {
+    let (rest, default_port) = if let Some(rest) = url.strip_prefix("https://") {
+        (rest, 443u16)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (rest, 80u16)
+    } else {
+        return Err("outbound HTTP authority requires http:// or https://".to_string());
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .ok_or_else(|| "outbound HTTP URL has no authority".to_string())?;
+    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace) {
+        return Err("outbound HTTP URL has invalid authority".to_string());
+    }
+
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed
+            .find(']')
+            .ok_or_else(|| "unterminated bracketed HTTP host".to_string())?;
+        let host = &bracketed[..close];
+        if host.is_empty() {
+            return Err("outbound HTTP host is empty".to_string());
+        }
+        let suffix = &bracketed[close + 1..];
+        let port = if suffix.is_empty() {
+            default_port
+        } else {
+            let raw = suffix
+                .strip_prefix(':')
+                .ok_or_else(|| "invalid bracketed HTTP authority suffix".to_string())?;
+            parse_http_port(raw)?
+        };
+        (format!("[{host}]"), port)
+    } else {
+        if authority.matches(':').count() > 1 {
+            return Err("IPv6 HTTP hosts must be bracketed".to_string());
+        }
+        match authority.rsplit_once(':') {
+            Some((host, raw_port)) => {
+                if host.is_empty() {
+                    return Err("outbound HTTP host is empty".to_string());
+                }
+                (host.to_ascii_lowercase(), parse_http_port(raw_port)?)
+            }
+            None => (authority.to_ascii_lowercase(), default_port),
+        }
+    };
+
+    if host.is_empty() {
+        return Err("outbound HTTP host is empty".to_string());
+    }
+    Ok(crate::authority::AuthorityGrant::NetTcpOut { host, port })
+}
+
+fn parse_http_port(raw: &str) -> Result<u16, String> {
+    let port = raw
+        .parse::<u16>()
+        .map_err(|_| "outbound HTTP port must be a valid u16".to_string())?;
+    if port == 0 {
+        return Err("outbound HTTP port must be non-zero".to_string());
+    }
+    Ok(port)
+}
+
+/// Enforce actor authority at the last common callback boundary before a host
+/// operation executes. Actor-free runtime/top-level execution intentionally
+/// retains its existing ambient behavior; #165 scopes this migration to
+/// actor-backed authority. A missing actor or malformed manifest fails closed.
+fn authorize_actor_host_effect(
+    rt: &Runtime,
+    actor_id: Option<u64>,
+    effect_name: &str,
+    op_name: Option<&str>,
+    constants: &[crate::bytecode::Constant],
+    regs: &[crate::vm::Value],
+) -> Result<(), String> {
+    let Some(actor_id) = actor_id else {
+        return Ok(());
+    };
+    let Some(grant) = required_host_authority(effect_name, op_name, constants, regs)? else {
+        return Ok(());
+    };
+    let actor = rt
+        .actors
+        .get(&actor_id)
+        .ok_or_else(|| format!("authority source actor {actor_id} is missing"))?;
+    actor.require_authority(&grant).map_err(|error| error.to_string())
+}
+
+/// Enforce an exact actor-backed foreign-function authority grant.
+///
+/// The grant argument includes both library and symbol so permission to call
+/// one imported function cannot authorize another symbol from the same
+/// dynamic library. Actor-free execution keeps the legacy ambient contract.
+pub(crate) fn authorize_actor_ffi(
+    rt: &Runtime,
+    actor_id: Option<u64>,
+    library: &str,
+    symbol: &str,
+) -> Result<(), String> {
+    let Some(actor_id) = actor_id else {
+        return Ok(());
+    };
+    if library.is_empty() || symbol.is_empty() {
+        return Err("FFI library and symbol must be non-empty".to_string());
+    }
+    let actor = rt
+        .actors
+        .get(&actor_id)
+        .ok_or_else(|| format!("authority source actor {actor_id} is missing"))?;
+    let grant = crate::authority::AuthorityGrant::Other {
+        namespace: "FFI".to_string(),
+        operation: "Call".to_string(),
+        argument: Some(format!("{library}::{symbol}")),
+    };
+    actor.require_authority(&grant).map_err(|error| error.to_string())
+}
+
 /// Shared Web effect host implementation for all runtime callback types.
 /// Mirrors the standalone VM dispatch in `src/vm.rs`.
 pub(crate) fn perform_web_builtin(
@@ -361,6 +565,11 @@ impl std::fmt::Debug for RuntimeVmCallbacks {
 impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
     fn current_actor_id(&self) -> Option<u64> {
         self.runtime.borrow().current_actor
+    }
+
+    fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
+        let rt = self.runtime.borrow();
+        authorize_actor_ffi(&rt, rt.current_actor, library, symbol).is_ok()
     }
 
     fn alloc(&mut self, size: usize, type_tag: crate::runtime::heap::TypeTag) -> Option<*mut u8> {
@@ -804,6 +1013,22 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             if let Some(result) = rt.check_test_handler(&qualified, regs) {
                 return Some(result);
             }
+            if let Err(error) = authorize_actor_host_effect(
+                &rt,
+                rt.current_actor,
+                effect_name,
+                op_name,
+                &module.constants,
+                regs,
+            ) {
+                tracing::warn!(
+                    actor_id = ?rt.current_actor,
+                    effect = %qualified,
+                    %error,
+                    "denying actor-backed host effect"
+                );
+                return Some(crate::vm::Value::nil());
+            }
         }
         if effect_name == "Otp" {
             let mut rt = self.runtime.borrow_mut();
@@ -957,6 +1182,18 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
     #[cfg(feature = "ai-runtime")]
     fn complete_llm(&mut self, model: &str, prompt: &str) -> Option<String> {
         let mut rt = self.runtime.borrow_mut();
+        if authorize_actor_host_effect(
+            &rt,
+            rt.current_actor,
+            "Inference",
+            Some("ask"),
+            &[],
+            &[],
+        )
+        .is_err()
+        {
+            return None;
+        }
         if let Some(actor_id) = rt.current_actor {
             if rt
                 .actors
@@ -1116,11 +1353,21 @@ impl BytecodeRuntimeCallbacks {
     pub(crate) fn new(runtime: *mut Runtime, actor_id: u64) -> Self {
         BytecodeRuntimeCallbacks { runtime, actor_id }
     }
+
+    fn authority_actor_id(&self) -> Option<u64> {
+        (self.actor_id != 0).then_some(self.actor_id)
+    }
 }
 
 impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     fn current_actor_id(&self) -> Option<u64> {
         Some(self.actor_id)
+    }
+
+    fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
+        unsafe {
+            authorize_actor_ffi(&*self.runtime, self.authority_actor_id(), library, symbol).is_ok()
+        }
     }
 
     fn alloc(&mut self, size: usize, type_tag: crate::runtime::heap::TypeTag) -> Option<*mut u8> {
@@ -1573,6 +1820,22 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             if let Some(result) = (*self.runtime).check_test_handler(&qualified, regs) {
                 return Some(result);
             }
+            if let Err(error) = authorize_actor_host_effect(
+                &*self.runtime,
+                self.authority_actor_id(),
+                effect_name,
+                op_name,
+                &module.constants,
+                regs,
+            ) {
+                tracing::warn!(
+                    actor_id = self.actor_id,
+                    effect = %qualified,
+                    %error,
+                    "denying actor-backed host effect"
+                );
+                return Some(crate::vm::Value::nil());
+            }
             if effect_name == "Otp" {
                 return (*self.runtime).perform_otp_builtin(op_name, module, regs);
             }
@@ -1606,6 +1869,18 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     fn complete_llm(&mut self, model: &str, prompt: &str) -> Option<String> {
         unsafe {
             let rt = &mut *self.runtime;
+            if authorize_actor_host_effect(
+                rt,
+                self.authority_actor_id(),
+                "Inference",
+                Some("ask"),
+                &[],
+                &[],
+            )
+            .is_err()
+            {
+                return None;
+            }
             if rt
                 .actors
                 .get(&self.actor_id)
@@ -1693,6 +1968,23 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 .unwrap_or(false)
             {
                 return PerformAsyncResult::Pending;
+            }
+
+            // Authority must still be valid immediately before the first
+            // externally-observable provider request. Completed/resumed calls
+            // above do not re-authorize an operation that already crossed the
+            // boundary.
+            if authorize_actor_host_effect(
+                rt,
+                (actor_id != 0).then_some(actor_id),
+                "Inference",
+                Some("ask"),
+                &[],
+                &[],
+            )
+            .is_err()
+            {
+                return PerformAsyncResult::Ready(None);
             }
 
             // Build the request on the scheduler thread, then hand it to a
@@ -2211,5 +2503,379 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
     }
     fn gossip(&mut self, _message: &str) -> crate::vm::Value {
         crate::vm::Value::unit()
+    }
+}
+
+
+#[cfg(test)]
+mod host_authority_tests {
+    use super::{authorize_actor_host_effect, http_outbound_authority, required_host_authority};
+    use crate::authority::{AuthorityGrant, AuthorityManifest};
+    use crate::bytecode::Constant;
+    use crate::runtime::{Actor, Runtime};
+    use crate::vm::Value;
+
+    fn string_args(values: &[&str]) -> (Vec<Constant>, Vec<Value>) {
+        let constants: Vec<_> = values
+            .iter()
+            .map(|value| Constant::String((*value).to_string()))
+            .collect();
+        let regs = (0..values.len()).map(|idx| Value::string(idx as u32)).collect();
+        (constants, regs)
+    }
+
+    #[test]
+    fn http_authority_uses_exact_host_and_effective_port() {
+        assert_eq!(
+            http_outbound_authority("https://Api.Example.com/path").unwrap(),
+            AuthorityGrant::NetTcpOut {
+                host: "api.example.com".into(),
+                port: 443,
+            }
+        );
+        assert_eq!(
+            http_outbound_authority("http://example.com:8080?q=1").unwrap(),
+            AuthorityGrant::NetTcpOut {
+                host: "example.com".into(),
+                port: 8080,
+            }
+        );
+        assert_eq!(
+            http_outbound_authority("https://[2001:db8::1]/").unwrap(),
+            AuthorityGrant::NetTcpOut {
+                host: "[2001:db8::1]".into(),
+                port: 443,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_or_userinfo_http_targets_fail_closed() {
+        for url in [
+            "ftp://example.com/x",
+            "https://user@example.com/x",
+            "https://example.com:0/x",
+            "https://2001:db8::1/x",
+            "https:///x",
+        ] {
+            assert!(http_outbound_authority(url).is_err(), "{url} must be rejected");
+        }
+    }
+
+    #[test]
+    fn host_effects_map_to_typed_exact_grants() {
+        let (constants, regs) = string_args(&["/tmp/input.txt"]);
+        assert_eq!(
+            required_host_authority("FS", Some("read"), &constants, &regs).unwrap(),
+            Some(AuthorityGrant::FsRead {
+                path: "/tmp/input.txt".into(),
+            })
+        );
+
+        let (constants, regs) = string_args(&["HOME"]);
+        assert_eq!(
+            required_host_authority("Env", Some("get"), &constants, &regs).unwrap(),
+            Some(AuthorityGrant::EnvRead { name: "HOME".into() })
+        );
+
+        let (constants, regs) = string_args(&["PAYMENTS_KEY"]);
+        assert_eq!(
+            required_host_authority("Secret", Some("read"), &constants, &regs).unwrap(),
+            Some(AuthorityGrant::SecretRead {
+                name: "PAYMENTS_KEY".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn web_static_and_realtime_broadcast_map_to_exact_authority() {
+        let (constants, regs) = string_args(&["/srv/public/index.html"]);
+        assert_eq!(
+            required_host_authority("Web", Some("serve_static"), &constants, &regs).unwrap(),
+            Some(AuthorityGrant::FsRead {
+                path: "/srv/public/index.html".into(),
+            })
+        );
+
+        let (constants, regs) = string_args(&["orders", "changed"]);
+        assert_eq!(
+            required_host_authority("Realtime", Some("broadcast"), &constants, &regs).unwrap(),
+            Some(AuthorityGrant::Other {
+                namespace: "Realtime".into(),
+                operation: "Broadcast".into(),
+                argument: Some("orders".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_callback_blocks_web_serve_static_without_exact_file_grant() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let unique = format!(
+            "nulang-authority-static-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let file = std::env::temp_dir().join(unique);
+        std::fs::write(&file, "authority-protected-static-content").unwrap();
+        let file_string = file.to_string_lossy().into_owned();
+
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let actor_id = 800_006;
+        {
+            let mut rt = runtime.borrow_mut();
+            rt.actors
+                .insert(actor_id, Actor::new(actor_id, "web-static-authority", 8));
+            rt.current_actor = Some(actor_id);
+        }
+
+        let module = {
+            let mut module = crate::bytecode::CodeModule::new("web-static-authority");
+            module.add_constant(Constant::String(file_string.clone()));
+            module
+        };
+        let regs = [Value::string(0)];
+        let mut callbacks = super::RuntimeVmCallbacks::new(runtime.clone());
+
+        let denied = callbacks
+            .perform_builtin_effect_in_module("Web", Some("serve_static"), &module, &regs)
+            .expect("denied Web.serve_static must be handled");
+        assert!(denied.is_nil(), "unprivileged actor must not read static file");
+
+        {
+            let mut rt = runtime.borrow_mut();
+            let token = format!("Fs::Read({file_string})");
+            let manifest = AuthorityManifest::from_tokens([token.as_str()]).unwrap();
+            rt.actors
+                .get_mut(&actor_id)
+                .unwrap()
+                .install_authority_manifest(&manifest);
+        }
+
+        let allowed = callbacks
+            .perform_builtin_effect_in_module("Web", Some("serve_static"), &module, &regs)
+            .expect("authorized Web.serve_static must be handled");
+        assert_eq!(
+            crate::vm::resolve_value_string(&[], allowed),
+            "authority-protected-static-content"
+        );
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn actor_host_access_is_deny_by_default_and_exact_match_only() {
+        let mut rt = Runtime::new();
+        let actor_id = 800_001;
+        rt.actors.insert(actor_id, Actor::new(actor_id, "host-authority", 8));
+        let (constants, regs) = string_args(&["/tmp/allowed.txt"]);
+
+        assert!(authorize_actor_host_effect(
+            &rt,
+            Some(actor_id),
+            "FS",
+            Some("read"),
+            &constants,
+            &regs,
+        )
+        .is_err());
+
+        let manifest = AuthorityManifest::from_tokens(["Fs::Read(/tmp/allowed.txt)"]).unwrap();
+        rt.actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .install_authority_manifest(&manifest);
+        assert!(authorize_actor_host_effect(
+            &rt,
+            Some(actor_id),
+            "FS",
+            Some("read"),
+            &constants,
+            &regs,
+        )
+        .is_ok());
+
+        let (other_constants, other_regs) = string_args(&["/tmp/other.txt"]);
+        assert!(authorize_actor_host_effect(
+            &rt,
+            Some(actor_id),
+            "FS",
+            Some("read"),
+            &other_constants,
+            &other_regs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn malformed_actor_manifest_cannot_authorize_exact_present_grant() {
+        let mut rt = Runtime::new();
+        let actor_id = 800_002;
+        let mut actor = Actor::new(actor_id, "host-authority-invalid", 8);
+        actor.capabilities.insert("Env::Read(HOME)".to_string());
+        actor
+            .capabilities
+            .insert("Net::TcpOut(malformed)".to_string());
+        rt.actors.insert(actor_id, actor);
+        let (constants, regs) = string_args(&["HOME"]);
+
+        assert!(authorize_actor_host_effect(
+            &rt,
+            Some(actor_id),
+            "Env",
+            Some("get"),
+            &constants,
+            &regs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn actor_http_authority_is_exact_destination_not_category_permission() {
+        let mut rt = Runtime::new();
+        let actor_id = 800_003;
+        let mut actor = Actor::new(actor_id, "host-network-authority", 8);
+        let manifest = AuthorityManifest::from_tokens(["Net::TcpOut(api.example.com:443)"]).unwrap();
+        actor.install_authority_manifest(&manifest);
+        rt.actors.insert(actor_id, actor);
+
+        let (constants, regs) = string_args(&["https://api.example.com/v1"]);
+        assert!(authorize_actor_host_effect(
+            &rt,
+            Some(actor_id),
+            "Http",
+            Some("get"),
+            &constants,
+            &regs,
+        )
+        .is_ok());
+
+        let (constants, regs) = string_args(&["https://api.example.com:8443/v1"]);
+        assert!(authorize_actor_host_effect(
+            &rt,
+            Some(actor_id),
+            "Http",
+            Some("get"),
+            &constants,
+            &regs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn actor_ffi_authority_is_exact_library_and_symbol() {
+        let mut rt = Runtime::new();
+        let actor_id = 800_004;
+        let mut actor = Actor::new(actor_id, "host-ffi-authority", 8);
+        let manifest = AuthorityManifest::from_tokens([
+            "FFI::Call(libpayments.so::charge)"
+        ])
+        .unwrap();
+        actor.install_authority_manifest(&manifest);
+        rt.actors.insert(actor_id, actor);
+
+        assert!(super::authorize_actor_ffi(
+            &rt,
+            Some(actor_id),
+            "libpayments.so",
+            "charge",
+        )
+        .is_ok());
+        assert!(super::authorize_actor_ffi(
+            &rt,
+            Some(actor_id),
+            "libpayments.so",
+            "refund",
+        )
+        .is_err());
+        assert!(super::authorize_actor_ffi(
+            &rt,
+            Some(actor_id),
+            "libother.so",
+            "charge",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bytecode_top_level_zero_sentinel_is_actor_free_but_missing_real_actor_fails_closed() {
+        let mut rt = Runtime::new();
+        let top_level = super::BytecodeRuntimeCallbacks::new(&mut rt as *mut Runtime, 0);
+        assert_eq!(top_level.authority_actor_id(), None);
+
+        let missing_actor = super::BytecodeRuntimeCallbacks::new(&mut rt as *mut Runtime, 999_999);
+        assert_eq!(missing_actor.authority_actor_id(), Some(999_999));
+
+        let (constants, regs) = string_args(&["/tmp/sentinel.txt"]);
+        assert!(authorize_actor_host_effect(
+            &rt,
+            top_level.authority_actor_id(),
+            "FS",
+            Some("read"),
+            &constants,
+            &regs,
+        )
+        .is_ok());
+        assert!(authorize_actor_host_effect(
+            &rt,
+            missing_actor.authority_actor_id(),
+            "FS",
+            Some("read"),
+            &constants,
+            &regs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn runtime_callback_denies_http_serve_before_socket_bind() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let actor_id = 800_005;
+        {
+            let mut rt = runtime.borrow_mut();
+            rt.actors
+                .insert(actor_id, Actor::new(actor_id, "host-http-denied", 8));
+            rt.current_actor = Some(actor_id);
+        }
+
+        let mut callbacks = super::RuntimeVmCallbacks::new(runtime.clone());
+        let module = crate::bytecode::CodeModule::new("host-http-denied");
+        let result = callbacks.perform_builtin_effect_in_module(
+            "Http",
+            Some("serve"),
+            &module,
+            &[Value::int(0), Value::int(0)],
+        );
+
+        assert!(result.expect("denied host effect must be handled").is_nil());
+        assert!(
+            runtime.borrow().http_server.is_none(),
+            "denied Http.serve must not bind a socket"
+        );
+    }
+
+    #[test]
+    fn actor_free_runtime_keeps_existing_ambient_host_contract() {
+        let rt = Runtime::new();
+        let (constants, regs) = string_args(&["/tmp/ambient.txt"]);
+        assert!(authorize_actor_host_effect(
+            &rt,
+            None,
+            "FS",
+            Some("read"),
+            &constants,
+            &regs,
+        )
+        .is_ok());
     }
 }
