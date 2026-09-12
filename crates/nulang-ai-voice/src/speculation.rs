@@ -112,8 +112,12 @@ where
             return Ok(SpeculationOutcome::Ignored);
         }
 
-        let replaced = if let Some(previous) = self.active.take() {
+        // Do not drop the local handle until the runtime confirms cancellation.
+        // If cancellation fails, retaining it lets callers retry instead of
+        // orphaning speculative work that may still be running remotely.
+        let replaced = if let Some(previous) = self.active.clone() {
             self.runtime.cancel(&previous).await?;
+            self.active = None;
             true
         } else {
             false
@@ -132,24 +136,27 @@ where
         &mut self,
         transcript: &str,
     ) -> Result<SpeculationOutcome, VoiceProviderError> {
-        let Some(active) = self.active.take() else {
+        let Some(active) = self.active.clone() else {
             return Ok(SpeculationOutcome::Ignored);
         };
 
         if compatible_partial(&active.transcript, transcript) {
             self.runtime.reuse(&active, transcript).await?;
+            self.active = None;
             Ok(SpeculationOutcome::Reused)
         } else {
             self.runtime.cancel(&active).await?;
+            self.active = None;
             Ok(SpeculationOutcome::Cancelled)
         }
     }
 
     pub async fn cancel_active(&mut self) -> Result<bool, VoiceProviderError> {
-        let Some(active) = self.active.take() else {
+        let Some(active) = self.active.clone() else {
             return Ok(false);
         };
         self.runtime.cancel(&active).await?;
+        self.active = None;
         Ok(true)
     }
 }
@@ -182,6 +189,8 @@ mod tests {
         started: Mutex<Vec<String>>,
         cancelled: Mutex<Vec<Uuid>>,
         reused: Mutex<Vec<Uuid>>,
+        fail_cancel: bool,
+        fail_reuse: bool,
     }
 
     impl SpeculativeIntentRuntime for FakeRuntime {
@@ -200,6 +209,14 @@ mod tests {
             handle: &'a SpeculationHandle,
         ) -> VoiceFuture<'a, Result<(), VoiceProviderError>> {
             Box::pin(async move {
+                if self.fail_cancel {
+                    return Err(VoiceProviderError::new(
+                        "fake",
+                        "cancel_failed",
+                        "simulated cancellation failure",
+                        true,
+                    ));
+                }
                 self.cancelled.lock().unwrap().push(handle.id);
                 Ok(())
             })
@@ -211,6 +228,14 @@ mod tests {
             _final_transcript: &'a str,
         ) -> VoiceFuture<'a, Result<(), VoiceProviderError>> {
             Box::pin(async move {
+                if self.fail_reuse {
+                    return Err(VoiceProviderError::new(
+                        "fake",
+                        "reuse_failed",
+                        "simulated reuse failure",
+                        true,
+                    ));
+                }
                 self.reused.lock().unwrap().push(handle.id);
                 Ok(())
             })
@@ -291,5 +316,46 @@ mod tests {
             .unwrap();
         assert_eq!(result, SpeculationOutcome::Ignored);
         assert!(controller.active().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_failure_retains_active_handle_for_retry() {
+        let runtime = FakeRuntime {
+            fail_cancel: true,
+            ..FakeRuntime::default()
+        };
+        let mut controller = SpeculativeIntentController::new(runtime);
+        controller
+            .observe_partial("search auth", PrefetchSafety::ReadOnly)
+            .await
+            .unwrap();
+        let active_id = controller.active().unwrap().id;
+
+        let error = controller.cancel_active().await.unwrap_err();
+
+        assert_eq!(error.code, "cancel_failed");
+        assert_eq!(controller.active().map(|handle| handle.id), Some(active_id));
+    }
+
+    #[tokio::test]
+    async fn test_reuse_failure_retains_active_handle_for_retry_or_cancel() {
+        let runtime = FakeRuntime {
+            fail_reuse: true,
+            ..FakeRuntime::default()
+        };
+        let mut controller = SpeculativeIntentController::new(runtime);
+        controller
+            .observe_partial("review the auth", PrefetchSafety::ReadOnly)
+            .await
+            .unwrap();
+        let active_id = controller.active().unwrap().id;
+
+        let error = controller
+            .observe_final("review the auth code")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "reuse_failed");
+        assert_eq!(controller.active().map(|handle| handle.id), Some(active_id));
     }
 }
