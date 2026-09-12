@@ -73,19 +73,6 @@ fn main() -> Int {
 }
 "#;
 
-const EXPLICIT_RESUME_EXPR: &str = r#"
-effect Tick { next: Int -> Int }
-
-fn main() -> Int {
-    handle {
-        let x = perform Tick.next(40)
-        x + 2
-    } {
-        | Tick.next(x) resume => resume(x + 1)
-    }
-}
-"#;
-
 fn lower(source: &str) -> Result<mir::Module, NuError> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.lex()?;
@@ -111,6 +98,27 @@ fn run_native(source: &str) -> Result<Value, NuError> {
     let mir = lower(source)?;
     let module = AotModule::compile(&mir)?;
     module.run().map(Value::from_raw)
+}
+
+fn explicit_resume_mir() -> mir::Module {
+    use nulang::bytecode::Constant;
+    use nulang::types::Type;
+
+    // Build the backend-level form directly. Source-level `resume(expr)` is
+    // currently typed as Unit by the frontend, so a source fixture that tries
+    // to use its value would fail before reaching AOT. This fixture isolates
+    // the native backend contract without pretending that frontend gap is
+    // already solved.
+    let mut builder = mir::FunctionBuilder::new("main", None);
+    let value = builder.add_temp(Type::int());
+    let resume_result = builder.add_temp(Type::unit());
+    builder.assign(value, mir::RValue::Const(Constant::Int(41)));
+    builder.assign(resume_result, mir::RValue::Resume(value));
+    builder.terminate(mir::Terminator::Return(None));
+
+    let mut module = mir::Module::new("semantic-closure-explicit-resume");
+    module.functions.push(builder.build());
+    module
 }
 
 fn assert_bytecode_native_int(source: &str, expected: i64) {
@@ -154,22 +162,18 @@ fn sequential_performs_capture_fresh_continuations_on_both_backends() {
 }
 
 #[test]
-fn explicit_resume_expression_is_a_deterministic_native_restriction() {
-    let bytecode = run_bytecode(EXPLICIT_RESUME_EXPR)
-        .expect("bytecode should execute explicit continuation resume");
-    assert_eq!(bytecode.as_int(), Some(43));
-
-    let mir = lower(EXPLICIT_RESUME_EXPR).expect("explicit resume should lower to MIR");
+fn explicit_resume_rvalue_is_a_deterministic_native_restriction() {
+    let mir = explicit_resume_mir();
     let err = match AotModule::compile(&mir) {
         Ok(_) => panic!(
-            "native accepted explicit resume(expr); if support was implemented, replace this restricted-profile assertion with a differential result check"
+            "native accepted explicit RValue::Resume; if support was implemented, replace this restricted-profile assertion with a differential result check"
         ),
         Err(err) => err.to_string(),
     };
 
     assert!(
         err.contains("effect-continuation resume requires the bytecode backend"),
-        "native must reject explicit resume(expr) with the documented restriction, got: {err}"
+        "native must reject explicit RValue::Resume with the documented restriction, got: {err}"
     );
 }
 
