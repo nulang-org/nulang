@@ -2067,6 +2067,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,
                     crdt_field_map,
+                authority_tokens: Default::default(),
                 };
 
                 let snapshot_json = match serde_json::to_vec(&snapshot) {
