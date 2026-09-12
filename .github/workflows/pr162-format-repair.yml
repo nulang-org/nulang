@@ -1,0 +1,35 @@
+name: PR162 Format Repair
+
+on:
+  push:
+    branches:
+      - fix/main-ci-baseline
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/main-ci-baseline
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustup component add rustfmt
+      - name: Apply rustfmt and remove helper
+        run: |
+          cargo fmt --all
+          rm -f .github/workflows/pr162-format-repair.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/effect_checker.rs .github/workflows/pr162-format-repair.yml
+          if git diff --cached --quiet; then
+            echo "No formatting changes needed"
+            exit 0
+          fi
+          git commit -m "style: format durable effect checker"
+          git push origin HEAD:fix/main-ci-baseline
