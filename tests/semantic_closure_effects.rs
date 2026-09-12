@@ -118,3 +118,20 @@ fn plain_wasm_rejects_resumable_handlers_instead_of_returning_nil() {
         "plain WASM must fail loudly instead of compiling Resume to nil, got: {message}"
     );
 }
+
+#[cfg(feature = "wasmfx-backend")]
+#[test]
+fn wasmfx_rejects_user_handlers_instead_of_returning_nil() {
+    let mir = lower(IMPLICIT_RESUME).expect("resumable handler should lower to MIR");
+    let mut backend = nulang::wasmfx_backend::WasmFxBackend::new();
+    let err = backend
+        .compile(&mir, "semantic-closure-effects")
+        .expect_err("WasmFX must reject unsupported user handler/resume semantics");
+    let message = err.to_string();
+
+    assert!(
+        message.contains("WasmFX backend restricted profile")
+            && message.contains("continuation resume are not supported yet"),
+        "WasmFX must fail loudly instead of compiling user-handler Resume to nil, got: {message}"
+    );
+}
