@@ -23,13 +23,16 @@ jobs:
       - name: Apply FFI authority patch
         run: python3 scripts/apply_authority_ffi_gate.py
 
+      - name: Add host-action execution regression
+        run: python3 scripts/apply_authority_host_integration_test.py
+
       - name: Reject whitespace errors
         run: git diff --check
 
       - name: Run host authority regressions
         run: cargo test --lib host_authority -- --nocapture
 
-      - name: Run migration-independent authority unit tests
+      - name: Run authority unit tests
         run: cargo test --lib authority -- --nocapture
 
       - name: Check library
@@ -45,6 +48,7 @@ jobs:
         run: |
           rm scripts/apply_authority_host_boundaries.py
           rm scripts/apply_authority_ffi_gate.py
+          rm scripts/apply_authority_host_integration_test.py
           rm .github/workflows/apply-authority-host-boundaries.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
