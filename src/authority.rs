@@ -120,6 +120,27 @@ impl AuthorityManifest {
         })
     }
 
+    /// Return true when every authority in this manifest is already present
+    /// in `parent`. This is the primitive monotonic-delegation invariant:
+    /// delegation may remove authority but cannot manufacture new authority.
+    ///
+    /// This intentionally uses exact grants only. Resource-specific semantic
+    /// attenuation (for example proving `/uploads/public/**` is narrower than
+    /// `/uploads/**`) belongs in explicit per-resource policies rather than an
+    /// unsafe generic string-prefix rule.
+    pub fn is_subset_of(&self, parent: &AuthorityManifest) -> bool {
+        self.grants.is_subset(&parent.grants)
+    }
+
+    /// Intersect this manifest with an allow-list. The result can only have
+    /// equal or less authority than `self`, making it safe for child actors,
+    /// sandboxed handlers, and delegated execution contexts.
+    pub fn restrict_to(&self, allowed: &AuthorityManifest) -> AuthorityManifest {
+        AuthorityManifest {
+            grants: self.grants.intersection(&allowed.grants).cloned().collect(),
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &AuthorityGrant> {
         self.grants.iter()
     }
@@ -134,6 +155,12 @@ impl AuthorityManifest {
         let mut tokens: Vec<_> = self.grants.iter().map(ToString::to_string).collect();
         tokens.sort_unstable();
         tokens
+    }
+
+    /// Canonical compatibility representation for the runtime's current actor
+    /// field. New semantic code should prefer `AuthorityManifest` directly.
+    pub fn canonical_token_set(&self) -> BTreeSet<String> {
+        self.canonical_tokens().into_iter().collect()
     }
 }
 
@@ -339,9 +366,33 @@ mod tests {
         let tokens = BTreeSet::from(["Net::TcpOut(api.stripe.com:443)".to_string()]);
         let manifest = AuthorityManifest::from_token_set(&tokens).unwrap();
         assert!(manifest.allows_tcp_out("api.stripe.com", 443));
+        assert_eq!(manifest.canonical_token_set(), tokens);
 
         let malformed = BTreeSet::from(["Net::TcpOut(api.stripe.com)".to_string()]);
         assert!(AuthorityManifest::from_token_set(&malformed).is_err());
+    }
+
+    #[test]
+    fn attenuation_can_only_remove_exact_authority() {
+        let parent = AuthorityManifest::from_tokens([
+            "Fs::Read(/uploads/**)",
+            "Net::TcpOut(api.stripe.com:443)",
+            "Secret::Read(STRIPE_KEY)",
+        ])
+        .unwrap();
+        let requested = AuthorityManifest::from_tokens([
+            "Net::TcpOut(api.stripe.com:443)",
+            "Secret::Read(OTHER_KEY)",
+        ])
+        .unwrap();
+
+        let child = parent.restrict_to(&requested);
+        assert_eq!(
+            child.canonical_tokens(),
+            vec!["Net::TcpOut(api.stripe.com:443)"]
+        );
+        assert!(child.is_subset_of(&parent));
+        assert!(!requested.is_subset_of(&parent));
     }
 
     #[test]
