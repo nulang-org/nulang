@@ -29,6 +29,50 @@ fn main() -> Int {
 }
 "#;
 
+const ABORTIVE_HANDLER: &str = r#"
+effect Tick { next: Int -> Int }
+
+fn main() -> Int {
+    handle {
+        let x = perform Tick.next(40)
+        x + 100
+    } {
+        | Tick.next(x) => x + 1
+    }
+}
+"#;
+
+const NESTED_INNERMOST_HANDLER: &str = r#"
+effect Shared { get: Int -> Int }
+
+fn main() -> Int {
+    handle {
+        handle {
+            perform Shared.get(0)
+        } {
+            | Shared.get(x) resume => 1
+        }
+    } {
+        | Shared.get(x) resume => 2
+    }
+}
+"#;
+
+const SEQUENTIAL_RESUMES: &str = r#"
+effect Math { double: Int -> Int }
+
+fn main() -> Int {
+    handle {
+        let a = perform Math.double(3)
+        let b = perform Math.double(10)
+        let c = perform Math.double(a + b)
+        c
+    } {
+        | Math.double(n) resume => n * 2
+    }
+}
+"#;
+
 const EXPLICIT_RESUME_EXPR: &str = r#"
 effect Tick { next: Int -> Int }
 
@@ -69,15 +113,44 @@ fn run_native(source: &str) -> Result<Value, NuError> {
     module.run().map(Value::from_raw)
 }
 
+fn assert_bytecode_native_int(source: &str, expected: i64) {
+    let bytecode = run_bytecode(source).expect("bytecode should execute semantic-closure case");
+    let native = run_native(source).expect("native should execute supported semantic-closure case");
+
+    assert_eq!(bytecode.as_int(), Some(expected));
+    assert_eq!(native.as_int(), Some(expected));
+    assert_eq!(
+        bytecode.as_raw(),
+        native.as_raw(),
+        "bytecode and native must agree on the exact tagged result"
+    );
+}
+
 #[test]
 fn resumable_handler_matches_bytecode_and_native() {
-    let bytecode = run_bytecode(IMPLICIT_RESUME).expect("bytecode should execute resumable handler");
-    let native =
-        run_native(IMPLICIT_RESUME).expect("native should execute supported resumable handler");
+    assert_bytecode_native_int(IMPLICIT_RESUME, 43);
+}
 
-    assert_eq!(bytecode.as_int(), Some(43));
-    assert_eq!(native.as_int(), Some(43));
-    assert_eq!(bytecode.as_raw(), native.as_raw());
+#[test]
+fn abortive_handler_matches_bytecode_and_native() {
+    // A non-resuming arm aborts the captured continuation. The expression
+    // after the perform must therefore not execute; the handler result wins.
+    assert_bytecode_native_int(ABORTIVE_HANDLER, 41);
+}
+
+#[test]
+fn nested_same_effect_uses_innermost_handler_on_both_backends() {
+    // Handler lookup is dynamically nested: the inner Shared.get arm must win
+    // and resume its own continuation without leaking to the outer handler.
+    assert_bytecode_native_int(NESTED_INNERMOST_HANDLER, 1);
+}
+
+#[test]
+fn sequential_performs_capture_fresh_continuations_on_both_backends() {
+    // This formerly stressed the native multi-perform resuming-handler path.
+    // Each perform must capture a fresh continuation: 3*2=6, 10*2=20,
+    // then (6+20)*2=52.
+    assert_bytecode_native_int(SEQUENTIAL_RESUMES, 52);
 }
 
 #[test]
