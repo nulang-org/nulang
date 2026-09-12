@@ -85,9 +85,9 @@ impl SemanticTurnDetector {
             }
             TranscriptKind::Partial
                 if observation.silence_ms >= self.config.partial_silence_ms
-                    && observation
-                        .semantic_completion
-                        .is_some_and(|score| score >= self.config.semantic_completion_threshold) =>
+                    && observation.semantic_completion.is_some_and(|score| {
+                        score >= self.config.semantic_completion_threshold
+                    }) =>
             {
                 TurnDecision::Complete(TurnCompletionReason::SemanticPartialSilence)
             }
