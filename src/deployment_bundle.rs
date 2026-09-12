@@ -82,8 +82,9 @@ impl DeploymentBundle {
 
             let path = entry
                 .path()
-                .map_err(|err| DeploymentBundleError::Archive(err.to_string()))?;
-            validate_archive_path(path.as_ref())?;
+                .map_err(|err| DeploymentBundleError::Archive(err.to_string()))?
+                .into_owned();
+            validate_archive_path(&path)?;
             let path_string = path.to_string_lossy().into_owned();
 
             let size = entry.size();
@@ -104,7 +105,7 @@ impl DeploymentBundle {
                 continue;
             }
 
-            if is_packaged_nbc(path.as_ref()) {
+            if is_packaged_nbc(&path) {
                 if artifact.is_some() {
                     return Err(DeploymentBundleError::MultipleArtifacts);
                 }
@@ -123,7 +124,7 @@ impl DeploymentBundle {
                 continue;
             }
 
-            if path.as_ref() == Path::new("dist/nulang-app.ir.json") {
+            if path == Path::new("dist/nulang-app.ir.json") {
                 if web_ir.is_some() {
                     return Err(DeploymentBundleError::MultipleDeploymentIr);
                 }
@@ -278,7 +279,6 @@ mod tests {
     use crate::bytecode::CodeModule;
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use std::io::Write;
 
     fn make_bundle(entries: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
         let mut output = Vec::new();
