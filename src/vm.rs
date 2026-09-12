@@ -220,6 +220,14 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Emit an event in the current actor.  Default is a no-op.
     fn emit_event(&mut self, _event: &str, _args: &[Value]) {}
 
+    /// Authorize one foreign-function call before any library is loaded or
+    /// symbol resolved. Standalone callbacks retain the historic ambient
+    /// behavior; runtime-backed actor callbacks override this and require an
+    /// exact typed `FFI::Call("library::symbol")` authority grant.
+    fn authorize_ffi(&mut self, _library: &str, _symbol: &str) -> bool {
+        true
+    }
+
     /// Handle a built-in effect performed without an explicit handler.
     ///
     /// The callback receives the effect name and the current frame registers
@@ -3403,6 +3411,16 @@ impl VM {
                 ),
                 span: Span::default(),
             });
+        }
+
+        // Actor authority is checked before parameter marshalling, dynamic
+        // library loading, symbol resolution, or the native call itself.
+        if !self
+            .actor_callbacks
+            .authorize_ffi(&def.library, &def.symbol)
+        {
+            self.frames[frame_idx].regs[dst as usize] = Value::nil();
+            return Ok(());
         }
 
         let params: Vec<CType> = def
