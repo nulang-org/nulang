@@ -1209,6 +1209,23 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
     })
 }
 
+/// Build compiler arguments for canonical package WASM AOT compilation.
+///
+/// Keep capability forwarding centralized so both `build-wasm` and the
+/// optional WASM tier of `deploy` preserve the same default-deny package
+/// semantics as normal `build`/`run`.
+fn wasm_aot_args(wasm_path: &str, entry: &str) -> Vec<String> {
+    let mut args = vec![
+        "--backend".to_string(),
+        "wasm-aot".to_string(),
+        "--out".to_string(),
+        wasm_path.to_string(),
+        entry.to_string(),
+    ];
+    args.extend(capability_args());
+    args
+}
+
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
 fn cmd_build_wasm() -> NuResult<()> {
@@ -1234,7 +1251,9 @@ fn cmd_build_wasm() -> NuResult<()> {
 
     eprintln!("Building {} (WASM AOT)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+    let args = wasm_aot_args(&wasm_path_str, &entry_str);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    nulang_exe(&arg_refs)?;
     println!("WASM AOT build succeeded.");
     Ok(())
 }
@@ -2220,7 +2239,9 @@ fn cmd_deploy(
         let wasm_path = nula_dist.join(format!("{}.wasm", name));
         let wasm_path_str = wasm_path.to_string_lossy().into_owned();
         eprintln!("Compiling {} to .wasm + .cwasm...", name);
-        nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+        let args = wasm_aot_args(&wasm_path_str, &entry_str);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        nulang_exe(&arg_refs)?;
     }
 
     // Bundle into .tar.gz: .nula/dist/ contents + dist/** + Nulang.toml + Nulang.lock.
@@ -2534,6 +2555,40 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_wasm_forwards_manifest_capabilities() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_wasm_caps_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            "[package]\nname = \"caps-test\"\nversion = \"0.1.0\"\ncapabilities = [\"net\", \"fs\"]\n\n[dependencies]\n",
+        )
+        .unwrap();
+        let _guard = ChangeDir::new(&dir);
+
+        let args = wasm_aot_args("/tmp/out.wasm", "/tmp/main.nula");
+        assert_eq!(
+            args,
+            vec![
+                "--backend",
+                "wasm-aot",
+                "--out",
+                "/tmp/out.wasm",
+                "/tmp/main.nula",
+                "--with",
+                "net",
+                "--with",
+                "fs",
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_manifest_language_pin() {
