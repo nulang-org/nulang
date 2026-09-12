@@ -37,6 +37,18 @@ pub enum IntentSafety {
     Unknown,
 }
 
+/// Non-serialized proof that classification was applied to this exact semantic
+/// payload. Public classification fields remain useful for inspection and
+/// transport, but they are not authoritative for execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedClassification {
+    text: String,
+    safety: IntentSafety,
+    risk: ExecutionRisk,
+    requested_capabilities: Vec<String>,
+    requires_confirmation: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntentIr {
     pub id: Uuid,
@@ -53,6 +65,14 @@ pub struct IntentIr {
     pub requires_confirmation: bool,
     pub execution_confirmed: bool,
     pub metadata: serde_json::Value,
+    /// Classification authority is process-local and cannot be forged by
+    /// deserializing an Intent IR supplied by an external caller.
+    #[serde(skip)]
+    classification: Option<AppliedClassification>,
+    /// Confirmation authority is likewise private. The public boolean is only
+    /// an observable mirror and cannot grant execution on its own.
+    #[serde(skip)]
+    confirmation_granted: bool,
 }
 
 impl IntentIr {
@@ -72,6 +92,8 @@ impl IntentIr {
             requires_confirmation: false,
             execution_confirmed: false,
             metadata: serde_json::json!({}),
+            classification: None,
+            confirmation_granted: false,
         }
     }
 
@@ -84,29 +106,45 @@ impl IntentIr {
     }
 
     pub fn is_executable(&self) -> bool {
-        self.phase == IntentPhase::Confirmed
-            && self.execution_risk.is_some()
-            && self.safety != IntentSafety::Unknown
-            && (!self.requires_confirmation || self.execution_confirmed)
+        if self.phase != IntentPhase::Confirmed {
+            return false;
+        }
+        let Ok(classification) = self.validated_classification() else {
+            return false;
+        };
+        classification.safety != IntentSafety::Unknown
+            && (!classification.requires_confirmation || self.confirmation_granted)
     }
 
     pub fn apply_classification(&mut self, classification: IntentClassification) {
-        self.safety = classification.safety;
-        self.execution_risk = Some(classification.risk);
-        self.requested_capabilities = classification.required_capabilities;
-        self.requires_confirmation = classification.requires_confirmation;
-        self.execution_confirmed = !classification.requires_confirmation;
+        let snapshot = AppliedClassification {
+            text: self.text.clone(),
+            safety: classification.safety,
+            risk: classification.risk,
+            requested_capabilities: classification.required_capabilities.clone(),
+            requires_confirmation: classification.requires_confirmation,
+        };
+
+        self.safety = snapshot.safety;
+        self.execution_risk = Some(snapshot.risk);
+        self.requested_capabilities = snapshot.requested_capabilities.clone();
+        self.requires_confirmation = snapshot.requires_confirmation;
+        self.confirmation_granted = !snapshot.requires_confirmation;
+        self.execution_confirmed = self.confirmation_granted;
         self.metadata["classification_rationale"] =
             serde_json::Value::String(classification.rationale);
+        self.classification = Some(snapshot);
     }
 
     pub fn confirm_execution(&mut self) -> Result<(), IntentExecutionError> {
         if self.phase != IntentPhase::Confirmed {
             return Err(IntentExecutionError::ProvisionalIntent);
         }
-        if self.execution_risk.is_none() || self.safety == IntentSafety::Unknown {
+        let classification = self.validated_classification()?;
+        if classification.safety == IntentSafety::Unknown {
             return Err(IntentExecutionError::UnclassifiedIntent);
         }
+        self.confirmation_granted = true;
         self.execution_confirmed = true;
         Ok(())
     }
@@ -119,10 +157,11 @@ impl IntentIr {
         if self.phase != IntentPhase::Confirmed {
             return Err(IntentExecutionError::ProvisionalIntent);
         }
-        if self.execution_risk.is_none() || self.safety == IntentSafety::Unknown {
+        let classification = self.validated_classification()?.clone();
+        if classification.safety == IntentSafety::Unknown {
             return Err(IntentExecutionError::UnclassifiedIntent);
         }
-        if self.requires_confirmation && !self.execution_confirmed {
+        if classification.requires_confirmation && !self.confirmation_granted {
             return Err(IntentExecutionError::ExplicitConfirmationRequired);
         }
 
@@ -131,12 +170,30 @@ impl IntentIr {
         goal.constraints = serde_json::json!({
             "intent_id": self.id,
             "modality": self.modality,
-            "safety": self.safety,
-            "execution_risk": self.execution_risk,
-            "requested_capabilities": self.requested_capabilities,
-            "execution_confirmed": self.execution_confirmed,
+            "safety": classification.safety,
+            "execution_risk": classification.risk,
+            "requested_capabilities": classification.requested_capabilities,
+            "execution_confirmed": self.confirmation_granted,
         });
         Ok(goal)
+    }
+
+    fn validated_classification(&self) -> Result<&AppliedClassification, IntentExecutionError> {
+        let Some(classification) = self.classification.as_ref() else {
+            return Err(IntentExecutionError::UnclassifiedIntent);
+        };
+
+        let mirrors_match = classification.text == self.text
+            && classification.safety == self.safety
+            && Some(classification.risk) == self.execution_risk
+            && classification.requested_capabilities == self.requested_capabilities
+            && classification.requires_confirmation == self.requires_confirmation
+            && self.execution_confirmed == self.confirmation_granted;
+
+        if !mirrors_match {
+            return Err(IntentExecutionError::ClassificationStale);
+        }
+        Ok(classification)
     }
 }
 
@@ -144,6 +201,7 @@ impl IntentIr {
 pub enum IntentExecutionError {
     ProvisionalIntent,
     UnclassifiedIntent,
+    ClassificationStale,
     ExplicitConfirmationRequired,
 }
 
@@ -198,5 +256,46 @@ mod tests {
 
         intent.confirm_execution().unwrap();
         assert!(intent.into_goal("nulang", 2.0).is_ok());
+    }
+
+    #[test]
+    fn mutating_text_after_classification_invalidates_authority() {
+        let mut intent = IntentIr::confirmed(IntentModality::Text, "review the auth module");
+        let classification = RuleBasedIntentClassifier.classify(&intent).unwrap();
+        intent.apply_classification(classification);
+        intent.text = "delete production".into();
+
+        assert_eq!(
+            intent.into_goal("nulang", 2.0),
+            Err(IntentExecutionError::ClassificationStale)
+        );
+    }
+
+    #[test]
+    fn public_confirmation_flag_cannot_forge_approval() {
+        let mut intent = IntentIr::confirmed(IntentModality::Text, "deploy to production");
+        let classification = RuleBasedIntentClassifier.classify(&intent).unwrap();
+        intent.apply_classification(classification);
+        intent.execution_confirmed = true;
+
+        assert_eq!(
+            intent.into_goal("nulang", 2.0),
+            Err(IntentExecutionError::ClassificationStale)
+        );
+    }
+
+    #[test]
+    fn deserialization_does_not_restore_execution_authority() {
+        let mut intent = IntentIr::confirmed(IntentModality::Api, "review the auth module");
+        let classification = RuleBasedIntentClassifier.classify(&intent).unwrap();
+        intent.apply_classification(classification);
+        let json = serde_json::to_string(&intent).unwrap();
+        let restored: IntentIr = serde_json::from_str(&json).unwrap();
+
+        assert!(!restored.is_executable());
+        assert_eq!(
+            restored.into_goal("nulang", 2.0),
+            Err(IntentExecutionError::UnclassifiedIntent)
+        );
     }
 }
