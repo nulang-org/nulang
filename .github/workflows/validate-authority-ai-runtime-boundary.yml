@@ -5,46 +5,8 @@ on:
     branches:
       - fix/authority-ai-runtime-boundary
 
-permissions:
-  contents: write
-
 jobs:
-  validate-and-publish:
+  smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Apply AI runtime boundary correction
-        run: python3 scripts/fix_authority_ai_runtime_boundary.py
-
-      - name: Reject whitespace errors
-        run: git diff --check
-
-      - name: Run host authority regressions
-        run: cargo test --lib host_authority -- --nocapture
-
-      - name: Run integration regressions
-        run: cargo test --lib integration_tests::tests:: -- --nocapture
-
-      - name: Check library
-        run: cargo check --lib
-
-      - name: Check without optional features
-        run: cargo check --lib --no-default-features
-
-      - name: Check all targets
-        run: cargo check --all-targets
-
-      - name: Publish validated correction
-        run: |
-          rm scripts/fix_authority_ai_runtime_boundary.py
-          rm .github/workflows/validate-authority-ai-runtime-boundary.yml
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git diff --cached --check
-          test "$(git diff --cached --name-only | sort)" = "src/runtime/callbacks.rs"
-          git commit -m "fix(authority): keep logical AI services above host boundary [authority-ai-boundary-applied]"
-          git push origin HEAD:fix/authority-ai-runtime-boundary
+      - run: echo workflow-ingestion-ok
