@@ -217,13 +217,14 @@ impl Lockfile {
                 continue;
             }
 
-            let source_id = source_id_for_package_dir(path).map_err(|error| NuError::PackageError {
-                msg: format!(
-                    "cannot compute source identity for locked package '{}' {} from {}: {}",
-                    package.name, package.version, package.source, error
-                ),
-                span: Span::default(),
-            })?;
+            let source_id =
+                source_id_for_package_dir(path).map_err(|error| NuError::PackageError {
+                    msg: format!(
+                        "cannot compute source identity for locked package '{}' {} from {}: {}",
+                        package.name, package.version, package.source, error
+                    ),
+                    span: Span::default(),
+                })?;
             let semantic_id = self
                 .package_identity(&package.name, &package.version, &package.source)
                 .map(LockedPackageIdentity::parsed_semantic_id)
@@ -442,7 +443,10 @@ content_hash = "legacy-hash"
         let identity = loaded
             .package_identity("util", "0.1.0", &source)
             .expect("save should populate available path source identity");
-        assert_eq!(identity.parsed_source_id().unwrap(), Some(expected_source_id));
+        assert_eq!(
+            identity.parsed_source_id().unwrap(),
+            Some(expected_source_id)
+        );
         assert_eq!(identity.parsed_semantic_id().unwrap(), Some(semantic_id));
         assert_eq!(loaded.package[0].content_hash, "legacy-stays-legacy");
 

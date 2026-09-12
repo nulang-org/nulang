@@ -349,7 +349,6 @@ pub(crate) fn spawn_from_module(
 ///
 /// This is staged migration plumbing and becomes live once exact spawn
 /// provenance is threaded through the VM callback boundary.
-#[allow(dead_code)]
 pub(crate) fn spawn_from_module_with_authority(
     rt: &mut Runtime,
     module: &crate::bytecode::CodeModule,

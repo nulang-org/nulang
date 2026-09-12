@@ -111,7 +111,9 @@ impl Error for ProtocolWireError {
         match self {
             Self::InvalidProtocolId(error) => Some(error),
             Self::ProtocolMismatch(error) => Some(error),
-            Self::InvalidLength { .. } | Self::InvalidMagic | Self::UnsupportedVersion { .. } => None,
+            Self::InvalidLength { .. } | Self::InvalidMagic | Self::UnsupportedVersion { .. } => {
+                None
+            }
         }
     }
 }

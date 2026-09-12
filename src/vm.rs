@@ -194,6 +194,7 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     fn spawn_actor(
         &mut self,
         module: &CodeModule,
+        spawn_pc: usize,
         behavior_idx: usize,
         init: Vec<(String, Value)>,
     ) -> Value;
@@ -919,6 +920,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
     fn spawn_actor(
         &mut self,
         _module: &CodeModule,
+        _spawn_pc: usize,
         _behavior_idx: usize,
         _init: Vec<(String, Value)>,
     ) -> Value {
@@ -4275,7 +4277,8 @@ impl VM {
             }
         }
         let result = if let Some(module) = self.modules.get(module_idx) {
-            self.actor_callbacks.spawn_actor(module, behavior_idx, init)
+            self.actor_callbacks
+                .spawn_actor(module, spawn_pc, behavior_idx, init)
         } else {
             Value::actor_ref(0)
         };
@@ -4356,7 +4359,10 @@ impl VM {
             }
         } else {
             match self.modules.get(module_idx) {
-                Some(module) => self.actor_callbacks.spawn_actor(module, behavior_idx, init),
+                Some(module) => {
+                    self.actor_callbacks
+                        .spawn_actor(module, spawn_pc, behavior_idx, init)
+                }
                 None => Value::actor_ref(0),
             }
         };
