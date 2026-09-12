@@ -10,8 +10,11 @@
 //! 3. execute the operation, passing the same ID as the idempotency/dedup key
 //!    whenever the dependency supports one;
 //! 4. journal [`DurableEffectRecord::Completed`] with the result;
-//! 5. on recovery, replay a completed result without redispatch, otherwise
-//!    follow the declared [`DeliverySemantics`].
+//! 5. on recovery, validate that the replayed request matches the journaled
+//!    request before replaying a result or redispatching;
+//! 6. if a completed operation must be undone, prepare an explicit
+//!    [`DurableCompensationRecord`] rather than pretending the original effect
+//!    was rollbackable.
 //!
 //! The runtime/workflow persistence layer can adopt this state machine without
 //! changing its storage backend. Until that integration lands, these types pin
@@ -24,6 +27,8 @@ use std::fmt;
 use std::str::FromStr;
 
 const EFFECT_ID_DOMAIN: &[u8] = b"nulang.durable-effect.v1\0";
+const COMPENSATION_ID_DOMAIN: &[u8] = b"nulang.durable-compensation.v1\0";
+const REQUEST_DIGEST_DOMAIN: &[u8] = b"nulang.durable-effect-request.v1\0";
 
 /// Stable identity for one logical durable side effect.
 ///
@@ -50,6 +55,24 @@ impl DurableEffectId {
         Self(*hasher.finalize().as_bytes())
     }
 
+    /// Derive a stable logical operation ID for a compensation of this effect.
+    ///
+    /// Compensation identity is domain-separated from ordinary effect identity
+    /// and includes the original effect ID, so compensating two otherwise
+    /// identical operations cannot collide.
+    pub fn derive_compensation(
+        self,
+        compensation_ordinal: u32,
+        effect_operation: &str,
+    ) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(COMPENSATION_ID_DOMAIN);
+        hasher.update(&self.0);
+        hasher.update(&compensation_ordinal.to_le_bytes());
+        hash_len_prefixed(&mut hasher, effect_operation.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -65,12 +88,23 @@ fn hash_len_prefixed(hasher: &mut Hasher, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+fn request_digest(request: &[u8]) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(REQUEST_DIGEST_DOMAIN);
+    hash_len_prefixed(&mut hasher, request);
+    *hasher.finalize().as_bytes()
+}
+
+fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8; 32]) -> fmt::Result {
+    for byte in bytes {
+        write!(f, "{byte:02x}")?;
+    }
+    Ok(())
+}
+
 impl fmt::Display for DurableEffectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        write_hex(f, &self.0)
     }
 }
 
@@ -156,6 +190,26 @@ impl DurableEffectSpec {
     }
 }
 
+/// A journal lookup used the correct logical operation ID but supplied a
+/// different request body. Recovery must fail closed rather than replaying a
+/// recorded result or redispatching the old operation for the new request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableEffectRequestMismatch {
+    pub expected_digest: [u8; 32],
+    pub actual_digest: [u8; 32],
+}
+
+impl fmt::Display for DurableEffectRequestMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "durable effect request digest mismatch: expected ")?;
+        write_hex(f, &self.expected_digest)?;
+        write!(f, ", got ")?;
+        write_hex(f, &self.actual_digest)
+    }
+}
+
+impl std::error::Error for DurableEffectRequestMismatch {}
+
 /// Durable journal state for one logical effect.
 ///
 /// There is intentionally no durable `Dispatched` state. Recording such a
@@ -179,7 +233,7 @@ impl DurableEffectRecord {
     pub fn prepare(spec: DurableEffectSpec, request: &[u8]) -> Self {
         Self::Prepared {
             spec,
-            request_digest: *blake3::hash(request).as_bytes(),
+            request_digest: request_digest(request),
         }
     }
 
@@ -193,6 +247,24 @@ impl DurableEffectRecord {
         match self {
             Self::Prepared { request_digest, .. }
             | Self::Completed { request_digest, .. } => request_digest,
+        }
+    }
+
+    /// Verify that recovery is replaying the exact request originally bound to
+    /// this logical effect ID.
+    pub fn validate_request(
+        &self,
+        request: &[u8],
+    ) -> Result<(), DurableEffectRequestMismatch> {
+        let actual_digest = request_digest(request);
+        let expected_digest = *self.request_digest();
+        if actual_digest == expected_digest {
+            Ok(())
+        } else {
+            Err(DurableEffectRequestMismatch {
+                expected_digest,
+                actual_digest,
+            })
         }
     }
 
@@ -234,6 +306,51 @@ impl DurableEffectRecord {
             },
         }
     }
+
+    /// Validate replay request identity and then choose the recovery action.
+    ///
+    /// Persistence integrations SHOULD use this method instead of calling
+    /// `recovery_action` directly when they still have the replayed request.
+    pub fn recovery_action_for_request(
+        &self,
+        request: &[u8],
+    ) -> Result<DurableEffectRecoveryAction<'_>, DurableEffectRequestMismatch> {
+        self.validate_request(request)?;
+        Ok(self.recovery_action())
+    }
+
+    /// Prepare an explicit compensation for a completed effect.
+    ///
+    /// A compensation is another durable effect with its own stable operation
+    /// ID and recovery semantics. It can only be prepared after the original
+    /// effect has a durable completion record; Nulang never models an external
+    /// side effect as if it could be rolled back before its commit is known.
+    pub fn prepare_compensation(
+        &self,
+        compensation_ordinal: u32,
+        effect_operation: impl Into<String>,
+        boundary: EffectBoundary,
+        delivery: DeliverySemantics,
+        request: &[u8],
+    ) -> Result<DurableCompensationRecord, DurableCompensationError> {
+        let original_effect_id = match self {
+            Self::Completed { spec, .. } => spec.id,
+            Self::Prepared { .. } => return Err(DurableCompensationError::OriginalNotCompleted),
+        };
+        let effect_operation = effect_operation.into();
+        let compensation_id = original_effect_id
+            .derive_compensation(compensation_ordinal, &effect_operation);
+        let spec = DurableEffectSpec::new(
+            compensation_id,
+            effect_operation,
+            boundary,
+            delivery,
+        );
+        Ok(DurableCompensationRecord {
+            original_effect_id,
+            effect: DurableEffectRecord::prepare(spec, request),
+        })
+    }
 }
 
 /// Recovery decision for a durable effect journal record.
@@ -250,6 +367,76 @@ pub enum DurableEffectRecoveryAction<'a> {
     RetryWithDeduplication { operation_id: DurableEffectId },
     /// The configured backend owns the recovery guarantee and must decide.
     DelegateToBackend,
+}
+
+/// Invalid durable compensation transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableCompensationError {
+    /// The original effect has not durably completed, so compensation would
+    /// pretend to undo work whose commit state is still unknown.
+    OriginalNotCompleted,
+}
+
+impl fmt::Display for DurableCompensationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OriginalNotCompleted => write!(
+                f,
+                "cannot prepare compensation before the original durable effect completes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DurableCompensationError {}
+
+/// Explicit durable compensation linked to one completed original effect.
+///
+/// The embedded effect record intentionally reuses the ordinary durable-effect
+/// state machine. Compensation can itself crash after external commit, so it
+/// requires the same stable identity, retry, deduplication, and replay rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableCompensationRecord {
+    original_effect_id: DurableEffectId,
+    effect: DurableEffectRecord,
+}
+
+impl DurableCompensationRecord {
+    pub fn original_effect_id(&self) -> DurableEffectId {
+        self.original_effect_id
+    }
+
+    pub fn effect(&self) -> &DurableEffectRecord {
+        &self.effect
+    }
+
+    pub fn compensation_id(&self) -> DurableEffectId {
+        self.effect.spec().id
+    }
+
+    pub fn validate_request(
+        &self,
+        request: &[u8],
+    ) -> Result<(), DurableEffectRequestMismatch> {
+        self.effect.validate_request(request)
+    }
+
+    pub fn recovery_action(&self) -> DurableEffectRecoveryAction<'_> {
+        self.effect.recovery_action()
+    }
+
+    pub fn recovery_action_for_request(
+        &self,
+        request: &[u8],
+    ) -> Result<DurableEffectRecoveryAction<'_>, DurableEffectRequestMismatch> {
+        self.effect.recovery_action_for_request(request)
+    }
+
+    /// Commit the first durable compensation result.
+    pub fn complete(mut self, result: Vec<u8>) -> Self {
+        self.effect = self.effect.complete(result);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -296,9 +483,21 @@ mod tests {
         let record = DurableEffectRecord::prepare(spec(DeliverySemantics::AtLeastOnce), b"$10");
         let id = record.spec().id;
         assert_eq!(
-            record.recovery_action(),
+            record.recovery_action_for_request(b"$10").unwrap(),
             DurableEffectRecoveryAction::RetryAtLeastOnce { operation_id: id }
         );
+    }
+
+    #[test]
+    fn replay_with_different_request_fails_closed() {
+        let record = DurableEffectRecord::prepare(
+            spec(DeliverySemantics::EffectivelyOnceWithDeduplication),
+            b"amount=10&currency=USD",
+        );
+        let err = record
+            .recovery_action_for_request(b"amount=100&currency=USD")
+            .unwrap_err();
+        assert_ne!(err.expected_digest, err.actual_digest);
     }
 
     #[test]
@@ -312,7 +511,7 @@ mod tests {
         );
         let id = record.spec().id;
         assert_eq!(
-            record.recovery_action(),
+            record.recovery_action_for_request(b"$10").unwrap(),
             DurableEffectRecoveryAction::RetryWithDeduplication { operation_id: id }
         );
         assert_eq!(id.idempotency_key(), record.spec().id.to_string());
@@ -326,9 +525,21 @@ mod tests {
         )
         .complete(b"charged".to_vec());
         assert_eq!(
-            record.recovery_action(),
+            record.recovery_action_for_request(b"$10").unwrap(),
             DurableEffectRecoveryAction::ReplayRecordedResult(b"charged")
         );
+    }
+
+    #[test]
+    fn completed_result_is_not_replayed_for_a_different_request() {
+        let record = DurableEffectRecord::prepare(
+            spec(DeliverySemantics::EffectivelyOnceWithDeduplication),
+            b"order=7&amount=10",
+        )
+        .complete(b"charged".to_vec());
+        assert!(record
+            .recovery_action_for_request(b"order=7&amount=11")
+            .is_err());
     }
 
     #[test]
@@ -354,6 +565,81 @@ mod tests {
     }
 
     #[test]
+    fn compensation_requires_a_completed_original_effect() {
+        let prepared = DurableEffectRecord::prepare(
+            spec(DeliverySemantics::EffectivelyOnceWithDeduplication),
+            b"charge",
+        );
+        assert_eq!(
+            prepared
+                .prepare_compensation(
+                    0,
+                    "Payment.refund",
+                    EffectBoundary::External,
+                    DeliverySemantics::EffectivelyOnceWithDeduplication,
+                    b"refund",
+                )
+                .unwrap_err(),
+            DurableCompensationError::OriginalNotCompleted
+        );
+    }
+
+    #[test]
+    fn compensation_has_stable_distinct_identity_and_recovery_rules() {
+        let completed = DurableEffectRecord::prepare(
+            spec(DeliverySemantics::EffectivelyOnceWithDeduplication),
+            b"charge",
+        )
+        .complete(b"charged".to_vec());
+        let original_id = completed.spec().id;
+        let compensation = completed
+            .prepare_compensation(
+                0,
+                "Payment.refund",
+                EffectBoundary::External,
+                DeliverySemantics::EffectivelyOnceWithDeduplication,
+                b"refund",
+            )
+            .unwrap();
+        let compensation_id = compensation.compensation_id();
+        assert_eq!(compensation.original_effect_id(), original_id);
+        assert_ne!(compensation_id, original_id);
+        assert_eq!(
+            compensation
+                .recovery_action_for_request(b"refund")
+                .unwrap(),
+            DurableEffectRecoveryAction::RetryWithDeduplication {
+                operation_id: compensation_id,
+            }
+        );
+    }
+
+    #[test]
+    fn completed_compensation_replays_without_redispatch() {
+        let original = DurableEffectRecord::prepare(
+            spec(DeliverySemantics::EffectivelyOnceWithDeduplication),
+            b"charge",
+        )
+        .complete(b"charged".to_vec());
+        let compensation = original
+            .prepare_compensation(
+                0,
+                "Payment.refund",
+                EffectBoundary::External,
+                DeliverySemantics::EffectivelyOnceWithDeduplication,
+                b"refund",
+            )
+            .unwrap()
+            .complete(b"refunded".to_vec());
+        assert_eq!(
+            compensation
+                .recovery_action_for_request(b"refund")
+                .unwrap(),
+            DurableEffectRecoveryAction::ReplayRecordedResult(b"refunded")
+        );
+    }
+
+    #[test]
     fn backend_defined_recovery_is_not_strengthened_by_runtime() {
         let backend_spec = DurableEffectSpec::new(
             DurableEffectId::derive(9, "publish", 0, "Queue.publish"),
@@ -363,7 +649,7 @@ mod tests {
         );
         let record = DurableEffectRecord::prepare(backend_spec, b"message");
         assert_eq!(
-            record.recovery_action(),
+            record.recovery_action_for_request(b"message").unwrap(),
             DurableEffectRecoveryAction::DelegateToBackend
         );
     }
