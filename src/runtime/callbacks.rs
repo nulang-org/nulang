@@ -31,6 +31,17 @@ use std::sync::Arc;
 /// Spawn using authority metadata attached to the exact executing bytecode PC.
 /// Any malformed metadata or parent escalation fails closed before a child is
 /// created or enqueued.
+/// Return the canonical authority token set that must cross a migration
+/// boundary with `actor`. A malformed in-memory compatibility manifest is a
+/// security error: callers must abort migration before sending a packet or
+/// reaping the source actor.
+pub(crate) fn migration_authority_tokens(
+    actor: &crate::runtime::Actor,
+) -> Result<std::collections::BTreeSet<String>, crate::authority_runtime::RuntimeAuthorityError> {
+    let manifest = actor.authority_manifest()?;
+    Ok(manifest.canonical_token_set())
+}
+
 pub(crate) fn spawn_with_site_authority(
     rt: &mut Runtime,
     module: &crate::bytecode::CodeModule,
@@ -2060,6 +2071,17 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                         .map(|((_, name), id)| (name.clone(), id.0))
                         .collect()
                 });
+                let authority_tokens = match migration_authority_tokens(actor) {
+                    Ok(tokens) => tokens,
+                    Err(error) => {
+                        tracing::warn!(
+                            actor_id,
+                            %error,
+                            "nulang-migrate: refusing to migrate actor with invalid authority manifest"
+                        );
+                        return;
+                    }
+                };
                 let snapshot = crate::runtime::persistence::ActorSnapshot {
                     actor_id,
                     sequence: actor.sequence,
@@ -2067,7 +2089,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,
                     crdt_field_map,
-                authority_tokens: Default::default(),
+                    authority_tokens,
                 };
 
                 let snapshot_json = match serde_json::to_vec(&snapshot) {
@@ -2211,5 +2233,41 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
     }
     fn gossip(&mut self, _message: &str) -> crate::vm::Value {
         crate::vm::Value::unit()
+    }
+}
+
+
+#[cfg(test)]
+mod migration_authority_tests {
+    use super::migration_authority_tokens;
+    use crate::authority::AuthorityManifest;
+    use crate::authority_runtime::RuntimeAuthorityError;
+    use crate::runtime::Actor;
+
+    #[test]
+    fn migration_sender_preserves_canonical_actor_authority() {
+        let mut actor = Actor::new(700_001, "migration-authority", 8);
+        let manifest = AuthorityManifest::from_tokens([
+            "Secret::Read(MIGRATION_KEY)",
+            "Net::TcpOut(api.example.com:443)",
+        ])
+        .unwrap();
+        actor.install_authority_manifest(&manifest);
+
+        let tokens = migration_authority_tokens(&actor).unwrap();
+        assert_eq!(tokens, manifest.canonical_token_set());
+    }
+
+    #[test]
+    fn migration_sender_rejects_malformed_actor_authority() {
+        let mut actor = Actor::new(700_002, "migration-authority-invalid", 8);
+        actor
+            .capabilities
+            .insert("Net::TcpOut(malformed)".to_string());
+
+        assert!(matches!(
+            migration_authority_tokens(&actor),
+            Err(RuntimeAuthorityError::InvalidManifest(_))
+        ));
     }
 }
