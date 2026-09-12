@@ -2404,19 +2404,23 @@ in this pass beyond the first):**
 ```nulang
 workflow OrderFulfillment {
   step receive_order {
-    perform IO.print("Processing order")
+    // Replay-safe order-receipt logic belongs here.
+    ()
   }
 
   step validate_inventory {
-    perform IO.print("Checking stock")
+    // Replay-safe inventory validation belongs here.
+    ()
   }
 
   step charge_payment {
-    perform IO.print("Charging payment")
+    // Replay-safe payment orchestration belongs here.
+    ()
   }
 
   step ship_order {
-    perform IO.print("Shipping")
+    // Replay-safe shipment orchestration belongs here.
+    ()
   }
 }
 ```
@@ -2449,15 +2453,18 @@ workflow OrderFulfillment {
 workflow ParallelProcessing {
   parallel {
     step gather_a {
-      perform IO.print("gathering A")
+      // Replay-safe branch A logic.
+      ()
     }
     step gather_b {
-      perform IO.print("gathering B")
+      // Replay-safe branch B logic.
+      ()
     }
   }
 
   step aggregate_results {
-    perform IO.print("aggregating")
+    // Replay-safe aggregation logic.
+    ()
   }
 }
 ```
@@ -2479,19 +2486,24 @@ workflow ParallelProcessing {
 ```nulang
 workflow SagaTransaction {
   step reserve_inventory {
-    perform IO.print("reserved")
+    // Replay-safe reservation logic.
+    ()
   } compensate {
-    perform IO.print("released")
+    // Replay-safe release logic.
+    ()
   }
 
   step charge_payment {
-    perform IO.print("charged")
+    // Replay-safe payment logic.
+    ()
   } compensate {
-    perform IO.print("refunded")
+    // Replay-safe refund logic.
+    ()
   }
 
   step ship_goods {
-    perform IO.print("shipped")
+    // Replay-safe shipment logic.
+    ()
   }
 }
 ```
