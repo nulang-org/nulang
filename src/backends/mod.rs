@@ -167,7 +167,7 @@ pub struct DefaultWasmBackend;
 fn validate_default_wasm_semantics(module: &MirModule) -> NuResult<()> {
     for function in module.functions.iter().chain(module.behaviors.iter()) {
         for block in &function.blocks {
-            if matches!(block.terminator, crate::mir::Terminator::Resume(_)) {
+            if matches!(&block.terminator, crate::mir::Terminator::Resume(_)) {
                 return Err(crate::types::NuError::VMError {
                     msg: "WASM backend restricted profile: user-defined effect handlers and continuation resume are not supported; use the bytecode backend"
                         .into(),
@@ -236,7 +236,7 @@ pub struct ReqwestHttpProvider {
 
 #[cfg(any(feature = "ai-runtime", feature = "http-client"))]
 impl ReqwestHttpProvider {
-    /// Create a new reqwest-backed provider with a default timeout.
+    /// Create a new reqwest-backed HTTP provider with a default timeout.
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
