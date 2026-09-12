@@ -1,5 +1,7 @@
 use crate::interruption::{InterruptionNotice, InterruptionReason};
-use crate::provider::{CapacityProvider, CapacityQuery, ProviderError, ProviderFuture, ProviderSnapshot};
+use crate::provider::{
+    CapacityProvider, CapacityQuery, ProviderError, ProviderFuture, ProviderSnapshot,
+};
 use crate::{AcceleratorSpec, Architecture, CapacityOffer, Lifecycle, TrustTier};
 use serde::{Deserialize, Serialize};
 use std::{future::Future, pin::Pin};
@@ -85,7 +87,8 @@ pub struct GcpSnapshot {
     pub offers: Vec<GcpOffer>,
 }
 
-pub type GcpSourceFuture<'a> = Pin<Box<dyn Future<Output = Result<GcpSnapshot, ProviderError>> + Send + 'a>>;
+pub type GcpSourceFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<GcpSnapshot, ProviderError>> + Send + 'a>>;
 
 pub trait GcpOfferSource: Send + Sync {
     fn fetch<'a>(&'a self, query: &'a CapacityQuery) -> GcpSourceFuture<'a>;
