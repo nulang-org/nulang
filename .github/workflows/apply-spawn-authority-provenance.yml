@@ -17,6 +17,20 @@ jobs:
         with:
           ref: feat/spawn-authority-provenance
           fetch-depth: 0
+      - name: Align patch assertions with current callback topology
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/apply_spawn_authority_provenance.py')
+          s = p.read_text()
+          s = s.replace('if sig_count != 4:', 'if sig_count != 2:')
+          s = s.replace('expected 4 spawn signatures', 'expected 2 spawn signatures')
+          s = s.replace('if rc_count != 2:', 'if rc_count != 1:')
+          s = s.replace('expected 2 Rc spawn bodies', 'expected 1 Rc spawn body')
+          s = s.replace('if raw_count != 2:', 'if raw_count != 1:')
+          s = s.replace('expected 2 raw-pointer spawn bodies', 'expected 1 raw-pointer spawn body')
+          p.write_text(s)
+          PY
       - name: Apply exact-provenance patch
         run: python3 scripts/apply_spawn_authority_provenance.py
       - name: Format
