@@ -7,14 +7,14 @@ s = p.read_text()
 anchor = '''/// `nula build-wasm`: compile package to .wasm + AOT .cwasm.\n/// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.\nfn cmd_build_wasm() -> NuResult<()> {'''
 if s.count(anchor) != 1:
     raise SystemExit(f'cmd_build_wasm anchor count={s.count(anchor)}')
-helper = '''/// Build compiler arguments for the canonical WASM AOT package path.\n///\n/// Keep package capability forwarding centralized here so `build-wasm` has\n/// the same default-deny semantics as `build`/`run`.\nfn wasm_aot_args(wasm_path: &str, entry: &str) -> Vec<String> {\n    let mut args = vec![\n        "--backend".to_string(),\n        "wasm-aot".to_string(),\n        "--out".to_string(),\n        wasm_path.to_string(),\n        entry.to_string(),\n    ];\n    args.extend(capability_args());\n    args\n}\n\n'''
+helper = '''/// Build compiler arguments for canonical package WASM AOT compilation.\n///\n/// Keep capability forwarding centralized so both `build-wasm` and the\n/// optional WASM tier of `deploy` preserve the same default-deny package\n/// semantics as normal `build`/`run`.\nfn wasm_aot_args(wasm_path: &str, entry: &str) -> Vec<String> {\n    let mut args = vec![\n        "--backend".to_string(),\n        "wasm-aot".to_string(),\n        "--out".to_string(),\n        wasm_path.to_string(),\n        entry.to_string(),\n    ];\n    args.extend(capability_args());\n    args\n}\n\n'''
 s = s.replace(anchor, helper + anchor, 1)
 
 old = '''    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;'''
 new = '''    let args = wasm_aot_args(&wasm_path_str, &entry_str);\n    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();\n    nulang_exe(&arg_refs)?;'''
-if s.count(old) != 1:
-    raise SystemExit(f'build-wasm invocation count={s.count(old)}')
-s = s.replace(old, new, 1)
+if s.count(old) != 2:
+    raise SystemExit(f'wasm-aot package invocation count={s.count(old)}')
+s = s.replace(old, new)
 
 # Add a focused pure argument-construction regression at the beginning of the
 # existing tests module. No Wasmtime process is required for this invariant.
