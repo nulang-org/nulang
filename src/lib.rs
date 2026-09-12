@@ -7,6 +7,7 @@
 // replacing those values with mathematical constants would change test semantics.
 #![cfg_attr(test, allow(clippy::approx_constant))]
 
+pub mod admission_policy;
 pub mod agent;
 pub mod aot;
 pub mod ast;
