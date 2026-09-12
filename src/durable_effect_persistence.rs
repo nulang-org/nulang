@@ -23,6 +23,7 @@ pub enum DurableEffectPersistenceRecord {
     Effect(DurableEffectRecord),
     Compensation {
         original_effect_id: DurableEffectId,
+        compensation_ordinal: u32,
         effect: DurableEffectRecord,
     },
 }
@@ -35,6 +36,7 @@ impl DurableEffectPersistenceRecord {
     pub fn from_compensation(record: &DurableCompensationRecord) -> Self {
         Self::Compensation {
             original_effect_id: record.original_effect_id(),
+            compensation_ordinal: record.compensation_ordinal(),
             effect: record.effect().clone(),
         }
     }
@@ -55,6 +57,16 @@ impl DurableEffectPersistenceRecord {
         }
     }
 
+    pub fn compensation_ordinal(&self) -> Option<u32> {
+        match self {
+            Self::Effect(_) => None,
+            Self::Compensation {
+                compensation_ordinal,
+                ..
+            } => Some(*compensation_ordinal),
+        }
+    }
+
     /// Encode the stable versioned JSON representation.
     pub fn to_json(&self) -> Result<Vec<u8>, DurableEffectPersistenceError> {
         let envelope = PersistedEnvelopeV1 {
@@ -68,7 +80,9 @@ impl DurableEffectPersistenceRecord {
     ///
     /// Unknown versions fail closed. Callers must perform an explicit format
     /// migration rather than asking an older runtime to guess at newer durable
-    /// semantics.
+    /// semantics. Compensation identity is re-derived during decode so a
+    /// corrupted or inconsistent original-id/ordinal/operation tuple cannot be
+    /// accepted as a different logical compensation.
     pub fn from_json(bytes: &[u8]) -> Result<Self, DurableEffectPersistenceError> {
         let envelope: PersistedEnvelopeV1 =
             serde_json::from_slice(bytes).map_err(DurableEffectPersistenceError::from)?;
@@ -84,8 +98,14 @@ impl DurableEffectPersistenceRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurableEffectPersistenceError {
     Json(String),
-    UnsupportedVersion { actual: u16 },
+    UnsupportedVersion {
+        actual: u16,
+    },
     InvalidEffectId(String),
+    CompensationIdentityMismatch {
+        expected: DurableEffectId,
+        actual: DurableEffectId,
+    },
 }
 
 impl fmt::Display for DurableEffectPersistenceError {
@@ -99,6 +119,10 @@ impl fmt::Display for DurableEffectPersistenceError {
             Self::InvalidEffectId(value) => {
                 write!(f, "invalid durable effect id in persistence data: {value}")
             }
+            Self::CompensationIdentityMismatch { expected, actual } => write!(
+                f,
+                "persisted compensation identity mismatch: expected {expected}, got {actual}"
+            ),
         }
     }
 }
@@ -123,6 +147,7 @@ enum PersistedRecordKindV1 {
     Effect(PersistedEffectRecordV1),
     Compensation {
         original_effect_id: String,
+        compensation_ordinal: u32,
         effect: PersistedEffectRecordV1,
     },
 }
@@ -135,9 +160,11 @@ impl PersistedRecordKindV1 {
             }
             DurableEffectPersistenceRecord::Compensation {
                 original_effect_id,
+                compensation_ordinal,
                 effect,
             } => Self::Compensation {
                 original_effect_id: original_effect_id.to_string(),
+                compensation_ordinal: *compensation_ordinal,
                 effect: PersistedEffectRecordV1::from_runtime(effect),
             },
         }
@@ -150,14 +177,28 @@ impl PersistedRecordKindV1 {
             )),
             Self::Compensation {
                 original_effect_id,
+                compensation_ordinal,
                 effect,
             } => {
                 let original_effect_id = DurableEffectId::from_str(&original_effect_id).map_err(
-                    |_| DurableEffectPersistenceError::InvalidEffectId(original_effect_id),
+                    |_| DurableEffectPersistenceError::InvalidEffectId(original_effect_id.clone()),
                 )?;
+                let effect = effect.into_runtime()?;
+                let actual = effect.spec().id;
+                let expected = original_effect_id.derive_compensation(
+                    compensation_ordinal,
+                    &effect.spec().effect_operation,
+                );
+                if actual != expected {
+                    return Err(DurableEffectPersistenceError::CompensationIdentityMismatch {
+                        expected,
+                        actual,
+                    });
+                }
                 Ok(DurableEffectPersistenceRecord::Compensation {
                     original_effect_id,
-                    effect: effect.into_runtime()?,
+                    compensation_ordinal,
+                    effect,
                 })
             }
         }
@@ -329,6 +370,7 @@ mod tests {
         let restored = DurableEffectPersistenceRecord::from_json(&bytes).unwrap();
 
         assert_eq!(restored.original_effect_id(), None);
+        assert_eq!(restored.compensation_ordinal(), None);
         assert_eq!(
             restored
                 .effect()
@@ -361,6 +403,7 @@ mod tests {
         let restored = DurableEffectPersistenceRecord::from_json(&bytes).unwrap();
 
         assert_eq!(restored.original_effect_id(), Some(original_id));
+        assert_eq!(restored.compensation_ordinal(), Some(0));
         assert_eq!(restored.effect().spec().id, compensation_id);
         assert_eq!(
             restored
@@ -371,6 +414,30 @@ mod tests {
                 operation_id: compensation_id,
             }
         );
+    }
+
+    #[test]
+    fn corrupted_compensation_ordinal_fails_identity_validation() {
+        let original = completed_effect();
+        let compensation = original
+            .prepare_compensation(
+                0,
+                "Payment.refund",
+                EffectBoundary::External,
+                DeliverySemantics::EffectivelyOnceWithDeduplication,
+                b"order=7&refund=10",
+            )
+            .unwrap();
+        let persisted = DurableEffectPersistenceRecord::from_compensation(&compensation);
+        let bytes = persisted.to_json().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["record"]["value"]["compensation_ordinal"] = serde_json::Value::from(1);
+        let bytes = serde_json::to_vec(&value).unwrap();
+
+        assert!(matches!(
+            DurableEffectPersistenceRecord::from_json(&bytes),
+            Err(DurableEffectPersistenceError::CompensationIdentityMismatch { .. })
+        ));
     }
 
     #[test]
