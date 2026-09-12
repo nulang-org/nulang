@@ -56,6 +56,62 @@ impl AuthorityGrant {
         };
         token.parse()
     }
+
+    /// Render this grant as valid source syntax. Unlike the canonical token
+    /// representation used for artifact identity, source syntax quotes and
+    /// escapes authority arguments so formatter output always reparses.
+    pub fn to_source_syntax(&self) -> String {
+        match self {
+            AuthorityGrant::NetTcpOut { host, port } => {
+                format!(
+                    "Net::TcpOut({})",
+                    quote_source_string(&format!("{host}:{port}"))
+                )
+            }
+            AuthorityGrant::FsRead { path } => {
+                format!("Fs::Read({})", quote_source_string(path))
+            }
+            AuthorityGrant::FsWrite { path } => {
+                format!("Fs::Write({})", quote_source_string(path))
+            }
+            AuthorityGrant::EnvRead { name } => {
+                format!("Env::Read({})", quote_source_string(name))
+            }
+            AuthorityGrant::SecretRead { name } => {
+                format!("Secret::Read({})", quote_source_string(name))
+            }
+            AuthorityGrant::Other {
+                namespace,
+                operation,
+                argument,
+            } => match argument {
+                Some(argument) => format!(
+                    "{namespace}::{operation}({})",
+                    quote_source_string(argument)
+                ),
+                None => format!("{namespace}::{operation}"),
+            },
+        }
+    }
+}
+
+fn quote_source_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Deterministically ordered authority set. Empty means no external authority.
