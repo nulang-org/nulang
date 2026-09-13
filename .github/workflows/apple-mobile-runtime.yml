@@ -1,0 +1,87 @@
+name: Apple Mobile Runtime
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "include/**"
+      - "platforms/native/**"
+      - "platforms/ios/**"
+      - "scripts/check_mobile_runtime_profile.sh"
+      - "scripts/build_apple_mobile_runtime.sh"
+      - ".github/workflows/apple-mobile-runtime.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "include/**"
+      - "platforms/native/**"
+      - "platforms/ios/**"
+      - "scripts/check_mobile_runtime_profile.sh"
+      - "scripts/build_apple_mobile_runtime.sh"
+      - ".github/workflows/apple-mobile-runtime.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  mobile-profile:
+    name: Mobile Runtime Isolation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify dependency graph and interpreter build
+        run: bash scripts/check_mobile_runtime_profile.sh
+
+      - name: Test interpreter-only library
+        run: cargo test --lib --no-default-features --features mobile-runtime
+
+      - name: Compile shared C bootstrap test
+        run: |
+          cc \
+            -std=c11 \
+            -Wall \
+            -Wextra \
+            -Werror \
+            -I include \
+            platforms/native/bridge/nulang_mobile_host.c \
+            platforms/native/bridge/tests/test_mobile_bridge.c \
+            -o /tmp/nulang-mobile-bridge-test
+          /tmp/nulang-mobile-bridge-test
+
+  xcframework:
+    name: Build NulangMobile.xcframework
+    runs-on: macos-latest
+    needs: mobile-profile
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Apple runtime
+        env:
+          NULANG_SKIP_PROFILE_CHECK: "1"
+        run: bash scripts/build_apple_mobile_runtime.sh
+
+      - name: Upload XCFramework proof artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: NulangMobile-xcframework-${{ github.sha }}
+          path: .nula/native/apple/NulangMobile.xcframework.zip
+          if-no-files-found: error
+          retention-days: 14
