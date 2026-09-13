@@ -1,3 +1,4 @@
+# Trigger after workflow registration; self-removes on successful validation.
 name: Raw Value Provenance Migration
 
 on:
@@ -71,7 +72,6 @@ jobs:
           )
           p.write_text(s)
 
-          # C ABI and libffi are explicitly untrusted integer boundaries.
           p = Path('src/ffi/c_api.rs')
           s = p.read_text()
           old = '    Ok(Value::from_bits(value.raw))\n'
@@ -88,8 +88,6 @@ jobs:
               raise SystemExit('libffi raw-value anchor changed')
           p.write_text(s.replace(old, new, 1))
 
-          # WASM helpers preserve guest-local pointer semantics, but guest bits
-          # may become host Values only through the safe external decoder.
           p = Path('src/wasm_runtime.rs')
           s = p.read_text()
           old = '''    if value_layout::is_ptr_raw(raw) {\n        return Err("wasm guest pointer-tagged value has no host heap provenance");\n    }\n    Ok(crate::vm::Value::from_raw(raw))\n'''
@@ -111,9 +109,6 @@ jobs:
               raise SystemExit('WasmFX guest decoder anchor changed')
           p.write_text(s.replace(old, new, 1))
 
-          # Persistence resolves serialized object ids through obj_table before
-          # raw reconstruction. Remaining raw values are non-pointer/immediate
-          # or internally reconstructed closure tags.
           p = Path('src/runtime/heap_serialize.rs')
           s = p.read_text()
           s = s.replace('Value::from_raw(raw)', 'unsafe { Value::from_raw(raw) }')
