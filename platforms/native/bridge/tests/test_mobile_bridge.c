@@ -9,6 +9,12 @@ struct NulangRuntime {
     const char *last_error;
 };
 
+struct NulangMobileActionRuntime {
+    int ready;
+    const char *last_error;
+    char result[256];
+};
+
 typedef void (*RegisteredStringFn)(const char *);
 
 static RegisteredStringFn registered_document = NULL;
@@ -17,6 +23,9 @@ static int runtime_new_calls = 0;
 static int runtime_free_calls = 0;
 static int load_calls = 0;
 static int run_calls = 0;
+static int action_new_calls = 0;
+static int action_invoke_calls = 0;
+static int action_free_calls = 0;
 
 NulangRuntime *nulang_runtime_new_interpreter(void) {
     NulangRuntime *runtime = (NulangRuntime *)calloc(1, sizeof(*runtime));
@@ -97,6 +106,74 @@ int32_t nulang_register_native_function(
     return -1;
 }
 
+NulangMobileActionRuntime *nulang_mobile_action_runtime_new(
+    const uint8_t *bytes,
+    size_t len
+) {
+    NulangMobileActionRuntime *runtime =
+        (NulangMobileActionRuntime *)calloc(1, sizeof(*runtime));
+    assert(runtime != NULL);
+    action_new_calls++;
+
+    if (bytes == NULL || len < 4 || memcmp(bytes, "NLBC", 4) != 0) {
+        runtime->ready = 0;
+        runtime->last_error = "invalid mobile action artifact";
+        return runtime;
+    }
+    if (len > 4 && bytes[4] == 0xEE) {
+        runtime->ready = 0;
+        runtime->last_error = "invalid mobile action metadata";
+        return runtime;
+    }
+
+    runtime->ready = 1;
+    runtime->last_error = NULL;
+    return runtime;
+}
+
+bool nulang_mobile_action_runtime_is_ready(
+    const NulangMobileActionRuntime *runtime
+) {
+    return runtime != NULL && runtime->ready != 0;
+}
+
+const char *nulang_mobile_action_runtime_invoke(
+    NulangMobileActionRuntime *runtime,
+    const char *request_json
+) {
+    action_invoke_calls++;
+    if (runtime == NULL || !runtime->ready || request_json == NULL) {
+        return NULL;
+    }
+    if (strstr(request_json, "\"handler\":\"save\"") == NULL) {
+        runtime->last_error = "client action is not authorized";
+        return NULL;
+    }
+
+    snprintf(
+        runtime->result,
+        sizeof(runtime->result),
+        "%s",
+        "{\"protocol\":\"nulang-action-result/1\","
+        "\"correlation_id\":\"corr-bridge\",\"messages\":[]}"
+    );
+    runtime->last_error = NULL;
+    return runtime->result;
+}
+
+const char *nulang_mobile_action_runtime_last_error(
+    const NulangMobileActionRuntime *runtime
+) {
+    return runtime == NULL ? NULL : runtime->last_error;
+}
+
+void nulang_mobile_action_runtime_free(NulangMobileActionRuntime *runtime) {
+    if (runtime != NULL) {
+        action_free_calls++;
+        free(runtime);
+    }
+}
+
 typedef struct CallbackState {
     int documents;
     int messages;
@@ -139,6 +216,7 @@ int main(void) {
     assert(app != NULL);
     assert(runtime_new_calls == 1);
     assert(load_calls == 1);
+    assert(action_new_calls == 1);
 
     NulangMobileApp *second = NULL;
     status = nulang_mobile_app_new(
@@ -151,6 +229,8 @@ int main(void) {
     );
     assert(status == NULANG_MOBILE_ALREADY_ACTIVE);
     assert(second == NULL);
+    assert(runtime_new_calls == 1);
+    assert(action_new_calls == 1);
 
     NulangValue result = {0};
     status = nulang_mobile_app_run(app, &result, error, sizeof(error));
@@ -162,8 +242,40 @@ int main(void) {
     assert(strstr(callbacks.last_document, "nulang-ui/1") != NULL);
     assert(strstr(callbacks.last_message, "nulang-ui-msg/1") != NULL);
 
+    const char *action_result = NULL;
+    status = nulang_mobile_app_invoke_action(
+        app,
+        "{\"protocol\":\"nulang-action-invoke/1\","
+        "\"handler\":\"save\",\"correlation_id\":\"corr-bridge\","
+        "\"idempotency_key\":\"save:corr-bridge\",\"form\":{},\"signals\":{}}",
+        &action_result,
+        error,
+        sizeof(error)
+    );
+    assert(status == NULANG_MOBILE_OK);
+    assert(action_invoke_calls == 1);
+    assert(action_result != NULL);
+    assert(strstr(action_result, "nulang-action-result/1") != NULL);
+    assert(strstr(action_result, "corr-bridge") != NULL);
+
+    action_result = (const char *)0x1;
+    status = nulang_mobile_app_invoke_action(
+        app,
+        "{\"protocol\":\"nulang-action-invoke/1\","
+        "\"handler\":\"secret\",\"correlation_id\":\"corr-bridge\","
+        "\"idempotency_key\":\"secret:corr-bridge\",\"form\":{},\"signals\":{}}",
+        &action_result,
+        error,
+        sizeof(error)
+    );
+    assert(status == NULANG_MOBILE_ACTION_ERROR);
+    assert(action_invoke_calls == 2);
+    assert(action_result == NULL);
+    assert(strstr(error, "not authorized") != NULL);
+
     nulang_mobile_app_free(app);
     assert(runtime_free_calls == 1);
+    assert(action_free_calls == 1);
 
     app = NULL;
     status = nulang_mobile_app_new(
@@ -177,6 +289,7 @@ int main(void) {
     assert(status == NULANG_MOBILE_OK);
     nulang_mobile_app_free(app);
     assert(runtime_free_calls == 2);
+    assert(action_free_calls == 2);
 
     static const uint8_t invalid[] = {0, 1, 2, 3};
     app = NULL;
@@ -192,6 +305,27 @@ int main(void) {
     assert(app == NULL);
     assert(strstr(error, "invalid .nbc") != NULL);
     assert(runtime_free_calls == 3);
+    assert(action_new_calls == 2);
+    assert(action_free_calls == 2);
+
+    static const uint8_t invalid_actions[] = {
+        'N', 'L', 'B', 'C', 0xEE, 0, 0, 1
+    };
+    app = NULL;
+    status = nulang_mobile_app_new(
+        invalid_actions,
+        sizeof(invalid_actions),
+        host,
+        &app,
+        error,
+        sizeof(error)
+    );
+    assert(status == NULANG_MOBILE_ARTIFACT_ERROR);
+    assert(app == NULL);
+    assert(strstr(error, "invalid mobile action metadata") != NULL);
+    assert(runtime_free_calls == 4);
+    assert(action_new_calls == 3);
+    assert(action_free_calls == 3);
 
     puts("nulang mobile C bridge tests passed");
     return 0;
