@@ -3,6 +3,9 @@
     clippy::too_many_arguments,
     clippy::missing_transmute_annotations
 )]
+// Test fixtures intentionally exercise source-level decimal spellings such as 3.14;
+// replacing those values with mathematical constants would change test semantics.
+#![cfg_attr(test, allow(clippy::approx_constant))]
 
 pub mod agent;
 pub mod aot;
@@ -50,6 +53,7 @@ pub mod observability;
 pub mod package;
 pub mod parser;
 pub mod prelude_source;
+pub mod primitives;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod registry;
@@ -70,6 +74,7 @@ pub mod vm;
 pub mod wasm_component_runtime;
 #[cfg(feature = "wasm-backend")]
 pub mod wasm_runtime;
+#[cfg(feature = "wasm-backend")]
 pub mod wasm_types;
 #[cfg(feature = "wasmfx-backend")]
 pub mod wasmfx_backend;

@@ -460,6 +460,7 @@ impl AotModule {
         }
 
         // Clean up: reconstruct Box to drop callbacks and free heap/GC.
+        stash_aot_result_repr(result);
         unsafe {
             crate::jit::runtime::clear_jit_callbacks();
             let _ = Box::from_raw(callbacks_ptr as *mut crate::vm::StandaloneVmCallbacks);
@@ -467,6 +468,87 @@ impl AotModule {
         crate::jit::runtime::aot_clear_constants();
         clear_aot_module_ctx();
         let _ = crate::jit::runtime::aot_take_heap();
+
+        Ok(result)
+    }
+
+    /// Run the module entry point inside a real actor `Runtime`.
+    ///
+    /// This is the `--backend native` equivalent of the bytecode path's
+    /// `run_with_runtime`: the top-level native code runs with runtime-backed
+    /// callbacks, so `spawn` creates live runtime actors and `send` enqueues
+    /// real messages. After the entry function returns, the scheduler runs until
+    /// the run queue drains.
+    ///
+    /// The `AotModule` is consumed and registered with the runtime so that
+    /// spawned actors dispatch their behaviors through native code.
+    pub fn run_in_runtime(self, rt: &mut crate::runtime::Runtime) -> NuResult<u64> {
+        let Some(idx) = self.entry_idx else {
+            return Ok(crate::vm::Value::nil().as_raw());
+        };
+        let ptr = self.compiled_funcs.get(idx).copied().ok_or_else(|| {
+            crate::types::NuError::VMError {
+                msg: "no compiled entry point".into(),
+                span: crate::types::Span::default(),
+            }
+        })?;
+
+        // The bytecode companion carries actor metadata needed by
+        // `spawn_from_module`. Require it for any module that uses actors.
+        let code_module =
+            self.code_module
+                .clone()
+                .ok_or_else(|| crate::types::NuError::VMError {
+                    msg: "AOT runtime execution requires a bytecode companion module".into(),
+                    span: crate::types::Span::default(),
+                })?;
+        let constants = self.constants.clone();
+
+        // Register the AOT module and its bytecode grains with the runtime.
+        let module_ptr = rt.register_aot_module(self);
+        rt.register_module_grains(&code_module);
+
+        // Set up the AOT helper context (heap fallback, constant pool, closure
+        // dispatch). The module pointer stays valid for the lifetime of `rt`.
+        let mut heap = crate::runtime::heap::ActorHeap::new(1024 * 1024);
+        heap.set_actor_id(0);
+        crate::jit::runtime::aot_set_heap(heap);
+        if !constants.is_empty() {
+            unsafe {
+                crate::jit::runtime::aot_set_constants(&constants);
+            }
+        }
+        unsafe {
+            set_aot_module_ctx(&*module_ptr);
+        }
+
+        // Install runtime-backed callbacks and call the native entry.
+        let mut callbacks = AotTopLevelCallbacks { runtime: rt };
+        unsafe {
+            crate::jit::runtime::set_jit_callbacks(&mut callbacks);
+        }
+        let func: extern "C" fn() -> u64 = unsafe { std::mem::transmute(ptr) };
+        let result = func();
+
+        // Clear helper context before running the scheduler.
+        crate::jit::runtime::clear_jit_callbacks();
+        if let Some(msg) = crate::jit::runtime::aot_take_pending_error() {
+            crate::jit::runtime::aot_clear_constants();
+            clear_aot_module_ctx();
+            let _ = crate::jit::runtime::aot_take_heap();
+            return Err(crate::types::NuError::runtime_error(
+                msg,
+                crate::types::Span::default(),
+            ));
+        }
+
+        crate::jit::runtime::aot_clear_constants();
+        clear_aot_module_ctx();
+        stash_aot_result_repr(result);
+        let _ = crate::jit::runtime::aot_take_heap();
+
+        // Drain actor mailboxes.
+        rt.run_scheduler();
 
         Ok(result)
     }
@@ -583,6 +665,35 @@ pub fn clear_aot_module_ctx() {
     AOT_MODULE_CTX.with(|c| *c.borrow_mut() = std::ptr::null());
 }
 
+thread_local! {
+    /// Materialized text of the last `AotModule::run`/`run_in_runtime`
+    /// result when it is a heap string, captured before the standalone heap
+    /// is torn down. After teardown the payload pointer dangles and
+    /// `Value::to_string_repr` degrades to a raw `#Value(...)` repr —
+    /// diverging from the interpreter, which prints the string content.
+    static AOT_RESULT_REPR: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Take the materialized string result of the last native run, if any.
+/// Consumed once by the driver in place of `to_string_repr`.
+pub fn take_aot_result_repr() -> Option<String> {
+    AOT_RESULT_REPR.with(|c| c.borrow_mut().take())
+}
+
+/// If `raw` is a string value, copy its content into `AOT_RESULT_REPR`
+/// while the owning heap/constant pool is still alive. No-op for non-strings.
+fn stash_aot_result_repr(raw: u64) {
+    use crate::value_layout::{TAG_MASK, TAG_PTR, TAG_STRING};
+    let tag = raw & TAG_MASK;
+    if tag != TAG_STRING && tag != TAG_PTR {
+        return;
+    }
+    if let Some(s) = crate::jit::runtime::resolve_string_coerce(raw) {
+        AOT_RESULT_REPR.with(|c| *c.borrow_mut() = Some(s));
+    }
+}
+
 /// The armed module's constant pool, for callbacks that resolve string
 /// arguments (async effect dispatch). Empty when no module is armed.
 pub fn aot_module_constants() -> &'static [crate::bytecode::Constant] {
@@ -696,7 +807,11 @@ pub unsafe extern "C" fn nulang_aot_spawn(behavior_idx: u64) -> u64 {
 // effects (an active handler for the same effect at runtime) are not
 // supported by the native backend — the compile-time `resolved_handler: None`
 // only guarantees no *lexical* handler, matching the bytecode fallback for
-// unbound effects. Outside an actor context the helper degrades to nil.
+// unbound effects. An effect the callback leaves unhandled (returns None) is
+// recorded on the pending-error channel and surfaced by the driver's
+// `aot_take_pending_error` drain, matching the interpreter's `Unhandled
+// effect` error; effects the callback handles with a nil result (e.g.
+// `Actor.*` outside an actor context) still degrade to nil.
 
 macro_rules! define_aot_perform {
     ($name:ident, $($arg:ident),*) => {
@@ -720,7 +835,7 @@ macro_rules! define_aot_perform {
             } else {
                 unsafe { &(*module).constants }
             };
-            crate::jit::runtime::try_with_callbacks(|cb| {
+            let handled = crate::jit::runtime::try_with_callbacks(|cb| {
                 if module.is_null() {
                     cb.perform_builtin_effect(&effect, Some(&op), constants, &regs)
                 } else {
@@ -732,9 +847,23 @@ macro_rules! define_aot_perform {
                     )
                 }
             })
-            .flatten()
-            .unwrap_or_else(crate::vm::Value::nil)
-            .as_raw()
+            .flatten();
+            // Interpreter parity (`vm.rs` Perform fast path): a builtin
+            // callback returning None means the effect is genuinely unhandled
+            // and the VM errors with "Unhandled effect: '<Effect>.<op>'".
+            // Record it on the shared pending-error channel (drained by
+            // `AotModule::run`/`run_in_runtime`) instead of silently
+            // yielding nil, which masked unknown effects as false values.
+            match handled {
+                Some(v) => v.as_raw(),
+                None => {
+                    crate::jit::runtime::aot_set_pending_error(format!(
+                        "Unhandled effect: '{}.{}'",
+                        effect, op
+                    ));
+                    crate::vm::Value::nil().as_raw()
+                }
+            }
         }
     };
 }
@@ -1204,6 +1333,267 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
                 .receive_match(behavior_ids)
         }
         .map(|(pos, payload)| (pos, payload.to_vec()))
+    }
+}
+
+/// `ActorVmCallbacks` for running AOT-compiled top-level code inside a real
+/// `Runtime`. Unlike `AotRuntimeCallbacks` (which is fixed to one scheduler-
+/// driven actor), this reads `runtime.current_actor` dynamically: outside an
+/// actor context allocations go to `Runtime::main_heap`, and `Actor.*` builtin
+/// effects are no-ops, exactly like the bytecode `RuntimeVmCallbacks` path.
+struct AotTopLevelCallbacks {
+    runtime: *mut crate::runtime::Runtime,
+}
+
+impl AotTopLevelCallbacks {
+    fn current_actor_id(&self) -> Option<u64> {
+        // SAFETY: caller guarantees `runtime` is live and uniquely borrowed
+        // for the duration of the native entry call.
+        unsafe { (*self.runtime).current_actor }
+    }
+}
+
+impl std::fmt::Debug for AotTopLevelCallbacks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AotTopLevelCallbacks")
+    }
+}
+
+impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
+    fn current_actor_id(&self) -> Option<u64> {
+        self.current_actor_id()
+    }
+
+    fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
+        // SAFETY: as in `AotRuntimeCallbacks`.
+        unsafe {
+            let rt = &mut *self.runtime;
+            if let Some(actor_id) = rt.current_actor {
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    return actor.heap.alloc(size, type_tag);
+                }
+            }
+            rt.main_heap.alloc(size, type_tag)
+        }
+    }
+
+    fn alloc_arena(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
+        unsafe {
+            let rt = &mut *self.runtime;
+            if let Some(actor_id) = rt.current_actor {
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    return actor.iso_arena.alloc(size, type_tag);
+                }
+            }
+            rt.main_heap.alloc(size, type_tag)
+        }
+    }
+
+    fn reset_arena(&mut self) {
+        unsafe {
+            let rt = &mut *self.runtime;
+            if let Some(actor_id) = rt.current_actor {
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    actor.iso_arena.reset();
+                }
+            }
+        }
+    }
+
+    fn is_arena_ptr(&self, ptr: *const u8) -> bool {
+        unsafe {
+            let rt = &*self.runtime;
+            rt.current_actor
+                .and_then(|id| rt.actors.get(&id))
+                .map(|a| a.iso_arena.contains(ptr))
+                .unwrap_or(false)
+        }
+    }
+
+    fn drop_ref(&mut self, ptr: *mut u8) {
+        unsafe {
+            let rt = &mut *self.runtime;
+            if let Some(actor_id) = rt.current_actor {
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    if actor.iso_arena.contains(ptr) {
+                        return;
+                    }
+                    actor.orca_gc.drop_local_ref(&mut actor.heap, ptr);
+                    return;
+                }
+            }
+            rt.main_gc.drop_local_ref(&mut rt.main_heap, ptr);
+        }
+    }
+
+    fn retain_ref(&mut self, ptr: *mut u8) {
+        unsafe {
+            let rt = &mut *self.runtime;
+            if let Some(actor_id) = rt.current_actor {
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    if actor.iso_arena.contains(ptr) {
+                        return;
+                    }
+                    actor.orca_gc.local_ref(&actor.heap, ptr);
+                    return;
+                }
+            }
+            rt.main_gc.local_ref(&rt.main_heap, ptr);
+        }
+    }
+
+    fn array_len(&self, ptr: *mut u8) -> Option<usize> {
+        unsafe {
+            let _rt = &*self.runtime;
+            let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
+            if header.type_tag == HeapTypeTag::Array {
+                let payload_size = header
+                    .size
+                    .saturating_sub(crate::runtime::heap::ActorHeap::HEADER_SIZE);
+                Some(payload_size / std::mem::size_of::<crate::vm::Value>())
+            } else {
+                None
+            }
+        }
+    }
+
+    fn spawn_actor(
+        &mut self,
+        module: &crate::bytecode::CodeModule,
+        behavior_idx: usize,
+        init: Vec<(String, crate::vm::Value)>,
+    ) -> crate::vm::Value {
+        unsafe { (*self.runtime).spawn_from_module(module, behavior_idx, init) }
+    }
+
+    fn send_message(
+        &mut self,
+        target: crate::vm::Value,
+        behavior_id: u16,
+        args: &[crate::vm::Value],
+    ) {
+        if let Some(target_id) = target.as_actor_id() {
+            unsafe { (*self.runtime).send_message_by_id(target_id, behavior_id, args) }
+        }
+    }
+
+    fn ask_actor(
+        &mut self,
+        target: crate::vm::Value,
+        behavior_id: u16,
+        args: &[crate::vm::Value],
+    ) -> crate::vm::Value {
+        if let Some(target_id) = target.as_actor_id() {
+            unsafe {
+                return (*self.runtime)
+                    .ask_actor_sync(target_id, behavior_id, args)
+                    .unwrap_or(crate::vm::Value::nil());
+            }
+        }
+        crate::vm::Value::nil()
+    }
+
+    fn get_state_field(&self, field: &str) -> crate::vm::Value {
+        unsafe {
+            let rt = &*self.runtime;
+            if let Some(actor_id) = rt.current_actor {
+                if let Some(actor) = rt.actors.get(&actor_id) {
+                    return actor
+                        .get_state_field(field)
+                        .unwrap_or(crate::vm::Value::nil());
+                }
+            }
+        }
+        crate::vm::Value::nil()
+    }
+
+    fn set_state_field(&mut self, field: &str, value: crate::vm::Value) {
+        unsafe {
+            let rt = &mut *self.runtime;
+            if let Some(actor_id) = rt.current_actor {
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    if actor
+                        .state_models
+                        .get(field)
+                        .map(|m| m.is_crdt())
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
+                    actor.set_state_field(field, value);
+                }
+            }
+        }
+    }
+
+    fn perform_builtin_effect_in_module(
+        &mut self,
+        effect_name: &str,
+        op_name: Option<&str>,
+        module: &crate::bytecode::CodeModule,
+        regs: &[crate::vm::Value],
+    ) -> Option<crate::vm::Value> {
+        let actor_id = self.current_actor_id().unwrap_or(0);
+        let mut bc =
+            crate::runtime::callbacks::BytecodeRuntimeCallbacks::new(self.runtime, actor_id);
+        bc.perform_builtin_effect_in_module(effect_name, op_name, module, regs)
+    }
+
+    fn perform_async(
+        &mut self,
+        effect_op: &str,
+        constants: &[crate::bytecode::Constant],
+        args: &[crate::vm::Value],
+    ) -> crate::vm::PerformAsyncResult {
+        let actor_id = self.current_actor_id().unwrap_or(0);
+        let mut bc =
+            crate::runtime::callbacks::BytecodeRuntimeCallbacks::new(self.runtime, actor_id);
+        bc.perform_async(effect_op, constants, args)
+    }
+
+    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) {
+        unsafe {
+            let rt = &mut *self.runtime;
+            if let Some(actor_id) = rt.current_actor {
+                rt.emit_event(actor_id, event, args);
+            }
+        }
+    }
+
+    fn try_receive(&mut self) -> Option<(u16, crate::vm::Value)> {
+        unsafe {
+            let rt = &mut *self.runtime;
+            let actor_id = rt.current_actor?;
+            rt.actors.get_mut(&actor_id)?.mailbox.pop()
+        }
+        .map(|msg| {
+            let first = msg
+                .payload
+                .first()
+                .copied()
+                .unwrap_or(crate::vm::Value::nil());
+            (msg.behavior_id, first)
+        })
+    }
+
+    fn try_receive_match(
+        &mut self,
+        behavior_ids: &[u16],
+    ) -> Option<(usize, Vec<crate::vm::Value>)> {
+        unsafe {
+            let rt = &mut *self.runtime;
+            let actor_id = rt.current_actor?;
+            rt.actors
+                .get_mut(&actor_id)?
+                .mailbox
+                .receive_match(behavior_ids)
+        }
+        .map(|(pos, payload)| (pos, payload.to_vec()))
+    }
+
+    fn wait_signal(&mut self, _name: &str) -> crate::vm::SignalWaitResult {
+        // Native top-level code has no workflow continuation suspension.
+        crate::vm::SignalWaitResult::Ready(crate::vm::Value::unit())
     }
 }
 

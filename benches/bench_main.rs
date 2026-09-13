@@ -10,6 +10,7 @@ mod gc_bench;
 mod interp_bench;
 mod jit_bench;
 mod persist_bench;
+mod scheduler_bench;
 mod vm_bench;
 
 use criterion::criterion_main;
@@ -23,4 +24,5 @@ criterion_main!(
     gc_bench::benches,
     dist_bench::benches,
     persist_bench::benches,
+    scheduler_bench::benches,
 );

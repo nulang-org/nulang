@@ -1,0 +1,13 @@
+[package]
+name = "nulang-capacity"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Provider-neutral capacity scoring and placement primitives for Nulang Cloud"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1.0"

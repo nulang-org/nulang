@@ -1,0 +1,10 @@
+let comp = fn(src) => fn(pos) => fn(len) => fn(left) => fn(min_prec) => fn(nr) => fn(env) => fn(elen) => (
+    let no_left = 268435456 * 4096 in
+    let pair = if left == no_left then (
+        let p = pos in
+        if p >= len then ((nr * 65536)) + p
+        else 42
+    ) else ((left * 65536)) + pos in
+    pair
+) in
+comp("hello")(0)(5)(268435456 * 4096)(-1)(8)("")(0)

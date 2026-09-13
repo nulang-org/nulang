@@ -10,10 +10,8 @@ use crate::ast::*;
 use crate::types::*;
 
 // Fast hashing for compiler-internal maps (keys are not attacker-controlled).
-type FxHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
-type FxHashSet<T> =
-    std::collections::HashSet<T, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+type FxHashMap<K, V> = rustc_hash::FxHashMap<K, V>;
+type FxHashSet<T> = rustc_hash::FxHashSet<T>;
 
 // ---------------------------------------------------------------------------
 // Effect Row Operations
@@ -498,6 +496,13 @@ impl EffectChecker {
     /// Look up the inferred effect row of a module-level function.
     pub fn function_row(&self, name: &str) -> Option<&EffectRow> {
         self.fn_rows.get(name)
+    }
+
+    /// Return a clone of the map from module-level function names to their
+    /// inferred effect rows. Useful for LSP features that want to avoid
+    /// recomputing the effect checker.
+    pub fn function_rows(&self) -> FxHashMap<String, EffectRow> {
+        self.fn_rows.clone()
     }
 
     pub fn new() -> Self {
@@ -1150,6 +1155,7 @@ impl EffectChecker {
         for decl in &flat {
             self.check_decl(decl)?;
         }
+        check_durable_determinism(&flat)?;
         self.check_resource_grants()?;
         Ok(())
     }
@@ -1249,6 +1255,374 @@ impl EffectChecker {
         ));
         let _ = span; // span reserved for future line/column diagnostics
     }
+}
+
+// ---------------------------------------------------------------------------
+// Durable-effect determinism
+// ---------------------------------------------------------------------------
+
+/// Ambient effects unsafe inside durable workflow steps.
+///
+/// Nulang recovery is checkpoint + journal re-drive, not full history replay:
+/// a step suspended on a signal or `LLM.ask` is re-run from its start after a
+/// crash (see `LLM_SUSPEND_MARKER` in runtime/mod.rs). An ambient effect
+/// executed before the suspension point would run again — nondeterministic
+/// value sources (`Time.now*`, `Rand.*`) yield different results, and
+/// externally visible effects (`Net.*`, `FS.*`, stdio) duplicate their side
+/// effects. Exclusions: `Timer.sleep` is journaled as `TimerSet` and re-armed
+/// on recovery; `LLM.*` is allowed by design (a re-driven step starts a fresh
+/// background call, documented next to `LLM_SUSPEND_MARKER`).
+fn is_forbidden_in_durable(effect: &str, op: &str) -> bool {
+    match effect {
+        "Rand" => true,
+        "Net" | "FS" => true,
+        "Time" => op != "sleep",
+        "IO" => matches!(op, "print" | "println" | "read"),
+        _ => false,
+    }
+}
+
+/// A user-installed `handle` arm covering an effect exempts performs of that
+/// effect inside the handled body: the handler intercepts them, so the
+/// ambient runtime never produces the nondeterministic result. Arms bind a
+/// bare effect name (`Time` — all ops) or one op (`Time.now`).
+fn is_handled_by_user(effect: &str, op: &str, handled: &[(String, Option<String>)]) -> bool {
+    handled
+        .iter()
+        .any(|(he, ho)| he == effect && (ho.is_none() || ho.as_deref() == Some(op)))
+}
+
+/// Module-level gate rejecting ambient nondeterminism in durable `workflow`
+/// step bodies. Walks step bodies plus saga compensations, following module
+/// function calls (a step calling `fn now() { perform Time.now_ms() }` is
+/// rejected exactly as if the perform were inlined) and honoring user
+/// `handle` scopes, which make the performs they intercept deterministic.
+struct DurableEffectWalker<'a> {
+    /// Module function bodies by name, for the interprocedural walk.
+    fns: std::collections::HashMap<&'a str, &'a Expr>,
+    /// Functions currently being expanded (recursion guard).
+    visiting: Vec<&'a str>,
+}
+
+impl<'a> DurableEffectWalker<'a> {
+    fn new(decls: &[&'a Decl]) -> Self {
+        let fns = decls
+            .iter()
+            .filter_map(|d| match d {
+                Decl::Function { name, body, .. } => Some((name.as_str(), body)),
+                _ => None,
+            })
+            .collect();
+        DurableEffectWalker {
+            fns,
+            visiting: Vec::new(),
+        }
+    }
+
+    /// Check every replay surface: workflow step bodies (plus saga
+    /// compensations), the behavior bodies of `persistent` actors and
+    /// `entity` actors, and entity `apply` handlers. All of these re-run
+    /// on recovery replay, so an ambient non-deterministic perform
+    /// diverges from the journaled state exactly as in a workflow step.
+    fn check(&mut self, decls: &[&'a Decl]) -> NuResult<()> {
+        for decl in decls {
+            match decl {
+                Decl::Workflow {
+                    name,
+                    items,
+                    compensate,
+                    ..
+                } => {
+                    for item in items {
+                        let steps: &[WorkflowStep] = match item {
+                            WorkflowItem::Step(s) => std::slice::from_ref(s),
+                            WorkflowItem::Parallel(steps) => steps,
+                        };
+                        for step in steps {
+                            let scope = format!("workflow '{name}' step '{}'", step.name);
+                            self.walk(&scope, &step.body, &[])?;
+                            if let Some(comp) = &step.compensate {
+                                self.walk(&scope, comp, &[])?;
+                            }
+                        }
+                    }
+                    if let Some(comp) = compensate {
+                        self.walk(&format!("workflow '{name}' compensate"), comp, &[])?;
+                    }
+                }
+                Decl::Actor {
+                    name,
+                    persistent,
+                    behaviors,
+                    events,
+                    apply_handlers,
+                    ..
+                } => {
+                    // `persistent` actors replay behavior bodies on
+                    // recovery; entities (detected by their `events`
+                    // block, matching the typechecker) additionally
+                    // replay `apply` handlers to rebuild state.
+                    let is_entity = !events.is_empty();
+                    if !*persistent && !is_entity {
+                        continue;
+                    }
+                    let kind = if is_entity {
+                        "entity"
+                    } else {
+                        "persistent actor"
+                    };
+                    for b in behaviors {
+                        let scope = format!("behavior '{}' of {kind} '{name}'", b.name);
+                        self.walk(&scope, &b.body, &[])?;
+                    }
+                    for h in apply_handlers {
+                        let scope = format!("apply handler '{}' of entity '{name}'", h.event);
+                        self.walk(&scope, &h.body, &[])?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_fn(
+        &mut self,
+        scope: &str,
+        name: &'a str,
+        handled: &[(String, Option<String>)],
+    ) -> NuResult<()> {
+        if self.visiting.iter().any(|n| *n == name) {
+            return Ok(());
+        }
+        if let Some(body) = self.fns.get(name).copied() {
+            self.visiting.push(name);
+            let r = self.walk(scope, body, handled);
+            self.visiting.pop();
+            r?;
+        }
+        Ok(())
+    }
+
+    fn walk(
+        &mut self,
+        scope: &str,
+        expr: &'a Expr,
+        handled: &[(String, Option<String>)],
+    ) -> NuResult<()> {
+        match expr {
+            Expr::Perform {
+                effect,
+                op,
+                args,
+                span,
+            } => {
+                if is_forbidden_in_durable(effect, op) && !is_handled_by_user(effect, op, handled) {
+                    return Err(NuError::EffectError {
+                        msg: format!(
+                            "{scope}: effect '{effect}.{op}' is not allowed in durable replay surfaces — a re-run after a crash (signal/LLM suspend) would execute it again with different results; handle it locally with `handle ... with` (deterministic implementation) or move it outside the durable context"
+                        ),
+                        span: *span,
+                        missing_effects: None,
+                        allowed_effects: None,
+                    });
+                }
+                for a in args {
+                    self.walk(scope, a, handled)?;
+                }
+                Ok(())
+            }
+            Expr::Handle { body, handlers, .. } => {
+                // Performs inside the handled body that an arm binds are
+                // intercepted by user code — extend the handled set for the
+                // body walk only.
+                let mut inner = handled.to_vec();
+                for h in handlers {
+                    inner.push((
+                        h.effect_name.clone(),
+                        if h.op_name.is_empty() {
+                            None
+                        } else {
+                            Some(h.op_name.clone())
+                        },
+                    ));
+                }
+                self.walk(scope, body, &inner)?;
+                // Handler bodies run with the OUTER set: a perform of the
+                // arm's own effect inside the arm is re-entrant, not covered
+                // by the arm.
+                for h in handlers {
+                    self.walk(scope, &h.body, handled)?;
+                }
+                Ok(())
+            }
+            Expr::App { func, args, .. } => {
+                self.walk(scope, func, handled)?;
+                for a in args {
+                    self.walk(scope, a, handled)?;
+                }
+                if let Expr::Var(name, _) = &**func {
+                    self.expand_fn(scope, name.as_str(), handled)?;
+                }
+                Ok(())
+            }
+            Expr::Lambda { body, .. } => self.walk(scope, body, handled),
+            Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+                self.walk(scope, value, handled)?;
+                self.walk(scope, body, handled)
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.walk(scope, cond, handled)?;
+                self.walk(scope, then_branch, handled)?;
+                if let Some(e) = else_branch {
+                    self.walk(scope, e, handled)?;
+                }
+                Ok(())
+            }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                self.walk(scope, scrutinee, handled)?;
+                for (_, guard, arm_body) in arms {
+                    if let Some(g) = guard {
+                        self.walk(scope, g, handled)?;
+                    }
+                    self.walk(scope, arm_body, handled)?;
+                }
+                Ok(())
+            }
+            Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => {
+                for e in exprs {
+                    self.walk(scope, e, handled)?;
+                }
+                Ok(())
+            }
+            Expr::FieldAccess { expr, .. } => self.walk(scope, expr, handled),
+            Expr::RecordUpdate { base, fields, .. } => {
+                self.walk(scope, base, handled)?;
+                for (_, e) in fields {
+                    self.walk(scope, e, handled)?;
+                }
+                Ok(())
+            }
+            Expr::Index { arr, idx, .. } => {
+                self.walk(scope, arr, handled)?;
+                self.walk(scope, idx, handled)
+            }
+            Expr::Binary { left, right, .. } => {
+                self.walk(scope, left, handled)?;
+                self.walk(scope, right, handled)
+            }
+            Expr::Unary { expr, .. } => self.walk(scope, expr, handled),
+            Expr::Assign { target, value, .. } => {
+                self.walk(scope, target, handled)?;
+                self.walk(scope, value, handled)
+            }
+            Expr::Spawn {
+                actor_type,
+                init,
+                positional_args,
+                target_node,
+                ..
+            } => {
+                self.walk(scope, actor_type, handled)?;
+                for (_, e) in init {
+                    self.walk(scope, e, handled)?;
+                }
+                if let Some(args) = positional_args {
+                    for a in args {
+                        self.walk(scope, a, handled)?;
+                    }
+                }
+                if let Some(n) = target_node {
+                    self.walk(scope, n, handled)?;
+                }
+                Ok(())
+            }
+            Expr::Send { actor, args, .. } | Expr::Ask { actor, args, .. } => {
+                self.walk(scope, actor, handled)?;
+                for a in args {
+                    self.walk(scope, a, handled)?;
+                }
+                Ok(())
+            }
+            Expr::Receive { arms, after, .. } => {
+                for (_, _, guard, arm_body) in arms {
+                    if let Some(g) = guard {
+                        self.walk(scope, g, handled)?;
+                    }
+                    self.walk(scope, arm_body, handled)?;
+                }
+                if let Some((timeout, body)) = after {
+                    self.walk(scope, timeout, handled)?;
+                    self.walk(scope, body, handled)?;
+                }
+                Ok(())
+            }
+            Expr::Emit { args, .. } => {
+                for a in args {
+                    self.walk(scope, a, handled)?;
+                }
+                Ok(())
+            }
+            Expr::GrainRef { key, .. } => self.walk(scope, key, handled),
+            Expr::Resume { value, .. } => self.walk(scope, value, handled),
+            Expr::Migrate { actor, node, .. } => {
+                self.walk(scope, actor, handled)?;
+                self.walk(scope, node, handled)
+            }
+            Expr::CapAnnotate { expr, .. }
+            | Expr::TypeAnnotate { expr, .. }
+            | Expr::Consume { expr, .. } => self.walk(scope, expr, handled),
+            Expr::Recover { body, .. } => self.walk(scope, body, handled),
+            Expr::Pipe { left, right, .. } => {
+                self.walk(scope, left, handled)?;
+                self.walk(scope, right, handled)
+            }
+            Expr::For { iterable, body, .. } => {
+                self.walk(scope, iterable, handled)?;
+                self.walk(scope, body, handled)
+            }
+            Expr::While { cond, body, .. } => {
+                self.walk(scope, cond, handled)?;
+                self.walk(scope, body, handled)
+            }
+            Expr::Defer { expr, .. } => self.walk(scope, expr, handled),
+            Expr::Hide { body, .. } | Expr::Seal { body, .. } => self.walk(scope, body, handled),
+            Expr::FString(parts, _) | Expr::Tuple(parts, _) | Expr::Array(parts, _) => {
+                for e in parts {
+                    self.walk(scope, e, handled)?;
+                }
+                Ok(())
+            }
+            Expr::Record(fields, _) => {
+                for (_, e) in fields {
+                    self.walk(scope, e, handled)?;
+                }
+                Ok(())
+            }
+            Expr::Return(Some(e), _) => self.walk(scope, e, handled),
+            // Leaves: nothing to walk.
+            Expr::Literal(..)
+            | Expr::Var(..)
+            | Expr::SelfRef(..)
+            | Expr::Break(..)
+            | Expr::Panic(..)
+            | Expr::Return(None, _) => Ok(()),
+        }
+    }
+}
+
+/// Reject ambient nondeterministic/externally-visible effects inside durable
+/// `workflow` step bodies. Called from `EffectChecker::check_module` after
+/// per-decl checking so function rows are fully registered.
+fn check_durable_determinism(decls: &[&Decl]) -> NuResult<()> {
+    DurableEffectWalker::new(decls).check(decls)
 }
 
 impl Default for EffectChecker {
@@ -2025,9 +2399,38 @@ impl CapabilityAnalyzer {
                 Ok(cap)
             }
 
-            // Handle: capability of the body (handlers don't change the value
-            // capability, only the effect row).
-            Expr::Handle { body, .. } => self.infer_cap_tracked(ctx, body, consumed),
+            // Handle: the body determines the value capability, but handler
+            // arms execute in the performer's scope *before* a resuming arm
+            // returns control to the body — so an arm may consume an outer
+            // linear binding that the resumed body then uses after move (and
+            // the deep-cloned continuation keeps the pre-perform registers
+            // alive across all of it). Analyze each arm as an alternative
+            // path from the incoming consumption set (arm params shadow outer
+            // bindings, bound as `Ref`), then union every arm's consumptions
+            // into the body's set: after `handle`, any binding an arm may
+            // have consumed is treated as moved. This also satisfies the
+            // exactly-once obligation for bindings used only inside arms —
+            // previously arms were never walked, so a `g(x)` in an arm plus a
+            // `g(x)` after `resume` both passed.
+            Expr::Handle { body, handlers, .. } => {
+                let base = consumed.clone();
+                for h in handlers {
+                    let mut arm_consumed = base.clone();
+                    let arm_ctx = ctx.with_bindings(
+                        &h.params
+                            .iter()
+                            .map(|p| (p.clone(), Capability::Ref))
+                            .collect::<Vec<_>>(),
+                    );
+                    self.infer_cap_tracked(&arm_ctx, &h.body, &mut arm_consumed)?;
+                    for name in arm_consumed {
+                        if !base.contains(&name) {
+                            consumed.insert(name);
+                        }
+                    }
+                }
+                self.infer_cap_tracked(ctx, body, consumed)
+            }
 
             // Migrate: returns Unit (Val).
             Expr::Migrate { actor, node, .. } => {
@@ -2657,6 +3060,7 @@ mod tests {
             positional_args: None,
             register_as: None,
             target_node: None,
+            capabilities: vec![],
             span: s(),
         };
         let row = checker.infer_effects(&ctx, &spawn).unwrap();
@@ -2902,6 +3306,7 @@ mod tests {
             positional_args: None,
             register_as: None,
             target_node: None,
+            capabilities: vec![],
             span: s(),
         };
         let cap = analyzer.infer_cap(&ctx, &spawn).unwrap();
@@ -3364,6 +3769,165 @@ mod tests {
             cap: Capability::LinearIso,
             span: s(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // LinearIso consumption across handle/resume boundaries
+    // -----------------------------------------------------------------------
+
+    fn perform0(effect: &str, op: &str) -> Expr {
+        Expr::Perform {
+            effect: effect.to_string(),
+            op: op.to_string(),
+            args: vec![],
+            span: s(),
+        }
+    }
+
+    fn handle1(body: Expr, effect: &str, op: &str, arm_body: Expr, resume: bool) -> Expr {
+        Expr::Handle {
+            body: Box::new(body),
+            handlers: vec![EffectHandler {
+                effect_name: effect.to_string(),
+                op_name: op.to_string(),
+                params: vec![],
+                body: arm_body,
+                resume,
+            }],
+            span: s(),
+        }
+    }
+
+    #[test]
+    fn test_handle_arm_and_body_use_rejected() {
+        // A linear value consumed in a handler arm and again in the resumed
+        // body is a use-after-move: the arm runs first (consuming the value),
+        // then resume() continues the body with the value already moved. The
+        // deep-cloned continuation keeps the pre-perform registers alive
+        // across both, so the analyzer must see both uses against one
+        // consumption set. Pre-fix, arms were never walked and this compiled.
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new().with_binding("x", Capability::LinearIso);
+        let expr = handle1(
+            Expr::Block {
+                exprs: vec![perform0("E", "tick"), call1("g", lvar("x"))],
+                span: s(),
+            },
+            "E",
+            "tick",
+            call1("g", lvar("x")),
+            true,
+        );
+        let result = analyzer.infer_cap(&ctx, &expr);
+        match result {
+            Err(NuError::CapError { msg, .. }) => assert!(
+                msg.contains("used after being consumed"),
+                "expected use-after-consumed error, got: {}",
+                msg
+            ),
+            other => panic!("expected CapError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handle_arm_only_use_satisfies_must_use() {
+        // A linear value used ONLY inside a handler arm was previously
+        // reported as "never used" (arms were invisible to the analyzer).
+        // The arm is a real consumption site and must count.
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new().with_binding("x", Capability::LinearIso);
+        let expr = handle1(
+            Expr::Block {
+                exprs: vec![perform0("E", "tick")],
+                span: s(),
+            },
+            "E",
+            "tick",
+            call1("g", lvar("x")),
+            true,
+        );
+        assert!(
+            analyzer.infer_cap(&ctx, &expr).is_ok(),
+            "arm-only use must satisfy the exactly-once obligation"
+        );
+        assert!(analyzer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_handle_multi_arm_alternatives_no_double_count() {
+        // Arms are mutually exclusive at runtime (exactly one matches a
+        // perform). Each arm is analyzed as an alternative path from the
+        // SAME incoming consumption set, so a value consumed in one arm does
+        // not poison the other.
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new().with_binding("x", Capability::LinearIso);
+        let expr = Expr::Handle {
+            body: Box::new(Expr::Block {
+                exprs: vec![perform0("E", "tick")],
+                span: s(),
+            }),
+            handlers: vec![
+                EffectHandler {
+                    effect_name: "E".to_string(),
+                    op_name: "tick".to_string(),
+                    params: vec![],
+                    body: call1("g", lvar("x")),
+                    resume: true,
+                },
+                EffectHandler {
+                    effect_name: "E".to_string(),
+                    op_name: "tock".to_string(),
+                    params: vec![],
+                    body: Expr::Literal(Literal::Unit, s()),
+                    resume: true,
+                },
+            ],
+            span: s(),
+        };
+        assert!(
+            analyzer.infer_cap(&ctx, &expr).is_ok(),
+            "arms are alternatives; one arm's consumption must not count against another"
+        );
+        assert!(analyzer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_handle_arm_param_shadows_outer_linear() {
+        // An arm parameter shadowing an outer linear binding binds as a
+        // fresh `Ref` value: uses of the name inside the arm consume the
+        // parameter, not the outer linear binding (so they are not limited
+        // to at-most-once), while the outer binding's own obligation is
+        // unaffected.
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new().with_binding("x", Capability::LinearIso);
+        let handle_expr = Expr::Handle {
+            body: Box::new(Expr::Block {
+                exprs: vec![perform0("E", "tick")],
+                span: s(),
+            }),
+            handlers: vec![EffectHandler {
+                effect_name: "E".to_string(),
+                op_name: "tick".to_string(),
+                params: vec!["x".to_string()],
+                // Uses the shadowing param twice — legal for Ref, and must
+                // NOT be attributed to the outer LinearIso binding.
+                body: Expr::Block {
+                    exprs: vec![call1("g", lvar("x")), call1("h", lvar("x"))],
+                    span: s(),
+                },
+                resume: true,
+            }],
+            span: s(),
+        };
+        let expr = Expr::Block {
+            exprs: vec![handle_expr, call1("f", lvar("x"))],
+            span: s(),
+        };
+        assert!(
+            analyzer.infer_cap(&ctx, &expr).is_ok(),
+            "shadowed param uses must not consume the outer linear binding"
+        );
+        assert!(analyzer.diagnostics.is_empty());
     }
 
     #[test]
@@ -4199,6 +4763,169 @@ mod tests {
         assert!(checker.check_module(&ast.decls).is_ok());
         assert_eq!(checker.diagnostics.len(), 1);
         assert!(checker.diagnostics[0].contains("`workflow` declaration 'W' is deprecated"));
+    }
+
+    #[test]
+    fn test_durable_step_rejects_ambient_time() {
+        // A step suspended on a signal/LLM wait is re-run from its start
+        // after a crash; ambient Time.now* would yield a different value on
+        // the re-run. Must be a hard error, not a diagnostic.
+        let ast = parse_module(
+            r#"
+            workflow W {
+                step a { perform Time.now_ms() }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        let err = checker
+            .check_module(&ast.decls)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("effect 'Time.now_ms' is not allowed in durable replay surfaces"),
+            "ambient Time in a durable step must be rejected, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_durable_step_rejects_ambient_effect_via_helper_fn() {
+        // Interprocedural: a step calling a module function that performs an
+        // ambient effect is rejected exactly as if the perform were inlined.
+        let ast = parse_module(
+            r#"
+            fn now() { perform Time.now_ms() }
+            workflow W {
+                step a { now() }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        let err = checker
+            .check_module(&ast.decls)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("effect 'Time.now_ms' is not allowed in durable replay surfaces"),
+            "ambient Time via a helper fn must be rejected, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_durable_persistent_actor_behavior_rejects_ambient_time() {
+        // A persistent actor's behavior body re-runs on recovery replay;
+        // an ambient perform diverges exactly as in a workflow step.
+        let ast = parse_module(
+            r#"
+            persistent actor A {
+                state count: Int = 0
+                behavior tick() { perform Time.now_ms() }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        let err = checker
+            .check_module(&ast.decls)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("behavior 'tick' of persistent actor 'A'")
+                && err.contains("effect 'Time.now_ms' is not allowed in durable replay surfaces"),
+            "ambient Time in a persistent actor behavior must be rejected, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_durable_entity_apply_rejects_ambient_rand() {
+        // Entity apply handlers replay to rebuild state; ambient effects
+        // there diverge from the journaled event stream.
+        let ast = parse_module(
+            r#"
+            entity E {
+                state balance: Int = 0
+                events
+                    | Deposited(amount: Int)
+                apply
+                    | Deposited(amount) => perform Rand.int()
+                behavior get() { self.balance }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        let err = checker
+            .check_module(&ast.decls)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("apply handler 'Deposited' of entity 'E'")
+                && err.contains("effect 'Rand.int' is not allowed in durable replay surfaces"),
+            "ambient Rand in an entity apply handler must be rejected, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_nonpersistent_actor_behavior_allows_ambient_time() {
+        // Ordinary (non-persistent, non-entity) actors do not replay, so
+        // ambient effects stay legal there.
+        let ast = parse_module(
+            r#"
+            actor A {
+                state count: Int = 0
+                behavior tick() { perform Time.now_ms() }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_ok(),
+            "ambient Time in an ordinary actor must stay legal"
+        );
+    }
+
+    #[test]
+    fn test_durable_step_allows_sleep_handled_and_llm() {
+        // Timer.sleep is journaled and re-armed on recovery; a user handler
+        // intercepts the perform; LLM.ask is re-run by design. All three must
+        // pass the gate.
+        let ast = parse_module(
+            r#"
+            workflow W {
+                step a { perform Timer.sleep(1) }
+                step b { handle perform Time.now_ms() with { | Time.now_ms() => 42 } }
+                step c { perform LLM.ask("model", "prompt") }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_ok(),
+            "sleep, user-handled performs, and LLM.ask are allowed in durable steps"
+        );
+    }
+
+    #[test]
+    fn test_durable_gate_ignores_non_workflow_fns() {
+        // The gate is scoped to workflow step bodies; ordinary functions keep
+        // ambient effects.
+        let ast = parse_module(
+            r#"
+            fn now() { perform Time.now_ms() }
+            fn main() { now() }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_ok(),
+            "non-workflow functions must not be subject to the durable gate"
+        );
     }
 
     #[test]

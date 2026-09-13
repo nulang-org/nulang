@@ -1,0 +1,47 @@
+name: Capacity Core
+
+on:
+  pull_request:
+    paths:
+      - "crates/nulang-capacity/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/capacity.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/nulang-capacity/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/capacity.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  capacity:
+    name: Format, Check, Test & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --package nulang-capacity -- --check
+
+      - name: Check
+        run: cargo check -p nulang-capacity --all-targets
+
+      - name: Test
+        run: cargo test -p nulang-capacity
+
+      - name: Clippy
+        run: cargo clippy -p nulang-capacity --all-targets -- -D warnings

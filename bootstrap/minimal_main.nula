@@ -1,0 +1,9 @@
+fn compile(s: String) -> String {
+    perform IO.print("compiling " + s);
+    s
+}
+
+fn main() -> String {
+    let input = perform IO.read();
+    if input == "" then compile("default") else compile(input)
+}

@@ -1,0 +1,5 @@
+fn f(x: Int) -> Int { x + 1 }
+fn g(x: Int) -> Int { x * 2 }
+fn h(x: Int, y: Int) -> Int { f(g(x))(y) }
+fn test(c: Int) -> Int { if c == 44 then (let a = f(g(c)) in let b = h(a)(c) in let d = b >> 1 in let e = d + 1 in if e > 0 then f(e) else g(e)) else 0 }
+test(44)

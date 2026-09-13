@@ -2519,6 +2519,76 @@ impl VM {
         self.debug_hook = hook;
     }
 
+    /// Read the elements of a heap-allocated array value.
+    pub fn array_elements(&self, v: Value) -> Option<Vec<Value>> {
+        let ptr = v.as_ptr()?;
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag != HeapTypeTag::Array {
+                return None;
+            }
+            let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+            let len = payload_size / std::mem::size_of::<Value>();
+            let slots = std::slice::from_raw_parts(ptr as *const Value, len);
+            Some(slots.to_vec())
+        }
+    }
+
+    /// Read the elements of a heap-allocated tuple value.
+    pub fn tuple_elements(&self, v: Value) -> Option<Vec<Value>> {
+        let ptr = v.as_ptr()?;
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag != HeapTypeTag::Tuple {
+                return None;
+            }
+            let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+            let len = payload_size / std::mem::size_of::<Value>();
+            let slots = std::slice::from_raw_parts(ptr as *const Value, len);
+            Some(slots.to_vec())
+        }
+    }
+
+    /// Read the field values of a heap-allocated record value. Field names
+    /// are not stored on the heap; they must be recovered from the type
+    /// checker or from a separate name-to-index map.
+    pub fn record_field_values(&self, v: Value) -> Option<Vec<Value>> {
+        let ptr = v.as_ptr()?;
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag != HeapTypeTag::Record {
+                return None;
+            }
+            let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+            let len = payload_size / std::mem::size_of::<Value>();
+            let slots = std::slice::from_raw_parts(ptr as *const Value, len);
+            Some(slots.to_vec())
+        }
+    }
+
+    /// Return the UTF-8 bytes of a string value, whether it is an interned
+    /// string constant or a heap-allocated C string.
+    pub fn string_bytes(&self, v: Value) -> Option<Vec<u8>> {
+        if let Some(id) = v.as_string_id() {
+            let module_idx = self.modules.len().saturating_sub(1);
+            return self.modules.get(module_idx).and_then(|m| {
+                m.constants.get(id as usize).and_then(|c| match c {
+                    Constant::String(s) => Some(s.clone().into_bytes()),
+                    _ => None,
+                })
+            });
+        }
+        let ptr = v.as_ptr()?;
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag == HeapTypeTag::String {
+                Some(CStr::from_ptr(ptr as *const c_char).to_bytes().to_vec())
+            } else {
+                None
+            }
+        }
+    }
+
     /// Route `Print`/`SPrint`/`IO.print` output into `buf` instead of stdout
     /// (used by the DAP server to forward program output as `output` events
     /// without corrupting the DAP stream). `None` restores normal printing.
@@ -3084,6 +3154,35 @@ impl VM {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Call a top-level function in a loaded module by its bytecode offset.
+    ///
+    /// The first `args.len()` registers (r0..) receive the supplied arguments,
+    /// matching the MIR calling convention. Execution runs until the function
+    /// returns, halts, or errors; the value in register 0 is returned.
+    pub fn call_function(
+        &mut self,
+        module_idx: usize,
+        code_offset: usize,
+        args: &[Value],
+    ) -> NuResult<Value> {
+        if args.len() > 12 {
+            return Err(NuError::VMError {
+                msg: format!("call_function: too many arguments ({}, max 12)", args.len()),
+                span: Span::default(),
+            });
+        }
+        self.yield_pending = false;
+        self.frames.clear();
+        self.current_frame_idx = Some(0);
+        let mut frame = Frame::new(None, module_idx);
+        frame.pc = code_offset;
+        for (i, arg) in args.iter().enumerate() {
+            frame.regs[i] = *arg;
+        }
+        self.frames.push(frame);
+        self.run_from(module_idx, code_offset)
     }
 
     /// Resume a previously suspended execution.

@@ -270,13 +270,34 @@ impl WasmRuntime {
 // ── Host import functions ────────────────────────────────────────────
 
 /// `env.io_print(offset: i32, len: i32) -> i64`
+///
+/// The guest currently passes `len = 0` for every print (see
+/// `compile_perform` in `mir_wasm.rs`), relying on the host to read the
+/// null-terminated string at `offset` — the same convention as
+/// `resolve_string`. A zero length therefore means "scan to NUL", not
+/// "empty string"; before this fallback the slice `data[off..off]` made
+/// every `IO.print` a silent no-op on the WASM backend.
 fn host_print(mut caller: Caller<'_, HostState>, offset: i32, len: i32) -> Result<i64, Error> {
     let mem = get_memory(&mut caller)?;
     let data = mem.data(&caller);
     let off = offset as usize;
-    let end = std::cmp::min(off + len as usize, data.len());
+    if off > data.len() {
+        return Ok(value_layout::TAG_UNIT as i64);
+    }
+    let end = if len > 0 {
+        std::cmp::min(off + len as usize, data.len())
+    } else {
+        data[off..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|nul| off + nul)
+            .unwrap_or(data.len())
+    };
     let text = String::from_utf8_lossy(&data[off..end]);
-    print!("{}", text);
+    // Interpreter parity (runtime/callbacks.rs): both `IO.print` and
+    // `IO.println` emit a trailing newline, and the guest lowers both ops
+    // to this same import.
+    println!("{}", text);
     Ok(value_layout::TAG_UNIT as i64)
 }
 

@@ -1,15 +1,11 @@
 //! Shared type definitions used across all Nulang compiler and runtime modules.
 
 use crate::type_ir::NtirNode;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-// Fast hashing for compiler-internal maps (keys are not attacker-controlled).
-type FxHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
-type FxHashSet<T> =
-    std::collections::HashSet<T, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 // ---------------------------------------------------------------------------
 // Type Variables & Regions
@@ -558,6 +554,226 @@ impl std::fmt::Display for Type {
             }
             Type::Nominal { name, .. } => write!(f, "{}", name),
             Type::Skolem(id) => write!(f, "'t{}", id),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical type encoding (content hashing)
+// ---------------------------------------------------------------------------
+
+/// Append the canonical structural encoding of `ty` to `out`.
+///
+/// The encoding is deterministic and free of compiler-internal
+/// presentation: record fields are sorted by name (matching
+/// `unify_closed_records`, which treats records as
+/// field-order-insensitive), effect rows are sorted (they are sets),
+/// and every node carries an explicit tag with length-prefixed
+/// strings. Two structurally equal types always encode to identical
+/// bytes regardless of source field order or inference state.
+///
+/// This is intentionally NOT `Type::to_ntir`: NTIR erases information
+/// (type variables and skolems become `Unit`, function effect rows are
+/// dropped, `Nil`/`Never`/`Address` collapse to one code, nominal
+/// wrappers vanish). Those erasures are fine for the typechecker's
+/// fast-path equality probe, which still has full `mgu` as backstop —
+/// but a content hash has no backstop, so colliding distinct
+/// signatures would let mismatched behavior code run silently.
+pub fn write_canonical_type(ty: &Type, out: &mut Vec<u8>) {
+    fn write_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+    match ty {
+        Type::Var(v) => {
+            out.push(0x00);
+            out.extend_from_slice(&v.0.to_le_bytes());
+        }
+        Type::Primitive(p) => {
+            out.push(0x01);
+            out.push(match p {
+                PrimitiveType::Int => 0,
+                PrimitiveType::Float => 1,
+                PrimitiveType::Bool => 2,
+                PrimitiveType::String => 3,
+                PrimitiveType::Nil => 4,
+                PrimitiveType::Unit => 5,
+                PrimitiveType::Never => 6,
+                PrimitiveType::Address => 7,
+            });
+        }
+        Type::Tuple(ts) => {
+            out.push(0x02);
+            out.extend_from_slice(&(ts.len() as u32).to_le_bytes());
+            for t in ts {
+                write_canonical_type(t, out);
+            }
+        }
+        Type::Record(fields) => {
+            out.push(0x03);
+            // Records unify field-order-insensitively, so sort.
+            let mut sorted: Vec<&(String, Type)> = fields.iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+            for (name, t) in sorted {
+                write_str(out, name);
+                write_canonical_type(t, out);
+            }
+        }
+        Type::Variant(cases) => {
+            out.push(0x04);
+            // Constructor order is semantically significant; keep it.
+            out.extend_from_slice(&(cases.len() as u32).to_le_bytes());
+            for (name, t) in cases {
+                write_str(out, name);
+                match t {
+                    Some(t) => {
+                        out.push(1);
+                        write_canonical_type(t, out);
+                    }
+                    None => out.push(0),
+                }
+            }
+        }
+        Type::Array(t) => {
+            out.push(0x05);
+            write_canonical_type(t, out);
+        }
+        Type::Function {
+            param,
+            ret,
+            effect,
+            cap,
+        } => {
+            out.push(0x06);
+            write_canonical_type(param, out);
+            write_canonical_type(ret, out);
+            write_canonical_effect_row(effect, out);
+            out.push(canonical_cap_code(cap));
+        }
+        Type::Actor { state, behavior } => {
+            out.push(0x07);
+            write_canonical_type(state, out);
+            write_canonical_type(behavior, out);
+        }
+        Type::App { constructor, args } => {
+            out.push(0x08);
+            write_canonical_type(constructor, out);
+            out.extend_from_slice(&(args.len() as u32).to_le_bytes());
+            for a in args {
+                write_canonical_type(a, out);
+            }
+        }
+        Type::Reference { cap, inner } => {
+            out.push(0x09);
+            out.push(canonical_cap_code(cap));
+            write_canonical_type(inner, out);
+        }
+        Type::Scheme { vars, body } => {
+            out.push(0x0A);
+            out.extend_from_slice(&(vars.len() as u32).to_le_bytes());
+            for v in vars {
+                out.extend_from_slice(&v.0.to_le_bytes());
+            }
+            write_canonical_type(body, out);
+        }
+        Type::Nominal { name, underlying } => {
+            out.push(0x0B);
+            write_str(out, name);
+            write_canonical_type(underlying, out);
+        }
+        Type::Skolem(id) => {
+            out.push(0x0C);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+}
+
+/// Convenience wrapper around [`write_canonical_type`].
+pub fn canonical_type_bytes(ty: &Type) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_canonical_type(ty, &mut out);
+    out
+}
+
+/// Stable capability codes for the canonical type encoding. Explicit
+/// match arms (not `as u8`) keep the wire-stable values pinned even if
+/// the enum declaration order changes.
+pub fn canonical_cap_code(cap: &Capability) -> u8 {
+    match cap {
+        Capability::LinearIso => 0,
+        Capability::Linear => 1,
+        Capability::Iso => 2,
+        Capability::Trn => 3,
+        Capability::Ref => 4,
+        Capability::Val => 5,
+        Capability::Box => 6,
+        Capability::Tag => 7,
+    }
+}
+
+fn write_canonical_effect_row(row: &EffectRow, out: &mut Vec<u8>) {
+    fn effect_code(e: &Effect) -> u8 {
+        match e {
+            Effect::IO => 0,
+            Effect::Net => 1,
+            Effect::String => 2,
+            Effect::FS => 3,
+            Effect::Rand => 4,
+            Effect::Time => 5,
+            Effect::Spawn => 6,
+            Effect::Send => 7,
+            Effect::Receive => 8,
+            Effect::Migrate => 9,
+            Effect::STM => 10,
+            Effect::Async => 11,
+            Effect::Inference => 12,
+            Effect::Cost => 13,
+            Effect::Event => 14,
+            Effect::Array => 15,
+            Effect::FFI => 16,
+            Effect::Test => 17,
+            Effect::DB => 18,
+            Effect::Python => 19,
+            Effect::Env => 20,
+            Effect::Process => 21,
+            Effect::System => 22,
+            Effect::Render => 23,
+            Effect::Request => 24,
+            Effect::Respond => 25,
+            Effect::Realtime => 26,
+            Effect::Client => 27,
+            Effect::Web => 28,
+            Effect::UserDefined(_) => 29,
+        }
+    }
+    fn write_effect(e: &Effect, out: &mut Vec<u8>) {
+        out.push(effect_code(e));
+        if let Effect::UserDefined(name) = e {
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+    }
+    match row {
+        EffectRow::Closed(effects) => {
+            out.push(0x00);
+            // Effect rows are sets; sort for a canonical form.
+            let mut sorted: Vec<&Effect> = effects.iter().collect();
+            sorted.sort();
+            out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+            for e in sorted {
+                write_effect(e, out);
+            }
+        }
+        EffectRow::Open(effects, region) => {
+            out.push(0x01);
+            let mut sorted: Vec<&Effect> = effects.iter().collect();
+            sorted.sort();
+            out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+            for e in sorted {
+                write_effect(e, out);
+            }
+            out.extend_from_slice(&region.0.to_le_bytes());
         }
     }
 }
@@ -1581,302 +1797,6 @@ impl NuError {
     pub fn ffi_error(msg: String, span: Span) -> Self {
         NuError::FFIError { msg, span }
     }
-    /// Produce a colorized, multi-line error message with source excerpts and
-    /// carets. Uses ANSI escape codes; callers should gate on `is_terminal()`
-    /// if they support plain-text fallback.
-    pub fn format_rich(&self) -> String {
-        // ANSI helpers
-        const RED: &str = "\x1b[1;31m";
-        const CYAN: &str = "\x1b[36m";
-        const BLUE: &str = "\x1b[34m";
-        const BOLD: &str = "\x1b[1m";
-        const RESET: &str = "\x1b[0m";
-        const DIM: &str = "\x1b[2m";
-        const GREEN: &str = "\x1b[32m";
-        const YELLOW: &str = "\x1b[33m";
-
-        let mut out = String::new();
-
-        /// Push a spanned error header + source excerpt + caret into `out`.
-        fn push_span_error(
-            out: &mut String,
-            kind: &str,
-            msg: &str,
-            span: &Span,
-            code: Option<&str>,
-            suggestion: Option<&str>,
-            extra_lines: &[String],
-        ) {
-            let line = span.line();
-            let col = span.column();
-            let file = span.file().unwrap_or_default();
-
-            // Header with error code
-            write_header(out, kind, line, col, &file, code);
-
-            // Source excerpt
-            if let Some(src_line) = span.source_line() {
-                let col_idx = col.saturating_sub(1).min(src_line.len());
-                let span_len = (span.end.saturating_sub(span.start) as usize)
-                    .max(1)
-                    .min(src_line.len().saturating_sub(col_idx));
-
-                let line_label = format!("{line}");
-                out.push_str(&format!("{DIM}{line_label:>4} {BLUE}|{RESET} "));
-                out.push_str(&src_line[..col_idx]);
-                out.push_str(RED);
-                let end = (col_idx + span_len).min(src_line.len());
-                out.push_str(&src_line[col_idx..end]);
-                out.push_str(RESET);
-                out.push_str(&src_line[end..]);
-                out.push('\n');
-
-                // Caret line
-                let padding = format!("{:>4} {BLUE}|{RESET} ", "");
-                out.push_str(&padding);
-                for _ in 0..col_idx {
-                    out.push(' ');
-                }
-                out.push_str(RED);
-                for _ in 0..span_len {
-                    out.push('^');
-                }
-                out.push(' ');
-                out.push_str(msg);
-                out.push_str(RESET);
-                out.push('\n');
-            } else {
-                out.push_str(&format!("  {msg}\n"));
-            }
-
-            // Extra diagnostic lines (expected/found types, missing effects, etc.)
-            for extra in extra_lines {
-                let padding = format!("{:>4} {BLUE}|{RESET} ", "");
-                out.push_str(&padding);
-                out.push_str(extra);
-                out.push('\n');
-            }
-
-            // Suggestion
-            if let Some(s) = suggestion {
-                out.push_str(&format!("{BLUE}help:{RESET} {s}\n"));
-            }
-        }
-
-        fn write_header(
-            out: &mut String,
-            kind: &str,
-            line: usize,
-            col: usize,
-            file: &str,
-            code: Option<&str>,
-        ) {
-            let code_str = code.map(|c| format!("[{c}]")).unwrap_or_default();
-            out.push_str(&format!(
-                "{RED}error{code_str}{RESET}{BOLD}: {kind}{RESET}\n"
-            ));
-            if file.is_empty() {
-                out.push_str(&format!("  {BLUE}--> {RESET}{line}:{col}\n"));
-            } else {
-                out.push_str(&format!("  {BLUE}--> {RESET}{file}:{line}:{col}\n"));
-            }
-            out.push_str(&format!(" {DIM}{line:>4} {CYAN}|{RESET}\n"));
-        }
-
-        let code = self.stable_code();
-
-        match self {
-            NuError::LexError { msg, span } => {
-                push_span_error(
-                    &mut out,
-                    "Lex error",
-                    msg,
-                    span,
-                    code,
-                    self.suggestion(),
-                    &[],
-                );
-            }
-            NuError::ParseError {
-                msg,
-                span,
-                expected,
-                found,
-            } => {
-                let mut extras = Vec::new();
-                if let Some(exp) = expected {
-                    extras.push(format!("{GREEN}expected:{RESET} {exp}"));
-                }
-                if let Some(fnd) = found {
-                    extras.push(format!("{YELLOW}found:{RESET} {fnd}"));
-                }
-                push_span_error(
-                    &mut out,
-                    "Parse error",
-                    msg,
-                    span,
-                    code,
-                    self.suggestion(),
-                    &extras,
-                );
-            }
-            NuError::TypeError {
-                msg,
-                span,
-                expected_type,
-                found_type,
-                similar_names,
-            } => {
-                let mut extras = Vec::new();
-                if let Some(exp) = expected_type {
-                    extras.push(format!("{GREEN}expected type:{RESET} {exp}"));
-                }
-                if let Some(fnd) = found_type {
-                    extras.push(format!("{YELLOW}found type:{RESET} {fnd}"));
-                }
-                if let Some(names) = similar_names {
-                    if !names.is_empty() {
-                        extras.push(format!("{BLUE}did you mean:{RESET} {}?", names.join(", ")));
-                    }
-                }
-                push_span_error(
-                    &mut out,
-                    "Type error",
-                    msg,
-                    span,
-                    code,
-                    self.suggestion(),
-                    &extras,
-                );
-            }
-            NuError::EffectError {
-                msg,
-                span,
-                missing_effects,
-                allowed_effects,
-            } => {
-                let mut extras = Vec::new();
-                if let Some(missing) = missing_effects {
-                    if !missing.is_empty() {
-                        extras.push(format!(
-                            "{RED}missing effects:{RESET} {}",
-                            missing.join(", ")
-                        ));
-                    }
-                }
-                if let Some(allowed) = allowed_effects {
-                    extras.push(format!("{GREEN}allowed effects:{RESET} {allowed}"));
-                }
-                push_span_error(
-                    &mut out,
-                    "Effect error",
-                    msg,
-                    span,
-                    code,
-                    self.suggestion(),
-                    &extras,
-                );
-            }
-            NuError::CapError {
-                msg,
-                span,
-                explanation,
-            } => {
-                let mut extras = Vec::new();
-                if let Some(expl) = explanation {
-                    extras.push(format!("{BLUE}note:{RESET} {expl}"));
-                }
-                push_span_error(
-                    &mut out,
-                    "Capability error",
-                    msg,
-                    span,
-                    code,
-                    self.suggestion(),
-                    &extras,
-                );
-            }
-            NuError::FFIError { msg, span } => {
-                push_span_error(
-                    &mut out,
-                    "FFI error",
-                    msg,
-                    span,
-                    code,
-                    self.suggestion(),
-                    &[],
-                );
-            }
-            NuError::NotYetImplemented { feature, span } => {
-                push_span_error(
-                    &mut out,
-                    "Not yet implemented",
-                    feature,
-                    span,
-                    code,
-                    self.suggestion(),
-                    &[],
-                );
-            }
-            NuError::RuntimeError { msg, span } => {
-                push_span_error(
-                    &mut out,
-                    "Runtime error",
-                    msg,
-                    span,
-                    code,
-                    self.suggestion(),
-                    &[],
-                );
-            }
-            NuError::VMError { msg, span } => {
-                push_span_error(
-                    &mut out,
-                    "VM error",
-                    msg,
-                    span,
-                    code,
-                    self.suggestion(),
-                    &[],
-                );
-            }
-            NuError::Suspended(kind) => {
-                out.push_str(&format!(
-                    "{BLUE}info{RESET}{BOLD}: VM suspended ({kind}){RESET}\n"
-                ));
-            }
-            NuError::PythonError { msg, span } => {
-                push_span_error(
-                    &mut out,
-                    "Python error",
-                    msg,
-                    span,
-                    code,
-                    self.suggestion(),
-                    &[],
-                );
-            }
-            NuError::PackageError { msg, span } => {
-                push_span_error(
-                    &mut out,
-                    "Package error",
-                    msg,
-                    span,
-                    code,
-                    self.suggestion(),
-                    &[],
-                );
-            }
-            NuError::Multiple(errors) => {
-                for err in errors {
-                    out.push_str(&err.format_rich());
-                    out.push('\n');
-                }
-            }
-        }
-        out
-    }
-
     /// Return the canonical error code for this error, preferring structured
     /// fields over message-pattern heuristics.
     pub fn error_code(&self) -> Option<ErrorCode> {
@@ -2333,8 +2253,8 @@ mod tests {
     // expected/found/suggestion fields, not just the free-text `msg`.
     // These are unit-level companions to the end-to-end
     // `structerr_*` conformance cases, which verify the same
-    // populated fields reach the real error output through
-    // `format_rich`/`Display`.
+    // populated fields reach the real error output through `Display` and
+    // the rich diagnostic renderer in `crate::diagnostic`.
     // -----------------------------------------------------------------
 
     #[test]
@@ -2523,5 +2443,99 @@ mod tests {
     #[test]
     fn test_linear_subtype_of_val() {
         assert!(Capability::Linear.is_subtype_of(Capability::Val));
+    }
+
+    // -----------------------------------------------------------------
+    // Canonical type encoding (content hashing)
+    // -----------------------------------------------------------------
+
+    fn prim(p: PrimitiveType) -> Type {
+        Type::Primitive(p)
+    }
+
+    fn fn_type(effect: EffectRow) -> Type {
+        Type::Function {
+            param: Box::new(prim(PrimitiveType::Int)),
+            ret: Box::new(prim(PrimitiveType::Int)),
+            effect,
+            cap: Capability::Ref,
+        }
+    }
+
+    #[test]
+    fn test_canonical_type_record_field_order_invariant() {
+        // Records unify field-order-insensitively (unify_closed_records
+        // sorts by name), so the canonical encoding must too.
+        let a = Type::Record(vec![
+            ("x".to_string(), prim(PrimitiveType::Int)),
+            ("y".to_string(), prim(PrimitiveType::String)),
+        ]);
+        let b = Type::Record(vec![
+            ("y".to_string(), prim(PrimitiveType::String)),
+            ("x".to_string(), prim(PrimitiveType::Int)),
+        ]);
+        assert_eq!(canonical_type_bytes(&a), canonical_type_bytes(&b));
+    }
+
+    #[test]
+    fn test_canonical_type_distinguishes_ntir_collapsed_types() {
+        // NTIR collapses Nil/Never/Address and drops effect rows; a
+        // content hash must not — these are distinct signatures.
+        assert_ne!(
+            canonical_type_bytes(&prim(PrimitiveType::Never)),
+            canonical_type_bytes(&prim(PrimitiveType::Unit))
+        );
+        assert_ne!(
+            canonical_type_bytes(&prim(PrimitiveType::Nil)),
+            canonical_type_bytes(&prim(PrimitiveType::Unit))
+        );
+        assert_ne!(
+            canonical_type_bytes(&fn_type(EffectRow::Closed(vec![Effect::IO]))),
+            canonical_type_bytes(&fn_type(EffectRow::Closed(vec![Effect::Send])))
+        );
+        // Tuple order is significant.
+        let t1 = Type::Tuple(vec![prim(PrimitiveType::Int), prim(PrimitiveType::String)]);
+        let t2 = Type::Tuple(vec![prim(PrimitiveType::String), prim(PrimitiveType::Int)]);
+        assert_ne!(canonical_type_bytes(&t1), canonical_type_bytes(&t2));
+    }
+
+    #[test]
+    fn test_canonical_type_effect_row_order_invariant() {
+        // Effect rows are sets; ordering must not affect the encoding.
+        let a = fn_type(EffectRow::Closed(vec![Effect::IO, Effect::Send]));
+        let b = fn_type(EffectRow::Closed(vec![Effect::Send, Effect::IO]));
+        assert_eq!(canonical_type_bytes(&a), canonical_type_bytes(&b));
+    }
+
+    #[test]
+    fn test_canonical_type_user_defined_effect_distinct() {
+        let a = fn_type(EffectRow::Closed(vec![Effect::UserDefined(
+            "a".to_string(),
+        )]));
+        let b = fn_type(EffectRow::Closed(vec![Effect::UserDefined(
+            "b".to_string(),
+        )]));
+        assert_ne!(canonical_type_bytes(&a), canonical_type_bytes(&b));
+    }
+
+    #[test]
+    fn test_canonical_type_deterministic_nested() {
+        let ty = Type::Record(vec![
+            (
+                "f".to_string(),
+                Type::Array(Box::new(Type::Variant(vec![
+                    ("Some".to_string(), Some(prim(PrimitiveType::Int))),
+                    ("None".to_string(), None),
+                ]))),
+            ),
+            (
+                "g".to_string(),
+                Type::Reference {
+                    cap: Capability::Iso,
+                    inner: Box::new(prim(PrimitiveType::String)),
+                },
+            ),
+        ]);
+        assert_eq!(canonical_type_bytes(&ty), canonical_type_bytes(&ty));
     }
 }

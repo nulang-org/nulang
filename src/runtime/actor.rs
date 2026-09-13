@@ -588,6 +588,26 @@ impl Actor {
             None => Value::nil(),
         }
     }
+
+    /// Allocate an array of `Value`s on the actor heap and return a pointer
+    /// value. Returns nil if allocation fails. Empty vectors allocate a zero-byte
+    /// array, which the VM treats as length 0.
+    pub fn allocate_array(&mut self, items: Vec<Value>) -> Value {
+        let len = items.len();
+        let size = len.checked_mul(std::mem::size_of::<Value>()).unwrap_or(0);
+        match self.heap.alloc(size, TypeTag::Array) {
+            Some(ptr) => {
+                unsafe {
+                    let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, len);
+                    for (i, item) in items.into_iter().enumerate() {
+                        slots[i] = item;
+                    }
+                }
+                Value::ptr(ptr)
+            }
+            None => Value::nil(),
+        }
+    }
 }
 
 #[cfg(test)]
