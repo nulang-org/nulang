@@ -1,0 +1,54 @@
+name: PR 169 changelog repair
+
+on:
+  push:
+    branches:
+      - fix/build-wasm-capabilities-clean
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/build-wasm-capabilities-clean
+          fetch-depth: 0
+
+      - name: Add package WASM capability parity changelog entry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('CHANGELOG.md')
+          s = p.read_text()
+          marker = '### Added since 1.0.0-frozen — 2026-09-11 (backend parity + durable determinism)\n'
+          entry = '''### Package/WASM capability parity — 2026-09-12\n- **Manifest capabilities preserved by `nula build-wasm`** (`src/package/commands.rs`):\n  package WASM AOT compilation now forwards manifest-declared capability flags\n  through the same canonical compiler argument builder used by deploy's optional\n  WASM tier, preserving default-deny capability semantics across build targets.\n\n'''
+          if entry in s:
+              raise SystemExit(0)
+          if marker not in s:
+              raise SystemExit('stable-tier changelog insertion marker changed')
+          p.write_text(s.replace(marker, entry + marker, 1))
+          PY
+          git diff --check
+
+      - name: Remove repair workflow and commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/pr169-changelog-repair.yml
+          git diff --check
+          git fetch origin fix/build-wasm-capabilities-clean
+          if [ "$(git rev-parse origin/fix/build-wasm-capabilities-clean)" != "$GITHUB_SHA" ]; then
+            echo 'branch advanced during changelog validation; refusing stale push'
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'docs(changelog): note build-wasm capability parity'
+          git push origin HEAD:fix/build-wasm-capabilities-clean
