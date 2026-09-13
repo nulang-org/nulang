@@ -17,28 +17,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Reassemble boundary patch
-        shell: bash
+      - name: Apply current-main mobile runtime boundary
         run: |
-          cat patches/mobile/v21-v22.part00 \
-              patches/mobile/v21-v22.part01 \
-              patches/mobile/v21-v22.part02 \
-              patches/mobile/v21-v22.part03 \
-              patches/mobile/v21-v22.part04 > /tmp/mobile-runtime-boundary.patch
-          echo "56f4fce9e2806750543e13e0067da9a16453f83c219363aa92149dc34d7b8ae7  /tmp/mobile-runtime-boundary.patch" | sha256sum -c -
-
-      - name: Preflight strict-context application
-        run: |
-          python3 patches/mobile/apply_strict_patch.py --check /tmp/mobile-runtime-boundary.patch
-          python3 patches/mobile/apply_strict_patch.py /tmp/mobile-runtime-boundary.patch
-          python3 patches/mobile/apply_strict_patch.py --check patches/mobile/v21-v22.compile-followup.patch
-          git reset --hard HEAD
-
-      - name: Apply mobile runtime boundary
-        run: |
-          python3 patches/mobile/apply_strict_patch.py /tmp/mobile-runtime-boundary.patch
-          python3 patches/mobile/apply_strict_patch.py patches/mobile/v21-v22.compile-followup.patch
+          python3 patches/mobile/apply_current.py
           chmod +x scripts/check_mobile_runtime_profile.sh
+          git diff --check
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -57,6 +40,9 @@ jobs:
       - name: Verify interpreter-only mobile profile
         run: bash scripts/check_mobile_runtime_profile.sh
 
+      - name: Preserve no-default all-targets build
+        run: cargo check --all-targets --no-default-features
+
       - name: Preserve default build
         run: cargo check --lib
 
@@ -67,14 +53,8 @@ jobs:
         if: github.event_name == 'push'
         shell: bash
         run: |
-          rm -f patches/mobile/v21-v22.part00 \
-                patches/mobile/v21-v22.part01 \
-                patches/mobile/v21-v22.part02 \
-                patches/mobile/v21-v22.part03 \
-                patches/mobile/v21-v22.part04 \
-                patches/mobile/v21-v22.compile-followup.patch \
-                patches/mobile/apply_strict_patch.py \
-                .github/workflows/mobile-runtime-boundary-integration.yml
+          rm -rf patches/mobile
+          rm -f .github/workflows/mobile-runtime-boundary-integration.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
