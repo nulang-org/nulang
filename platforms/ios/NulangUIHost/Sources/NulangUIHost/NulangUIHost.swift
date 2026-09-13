@@ -98,6 +98,17 @@ public final class NulangUIStore: ObservableObject {
     }
 }
 
+enum NulangUIRenderLimits {
+    /// SwiftUI view construction below this layer is recursive. Keep that
+    /// recursion bounded even though protocol validation intentionally accepts
+    /// much deeper acyclic documents using an iterative traversal.
+    static let maximumDepth = 256
+
+    static func allows(_ depth: Int) -> Bool {
+        depth < maximumDepth
+    }
+}
+
 public struct NulangUIRootView: View {
     @ObservedObject private var store: NulangUIStore
 
@@ -109,7 +120,7 @@ public struct NulangUIRootView: View {
         Group {
             if let document = store.document,
                let root = document.node(id: document.root) {
-                render(root, in: document)
+                render(root, in: document, depth: 0)
             } else if let error = store.lastError {
                 Text(error.localizedDescription)
                     .accessibilityIdentifier("nulang-ui-error")
@@ -120,7 +131,15 @@ public struct NulangUIRootView: View {
         }
     }
 
-    private func render(_ node: UiNode, in document: UiDocument) -> AnyView {
+    private func render(_ node: UiNode, in document: UiDocument, depth: Int) -> AnyView {
+        guard NulangUIRenderLimits.allows(depth) else {
+            return AnyView(
+                Text("Nulang UI render depth limit exceeded")
+                    .font(.caption)
+                    .accessibilityIdentifier("nulang-ui-depth-limit-\(node.id)")
+            )
+        }
+
         switch node.kind {
         case "column":
             return AnyView(
@@ -128,7 +147,7 @@ public struct NulangUIRootView: View {
                     alignment: horizontalAlignment(node.properties["alignment"]),
                     spacing: spacing(node.properties["spacing"])
                 ) {
-                    renderChildren(node, in: document)
+                    renderChildren(node, in: document, depth: depth)
                 }
             )
 
@@ -138,7 +157,7 @@ public struct NulangUIRootView: View {
                     alignment: verticalAlignment(node.properties["alignment"]),
                     spacing: spacing(node.properties["spacing"])
                 ) {
-                    renderChildren(node, in: document)
+                    renderChildren(node, in: document, depth: depth)
                 }
             )
 
@@ -178,10 +197,10 @@ public struct NulangUIRootView: View {
     }
 
     @ViewBuilder
-    private func renderChildren(_ node: UiNode, in document: UiDocument) -> some View {
+    private func renderChildren(_ node: UiNode, in document: UiDocument, depth: Int) -> some View {
         ForEach(node.children, id: \.self) { childId in
             if let child = document.node(id: childId) {
-                render(child, in: document)
+                render(child, in: document, depth: depth + 1)
             }
         }
     }
