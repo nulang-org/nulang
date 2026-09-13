@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "nulang_embed.h"
+#include "nulang_mobile_actions.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,12 +32,14 @@ typedef enum NulangMobileStatus {
     NULANG_MOBILE_CALLBACK_ERROR = 4,
     NULANG_MOBILE_ARTIFACT_ERROR = 5,
     NULANG_MOBILE_RUN_ERROR = 6,
-    NULANG_MOBILE_ALLOCATION_ERROR = 7
+    NULANG_MOBILE_ALLOCATION_ERROR = 7,
+    NULANG_MOBILE_ACTION_ERROR = 8
 } NulangMobileStatus;
 
 /*
  * Create one interpreter-only mobile runtime, register the semantic UI
- * callbacks, and load a frozen .nbc artifact.
+ * callbacks, load a frozen .nbc artifact, and construct the restricted
+ * client-action runtime from the same artifact bytes.
  *
  * The current native-function registry is process-global. Therefore v1
  * intentionally permits only one active NulangMobileApp per process.
@@ -60,7 +63,23 @@ NulangMobileStatus nulang_mobile_app_run(
     size_t error_len
 );
 
-/* Free the runtime and release the process-global bridge slot. */
+/*
+ * Execute one compiler-authorized nulang-action-invoke/1 request.
+ *
+ * On success, *out_result_json points to runtime-owned
+ * nulang-action-result/1 JSON. The caller must copy it before the next action
+ * invocation or before freeing the app. Calls must remain serialized with the
+ * other NulangMobileApp lifecycle methods.
+ */
+NulangMobileStatus nulang_mobile_app_invoke_action(
+    NulangMobileApp *app,
+    const char *request_json,
+    const char **out_result_json,
+    char *error,
+    size_t error_len
+);
+
+/* Free both runtimes and release the process-global bridge slot. */
 void nulang_mobile_app_free(NulangMobileApp *app);
 
 #ifdef __cplusplus
