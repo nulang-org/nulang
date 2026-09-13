@@ -250,7 +250,7 @@ impl WasmRuntime {
             }
         })?;
         guest_non_pointer_value(raw as u64)
-            .map_err(|msg| NuError::runtime_error(msg, Span::default()))
+            .map_err(|msg| NuError::runtime_error(msg.to_string(), Span::default()))
     }
 
     /// Resolve a tagged string `Value` (`TAG_STRING | offset`) to its text by
