@@ -1,0 +1,148 @@
+name: Raw Value Provenance Migration
+
+on:
+  push:
+    branches:
+      - integration/raw-value-provenance
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: integration/raw-value-provenance
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+
+      - name: Replay proven internal raw-constructor annotations
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin fix/value-safety-boundary
+          git diff ab0e61010409e2e70276e577c52e9232fa558a92 fe0aa2fdffc6dd50b240b1ae83d50a86b41c3556 -- \
+            src/aot/codegen.rs \
+            src/aot/mod.rs \
+            src/fuzz.rs \
+            src/integration_tests/mod.rs \
+            src/jit/runtime.rs \
+            src/jit/tests.rs \
+            src/jit/typed_compiler.rs \
+            src/main.rs \
+            src/python/marshal.rs \
+            > /tmp/raw-constructors.patch
+          git apply --3way /tmp/raw-constructors.patch
+
+      - name: Make core raw reconstruction compiler-enforced
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/vm.rs')
+          s = p.read_text()
+
+          old_raw = '''    /// Construct a Value from raw NaN-boxed bits.\n    ///\n    /// # Safety\n    /// The caller must ensure the bits form a valid tagged value.\n    pub fn from_raw(raw: u64) -> Self {\n        Value { raw }\n    }\n'''
+          new_raw = '''    /// Construct a `Value` from trusted raw NaN-boxed bits.\n    ///\n    /// # Safety\n    /// If `raw` has `TAG_PTR`, its payload must be a live pointer produced by\n    /// a Nulang host heap and remain valid for every use of the returned value.\n    /// Other tagged payloads must satisfy their tag-specific runtime invariants.\n    pub unsafe fn from_raw(raw: u64) -> Self {\n        Value { raw }\n    }\n'''
+          if old_raw not in s:
+              raise SystemExit('from_raw anchor changed')
+          s = s.replace(old_raw, new_raw, 1)
+
+          old_bits = '''    /// Construct a Value from raw NaN-boxed bits.\n    pub fn from_bits(raw: u64) -> Self {\n        Value { raw }\n    }\n'''
+          new_bits = '''    /// Construct a `Value` from trusted raw NaN-boxed bits.\n    ///\n    /// # Safety\n    /// Same contract as [`Value::from_raw`]: pointer-tagged bits must carry a\n    /// live Nulang host-heap pointer and every tag payload must satisfy its\n    /// runtime invariant.\n    pub unsafe fn from_bits(raw: u64) -> Self {\n        Value { raw }\n    }\n\n    /// Decode externally controlled raw bits without allowing them to mint a\n    /// process-local host heap pointer. Immediate tags and floats are safe to\n    /// transport as opaque values; `TAG_PTR` requires host provenance and is\n    /// therefore rejected at untrusted boundaries.\n    pub fn try_from_untrusted_bits(raw: u64) -> Result<Self, &'static str> {\n        if (raw & TAG_MASK) == TAG_PTR {\n            Err("pointer-tagged raw value has no Nulang host-heap provenance")\n        } else {\n            Ok(Value { raw })\n        }\n    }\n'''
+          if old_bits not in s:
+              raise SystemExit('from_bits anchor changed')
+          s = s.replace(old_bits, new_bits, 1)
+
+          s = s.replace(
+              'self.frames[frame_idx].regs[i] = Value::from_bits(*bits);',
+              'self.frames[frame_idx].regs[i] = unsafe { Value::from_bits(*bits) };',
+          )
+          s = s.replace(
+              'frame.regs[i] = Value::from_bits(bits);',
+              'frame.regs[i] = unsafe { Value::from_bits(bits) };',
+          )
+          p.write_text(s)
+
+          # C ABI and libffi are explicitly untrusted integer boundaries.
+          p = Path('src/ffi/c_api.rs')
+          s = p.read_text()
+          old = '    Ok(Value::from_bits(value.raw))\n'
+          new = '    Value::try_from_untrusted_bits(value.raw)\n'
+          if old not in s:
+              raise SystemExit('C ABI raw-value anchor changed')
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('src/ffi/marshal.rs')
+          s = p.read_text()
+          old = '    Ok(Value::from_bits(raw))\n'
+          new = '    Value::try_from_untrusted_bits(raw).map_err(str::to_string)\n'
+          if old not in s:
+              raise SystemExit('libffi raw-value anchor changed')
+          p.write_text(s.replace(old, new, 1))
+
+          # WASM helpers preserve guest-local pointer semantics, but guest bits
+          # may become host Values only through the safe external decoder.
+          p = Path('src/wasm_runtime.rs')
+          s = p.read_text()
+          old = '''    if value_layout::is_ptr_raw(raw) {\n        return Err("wasm guest pointer-tagged value has no host heap provenance");\n    }\n    Ok(crate::vm::Value::from_raw(raw))\n'''
+          new = '''    crate::vm::Value::try_from_untrusted_bits(raw)\n        .map_err(|_| "wasm guest pointer-tagged value has no host heap provenance")\n'''
+          if old not in s:
+              raise SystemExit('WASM guest decoder anchor changed')
+          s = s.replace(old, new, 1)
+          s = s.replace(
+              'crate::vm::Value::from_raw(raw).to_string_repr()',
+              'unsafe { crate::vm::Value::from_raw(raw) }.to_string_repr()',
+          )
+          p.write_text(s)
+
+          p = Path('src/wasmfx_runtime.rs')
+          s = p.read_text()
+          old = '''    if value_layout::is_ptr_raw(raw) {\n        return Err(NuError::VMError {\n            msg: "wasmfx guest returned a host pointer-tagged value".into(),\n            span: crate::types::Span::default(),\n        });\n    }\n    Ok(crate::vm::Value::from_raw(raw))\n'''
+          new = '''    crate::vm::Value::try_from_untrusted_bits(raw).map_err(|_| NuError::VMError {\n        msg: "wasmfx guest returned a host pointer-tagged value".into(),\n        span: crate::types::Span::default(),\n    })\n'''
+          if old not in s:
+              raise SystemExit('WasmFX guest decoder anchor changed')
+          p.write_text(s.replace(old, new, 1))
+
+          # Persistence resolves serialized object ids through obj_table before
+          # raw reconstruction. Remaining raw values are non-pointer/immediate
+          # or internally reconstructed closure tags.
+          p = Path('src/runtime/heap_serialize.rs')
+          s = p.read_text()
+          s = s.replace('Value::from_raw(raw)', 'unsafe { Value::from_raw(raw) }')
+          p.write_text(s)
+          PY
+
+      - name: Format and validate constructor migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.95.0 fmt --all
+          cargo +1.95.0 fmt --all -- --check
+          cargo +1.95.0 check --all-targets --no-default-features
+          cargo +1.95.0 check --all-targets
+          git diff --check
+
+      - name: Remove migration workflow and commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/raw-value-provenance-migrate.yml
+          git diff --check
+          git fetch origin integration/raw-value-provenance
+          if [ "$(git rev-parse origin/integration/raw-value-provenance)" != "$GITHUB_SHA" ]; then
+            echo 'integration branch advanced during validation; refusing stale push'
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix(runtime): enforce raw Value provenance boundaries'
+          git push origin HEAD:integration/raw-value-provenance
