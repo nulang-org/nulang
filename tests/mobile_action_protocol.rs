@@ -20,6 +20,23 @@ fn public_action_request_round_trips_explicit_snapshot_state() {
 }
 
 #[test]
+fn public_action_request_requires_idempotency_identity() {
+    let missing = r#"{"protocol":"nulang-action-invoke/1","handler":"task.complete","correlation_id":"corr-42"}"#;
+    assert!(matches!(
+        ClientActionRequest::from_json(missing),
+        Err(ClientActionProtocolError::InvalidRequestJson(_))
+    ));
+
+    let empty = ClientActionRequest::new("task.complete", "corr-42", "");
+    assert_eq!(
+        empty.validate(),
+        Err(ClientActionProtocolError::MissingField {
+            field: "idempotency_key"
+        })
+    );
+}
+
+#[test]
 fn public_action_result_reuses_versioned_ui_message_envelopes() {
     let result = ClientActionResult {
         protocol_version: CLIENT_ACTION_RESULT_PROTOCOL.to_string(),
