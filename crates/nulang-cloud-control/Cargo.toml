@@ -1,0 +1,19 @@
+[package]
+name = "nulang-cloud-control"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Control-plane contracts bridging Nulang artifact admission and capacity placement"
+
+# Keep this bridge out of the root workspace dependency graph. It depends on
+# both sides of the boundary while `nulang-capacity` remains runtime-agnostic.
+[workspace]
+
+[dependencies]
+nulang = { path = "../..", default-features = false }
+nulang-capacity = { path = "../nulang-capacity" }
+
+[dev-dependencies]
+flate2 = "1"
+futures = "0.3"
+tar = "0.4"

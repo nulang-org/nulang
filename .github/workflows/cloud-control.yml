@@ -1,0 +1,55 @@
+name: Cloud Control Contracts
+
+on:
+  pull_request:
+    paths:
+      - "crates/nulang-cloud-control/**"
+      - "crates/nulang-capacity/**"
+      - "src/admission_policy.rs"
+      - "src/deployment_audit.rs"
+      - "src/deployment_bundle.rs"
+      - "src/deployment_manifest.rs"
+      - ".github/workflows/cloud-control.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/nulang-cloud-control/**"
+      - "crates/nulang-capacity/**"
+      - "src/admission_policy.rs"
+      - "src/deployment_audit.rs"
+      - "src/deployment_bundle.rs"
+      - "src/deployment_manifest.rs"
+      - ".github/workflows/cloud-control.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  contracts:
+    name: Format, Check, Test & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/nulang-cloud-control
+
+      - name: Format
+        run: cargo fmt --manifest-path crates/nulang-cloud-control/Cargo.toml -- --check
+
+      - name: Check
+        run: cargo check --manifest-path crates/nulang-cloud-control/Cargo.toml --all-targets
+
+      - name: Test
+        run: cargo test --manifest-path crates/nulang-cloud-control/Cargo.toml
+
+      - name: Clippy
+        run: cargo clippy --manifest-path crates/nulang-cloud-control/Cargo.toml --all-targets -- -D warnings
