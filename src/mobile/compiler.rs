@@ -3,8 +3,9 @@
 //! Authorization is derived from semantic UI bindings, not from public
 //! exports, tools, or function naming. A handler is eligible only when the
 //! existing reactivity/effect analysis classifies its binding as `client`, its
-//! inferred type is the frozen `String -> String` reducer ABI, and codegen
-//! produced a concrete top-level function-table entry.
+//! effect row is actually known, its inferred type is the frozen
+//! `String -> String` reducer ABI, and codegen produced a concrete top-level
+//! function-table entry.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -21,6 +22,7 @@ use crate::web::reactivity::{analyze_module, ActionPlacement, GraphNode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientActionCompileError {
+    MissingEffectRow { handler: String },
     MissingInferredType { handler: String },
     InvalidReducerType { handler: String, found: String },
     MissingCompiledFunction { handler: String },
@@ -30,6 +32,10 @@ pub enum ClientActionCompileError {
 impl fmt::Display for ClientActionCompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingEffectRow { handler } => write!(
+                f,
+                "client action '{handler}' has no inferred effect row; refusing native authorization"
+            ),
             Self::MissingInferredType { handler } => write!(
                 f,
                 "client action '{handler}' has no inferred function type"
@@ -57,6 +63,8 @@ impl std::error::Error for ClientActionCompileError {}
 /// Repeated bindings to the same handler produce one allowlist entry. Server
 /// actions are intentionally omitted: native hosts must route those through
 /// the explicit server/network policy rather than executing them locally.
+/// Missing effect-analysis results fail closed rather than inheriting the web
+/// hydrator's permissive default-to-client behavior.
 pub fn build_client_action_metadata(
     ast: &AstModule,
     type_checker: &TypeChecker,
@@ -79,6 +87,12 @@ pub fn build_client_action_metadata(
 
     let mut client_actions = Vec::with_capacity(handlers.len());
     for handler in handlers {
+        if effect_checker.function_row(&handler).is_none() {
+            return Err(ClientActionCompileError::MissingEffectRow {
+                handler: handler.clone(),
+            });
+        }
+
         let inferred = type_checker
             .inferred_decl_types
             .get(&handler)
@@ -185,7 +199,12 @@ fn view() -> Html {
         assert_eq!(metadata.client_actions.len(), 1);
         assert_eq!(metadata.client_actions[0].action_id, "increment");
         assert_eq!(metadata.client_actions[0].handler, "increment");
-        assert_eq!(metadata.client_actions[0].function_index, 0);
+        assert_eq!(
+            metadata.client_actions[0].function_index as usize,
+            module
+                .function_offset_by_name("increment")
+                .expect("compiled increment function")
+        );
     }
 
     #[test]
@@ -220,5 +239,26 @@ fn view() -> Html { <button action={bad}>Bad</button> }
             ClientActionCompileError::InvalidReducerType { ref handler, .. }
                 if handler == "bad"
         ));
+    }
+
+    #[test]
+    fn missing_effect_analysis_cannot_authorize_action() {
+        let source = r#"
+import stdlib::web::html
+import stdlib::web::types
+
+fn save(request: String) -> String { request }
+fn view() -> Html { <button action={save}>Save</button> }
+"#;
+        let (ast, types, _effects, module) = compile(source);
+        let empty_effects = EffectChecker::new();
+        let error = build_client_action_metadata(&ast, &types, &empty_effects, &module)
+            .expect_err("missing effects must fail closed");
+        assert_eq!(
+            error,
+            ClientActionCompileError::MissingEffectRow {
+                handler: "save".to_string()
+            }
+        );
     }
 }
