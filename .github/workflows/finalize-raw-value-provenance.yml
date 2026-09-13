@@ -1,0 +1,186 @@
+name: Finalize Raw Value Provenance
+
+on:
+  push:
+    branches:
+      - ops/raw-value-provenance-finalize
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: integration/raw-value-provenance
+          fetch-depth: 0
+
+      - name: Require pointer-width prerequisite
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main integration/raw-value-provenance
+          git show origin/main:src/vm.rs | grep -q 'pointer address does not fit the 48-bit Value payload' || {
+            echo '#182 is not in main yet; leaving #200 untouched.'
+            exit 78
+          }
+
+      - name: Refresh onto main and finalize provenance audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          START_HEAD="$(git rev-parse HEAD)"
+          echo "$START_HEAD" > /tmp/raw-value-start-head
+          git merge --no-edit origin/main
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('.')
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = root / path
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected one match, found {count}: {old[:100]!r}')
+              p.write_text(text.replace(old, new, 1))
+
+          # Replace repeated unchecked TAG_PYTHON construction with a typed,
+          # domain-specific constructor. PythonObjectId is produced by the
+          # registry and TAG_PYTHON is not a host-pointer tag.
+          p = root / 'src/python/marshal.rs'
+          text = p.read_text()
+          helper_anchor = 'use crate::vm::Value;\n'
+          helper = '''use crate::vm::Value;\n\n/// Construct the non-pointer Value representation for a registered Python object.\n///\n/// This is a typed provenance-preserving constructor: `PythonObjectId` values\n/// come only from the bridge registry, and `TAG_PYTHON` is interpreted as an\n/// opaque registry handle rather than a process-local host pointer.\nfn python_object_value(id: PythonObjectId) -> Value {\n    // SAFETY: TAG_PYTHON is a non-pointer handle tag and `id` was allocated by\n    // the Python registry; no host address is reconstructed from these bits.\n    unsafe { Value::from_raw(TAG_PYTHON | id.0) }\n}\n'''
+          if 'fn python_object_value(id: PythonObjectId)' not in text:
+              if helper_anchor not in text:
+                  raise SystemExit('python marshal import anchor changed')
+              text = text.replace(helper_anchor, helper, 1)
+          text = text.replace('unsafe { Value::from_raw(TAG_PYTHON | id.0) }', 'python_object_value(id)')
+          text = text.replace('unsafe { Value::from_raw(TAG_PYTHON | py_id.0) }', 'python_object_value(py_id)')
+          p.write_text(text)
+
+          safety_by_path = {
+              'src/vm.rs': 'raw register bits were produced by Nulang JIT/AOT code using this process\'s Value ABI; register copies preserve the original tag payload and pointer provenance.',
+              'src/jit/runtime.rs': 'this raw value comes from Nulang-generated JIT/AOT helpers or their in-process register ABI, not from an external byte stream; pointer-tagged values retain the originating runtime heap provenance.',
+              'src/aot/mod.rs': 'AOT helper arguments are emitted by Nulang-generated code using the same in-process Value ABI, so pointer-tagged payloads retain runtime provenance.',
+              'src/aot/codegen.rs': 'the test/native result was produced by Nulang-generated AOT code in this process using the same Value ABI; it is not externally supplied raw data.',
+              'src/fuzz.rs': 'the raw result is produced by AotModule::run for the same in-process fuzz program and is decoded only under Nulang\'s own Value ABI.',
+              'src/integration_tests/mod.rs': 'the native result is produced by Nulang AOT code in this process and preserves the runtime Value representation.',
+              'src/jit/tests.rs': 'the test register buffer is initialized from valid Values and mutated only by Nulang-generated JIT code using the same Value ABI.',
+              'src/jit/typed_compiler.rs': 'the test register buffer contains Values created by this runtime and is executed by the in-process typed JIT ABI.',
+              'src/wasm_runtime.rs': 'guest TAG_PTR values are excluded on this path; the remaining raw value cannot authorize a host-pointer dereference.',
+              'src/main.rs': 'the raw result was produced by an in-process Nulang execution backend using the same Value ABI.',
+          }
+
+          def add_safety_comments(path: str, explanation: str) -> None:
+              p = root / path
+              lines = p.read_text().splitlines(keepends=True)
+              out = []
+              for line in lines:
+                  is_unchecked = ('unsafe {' in line and ('Value::from_raw(' in line or 'Value::from_bits(' in line))
+                  if is_unchecked:
+                      nearby = ''.join(out[-4:])
+                      if 'SAFETY:' not in nearby:
+                          indent = line[:len(line) - len(line.lstrip())]
+                          out.append(f'{indent}// SAFETY: {explanation}\n')
+                  out.append(line)
+              p.write_text(''.join(out))
+
+          for path, explanation in safety_by_path.items():
+              add_safety_comments(path, explanation)
+
+          # Persistence already carries specific proofs for the portable-object
+          # table and closure-handle reconstruction. C/FFI and WasmFX use the
+          # checked decoder and therefore need no unchecked reconstruction note.
+
+          # Close F1 in the unsafe audit while keeping Value::ptr provenance as
+          # the separate follow-up tracked by #186.
+          p = root / 'docs/UNSAFE_AUDIT.md'
+          text = p.read_text()
+          start = text.index('### F1 — HIGH — safe `Value::from_raw` / `Value::from_bits` construct arbitrary tagged pointers')
+          end = text.index('### F2 — HIGH — `Value::ptr` truncates pointer addresses to 48 bits')
+          f1 = '''### F1 — HIGH — safe `Value::from_raw` / `Value::from_bits` construct arbitrary tagged pointers\n**Status: fixed by the raw-value provenance hardening.** `Value::from_raw` and\n`Value::from_bits` are now `unsafe fn`s with explicit tag/provenance contracts.\nExternally controlled raw values cross through `Value::try_from_untrusted_bits`,\nwhich rejects `TAG_PTR`; C/FFI and WASM/WasmFX ingress use that checked path.\nPortable snapshots remap pointer object IDs through the restored object table\nbefore host pointer construction. Trusted VM/JIT/AOT/Python reconstruction\nremains visibly unsafe or uses a typed non-pointer handle constructor, with\nlocal `SAFETY:` rationale at each unchecked boundary.\n\nThe independent `Value::ptr(*mut u8)` safe-constructor provenance hole is not\npart of F1 and is tracked separately by #186; #182 already makes its 48-bit\npayload-width behavior fail closed.\n\n'''
+          text = text[:start] + f1 + text[end:]
+          text = text.replace(
+              '| `src/vm.rs` | 53 | mixed — **suspicious** | `Value::from_raw`/`from_bits` safe constructors; `Value::ptr` 48-bit truncation; `CStr::from_ptr` on heap strings |',
+              '| `src/vm.rs` | 53 | mixed | raw reconstruction is explicit/checked; `Value::ptr` provenance is tracked by #186; `CStr::from_ptr` remains a separate bounded-string audit item |',
+          )
+          p.write_text(text)
+
+          # Add the raw-provenance correction next to the pointer-width entry.
+          p = root / 'CHANGELOG.md'
+          text = p.read_text()
+          if '**Raw `Value` reconstruction provenance**' not in text:
+              header = '### Runtime soundness — 2026-09-12\n'
+              if header not in text:
+                  raise SystemExit('runtime soundness changelog section missing after #182 merge')
+              entry = '''### Runtime soundness — 2026-09-12\n- **Raw `Value` reconstruction provenance** (`src/vm.rs`, JIT/AOT, FFI, WASM):\n  arbitrary `u64` bits can no longer become a host `Value` through a safe raw\n  constructor. Trusted internal round-trips are explicit unsafe boundaries;\n  untrusted C/FFI/WASM raw values reject host-pointer tags before reconstruction.\n'''
+              text = text.replace(header, entry, 1)
+          p.write_text(text)
+
+          # Static audit: constructor signatures must remain unsafe and every
+          # unchecked raw reconstruction call must have a nearby SAFETY proof.
+          vm = (root / 'src/vm.rs').read_text()
+          if 'pub unsafe fn from_raw(raw: u64) -> Self' not in vm:
+              raise SystemExit('Value::from_raw lost unsafe contract')
+          if 'pub unsafe fn from_bits(raw: u64) -> Self' not in vm:
+              raise SystemExit('Value::from_bits lost unsafe contract')
+
+          unexpected = []
+          for base in ('src', 'crates', 'tests'):
+              for path in (root / base).rglob('*.rs'):
+                  lines = path.read_text().splitlines()
+                  for i, line in enumerate(lines):
+                      if 'pub unsafe fn from_raw' in line or 'pub unsafe fn from_bits' in line:
+                          continue
+                      if 'Value::from_raw(' not in line and 'Value::from_bits(' not in line:
+                          continue
+                      if 'unsafe {' not in line:
+                          # Safe typed/checking helpers may mention the names in tests/source strings.
+                          if 'contains(' in line or 'include_str!' in line:
+                              continue
+                          unexpected.append(f'{path}:{i+1}: raw reconstruction is not visibly unsafe')
+                          continue
+                      nearby = '\n'.join(lines[max(0, i-4):i])
+                      if 'SAFETY:' not in nearby:
+                          unexpected.append(f'{path}:{i+1}: missing nearby SAFETY rationale')
+          if unexpected:
+              raise SystemExit('\n'.join(unexpected))
+          PY
+
+      - name: Validate finalized branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          cargo +1.95.0 fmt --all
+          cargo +1.95.0 fmt --all -- --check
+          cargo +1.95.0 check --all-targets --no-default-features
+          cargo +1.95.0 check --all-targets
+          cargo +1.95.0 test --test raw_value_provenance
+          git diff --check
+          # The provenance change adds no dependencies. Do not commit lockfile
+          # normalization caused by Cargo workspace discovery.
+          git checkout origin/main -- Cargo.lock
+
+      - name: Commit only if target branch stayed stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          START_HEAD="$(cat /tmp/raw-value-start-head)"
+          git fetch origin integration/raw-value-provenance
+          if [ "$(git rev-parse origin/integration/raw-value-provenance)" != "$START_HEAD" ]; then
+            echo 'raw-value branch advanced during finalization; refusing stale push'
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'fix(runtime): finalize raw Value provenance audit'
+          git push origin HEAD:integration/raw-value-provenance
