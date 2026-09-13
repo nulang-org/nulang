@@ -126,6 +126,20 @@ pub struct LeaseAttempt {
     pub error: Option<LeaseError>,
 }
 
+/// Structured mismatches between a provider lease response and the exact
+/// request that produced it. A mismatched success response is unsafe to treat as
+/// either success or a normal fallback failure because the provider may already
+/// have allocated capacity under unexpected identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseResponseViolation {
+    EmptyLeaseId,
+    ProviderMismatch { expected: String, actual: String },
+    OfferMismatch { expected: String, actual: String },
+    JobMismatch { expected: String, actual: String },
+    PlacementTokenMismatch { expected: String, actual: String },
+    StateNotAcquired { actual: LeaseState },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacementLeaseError {
     ClaimHeld,
@@ -133,7 +147,63 @@ pub enum PlacementLeaseError {
     /// Capacity acquisition may have succeeded remotely. Keep the durable
     /// claim and reconcile this provider before trying any other provider.
     Indeterminate(LeaseError),
+    /// A provider returned `Ok` but the lease identity/state does not match the
+    /// exact request. Keep the durable claim and reconcile before fallback;
+    /// otherwise the job could be double-placed or bound to the wrong capacity.
+    InvalidResponse {
+        request: LeaseRequest,
+        lease: CapacityLease,
+        violations: Vec<LeaseResponseViolation>,
+    },
     Exhausted(Vec<LeaseAttempt>),
+}
+
+/// Validate that a provider's successful lease response is bound to the exact
+/// acquisition request and represents live acquired capacity.
+pub fn validate_lease_response(
+    request: &LeaseRequest,
+    lease: &CapacityLease,
+) -> Result<(), Vec<LeaseResponseViolation>> {
+    let mut violations = Vec::new();
+
+    if lease.lease_id.is_empty() {
+        violations.push(LeaseResponseViolation::EmptyLeaseId);
+    }
+    if lease.provider != request.provider {
+        violations.push(LeaseResponseViolation::ProviderMismatch {
+            expected: request.provider.clone(),
+            actual: lease.provider.clone(),
+        });
+    }
+    if lease.offer_id != request.offer_id {
+        violations.push(LeaseResponseViolation::OfferMismatch {
+            expected: request.offer_id.clone(),
+            actual: lease.offer_id.clone(),
+        });
+    }
+    if lease.job_id != request.job_id {
+        violations.push(LeaseResponseViolation::JobMismatch {
+            expected: request.job_id.clone(),
+            actual: lease.job_id.clone(),
+        });
+    }
+    if lease.placement_token != request.placement_token {
+        violations.push(LeaseResponseViolation::PlacementTokenMismatch {
+            expected: request.placement_token.clone(),
+            actual: lease.placement_token.clone(),
+        });
+    }
+    if lease.state != LeaseState::Acquired {
+        violations.push(LeaseResponseViolation::StateNotAcquired {
+            actual: lease.state,
+        });
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
 }
 
 /// Acquire one placement lease using ranked candidates as a sequential
@@ -188,7 +258,16 @@ pub async fn acquire_ranked_placement(
         };
 
         match leaser.acquire(&request).await {
-            Ok(lease) => return Ok(lease),
+            Ok(lease) => match validate_lease_response(&request, &lease) {
+                Ok(()) => return Ok(lease),
+                Err(violations) => {
+                    return Err(PlacementLeaseError::InvalidResponse {
+                        request,
+                        lease,
+                        violations,
+                    })
+                }
+            },
             Err(error) if error.kind == LeaseErrorKind::Indeterminate => {
                 return Err(PlacementLeaseError::Indeterminate(error));
             }
@@ -211,19 +290,76 @@ pub async fn acquire_ranked_placement(
 mod tests {
     use super::*;
 
-    #[test]
-    fn idempotency_key_is_unambiguous_and_offer_scoped() {
-        let request = LeaseRequest {
+    fn request() -> LeaseRequest {
+        LeaseRequest {
             provider: "aws".into(),
             offer_id: "c7g-spot".into(),
             job_id: "job-1".into(),
             placement_token: "placement-42".into(),
             requested_ttl_seconds: Some(900),
-        };
+        }
+    }
+
+    fn lease() -> CapacityLease {
+        CapacityLease {
+            lease_id: "lease-1".into(),
+            provider: "aws".into(),
+            offer_id: "c7g-spot".into(),
+            job_id: "job-1".into(),
+            placement_token: "placement-42".into(),
+            acquired_at_unix_ms: 100,
+            expires_at_unix_ms: Some(1_000),
+            state: LeaseState::Acquired,
+        }
+    }
+
+    #[test]
+    fn idempotency_key_is_unambiguous_and_offer_scoped() {
+        assert_eq!(
+            request().idempotency_key(),
+            "j5:job-1|t12:placement-42|p3:aws|o8:c7g-spot"
+        );
+    }
+
+    #[test]
+    fn matching_lease_response_is_accepted() {
+        assert_eq!(validate_lease_response(&request(), &lease()), Ok(()));
+    }
+
+    #[test]
+    fn lease_response_validation_reports_all_identity_and_state_mismatches() {
+        let mut actual = lease();
+        actual.lease_id.clear();
+        actual.provider = "gcp".into();
+        actual.offer_id = "n2-spot".into();
+        actual.job_id = "other-job".into();
+        actual.placement_token = "other-placement".into();
+        actual.state = LeaseState::Released;
 
         assert_eq!(
-            request.idempotency_key(),
-            "j5:job-1|t12:placement-42|p3:aws|o8:c7g-spot"
+            validate_lease_response(&request(), &actual),
+            Err(vec![
+                LeaseResponseViolation::EmptyLeaseId,
+                LeaseResponseViolation::ProviderMismatch {
+                    expected: "aws".into(),
+                    actual: "gcp".into(),
+                },
+                LeaseResponseViolation::OfferMismatch {
+                    expected: "c7g-spot".into(),
+                    actual: "n2-spot".into(),
+                },
+                LeaseResponseViolation::JobMismatch {
+                    expected: "job-1".into(),
+                    actual: "other-job".into(),
+                },
+                LeaseResponseViolation::PlacementTokenMismatch {
+                    expected: "placement-42".into(),
+                    actual: "other-placement".into(),
+                },
+                LeaseResponseViolation::StateNotAcquired {
+                    actual: LeaseState::Released,
+                },
+            ])
         );
     }
 }
