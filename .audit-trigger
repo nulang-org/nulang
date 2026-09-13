@@ -1,2 +1,3 @@
 trigger pointer provenance migration for fix/p0-value-ptr-provenance-v2
 retry-after-raw-value-success: 2026-09-13T00:48Z
+retry-after-heap-return-fix: 2026-09-13T11:12Z
