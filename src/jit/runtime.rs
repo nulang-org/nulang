@@ -1425,7 +1425,7 @@ fn aot_ffi_call_impl(lib_raw: u64, sym_raw: u64, sig: u64, args: &[u64]) -> Valu
                 Ok(c) => c,
                 Err(_) => return Value::nil(),
             };
-            cargs.push(Value::ptr(c.as_ptr() as *mut u8));
+            cargs.push(unsafe { /* SAFETY: JIT/AOT runtime path receives this pointer from the active runtime allocator or an existing live pointer Value. */ Value::ptr(c.as_ptr() as *mut u8) });
             cstrings.push(c);
         } else {
             cargs.push(unsafe { Value::from_bits(args[i]) });

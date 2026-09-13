@@ -662,7 +662,7 @@ fn host_ffi_call_impl(
         if *p == crate::ffi::marshal::CType::CStr {
             let s = read_wasm_string(&mut caller, args[i]);
             let c = std::ffi::CString::new(s).map_err(|_| Error::msg("bad cstr"))?;
-            cargs.push(crate::vm::Value::ptr(c.as_ptr() as *mut u8));
+            cargs.push(unsafe { /* SAFETY: host-side storage owns this pointer for the duration required by the guest/host bridge. */ crate::vm::Value::ptr(c.as_ptr() as *mut u8) });
             cstrings.push(c);
         } else {
             cargs.push(guest_non_pointer_value(args[i] as u64).map_err(Error::msg)?);

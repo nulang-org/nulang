@@ -583,7 +583,10 @@ impl Actor {
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                     *ptr.add(bytes.len()) = 0;
                 }
-                Value::ptr(ptr)
+                unsafe {
+                    /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                    Value::ptr(ptr)
+                }
             }
             None => Value::nil(),
         }
@@ -603,7 +606,10 @@ impl Actor {
                         slots[i] = item;
                     }
                 }
-                Value::ptr(ptr)
+                unsafe {
+                    /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                    Value::ptr(ptr)
+                }
             }
             None => Value::nil(),
         }
