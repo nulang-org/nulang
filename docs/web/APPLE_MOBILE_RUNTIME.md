@@ -2,7 +2,9 @@
 
 Status: Experimental build/release tooling.
 
-`NulangMobile.xcframework` is the Apple distribution boundary for Nulang's interpreter-only embedded runtime. It contains the Rust static runtime and the shared platform-neutral C mobile bootstrap behind one Clang module, `CNulangMobile`.
+`NulangMobile.xcframework` is the Apple binary distribution boundary for Nulang's interpreter-only embedded runtime. It contains the Rust static runtime and the shared platform-neutral C mobile bootstrap behind one Clang module, `CNulangMobile`.
+
+The build also emits `NulangMobileRuntimePackage.zip`, a local Swift package that wraps the XCFramework with a small ownership/transport layer. Applications therefore do not need to reproduce C lifetime and callback-copying code themselves.
 
 ## What is packaged
 
@@ -19,6 +21,29 @@ Each archive combines:
 4. `CNulangMobile.h` plus `module.modulemap`, allowing Swift/Objective-C to `import CNulangMobile`.
 
 No JIT/native-codegen dependency is permitted in this profile. Runtime construction inside the mobile bridge also uses `nulang_runtime_new_interpreter()` as a second line of enforcement.
+
+## Generated Swift package
+
+The same build creates:
+
+```text
+.nula/native/apple/NulangMobileRuntimePackage/
+├── Package.swift
+├── NulangMobile.xcframework/
+└── Sources/
+    └── NulangMobileRuntime/
+        └── NulangMobileRuntime.swift
+```
+
+The `NulangMobileRuntime` target is intentionally low-level and UI-neutral. It:
+
+- owns the opaque `NulangMobileApp` handle;
+- serializes create/run/free access around the C runtime;
+- copies callback JSON into Swift-owned `Data` before the C callback returns;
+- forwards document/message bytes onto a caller-selected `DispatchQueue`;
+- exposes synchronous `run()` for a higher-level host to call from its dedicated runtime worker.
+
+It does **not** decode `nulang-ui/1`, mutate SwiftUI state, execute server actions, or invent a client-action entrypoint. Those semantics stay above the runtime transport boundary.
 
 ## Build
 
@@ -40,9 +65,11 @@ Artifacts are written under:
 .nula/native/apple/
   NulangMobile.xcframework/
   NulangMobile.xcframework.zip
+  NulangMobileRuntimePackage/
+  NulangMobileRuntimePackage.zip
 ```
 
-The script prints a SHA-256 for the zip. Release automation should preserve that checksum alongside the artifact.
+The script prints SHA-256 values for both distributable zip files. Release automation should preserve those checksums alongside the artifacts.
 
 ## Validation sequence
 
@@ -55,9 +82,12 @@ The build script performs these gates in order:
 5. archive combination and simulator `lipo`;
 6. `xcodebuild -create-xcframework`;
 7. architecture inspection and module-map presence check;
-8. deterministic proof-artifact packaging and checksum output.
+8. XCFramework proof-artifact packaging and checksum output;
+9. generated Swift-package assembly around the exact XCFramework;
+10. a real generic-iOS-Simulator `xcodebuild` of `NulangMobileRuntime`;
+11. Swift-package proof-artifact packaging and checksum output.
 
-`.github/workflows/apple-mobile-runtime.yml` runs the dependency/test gate on Linux first, then performs the real XCFramework build on `macos-latest`. A green workflow on the exact release commit is required before treating the Apple runtime as distributable.
+`.github/workflows/apple-mobile-runtime.yml` runs the dependency/test gate on Linux first, then performs the real XCFramework and generated Swift-package build on `macos-latest`. A green workflow on the exact release commit is required before treating the Apple runtime package as distributable.
 
 ## Runtime lifecycle
 
@@ -65,6 +95,9 @@ Native applications should use the shared mobile host API rather than reproducin
 
 ```text
 app.nbc
+   |
+   v
+NulangMobileRuntime (Swift owner)
    |
    v
 nulang_mobile_app_new
@@ -79,8 +112,10 @@ nulang_mobile_app_run
    `- incremental nulang-ui-msg/1 callbacks
 ```
 
-The current pre-registered native-function registry is process-global, so v1 deliberately allows one active `NulangMobileApp` per process. Platform lifecycle wrappers must serialize create/run/free operations and decode/copy callback JSON before returning from a callback.
+The current pre-registered native-function registry is process-global, so v1 deliberately allows one active `NulangMobileApp` per process. Platform lifecycle wrappers must serialize create/run/free operations. Callback pointers are borrowed only for the duration of each C callback, so the Swift wrapper copies them synchronously before dispatching work to another queue.
 
 ## Scope boundary
 
-This package stops at the runtime/transport boundary. SwiftUI rendering, `MainActor` UI state application, and client-action ingress belong in the Apple host layer above `CNulangMobile`. Keeping those concerns separate makes runtime packaging independently testable and prevents the Swift layer from bypassing the common C lifecycle used by Android/JNI as well.
+This package stops at the runtime/transport boundary. SwiftUI rendering and `MainActor` UI state application belong in `NulangUIHost` above it.
+
+Client-action ingress also remains intentionally outside this transport wrapper until the compiler/runtime freezes a dedicated authorized action ABI. A Swift method that simply invokes an arbitrary exported function by name would bypass compiler placement/authorization semantics and is not an acceptable substitute.
