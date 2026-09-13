@@ -102,7 +102,6 @@ pub struct ClientActionResult {
     #[serde(rename = "protocol")]
     pub protocol_version: String,
     pub correlation_id: String,
-    #[serde(default)]
     pub messages: Vec<NativeUiMessageEnvelope>,
 }
 
@@ -261,6 +260,15 @@ mod tests {
         assert!(matches!(
             result.validate("different"),
             Err(ClientActionProtocolError::CorrelationMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn result_requires_explicit_messages_array() {
+        let missing = r#"{"protocol":"nulang-action-result/1","correlation_id":"corr-1"}"#;
+        assert!(matches!(
+            ClientActionResult::from_json(missing, "corr-1"),
+            Err(ClientActionProtocolError::InvalidResultJson(_))
         ));
     }
 
