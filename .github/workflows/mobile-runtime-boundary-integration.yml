@@ -17,85 +17,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Reconcile current benchmark harness
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path("patches/mobile/apply_current.py")
-          text = path.read_text()
-          old = "    persist_bench::benches,\n"
-          new = "    persist_bench::benches,\n    scheduler_bench::benches,\n"
-          count = text.count(old)
-          if count != 3:
-              raise SystemExit(f"expected 3 benchmark-list anchors, found {count}")
-          path.write_text(text.replace(old, new))
-          PY
-
       - name: Apply current-main mobile runtime boundary
         run: |
-          python3 patches/mobile/apply_current.py
+          python3 patches/mobile/reconcile_current.py
           chmod +x scripts/check_mobile_runtime_profile.sh
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          # The Wasm SIMD analyzer's only production consumer is the Wasm
-          # backend and it imports JIT-owned SIMD types. Keep the analyzer with
-          # that backend rather than leaking native-codegen into mobile.
-          lib = Path("src/lib.rs")
-          text = lib.read_text()
-          old = 'pub mod mir_wasm_simd;'
-          if text.count(old) != 1:
-              raise SystemExit("expected one mir_wasm_simd module declaration")
-          lib.write_text(text.replace(old, '#[cfg(feature = "wasm-backend")]\npub mod mir_wasm_simd;', 1))
-
-          # TieredAction is only used by the native JIT path; the VM still
-          # retains the stable JitBackend trait slot in interpreter builds.
-          vm = Path("src/vm.rs")
-          text = vm.read_text()
-          old = 'use crate::backends::{create_default_jit, JitBackend, TieredAction};'
-          if text.count(old) != 1:
-              raise SystemExit("expected one VM backend import")
-          new = '''use crate::backends::{create_default_jit, JitBackend};
-          #[cfg(feature = "native-codegen")]
-          use crate::backends::TieredAction;'''
-          vm.write_text(text.replace(old, new, 1))
-
-          # Integration tests expose an opt-in native backend through
-          # NU_BACKEND=native. Compile that arm only with native-codegen and
-          # reject it explicitly otherwise instead of silently using bytecode.
-          tests = Path("src/integration_tests/mod.rs")
-          text = tests.read_text()
-          old = '''        match backend() {
-            "native" => {
-                let aot_module = crate::aot::AotModule::compile(&mir)?;
-                let result_raw = aot_module.run()?;
-                let value = Value::from_raw(result_raw);
-                Ok((value, module_type))
-            }
-            _ => {
-'''
-          if text.count(old) != 1:
-              raise SystemExit("expected native integration-test backend arm")
-          new = '''        match backend() {
-            #[cfg(feature = "native-codegen")]
-            "native" => {
-                let aot_module = crate::aot::AotModule::compile(&mir)?;
-                let result_raw = aot_module.run()?;
-                let value = Value::from_raw(result_raw);
-                Ok((value, module_type))
-            }
-            #[cfg(not(feature = "native-codegen"))]
-            "native" => Err(NuError::VMError {
-                msg: "native test backend not compiled in (enable 'native-codegen')".into(),
-                span: crate::types::Span::default(),
-            }),
-            _ => {
-'''
-          tests.write_text(text.replace(old, new, 1))
-          PY
-
           git diff --check
 
       - name: Install Rust
