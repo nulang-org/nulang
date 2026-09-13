@@ -69,7 +69,7 @@ jobs:
           /tmp/nulang-mobile-bridge-test
 
   xcframework:
-    name: Build NulangMobile.xcframework
+    name: Build Apple runtime + Swift package
     runs-on: macos-latest
     needs: mobile-profile
     steps:
@@ -86,10 +86,12 @@ jobs:
           NULANG_SKIP_PROFILE_CHECK: "1"
         run: bash scripts/build_apple_mobile_runtime.sh
 
-      - name: Upload XCFramework proof artifact
+      - name: Upload Apple runtime proof artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: NulangMobile-xcframework-${{ github.sha }}
-          path: .nula/native/apple/NulangMobile.xcframework.zip
+          name: NulangMobile-apple-runtime-${{ github.sha }}
+          path: |
+            .nula/native/apple/NulangMobile.xcframework.zip
+            .nula/native/apple/NulangMobileRuntimePackage.zip
           if-no-files-found: error
           retention-days: 14
