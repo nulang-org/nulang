@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Added since 1.0.0-frozen — 2026-09-13 (mobile runtime boundary)
+- **Interpreter-only mobile runtime profile** (`Cargo.toml`, `src/runtime/`, `src/backends/`, `src/vm.rs`): native Cranelift/AOT code generation is now owned by the optional `native-codegen` feature while remaining enabled in default builds. The `mobile-runtime` profile excludes executable-code-generation and dynamic-loader dependencies, gates native backend wiring and benchmarks, and keeps Wasm support independently selectable. `scripts/check_mobile_runtime_profile.sh` provides the release gate for dependency-graph isolation and interpreter-only correctness.
+
 ### Added since 1.0.0-frozen — 2026-09-11 (backend parity + durable determinism)
 - **Canonical behavior content hashing** (`src/types.rs`,
   `src/mir_codegen.rs`): the BLAKE3 content hash that gates
