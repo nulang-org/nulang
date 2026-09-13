@@ -1,0 +1,85 @@
+name: Refresh PR 169 After Pointer Fix
+
+on:
+  push:
+    branches:
+      - ops/refresh-pr169-after-182
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/build-wasm-capabilities-clean
+          fetch-depth: 0
+
+      - name: Require pointer-width prerequisite
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main fix/build-wasm-capabilities-clean
+          git show origin/main:src/vm.rs | grep -q 'pointer address does not fit the 48-bit Value payload' || {
+            echo '#182 is not in main yet; leaving #169 untouched.'
+            exit 78
+          }
+
+      - name: Rebuild branch from current main
+        shell: bash
+        run: |
+          set -euo pipefail
+          START_HEAD="$(git rev-parse HEAD)"
+          echo "$START_HEAD" > /tmp/pr169-start-head
+          MERGE_BASE="$(git merge-base origin/main HEAD)"
+          git diff "$MERGE_BASE"..HEAD -- src/package/commands.rs > /tmp/pr169-package.patch
+          test -s /tmp/pr169-package.patch
+
+          git reset --hard origin/main
+          git apply --3way /tmp/pr169-package.patch
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('CHANGELOG.md')
+          text = p.read_text()
+          heading = '### Package/WASM capability parity — 2026-09-12\n'
+          if heading not in text:
+              anchor = '### Added since 1.0.0-frozen — 2026-09-11 (backend parity + durable determinism)\n'
+              if anchor not in text:
+                  raise SystemExit('changelog insertion anchor changed')
+              entry = '''### Package/WASM capability parity — 2026-09-12\n- **Manifest capabilities preserved by `nula build-wasm`** (`src/package/commands.rs`):\n  package WASM AOT compilation now forwards manifest-declared capability flags\n  through the same canonical compiler argument builder used by deploy's optional\n  WASM tier, preserving default-deny capability semantics across build targets.\n\n'''
+              text = text.replace(anchor, entry + anchor, 1)
+          p.write_text(text)
+          PY
+
+      - name: Validate rebuilt branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          cargo +1.95.0 fmt --all
+          cargo +1.95.0 fmt --all -- --check
+          cargo +1.95.0 test test_build_wasm_forwards_manifest_capabilities --lib
+          cargo +1.95.0 check --all-targets --no-default-features
+          git diff --check
+          git checkout origin/main -- Cargo.lock
+
+      - name: Commit with stale-head protection
+        shell: bash
+        run: |
+          set -euo pipefail
+          START_HEAD="$(cat /tmp/pr169-start-head)"
+          git fetch origin fix/build-wasm-capabilities-clean
+          if [ "$(git rev-parse origin/fix/build-wasm-capabilities-clean)" != "$START_HEAD" ]; then
+            echo '#169 advanced during validation; refusing stale force-push'
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add CHANGELOG.md src/package/commands.rs
+          git diff --cached --check
+          git commit -m 'fix(package): preserve manifest capabilities in build-wasm'
+          git push --force-with-lease=refs/heads/fix/build-wasm-capabilities-clean:"$START_HEAD" origin HEAD:fix/build-wasm-capabilities-clean
