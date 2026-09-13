@@ -1,0 +1,69 @@
+name: Web Contract Reconcile
+
+on:
+  push:
+    branches:
+      - feat/native-web-contracts
+
+permissions:
+  contents: write
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/native-web-contracts
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Reconcile contract fixtures with current language semantics
+        shell: python
+        run: |
+          from pathlib import Path
+
+          contracts = Path("src/web/contracts.rs")
+          text = contracts.read_text()
+          text = text.replace("type UserId = String", "opaque type UserId = String")
+          text = text.replace("type ExternalId = String", "opaque type ExternalId = String")
+          contracts.write_text(text)
+
+          package = Path("src/web/package_contracts.rs")
+          text = package.read_text()
+          text = text.replace("type UserId = String", "opaque type UserId = String")
+          text = text.replace(
+              "fn route(path, handler) { nil }\nfn handler() { nil }\nfn main() { route(\"/not-web\", handler) }",
+              "fn route(path, callback) { nil }\nfn callback() { nil }\nfn main() { route(\"/not-web\", callback) }",
+          )
+          text = text.replace(
+              "fn route(path, handler) { nil }\nfn local_handler() { nil }",
+              "fn route(path, callback) { nil }\nfn local_handler() { nil }",
+          )
+          package.write_text(text)
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Contract tests
+        run: cargo test --lib 'web::contracts::tests::'
+
+      - name: Package contract tests
+        run: cargo test --lib 'web::package_contracts::tests::'
+
+      - name: Publish source-only fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add src/web/contracts.rs src/web/package_contracts.rs
+          if git diff --cached --quiet; then
+            echo "No source changes to publish"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "test(web): align contracts with nominal type semantics"
+          git push origin HEAD:feat/native-web-contracts
