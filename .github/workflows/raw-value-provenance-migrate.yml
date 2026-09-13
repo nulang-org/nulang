@@ -139,6 +139,35 @@ jobs:
               '    // SAFETY: TAG_PTR and TAG_STRING were validated/remapped above; this path contains only immediate/non-pointer tags.\n    unsafe { Value::from_raw(raw) }\n}',
               1,
           )
+          old = '''                Some(Value::from_raw(\n                    TAG_CLOSURE\n                        | crate::vm::CLOSURE_ENV_FLAG\n                        | (env_idx as u64 & crate::vm::CLOSURE_ENV_IDX_MASK),\n                ))\n'''
+          new = '''                // SAFETY: this is an internally constructed closure handle. The\n                // environment index was allocated by this VM immediately above and is\n                // masked to the closure representation's validated index field.\n                Some(unsafe {\n                    Value::from_raw(\n                        TAG_CLOSURE\n                            | crate::vm::CLOSURE_ENV_FLAG\n                            | (env_idx as u64 & crate::vm::CLOSURE_ENV_IDX_MASK),\n                    )\n                })\n'''
+          if old not in s:
+              raise SystemExit('closure reconstruction raw-value anchor changed')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # One AOT regression added after the historical hardening branch still
+          # decodes an in-process AOT result. Make its trusted boundary explicit.
+          p = Path('src/aot/codegen.rs')
+          s = p.read_text()
+          old = '''            crate::vm::Value::from_raw(raw).is_nil(),\n            "Actor.link outside an actor must nil-no-op like the interpreter"\n'''
+          new = '''            // SAFETY: `raw` is produced by the in-process AOT module using\n            // the same Value ABI; this assertion only inspects the nil tag.\n            unsafe { crate::vm::Value::from_raw(raw) }.is_nil(),\n            "Actor.link outside an actor must nil-no-op like the interpreter"\n'''
+          if old not in s:
+              raise SystemExit('AOT raw-result regression anchor changed')
+          p.write_text(s.replace(old, new, 1))
+
+          # The historical caller-annotation patch predates #186 and wrapped
+          # `Value::ptr` even though it is still a safe constructor on this slice.
+          # Remove those wrappers so the #181 PR remains warning-clean; #186 will
+          # make pointer construction itself an explicit provenance boundary next.
+          p = Path('src/jit/runtime.rs')
+          s = p.read_text()
+          s = s.replace('unsafe { Value::ptr(ptr) }.as_raw()', 'Value::ptr(ptr).as_raw()')
+          s = s.replace('unsafe { Value::ptr(dst_ptr) }.as_raw()', 'Value::ptr(dst_ptr).as_raw()')
+          s = s.replace(
+              'unsafe { Value::ptr(c.as_ptr() as *mut u8) }',
+              'Value::ptr(c.as_ptr() as *mut u8)',
+          )
           p.write_text(s)
           PY
 
