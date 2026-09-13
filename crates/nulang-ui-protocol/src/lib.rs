@@ -302,9 +302,7 @@ impl UiDocument {
             }
         }
 
-        let mut visiting = BTreeSet::new();
-        let mut visited = BTreeSet::new();
-        visit(&self.root, &nodes, &mut visiting, &mut visited)?;
+        let visited = visit_iterative(&self.root, &nodes)?;
         if visited.len() != nodes.len() {
             let node = nodes
                 .keys()
@@ -667,28 +665,43 @@ fn node_mut<'a>(
         .ok_or_else(|| ProtocolError::MissingNode(node_id.clone()))
 }
 
-fn visit(
-    node_id: &NodeId,
+fn visit_iterative(
+    root: &NodeId,
     nodes: &BTreeMap<NodeId, &UiNode>,
-    visiting: &mut BTreeSet<NodeId>,
-    visited: &mut BTreeSet<NodeId>,
-) -> Result<(), ProtocolError> {
-    if visited.contains(node_id) {
-        return Ok(());
+) -> Result<BTreeSet<NodeId>, ProtocolError> {
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![(root.clone(), false)];
+
+    while let Some((node_id, exiting)) = stack.pop() {
+        if exiting {
+            visiting.remove(&node_id);
+            visited.insert(node_id);
+            continue;
+        }
+        if visited.contains(&node_id) {
+            continue;
+        }
+        if !visiting.insert(node_id.clone()) {
+            return Err(ProtocolError::Cycle(node_id));
+        }
+
+        stack.push((node_id.clone(), true));
+        let children = &nodes
+            .get(&node_id)
+            .expect("child references are checked before traversal")
+            .children;
+        for child in children.iter().rev() {
+            if visiting.contains(child) {
+                return Err(ProtocolError::Cycle(child.clone()));
+            }
+            if !visited.contains(child) {
+                stack.push((child.clone(), false));
+            }
+        }
     }
-    if !visiting.insert(node_id.clone()) {
-        return Err(ProtocolError::Cycle(node_id.clone()));
-    }
-    for child in &nodes
-        .get(node_id)
-        .expect("child references are checked before traversal")
-        .children
-    {
-        visit(child, nodes, visiting, visited)?;
-    }
-    visiting.remove(node_id);
-    visited.insert(node_id.clone());
-    Ok(())
+
+    Ok(visited)
 }
 
 #[cfg(test)]
@@ -857,6 +870,28 @@ mod tests {
             wrong.validate(),
             Err(ProtocolError::UnsupportedProtocol { .. })
         ));
+    }
+
+    #[test]
+    fn tree_validation_handles_deep_documents_iteratively() {
+        const DEPTH: usize = 20_000;
+        let mut nodes = Vec::with_capacity(DEPTH);
+        for index in 0..DEPTH {
+            let id = NodeId::new(format!("node-{index:05}"));
+            let mut node = UiNode::new(id, "column");
+            if index + 1 < DEPTH {
+                node.children
+                    .push(NodeId::new(format!("node-{:05}", index + 1)));
+            }
+            nodes.push(node);
+        }
+        let document = UiDocument::new(
+            DocumentId::from("deep"),
+            Revision(1),
+            NodeId::from("node-00000"),
+            nodes,
+        );
+        document.validate().unwrap();
     }
 
     #[test]
