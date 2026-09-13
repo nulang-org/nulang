@@ -1,5 +1,9 @@
 //! Core domain types for the NuLang Agent Runtime (NLAP v1).
 
+pub mod capability;
+pub mod intent;
+pub mod voice;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;

@@ -1,9 +1,10 @@
-//! SQLite persistence for goals, tasks, and conversations.
+//! SQLite persistence for goals, tasks, conversations, and worker registry state.
 
 use chrono::{DateTime, Utc};
 use nulang_ai_core::{
     ConversationState, Goal, GoalGraph, GoalStatus, ManagerKind, Task, TaskStatus,
 };
+use nulang_ai_worker::WorkerSnapshot;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -79,6 +80,11 @@ impl SqliteStore {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS workers (
+                agent_id TEXT PRIMARY KEY,
+                snapshot_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             "#,
         )?;
         Ok(())
@@ -86,6 +92,53 @@ impl SqliteStore {
 
     pub fn db_path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn upsert_worker_snapshot(&self, snapshot: &WorkerSnapshot) -> Result<(), StoreError> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute(
+            r#"INSERT INTO workers (agent_id, snapshot_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                snapshot_json=excluded.snapshot_json,
+                updated_at=excluded.updated_at
+            "#,
+            params![
+                snapshot.agent_id,
+                serde_json::to_string(snapshot)?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_worker_snapshots(&self, snapshots: &[WorkerSnapshot]) -> Result<(), StoreError> {
+        let mut conn = Connection::open(&self.path)?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM workers", [])?;
+        for snapshot in snapshots {
+            tx.execute(
+                "INSERT INTO workers (agent_id, snapshot_json, updated_at) VALUES (?1, ?2, ?3)",
+                params![
+                    snapshot.agent_id,
+                    serde_json::to_string(snapshot)?,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_worker_snapshots(&self) -> Result<Vec<WorkerSnapshot>, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let mut stmt = conn.prepare("SELECT snapshot_json FROM workers ORDER BY agent_id ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut snapshots = Vec::new();
+        for row in rows {
+            snapshots.push(serde_json::from_str(&row?)?);
+        }
+        Ok(snapshots)
     }
 
     pub fn upsert_goal(&self, goal: &Goal) -> Result<(), StoreError> {

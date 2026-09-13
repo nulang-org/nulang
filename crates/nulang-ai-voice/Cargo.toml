@@ -1,0 +1,12 @@
+[package]
+name = "nulang-ai-voice"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Realtime voice transport and provider adapters for the NuLang agent runtime"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+nulang-ai-core = { path = "../nulang-ai-core", version = "0.1.0" }
