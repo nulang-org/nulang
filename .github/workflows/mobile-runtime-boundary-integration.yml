@@ -17,6 +17,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Reconcile current benchmark harness
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("patches/mobile/apply_current.py")
+          text = path.read_text()
+          old = "    persist_bench::benches,\n"
+          new = "    persist_bench::benches,\n    scheduler_bench::benches,\n"
+          count = text.count(old)
+          if count != 3:
+              raise SystemExit(f"expected 3 benchmark-list anchors, found {count}")
+          path.write_text(text.replace(old, new))
+          PY
+
       - name: Apply current-main mobile runtime boundary
         run: |
           python3 patches/mobile/apply_current.py
