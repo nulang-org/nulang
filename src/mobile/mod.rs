@@ -5,6 +5,7 @@
 //! introducing a second compiler or VM.
 
 pub mod action;
+pub mod compiler;
 
 use serde::{Deserialize, Serialize};
 
