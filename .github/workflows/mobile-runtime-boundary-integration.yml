@@ -36,6 +36,32 @@ jobs:
         run: |
           python3 patches/mobile/apply_current.py
           chmod +x scripts/check_mobile_runtime_profile.sh
+
+          # Current main made the Wasm SIMD analyzer unconditional even though
+          # its only production consumer is the wasm-backend. Keep that code
+          # with the backend so interpreter-only mobile builds do not import
+          # JIT-owned SIMD types.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lib = Path("src/lib.rs")
+          text = lib.read_text()
+          old = 'pub mod mir_wasm_simd;'
+          if text.count(old) != 1:
+              raise SystemExit("expected one mir_wasm_simd module declaration")
+          lib.write_text(text.replace(old, '#[cfg(feature = "wasm-backend")]\npub mod mir_wasm_simd;', 1))
+
+          vm = Path("src/vm.rs")
+          text = vm.read_text()
+          old = 'use crate::backends::{create_default_jit, JitBackend, TieredAction};'
+          if text.count(old) != 1:
+              raise SystemExit("expected one VM backend import")
+          new = '''use crate::backends::{create_default_jit, JitBackend};
+          #[cfg(feature = "native-codegen")]
+          use crate::backends::TieredAction;'''
+          vm.write_text(text.replace(old, new, 1))
+          PY
+
           git diff --check
 
       - name: Install Rust
