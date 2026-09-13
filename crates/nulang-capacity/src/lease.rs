@@ -140,13 +140,23 @@ pub enum LeaseResponseViolation {
     StateNotAcquired { actual: LeaseState },
 }
 
+/// Exact logical request and provider error for an acquisition whose remote
+/// outcome is unknown. Keeping both together makes the tuple-shaped
+/// `PlacementLeaseError::Indeterminate(_)` backward-compatible while retaining
+/// every identity needed for safe reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndeterminateLease {
+    pub request: LeaseRequest,
+    pub error: LeaseError,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacementLeaseError {
     ClaimHeld,
     ClaimStore(String),
     /// Capacity acquisition may have succeeded remotely. Keep the durable
-    /// claim and reconcile this provider before trying any other provider.
-    Indeterminate(LeaseError),
+    /// claim and reconcile the exact request before trying another provider.
+    Indeterminate(IndeterminateLease),
     /// A provider returned `Ok` but the lease identity/state does not match the
     /// exact request. Keep the durable claim and reconcile before fallback;
     /// otherwise the job could be double-placed or bound to the wrong capacity.
@@ -269,7 +279,10 @@ pub async fn acquire_ranked_placement(
                 }
             },
             Err(error) if error.kind == LeaseErrorKind::Indeterminate => {
-                return Err(PlacementLeaseError::Indeterminate(error));
+                return Err(PlacementLeaseError::Indeterminate(IndeterminateLease {
+                    request,
+                    error,
+                }));
             }
             Err(error) => attempts.push(LeaseAttempt {
                 provider: provider.clone(),
