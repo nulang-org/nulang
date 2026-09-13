@@ -145,8 +145,11 @@ pub enum PlacementLeaseError {
     ClaimHeld,
     ClaimStore(String),
     /// Capacity acquisition may have succeeded remotely. Keep the durable
-    /// claim and reconcile this provider before trying any other provider.
-    Indeterminate(LeaseError),
+    /// claim and reconcile the exact request before trying another provider.
+    Indeterminate {
+        request: LeaseRequest,
+        error: LeaseError,
+    },
     /// A provider returned `Ok` but the lease identity/state does not match the
     /// exact request. Keep the durable claim and reconcile before fallback;
     /// otherwise the job could be double-placed or bound to the wrong capacity.
@@ -269,7 +272,7 @@ pub async fn acquire_ranked_placement(
                 }
             },
             Err(error) if error.kind == LeaseErrorKind::Indeterminate => {
-                return Err(PlacementLeaseError::Indeterminate(error));
+                return Err(PlacementLeaseError::Indeterminate { request, error });
             }
             Err(error) => attempts.push(LeaseAttempt {
                 provider: provider.clone(),
