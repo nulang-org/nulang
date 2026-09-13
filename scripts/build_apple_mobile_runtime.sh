@@ -46,8 +46,11 @@ rm -rf \
     "$OUT/simulator-x86_64" \
     "$OUT/simulator" \
     "$OUT/headers" \
+    "$OUT/swift-derived-data" \
     "$OUT/NulangMobile.xcframework" \
-    "$OUT/NulangMobile.xcframework.zip"
+    "$OUT/NulangMobile.xcframework.zip" \
+    "$OUT/NulangMobileRuntimePackage" \
+    "$OUT/NulangMobileRuntimePackage.zip"
 mkdir -p \
     "$OUT/device" \
     "$OUT/simulator-arm64" \
@@ -167,5 +170,39 @@ echo "==> Packaging XCFramework proof artifact"
     shasum -a 256 NulangMobile.xcframework.zip
 )
 
+echo "==> Creating local Swift runtime package"
+swift_package="$OUT/NulangMobileRuntimePackage"
+mkdir -p "$swift_package/Sources/NulangMobileRuntime"
+cp \
+    "$ROOT/platforms/ios/NulangMobileRuntime/Package.swift.template" \
+    "$swift_package/Package.swift"
+cp \
+    "$ROOT/platforms/ios/NulangMobileRuntime/Sources/NulangMobileRuntime/NulangMobileRuntime.swift" \
+    "$swift_package/Sources/NulangMobileRuntime/"
+ditto \
+    "$OUT/NulangMobile.xcframework" \
+    "$swift_package/NulangMobile.xcframework"
+
+echo "==> Compiling generated Swift runtime package for iOS Simulator"
+(
+    cd "$swift_package"
+    xcodebuild \
+        -scheme NulangMobileRuntime \
+        -destination 'generic/platform=iOS Simulator' \
+        -derivedDataPath "$OUT/swift-derived-data" \
+        CODE_SIGNING_ALLOWED=NO \
+        build
+)
+
+echo "==> Packaging Swift runtime proof artifact"
+(
+    cd "$OUT"
+    ditto -c -k --sequesterRsrc --keepParent \
+        NulangMobileRuntimePackage \
+        NulangMobileRuntimePackage.zip
+    shasum -a 256 NulangMobileRuntimePackage.zip
+)
+
 echo
 echo "Apple mobile runtime: $OUT/NulangMobile.xcframework"
+echo "Swift runtime package: $OUT/NulangMobileRuntimePackage.zip"
