@@ -77,6 +77,11 @@ pub enum PlacementReconciliationError {
         violations: Vec<LeaseResponseViolation>,
     },
     OriginalCandidateNotFound { provider: String, offer_id: String },
+    AmbiguousOriginalCandidate {
+        provider: String,
+        offer_id: String,
+        matches: usize,
+    },
     Resume(PlacementLeaseError),
 }
 
@@ -95,6 +100,8 @@ pub async fn reconcile_and_resume_ranked_placement(
     request: &LeaseRequest,
     claim_expires_at_unix_ms: u64,
 ) -> Result<PlacementReconciliationResult, PlacementReconciliationError> {
+    let original_index = unique_original_candidate_index(ranked_candidates, request)?;
+
     let reconciler = reconcilers
         .iter()
         .copied()
@@ -121,17 +128,6 @@ pub async fn reconcile_and_resume_ranked_placement(
         }
         LeaseReconciliationStatus::Pending => Ok(PlacementReconciliationResult::Pending),
         LeaseReconciliationStatus::ConfirmedAbsent => {
-            let original_index = ranked_candidates
-                .iter()
-                .position(|candidate| {
-                    candidate.offer.provider == request.provider
-                        && candidate.offer.offer_id == request.offer_id
-                })
-                .ok_or_else(|| PlacementReconciliationError::OriginalCandidateNotFound {
-                    provider: request.provider.clone(),
-                    offer_id: request.offer_id.clone(),
-                })?;
-
             let remaining = &ranked_candidates[original_index + 1..];
             let lease = acquire_ranked_placement(
                 claim_store,
@@ -149,6 +145,37 @@ pub async fn reconcile_and_resume_ranked_placement(
     }
 }
 
+fn unique_original_candidate_index(
+    ranked_candidates: &[PlacementCandidate],
+    request: &LeaseRequest,
+) -> Result<usize, PlacementReconciliationError> {
+    let mut matches = ranked_candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.offer.provider == request.provider
+                && candidate.offer.offer_id == request.offer_id
+        });
+
+    let Some((index, _)) = matches.next() else {
+        return Err(PlacementReconciliationError::OriginalCandidateNotFound {
+            provider: request.provider.clone(),
+            offer_id: request.offer_id.clone(),
+        });
+    };
+
+    let duplicate_count = 1 + matches.count();
+    if duplicate_count > 1 {
+        return Err(PlacementReconciliationError::AmbiguousOriginalCandidate {
+            provider: request.provider.clone(),
+            offer_id: request.offer_id.clone(),
+            matches: duplicate_count,
+        });
+    }
+
+    Ok(index)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -158,10 +185,9 @@ mod tests {
     use futures::executor::block_on;
 
     use super::*;
-    use crate::broker::PlacementCandidate;
     use crate::lease::{
-        AcquireLeaseFuture, CapacityLeaser, ClaimFuture, ClaimResult, LeaseError, LeaseRequest,
-        LeaseState, PlacementClaim, ReleaseClaimFuture, ReleaseLeaseFuture,
+        AcquireLeaseFuture, ClaimFuture, ClaimResult, LeaseError, LeaseState, PlacementClaim,
+        ReleaseClaimFuture, ReleaseLeaseFuture,
     };
     use crate::{Architecture, CapacityOffer, Lifecycle, TrustTier};
 
@@ -391,6 +417,30 @@ mod tests {
         assert!(matches!(
             error,
             PlacementReconciliationError::InvalidRecoveredLease { .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_original_provider_offer_is_rejected_as_ambiguous() {
+        let candidates = vec![
+            candidate("aws", "aws-offer", 0.1),
+            candidate("aws", "aws-offer", 0.2),
+        ];
+        let reconciler = FakeReconciler::new("aws", LeaseReconciliationStatus::ConfirmedAbsent);
+
+        let error = block_on(reconcile_and_resume_ranked_placement(
+            &MemoryClaimStore,
+            &[&reconciler],
+            &[],
+            &candidates,
+            &request(),
+            10_000,
+        ))
+        .expect_err("duplicate provider/offer must be ambiguous");
+
+        assert!(matches!(
+            error,
+            PlacementReconciliationError::AmbiguousOriginalCandidate { matches: 2, .. }
         ));
     }
 }
