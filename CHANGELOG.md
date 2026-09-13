@@ -45,6 +45,12 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Package/WASM capability parity — 2026-09-12
+- **Manifest capabilities preserved by `nula build-wasm`** (`src/package/commands.rs`):
+  package WASM AOT compilation now forwards manifest-declared capability flags
+  through the same canonical compiler argument builder used by deploy's optional
+  WASM tier, preserving default-deny capability semantics across build targets.
+
 ### Added since 1.0.0-frozen — 2026-09-11 (backend parity + durable determinism)
 - **Canonical behavior content hashing** (`src/types.rs`,
   `src/mir_codegen.rs`): the BLAKE3 content hash that gates
