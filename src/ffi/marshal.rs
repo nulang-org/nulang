@@ -105,7 +105,7 @@ fn opaque_c_value_to_value(raw: u64) -> Result<Value, String> {
                 .to_string(),
         );
     }
-    Ok(Value::from_bits(raw))
+    Value::try_from_untrusted_bits(raw).map_err(str::to_string)
 }
 
 /// Marshal a C `i64` return value into a Nulang value.

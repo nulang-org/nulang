@@ -84,10 +84,8 @@ impl Default for HostState {
 /// denotes a linear-memory offset and is valid guest state; it becomes unsafe
 /// only when those bits cross the guest/host boundary as a host `Value`.
 fn guest_non_pointer_value(raw: u64) -> Result<crate::vm::Value, &'static str> {
-    if value_layout::is_ptr_raw(raw) {
-        return Err("wasm guest pointer-tagged value has no host heap provenance");
-    }
-    Ok(crate::vm::Value::from_raw(raw))
+    crate::vm::Value::try_from_untrusted_bits(raw)
+        .map_err(|_| "wasm guest pointer-tagged value has no host heap provenance")
 }
 
 // ── WASM Runtime ─────────────────────────────────────────────────────
@@ -421,7 +419,7 @@ fn host_str_concat(mut caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<
                 // converting a guest linear-memory pointer into a host Value.
                 format!("#Value({:x})", raw)
             } else {
-                crate::vm::Value::from_raw(raw).to_string_repr()
+                unsafe { crate::vm::Value::from_raw(raw) }.to_string_repr()
             }
         };
         (read(a), read(b))

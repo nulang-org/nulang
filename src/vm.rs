@@ -1960,11 +1960,14 @@ impl Value {
         self.raw
     }
 
-    /// Construct a Value from raw NaN-boxed bits.
+    /// Construct a `Value` from trusted raw NaN-boxed bits.
     ///
     /// # Safety
-    /// The caller must ensure the bits form a valid tagged value.
-    pub fn from_raw(raw: u64) -> Self {
+    /// Every tag payload must satisfy its runtime invariant. If `raw` has
+    /// `TAG_PTR`, the caller must preserve the originating pointer's provenance
+    /// and lifetime for every operation that can dereference the returned value;
+    /// externally controlled bits must use [`Value::try_from_untrusted_bits`].
+    pub unsafe fn from_raw(raw: u64) -> Self {
         Value { raw }
     }
 
@@ -1973,9 +1976,26 @@ impl Value {
         self.raw
     }
 
-    /// Construct a Value from raw NaN-boxed bits.
-    pub fn from_bits(raw: u64) -> Self {
+    /// Construct a `Value` from trusted raw NaN-boxed bits.
+    ///
+    /// # Safety
+    /// Same contract as [`Value::from_raw`]. Pointer-tagged bits must retain
+    /// their originating host provenance/lifetime for every dereference;
+    /// untrusted integer boundaries must use the validated decoder instead.
+    pub unsafe fn from_bits(raw: u64) -> Self {
         Value { raw }
+    }
+
+    /// Decode externally controlled raw bits without allowing them to mint a
+    /// process-local host heap pointer. Immediate tags and floats are safe to
+    /// transport as opaque values; `TAG_PTR` requires host provenance and is
+    /// therefore rejected at untrusted boundaries.
+    pub fn try_from_untrusted_bits(raw: u64) -> Result<Self, &'static str> {
+        if (raw & TAG_MASK) == TAG_PTR {
+            Err("pointer-tagged raw value has no Nulang host-heap provenance")
+        } else {
+            Ok(Value { raw })
+        }
     }
 
     pub fn to_string_repr(&self) -> String {
@@ -3335,7 +3355,7 @@ impl VM {
 
         if action != TieredAction::Interpret {
             for (i, bits) in regs.iter().enumerate() {
-                self.frames[frame_idx].regs[i] = Value::from_bits(*bits);
+                self.frames[frame_idx].regs[i] = unsafe { Value::from_bits(*bits) };
             }
 
             // A re-entrant callee raised a runtime error (e.g. step-limit
@@ -3541,7 +3561,7 @@ impl VM {
         for i in 0..argc {
             // SAFETY: `regs` points at the compiled region's 256-entry buffer.
             let bits = unsafe { *regs.add(i) };
-            frame.regs[i] = Value::from_bits(bits);
+            frame.regs[i] = unsafe { Value::from_bits(bits) };
         }
         frame.return_dst = dst.min(255) as u8;
         self.frames.push(frame);

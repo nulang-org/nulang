@@ -284,7 +284,7 @@ fn value_from_c(value: NulangValue) -> Result<Value, &'static str> {
     if (value.raw & TAG_MASK) == TAG_PTR {
         return Err(INVALID_C_VALUE);
     }
-    Ok(Value::from_bits(value.raw))
+    Value::try_from_untrusted_bits(value.raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -474,13 +474,17 @@ pub extern "C" fn nulang_value_bool(value: NulangValue) -> bool {
 /// Check whether a value is `nil`.
 #[no_mangle]
 pub extern "C" fn nulang_value_is_nil(value: NulangValue) -> bool {
-    value_from_c(value).map(|value| value.is_nil()).unwrap_or(false)
+    value_from_c(value)
+        .map(|value| value.is_nil())
+        .unwrap_or(false)
 }
 
 /// Check whether a value is the unit value `()`.
 #[no_mangle]
 pub extern "C" fn nulang_value_is_unit(value: NulangValue) -> bool {
-    value_from_c(value).map(|value| value.is_unit()).unwrap_or(false)
+    value_from_c(value)
+        .map(|value| value.is_unit())
+        .unwrap_or(false)
 }
 
 /// Create an integer Nulang value.
