@@ -1,0 +1,36 @@
+name: Apple UI Host
+
+on:
+  pull_request:
+    paths:
+      - "crates/nulang-ui-protocol/**"
+      - "platforms/ios/NulangUIHost/**"
+      - ".github/workflows/apple-ui-host.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/nulang-ui-protocol/**"
+      - "platforms/ios/NulangUIHost/**"
+      - ".github/workflows/apple-ui-host.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  swift-conformance:
+    name: Swift protocol + SwiftUI host
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Swift package tests
+        run: swift test --package-path platforms/ios/NulangUIHost
+
+      - name: iOS Simulator compile gate
+        working-directory: platforms/ios/NulangUIHost
+        run: |
+          xcodebuild \
+            -scheme NulangUIHost \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
