@@ -17,6 +17,7 @@ This crate is deliberately separated from the Nulang language/runtime and from c
 9. **Provider acquisition is idempotent too.** Offer-scoped, length-prefixed idempotency material is stable across retries; adapters may hash it to satisfy provider-native token limits.
 10. **Ambiguous acquisition never falls through.** If a provider may have allocated capacity but its response was lost, the placement remains claimed and must be reconciled before another provider is tried.
 11. **Telemetry replaces static assumptions.** Observed fleet data can update throughput, interruption probability, startup percentiles, and acquisition confidence before scoring.
+12. **Runtime eligibility remains a hard gate after economic ranking.** A cheap provider offer is not schedulable unless the bound worker pool supplies every required runtime feature and the minimum isolation level. Extra runtime features never imply deployment authority; authority remains the admission policy's responsibility.
 
 ## Current scope
 
@@ -36,13 +37,16 @@ Implemented:
 - GCP Spot/standard normalizer and preemption normalization
 - Nebius preemptible/regular normalizer and preemption normalization
 - observed fleet telemetry estimates for dynamic scheduler inputs
-- tests covering Spot economics, long-running interruption risk, egress, GPU/trust constraints, critical workload policy, cross-provider ranking, stale snapshots, provider health, interruption transitions, telemetry, and lease idempotency
+- runtime-aware execution targets with deterministic feature/isolation eligibility filtering that preserves broker ranking
+- tests covering Spot economics, long-running interruption risk, egress, GPU/trust constraints, critical workload policy, cross-provider ranking, stale snapshots, provider health, interruption transitions, telemetry, lease idempotency, and runtime/isolation eligibility
 
 ## Adapter architecture
 
 Provider-specific API clients should implement the source trait for their adapter (`AwsOfferSource`, `GcpOfferSource`, or `NebiusOfferSource`) and the capacity-leasing boundary used by the control plane. This keeps authentication, HTTP/cloud SDK selection, pagination, and provider API churn outside the scheduler core.
 
 The capacity core must remain usable without any provider SDK dependency.
+
+The hosted control plane should translate validated deployment admission into `ExecutionRequirements`, bind configured worker-pool runtime facts as `RuntimeEnvelope`s, and filter economically ranked candidates before final authoritative admission and scheduling. `nulang-capacity` intentionally does not import the compiler/runtime crate to perform that translation itself.
 
 ## Next slices
 
