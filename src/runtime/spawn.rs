@@ -290,9 +290,8 @@ pub(crate) fn spawn_from_module(
             };
         }
     }
-    // Wire AOT-native dispatch: if an AOT module is registered for this actor
-    // type, register the adapter for each behavior it compiles so the
-    // scheduler dispatches them natively (bytecode falls back for the rest).
+    // Wire AOT-native dispatch only when native codegen is present.
+    #[cfg(feature = "native-codegen")]
     if let Some(meta) = meta.as_ref() {
         if !matches!(role, ActorRole::Workflow) {
             let module_ptr = rt.aot_modules.get(&meta.name).copied();

@@ -118,12 +118,18 @@ mod tests {
         let mut mir = crate::mir_lower::lower_module(&hir)?;
 
         match backend() {
+            #[cfg(feature = "native-codegen")]
             "native" => {
                 let aot_module = crate::aot::AotModule::compile(&mir)?;
                 let result_raw = aot_module.run()?;
                 let value = Value::from_raw(result_raw);
                 Ok((value, module_type))
             }
+            #[cfg(not(feature = "native-codegen"))]
+            "native" => Err(NuError::VMError {
+                msg: "native test backend not compiled in (enable 'native-codegen')".into(),
+                span: crate::types::Span::default(),
+            }),
             _ => {
                 let module = crate::mir_codegen::compile_mir(&mut mir, "test")?;
                 // 5. Run
@@ -1983,6 +1989,7 @@ match { a: 2, b: 9 } with {
     /// (guard-stripped) compiler and produce exactly the same result the
     /// interpreter computes. The arithmetic-heavy body gives the tiering
     /// path a straight-line region longer than the 5-instruction minimum.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_typed_guard_stripping_hot_function() {
         let source = r#"
@@ -2126,6 +2133,7 @@ match { a: 2, b: 9 } with {
     /// that would produce inf/NaN). The hot run tiers the function up
     /// through the type-directed JIT path (>1000 reductions), so both
     /// runs agreeing proves interpreter == JIT.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_float_div_by_zero_cold_and_hot_parity() {
         let source = |n: i64| {
@@ -2185,6 +2193,7 @@ match { a: 2, b: 9 } with {
     /// fuzzer cannot reach (its corpus contains no effect programs), so this
     /// test pins interp==JIT for an effect performed once per loop iteration
     /// for 2000 iterations.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_effect_in_hot_loop_jit_matches_interpreter() {
         let source = |n: i64| {
@@ -2259,6 +2268,7 @@ match { a: 2, b: 9 } with {
     /// (interpreted, since `PerformDirect` yields) back into the JIT-compiled
     /// loop body's `acc += v * 2`, pinning the register-round-trip at the
     /// yield point. Expected: Σ 2(i+1) for i in 0..n == n(n+1).
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_effect_resume_value_flows_into_jit_loop_arithmetic() {
         let source = |n: i64| {
@@ -2322,6 +2332,7 @@ match { a: 2, b: 9 } with {
     /// form (which is correct but fragments the JIT region), the straight-line
     /// loop body compiles as one region, so `jit_compiled_count() >= 1`.
     /// Expected for last i = n-1: acc = (i+10)*3.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_multi_effect_dispatch_in_hot_loop_jit() {
         let source = |n: i64| {
@@ -2382,6 +2393,7 @@ match { a: 2, b: 9 } with {
     /// Hot float arithmetic with a nonzero divisor: the typed JIT path
     /// must produce bit-identical results to the interpreter. The
     /// recurrence acc' = (2*acc + 1)/4 converges to exactly 0.5.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_float_arithmetic_hot_typed_jit_exact() {
         let source = r#"
