@@ -41,6 +41,9 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Check Apple build script syntax
+        run: bash -n scripts/build_apple_mobile_runtime.sh
+
       - name: Verify dependency graph and interpreter build
         run: bash scripts/check_mobile_runtime_profile.sh
 
