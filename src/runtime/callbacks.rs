@@ -970,8 +970,9 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             .get_mut(&actor_id)?
             .mailbox
             .receive_match(behavior_ids)?;
-        // ORCA receiver protocol: hold heap pointers carried by the message.
-        rt.hold_payload_refs(actor_id, &*payload);
+        // Ownership is established only after pattern+guard commit. Until
+        // then the message remains logically queued and its in-flight ORCA
+        // reference keeps the payload alive.
         Some((
             pos,
             Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
@@ -981,8 +982,12 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
     fn commit_receive_match(&mut self) {
         let mut rt = self.runtime.borrow_mut();
         if let Some(actor_id) = rt.current_actor {
-            if let Some(actor) = rt.actors.get_mut(&actor_id) {
-                actor.mailbox.commit_receive_match();
+            let payload = rt
+                .actors
+                .get_mut(&actor_id)
+                .and_then(|actor| actor.mailbox.commit_receive_match());
+            if let Some(payload) = payload {
+                rt.hold_payload_refs(actor_id, &payload);
             }
         }
     }
@@ -1817,8 +1822,8 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 let actor = (*self.runtime).actors.get_mut(&self.actor_id)?;
                 actor.mailbox.receive_match(behavior_ids)?
             };
-            // ORCA receiver protocol: hold heap pointers carried by the message.
-            (*self.runtime).hold_payload_refs(self.actor_id, &*payload);
+            // Ownership is established only by commit_receive_match after
+            // the pattern+guard succeeds.
             Some((
                 pos,
                 Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
@@ -1867,8 +1872,12 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
 
     fn commit_receive_match(&mut self) {
         unsafe {
-            if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
-                actor.mailbox.commit_receive_match();
+            let payload = (*self.runtime)
+                .actors
+                .get_mut(&self.actor_id)
+                .and_then(|actor| actor.mailbox.commit_receive_match());
+            if let Some(payload) = payload {
+                (*self.runtime).hold_payload_refs(self.actor_id, &payload);
             }
         }
     }
