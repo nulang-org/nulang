@@ -26,7 +26,9 @@
 
 use std::ffi::{c_char, CStr, CString};
 
-use crate::backends::{create_default_jit, JitBackend, TieredAction};
+#[cfg(feature = "native-codegen")]
+use crate::backends::TieredAction;
+use crate::backends::{create_default_jit, JitBackend};
 use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
 use crate::ffi::{call_native, CType, Signature, FFI_REGISTRY};
 use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
@@ -3264,6 +3266,7 @@ impl VM {
     ///
     /// Returns `true` if the JIT executed a compiled region and advanced the
     /// PC — the caller should return `Ok(())` immediately.
+    #[cfg(feature = "native-codegen")]
     fn try_jit_execute(&mut self, frame_idx: usize) -> bool {
         let module_idx = self.frames[frame_idx].module_idx;
         let pc = self.frames[frame_idx].pc;
@@ -3365,6 +3368,11 @@ impl VM {
             // JIT executed but region not tracked — fall back to interpretation.
         }
         // JIT fell back to interpretation — continue in the interpreter.
+        false
+    }
+
+    #[cfg(not(feature = "native-codegen"))]
+    fn try_jit_execute(&mut self, _frame_idx: usize) -> bool {
         false
     }
 
@@ -3490,6 +3498,7 @@ impl VM {
     /// # Safety
     /// `regs` must point at the 256-entry register buffer of the compiled
     /// region that invoked this helper.
+    #[cfg(feature = "native-codegen")]
     pub(crate) fn jit_direct_call(
         &mut self,
         regs: *mut u64,
@@ -6592,6 +6601,7 @@ mod vm_tests {
     /// result. Guards the straight-line-region contract: compiled regions must
     /// not contain branches, because the VM advances pc by the full region
     /// length after a region runs.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_hot_loop_with_early_exit_branch() {
         let mut module = CodeModule::new("test_jit_early_exit");
@@ -6672,6 +6682,7 @@ mod vm_tests {
     /// back-edge, so `find_compilable_region` detects the loop and compiles
     /// it natively. Guards against silent regressions to interpreter-only
     /// arithmetic hot loops.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_source_hot_loop_tiers_up() {
         use crate::lexer::Lexer;
@@ -7399,6 +7410,7 @@ mod vm_tests {
     /// `constants_to_jit_bits` used to encode `Constant::String` as nil bits,
     /// so a hot loop loading a string constant produced nil once the region
     /// compiled, while the cold interpreter produced the string.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_hot_loop_string_constant_survives_tierup() {
         fn build_string_loop_module(limit: i64) -> CodeModule {
@@ -7471,6 +7483,7 @@ mod vm_tests {
     /// null/type/bounds checks and yield nil for out-of-bounds reads instead
     /// of dereferencing unchecked memory (a large offset used to read
     /// garbage or segfault after tier-up).
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_hot_oob_arrload_returns_nil() {
         fn build_oob_module(limit: i64) -> CodeModule {
@@ -7543,6 +7556,7 @@ mod vm_tests {
     /// Verify that a hot integer-arithmetic loop compiles through the
     /// type-directed (guard-stripped) path and produces the same result as
     /// the interpreter.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_typed_tiering_integer_loop() {
         let mut module = CodeModule::new("test_jit_typed_int_loop");
@@ -7993,6 +8007,7 @@ mod vm_tests {
     /// and panic in debug builds — 2^47 * 2^47 wraps to 0 once masked to
     /// 48 bits. The hot loop also exercises the `nulang_imul` JIT helper
     /// after tier-up.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_imul_boundary_value_wraps() {
         const BOUNDARY: i64 = 140737488355328; // 2^47

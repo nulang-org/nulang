@@ -1081,15 +1081,20 @@ fn print_help() {
     println!("  --emit-stdlib-docs <dir>  Generate per-effect stdlib Markdown docs into <dir>");
     println!("  --lsp            Start Language Server (stdio)");
     println!("  --dap            Start Debug Adapter (stdio; program via launch request)");
-    print!("  --backend <b>    Backend: bytecode (default) | native | core-vm");
+    print!("  --backend <b>    Backend: bytecode (default) | core-vm");
+    if cfg!(feature = "native-codegen") {
+        print!(" | native");
+    }
     if cfg!(feature = "wasm-backend") {
         print!(" | wasm | wasm-run | wasm-aot");
     }
     println!();
     println!("                   core-vm: frozen Core interpreter (Stage 3 bootstrap)");
-    println!("                   native: pure-functional subset only (no effects,");
-    println!("                   actors, or FFI — errors name the unsupported");
-    println!("                   construct; use bytecode for full-language programs)");
+    if cfg!(feature = "native-codegen") {
+        println!("                   native: pure-functional subset only (no effects,");
+        println!("                   actors, or FFI — errors name the unsupported");
+        println!("                   construct; use bytecode for full-language programs)");
+    }
     if cfg!(feature = "wasm-backend") {
         println!("                   wasm*: IO.print/read only (no user-defined effect");
         println!("                   handlers, no actor mailbox)");
@@ -1098,7 +1103,11 @@ fn print_help() {
         println!("                   wasmfx*: suspending effects lower to WasmFX stack");
         println!("                   switching (LLM.ask, Signal.wait, ReceiveWait)");
     }
-    println!("  --target <t>     Target ISA for native backend: native (default) | ptx | riscv64");
+    if cfg!(feature = "native-codegen") {
+        println!(
+            "  --target <t>     Target ISA for native backend: native (default) | ptx | riscv64"
+        );
+    }
     if cfg!(feature = "wasm-backend") {
         println!("  --out <file>     Output file for WASM backends (default: out.wasm)");
     }
@@ -1872,6 +1881,7 @@ fn run_source(
             msg: "wasm backend not compiled in (enable 'wasm-backend' feature)".into(),
             span: Span::default(),
         }),
+        #[cfg(feature = "native-codegen")]
         "native" => {
             let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
             let mir = nulang::mir_lower::lower_module(&hir)?;
@@ -1972,6 +1982,11 @@ fn run_source(
             }
             Ok(())
         }
+        #[cfg(not(feature = "native-codegen"))]
+        "native" => Err(nulang::types::NuError::VMError {
+            msg: "native backend not compiled in (enable 'native-codegen' feature)".into(),
+            span: Span::default(),
+        }),
         "bytecode" => {
             // Bytecode backend (default).
             let m = compile_with_new_pipeline(&ast, "main", &type_checker)?;
