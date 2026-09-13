@@ -9,6 +9,7 @@ pub mod interruption;
 pub mod lease;
 pub mod provider;
 pub mod providers;
+pub mod reconcile;
 pub mod telemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
