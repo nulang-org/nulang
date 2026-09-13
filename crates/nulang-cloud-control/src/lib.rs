@@ -7,6 +7,7 @@
 //! economics, and runtime eligibility as separate decisions.
 
 pub mod acquisition;
+pub mod reconciliation;
 
 use std::fmt;
 
