@@ -49,14 +49,30 @@ jobs:
       - name: Preserve WASM feature graph
         run: cargo check --lib --features wasm-backend
 
-      - name: Commit validated source changes
+      - name: Commit validated source changes only
         if: github.event_name == 'push'
         shell: bash
         run: |
-          rm -rf patches/mobile
-          rm -f .github/workflows/mobile-runtime-boundary-integration.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The reconciliation transform also prepares the permanent CI gate and
+          # mutates its patch helper. The Actions token cannot write workflow
+          # files, and patch assets are temporary publication machinery, so keep
+          # those paths byte-for-byte at the branch HEAD for this commit. They
+          # are removed/updated separately after the validated source lands.
+          git restore --source=HEAD --worktree --staged -- \
+            .github/workflows/ci.yml \
+            .github/workflows/mobile-runtime-boundary-integration.yml \
+            patches/mobile
+
           git add -A
+          if ! git diff --cached --quiet -- .github/workflows patches/mobile; then
+            echo "Refusing to publish workflow or patch-helper changes from Actions"
+            git diff --cached -- .github/workflows patches/mobile
+            exit 1
+          fi
+          git diff --cached --stat
+          git diff --cached --quiet && exit 0
           git commit -m "feat(mobile): isolate interpreter-only runtime"
           git push origin HEAD:feat/mobile-runtime-boundary-ci2
