@@ -179,6 +179,19 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
         .iter()
         .filter_map(FunctionMeta::from_decl)
         .collect();
+    let transparent_aliases: HashMap<String, String> = module
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            Decl::TypeAlias {
+                name,
+                body,
+                opaque: false,
+                ..
+            } => Some((name.clone(), body.to_string())),
+            _ => None,
+        })
+        .collect();
 
     let mut raw_routes = Vec::new();
     collect_routes_in_module(module, &mut raw_routes);
@@ -208,6 +221,7 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
                 handler_name.as_deref().unwrap_or("<handler>"),
                 &mut params,
                 &meta.params,
+                &transparent_aliases,
                 &mut out.diagnostics,
             );
         }
@@ -242,6 +256,7 @@ fn validate_and_infer_param_types(
     handler_name: &str,
     route_params: &mut [RouteParamContract],
     handler_params: &[Param],
+    transparent_aliases: &HashMap<String, String>,
     diagnostics: &mut Vec<String>,
 ) {
     for route_param in route_params {
@@ -253,7 +268,9 @@ fn validate_and_infer_param_types(
             .map(ToString::to_string);
 
         match (&route_param.ty, handler_ty) {
-            (Some(route_ty), Some(handler_ty)) if route_ty != &handler_ty => {
+            (Some(route_ty), Some(handler_ty))
+                if canonical_type_name(route_ty, transparent_aliases) != handler_ty =>
+            {
                 diagnostics.push(format!(
                     "{method} {path}: route parameter '{}' is typed as {} but handler '{}' declares {}",
                     route_param.name, route_ty, handler_name, handler_ty
@@ -271,6 +288,20 @@ fn validate_and_infer_param_types(
             _ => {}
         }
     }
+}
+
+fn canonical_type_name(name: &str, aliases: &HashMap<String, String>) -> String {
+    let mut current = name.to_string();
+    for _ in 0..=aliases.len() {
+        let Some(next) = aliases.get(&current) else {
+            break;
+        };
+        if next == &current {
+            break;
+        }
+        current = next.clone();
+    }
+    current
 }
 
 fn handler_param_contract(param: &Param) -> HandlerParamContract {
@@ -580,7 +611,7 @@ fn web_main() {
         assert_eq!(compiled.routes.len(), 1);
         let route = &compiled.routes[0];
         assert_eq!(route.handler.as_deref(), Some("show_user"));
-        assert_eq!(route.params[0].ty.as_deref(), Some("UserId"));
+        assert_eq!(route.params[0].ty.as_deref(), Some("String"));
         assert_eq!(route.response_type.as_deref(), Some("String"));
         assert!(route.effects.contains(&"DB".to_string()));
         assert!(route.effects.contains(&"Request".to_string()));
@@ -616,7 +647,7 @@ fn web_main() {
         let module = parse(
             r#"
 type UserId = String
-type ExternalId = String
+type ExternalId = Int
 
 fn show_user(id: UserId) -> String {
     "ok"
@@ -631,6 +662,6 @@ fn web_main() {
         let compiled = compile_module_contracts(&module);
         assert_eq!(compiled.diagnostics.len(), 1);
         assert!(compiled.diagnostics[0].contains("typed as ExternalId"));
-        assert!(compiled.diagnostics[0].contains("declares UserId"));
+        assert!(compiled.diagnostics[0].contains("declares String"));
     }
 }

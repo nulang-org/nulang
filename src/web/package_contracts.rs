@@ -438,9 +438,9 @@ fn web_main() {
     fn does_not_treat_unimported_user_route_function_as_framework_helper() {
         let module = parse(
             r#"
-fn route(path, handler) { nil }
-fn handler() { nil }
-fn main() { route("/not-web", handler) }
+fn route(path, callback) { nil }
+fn callback() { nil }
+fn main() { route("/not-web", callback) }
 "#,
         );
 
@@ -459,7 +459,7 @@ fn web_main() { route("/", home) }
         );
         let unrelated = parse(
             r#"
-fn route(path, handler) { nil }
+fn route(path, callback) { nil }
 fn local_handler() { nil }
 fn utility() { route("/not-a-web-route", local_handler) }
 "#,
