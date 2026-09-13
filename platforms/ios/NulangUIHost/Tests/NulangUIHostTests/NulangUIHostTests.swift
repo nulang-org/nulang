@@ -136,4 +136,9 @@ final class NulangUIHostTests: XCTestCase {
         XCTAssertNotNil(store.lastError)
         XCTAssertEqual(store.document, before)
     }
+
+    func testRendererBoundsRecursiveDepth() {
+        XCTAssertTrue(NulangUIRenderLimits.allows(NulangUIRenderLimits.maximumDepth - 1))
+        XCTAssertFalse(NulangUIRenderLimits.allows(NulangUIRenderLimits.maximumDepth))
+    }
 }
