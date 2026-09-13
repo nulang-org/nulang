@@ -1,8 +1,10 @@
-//! Mobile artifact/host manifest contract.
+//! Mobile artifact/host contracts.
 //!
 //! Native packagers consume the ordinary frozen `.nbc` artifact. This module
-//! defines the machine-readable metadata that binds that artifact to the
-//! embedding ABI and UI protocols without introducing a second compiler or VM.
+//! defines machine-readable metadata and versioned host protocols without
+//! introducing a second compiler or VM.
+
+pub mod action;
 
 use serde::{Deserialize, Serialize};
 
