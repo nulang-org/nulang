@@ -82,4 +82,34 @@ replace_once(
 ''',
 )
 
+# Tests whose contract explicitly requires native tier-up are not meaningful in
+# the interpreter-only mobile profile. Gate only those assertions, rather than
+# every test with "jit" in its name: fallback/parity tests that remain valid
+# without native codegen must continue to run on mobile.
+jit_only_tests = {
+    "src/integration_tests/mod.rs": [
+        "test_effect_in_hot_loop_jit_matches_interpreter",
+        "test_effect_resume_value_flows_into_jit_loop_arithmetic",
+        "test_float_arithmetic_hot_typed_jit_exact",
+        "test_float_div_by_zero_cold_and_hot_parity",
+        "test_jit_typed_guard_stripping_hot_function",
+        "test_multi_effect_dispatch_in_hot_loop_jit",
+    ],
+    "src/vm.rs": [
+        "test_imul_boundary_value_wraps",
+        "test_jit_hot_loop_string_constant_survives_tierup",
+        "test_jit_hot_loop_with_early_exit_branch",
+        "test_jit_hot_oob_arrload_returns_nil",
+        "test_jit_source_hot_loop_tiers_up",
+        "test_jit_typed_tiering_integer_loop",
+    ],
+}
+for path, names in jit_only_tests.items():
+    for name in names:
+        replace_once(
+            path,
+            f"    #[test]\n    fn {name}()",
+            f'    #[cfg(feature = "native-codegen")]\n    #[test]\n    fn {name}()',
+        )
+
 print("current-main mobile runtime reconciliation applied")
