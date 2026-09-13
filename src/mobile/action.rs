@@ -20,7 +20,6 @@ pub struct ClientActionRequest {
     pub protocol_version: String,
     pub handler: String,
     pub correlation_id: String,
-    #[serde(default)]
     pub idempotency_key: String,
     #[serde(default)]
     pub form: BTreeMap<String, String>,
@@ -52,7 +51,7 @@ impl ClientActionRequest {
         }
         require_nonempty("handler", &self.handler)?;
         require_nonempty("correlation_id", &self.correlation_id)?;
-        Ok(())
+        require_nonempty("idempotency_key", &self.idempotency_key)
     }
 
     pub fn from_json(json: &str) -> Result<Self, ClientActionProtocolError> {
@@ -225,16 +224,33 @@ mod tests {
 
     #[test]
     fn request_rejects_wrong_major_and_missing_identity() {
-        let wrong = r#"{"protocol":"nulang-action-invoke/2","handler":"save","correlation_id":"c"}"#;
+        let wrong = r#"{"protocol":"nulang-action-invoke/2","handler":"save","correlation_id":"c","idempotency_key":"i"}"#;
         assert!(matches!(
             ClientActionRequest::from_json(wrong),
             Err(ClientActionProtocolError::UnsupportedRequestProtocol { .. })
         ));
 
-        let missing = r#"{"protocol":"nulang-action-invoke/1","handler":"","correlation_id":"c"}"#;
+        let missing = r#"{"protocol":"nulang-action-invoke/1","handler":"","correlation_id":"c","idempotency_key":"i"}"#;
         assert_eq!(
             ClientActionRequest::from_json(missing),
             Err(ClientActionProtocolError::MissingField { field: "handler" })
+        );
+    }
+
+    #[test]
+    fn request_requires_nonempty_idempotency_identity() {
+        let missing = r#"{"protocol":"nulang-action-invoke/1","handler":"save","correlation_id":"c"}"#;
+        assert!(matches!(
+            ClientActionRequest::from_json(missing),
+            Err(ClientActionProtocolError::InvalidRequestJson(_))
+        ));
+
+        let empty = ClientActionRequest::new("save", "corr-1", "   ");
+        assert_eq!(
+            empty.validate(),
+            Err(ClientActionProtocolError::MissingField {
+                field: "idempotency_key"
+            })
         );
     }
 
