@@ -1,0 +1,25 @@
+// swift-tools-version: 5.10
+import PackageDescription
+
+let package = Package(
+    name: "NulangMobileRuntime",
+    platforms: [
+        .iOS(.v15),
+    ],
+    products: [
+        .library(
+            name: "NulangMobileRuntime",
+            targets: ["NulangMobileRuntime"]
+        ),
+    ],
+    targets: [
+        .binaryTarget(
+            name: "CNulangMobile",
+            path: "NulangMobile.xcframework"
+        ),
+        .target(
+            name: "NulangMobileRuntime",
+            dependencies: ["CNulangMobile"]
+        ),
+    ]
+)
