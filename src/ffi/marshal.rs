@@ -19,6 +19,8 @@ pub enum CType {
     Unit,
     /// A raw Nulang value passed as an opaque i64-tagged value. This is only
     /// usable via the C registration API; it has no language-level syntax.
+    /// Raw host-pointer tags returned by C are rejected because the ABI cannot
+    /// establish that they point into a live Nulang heap.
     Value,
 }
 
@@ -92,6 +94,19 @@ pub unsafe fn value_to_voidptr(v: &Value) -> Result<*mut c_void, String> {
 // ---------------------------------------------------------------------------
 // Conversion helpers: C return value -> Value
 // ---------------------------------------------------------------------------
+
+/// Extract an opaque tagged value returned by C without allowing C to mint a
+/// host heap pointer. `CType::Value` is a raw integer ABI, so a `TAG_PTR`
+/// payload has no host-heap provenance and must fail closed.
+fn opaque_c_value_to_value(raw: u64) -> Result<Value, String> {
+    if crate::value_layout::is_ptr_raw(raw) {
+        return Err(
+            "CType::Value returned a pointer-tagged value without Nulang heap provenance"
+                .to_string(),
+        );
+    }
+    Value::try_from_untrusted_bits(raw).map_err(str::to_string)
+}
 
 /// Marshal a C `i64` return value into a Nulang value.
 pub fn i64_to_value(n: i64) -> Value {
@@ -324,7 +339,7 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
         }
         CType::Value => {
             let r: u64 = unsafe { cif.call(code, &ffi_args) };
-            Ok(Value::from_bits(r))
+            opaque_c_value_to_value(r)
         }
     }
 }
@@ -669,6 +684,11 @@ mod tests {
     }
 
     #[cfg(feature = "ffi")]
+    extern "C" fn forged_pointer_value() -> u64 {
+        crate::value_layout::TAG_PTR | 0x1234
+    }
+
+    #[cfg(feature = "ffi")]
     extern "C" fn make_greeting() -> *const c_char {
         let s = std::ffi::CString::new("hello ffi").unwrap();
         s.into_raw()
@@ -718,6 +738,17 @@ mod tests {
         let original = Value::int(42);
         let result = unsafe { call_native(&func, &[original]).unwrap() };
         assert_eq!(result.as_int(), Some(42));
+    }
+
+    #[test]
+    #[cfg(feature = "ffi")]
+    fn test_call_native_value_rejects_forged_pointer_return() {
+        let func = make_func(
+            forged_pointer_value as *const c_void,
+            Signature::new(vec![], CType::Value),
+        );
+        let err = unsafe { call_native(&func, &[]) }.unwrap_err();
+        assert!(err.contains("pointer-tagged"));
     }
 
     #[test]

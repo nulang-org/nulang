@@ -1960,7 +1960,11 @@ fn run_source(
             } else {
                 aot_module.run()?
             };
-            let result = nulang::vm::Value::from_raw(result_raw);
+            // SAFETY: result_raw was produced by Nulang-generated native/AOT code
+            // using the same in-process Value ABI. String payloads are materialized
+            // before the standalone AOT heap is torn down and are not dereferenced
+            // through this fallback Value afterwards.
+            let result = unsafe { nulang::vm::Value::from_raw(result_raw) };
             // Native runs materialize a string result before tearing down the
             // standalone heap (see `aot::take_aot_result_repr`); without it
             // the payload pointer dangles and string results print as raw
@@ -2079,7 +2083,10 @@ fn run_source(
             let result_str = if let Some(s) = vm.resolve_display_string(value) {
                 s
             } else {
-                nulang::vm::Value::from_raw(value).to_string_repr()
+                // SAFETY: this raw result was returned by the in-process CoreVM ABI.
+                // resolve_display_string handled live pointer/string cases above;
+                // this fallback only formats non-dereferencing immediate/tag metadata.
+                unsafe { nulang::vm::Value::from_raw(value) }.to_string_repr()
             };
             if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
                 println!("{}", result_str);

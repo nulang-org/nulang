@@ -45,6 +45,12 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Runtime soundness — 2026-09-12
+- **NaN-box pointer width safety** (`src/vm.rs`): `Value::ptr` now rejects host
+  addresses that do not fit the 48-bit payload instead of silently masking high
+  address bits and manufacturing a different pointer. Valid in-range pointers
+  keep the existing representation and behavior.
+
 ### Added since 1.0.0-frozen — 2026-09-11 (backend parity + durable determinism)
 - **Canonical behavior content hashing** (`src/types.rs`,
   `src/mir_codegen.rs`): the BLAKE3 content hash that gates
