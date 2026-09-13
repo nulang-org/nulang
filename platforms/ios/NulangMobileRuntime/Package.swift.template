@@ -11,6 +11,18 @@ let package = Package(
             name: "NulangMobileRuntime",
             targets: ["NulangMobileRuntime"]
         ),
+        .library(
+            name: "NulangUIProtocol",
+            targets: ["NulangUIProtocol"]
+        ),
+        .library(
+            name: "NulangUIHost",
+            targets: ["NulangUIHost"]
+        ),
+        .library(
+            name: "NulangAppleHost",
+            targets: ["NulangAppleHost"]
+        ),
     ],
     targets: [
         .binaryTarget(
@@ -20,6 +32,19 @@ let package = Package(
         .target(
             name: "NulangMobileRuntime",
             dependencies: ["CNulangMobile"]
+        ),
+        .target(name: "NulangUIProtocol"),
+        .target(
+            name: "NulangUIHost",
+            dependencies: ["NulangUIProtocol"]
+        ),
+        .target(
+            name: "NulangAppleHost",
+            dependencies: [
+                "NulangMobileRuntime",
+                "NulangUIHost",
+                "NulangUIProtocol",
+            ]
         ),
     ]
 )
