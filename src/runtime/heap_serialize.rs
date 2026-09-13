@@ -725,7 +725,10 @@ fn deserialize_one_value(
     if tag == TAG_PTR {
         let obj_id = (raw & PAYLOAD_MASK) as u32;
         if let Some(&ptr) = obj_table.get(&obj_id) {
-            return Value::ptr(ptr);
+            return unsafe {
+                /* SAFETY: deserialization recovered this pointer from the live object table, not from persisted raw address bits. */
+                Value::ptr(ptr)
+            };
         }
         // Dangling reference — return nil.
         return Value::nil();
