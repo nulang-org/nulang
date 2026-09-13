@@ -1,4 +1,5 @@
-# Trigger after workflow registration; self-removes on successful validation.
+# Temporary self-removing migration workflow for #181. It validates the exact
+# branch head with the pinned Rust toolchain before committing source changes.
 name: Raw Value Provenance Migration
 
 on:
@@ -35,7 +36,6 @@ jobs:
             src/jit/runtime.rs \
             src/jit/tests.rs \
             src/jit/typed_compiler.rs \
-            src/main.rs \
             src/python/marshal.rs \
             > /tmp/raw-constructors.patch
           git apply --3way /tmp/raw-constructors.patch
@@ -51,13 +51,13 @@ jobs:
           s = p.read_text()
 
           old_raw = '''    /// Construct a Value from raw NaN-boxed bits.\n    ///\n    /// # Safety\n    /// The caller must ensure the bits form a valid tagged value.\n    pub fn from_raw(raw: u64) -> Self {\n        Value { raw }\n    }\n'''
-          new_raw = '''    /// Construct a `Value` from trusted raw NaN-boxed bits.\n    ///\n    /// # Safety\n    /// If `raw` has `TAG_PTR`, its payload must be a live pointer produced by\n    /// a Nulang host heap and remain valid for every use of the returned value.\n    /// Other tagged payloads must satisfy their tag-specific runtime invariants.\n    pub unsafe fn from_raw(raw: u64) -> Self {\n        Value { raw }\n    }\n'''
+          new_raw = '''    /// Construct a `Value` from trusted raw NaN-boxed bits.\n    ///\n    /// # Safety\n    /// Every tag payload must satisfy its runtime invariant. If `raw` has\n    /// `TAG_PTR`, the caller must preserve the originating pointer's provenance\n    /// and lifetime for every operation that can dereference the returned value;\n    /// externally controlled bits must use [`Value::try_from_untrusted_bits`].\n    pub unsafe fn from_raw(raw: u64) -> Self {\n        Value { raw }\n    }\n'''
           if old_raw not in s:
               raise SystemExit('from_raw anchor changed')
           s = s.replace(old_raw, new_raw, 1)
 
           old_bits = '''    /// Construct a Value from raw NaN-boxed bits.\n    pub fn from_bits(raw: u64) -> Self {\n        Value { raw }\n    }\n'''
-          new_bits = '''    /// Construct a `Value` from trusted raw NaN-boxed bits.\n    ///\n    /// # Safety\n    /// Same contract as [`Value::from_raw`]: pointer-tagged bits must carry a\n    /// live Nulang host-heap pointer and every tag payload must satisfy its\n    /// runtime invariant.\n    pub unsafe fn from_bits(raw: u64) -> Self {\n        Value { raw }\n    }\n\n    /// Decode externally controlled raw bits without allowing them to mint a\n    /// process-local host heap pointer. Immediate tags and floats are safe to\n    /// transport as opaque values; `TAG_PTR` requires host provenance and is\n    /// therefore rejected at untrusted boundaries.\n    pub fn try_from_untrusted_bits(raw: u64) -> Result<Self, &'static str> {\n        if (raw & TAG_MASK) == TAG_PTR {\n            Err("pointer-tagged raw value has no Nulang host-heap provenance")\n        } else {\n            Ok(Value { raw })\n        }\n    }\n'''
+          new_bits = '''    /// Construct a `Value` from trusted raw NaN-boxed bits.\n    ///\n    /// # Safety\n    /// Same contract as [`Value::from_raw`]. Pointer-tagged bits must retain\n    /// their originating host provenance/lifetime for every dereference;\n    /// untrusted integer boundaries must use the validated decoder instead.\n    pub unsafe fn from_bits(raw: u64) -> Self {\n        Value { raw }\n    }\n\n    /// Decode externally controlled raw bits without allowing them to mint a\n    /// process-local host heap pointer. Immediate tags and floats are safe to\n    /// transport as opaque values; `TAG_PTR` requires host provenance and is\n    /// therefore rejected at untrusted boundaries.\n    pub fn try_from_untrusted_bits(raw: u64) -> Result<Self, &'static str> {\n        if (raw & TAG_MASK) == TAG_PTR {\n            Err("pointer-tagged raw value has no Nulang host-heap provenance")\n        } else {\n            Ok(Value { raw })\n        }\n    }\n'''
           if old_bits not in s:
               raise SystemExit('from_bits anchor changed')
           s = s.replace(old_bits, new_bits, 1)
@@ -72,6 +72,24 @@ jobs:
           )
           p.write_text(s)
 
+          # Current CLI has diverged from the historical hardening branch, so
+          # migrate its two present raw-result sites explicitly instead of
+          # replaying stale main.rs hunks.
+          p = Path('src/main.rs')
+          s = p.read_text()
+          old = '            let result = nulang::vm::Value::from_raw(result_raw);\n'
+          new = '''            // SAFETY: result_raw was produced by Nulang-generated native/AOT code\n            // using the same in-process Value ABI. String payloads are materialized\n            // before the standalone AOT heap is torn down and are not dereferenced\n            // through this fallback Value afterwards.\n            let result = unsafe { nulang::vm::Value::from_raw(result_raw) };\n'''
+          if old not in s:
+              raise SystemExit('native CLI raw-result anchor changed')
+          s = s.replace(old, new, 1)
+          old = '                nulang::vm::Value::from_raw(value).to_string_repr()\n'
+          new = '''                // SAFETY: this raw result was returned by the in-process CoreVM ABI.\n                // resolve_display_string handled live pointer/string cases above;\n                // this fallback only formats non-dereferencing immediate/tag metadata.\n                unsafe { nulang::vm::Value::from_raw(value) }.to_string_repr()\n'''
+          if old not in s:
+              raise SystemExit('core-vm CLI raw-result anchor changed')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # C ABI and libffi CType::Value are untrusted integer boundaries.
           p = Path('src/ffi/c_api.rs')
           s = p.read_text()
           old = '    Ok(Value::from_bits(value.raw))\n'
@@ -88,6 +106,8 @@ jobs:
               raise SystemExit('libffi raw-value anchor changed')
           p.write_text(s.replace(old, new, 1))
 
+          # WASM guest TAG_PTR means a linear-memory offset, not a host heap
+          # address. Convert guest results only through the validated decoder.
           p = Path('src/wasm_runtime.rs')
           s = p.read_text()
           old = '''    if value_layout::is_ptr_raw(raw) {\n        return Err("wasm guest pointer-tagged value has no host heap provenance");\n    }\n    Ok(crate::vm::Value::from_raw(raw))\n'''
@@ -109,9 +129,16 @@ jobs:
               raise SystemExit('WasmFX guest decoder anchor changed')
           p.write_text(s.replace(old, new, 1))
 
+          # Persistence handles TAG_PTR above this fallthrough by translating a
+          # portable object id through obj_table; missing ids become nil. The
+          # unchecked fallthrough therefore reconstructs non-pointer tags only.
           p = Path('src/runtime/heap_serialize.rs')
           s = p.read_text()
-          s = s.replace('Value::from_raw(raw)', 'unsafe { Value::from_raw(raw) }')
+          s = s.replace(
+              '    Value::from_raw(raw)\n}',
+              '    // SAFETY: TAG_PTR and TAG_STRING were validated/remapped above; this path contains only immediate/non-pointer tags.\n    unsafe { Value::from_raw(raw) }\n}',
+              1,
+          )
           p.write_text(s)
           PY
 
