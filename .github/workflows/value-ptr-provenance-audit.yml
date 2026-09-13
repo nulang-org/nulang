@@ -6,7 +6,7 @@ on:
       - audit/value-ptr-provenance
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   audit:
@@ -14,31 +14,32 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: audit/value-ptr-provenance
+          ref: fix/p0-value-ptr-provenance-v2
+          fetch-depth: 0
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
-      - name: Enumerate Value::ptr provenance call sites
+          components: rustfmt
+
+      - name: Run compiler-driven pointer provenance migration
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('src/vm.rs')
-          s = p.read_text()
-          old = '    pub fn ptr(p: *mut u8) -> Self {'
-          new = '    pub unsafe fn ptr(p: *mut u8) -> Self {'
-          if old not in s:
-              raise SystemExit('Value::ptr source shape changed')
-          p.write_text(s.replace(old, new, 1))
-          PY
-          set +e
-          cargo +1.95.0 check --all-targets --all-features 2>&1 | tee /tmp/value-ptr-audit.log
-          status=${PIPESTATUS[0]}
-          set -e
-          echo '--- unsafe Value::ptr diagnostics ---'
-          grep -n -B2 -A5 'call to unsafe function.*Value::ptr' /tmp/value-ptr-audit.log || true
-          echo '--- textual callsites ---'
-          grep -RIn --include='*.rs' 'Value::ptr(' src tests crates || true
-          # The audit intentionally succeeds after collecting diagnostics.
-          exit 0
+          echo "TARGET_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          python3 scripts/migrate_value_ptr_provenance.py
+
+      - name: Commit validated hardening to target branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin fix/p0-value-ptr-provenance-v2
+          if [ "$(git rev-parse origin/fix/p0-value-ptr-provenance-v2)" != "$TARGET_SHA" ]; then
+            echo 'target branch advanced during validation; refusing stale push'
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix(runtime): require provenance for pointer Values'
+          git push origin HEAD:fix/p0-value-ptr-provenance-v2
