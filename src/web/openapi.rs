@@ -50,9 +50,7 @@ pub fn generate_openapi(
 fn operation_for(route: &RouteContract) -> Value {
     // Path parameters continue to come directly from the route contract so
     // legacy routes that still use ambient `Web.param` remain accurately
-    // described. Additional request parameters come from the compiler binding
-    // IR, which becomes the single source of truth for query/header/cookie
-    // metadata as those bindings are emitted by the frontend.
+    // described. Additional request parameters come from compiler binding IR.
     let mut parameters: Vec<Value> = route.params.iter().map(path_parameter).collect();
     let binding_compilation = compile_route_bindings(route);
     parameters.extend(
@@ -100,6 +98,9 @@ fn operation_for(route: &RouteContract) -> Value {
     operation.insert("operationId".to_string(), Value::String(operation_id));
     if !parameters.is_empty() {
         operation.insert("parameters".to_string(), Value::Array(parameters));
+    }
+    if let Some(request_body) = form_request_body(&binding_compilation.bindings) {
+        operation.insert("requestBody".to_string(), request_body);
     }
     operation.insert("responses".to_string(), Value::Object(responses));
 
@@ -166,9 +167,10 @@ fn path_parameter(param: &RouteParamContract) -> Value {
     })
 }
 
-/// Convert request bindings that OpenAPI represents as parameters. Body and
-/// form inputs intentionally remain in `x-nulang-request-bindings` until the
-/// typed response/request algebra defines their media types and schemas.
+/// Convert request bindings that OpenAPI represents as parameters. Raw body
+/// bindings intentionally remain in `x-nulang-request-bindings` until Nulang's
+/// request algebra defines a media type. Form bindings are represented through
+/// an URL-encoded `requestBody` because their transport semantics are explicit.
 fn binding_parameter(binding: &RouteBindingContract) -> Option<Value> {
     let location = match binding.source {
         RouteBindingSource::Query => "query",
@@ -185,6 +187,50 @@ fn binding_parameter(binding: &RouteBindingContract) -> Option<Value> {
         "required": true,
         "schema": schema_for_type(binding.ty.as_deref()),
         "x-nulang-handler-param": binding.handler_param,
+    }))
+}
+
+/// Generate a real OpenAPI request body for `from form(...)` bindings.
+///
+/// The HTTP runtime only populates form bindings for
+/// `application/x-www-form-urlencoded`, so this media type is compiler-owned
+/// behavior rather than a guess made by the documentation generator.
+fn form_request_body(bindings: &[RouteBindingContract]) -> Option<Value> {
+    let form_bindings: Vec<_> = bindings
+        .iter()
+        .filter(|binding| binding.source == RouteBindingSource::Form)
+        .collect();
+    if form_bindings.is_empty() {
+        return None;
+    }
+
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+    for binding in form_bindings {
+        let mut schema = schema_for_type(binding.ty.as_deref());
+        if let Value::Object(fields) = &mut schema {
+            fields.insert(
+                "x-nulang-handler-param".to_string(),
+                Value::String(binding.handler_param.clone()),
+            );
+        }
+        properties.insert(binding.source_name.clone(), schema);
+        if !required.iter().any(|name| name == &binding.source_name) {
+            required.push(binding.source_name.clone());
+        }
+    }
+
+    Some(json!({
+        "required": true,
+        "content": {
+            "application/x-www-form-urlencoded": {
+                "schema": {
+                    "type": "object",
+                    "properties": Value::Object(properties),
+                    "required": required,
+                }
+            }
+        }
     }))
 }
 
@@ -273,6 +319,7 @@ mod tests {
                 name: "id".to_string(),
                 ty: Some("UserId".to_string()),
                 capability: None,
+                request: None,
             }],
             response_type: Some("User".to_string()),
             error_type: Some("UserError".to_string()),
@@ -349,6 +396,29 @@ mod tests {
         assert_eq!(binding_parameter(&cookie).unwrap()["in"], "cookie");
         assert!(binding_parameter(&body).is_none());
         assert_eq!(binding_extension(&body)["source"], "body");
+    }
+
+    #[test]
+    fn emits_urlencoded_form_bindings_as_request_body() {
+        let bindings = vec![
+            binding(RouteBindingSource::Form, "title", "String"),
+            binding(RouteBindingSource::Form, "count", "Int"),
+        ];
+        let body = form_request_body(&bindings).unwrap();
+
+        let schema = &body["content"]["application/x-www-form-urlencoded"]["schema"];
+        assert_eq!(body["required"], true);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["title"]["type"], "string");
+        assert_eq!(schema["properties"]["count"]["type"], "integer");
+        assert_eq!(schema["required"][0], "title");
+        assert_eq!(schema["required"][1], "count");
+    }
+
+    #[test]
+    fn raw_body_does_not_invent_an_openapi_media_type() {
+        let body = binding(RouteBindingSource::Body, "body", "Payload");
+        assert!(form_request_body(&[body]).is_none());
     }
 
     #[test]
