@@ -13,7 +13,7 @@ The route metadata in `nulang-app.ir.json` now includes the existing method/path
 - `handler`: statically resolved handler name when available.
 - `params`: path parameter names and source-level types when known.
 - `handler_params`: handler parameter names, types, and Nulang reference capabilities.
-- `bindings`: deterministic request-source to handler-slot bindings. The first implementation supports `path` bindings and records `source_name`, `handler_param`, `handler_index`, and the resolved source-level type.
+- `bindings`: deterministic request-source to handler-slot bindings. The compiler currently emits `path`; the Contract IR reserves `query`, `header`, `cookie`, `body`, and `form` as the transport-neutral vocabulary for subsequent typed extractors. Bindings record `source_name`, `handler_param`, `handler_index`, and the resolved source-level type.
 - `response_type`: declared handler return type.
 - `error_type`: declared typed-error type.
 - `effects`: declared handler effect row.
@@ -43,6 +43,27 @@ Contract extraction parses the package source tree and builds one package-level 
 
 Bare helper-call recognition is scoped to the source module that imports `stdlib::web*`. A web import in one file therefore cannot reinterpret an unrelated user-defined `route()` call in another file as framework metadata.
 
+## Authoritative validation boundary
+
+Contract extraction intentionally remains best-effort so IDEs and compiler tooling can inspect partial metadata without panicking. Serving and artifact-producing entry points need a stronger guarantee.
+
+`web::validation::compile_validated_contracts_from_tree(...)` is the authoritative hard boundary for those consumers. It aggregates extraction and binding diagnostics, deduplicates and sorts them deterministically, and returns the original `ContractCompilation` only when the package contract is valid. Downstream consumers should reuse that returned compilation instead of independently reparsing the source tree.
+
+This gives the intended flow:
+
+```text
+source tree
+    -> best-effort contract extraction
+    -> authoritative validation
+    -> one validated ContractCompilation
+       -> runtime attachment
+       -> deployment IR
+       -> OpenAPI / client generation
+       -> tests / tooling
+```
+
+`web::dispatch::compile_runtime_routes_from_contracts(...)` accepts that already-validated compilation so runtime attachment does not need another source pass.
+
 ## Runtime binding and dispatch
 
 The runtime bridge is implemented as a sidecar rather than adding source-level type metadata to the low-level `Web.route` host effect. VM registration remains method/path/module/function. Package analysis then joins the matching compiler contract onto each collected route.
@@ -60,12 +81,13 @@ Direct path arguments are staged into VM registers `r0..rN`, followed by a non-c
 
 A route is marked `direct_call` only when every declared handler parameter and every route path parameter has a compiler-produced binding. Legacy handlers that still depend on ambient `Web.param(...)` therefore do not silently switch execution models.
 
-The transport-facing `web::dispatch` seam exposes three operations:
+The transport-facing `web::dispatch` seam exposes four operations:
 
 ```text
-compile_runtime_routes(...)  -> validate package contracts + attach plans
-match_route(...)             -> match using compiled plan or legacy fallback
-render_direct_route(...)     -> invoke only fully bound typed handlers
+compile_runtime_routes(...)                -> validate source contracts + attach plans
+compile_runtime_routes_from_contracts(...) -> attach one validated contract set
+match_route(...)                           -> match using compiled plan or legacy fallback
+render_direct_route(...)                   -> invoke only fully bound typed handlers
 ```
 
 HTTP remains responsible for request lifecycle, headers, cookies, cancellation, and the existing request context during migration. The final dev-server call-site wiring should wrap both legacy and typed calls in that request lifecycle while selecting `render_direct_route(...)` only for `direct_call` plans.
@@ -123,9 +145,9 @@ The runtime should ultimately execute a route as an ephemeral supervised request
 
 ## Next implementation slices
 
-1. Wire `compile_runtime_routes`, compiled matching, and `render_direct_route` into `nula dev` / the existing `WebDevServer`, preserving the legacy request context around execution during migration.
-2. Make contract/binding diagnostics hard `nula build --web` and `nula dev` failures before serving or emitting deployment artifacts.
-3. Extend binding sources to query/body/header inputs and generate transport-independent response/error contracts and OpenAPI/client artifacts from the same IR.
+1. Wire the validated `RuntimeWebRoute` set, compiled matching, and `render_direct_route` into `nula dev` / the existing `WebDevServer`, preserving the legacy request context around execution only as a migration fallback.
+2. Invoke the authoritative validation boundary from `nula build --web` and `nula dev` before serving or emitting deployment artifacts.
+3. Teach the compiler to emit the reserved `query`, `header`, `cookie`, `body`, and `form` binding sources, then generate transport-independent response/error contracts and OpenAPI/client artifacts from the same IR.
 4. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
 5. Replace ambient request context and middleware dependency injection with effect handlers.
 6. Introduce authorization/resource capabilities separately from Nulang reference capabilities, including capability attenuation and capability-parameterized effects.
