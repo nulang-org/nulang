@@ -1,0 +1,55 @@
+name: Fix OpenAPI request fixture
+
+on:
+  push:
+    branches:
+      - fix/web-openapi-request-fixture
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/web-openapi-request-fixture
+          fetch-depth: 0
+
+      - name: Add request field to OpenAPI test fixture
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          path = Path("src/web/openapi.rs")
+          text = path.read_text()
+          old = '''            handler_params: vec![HandlerParamContract {
+              name: "id".to_string(),
+              ty: Some("UserId".to_string()),
+              capability: None,
+          }],'''
+          new = '''            handler_params: vec![HandlerParamContract {
+              name: "id".to_string(),
+              ty: Some("UserId".to_string()),
+              capability: None,
+              request: None,
+          }],'''
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one OpenAPI fixture anchor, found {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+      - name: Format and test OpenAPI module
+        run: |
+          cargo fmt --all
+          cargo test web::openapi::tests --lib
+
+      - name: Commit regression fix
+        run: |
+          rm .github/workflows/zz-ai-fix-openapi-fixture.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/web/openapi.rs .github/workflows/zz-ai-fix-openapi-fixture.yml
+          git commit -m "fix(web): update OpenAPI request binding fixture"
+          git push origin HEAD:fix/web-openapi-request-fixture
