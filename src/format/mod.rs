@@ -11,8 +11,10 @@
 //!
 //! - [`constants`] — magic bytes, version numbers, [`constants::FormatError`].
 //! - [`nbc`] — `CodeModule::to_nbc` / `from_nbc` and [`nbc::NbcArtifact`].
+//! - [`mobile_nbc`] — additive mobile-action authorization metadata.
 //! - [`migrate`] — the only legal place format-version upgrades live.
 
 pub mod constants;
 pub mod migrate;
+pub mod mobile_nbc;
 pub mod nbc;
