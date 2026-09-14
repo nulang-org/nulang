@@ -100,13 +100,12 @@ fn required_host_authority(
         }
         Ok(value)
     };
-    let other = |namespace: &str, operation: &str, argument: Option<String>| {
-        AuthorityGrant::Other {
+    let other =
+        |namespace: &str, operation: &str, argument: Option<String>| AuthorityGrant::Other {
             namespace: namespace.to_string(),
             operation: operation.to_string(),
             argument,
-        }
-    };
+        };
 
     let grant = match (effect_name, op_name) {
         ("FS", Some("read" | "exists")) => AuthorityGrant::FsRead {
@@ -118,9 +117,7 @@ fn required_host_authority(
         ("Web", Some("serve_static")) => AuthorityGrant::FsRead {
             path: string_arg(0)?,
         },
-        ("Realtime", Some("broadcast")) => {
-            other("Realtime", "Broadcast", Some(string_arg(0)?))
-        },
+        ("Realtime", Some("broadcast")) => other("Realtime", "Broadcast", Some(string_arg(0)?)),
         ("Env", Some("get")) => AuthorityGrant::EnvRead {
             name: string_arg(0)?,
         },
@@ -178,7 +175,8 @@ fn http_outbound_authority(url: &str) -> Result<crate::authority::AuthorityGrant
         .split(['/', '?', '#'])
         .next()
         .ok_or_else(|| "outbound HTTP URL has no authority".to_string())?;
-    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace) {
+    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace)
+    {
         return Err("outbound HTTP URL has invalid authority".to_string());
     }
 
@@ -253,7 +251,9 @@ fn authorize_actor_host_effect(
         .actors
         .get(&actor_id)
         .ok_or_else(|| format!("authority source actor {actor_id} is missing"))?;
-    actor.require_authority(&grant).map_err(|error| error.to_string())
+    actor
+        .require_authority(&grant)
+        .map_err(|error| error.to_string())
 }
 
 /// Enforce an exact actor-backed foreign-function authority grant.
@@ -282,7 +282,9 @@ pub(crate) fn authorize_actor_ffi(
         operation: "Call".to_string(),
         argument: Some(format!("{library}::{symbol}")),
     };
-    actor.require_authority(&grant).map_err(|error| error.to_string())
+    actor
+        .require_authority(&grant)
+        .map_err(|error| error.to_string())
 }
 
 /// Shared Web effect host implementation for all runtime callback types.
@@ -1206,15 +1208,8 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
     #[cfg(feature = "ai-runtime")]
     fn complete_llm(&mut self, model: &str, prompt: &str) -> Option<String> {
         let mut rt = self.runtime.borrow_mut();
-        if authorize_actor_host_effect(
-            &rt,
-            rt.current_actor,
-            "Inference",
-            Some("ask"),
-            &[],
-            &[],
-        )
-        .is_err()
+        if authorize_actor_host_effect(&rt, rt.current_actor, "Inference", Some("ask"), &[], &[])
+            .is_err()
         {
             return None;
         }
@@ -2550,7 +2545,6 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
     }
 }
 
-
 #[cfg(test)]
 mod migration_authority_tests {
     use super::migration_authority_tokens;
@@ -2599,7 +2593,9 @@ mod host_authority_tests {
             .iter()
             .map(|value| Constant::String((*value).to_string()))
             .collect();
-        let regs = (0..values.len()).map(|idx| Value::string(idx as u32)).collect();
+        let regs = (0..values.len())
+            .map(|idx| Value::string(idx as u32))
+            .collect();
         (constants, regs)
     }
 
@@ -2637,7 +2633,10 @@ mod host_authority_tests {
             "https://2001:db8::1/x",
             "https:///x",
         ] {
-            assert!(http_outbound_authority(url).is_err(), "{url} must be rejected");
+            assert!(
+                http_outbound_authority(url).is_err(),
+                "{url} must be rejected"
+            );
         }
     }
 
@@ -2654,7 +2653,9 @@ mod host_authority_tests {
         let (constants, regs) = string_args(&["HOME"]);
         assert_eq!(
             required_host_authority("Env", Some("get"), &constants, &regs).unwrap(),
-            Some(AuthorityGrant::EnvRead { name: "HOME".into() })
+            Some(AuthorityGrant::EnvRead {
+                name: "HOME".into()
+            })
         );
 
         let (constants, regs) = string_args(&["PAYMENTS_KEY"]);
@@ -2725,7 +2726,10 @@ mod host_authority_tests {
         let denied = callbacks
             .perform_builtin_effect_in_module("Web", Some("serve_static"), &module, &regs)
             .expect("denied Web.serve_static must be handled");
-        assert!(denied.is_nil(), "unprivileged actor must not read static file");
+        assert!(
+            denied.is_nil(),
+            "unprivileged actor must not read static file"
+        );
 
         {
             let mut rt = runtime.borrow_mut();
@@ -2752,7 +2756,8 @@ mod host_authority_tests {
     fn actor_host_access_is_deny_by_default_and_exact_match_only() {
         let mut rt = Runtime::new();
         let actor_id = 800_001;
-        rt.actors.insert(actor_id, Actor::new(actor_id, "host-authority", 8));
+        rt.actors
+            .insert(actor_id, Actor::new(actor_id, "host-authority", 8));
         let (constants, regs) = string_args(&["/tmp/allowed.txt"]);
 
         assert!(authorize_actor_host_effect(
@@ -2820,7 +2825,8 @@ mod host_authority_tests {
         let mut rt = Runtime::new();
         let actor_id = 800_003;
         let mut actor = Actor::new(actor_id, "host-network-authority", 8);
-        let manifest = AuthorityManifest::from_tokens(["Net::TcpOut(api.example.com:443)"]).unwrap();
+        let manifest =
+            AuthorityManifest::from_tokens(["Net::TcpOut(api.example.com:443)"]).unwrap();
         actor.install_authority_manifest(&manifest);
         rt.actors.insert(actor_id, actor);
 
@@ -2852,34 +2858,18 @@ mod host_authority_tests {
         let mut rt = Runtime::new();
         let actor_id = 800_004;
         let mut actor = Actor::new(actor_id, "host-ffi-authority", 8);
-        let manifest = AuthorityManifest::from_tokens([
-            "FFI::Call(libpayments.so::charge)"
-        ])
-        .unwrap();
+        let manifest =
+            AuthorityManifest::from_tokens(["FFI::Call(libpayments.so::charge)"]).unwrap();
         actor.install_authority_manifest(&manifest);
         rt.actors.insert(actor_id, actor);
 
-        assert!(super::authorize_actor_ffi(
-            &rt,
-            Some(actor_id),
-            "libpayments.so",
-            "charge",
-        )
-        .is_ok());
-        assert!(super::authorize_actor_ffi(
-            &rt,
-            Some(actor_id),
-            "libpayments.so",
-            "refund",
-        )
-        .is_err());
-        assert!(super::authorize_actor_ffi(
-            &rt,
-            Some(actor_id),
-            "libother.so",
-            "charge",
-        )
-        .is_err());
+        assert!(
+            super::authorize_actor_ffi(&rt, Some(actor_id), "libpayments.so", "charge",).is_ok()
+        );
+        assert!(
+            super::authorize_actor_ffi(&rt, Some(actor_id), "libpayments.so", "refund",).is_err()
+        );
+        assert!(super::authorize_actor_ffi(&rt, Some(actor_id), "libother.so", "charge",).is_err());
     }
 
     #[test]
@@ -2947,14 +2937,8 @@ mod host_authority_tests {
     fn actor_free_runtime_keeps_existing_ambient_host_contract() {
         let rt = Runtime::new();
         let (constants, regs) = string_args(&["/tmp/ambient.txt"]);
-        assert!(authorize_actor_host_effect(
-            &rt,
-            None,
-            "FS",
-            Some("read"),
-            &constants,
-            &regs,
-        )
-        .is_ok());
+        assert!(
+            authorize_actor_host_effect(&rt, None, "FS", Some("read"), &constants, &regs,).is_ok()
+        );
     }
 }

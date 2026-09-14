@@ -38,7 +38,10 @@ pub fn source_id_for_package_dir(root: &Path) -> io::Result<SourceId> {
     if !root_metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("package source directory does not exist: {}", root.display()),
+            format!(
+                "package source directory does not exist: {}",
+                root.display()
+            ),
         ));
     }
 
@@ -108,7 +111,10 @@ where
     let mut canonical_modules = BTreeMap::new();
     for (path, semantic_id) in modules {
         let path = normalize_logical_path(path.as_ref())?;
-        if canonical_modules.insert(path.clone(), semantic_id).is_some() {
+        if canonical_modules
+            .insert(path.clone(), semantic_id)
+            .is_some()
+        {
             return Err(PackageIdentityError::DuplicateModulePath(path));
         }
     }
@@ -143,10 +149,7 @@ fn collect_nula_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> io::Re
         }
         if file_type.is_dir() {
             let name = entry.file_name();
-            if matches!(
-                name.to_str(),
-                Some(".git") | Some(".nula") | Some("target")
-            ) {
+            if matches!(name.to_str(), Some(".git") | Some(".nula") | Some("target")) {
                 continue;
             }
             collect_nula_files(&path, files)?;

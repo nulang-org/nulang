@@ -175,10 +175,12 @@ where
     T: FromStr,
     T::Err: fmt::Display,
 {
-    value.parse::<T>().map_err(|error| ArtifactIdentityError::InvalidIdentity {
-        field,
-        message: error.to_string(),
-    })
+    value
+        .parse::<T>()
+        .map_err(|error| ArtifactIdentityError::InvalidIdentity {
+            field,
+            message: error.to_string(),
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,7 +289,10 @@ mod tests {
             ["lto=thin", "opt=3", "lto=thin"],
         );
         assert_eq!(first.artifact_id(), reordered.artifact_id());
-        assert_eq!(first.flags().collect::<Vec<_>>(), reordered.flags().collect::<Vec<_>>());
+        assert_eq!(
+            first.flags().collect::<Vec<_>>(),
+            reordered.flags().collect::<Vec<_>>()
+        );
     }
 
     #[test]

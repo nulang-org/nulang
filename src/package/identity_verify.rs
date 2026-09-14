@@ -33,13 +33,14 @@ impl Lockfile {
                 continue;
             }
 
-            let actual = source_id_for_package_dir(path).map_err(|error| NuError::PackageError {
-                msg: format!(
-                    "cannot verify source identity for locked package '{}' {} from {}: {}",
-                    identity.name, identity.version, identity.source, error
-                ),
-                span: Span::default(),
-            })?;
+            let actual =
+                source_id_for_package_dir(path).map_err(|error| NuError::PackageError {
+                    msg: format!(
+                        "cannot verify source identity for locked package '{}' {} from {}: {}",
+                        identity.name, identity.version, identity.source, error
+                    ),
+                    span: Span::default(),
+                })?;
             if actual != expected {
                 return Err(NuError::PackageError {
                     msg: format!(

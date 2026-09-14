@@ -4675,18 +4675,17 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
-        let authority_manifest = match crate::authority::AuthorityManifest::from_token_set(
-            &snapshot.authority_tokens,
-        ) {
-            Ok(manifest) => manifest,
-            Err(err) => {
-                warn!(
-                    "nulang-recover: refusing actor {} with invalid authority manifest: {}",
-                    actor_id, err
-                );
-                return None;
-            }
-        };
+        let authority_manifest =
+            match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    warn!(
+                        "nulang-recover: refusing actor {} with invalid authority manifest: {}",
+                        actor_id, err
+                    );
+                    return None;
+                }
+            };
         let workflow_events = self.persistence.read_workflow_events(actor_id);
         let is_workflow = self
             .recovery_modules
@@ -5085,7 +5084,8 @@ impl Runtime {
             .map_err(|err| NuError::RuntimeError {
                 msg: format!(
                     "invalid authority snapshot for virtual actor {}: {}",
-                    grain_id.actor_name(), err
+                    grain_id.actor_name(),
+                    err
                 ),
                 span: Span::new(0, 0),
             })?

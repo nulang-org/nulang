@@ -283,7 +283,6 @@ fn main() { spawn Child {} }
     assert!(rt.actors.contains_key(&900_001));
 }
 
-
 fn sorted_actor_manifests(rt: &Runtime) -> Vec<Vec<String>> {
     let mut manifests: Vec<Vec<String>> = rt
         .actors

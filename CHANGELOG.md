@@ -45,6 +45,46 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Runtime soundness & actor authority — 2026-09-14 (P0 stabilization gate, issues #181, #186, #165, #143)
+- **Raw `Value` provenance boundaries** (`src/vm.rs`, `src/wasm_runtime.rs`,
+  `src/wasmfx_runtime.rs`, `src/aot/`, `src/ffi/`, `src/runtime/`,
+  `tests/raw_value_provenance.rs`; issues #181, #186): the unchecked raw-bit
+  constructors are now `pub unsafe fn from_raw_unchecked` /
+  `pub unsafe fn from_bits_unchecked` with a boundary-specific `SAFETY:`
+  justification audited at every call site, and `Value::ptr` is an `unsafe fn`
+  whose contract requires a live, in-layout pointer (with a `compile_fail`
+  doctest against safe reintroduction). Externally supplied bits must enter
+  through the fail-closed `try_from_untrusted_bits` decoder, which rejects
+  pointer-tagged values before they can reach heap/GC dereference paths. The
+  VM allocation API exposes `ActorVmCallbacks::alloc_value` so normal heap
+  allocation constructs the pointer `Value` in one safe, provenance-preserving
+  operation. `docs/UNSAFE_AUDIT.md` F1/F1b are closed.
+- **Exact spawn-site authority** (`src/parser.rs`, `src/mir_codegen.rs`,
+  `src/vm.rs`, `src/runtime/callbacks.rs`, `src/authority_runtime.rs`,
+  `src/runtime/spawn.rs`, `src/runtime/persistence.rs`,
+  `tests/spawn_authority_provenance.rs`; issue #165): source-level spawn
+  capability grants now flow source → typed parse → MIR → bytecode metadata
+  keyed by exact Spawn PC → VM callback spawn-PC provenance → monotonic parent
+  delegation → child manifest install. Malformed, missing, ambiguous,
+  over-privileged, or legacy-durable-restart links fail closed before the
+  privileged child becomes observable; authority manifests survive durable
+  snapshots, SQLite persistence, and migration packets; the native/AOT backend
+  conforms to the same exact-site provenance as the VM (the behavior-index
+  compatibility bridge is removed); and externally observable host boundaries
+  (FS, env, secrets, network egress, FFI, process/system, DB, provider) are
+  grant-checked at the runtime callback layer. Remote `spawn @node` with
+  non-empty grants fails compilation as unsupported rather than dropping
+  authority.
+- **Transactional selective receive** (`src/runtime/mailbox.rs`,
+  `src/runtime/callbacks.rs`, `src/aot/codegen.rs`; issue #143): selective
+  receive and ORCA ownership now form one transactional lifecycle —
+  `ReceiveMatch`/`ReceiveWait` stage candidates in per-lane skip buffers
+  without taking ownership, `ReceiveCommit` establishes receiver-side ORCA
+  ownership exactly once, and abort/reset releases the staged state, so
+  guard-rejected messages can no longer accumulate ownership holds. The AOT
+  backend rejects selective-receive transactions at compile time (fail closed)
+  until native parity lands.
+
 ### Added since 1.0.0-frozen — 2026-09-14 (web contract dispatch hardening)
 - **Web request decoding fixes** (Experimental, `src/web/request_bindings.rs`,
   `src/web/bindings.rs`, `src/web/contracts.rs`, `src/web/dispatch.rs`).

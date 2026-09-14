@@ -1448,13 +1448,8 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
     fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
         unsafe {
             let rt = &*self.runtime;
-            crate::runtime::callbacks::authorize_actor_ffi(
-                rt,
-                rt.current_actor,
-                library,
-                symbol,
-            )
-            .is_ok()
+            crate::runtime::callbacks::authorize_actor_ffi(rt, rt.current_actor, library, symbol)
+                .is_ok()
         }
     }
 

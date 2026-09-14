@@ -101,9 +101,7 @@ fn run_native(source: &str) -> Result<Value, NuError> {
     // native program, whose bits were produced by this process's own AOT
     // codegen — never by an untrusted decoder — so reconstructing the Value
     // is sound and does not widen the untrusted-bit surface.
-    module
-        .run()
-        .map(|raw| unsafe { Value::from_raw(raw) })
+    module.run().map(|raw| unsafe { Value::from_raw(raw) })
 }
 
 fn explicit_resume_mir() -> mir::Module {
