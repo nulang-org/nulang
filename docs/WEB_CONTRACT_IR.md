@@ -152,6 +152,8 @@ render_direct_route(...)                   -> path-only compatibility API
 
 Both typed and legacy calls remain inside the existing request context during the migration period. This preserves current request helpers and response-cookie behavior while argument sourcing moves to compiler-owned bindings.
 
+Network-level regression coverage compiles real Nulang handlers and route contracts, starts `WebDevServer` on an ephemeral TCP port, and verifies successful typed query decoding, `400 application/problem+json` decode failures, and legacy route fallback over the wire.
+
 ## Decode failures and HTTP problems
 
 Request decoding distinguishes client input failures from compiler/runtime invariant failures:
@@ -260,8 +262,7 @@ The runtime should ultimately execute each route under lightweight supervised re
 
 1. Define an explicit request/response algebra (`Json[T]`, `Html`, bytes, streams, typed bodies/media) so Contract IR and OpenAPI can represent payloads without guessing.
 2. Add richer request decoders for optional/default values, repeated query parameters/collections, binary bodies, transparent aliases, and opaque/domain types.
-3. Add full socket-level regression tests covering compiler syntax through `WebDevServer`, including 400 problem responses and legacy fallback.
-4. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
-5. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.
-6. Introduce authorization/resource capabilities separately from Nulang reference capabilities, including attenuation and capability-parameterized effects.
-7. Unify HTTP, SSE, and WebSocket entry points over the same actor/effect/capability execution model.
+3. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
+4. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.
+5. Introduce authorization/resource capabilities separately from Nulang reference capabilities, including attenuation and capability-parameterized effects.
+6. Unify HTTP, SSE, and WebSocket entry points over the same actor/effect/capability execution model.
