@@ -16,11 +16,7 @@ pub const OPENAPI_VERSION: &str = "3.1.0";
 /// runtime still has HTML-oriented response behavior and the typed response
 /// algebra (`Json[T]`, `Html`, `Stream[T]`, etc.) has not landed yet. We retain
 /// the Nulang response/error type as extensions until that contract is explicit.
-pub fn generate_openapi(
-    contracts: &ContractCompilation,
-    title: &str,
-    version: &str,
-) -> Value {
+pub fn generate_openapi(contracts: &ContractCompilation, title: &str, version: &str) -> Value {
     let mut paths = Map::new();
 
     for route in &contracts.routes {
@@ -132,14 +128,7 @@ fn operation_for(route: &RouteContract) -> Value {
     if !route.effects.is_empty() {
         operation.insert(
             "x-nulang-effects".to_string(),
-            Value::Array(
-                route
-                    .effects
-                    .iter()
-                    .cloned()
-                    .map(Value::String)
-                    .collect(),
-            ),
+            Value::Array(route.effects.iter().cloned().map(Value::String).collect()),
         );
     }
     if let Some(placement) = &route.placement {
