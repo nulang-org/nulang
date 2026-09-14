@@ -2,12 +2,21 @@
 //!
 //! Request decoding itself stays independent of HTTP. This module is the thin
 //! boundary that serializes a [`RequestDecodeError`] as a problem response when
-//! the HTTP transport chooses to surface the failure to a client.
+//! an HTTP transport chooses to surface the failure to a client.
 
-use crate::runtime::http_server::HttpResponse;
 use crate::web::request_bindings::RequestDecodeError;
 
 pub const PROBLEM_JSON_CONTENT_TYPE: &str = "application/problem+json";
+
+/// Transport-facing problem response produced without depending on the runtime
+/// HTTP server implementation. Server adapters translate this DTO into their
+/// native response type at the outer boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProblemHttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
 
 /// Convert a typed request decode failure into an HTTP problem response.
 ///
@@ -15,13 +24,13 @@ pub const PROBLEM_JSON_CONTENT_TYPE: &str = "application/problem+json";
 /// input becomes 400, while impossible binding-plan states remain 500. Keeping
 /// that policy in the compiler/runtime error contract prevents HTTP adapters
 /// from independently reclassifying the same failure.
-pub fn request_decode_problem_response(error: &RequestDecodeError) -> HttpResponse {
+pub fn request_decode_problem_response(error: &RequestDecodeError) -> ProblemHttpResponse {
     let body = serde_json::to_vec(&error.problem_details()).unwrap_or_else(|_| {
-        br#"{"type":"urn:nulang:web:problem-serialization","title":"Internal Server Error","status":500}"#
+        br#"{\"type\":\"urn:nulang:web:problem-serialization\",\"title\":\"Internal Server Error\",\"status\":500}"#
             .to_vec()
     });
 
-    HttpResponse {
+    ProblemHttpResponse {
         status: error.http_status(),
         headers: vec![(
             "Content-Type".to_string(),
