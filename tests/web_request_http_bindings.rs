@@ -32,7 +32,11 @@ fn web_main() {
     );
 
     let contracts = compile_module_contracts(&module);
-    assert!(contracts.diagnostics.is_empty(), "{:?}", contracts.diagnostics);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
     assert_eq!(contracts.routes.len(), 1);
 
     let binding_compilation = compile_route_bindings(&contracts.routes[0]);
@@ -52,11 +56,8 @@ fn web_main() {
             "application/x-www-form-urlencoded; charset=utf-8".to_string(),
         ),
     ];
-    let captured = HttpRequestBindingInputs::capture(
-        "/users/42?limit=25",
-        &headers,
-        b"title=hello+world",
-    );
+    let captured =
+        HttpRequestBindingInputs::capture("/users/42?limit=25", &headers, b"title=hello+world");
     let values = captured.values(&path, &headers);
 
     let arguments = bind_request_arguments(
@@ -97,7 +98,11 @@ fn web_main() {
     );
     let contracts = compile_module_contracts(&module);
     let bindings = compile_route_bindings(&contracts.routes[0]);
-    assert!(bindings.diagnostics.is_empty(), "{:?}", bindings.diagnostics);
+    assert!(
+        bindings.diagnostics.is_empty(),
+        "{:?}",
+        bindings.diagnostics
+    );
 
     let path = HashMap::new();
     let headers = vec![("Content-Type".to_string(), "application/json".to_string())];

@@ -72,14 +72,11 @@ impl HttpRequestBindingInputs {
 fn is_urlencoded_form(headers: &[(String, String)]) -> bool {
     headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("content-type")
-            && value
-                .split(';')
-                .next()
-                .is_some_and(|media_type| {
-                    media_type
-                        .trim()
-                        .eq_ignore_ascii_case("application/x-www-form-urlencoded")
-                })
+            && value.split(';').next().is_some_and(|media_type| {
+                media_type
+                    .trim()
+                    .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+            })
     })
 }
 
@@ -123,17 +120,17 @@ mod tests {
 
     #[test]
     fn arbitrary_body_is_not_reinterpreted_as_form_data() {
-        let headers = vec![(
-            "Content-Type".to_string(),
-            "application/json".to_string(),
-        )];
+        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         let captured = HttpRequestBindingInputs::capture(
             "/users?active=true",
             &headers,
             br#"{\"title\":\"hello\"}"#,
         );
 
-        assert_eq!(captured.query.get("active").map(String::as_str), Some("true"));
+        assert_eq!(
+            captured.query.get("active").map(String::as_str),
+            Some("true")
+        );
         assert!(captured.form.is_empty());
         assert!(captured.body.is_some());
     }
