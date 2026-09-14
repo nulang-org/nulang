@@ -5,6 +5,7 @@
 
 struct NulangMobileApp {
     NulangRuntime *runtime;
+    NulangMobileActionRuntime *actions;
     int64_t module_handle;
 };
 
@@ -114,14 +115,32 @@ NulangMobileStatus nulang_mobile_app_new(
         return NULANG_MOBILE_ARTIFACT_ERROR;
     }
 
+    NulangMobileActionRuntime *actions =
+        nulang_mobile_action_runtime_new(nbc, nbc_len);
+    if (actions == NULL) {
+        nulang_runtime_free(runtime);
+        copy_error(error, error_len, "failed to create mobile action runtime");
+        return NULANG_MOBILE_RUNTIME_ERROR;
+    }
+    if (!nulang_mobile_action_runtime_is_ready(actions)) {
+        const char *action_error =
+            nulang_mobile_action_runtime_last_error(actions);
+        copy_error(error, error_len, action_error);
+        nulang_mobile_action_runtime_free(actions);
+        nulang_runtime_free(runtime);
+        return NULANG_MOBILE_ARTIFACT_ERROR;
+    }
+
     NulangMobileApp *app = (NulangMobileApp *)calloc(1, sizeof(*app));
     if (app == NULL) {
+        nulang_mobile_action_runtime_free(actions);
         nulang_runtime_free(runtime);
         copy_error(error, error_len, "failed to allocate mobile app handle");
         return NULANG_MOBILE_ALLOCATION_ERROR;
     }
 
     app->runtime = runtime;
+    app->actions = actions;
     app->module_handle = module_handle;
     g_callbacks = callbacks;
     g_active_app = app;
@@ -155,6 +174,37 @@ NulangMobileStatus nulang_mobile_app_run(
     return NULANG_MOBILE_OK;
 }
 
+NulangMobileStatus nulang_mobile_app_invoke_action(
+    NulangMobileApp *app,
+    const char *request_json,
+    const char **out_result_json,
+    char *error,
+    size_t error_len
+) {
+    if (out_result_json != NULL) {
+        *out_result_json = NULL;
+    }
+
+    if (app == NULL || app != g_active_app || app->actions == NULL ||
+        request_json == NULL || out_result_json == NULL) {
+        copy_error(error, error_len, "invalid mobile action arguments");
+        return NULANG_MOBILE_INVALID_ARGUMENT;
+    }
+
+    const char *result =
+        nulang_mobile_action_runtime_invoke(app->actions, request_json);
+    if (result == NULL) {
+        const char *action_error =
+            nulang_mobile_action_runtime_last_error(app->actions);
+        copy_error(error, error_len, action_error);
+        return NULANG_MOBILE_ACTION_ERROR;
+    }
+
+    *out_result_json = result;
+    copy_error(error, error_len, "");
+    return NULANG_MOBILE_OK;
+}
+
 void nulang_mobile_app_free(NulangMobileApp *app) {
     if (app == NULL) {
         return;
@@ -163,6 +213,11 @@ void nulang_mobile_app_free(NulangMobileApp *app) {
     if (app == g_active_app) {
         g_active_app = NULL;
         g_callbacks = (NulangMobileCallbacks){0};
+    }
+
+    if (app->actions != NULL) {
+        nulang_mobile_action_runtime_free(app->actions);
+        app->actions = NULL;
     }
 
     if (app->runtime != NULL) {
