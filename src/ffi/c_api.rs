@@ -66,6 +66,16 @@ impl NulangRuntime {
         handle
     }
 
+    /// Resolve an externally visible C module handle to the unique compiled
+    /// module it references. Public handles intentionally have fresh identity
+    /// even when compilation reuses a cached module, so they must never be
+    /// used directly as indices into `modules`.
+    fn module_index_for_handle(&self, module_handle: usize) -> Option<usize> {
+        let module_index = *self.module_handles.get(module_handle)?;
+        self.modules.get(module_index)?;
+        Some(module_index)
+    }
+
     fn compile(&mut self, source: &str) -> Option<usize> {
         self.clear_error();
 
@@ -96,7 +106,7 @@ impl NulangRuntime {
 
     fn run(&mut self, module_handle: usize) -> Option<Value> {
         self.clear_error();
-        let module_index = *self.module_handles.get(module_handle)?;
+        let module_index = self.module_index_for_handle(module_handle)?;
         let module = self.modules.get(module_index)?.clone();
         let mut vm = VM::new();
         vm.load_module(module);
@@ -116,7 +126,8 @@ impl NulangRuntime {
         args: &[NulangValue],
     ) -> Option<Value> {
         self.clear_error();
-        let module = self.modules.get(module_handle)?.clone();
+        let module_index = self.module_index_for_handle(module_handle)?;
+        let module = self.modules.get(module_index)?.clone();
         let offset = module.function_offset_by_name(name)?;
         let mut vm = VM::new();
         vm.load_module(module);
@@ -131,7 +142,8 @@ impl NulangRuntime {
     }
 
     fn add_module_string(&mut self, module_handle: usize, s: &str) -> Option<Value> {
-        let module = self.modules.get_mut(module_handle)?;
+        let module_index = self.module_index_for_handle(module_handle)?;
+        let module = self.modules.get_mut(module_index)?;
         let idx = module.add_string_constant(s);
         Some(Value::string(idx as u32))
     }
@@ -145,10 +157,13 @@ impl NulangRuntime {
             return value;
         }
         if let Some(bytes) = vm.string_bytes(value) {
-            if let Some(module) = self.modules.get_mut(module_handle) {
-                let id =
-                    module.add_string_constant(String::from_utf8_lossy(&bytes).into_owned()) as u32;
-                return Value::string(id);
+            if let Some(module_index) = self.module_index_for_handle(module_handle) {
+                if let Some(module) = self.modules.get_mut(module_index) {
+                    let id = module
+                        .add_string_constant(String::from_utf8_lossy(&bytes).into_owned())
+                        as u32;
+                    return Value::string(id);
+                }
             }
         }
         value
@@ -662,6 +677,36 @@ mod tests {
         let second_value = unsafe { nulang_run(rt, second) };
         assert_eq!(nulang_value_int(first_value), 42);
         assert_eq!(nulang_value_int(second_value), 42);
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_cached_compile_handle_supports_module_operations() {
+        let rt = nulang_runtime_new();
+        assert!(!rt.is_null());
+
+        let source = CString::new(
+            "fn len(s: String) -> Int { perform String.length(s) } len(\"\")",
+        )
+        .unwrap();
+        let first = unsafe { nulang_compile(rt, source.as_ptr()) };
+        let cached = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(first >= 0 && cached >= 0);
+        assert_ne!(first, cached);
+
+        let text = CString::new("cached").unwrap();
+        // SAFETY: rt, cached, and text are valid.
+        let arg = unsafe { nulang_module_string(rt, cached, text.as_ptr()) };
+        assert!(!nulang_value_is_nil(arg));
+
+        let args = [arg];
+        let name = CString::new("len").unwrap();
+        // SAFETY: rt and cached are valid, name is a valid C string, and args is live.
+        let result = unsafe {
+            nulang_call_function(rt, cached, name.as_ptr(), args.as_ptr(), args.len())
+        };
+        assert_eq!(nulang_value_int(result), 6);
 
         unsafe { nulang_runtime_free(rt) };
     }
