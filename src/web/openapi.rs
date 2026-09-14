@@ -4,6 +4,7 @@
 //! reparsing source. Runtime dispatch, deployment metadata, OpenAPI, and future
 //! client generators therefore describe the same validated route contracts.
 
+use crate::web::bindings::{compile_route_bindings, RouteBindingContract, RouteBindingSource};
 use crate::web::contracts::{ContractCompilation, RouteContract, RouteParamContract};
 use serde_json::{json, Map, Value};
 
@@ -47,7 +48,20 @@ pub fn generate_openapi(
 }
 
 fn operation_for(route: &RouteContract) -> Value {
-    let parameters: Vec<Value> = route.params.iter().map(path_parameter).collect();
+    // Path parameters continue to come directly from the route contract so
+    // legacy routes that still use ambient `Web.param` remain accurately
+    // described. Additional request parameters come from the compiler binding
+    // IR, which becomes the single source of truth for query/header/cookie
+    // metadata as those bindings are emitted by the frontend.
+    let mut parameters: Vec<Value> = route.params.iter().map(path_parameter).collect();
+    let binding_compilation = compile_route_bindings(route);
+    parameters.extend(
+        binding_compilation
+            .bindings
+            .iter()
+            .filter_map(binding_parameter),
+    );
+
     let operation_id = route.handler.clone().unwrap_or_else(|| {
         let suffix = route
             .path
@@ -89,6 +103,31 @@ fn operation_for(route: &RouteContract) -> Value {
     }
     operation.insert("responses".to_string(), Value::Object(responses));
 
+    if !binding_compilation.bindings.is_empty() {
+        operation.insert(
+            "x-nulang-request-bindings".to_string(),
+            Value::Array(
+                binding_compilation
+                    .bindings
+                    .iter()
+                    .map(binding_extension)
+                    .collect(),
+            ),
+        );
+    }
+    if !binding_compilation.diagnostics.is_empty() {
+        operation.insert(
+            "x-nulang-binding-diagnostics".to_string(),
+            Value::Array(
+                binding_compilation
+                    .diagnostics
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
     if !route.effects.is_empty() {
         operation.insert(
             "x-nulang-effects".to_string(),
@@ -125,6 +164,49 @@ fn path_parameter(param: &RouteParamContract) -> Value {
         "required": true,
         "schema": schema_for_type(param.ty.as_deref()),
     })
+}
+
+/// Convert request bindings that OpenAPI represents as parameters. Body and
+/// form inputs intentionally remain in `x-nulang-request-bindings` until the
+/// typed response/request algebra defines their media types and schemas.
+fn binding_parameter(binding: &RouteBindingContract) -> Option<Value> {
+    let location = match binding.source {
+        RouteBindingSource::Query => "query",
+        RouteBindingSource::Header => "header",
+        RouteBindingSource::Cookie => "cookie",
+        RouteBindingSource::Path | RouteBindingSource::Body | RouteBindingSource::Form => {
+            return None
+        }
+    };
+
+    Some(json!({
+        "name": binding.source_name,
+        "in": location,
+        "required": true,
+        "schema": schema_for_type(binding.ty.as_deref()),
+        "x-nulang-handler-param": binding.handler_param,
+    }))
+}
+
+fn binding_extension(binding: &RouteBindingContract) -> Value {
+    json!({
+        "source": binding_source_name(binding.source),
+        "source_name": binding.source_name,
+        "handler_param": binding.handler_param,
+        "handler_index": binding.handler_index,
+        "type": binding.ty,
+    })
+}
+
+fn binding_source_name(source: RouteBindingSource) -> &'static str {
+    match source {
+        RouteBindingSource::Path => "path",
+        RouteBindingSource::Query => "query",
+        RouteBindingSource::Header => "header",
+        RouteBindingSource::Cookie => "cookie",
+        RouteBindingSource::Body => "body",
+        RouteBindingSource::Form => "form",
+    }
 }
 
 fn schema_for_type(ty: Option<&str>) -> Value {
@@ -200,6 +282,16 @@ mod tests {
         }
     }
 
+    fn binding(source: RouteBindingSource, name: &str, ty: &str) -> RouteBindingContract {
+        RouteBindingContract {
+            source,
+            source_name: name.to_string(),
+            handler_param: format!("handler_{name}"),
+            handler_index: 0,
+            ty: Some(ty.to_string()),
+        }
+    }
+
     #[test]
     fn normalizes_route_templates() {
         assert_eq!(openapi_path("/users/:id"), "/users/{id}");
@@ -240,6 +332,23 @@ mod tests {
         assert!(operation["responses"]["200"].get("content").is_none());
         assert_eq!(operation["x-nulang-placement"], "server");
         assert_eq!(operation["x-nulang-effects"][0], "DB");
+        assert_eq!(operation["x-nulang-request-bindings"][0]["source"], "path");
+    }
+
+    #[test]
+    fn maps_non_path_bindings_to_openapi_parameters() {
+        let query = binding(RouteBindingSource::Query, "limit", "Int");
+        let header = binding(RouteBindingSource::Header, "X-Trace", "String");
+        let cookie = binding(RouteBindingSource::Cookie, "session", "String");
+        let body = binding(RouteBindingSource::Body, "body", "Payload");
+
+        let query_param = binding_parameter(&query).unwrap();
+        assert_eq!(query_param["in"], "query");
+        assert_eq!(query_param["schema"]["type"], "integer");
+        assert_eq!(binding_parameter(&header).unwrap()["in"], "header");
+        assert_eq!(binding_parameter(&cookie).unwrap()["in"], "cookie");
+        assert!(binding_parameter(&body).is_none());
+        assert_eq!(binding_extension(&body)["source"], "body");
     }
 
     #[test]
