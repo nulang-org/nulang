@@ -81,7 +81,10 @@ pub(crate) fn perform_web_builtin(
                     slots.write(a);
                     slots.add(1).write(b);
                 }
-                crate::vm::Value::ptr(ptr)
+                unsafe {
+                    /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                    crate::vm::Value::ptr(ptr)
+                }
             }
             None => crate::vm::Value::nil(),
         }
@@ -104,7 +107,10 @@ pub(crate) fn perform_web_builtin(
                         slots.add(i).write(*item);
                     }
                 }
-                crate::vm::Value::ptr(ptr)
+                unsafe {
+                    /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                    crate::vm::Value::ptr(ptr)
+                }
             }
             None => crate::vm::Value::nil(),
         }
@@ -307,7 +313,10 @@ impl RuntimeVmCallbacks {
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                     *ptr.add(bytes.len()) = 0;
                 }
-                crate::vm::Value::ptr(ptr)
+                unsafe {
+                    /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                    crate::vm::Value::ptr(ptr)
+                }
             }
             None => crate::vm::Value::nil(),
         }

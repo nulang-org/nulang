@@ -79,6 +79,15 @@ impl Default for HostState {
     }
 }
 
+/// Convert guest-produced raw bits into a host `Value` only when they cannot
+/// masquerade as a process-local host heap pointer. Inside WASM, `TAG_PTR`
+/// denotes a linear-memory offset and is valid guest state; it becomes unsafe
+/// only when those bits cross the guest/host boundary as a host `Value`.
+fn guest_non_pointer_value(raw: u64) -> Result<crate::vm::Value, &'static str> {
+    crate::vm::Value::try_from_untrusted_bits(raw)
+        .map_err(|_| "wasm guest pointer-tagged value has no host heap provenance")
+}
+
 // ── WASM Runtime ─────────────────────────────────────────────────────
 
 /// A compiled and instantiated WASM module ready to run.
@@ -240,7 +249,8 @@ impl WasmRuntime {
                 map_wasmtime_err(e)
             }
         })?;
-        Ok(crate::vm::Value::from_raw(raw as u64))
+        guest_non_pointer_value(raw as u64)
+            .map_err(|msg| NuError::runtime_error(msg.to_string(), Span::default()))
     }
 
     /// Resolve a tagged string `Value` (`TAG_STRING | offset`) to its text by
@@ -396,15 +406,20 @@ fn host_str_concat(mut caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<
         let mem = get_memory(&mut caller)?;
         let data = mem.data(&caller);
         let read = |v: i64| -> String {
-            if (v as u64 & value_layout::TAG_MASK) == value_layout::TAG_STRING {
-                let off = (v as u64 & value_layout::PAYLOAD_MASK) as usize;
+            let raw = v as u64;
+            if (raw & value_layout::TAG_MASK) == value_layout::TAG_STRING {
+                let off = (raw & value_layout::PAYLOAD_MASK) as usize;
                 let bytes: Vec<u8> = data
                     .get(off..)
                     .map(|s| s.iter().take_while(|&&c| c != 0).copied().collect())
                     .unwrap_or_default();
                 String::from_utf8_lossy(&bytes).into_owned()
+            } else if value_layout::is_ptr_raw(raw) {
+                // Preserve the interpreter's textual representation without
+                // converting a guest linear-memory pointer into a host Value.
+                format!("#Value({:x})", raw)
             } else {
-                crate::vm::Value::from_raw(v as u64).to_string_repr()
+                unsafe { crate::vm::Value::from_raw(raw) }.to_string_repr()
             }
         };
         (read(a), read(b))
@@ -561,8 +576,9 @@ fn host_neg(_caller: Caller<'_, HostState>, a: i64) -> Result<i64, Error> {
     } else {
         // Match the interpreter's INeg (and the JIT helper `nulang_ineg`):
         // ints negate with a 48-bit overflow check at INT48_MIN; anything
-        // else is a type error.
-        let v = crate::vm::Value::from_raw(a);
+        // else is a type error. A guest pointer remains valid guest-local
+        // state, but it cannot be reconstructed as a host pointer Value.
+        let v = guest_non_pointer_value(a).map_err(Error::msg)?;
         match v.as_int() {
             Some(x) if x != crate::value_layout::INT48_MIN => Ok(value_layout::tag_int(-x) as i64),
             Some(x) => Err(Error::msg(error_message(crate::vm::int_overflow_error(
@@ -638,16 +654,18 @@ fn host_ffi_call_impl(
             .map_err(|_| Error::msg("ffi resolve"))?
     };
     // Marshal CStr params from WASM memory into CStrings valid for the call.
+    // All other values must be safe to represent as host Values; in
+    // particular a guest TAG_PTR is a linear-memory offset, not a host pointer.
     let mut cstrings: Vec<std::ffi::CString> = Vec::new();
     let mut cargs: Vec<crate::vm::Value> = Vec::with_capacity(args.len());
     for (i, p) in params.iter().enumerate() {
         if *p == crate::ffi::marshal::CType::CStr {
             let s = read_wasm_string(&mut caller, args[i]);
             let c = std::ffi::CString::new(s).map_err(|_| Error::msg("bad cstr"))?;
-            cargs.push(crate::vm::Value::ptr(c.as_ptr() as *mut u8));
+            cargs.push(unsafe { /* SAFETY: host-side storage owns this pointer for the duration required by the guest/host bridge. */ crate::vm::Value::ptr(c.as_ptr() as *mut u8) });
             cstrings.push(c);
         } else {
-            cargs.push(crate::vm::Value::from_bits(args[i] as u64));
+            cargs.push(guest_non_pointer_value(args[i] as u64).map_err(Error::msg)?);
         }
     }
     // SAFETY: func.ptr points to a function whose ABI matches the signature.
@@ -1048,6 +1066,18 @@ pub fn load_precompiled(cwasm_bytes: &[u8]) -> NuResult<WasmRuntime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_non_pointer_value_rejects_host_pointer_tag() {
+        let err = guest_non_pointer_value(value_layout::TAG_PTR | 0x1234).unwrap_err();
+        assert!(err.contains("host heap provenance"));
+    }
+
+    #[test]
+    fn guest_non_pointer_value_accepts_scalar() {
+        let value = guest_non_pointer_value(value_layout::tag_int(42)).unwrap();
+        assert_eq!(value.as_int(), Some(42));
+    }
 
     #[test]
     fn test_default_config_creates() {
