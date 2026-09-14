@@ -17,6 +17,9 @@ use std::time::Duration;
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
 use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
+use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
+use crate::web::http_problem::request_decode_problem_response;
+use crate::web::http_request::HttpRequestBindingInputs;
 use crate::web::reactivity::inject_client_runtime_script;
 use crate::web::runtime_bindings::RuntimeWebRoute;
 
@@ -920,22 +923,26 @@ impl WebDevServer {
                                         .map(|params| (r, params))
                                 })
                             {
+                                let captured = HttpRequestBindingInputs::capture(
+                                    &request.path,
+                                    &request.headers,
+                                    &request.body,
+                                );
+                                let values = captured.values(&params, &request.headers);
                                 let ctx = RequestContext {
                                     request: request.clone(),
                                     params: params.clone(),
                                 };
                                 let rendered = with_request_context(ctx, || {
-                                    crate::web::dispatch::render_direct_route(route, &params).map(
-                                        |direct| {
-                                            direct.or_else(|| {
-                                                render_route_handler(
-                                                    &route.route.handler_module,
-                                                    route.route.handler_func_idx,
-                                                    None,
-                                                )
-                                            })
-                                        },
-                                    )
+                                    match render_direct_request(route, &values) {
+                                        Ok(Some(rendered)) => Ok(Some(rendered)),
+                                        Ok(None) => Ok(render_route_handler(
+                                            &route.route.handler_module,
+                                            route.route.handler_func_idx,
+                                            None,
+                                        )),
+                                        Err(error) => Err(error),
+                                    }
                                 });
                                 match rendered {
                                     Ok(Some(html)) => HttpResponse {
@@ -951,7 +958,15 @@ impl WebDevServer {
                                         headers: vec![("Content-Type".into(), "text/plain".into())],
                                         body: b"Internal server error".to_vec(),
                                     },
-                                    Err(error) => {
+                                    Err(DirectRequestRenderError::Decode(error)) => {
+                                        let problem = request_decode_problem_response(&error);
+                                        HttpResponse {
+                                            status: problem.status,
+                                            headers: problem.headers,
+                                            body: problem.body,
+                                        }
+                                    }
+                                    Err(DirectRequestRenderError::Execution(error)) => {
                                         eprintln!("typed route dispatch error: {error}");
                                         HttpResponse {
                                             status: 500,
