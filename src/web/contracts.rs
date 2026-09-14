@@ -9,7 +9,9 @@
 //! IR format is ready for typed route syntax without forcing a runtime migration
 //! in the same change.
 
-use crate::ast::{AstModule, Decl, Expr, FunctionAnnotation, Literal, Param, WorkflowItem};
+use crate::ast::{
+    AstModule, Decl, Expr, FunctionAnnotation, Literal, Param, WebRequestParamSource, WorkflowItem,
+};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::types::EffectRow;
@@ -25,11 +27,30 @@ pub struct RouteParamContract {
     pub ty: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestParamSource {
+    Path,
+    Query,
+    Header,
+    Cookie,
+    Body,
+    Form,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestParamBindingContract {
+    pub source: RequestParamSource,
+    pub source_name: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandlerParamContract {
     pub name: String,
     pub ty: Option<String>,
     pub capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<RequestParamBindingContract>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +83,7 @@ pub struct ContractCompilation {
 #[derive(Clone)]
 struct FunctionMeta {
     params: Vec<Param>,
+    request_bindings: HashMap<String, RequestParamBindingContract>,
     response_type: Option<String>,
     error_type: Option<String>,
     effects: Vec<String>,
@@ -89,11 +111,29 @@ impl FunctionMeta {
             FunctionAnnotation::Placement(p) => Some(p.to_string()),
             _ => None,
         });
+        let request_bindings = annotations
+            .iter()
+            .filter_map(|annotation| match annotation {
+                FunctionAnnotation::RequestBinding {
+                    param,
+                    source,
+                    source_name,
+                } => Some((
+                    param.clone(),
+                    RequestParamBindingContract {
+                        source: request_source_contract(*source),
+                        source_name: source_name.clone(),
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
 
         Some((
             name.clone(),
             Self {
                 params: params.clone(),
+                request_bindings,
                 response_type: ret_type.as_ref().map(ToString::to_string),
                 error_type: error_type.as_ref().map(ToString::to_string),
                 effects: effect_names(effect.as_ref()),
@@ -221,6 +261,7 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
                 handler_name.as_deref().unwrap_or("<handler>"),
                 &mut params,
                 &meta.params,
+                &meta.request_bindings,
                 &transparent_aliases,
                 &mut out.diagnostics,
             );
@@ -232,7 +273,14 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
             handler: handler_name,
             params,
             handler_params: meta
-                .map(|m| m.params.iter().map(handler_param_contract).collect())
+                .map(|m| {
+                    m.params
+                        .iter()
+                        .map(|param| {
+                            handler_param_contract(param, m.request_bindings.get(&param.name))
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
             response_type: meta.and_then(|m| m.response_type.clone()),
             error_type: meta.and_then(|m| m.error_type.clone()),
@@ -256,13 +304,21 @@ fn validate_and_infer_param_types(
     handler_name: &str,
     route_params: &mut [RouteParamContract],
     handler_params: &[Param],
+    request_bindings: &HashMap<String, RequestParamBindingContract>,
     transparent_aliases: &HashMap<String, String>,
     diagnostics: &mut Vec<String>,
 ) {
     for route_param in route_params {
-        let handler_param = handler_params
-            .iter()
-            .find(|param| param.name == route_param.name);
+        let handler_param =
+            handler_params
+                .iter()
+                .find(|param| match request_bindings.get(&param.name) {
+                    Some(binding) => {
+                        binding.source == RequestParamSource::Path
+                            && binding.source_name == route_param.name
+                    }
+                    None => param.name == route_param.name,
+                });
         let handler_ty = handler_param
             .and_then(|param| param.ty.as_ref())
             .map(ToString::to_string);
@@ -304,11 +360,26 @@ fn canonical_type_name(name: &str, aliases: &HashMap<String, String>) -> String 
     current
 }
 
-fn handler_param_contract(param: &Param) -> HandlerParamContract {
+fn request_source_contract(source: WebRequestParamSource) -> RequestParamSource {
+    match source {
+        WebRequestParamSource::Path => RequestParamSource::Path,
+        WebRequestParamSource::Query => RequestParamSource::Query,
+        WebRequestParamSource::Header => RequestParamSource::Header,
+        WebRequestParamSource::Cookie => RequestParamSource::Cookie,
+        WebRequestParamSource::Body => RequestParamSource::Body,
+        WebRequestParamSource::Form => RequestParamSource::Form,
+    }
+}
+
+fn handler_param_contract(
+    param: &Param,
+    request: Option<&RequestParamBindingContract>,
+) -> HandlerParamContract {
     HandlerParamContract {
         name: param.name.clone(),
         ty: param.ty.as_ref().map(ToString::to_string),
         capability: param.cap.map(|cap| cap.to_string()),
+        request: request.cloned(),
     }
 }
 
