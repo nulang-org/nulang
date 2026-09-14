@@ -52,7 +52,7 @@ fn operation_for(route: &RouteContract) -> Value {
         let suffix = route
             .path
             .trim_matches('/')
-            .replace(['/', ':', '{', '}', ' '], "_");
+            .replace(|c: char| matches!(c, '/' | ':' | '{' | '}' | ' '), "_");
         format!("{}_{}", route.method.to_ascii_lowercase(), suffix)
             .trim_end_matches('_')
             .to_string()
