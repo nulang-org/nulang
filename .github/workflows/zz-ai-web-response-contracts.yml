@@ -18,6 +18,96 @@ jobs:
           ref: feat/web-response-contracts
           fetch-depth: 0
 
+      - name: Preserve declared return type metadata
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one anchor, found {count}: {old[:100]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "src/ast.rs",
+              "    RequestBinding {\n        param: String,\n        source: WebRequestParamSource,\n        source_name: String,\n    },\n",
+              "    RequestBinding {\n        param: String,\n        source: WebRequestParamSource,\n        source_name: String,\n    },\n    /// Parser-retained source spelling of a declared function return type.\n    /// Semantic typing continues to use the resolved `ret_type`; analysis\n    /// consumers such as Web Contract IR can use this when transparent aliases\n    /// carry protocol meaning (`Json[T] = String`).\n    DeclaredReturnType(String),\n",
+          )
+
+          parser = Path("src/parser.rs")
+          text = parser.read_text()
+          marker = "    fn parse_function(\n        &mut self,\n        public: bool,\n        mut annotations: Vec<FunctionAnnotation>,\n    ) -> NuResult<Decl> {\n"
+          helper = r'''    fn declared_type_spelling(tokens: &[Token]) -> String {
+              let mut out = String::new();
+              for token in tokens {
+                  match &token.kind {
+                      TokenKind::Ident(name) | TokenKind::UpperIdent(name) => out.push_str(name),
+                      TokenKind::Newline | TokenKind::DocComment(_) => {}
+                      TokenKind::Comma => out.push_str(", "),
+                      TokenKind::Colon => out.push_str(": "),
+                      TokenKind::Arrow => out.push_str(" -> "),
+                      TokenKind::Pipe => out.push_str(" | "),
+                      TokenKind::Iso => out.push_str("iso "),
+                      TokenKind::Trn => out.push_str("trn "),
+                      TokenKind::Ref => out.push_str("ref "),
+                      TokenKind::Val => out.push_str("val "),
+                      TokenKind::Box => out.push_str("box "),
+                      TokenKind::Tag => out.push_str("tag "),
+                      TokenKind::LinearIso => out.push_str("lineariso "),
+                      TokenKind::Linear => out.push_str("linear "),
+                      kind => out.push_str(&kind.to_string()),
+                  }
+              }
+              out.trim().to_string()
+          }
+
+'''
+          if text.count(marker) != 1:
+              raise SystemExit("src/parser.rs: parse_function anchor mismatch")
+          text = text.replace(marker, helper + marker, 1)
+          old_ret = """        let ret_type = if self.consume_if(&TokenKind::Arrow) {
+              Some(self.parse_type()?)
+          } else {
+              None
+          };
+"""
+          new_ret = """        let ret_type = if self.consume_if(&TokenKind::Arrow) {
+              let declared_type_start = self.pos;
+              let resolved = self.parse_type()?;
+              let declared = Self::declared_type_spelling(
+                  &self.tokens[declared_type_start..self.pos],
+              );
+              if !declared.is_empty() {
+                  annotations.push(FunctionAnnotation::DeclaredReturnType(declared));
+              }
+              Some(resolved)
+          } else {
+              None
+          };
+"""
+          if text.count(old_ret) < 1:
+              raise SystemExit("src/parser.rs: return type anchor missing")
+          # The first exact occurrence is parse_function; other parser surfaces
+          # intentionally keep only semantic Type values.
+          text = text.replace(old_ret, new_ret, 1)
+          parser.write_text(text)
+
+          replace_once(
+              "src/web/contracts.rs",
+              "        let placement = annotations.iter().find_map(|annotation| match annotation {\n            FunctionAnnotation::Placement(p) => Some(p.to_string()),\n            _ => None,\n        });\n",
+              "        let placement = annotations.iter().find_map(|annotation| match annotation {\n            FunctionAnnotation::Placement(p) => Some(p.to_string()),\n            _ => None,\n        });\n        let declared_response_type = annotations.iter().find_map(|annotation| match annotation {\n            FunctionAnnotation::DeclaredReturnType(ty) => Some(ty.clone()),\n            _ => None,\n        });\n",
+          )
+          replace_once(
+              "src/web/contracts.rs",
+              "                response_type: ret_type.as_ref().map(ToString::to_string),\n",
+              "                response_type: declared_response_type\n                    .or_else(|| ret_type.as_ref().map(ToString::to_string)),\n",
+          )
+          PY
+
       - name: Wire response contracts through Web stack
         shell: bash
         run: |
@@ -29,18 +119,15 @@ jobs:
               text = p.read_text()
               count = text.count(old)
               if count != 1:
-                  raise SystemExit(f"{path}: expected one anchor, found {count}: {old[:80]!r}")
+                  raise SystemExit(f"{path}: expected one anchor, found {count}: {old[:100]!r}")
               p.write_text(text.replace(old, new, 1))
 
-          # Export the response contract module.
           replace_once(
               "src/web/mod.rs",
               "pub mod request_bindings;\npub mod route_check;",
               "pub mod request_bindings;\npub mod response;\npub mod route_check;",
           )
 
-          # Add the first explicit serialized JSON response marker. T describes
-          # the payload schema while the runtime representation remains String.
           replace_once(
               "src/stdlib/web/types.nula",
               "// These are compile-time distinctions only; at runtime they erase to their\n// underlying String representation. The typechecker enforces opacity so\n// user code cannot accidentally pass a raw String where escaped Html is\n// required.\n",
@@ -52,8 +139,6 @@ jobs:
               "/// Serialized JSON response body. `T` documents the logical payload schema;\n/// the runtime representation is the already-serialized String.\npub type alias Json[T] = String\n\n/// Escaped HTML document fragment. Distinct from String at compile time.\nopaque type Html = String\n",
           )
 
-          # Runtime plans carry the same compiler-owned response descriptor used
-          # by OpenAPI and deployment IR.
           replace_once(
               "src/web/runtime_bindings.rs",
               "use crate::web::contracts::{ContractCompilation, RouteContract};\n",
@@ -69,16 +154,12 @@ jobs:
               "        handler_param_count: contract.handler_params.len(),\n        direct_call,\n",
               "        handler_param_count: contract.handler_params.len(),\n        response: response_contract(contract.response_type.as_deref()),\n        direct_call,\n",
           )
-
-          # Fix the only hand-built RuntimeRoutePlan in lib tests.
           replace_once(
               "src/web/dispatch.rs",
               "            handler_param_count,\n            direct_call: false,\n",
               "            handler_param_count,\n            response: None,\n            direct_call: false,\n",
           )
 
-          # Deployment IR exposes the additive structured response contract while
-          # retaining response_type for v1 compatibility.
           replace_once(
               "src/web/ir.rs",
               "use crate::web::package_contracts::compile_contracts_from_tree;\n",
@@ -95,8 +176,6 @@ jobs:
               "            response_type: contract.and_then(|c| c.response_type.clone()),\n            response: contract.and_then(|c| response_contract(c.response_type.as_deref())),\n            error_type: contract.and_then(|c| c.error_type.clone()),\n",
           )
 
-          # OpenAPI consumes the same response descriptor rather than inventing
-          # media types independently.
           replace_once(
               "src/web/openapi.rs",
               "use crate::web::contracts::{ContractCompilation, RouteContract, RouteParamContract};\n",
@@ -140,8 +219,6 @@ jobs:
               raise SystemExit("src/web/openapi.rs: response helper insertion anchor mismatch")
           p.write_text(text.replace(marker, insert + marker, 1))
 
-          # HTTP response construction now delegates Content-Type and hydration
-          # injection to the attached response contract.
           replace_once(
               "src/runtime/http_server.rs",
               "                                    Ok(Some(html)) => HttpResponse {\n                                        status: 200,\n                                        headers: vec![(\n                                            \"Content-Type\".into(),\n                                            \"text/html; charset=utf-8\".into(),\n                                        )],\n                                        body: inject_client_runtime_script(&html).into_bytes(),\n                                    },\n",
@@ -239,6 +316,10 @@ jobs:
           "#;
               let contracts = compile_module_contracts(&parse(contract_source));
               assert!(contracts.diagnostics.is_empty(), "{:?}", contracts.diagnostics);
+              assert_eq!(
+                  contracts.routes[0].response_type.as_deref(),
+                  Some("Json[String]")
+              );
               let plan = compile_runtime_route_plan(&contracts.routes[0])
                   .expect("compile response-aware runtime route plan");
               assert_eq!(
@@ -356,6 +437,7 @@ jobs:
       - name: Test response contract seams
         run: |
           cargo test web::response::tests --lib
+          cargo test web::contracts::tests --lib
           cargo test web::openapi::tests --lib
           cargo test web::runtime_bindings::tests --lib
           cargo test --test web_response_contracts
@@ -367,6 +449,6 @@ jobs:
           rm .github/workflows/zz-ai-web-response-contracts.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/web/response.rs src/web/mod.rs src/stdlib/web/types.nula src/web/runtime_bindings.rs src/web/dispatch.rs src/web/ir.rs src/web/openapi.rs src/runtime/http_server.rs tests/web_response_contracts.rs .github/workflows/zz-ai-web-response-contracts.yml
+          git add src/ast.rs src/parser.rs src/web/contracts.rs src/web/response.rs src/web/mod.rs src/stdlib/web/types.nula src/web/runtime_bindings.rs src/web/dispatch.rs src/web/ir.rs src/web/openapi.rs src/runtime/http_server.rs tests/web_response_contracts.rs .github/workflows/zz-ai-web-response-contracts.yml
           git commit -m "feat(web): add explicit response media contracts"
           git push origin HEAD:feat/web-response-contracts
