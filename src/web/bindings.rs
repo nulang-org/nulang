@@ -119,6 +119,20 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
         });
     }
 
+    // A handler parameter with neither a request binding nor a same-named
+    // route parameter is unbound: direct dispatch would stage nothing for its
+    // slot and the legacy zero-argument fallback would feed it the closure
+    // value or stale registers (ClosureCall copies the whole register bank).
+    let bound_slots: HashSet<usize> = out.bindings.iter().map(|binding| binding.handler_index).collect();
+    for (handler_index, handler_param) in contract.handler_params.iter().enumerate() {
+        if handler_param.request.is_none() && !bound_slots.contains(&handler_index) {
+            out.diagnostics.push(format!(
+                "{} {}: handler parameter '{}' has no request binding and no matching route parameter",
+                contract.method, contract.path, handler_param.name
+            ));
+        }
+    }
+
     out.bindings.sort_by_key(|binding| binding.handler_index);
     out
 }
@@ -226,6 +240,26 @@ mod tests {
         assert!(compiled.bindings.is_empty());
         assert_eq!(compiled.diagnostics.len(), 1);
         assert!(compiled.diagnostics[0].contains("has no same-named parameter"));
+    }
+
+    #[test]
+    fn unbound_handler_param_is_diagnostic() {
+        // A declared handler parameter with neither a request binding nor a
+        // same-named route capture would be fed the closure value by the
+        // legacy fallback (ClosureCall copies the whole register bank), so it
+        // must fail the plan instead.
+        let mut contract = route("/users/{id: UserId}");
+        contract.handler_params.push(HandlerParamContract {
+            name: "page".to_string(),
+            ty: Some("Int".to_string()),
+            capability: None,
+            request: None,
+        });
+        let compiled = compile_route_bindings(&contract);
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("'page' has no request binding")));
     }
 
     #[test]

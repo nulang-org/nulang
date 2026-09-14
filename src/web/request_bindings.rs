@@ -321,26 +321,29 @@ pub fn parse_cookie_header(header: &str) -> HashMap<String, String> {
 }
 
 fn percent_decode(input: &str) -> String {
+    // Decode into bytes first: pushing individual bytes as chars would
+    // widen each UTF-8 continuation byte into a separate code point,
+    // corrupting every non-ASCII value ("é" -> "Ã©").
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'+' {
-            out.push(' ');
+            out.push(b' ');
             i += 1;
             continue;
         }
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(a), Some(b)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push(((a << 4) | b) as char);
+                out.push((a << 4) | b);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex(byte: u8) -> Option<u8> {
@@ -501,5 +504,17 @@ mod tests {
                 .map(String::as_str),
             Some("dark mode")
         );
+    }
+
+    #[test]
+    fn percent_decode_preserves_non_ascii_utf8() {
+        // Raw and percent-encoded UTF-8 must survive decoding intact.
+        assert_eq!(percent_decode("café"), "café");
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        assert_eq!(percent_decode("Jos%C3%A9+M%C3%BCller"), "José Müller");
+        assert_eq!(percent_decode("100%E2%82%AC"), "100€");
+        // Malformed sequences pass through rather than corrupting neighbors.
+        assert_eq!(percent_decode("100%ZZ"), "100%ZZ");
+        assert_eq!(percent_decode("truncated%4"), "truncated%4");
     }
 }

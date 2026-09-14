@@ -83,6 +83,14 @@ pub struct ContractCompilation {
 #[derive(Clone)]
 struct FunctionMeta {
     params: Vec<Param>,
+    /// `using` parameters: appended to the compiled function's parameter list
+    /// by HIR lowering, so the VM function's arity exceeds `params.len()`.
+    /// Request bindings can never supply them.
+    using_params: Vec<Param>,
+    /// Typeclass dictionary parameters appended by HIR lowering (one per
+    /// constraint class). Like `using_params`, they extend the VM arity
+    /// beyond what a route binding plan can stage.
+    dict_param_count: usize,
     request_bindings: HashMap<String, RequestParamBindingContract>,
     response_type: Option<String>,
     error_type: Option<String>,
@@ -96,6 +104,8 @@ impl FunctionMeta {
         let Decl::Function {
             name,
             params,
+            type_param_constraints,
+            using_params,
             ret_type,
             error_type,
             effect,
@@ -106,6 +116,11 @@ impl FunctionMeta {
         else {
             return None;
         };
+
+        let dict_param_count = type_param_constraints
+            .iter()
+            .map(|(_, _, classes)| classes.len())
+            .sum();
 
         let placement = annotations.iter().find_map(|annotation| match annotation {
             FunctionAnnotation::Placement(p) => Some(p.to_string()),
@@ -133,6 +148,8 @@ impl FunctionMeta {
             name.clone(),
             Self {
                 params: params.clone(),
+                using_params: using_params.clone(),
+                dict_param_count,
                 request_bindings,
                 response_type: ret_type.as_ref().map(ToString::to_string),
                 error_type: error_type.as_ref().map(ToString::to_string),
@@ -255,6 +272,29 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
         };
 
         if let Some(meta) = meta {
+            if !meta.using_params.is_empty() || meta.dict_param_count > 0 {
+                // HIR lowering appends `using` and typeclass-dictionary
+                // parameters to the compiled function, so the VM arity exceeds
+                // the request-bound parameter list. A binding plan built from
+                // `params` alone would stage the closure into a parameter slot
+                // (ClosureCall copies the whole register bank). Reject the
+                // route instead of emitting a wrong-arity plan.
+                let extra = [
+                    (!meta.using_params.is_empty())
+                        .then(|| format!("{} using", meta.using_params.len())),
+                    (meta.dict_param_count > 0)
+                        .then(|| format!("{} typeclass dictionary", meta.dict_param_count)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" and ");
+                out.diagnostics.push(format!(
+                    "{method} {path}: handler '{}' has {extra} parameters that request bindings cannot supply",
+                    handler_name.as_deref().unwrap_or("<handler>"),
+                ));
+                continue;
+            }
             validate_and_infer_param_types(
                 &method,
                 &path,
@@ -734,5 +774,48 @@ fn web_main() {
         assert_eq!(compiled.diagnostics.len(), 1);
         assert!(compiled.diagnostics[0].contains("typed as ExternalId"));
         assert!(compiled.diagnostics[0].contains("declares String"));
+    }
+
+    #[test]
+    fn using_params_on_route_handler_is_diagnostic() {
+        // HIR lowering appends using/typeclass-dictionary parameters to the
+        // compiled function; a binding plan built from `params` alone would
+        // stage the closure into a parameter slot.
+        let module = parse(
+            r#"
+fn show(id: Int) using (log: Int) -> String {
+    "ok"
+}
+
+fn web_main() {
+    perform Web.route("GET", "/users/{id: Int}", show)
+}
+"#,
+        );
+
+        let compiled = compile_module_contracts(&module);
+        assert_eq!(compiled.diagnostics.len(), 1);
+        assert!(compiled.diagnostics[0].contains("using"));
+        assert!(compiled.routes.is_empty());
+    }
+
+    #[test]
+    fn typeclass_constraints_on_route_handler_is_diagnostic() {
+        let module = parse(
+            r#"
+fn show[T: Show](x: T) -> String {
+    "ok"
+}
+
+fn web_main() {
+    perform Web.route("GET", "/users/{x: Int}", show)
+}
+"#,
+        );
+
+        let compiled = compile_module_contracts(&module);
+        assert_eq!(compiled.diagnostics.len(), 1);
+        assert!(compiled.diagnostics[0].contains("typeclass dictionary"));
+        assert!(compiled.routes.is_empty());
     }
 }
