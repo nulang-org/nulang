@@ -91,10 +91,9 @@ mod tests {
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "nulang_web_dispatch_{}_{}_{}",
+            "nulang_web_dispatch_{}_{}",
             label,
-            std::process::id(),
-            std::thread::current().name().unwrap_or("unnamed")
+            std::process::id()
         ))
     }
 
