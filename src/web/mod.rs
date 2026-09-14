@@ -3,6 +3,7 @@ pub mod bindings;
 pub mod budget;
 pub mod contracts;
 pub mod dispatch;
+pub mod handler_call;
 pub mod http_problem;
 pub mod ir;
 pub mod modules;
