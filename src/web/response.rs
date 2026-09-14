@@ -18,7 +18,11 @@ pub enum ResponseBodyKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseContract {
     pub kind: ResponseBodyKind,
+    /// Base media type, suitable for protocol metadata such as OpenAPI content
+    /// keys. HTTP-specific parameters such as a charset remain separate.
     pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_type: Option<String>,
     /// Whether the HTML browser runtime should be injected into the rendered
@@ -30,7 +34,8 @@ impl ResponseContract {
     fn html() -> Self {
         Self {
             kind: ResponseBodyKind::Html,
-            media_type: "text/html; charset=utf-8".to_string(),
+            media_type: "text/html".to_string(),
+            charset: Some("utf-8".to_string()),
             payload_type: None,
             inject_client_runtime: true,
         }
@@ -40,8 +45,17 @@ impl ResponseContract {
         Self {
             kind: ResponseBodyKind::Json,
             media_type: "application/json".to_string(),
+            charset: None,
             payload_type: Some(payload_type),
             inject_client_runtime: false,
+        }
+    }
+
+    /// HTTP `Content-Type` derived from the transport-neutral response contract.
+    pub fn http_content_type(&self) -> String {
+        match &self.charset {
+            Some(charset) => format!("{}; charset={charset}", self.media_type),
+            None => self.media_type.clone(),
         }
     }
 }
@@ -75,7 +89,9 @@ mod tests {
     fn recognizes_html_without_reclassifying_string() {
         let html = response_contract(Some("Html")).unwrap();
         assert_eq!(html.kind, ResponseBodyKind::Html);
-        assert_eq!(html.media_type, "text/html; charset=utf-8");
+        assert_eq!(html.media_type, "text/html");
+        assert_eq!(html.charset.as_deref(), Some("utf-8"));
+        assert_eq!(html.http_content_type(), "text/html; charset=utf-8");
         assert!(html.inject_client_runtime);
         assert!(response_contract(Some("String")).is_none());
         assert!(response_contract(None).is_none());
@@ -86,6 +102,8 @@ mod tests {
         let json = response_contract(Some("Json[Result[User, ApiError]]")).unwrap();
         assert_eq!(json.kind, ResponseBodyKind::Json);
         assert_eq!(json.media_type, "application/json");
+        assert_eq!(json.charset, None);
+        assert_eq!(json.http_content_type(), "application/json");
         assert_eq!(
             json.payload_type.as_deref(),
             Some("Result[User, ApiError]")
