@@ -6,7 +6,7 @@ use crate::web::runtime_bindings::BoundRouteArgument;
 use std::collections::HashMap;
 use std::fmt;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RequestBindingValues<'a> {
     pub path: &'a HashMap<String, String>,
     pub query: &'a HashMap<String, String>,
