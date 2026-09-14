@@ -175,7 +175,8 @@ OpenAPI 3.1 generation consumes the same `ContractCompilation` and binding IR; i
 - header bindings become header parameters.
 - cookie bindings become cookie parameters.
 - all request bindings are retained in `x-nulang-request-bindings`.
-- body/form bindings remain Nulang extensions until the request algebra defines media-type/schema semantics strongly enough to emit OpenAPI `requestBody` without guessing.
+- form bindings become an `application/x-www-form-urlencoded` OpenAPI `requestBody`, because the HTTP transport now defines that media type explicitly.
+- raw whole-body bindings remain Nulang extensions until the request algebra defines their media type/schema semantics without guessing.
 - Nulang response/error types, effects, placement, and reference capabilities remain extensions where OpenAPI has no exact equivalent yet.
 
 This keeps runtime dispatch and generated API metadata on the same compiler-owned contract.
