@@ -4,7 +4,7 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -144,6 +144,12 @@ pub struct ActorSnapshot {
     /// and `perform Crdt.*` keeps working after a restart.
     #[serde(default)]
     pub crdt_field_map: Option<HashMap<String, u64>>,
+    /// Canonical external-authority tokens held by the actor at the time
+    /// of the snapshot. Missing on pre-authority snapshots means empty
+    /// authority (deny by default). Values are reparsed as a complete
+    /// typed manifest before any recovered actor becomes observable.
+    #[serde(default)]
+    pub authority_tokens: BTreeSet<String>,
 }
 
 /// A journal entry records a message delivered to an actor.
@@ -857,7 +863,8 @@ impl LibsqlStore {
                     state TEXT NOT NULL,
                     waiting_signal TEXT,
                     crdt_snapshot TEXT,
-                    crdt_field_map TEXT
+                    crdt_field_map TEXT,
+                    authority_tokens TEXT
                 )",
                 (),
             )
@@ -874,6 +881,11 @@ impl LibsqlStore {
             // Migrate databases created before the crdt_field_map column existed.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN crdt_field_map TEXT", ())
+                .await;
+            // Authority was added after the original persistence schema. Old rows
+            // remain NULL and therefore restore with empty (deny-by-default) authority.
+            let _ = conn
+                .execute("ALTER TABLE snapshots ADD COLUMN authority_tokens TEXT", ())
                 .await;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS journal (
@@ -985,12 +997,14 @@ impl PersistenceStore for LibsqlStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let authority_json = serde_json::to_string(&snapshot.authority_tokens)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str()],
+                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
+                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
@@ -1000,7 +1014,7 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = conn
                 .query(
-                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map FROM snapshots WHERE actor_id = ?1",
+                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
                     libsql::params![actor_id as i64],
                 )
                 .await
@@ -1011,6 +1025,7 @@ impl PersistenceStore for LibsqlStore {
             let waiting_signal: Option<String> = row.get(2).ok()?;
             let crdt_json: Option<String> = row.get(3).ok()?;
             let crdt_field_map_json: Option<String> = row.get(4).ok()?;
+            let authority_json: Option<String> = row.get(5).ok()?;
             let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
@@ -1018,6 +1033,19 @@ impl PersistenceStore for LibsqlStore {
             let crdt_field_map: Option<HashMap<String, u64>> = match crdt_field_map_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
+            };
+            let authority_tokens: BTreeSet<String> = match authority_json {
+                Some(json) => match serde_json::from_str(&json) {
+                    Ok(tokens) => tokens,
+                    Err(err) => {
+                        warn!(
+                            "nulang-persist: invalid authority metadata for actor {}: {}",
+                            actor_id, err
+                        );
+                        return None;
+                    }
+                },
+                None => BTreeSet::new(),
             };
             let state: HashMap<String, PersistedValue> = serde_json::from_str(&state_json).ok()?;
             Some(ActorSnapshot {
@@ -1027,6 +1055,7 @@ impl PersistenceStore for LibsqlStore {
                 waiting_signal,
                 crdt_snapshot,
                 crdt_field_map,
+                authority_tokens,
             })
         })
     }
@@ -1583,8 +1612,14 @@ impl PostgresStore {
                 state TEXT NOT NULL,
                 waiting_signal TEXT,
                 crdt_snapshot TEXT,
-                crdt_field_map TEXT
+                crdt_field_map TEXT,
+                authority_tokens TEXT
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS authority_tokens TEXT",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1635,16 +1670,19 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let authority_json = serde_json::to_string(&snapshot.authority_tokens)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (actor_id) DO UPDATE SET
                sequence = EXCLUDED.sequence,
                state = EXCLUDED.state,
                waiting_signal = EXCLUDED.waiting_signal,
                crdt_snapshot = EXCLUDED.crdt_snapshot,
-               crdt_field_map = EXCLUDED.crdt_field_map",
+               crdt_field_map = EXCLUDED.crdt_field_map,
+               authority_tokens = EXCLUDED.authority_tokens",
             &[
                 &(snapshot.actor_id as i64),
                 &(snapshot.sequence as i64),
@@ -1652,6 +1690,7 @@ impl PersistenceStore for PostgresStore {
                 &snapshot.waiting_signal.as_deref(),
                 &crdt_json.as_str(),
                 &crdt_field_map_json.as_str(),
+                &authority_json.as_str(),
             ],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1662,7 +1701,7 @@ impl PersistenceStore for PostgresStore {
         let mut conn = self.conn.lock().unwrap();
         let row = conn
             .query_one(
-                "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map
+                "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens
                  FROM snapshots WHERE actor_id = $1",
                 &[&(actor_id as i64)],
             )
@@ -1672,10 +1711,24 @@ impl PersistenceStore for PostgresStore {
         let waiting_signal: Option<String> = row.get(2);
         let crdt_json: Option<String> = row.get(3);
         let crdt_field_map_json: Option<String> = row.get(4);
+        let authority_json: Option<String> = row.get(5);
         let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> =
             crdt_json.and_then(|j| serde_json::from_str(&j).ok());
         let crdt_field_map: Option<HashMap<String, u64>> =
             crdt_field_map_json.and_then(|j| serde_json::from_str(&j).ok());
+        let authority_tokens: BTreeSet<String> = match authority_json {
+            Some(json) => match serde_json::from_str(&json) {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    warn!(
+                        "nulang-persist: invalid authority metadata for actor {}: {}",
+                        actor_id, err
+                    );
+                    return None;
+                }
+            },
+            None => BTreeSet::new(),
+        };
         let state: HashMap<String, PersistedValue> = serde_json::from_str(&state_json).ok()?;
         Some(ActorSnapshot {
             actor_id,
@@ -1684,6 +1737,7 @@ impl PersistenceStore for PostgresStore {
             waiting_signal,
             crdt_snapshot,
             crdt_field_map,
+            authority_tokens,
         })
     }
 
@@ -1976,6 +2030,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
 
@@ -2037,6 +2092,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
         store
@@ -2065,6 +2121,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
         store
@@ -2100,6 +2157,7 @@ mod json_file_store_tests {
                     waiting_signal: None,
                     crdt_snapshot: None,
                     crdt_field_map: None,
+                authority_tokens: Default::default(),
                 })
                 .unwrap();
             store
@@ -2138,6 +2196,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
 
@@ -2258,6 +2317,7 @@ mod rocksdb_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
 
@@ -2313,6 +2373,7 @@ mod rocksdb_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
         store
@@ -2341,6 +2402,7 @@ mod rocksdb_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
         store
@@ -2376,6 +2438,7 @@ mod rocksdb_store_tests {
                     waiting_signal: None,
                     crdt_snapshot: None,
                     crdt_field_map: None,
+                authority_tokens: Default::default(),
                 })
                 .unwrap();
             store
@@ -2446,6 +2509,7 @@ mod postgres_store_tests {
                 waiting_signal: Some("signal".to_string()),
                 crdt_snapshot: None,
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
 
@@ -2510,6 +2574,7 @@ mod postgres_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
         store
@@ -2542,6 +2607,7 @@ mod postgres_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
         store
