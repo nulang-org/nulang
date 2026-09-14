@@ -70,7 +70,7 @@ pub use distributed::*;
 pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
-pub use http_server::{render_route_handler, HttpServerState, WebDevServer, WebRoute};
+pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
 pub use mailbox::*;
 pub use network::NetworkTransport;
 pub use network::*;

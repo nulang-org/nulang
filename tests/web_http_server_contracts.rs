@@ -61,8 +61,8 @@ fn web_main() {
         contracts.diagnostics
     );
     assert_eq!(contracts.routes.len(), 1);
-    let plan = compile_runtime_route_plan(&contracts.routes[0])
-        .expect("compile typed runtime route plan");
+    let plan =
+        compile_runtime_route_plan(&contracts.routes[0]).expect("compile typed runtime route plan");
 
     RuntimeWebRoute {
         route: WebRoute {
@@ -76,10 +76,8 @@ fn web_main() {
 }
 
 fn legacy_route() -> WebRoute {
-    let (module, function_index) = compile_handler(
-        "fn legacy() -> String { \"legacy\" }",
-        "legacy",
-    );
+    let (module, function_index) =
+        compile_handler("fn legacy() -> String { \"legacy\" }", "legacy");
     WebRoute {
         method: HttpMethod::Get,
         path: "/legacy".to_string(),
@@ -156,8 +154,8 @@ fn invalid_typed_query_is_problem_json_over_real_http() {
 
 #[test]
 fn legacy_route_still_falls_back_over_real_http() {
-    let server = WebDevServer::bind(0, None, None, vec![legacy_route()])
-        .expect("bind legacy WebDevServer");
+    let server =
+        WebDevServer::bind(0, None, None, vec![legacy_route()]).expect("bind legacy WebDevServer");
 
     let response = send_raw_request(
         server.port,
@@ -165,8 +163,5 @@ fn legacy_route_still_falls_back_over_real_http() {
     );
 
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
-    assert!(
-        response_body(&response).starts_with("legacy"),
-        "{response}"
-    );
+    assert!(response_body(&response).starts_with("legacy"), "{response}");
 }
