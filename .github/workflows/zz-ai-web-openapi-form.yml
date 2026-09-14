@@ -1,0 +1,37 @@
+name: Validate OpenAPI form bindings
+
+on:
+  push:
+    branches:
+      - feat/web-openapi-form-body
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/web-openapi-form-body
+          fetch-depth: 0
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Test Web OpenAPI and binding invariants
+        run: |
+          cargo test web::openapi::tests --lib
+          cargo test web::bindings::tests --lib
+
+      - name: Commit validated formatting and remove staging workflow
+        shell: bash
+        run: |
+          rm .github/workflows/zz-ai-web-openapi-form.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/web/openapi.rs .github/workflows/zz-ai-web-openapi-form.yml
+          git commit -m "test(web): validate OpenAPI form request bodies"
+          git push origin HEAD:feat/web-openapi-form-body
