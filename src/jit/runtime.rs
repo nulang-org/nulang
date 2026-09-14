@@ -1392,6 +1392,11 @@ pub(crate) fn aot_ctype_from_tag(tag: u64) -> crate::ffi::marshal::CType {
 fn aot_ffi_call_impl(lib_raw: u64, sym_raw: u64, sig: u64, args: &[u64]) -> Value {
     let library = resolve_string_coerce(lib_raw).unwrap_or_default();
     let symbol = resolve_string_coerce(sym_raw).unwrap_or_default();
+    // Match interpreter FFICall: fail closed before dynamic library loading
+    // or symbol resolution when an actor lacks the exact typed grant.
+    if !unsafe { try_with_callbacks(|cb| cb.authorize_ffi(&library, &symbol)) }.unwrap_or(true) {
+        return Value::nil();
+    }
     let ret_tag = sig & 0b111;
     let mut params: Vec<crate::ffi::marshal::CType> = Vec::with_capacity(args.len());
     for i in 0..args.len() {
