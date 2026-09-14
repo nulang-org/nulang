@@ -49,12 +49,17 @@ pub fn compile_runtime_routes_from_contracts(
     }
 }
 
-/// Match one attached runtime route against a request path.
+/// Match one attached runtime route against an HTTP request target.
 ///
-/// Contract-backed routes use their precompiled route segments. Legacy routes
-/// fall back to the existing `:name` convention.
-pub fn match_route(route: &RuntimeWebRoute, request_path: &str) -> Option<HashMap<String, String>> {
-    match_attached_route(route, request_path)
+/// HTTP request targets may contain a query string (`/users?limit=10`), while
+/// route plans describe only the path component. Strip the query portion before
+/// matching so both compiler-backed and legacy routes have identical semantics.
+pub fn match_route(route: &RuntimeWebRoute, request_target: &str) -> Option<HashMap<String, String>> {
+    match_attached_route(route, request_path_only(request_target))
+}
+
+fn request_path_only(target: &str) -> &str {
+    target.split_once('?').map_or(target, |(path, _)| path)
 }
 
 /// Invoke a route directly when the compiler proved every handler parameter has
@@ -139,5 +144,12 @@ fn show() -> String { "ok" }
         let contracts = ContractCompilation::default();
         let routes = compile_runtime_routes_from_contracts(Vec::new(), &contracts).unwrap();
         assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn request_target_query_is_not_part_of_route_path() {
+        assert_eq!(request_path_only("/users?limit=10"), "/users");
+        assert_eq!(request_path_only("/users/42?expand=true"), "/users/42");
+        assert_eq!(request_path_only("/users/42"), "/users/42");
     }
 }
