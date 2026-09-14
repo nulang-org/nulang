@@ -4,6 +4,8 @@
 //! defines the machine-readable metadata that binds that artifact to the
 //! embedding ABI and UI protocols without introducing a second compiler or VM.
 
+pub mod action;
+
 use serde::{Deserialize, Serialize};
 
 use crate::format::constants::{BYTECODE_VERSION, LANGUAGE_VERSION_STR};
