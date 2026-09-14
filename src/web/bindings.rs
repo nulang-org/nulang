@@ -15,15 +15,22 @@ use crate::web::contracts::RouteContract;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// Request source used to populate a handler argument.
+/// Transport-neutral request source used to populate a handler argument.
 ///
-/// Only path parameters are lowered today. Keeping the source explicit avoids
-/// baking positional conventions into the IR when query/body/header bindings
-/// are added later.
+/// Path bindings are the first source emitted by the compiler. The remaining
+/// variants reserve the stable Contract IR vocabulary for typed query, header,
+/// cookie, body, and form extractors so transports and generators can converge
+/// on one schema without another IR-version split. Until the compiler emits a
+/// source, runtimes must not synthesize it implicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteBindingSource {
     Path,
+    Query,
+    Header,
+    Cookie,
+    Body,
+    Form,
 }
 
 /// One deterministic handler-argument binding.
@@ -133,6 +140,25 @@ mod tests {
         assert_eq!(compiled.bindings[0].handler_param, "id");
         assert_eq!(compiled.bindings[0].handler_index, 0);
         assert_eq!(compiled.bindings[0].ty.as_deref(), Some("UserId"));
+    }
+
+    #[test]
+    fn request_binding_sources_have_stable_ir_names() {
+        let cases = [
+            (RouteBindingSource::Path, "path"),
+            (RouteBindingSource::Query, "query"),
+            (RouteBindingSource::Header, "header"),
+            (RouteBindingSource::Cookie, "cookie"),
+            (RouteBindingSource::Body, "body"),
+            (RouteBindingSource::Form, "form"),
+        ];
+
+        for (source, expected) in cases {
+            assert_eq!(
+                serde_json::to_string(&source).unwrap(),
+                format!("\"{expected}\"")
+            );
+        }
     }
 
     #[test]
