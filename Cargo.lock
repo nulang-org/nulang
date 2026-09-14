@@ -2442,6 +2442,7 @@ dependencies = [
  "mimalloc",
  "nulang-ai",
  "nulang-ai-local",
+ "nulang-ui-protocol",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -2577,6 +2578,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "nulang-ui-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
