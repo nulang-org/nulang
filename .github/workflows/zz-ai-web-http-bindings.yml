@@ -1,0 +1,167 @@
+name: Apply HTTP request binding integration
+
+on:
+  push:
+    branches:
+      - feat/web-http-request-bindings
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/web-http-request-bindings
+          fetch-depth: 0
+
+      - name: Wire generalized request dispatch
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("src/runtime/http_server.rs")
+          text = path.read_text()
+
+          old_imports = '''use crate::web::reactivity::inject_client_runtime_script;
+          use crate::web::runtime_bindings::RuntimeWebRoute;
+          '''
+          new_imports = '''use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
+          use crate::web::http_problem::request_decode_problem_response;
+          use crate::web::http_request::HttpRequestBindingInputs;
+          use crate::web::reactivity::inject_client_runtime_script;
+          use crate::web::runtime_bindings::RuntimeWebRoute;
+          '''
+          if old_imports not in text:
+              raise SystemExit("HTTP server import anchor not found")
+          text = text.replace(old_imports, new_imports, 1)
+
+          old_dispatch = '''                                let ctx = RequestContext {
+                                      request: request.clone(),
+                                      params: params.clone(),
+                                  };
+                                  let rendered = with_request_context(ctx, || {
+                                      crate::web::dispatch::render_direct_route(route, &params).map(
+                                          |direct| {
+                                              direct.or_else(|| {
+                                                  render_route_handler(
+                                                      &route.route.handler_module,
+                                                      route.route.handler_func_idx,
+                                                      None,
+                                                  )
+                                              })
+                                          },
+                                      )
+                                  });
+                                  match rendered {
+                                      Ok(Some(html)) => HttpResponse {
+                                          status: 200,
+                                          headers: vec![(
+                                              "Content-Type".into(),
+                                              "text/html; charset=utf-8".into(),
+                                          )],
+                                          body: inject_client_runtime_script(&html).into_bytes(),
+                                      },
+                                      Ok(None) => HttpResponse {
+                                          status: 500,
+                                          headers: vec![("Content-Type".into(), "text/plain".into())],
+                                          body: b"Internal server error".to_vec(),
+                                      },
+                                      Err(error) => {
+                                          eprintln!("typed route dispatch error: {error}");
+                                          HttpResponse {
+                                              status: 500,
+                                              headers: vec![(
+                                                  "Content-Type".into(),
+                                                  "text/plain".into(),
+                                              )],
+                                              body: b"Internal server error".to_vec(),
+                                          }
+                                      }
+                                  }
+          '''
+          new_dispatch = '''                                let captured = HttpRequestBindingInputs::capture(
+                                      &request.path,
+                                      &request.headers,
+                                      &request.body,
+                                  );
+                                  let values = captured.values(&params, &request.headers);
+                                  let ctx = RequestContext {
+                                      request: request.clone(),
+                                      params: params.clone(),
+                                  };
+                                  let rendered = with_request_context(ctx, || {
+                                      match render_direct_request(route, &values) {
+                                          Ok(Some(rendered)) => Ok(Some(rendered)),
+                                          Ok(None) => Ok(render_route_handler(
+                                              &route.route.handler_module,
+                                              route.route.handler_func_idx,
+                                              None,
+                                          )),
+                                          Err(error) => Err(error),
+                                      }
+                                  });
+                                  match rendered {
+                                      Ok(Some(html)) => HttpResponse {
+                                          status: 200,
+                                          headers: vec![(
+                                              "Content-Type".into(),
+                                              "text/html; charset=utf-8".into(),
+                                          )],
+                                          body: inject_client_runtime_script(&html).into_bytes(),
+                                      },
+                                      Ok(None) => HttpResponse {
+                                          status: 500,
+                                          headers: vec![("Content-Type".into(), "text/plain".into())],
+                                          body: b"Internal server error".to_vec(),
+                                      },
+                                      Err(DirectRequestRenderError::Decode(error)) => {
+                                          let problem = request_decode_problem_response(&error);
+                                          HttpResponse {
+                                              status: problem.status,
+                                              headers: problem.headers,
+                                              body: problem.body,
+                                          }
+                                      }
+                                      Err(DirectRequestRenderError::Execution(error)) => {
+                                          eprintln!("typed route dispatch error: {error}");
+                                          HttpResponse {
+                                              status: 500,
+                                              headers: vec![(
+                                                  "Content-Type".into(),
+                                                  "text/plain".into(),
+                                              )],
+                                              body: b"Internal server error".to_vec(),
+                                          }
+                                      }
+                                  }
+          '''
+          if old_dispatch not in text:
+              raise SystemExit("HTTP server route dispatch anchor not found")
+          text = text.replace(old_dispatch, new_dispatch, 1)
+          path.write_text(text)
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Test HTTP binding seams
+        run: |
+          cargo test web::http_request::tests --lib
+          cargo test web::request_bindings::tests --lib
+          cargo test web::dispatch::tests --lib
+          cargo test web::http_problem::tests --lib
+
+      - name: Commit validated changes
+        shell: bash
+        run: |
+          rm .github/workflows/zz-ai-web-http-bindings.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/runtime/http_server.rs src/web/http_request.rs src/web/mod.rs .github/workflows/zz-ai-web-http-bindings.yml
+          git commit -m "feat(web): execute compiler-bound HTTP request sources"
+          git push origin HEAD:feat/web-http-request-bindings
