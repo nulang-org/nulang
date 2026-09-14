@@ -11,27 +11,10 @@
 //! require a same-named handler parameter and produce a diagnostic when one is
 //! missing.
 
+pub use crate::web::contracts::RequestParamSource as RouteBindingSource;
 use crate::web::contracts::RouteContract;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-
-/// Transport-neutral request source used to populate a handler argument.
-///
-/// Path bindings are the first source emitted by the compiler. The remaining
-/// variants reserve the stable Contract IR vocabulary for typed query, header,
-/// cookie, body, and form extractors so transports and generators can converge
-/// on one schema without another IR-version split. Until the compiler emits a
-/// source, runtimes must not synthesize it implicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RouteBindingSource {
-    Path,
-    Query,
-    Header,
-    Cookie,
-    Body,
-    Form,
-}
 
 /// One deterministic handler-argument binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,13 +42,48 @@ pub struct BindingCompilation {
 pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
     let contract_params = contract_syntax_params(&contract.path);
     let mut out = BindingCompilation::default();
+    let mut explicit_path_inputs = HashSet::new();
+
+    for (handler_index, handler_param) in contract.handler_params.iter().enumerate() {
+        let Some(request) = &handler_param.request else {
+            continue;
+        };
+        let ty = if request.source == RouteBindingSource::Path {
+            let Some(route_param) = contract
+                .params
+                .iter()
+                .find(|param| param.name == request.source_name)
+            else {
+                out.diagnostics.push(format!(
+                    "{} {}: handler parameter '{}' binds unknown path input '{}'",
+                    contract.method, contract.path, handler_param.name, request.source_name
+                ));
+                continue;
+            };
+            explicit_path_inputs.insert(request.source_name.clone());
+            route_param.ty.clone().or_else(|| handler_param.ty.clone())
+        } else {
+            handler_param.ty.clone()
+        };
+
+        out.bindings.push(RouteBindingContract {
+            source: request.source,
+            source_name: request.source_name.clone(),
+            handler_param: handler_param.name.clone(),
+            handler_index,
+            ty,
+        });
+    }
 
     for route_param in &contract.params {
+        if explicit_path_inputs.contains(&route_param.name) {
+            continue;
+        }
         let Some((handler_index, handler_param)) = contract
             .handler_params
             .iter()
             .enumerate()
-            .find(|(_, param)| param.name == route_param.name)
+            .find(|(_, param)| param.name == route_param.name && param.request.is_none())
         else {
             if contract_params.contains(route_param.name.as_str()) {
                 out.diagnostics.push(format!(
@@ -121,6 +139,7 @@ mod tests {
                 name: "id".to_string(),
                 ty: Some("UserId".to_string()),
                 capability: None,
+                request: None,
             }],
             response_type: Some("String".to_string()),
             error_type: None,
@@ -208,11 +227,13 @@ mod tests {
                     name: "user".to_string(),
                     ty: Some("UserId".to_string()),
                     capability: None,
+                    request: None,
                 },
                 HandlerParamContract {
                     name: "org".to_string(),
                     ty: Some("OrgId".to_string()),
                     capability: None,
+                    request: None,
                 },
             ],
             response_type: None,

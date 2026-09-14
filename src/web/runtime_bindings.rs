@@ -405,6 +405,7 @@ mod tests {
                 name: "id".to_string(),
                 ty: Some("Int".to_string()),
                 capability: None,
+                request: None,
             }],
             response_type: Some("String".to_string()),
             error_type: None,
