@@ -136,6 +136,7 @@ lipo -create \
     -output "$OUT/simulator/libnulang_mobile.a"
 
 cp "$ROOT/include/nulang_embed.h" "$OUT/headers/"
+cp "$ROOT/include/nulang_mobile_actions.h" "$OUT/headers/"
 cp "$ROOT/include/nulang_mobile_host.h" "$OUT/headers/"
 cp "$ROOT/platforms/ios/NulangMobileRuntime/CNulangMobile.h" "$OUT/headers/"
 cp "$ROOT/platforms/ios/NulangMobileRuntime/module.modulemap" "$OUT/headers/"
