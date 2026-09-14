@@ -5,6 +5,7 @@ pub mod contracts;
 pub mod dispatch;
 pub mod ir;
 pub mod modules;
+pub mod openapi;
 pub mod package_contracts;
 pub mod reactivity;
 pub mod request_bindings;
