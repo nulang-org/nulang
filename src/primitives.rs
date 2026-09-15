@@ -79,9 +79,34 @@ impl ActorRole {
         Ok(selected.unwrap_or(Self::Plain))
     }
 
+    /// Whether this is an ordinary actor with no specialized surface role.
+    pub const fn is_plain(self) -> bool {
+        matches!(self, Self::Plain)
+    }
+
+    /// Whether this actor was produced from the agent surface syntax.
+    pub const fn is_agent(self) -> bool {
+        matches!(self, Self::Agent)
+    }
+
+    /// Whether this actor was produced from the workflow surface syntax.
+    pub const fn is_workflow(self) -> bool {
+        matches!(self, Self::Workflow)
+    }
+
+    /// Whether this actor was produced from the organization surface syntax.
+    pub const fn is_organization(self) -> bool {
+        matches!(self, Self::Organization)
+    }
+
+    /// Whether this actor is represented as a virtual actor surface.
+    pub const fn is_virtual(self) -> bool {
+        matches!(self, Self::Virtual)
+    }
+
     /// Whether this role is surface sugar over the actor runtime.
     pub const fn is_composite_surface(self) -> bool {
-        !matches!(self, Self::Plain)
+        !self.is_plain()
     }
 }
 
@@ -239,6 +264,31 @@ mod tests {
             ActorRole::from_flags(true, false, false, false),
             Ok(ActorRole::Workflow)
         );
+    }
+
+    #[test]
+    fn role_predicates_are_exclusive() {
+        let roles = [
+            ActorRole::Plain,
+            ActorRole::Agent,
+            ActorRole::Workflow,
+            ActorRole::Organization,
+            ActorRole::Virtual,
+        ];
+
+        for role in roles {
+            let matches = [
+                role.is_plain(),
+                role.is_agent(),
+                role.is_workflow(),
+                role.is_organization(),
+                role.is_virtual(),
+            ]
+            .into_iter()
+            .filter(|matched| *matched)
+            .count();
+            assert_eq!(matches, 1, "{role:?} must match exactly one role predicate");
+        }
     }
 
     #[test]
