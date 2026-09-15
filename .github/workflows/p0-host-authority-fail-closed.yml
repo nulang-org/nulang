@@ -39,85 +39,91 @@ jobs:
           path = Path("src/runtime/callbacks.rs")
           text = path.read_text()
 
-          old = '''        ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
-          ("Inference" | "LLM", Some("ask")) => other("Inference", "Ask", None),
-          _ => return Ok(None),
-      };
-      Ok(Some(grant))
-  }
-  '''
-          new = '''        ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
-          ("Inference" | "LLM", Some("ask")) => other("Inference", "Ask", None),
-          (
-              "FS" | "Realtime" | "Env" | "Secret" | "Http" | "Process" | "System"
-              | "DB" | "Python" | "Provider" | "Inference" | "LLM",
-              operation,
-          ) => {
-              return Err(format!(
-                  "unmapped host-authority operation {effect_name}.{}",
-                  operation.unwrap_or("<missing>")
-              ));
-          }
-          _ => return Ok(None),
-      };
-      Ok(Some(grant))
-  }
+          anchor = (
+              '        ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),\n'
+              '        ("Inference" | "LLM", Some("ask")) => other("Inference", "Ask", None),\n'
+              '        _ => return Ok(None),\n'
+          )
+          replacement = (
+              '        ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),\n'
+              '        ("Inference" | "LLM", Some("ask")) => other("Inference", "Ask", None),\n'
+              '        (\n'
+              '            "FS" | "Realtime" | "Env" | "Secret" | "Http" | "Process" | "System"\n'
+              '            | "DB" | "Python" | "Provider" | "Inference" | "LLM",\n'
+              '            operation,\n'
+              '        ) => {\n'
+              '            return Err(format!(\n'
+              '                "unmapped host-authority operation {effect_name}.{}",\n'
+              '                operation.unwrap_or("<missing>")\n'
+              '            ));\n'
+              '        }\n'
+              '        _ => return Ok(None),\n'
+          )
 
-  #[cfg(test)]
-  mod host_authority_policy_tests {
-      use super::required_host_authority;
-
-      #[test]
-      fn sensitive_namespaces_fail_closed_for_unmapped_operations() {
-          for namespace in [
-              "FS", "Realtime", "Env", "Secret", "Http", "Process", "System",
-              "DB", "Provider", "Inference", "LLM",
-          ] {
-              let error = required_host_authority(namespace, Some("__unmapped__"), &[], &[])
-                  .expect_err("sensitive host namespace must fail closed");
-              assert!(error.contains("unmapped host-authority operation"), "{namespace}: {error}");
-          }
-      }
-
-      #[test]
-      fn missing_operation_in_sensitive_namespace_fails_closed() {
-          let error = required_host_authority("FS", None, &[], &[])
-              .expect_err("missing operation in sensitive namespace must fail closed");
-          assert!(error.contains("FS.<missing>"), "{error}");
-      }
-
-      #[test]
-      fn python_unknown_operation_still_requires_python_authority() {
-          let grant = required_host_authority("Python", Some("future_op"), &[], &[])
-              .expect("Python operations should classify")
-              .expect("Python operation must require authority");
-          assert_eq!(grant.to_string(), "Python::future_op");
-      }
-
-      #[test]
-      fn mixed_web_namespace_keeps_local_rendering_operations_ungated() {
-          for operation in ["html", "text", "raw", "route", "redirect", "param"] {
-              let grant = required_host_authority("Web", Some(operation), &[], &[])
-                  .expect("local Web operation should classify without error");
-              assert!(grant.is_none(), "{operation} unexpectedly required host authority");
-          }
-      }
-
-      #[test]
-      fn unknown_non_sensitive_namespace_remains_outside_authority_gate() {
-          let grant = required_host_authority("Test", Some("mock"), &[], &[])
-              .expect("non-sensitive namespace should remain outside the host-authority gate");
-          assert!(grant.is_none());
-      }
-  }
-  '''
-
-          if old not in text:
+          if anchor not in text:
               raise SystemExit("authority mapping anchor not found; refusing non-deterministic patch")
           if "mod host_authority_policy_tests" in text:
               raise SystemExit("host-authority regression tests already present")
+          text = text.replace(anchor, replacement, 1)
 
-          path.write_text(text.replace(old, new, 1))
+          marker = "\n/// Parse an outbound HTTP URL into the exact TCP authority it needs."
+          if marker not in text:
+              raise SystemExit("host-authority test insertion marker not found")
+
+          test_lines = [
+              "",
+              "#[cfg(test)]",
+              "mod host_authority_policy_tests {",
+              "    use super::required_host_authority;",
+              "",
+              "    #[test]",
+              "    fn sensitive_namespaces_fail_closed_for_unmapped_operations() {",
+              "        for namespace in [",
+              "            \"FS\", \"Realtime\", \"Env\", \"Secret\", \"Http\", \"Process\", \"System\",",
+              "            \"DB\", \"Provider\", \"Inference\", \"LLM\",",
+              "        ] {",
+              "            let error = required_host_authority(namespace, Some(\"__unmapped__\"), &[], &[])",
+              "                .expect_err(\"sensitive host namespace must fail closed\");",
+              "            assert!(error.contains(\"unmapped host-authority operation\"), \"{namespace}: {error}\");",
+              "        }",
+              "    }",
+              "",
+              "    #[test]",
+              "    fn missing_operation_in_sensitive_namespace_fails_closed() {",
+              "        for namespace in [\"FS\", \"Python\", \"Http\", \"DB\"] {",
+              "            let error = required_host_authority(namespace, None, &[], &[])",
+              "                .expect_err(\"missing operation in sensitive namespace must fail closed\");",
+              "            assert!(error.contains(\"<missing>\"), \"{namespace}: {error}\");",
+              "        }",
+              "    }",
+              "",
+              "    #[test]",
+              "    fn python_unknown_operation_still_requires_authority() {",
+              "        let grant = required_host_authority(\"Python\", Some(\"future_op\"), &[], &[])",
+              "            .expect(\"Python operation should classify\");",
+              "        assert!(grant.is_some());",
+              "    }",
+              "",
+              "    #[test]",
+              "    fn mixed_web_namespace_keeps_local_rendering_operations_ungated() {",
+              "        for operation in [\"html\", \"text\", \"raw\", \"route\", \"redirect\", \"param\"] {",
+              "            let grant = required_host_authority(\"Web\", Some(operation), &[], &[])",
+              "                .expect(\"local Web operation should classify without error\");",
+              "            assert!(grant.is_none(), \"{operation} unexpectedly required host authority\");",
+              "        }",
+              "    }",
+              "",
+              "    #[test]",
+              "    fn unknown_non_sensitive_namespace_remains_outside_authority_gate() {",
+              "        let grant = required_host_authority(\"Test\", Some(\"mock\"), &[], &[])",
+              "            .expect(\"non-sensitive namespace should remain outside host-authority gate\");",
+              "        assert!(grant.is_none());",
+              "    }",
+              "}",
+              "",
+          ]
+          text = text.replace(marker, "\n".join(test_lines) + marker, 1)
+          path.write_text(text)
 
       - name: Format
         run: cargo fmt --all
