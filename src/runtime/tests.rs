@@ -13,6 +13,98 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+
+#[test]
+fn test_authority_snapshot_round_trip_recovery() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    let manifest = crate::authority::AuthorityManifest::from_tokens([
+        "Secret::Read(PAYMENTS_KEY)",
+        "Net::TcpOut(api.example.com:443)",
+    ])
+    .unwrap();
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .install_authority_manifest(&manifest);
+
+    rt.checkpoint_actor(actor_id);
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.authority_tokens, manifest.canonical_token_set());
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    let recovered = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(recovered.authority_manifest().unwrap(), manifest);
+}
+
+#[test]
+fn test_malformed_authority_snapshot_fails_recovery_closed() {
+    let mut rt = Runtime::new();
+    let actor_id = 91_001;
+    let mut snapshot = ActorSnapshot::default();
+    snapshot.actor_id = actor_id;
+    snapshot
+        .authority_tokens
+        .insert("Net::TcpOut(malformed)".to_string());
+    rt.persistence.save_snapshot(snapshot).unwrap();
+
+    assert_eq!(rt.recover_actor(actor_id), None);
+    assert!(!rt.actors.contains_key(&actor_id));
+}
+
+#[test]
+fn test_migration_preserves_authority_manifest() {
+    let actor_id = 91_002;
+    let module = CodeModule::new("authority-migration");
+    let nbc = module.to_nbc(None).unwrap();
+    let manifest = crate::authority::AuthorityManifest::from_tokens([
+        "Fs::Read(/srv/input)",
+        "Env::Read(REGION)",
+    ])
+    .unwrap();
+    let snapshot = ActorSnapshot {
+        actor_id,
+        authority_tokens: manifest.canonical_token_set(),
+        ..ActorSnapshot::default()
+    };
+    let json = serde_json::to_vec(&snapshot).unwrap();
+
+    let mut rt = Runtime::new();
+    assert!(rt.receive_migrated_actor(actor_id, nbc, json));
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.authority_manifest().unwrap(), manifest);
+}
+
+#[test]
+fn test_migration_rejects_malformed_authority_before_insertion() {
+    let actor_id = 91_003;
+    let module = CodeModule::new("authority-migration-invalid");
+    let nbc = module.to_nbc(None).unwrap();
+    let mut snapshot = ActorSnapshot {
+        actor_id,
+        ..ActorSnapshot::default()
+    };
+    snapshot
+        .authority_tokens
+        .insert("Secret::Read(".to_string());
+    let json = serde_json::to_vec(&snapshot).unwrap();
+
+    let mut rt = Runtime::new();
+    assert!(!rt.receive_migrated_actor(actor_id, nbc, json));
+    assert!(!rt.actors.contains_key(&actor_id));
+    assert!(!rt.recovery_modules.contains_key(&actor_id));
+}
+
+#[test]
+fn test_legacy_snapshot_without_authority_is_deny_by_default() {
+    let snapshot: ActorSnapshot = serde_json::from_str(
+        r#"{"actor_id":91004,"sequence":7,"state":{},"waiting_signal":null,"crdt_snapshot":null,"crdt_field_map":null}"#,
+    )
+    .unwrap();
+    assert!(snapshot.authority_tokens.is_empty());
+}
+
 // ========================================================================
 // Core Runtime Tests
 // ========================================================================
@@ -1806,6 +1898,7 @@ fn test_memory_store_latest_sequence() {
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+    authority_tokens: Default::default(),
     };
     store.save_snapshot(snapshot).unwrap();
     store
@@ -1834,6 +1927,7 @@ fn test_libsql_store_save_load_snapshot() {
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+    authority_tokens: Default::default(),
     };
     store.save_snapshot(snapshot).unwrap();
 
@@ -1887,6 +1981,7 @@ fn test_libsql_store_latest_sequence() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+        authority_tokens: Default::default(),
         })
         .unwrap();
     store
@@ -1914,6 +2009,7 @@ fn test_libsql_store_clear() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+        authority_tokens: Default::default(),
         })
         .unwrap();
     store
@@ -1949,6 +2045,7 @@ fn test_libsql_store_persists_to_disk() {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
         store
@@ -1988,6 +2085,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             waiting_signal: None,
             crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3]), (8, 2, vec![])]),
             crdt_field_map: None,
+        authority_tokens: Default::default(),
         })
         .unwrap();
 
@@ -2006,6 +2104,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+        authority_tokens: Default::default(),
         })
         .unwrap();
     let loaded = store.load_snapshot(1).unwrap();
@@ -2048,6 +2147,7 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
                 waiting_signal: None,
                 crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3])]),
                 crdt_field_map: None,
+            authority_tokens: Default::default(),
             })
             .unwrap();
         let loaded = store.load_snapshot(1).unwrap();
@@ -3923,6 +4023,7 @@ fn test_actor_migration_between_two_nodes() {
             waiting_signal: actor.waiting_signal.clone(),
             crdt_snapshot,
             crdt_field_map,
+        authority_tokens: Default::default(),
         };
         let json = serde_json::to_vec(&snapshot).unwrap();
         let nbc = module.to_nbc(None).unwrap();
