@@ -35,7 +35,7 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: p0-http-route-dead-code-cleanup
+          key: p0-http-route-dead-code-cleanup-v2
 
       - name: Remove superseded local route matcher
         shell: bash
@@ -47,69 +47,22 @@ jobs:
           path = Path('src/runtime/http_server.rs')
           src = path.read_text()
 
-          matcher = '''/// Match a route pattern against a request path, returning captured parameters.
-          /// Patterns use `:name` segments, e.g. `/products/:id`.
-          pub fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
-              let pattern = pattern.trim_start_matches('/');
-              let path = path.trim_start_matches('/');
-              let pattern_parts: Vec<&str> = if pattern.is_empty() {
-                  vec![""]
-              } else {
-                  pattern.split('/').collect()
-              };
-              let path_parts: Vec<&str> = if path.is_empty() {
-                  vec![""]
-              } else {
-                  path.split('/').collect()
-              };
-              if pattern_parts.len() != path_parts.len() {
-                  return None;
-              }
-              let mut params = HashMap::new();
-              for (pat, seg) in pattern_parts.iter().zip(path_parts.iter()) {
-                  if pat.starts_with(':') {
-                      let name = &pat[1..];
-                      params.insert(name.to_string(), seg.to_string());
-                  } else if *pat != *seg {
-                      return None;
-                  }
-              }
-              Some(params)
-          }
+          matcher_start_marker = '/// Match a route pattern against a request path, returning captured parameters.\n'
+          matcher_end_marker = '/// Render a static route by calling its handler with no arguments.\n'
+          assert src.count(matcher_start_marker) == 1, 'legacy matcher start source drifted'
+          assert src.count(matcher_end_marker) == 1, 'render-route anchor source drifted'
+          matcher_start = src.index(matcher_start_marker)
+          matcher_end = src.index(matcher_end_marker, matcher_start)
+          src = src[:matcher_start] + src[matcher_end:]
 
-          '''
-          tests = '''    #[test]
-              fn test_match_route_exact() {
-                  let params = match_route("/", "/").unwrap();
-                  assert!(params.is_empty());
-              }
+          tests_start_marker = '    #[test]\n    fn test_match_route_exact() {\n'
+          tests_end_marker = '    #[test]\n    fn test_parse_form_urlencoded() {\n'
+          assert src.count(tests_start_marker) == 1, 'legacy matcher test start drifted'
+          assert src.count(tests_end_marker) == 1, 'parse-form test anchor drifted'
+          tests_start = src.index(tests_start_marker)
+          tests_end = src.index(tests_end_marker, tests_start)
+          src = src[:tests_start] + src[tests_end:]
 
-              #[test]
-              fn test_match_route_no_match() {
-                  assert!(match_route("/foo", "/bar").is_none());
-              }
-
-              #[test]
-              fn test_match_route_captures_param() {
-                  let params = match_route("/products/:id", "/products/42").unwrap();
-                  assert_eq!(params.get("id"), Some(&"42".to_string()));
-              }
-
-              #[test]
-              fn test_match_route_length_mismatch() {
-                  assert!(match_route("/products/:id", "/products/42/extra").is_none());
-              }
-
-          '''
-
-          # Dedent the exact source blocks before matching. Keeping the literals
-          # visibly indented here makes this workflow itself easier to review.
-          import textwrap
-          matcher = textwrap.dedent(matcher)
-          tests = textwrap.dedent(tests)
-          assert src.count(matcher) == 1, 'legacy matcher source drifted'
-          assert src.count(tests) == 1, 'legacy matcher tests source drifted'
-          src = src.replace(matcher, '', 1).replace(tests, '', 1)
           path.write_text(src)
           PY
           cargo fmt --all
