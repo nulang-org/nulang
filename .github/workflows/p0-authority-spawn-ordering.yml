@@ -1,4 +1,4 @@
-name: P0 Authority Spawn Ordering
+name: P0 Authority Spawn Ordering v4
 
 on:
   push:
