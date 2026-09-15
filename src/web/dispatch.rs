@@ -327,10 +327,7 @@ fn show() -> String { "ok" }
                 handler_module: crate::bytecode::CodeModule::new("gate_test"),
                 handler_func_idx: 0,
             },
-            plan: Some(plan(
-                vec![binding(RouteBindingSource::Query, "id", 0)],
-                1,
-            )),
+            plan: Some(plan(vec![binding(RouteBindingSource::Query, "id", 0)], 1)),
         };
         let err = render_direct_route(&route, &HashMap::new()).unwrap_err();
         assert!(err.contains("incomplete"), "{err}");
@@ -347,7 +344,9 @@ fn show() -> String { "ok" }
             },
             plan: Some(plan(vec![], 0)),
         };
-        assert!(render_direct_route(&route, &HashMap::new()).unwrap().is_none());
+        assert!(render_direct_route(&route, &HashMap::new())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
