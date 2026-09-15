@@ -1,12 +1,13 @@
 name: P0 Authority Snapshot Final Validation
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - integration/p0-stabilization-2026-09-14
-    paths:
-      - .github/workflows/p0-ai-redrive-recovery.yml
+
+concurrency:
+  group: p0-authority-snapshot-final
+  cancel-in-progress: true
 
 permissions:
   contents: write
