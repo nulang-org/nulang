@@ -83,9 +83,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The production hunks merge cleanly. Replay them independently from
-          # the test-only EOF append because #176 added migration authority
-          # tests at the same EOF location after #178's original base.
           git diff 5622d5271e30143cb8bee9f81f53f77119603175 8ff33558243499822ec46a43c3e4e2d6f870bc5b -- \
             src/aot/mod.rs \
             src/jit/runtime.rs \
@@ -98,9 +95,34 @@ jobs:
             src/runtime/callbacks.rs \
             > /tmp/03-host-authority-callbacks.patch
           test -s /tmp/03-host-authority-callbacks.patch
-          awk '/^@@ -2213,3 +2505,377 @@/{exit} {print}' \
-            /tmp/03-host-authority-callbacks.patch \
-            > /tmp/03-host-authority-callbacks-production.patch
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          src = Path('/tmp/03-host-authority-callbacks.patch').read_text().splitlines(keepends=True)
+          prefix = []
+          hunks = []
+          current = None
+          for line in src:
+              if line.startswith('@@ '):
+                  if current is not None:
+                      hunks.append(current)
+                  current = [line]
+              elif current is None:
+                  prefix.append(line)
+              else:
+                  current.append(line)
+          if current is not None:
+              hunks.append(current)
+          if not hunks:
+              raise SystemExit('no callbacks hunks found in #178 patch')
+          removed = [h for h in hunks if 'mod host_authority_tests {' in ''.join(h)]
+          kept = [h for h in hunks if 'mod host_authority_tests {' not in ''.join(h)]
+          if len(removed) != 1:
+              raise SystemExit(f'expected exactly one host-authority test hunk, found {len(removed)}')
+          out = ''.join(prefix) + ''.join(''.join(h) for h in kept)
+          Path('/tmp/03-host-authority-callbacks-production.patch').write_text(out)
+          PY
           test -s /tmp/03-host-authority-callbacks-production.patch
           git apply --3way --index /tmp/03-host-authority-callbacks-production.patch 2>&1 | tee /tmp/03-host-authority-callbacks-apply.log
 
