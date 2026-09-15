@@ -21,11 +21,7 @@ pub trait Manager: Send + Sync {
             .budget_usd
             .min(mission.budget.max_cost_usd)
             .max(0.0);
-        let mut tasks = self.plan_tasks(
-            mission.goal.id,
-            &mission.goal.intent,
-            effective_budget,
-        );
+        let mut tasks = self.plan_tasks(mission.goal.id, &mission.goal.intent, effective_budget);
 
         tasks.truncate(mission.budget.max_tasks as usize);
         if tasks.is_empty() {
