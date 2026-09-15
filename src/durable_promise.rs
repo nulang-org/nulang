@@ -17,8 +17,6 @@ use crate::runtime::PersistedValue;
 
 pub const DURABLE_PROMISE_FORMAT_VERSION: u16 = 1;
 
-/// Stable promise identity. Cloud implementations may encode tenant/region
-/// information externally; core semantics treat the ID as opaque.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PromiseId(pub String);
 
@@ -38,7 +36,6 @@ impl std::fmt::Display for PromiseId {
     }
 }
 
-/// Durable promise state. Terminal states are immutable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "value", rename_all = "snake_case")]
 pub enum PromiseState {
@@ -54,7 +51,6 @@ impl PromiseState {
     }
 }
 
-/// A caller's attempt to complete a promise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "completion", content = "value", rename_all = "snake_case")]
 pub enum PromiseCompletion {
@@ -73,17 +69,14 @@ impl PromiseCompletion {
     }
 }
 
-/// Append-only completion event. `sequence` is local to one promise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromiseEvent {
     pub sequence: u64,
     pub promise_id: PromiseId,
     pub state: PromiseState,
-    /// Principal/workload/resolver identity supplied by the caller.
     pub completed_by: Option<String>,
 }
 
-/// Persisted representation of one promise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromiseRecord {
     pub format_version: u16,
@@ -114,13 +107,9 @@ impl PromiseRecord {
     }
 }
 
-/// Result of a completion attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionOutcome {
-    /// Pending -> terminal transition was persisted.
     Applied,
-    /// The promise was already in the identical terminal state. No new event
-    /// was appended; callers may safely retry resolution after transport loss.
     IdempotentReplay,
 }
 
@@ -153,8 +142,12 @@ impl std::fmt::Display for PromiseError {
                 f,
                 "promise '{id}' is already completed as {existing:?}; conflicting completion {attempted:?} rejected"
             ),
-            Self::UnsupportedFormat(v) => write!(f, "unsupported durable-promise format version {v}"),
-            Self::Serialization(msg) => write!(f, "durable-promise serialization failed: {msg}"),
+            Self::UnsupportedFormat(v) => {
+                write!(f, "unsupported durable-promise format version {v}")
+            }
+            Self::Serialization(msg) => {
+                write!(f, "durable-promise serialization failed: {msg}")
+            }
             Self::Io(err) => write!(f, "durable-promise IO error: {err}"),
         }
     }
@@ -175,7 +168,6 @@ impl From<io::Error> for PromiseError {
     }
 }
 
-/// Storage contract used by the runtime and Cloud implementations.
 pub trait DurablePromiseStore: Send + Sync {
     fn create(&mut self, id: PromiseId) -> Result<PromiseRecord, PromiseError>;
     fn load(&self, id: &PromiseId) -> Result<Option<PromiseRecord>, PromiseError>;
@@ -199,7 +191,6 @@ pub trait DurablePromiseStore: Send + Sync {
     }
 }
 
-/// Apply the single-assignment transition to one loaded record.
 fn apply_completion(
     record: &mut PromiseRecord,
     completion: PromiseCompletion,
@@ -228,7 +219,6 @@ fn apply_completion(
     }
 }
 
-/// In-memory durable-promise store for tests/embedded runtimes.
 #[derive(Debug, Default, Clone)]
 pub struct MemoryPromiseStore {
     records: HashMap<PromiseId, PromiseRecord>,
@@ -268,9 +258,6 @@ impl DurablePromiseStore for MemoryPromiseStore {
     }
 }
 
-/// Simple JSON-file backend. Each promise is stored independently under a
-/// BLAKE3-derived filename so opaque IDs cannot escape the store directory.
-/// Writes use temp-file + rename replacement.
 #[derive(Debug, Clone)]
 pub struct JsonFilePromiseStore {
     root: PathBuf,
@@ -298,6 +285,10 @@ impl JsonFilePromiseStore {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
+        }
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(&path)?;
         }
         fs::rename(tmp, path)?;
         Ok(())
@@ -359,10 +350,23 @@ impl DurablePromiseStore for JsonFilePromiseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn id() -> PromiseId {
         PromiseId::new("tenant-a/order-42/approval").unwrap()
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "nulang-durable-promise-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 
     #[test]
@@ -455,9 +459,9 @@ mod tests {
 
     #[test]
     fn json_store_survives_reopen_and_replays_terminal_state() {
-        let dir = TempDir::new().unwrap();
+        let root = temp_root("reopen");
         {
-            let mut store = JsonFilePromiseStore::new(dir.path()).unwrap();
+            let mut store = JsonFilePromiseStore::new(&root).unwrap();
             store.create(id()).unwrap();
             store
                 .complete(
@@ -467,25 +471,31 @@ mod tests {
                 )
                 .unwrap();
         }
-        let store = JsonFilePromiseStore::new(dir.path()).unwrap();
-        assert_eq!(
-            store.state(&id()).unwrap(),
-            PromiseState::Resolved(PersistedValue::Int(99))
-        );
-        let events = store.events(&id()).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].sequence, 1);
-        assert_eq!(events[0].completed_by.as_deref(), Some("external:webhook"));
+        {
+            let store = JsonFilePromiseStore::new(&root).unwrap();
+            assert_eq!(
+                store.state(&id()).unwrap(),
+                PromiseState::Resolved(PersistedValue::Int(99))
+            );
+            let events = store.events(&id()).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].sequence, 1);
+            assert_eq!(events[0].completed_by.as_deref(), Some("external:webhook"));
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn opaque_id_cannot_escape_file_store_root() {
-        let dir = TempDir::new().unwrap();
-        let mut store = JsonFilePromiseStore::new(dir.path()).unwrap();
-        let dangerous = PromiseId::new("../../outside").unwrap();
-        store.create(dangerous.clone()).unwrap();
-        assert_eq!(store.state(&dangerous).unwrap(), PromiseState::Pending);
-        let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
-        assert_eq!(entries.len(), 1);
+        let root = temp_root("opaque-id");
+        {
+            let mut store = JsonFilePromiseStore::new(&root).unwrap();
+            let dangerous = PromiseId::new("../../outside").unwrap();
+            store.create(dangerous.clone()).unwrap();
+            assert_eq!(store.state(&dangerous).unwrap(), PromiseState::Pending);
+            let entries: Vec<_> = fs::read_dir(&root).unwrap().collect();
+            assert_eq!(entries.len(), 1);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }
