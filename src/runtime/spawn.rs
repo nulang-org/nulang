@@ -47,30 +47,17 @@ pub(crate) fn spawn_actor_with_id(
         actor.set_state_field(name, value);
     }
     actor.state_models = state_models;
-    // Register CRDT-backed fields with the CrdtManager.
     if let Some(ref mut mgr) = rt.crdt_manager {
         mgr.register_actor_fields(id, &actor);
     }
     actor.persistent = persistent;
     let workflow_name = workflow.map(|n| n.to_string());
     if let Some(name) = workflow {
-        // Legacy storage field retained until the versioned ActorRole format
-        // migration. Semantic reads use Actor::role()/ActorMeta::role().
         actor.is_workflow = true;
         actor.name = name.to_string();
         actor.register_behavior("__timer_fired", timer_fired_handler);
     }
     actor.state = crate::runtime::ActorState::Running;
-    // Restart recovery (CLI durability): when a persistent actor is spawned
-    // with an id that already has durable state in the persistence store
-    // (e.g. a previous `nula run` wrote `.nulang/store/actor_<id>/`), overlay
-    // the snapshot and replay the event log instead of keeping the declared
-    // defaults. Actor ids are drawn from a process-local counter that starts
-    // at the same value on every run, so a deterministic program re-spawns
-    // the same entities with the same ids after a restart. Fresh ids (new
-    // actors, or the default in-memory store used by tests) find no snapshot
-    // and are unaffected. Workflow actors have their own journal-based
-    // recovery path (`recover_actor`), so they are skipped here.
     if persistent && workflow.is_none() {
         restore_persistent_state(rt, &mut actor);
     }
@@ -109,14 +96,7 @@ pub(crate) fn spawn_actor_with_id(
     id
 }
 
-/// Overlay previously persisted state onto a freshly spawned persistent
-/// actor: restore the durable-field snapshot, then replay the event-sourced
-/// event log (mirroring the restore portion of `Runtime::recover_actor`).
-/// A no-op when the store holds no snapshot for this actor id.
 fn restore_persistent_state(rt: &Runtime, actor: &mut Actor) {
-    // Event-sourced-only actors may have an event log but no snapshot
-    // (EventSourced fields are excluded from snapshots by design), so both
-    // halves run independently.
     if let Some(snapshot) = rt.persistence.load_snapshot(actor.id) {
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal;
@@ -141,9 +121,6 @@ fn restore_persistent_state(rt: &Runtime, actor: &mut Actor) {
     }
 }
 
-/// Compatibility wrapper for recovery/distribution paths that still carry the
-/// legacy workflow boolean. New semantic code should call
-/// [`bytecode_offsets_for_role`] with the canonical [`ActorRole`].
 pub(crate) fn bytecode_offsets_for(
     module: &crate::bytecode::CodeModule,
     is_workflow: bool,
@@ -156,16 +133,6 @@ pub(crate) fn bytecode_offsets_for(
     bytecode_offsets_for_role(module, role)
 }
 
-/// Build a bytecode actor's `bytecode_offsets` vector from its canonical role.
-///
-/// Ordinary bytecode actors are dispatched by WHOLE-MODULE behavior id
-/// (`bytecode_offsets` indexes the module's full behavior list). Workflow
-/// actors are the exception: `layout_workflow_behavior_table` assigns
-/// steps LOCAL ids 0..step_count-1 (internal behaviors like
-/// `__timer_fired` come after), so a workflow's offsets must be its OWN
-/// behaviors compressed to local order — a plain actor declared before
-/// the workflow would otherwise shift every step (SPEC2 §10 known-issue
-/// #2, also seen at recover/migrate/hot-reload).
 pub(crate) fn bytecode_offsets_for_role(
     module: &crate::bytecode::CodeModule,
     role: ActorRole,
@@ -185,6 +152,24 @@ pub(crate) fn bytecode_offsets_for_role(
     } else {
         module.behaviors.iter().map(|b| b.code_offset).collect()
     }
+}
+
+/// Clone a module for one concrete runtime actor while preserving the complete
+/// executable payload. Only the metadata vector is projected to the matched
+/// actor type, giving persistence/recovery an unambiguous schema identity.
+pub(crate) fn actor_specific_module(
+    module: &crate::bytecode::CodeModule,
+    meta: Option<&crate::bytecode::ActorMeta>,
+) -> crate::bytecode::CodeModule {
+    let mut actor_module = module.clone();
+    if let Some(meta) = meta {
+        actor_module
+            .actor_metadata
+            .retain(|candidate| candidate.name == meta.name);
+    } else {
+        actor_module.actor_metadata.clear();
+    }
+    actor_module
 }
 
 /// Shared body of both VM-callback `spawn_actor` implementations.
@@ -243,8 +228,6 @@ pub(crate) fn spawn_from_module(
         spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
     };
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
-    // compensation_offsets filtered to this actor's own behaviors so
-    // step-local indices in run_saga_compensation match.
     let compensation_offsets: Vec<Option<usize>> = if let Some(meta) = meta {
         meta.behavior_indices
             .iter()
@@ -257,14 +240,13 @@ pub(crate) fn spawn_from_module(
             .map(|b| b.compensate_offset)
             .collect()
     };
+    let actor_module = actor_specific_module(module, meta);
     if let Some(actor) = rt.actors.get_mut(&id) {
-        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_module = Some(actor_module.clone());
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
         if let Some(meta) = meta {
             if matches!(role, ActorRole::Agent) {
-                // Legacy storage flag retained until the serialized role enum
-                // replaces the compatibility booleans.
                 actor.is_agent = true;
                 for (name, c) in &meta.state_defaults {
                     if let crate::bytecode::Constant::String(json) = c {
@@ -290,7 +272,6 @@ pub(crate) fn spawn_from_module(
             };
         }
     }
-    // Wire AOT-native dispatch only when native codegen is present.
     #[cfg(feature = "native-codegen")]
     if let Some(meta) = meta.as_ref() {
         if !matches!(role, ActorRole::Workflow) {
@@ -300,9 +281,6 @@ pub(crate) fn spawn_from_module(
                 let runtime_ptr = rt as *mut Runtime;
                 if let Some(actor) = rt.actors.get_mut(&id) {
                     for &gidx in &meta.behavior_indices {
-                        // CodeModule behavior names are fully-qualified
-                        // `"{Actor}.{behavior}"` (see mir_lower), which is
-                        // exactly what `fn_ptr_for_behavior` expects.
                         let fq = module
                             .behaviors
                             .get(gidx)
@@ -331,12 +309,13 @@ pub(crate) fn spawn_from_module(
     if matches!(role, ActorRole::Workflow) {
         layout_workflow_behavior_table(rt, id);
     }
-    register_recovery_module(rt, id, module.clone(), offsets, compensation_offsets);
+    // Recovery needs all executable code, but not unrelated entity metadata.
+    // Keeping the same projected module here ensures restart cannot reintroduce
+    // ambiguous schema/version provenance.
+    register_recovery_module(rt, id, actor_module, offsets, compensation_offsets);
     Value::actor_ref(id)
 }
 
-/// Populate a workflow actor's behavior table with placeholder entries for
-/// each bytecode step plus the internal `__timer_fired` handler.
 pub(crate) fn layout_workflow_behavior_table(rt: &mut Runtime, actor_id: u64) {
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         if !matches!(actor.role(), Ok(ActorRole::Workflow)) {
@@ -356,8 +335,6 @@ pub(crate) fn layout_workflow_behavior_table(rt: &mut Runtime, actor_id: u64) {
     }
 }
 
-/// Register bytecode metadata so that a persistent actor can be recovered
-/// after a runtime restart.
 pub(crate) fn register_recovery_module(
     rt: &mut Runtime,
     actor_id: u64,

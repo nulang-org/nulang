@@ -16,10 +16,9 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-/// Schema version assigned to durable records written before RFC 0008 version
-/// metadata existed.
+use crate::migration_manifest::MigrationManifest;
+
 pub const LEGACY_SCHEMA_VERSION: u32 = 1;
-/// Stable JSON key used by snapshot and journal record encodings.
 pub const SCHEMA_VERSION_FIELD: &str = "schema_version";
 
 #[derive(Debug)]
@@ -29,6 +28,12 @@ pub enum PersistenceSchemaError {
     InvalidVersionType,
     RecordMustBeObject,
     ReservedFieldCollision,
+    AmbiguousActorMetadata(usize),
+    InvalidMigrationManifest(String),
+    ManifestVersionMismatch {
+        actor_version: u32,
+        manifest_version: u32,
+    },
     Json(serde_json::Error),
 }
 
@@ -46,6 +51,20 @@ impl fmt::Display for PersistenceSchemaError {
             Self::ReservedFieldCollision => write!(
                 f,
                 "record already contains reserved persistence field '{SCHEMA_VERSION_FIELD}'"
+            ),
+            Self::AmbiguousActorMetadata(count) => write!(
+                f,
+                "actor-local bytecode module contains {count} actor metadata records; schema identity is ambiguous"
+            ),
+            Self::InvalidMigrationManifest(error) => {
+                write!(f, "invalid actor migration manifest: {error}")
+            }
+            Self::ManifestVersionMismatch {
+                actor_version,
+                manifest_version,
+            } => write!(
+                f,
+                "actor schema version {actor_version} does not match migration manifest target version {manifest_version}"
             ),
             Self::Json(error) => write!(f, "persistence JSON error: {error}"),
         }
@@ -67,15 +86,72 @@ impl From<serde_json::Error> for PersistenceSchemaError {
     }
 }
 
-/// A decoded persistence record plus the schema version under which it was
-/// written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedRecord<T> {
     pub schema_version: u32,
     pub record: T,
 }
 
-/// Serialize a durable record with an explicit top-level `schema_version`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorSchemaIdentity {
+    pub entity_type_name: Option<String>,
+    pub schema_version: u32,
+    pub migration_manifest_hash: Option<String>,
+}
+
+impl ActorSchemaIdentity {
+    pub fn legacy_v1() -> Self {
+        Self {
+            entity_type_name: None,
+            schema_version: LEGACY_SCHEMA_VERSION,
+            migration_manifest_hash: None,
+        }
+    }
+}
+
+/// Resolve the authoritative schema identity attached to one actor.
+///
+/// Actor-local bytecode modules are projected to zero or one metadata record at
+/// spawn/recovery registration. Ambiguous metadata is rejected rather than
+/// guessing which entity type produced a persistence record.
+pub fn actor_schema_identity(
+    actor: &crate::runtime::Actor,
+) -> Result<ActorSchemaIdentity, PersistenceSchemaError> {
+    let Some(module) = actor.bytecode_module.as_ref() else {
+        return Ok(ActorSchemaIdentity::legacy_v1());
+    };
+    match module.actor_metadata.as_slice() {
+        [] => Ok(ActorSchemaIdentity::legacy_v1()),
+        [meta] => {
+            if meta.version == 0 {
+                return Err(PersistenceSchemaError::ZeroSchemaVersion);
+            }
+            let migration_manifest_hash = if meta.migrations.trim().is_empty() {
+                None
+            } else {
+                let manifest = MigrationManifest::from_json(&meta.migrations).map_err(|error| {
+                    PersistenceSchemaError::InvalidMigrationManifest(error.to_string())
+                })?;
+                if manifest.target_version != meta.version {
+                    return Err(PersistenceSchemaError::ManifestVersionMismatch {
+                        actor_version: meta.version,
+                        manifest_version: manifest.target_version,
+                    });
+                }
+                Some(manifest.digest().map_err(|error| {
+                    PersistenceSchemaError::InvalidMigrationManifest(error.to_string())
+                })?)
+            };
+            Ok(ActorSchemaIdentity {
+                entity_type_name: Some(meta.name.clone()),
+                schema_version: meta.version,
+                migration_manifest_hash,
+            })
+        }
+        many => Err(PersistenceSchemaError::AmbiguousActorMetadata(many.len())),
+    }
+}
+
 pub fn encode_record<T: Serialize>(
     record: &T,
     schema_version: u32,
@@ -97,7 +173,6 @@ pub fn encode_record<T: Serialize>(
     Ok(serde_json::to_string(&value)?)
 }
 
-/// Deserialize a durable record, treating an absent schema version as v1.
 pub fn decode_record<T: DeserializeOwned>(
     json: &str,
 ) -> Result<DecodedRecord<T>, PersistenceSchemaError> {
@@ -126,7 +201,6 @@ fn decode_version(value: Option<Value>) -> Result<u32, PersistenceSchemaError> {
     u32::try_from(version).map_err(|_| PersistenceSchemaError::VersionOutOfRange(version))
 }
 
-/// Insert a schema version into an already-serialized JSON object.
 pub fn add_version_to_value(
     mut value: Value,
     schema_version: u32,
@@ -150,7 +224,10 @@ pub fn add_version_to_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{ActorSnapshot, EventEntry, JournalEntry, PersistedValue};
+    use crate::migration_manifest::{
+        MigrationContractMeta, MIGRATION_MANIFEST_FORMAT_VERSION,
+    };
+    use crate::runtime::{Actor, ActorSnapshot, EventEntry, JournalEntry, PersistedValue};
 
     #[test]
     fn legacy_snapshot_without_version_decodes_as_v1() {
@@ -213,6 +290,90 @@ mod tests {
         assert_eq!(decoded.schema_version, 2);
         assert_eq!(decoded.record.event_name, "Incremented");
         assert_eq!(decoded.record.value, PersistedValue::Int(9));
+    }
+
+    #[test]
+    fn native_actor_defaults_to_legacy_v1_identity() {
+        let actor = Actor::new(1, "native", 0);
+        assert_eq!(
+            actor_schema_identity(&actor).unwrap(),
+            ActorSchemaIdentity::legacy_v1()
+        );
+    }
+
+    #[test]
+    fn actor_identity_comes_from_single_attached_metadata_record() {
+        let manifest = MigrationManifest {
+            format_version: MIGRATION_MANIFEST_FORMAT_VERSION,
+            target_version: 2,
+            contracts: vec![MigrationContractMeta {
+                from_version: 1,
+                to_version: 2,
+                has_state_transform: true,
+                event_transforms: Vec::new(),
+            }],
+        };
+        let expected_hash = manifest.digest().unwrap();
+        let mut meta = crate::bytecode::ActorMeta::new("Counter");
+        meta.version = 2;
+        meta.migrations = manifest.to_json().unwrap();
+        let mut module = crate::bytecode::CodeModule::new("app");
+        module.actor_metadata.push(meta);
+        let mut actor = Actor::new(1, "actor_1", 0);
+        actor.bytecode_module = Some(module);
+
+        let identity = actor_schema_identity(&actor).unwrap();
+        assert_eq!(identity.entity_type_name.as_deref(), Some("Counter"));
+        assert_eq!(identity.schema_version, 2);
+        assert_eq!(
+            identity.migration_manifest_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn ambiguous_multi_entity_metadata_is_rejected() {
+        let mut module = crate::bytecode::CodeModule::new("app");
+        module
+            .actor_metadata
+            .push(crate::bytecode::ActorMeta::new("A"));
+        module
+            .actor_metadata
+            .push(crate::bytecode::ActorMeta::new("B"));
+        let mut actor = Actor::new(1, "actor_1", 0);
+        actor.bytecode_module = Some(module);
+        assert!(matches!(
+            actor_schema_identity(&actor),
+            Err(PersistenceSchemaError::AmbiguousActorMetadata(2))
+        ));
+    }
+
+    #[test]
+    fn manifest_target_must_match_actor_schema_version() {
+        let manifest = MigrationManifest {
+            format_version: MIGRATION_MANIFEST_FORMAT_VERSION,
+            target_version: 2,
+            contracts: vec![MigrationContractMeta {
+                from_version: 1,
+                to_version: 2,
+                has_state_transform: false,
+                event_transforms: Vec::new(),
+            }],
+        };
+        let mut meta = crate::bytecode::ActorMeta::new("Counter");
+        meta.version = 3;
+        meta.migrations = manifest.to_json().unwrap();
+        let mut module = crate::bytecode::CodeModule::new("app");
+        module.actor_metadata.push(meta);
+        let mut actor = Actor::new(1, "actor_1", 0);
+        actor.bytecode_module = Some(module);
+        assert!(matches!(
+            actor_schema_identity(&actor),
+            Err(PersistenceSchemaError::ManifestVersionMismatch {
+                actor_version: 3,
+                manifest_version: 2,
+            })
+        ));
     }
 
     #[test]
