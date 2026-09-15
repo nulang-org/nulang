@@ -1,4 +1,4 @@
-name: P0 Agent Tool-State Diagnostic
+name: P0 Agent Completion Dispatch Diagnostic
 
 on:
   push:
@@ -24,6 +24,11 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: p0-agent-dispatch-diag
 
       - name: Stage exact failing fixture authority
         shell: bash
@@ -53,36 +58,66 @@ jobs:
           path.write_text(text[:start] + migrated + text[end:])
           PY
 
-      - name: Instrument tool-state path locally
+      - name: Instrument completion dispatch locally
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path('src/runtime/agent.rs')
-          text = path.read_text()
-          needle = '''pub(crate) fn invoke_agent_tool_function(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    name: &str,\n    arguments: &serde_json::Map<String, serde_json::Value>,\n) -> Result<String, String> {\n    if let Some(actor_id) = rt.current_actor {'''
-          repl = '''pub(crate) fn invoke_agent_tool_function(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    name: &str,\n    arguments: &serde_json::Map<String, serde_json::Value>,\n) -> Result<String, String> {\n    eprintln!("P0_DIAG tool={} current_actor={:?}", name, rt.current_actor);\n    if let Some(actor_id) = rt.current_actor {\n        eprintln!("P0_DIAG actor={} is_agent={} semantic_behavior={}", actor_id, rt.actor_is_agent(actor_id), rt.is_semantic_memory_behavior(name));'''
+          agent = Path('src/runtime/agent.rs')
+          text = agent.read_text()
+
+          needle = '''pub(crate) fn complete_agent_llm(rt: &mut Runtime, actor_id: u64, prompt: &str) -> Option<String> {\n    let prev_current_actor = rt.current_actor;'''
+          repl = '''pub(crate) fn complete_agent_llm(rt: &mut Runtime, actor_id: u64, prompt: &str) -> Option<String> {\n    eprintln!("P0_DISPATCH complete_agent_llm actor={} current_actor_before={:?} is_agent={}", actor_id, rt.current_actor, rt.actor_is_agent(actor_id));\n    let prev_current_actor = rt.current_actor;'''
           if text.count(needle) != 1:
-              raise SystemExit('invoke_agent_tool_function shape changed')
+              raise SystemExit('complete_agent_llm shape changed')
           text = text.replace(needle, repl, 1)
 
-          needle2 = '''        let id = rt.semantic_memory_store_with_metadata(actor_id, &content, metadata);\n        Ok(format!('''
-          repl2 = '''        eprintln!("P0_DIAG store_fact actor={} content={}", actor_id, content);\n        let id = rt.semantic_memory_store_with_metadata(actor_id, &content, metadata);\n        if let Some(actor) = rt.actors.get(&actor_id) {\n            let state = actor\n                .get_state_field("semantic_memory")\n                .and_then(|value| vm_value_to_string(&value, actor.bytecode_module.as_ref()));\n            eprintln!("P0_DIAG semantic_after_store={:?}", state);\n        }\n        Ok(format!('''
-          if text.count(needle2) != 1:
-              raise SystemExit('semantic store shape changed')
-          text = text.replace(needle2, repl2, 1)
+          needle = '''    let request = build_agent_llm_request(rt, actor_id, prompt)?;\n    let module = rt.actors.get(&actor_id)?.bytecode_module.clone()?;\n    let response = rt\n        .complete_llm_with_tools(request, Vec::new(), &module)\n        .ok()?;'''
+          repl = '''    let request = build_agent_llm_request(rt, actor_id, prompt)?;\n    eprintln!("P0_DISPATCH built_agent_request actor={} tools={}", actor_id, request.tools.len());\n    let module = rt.actors.get(&actor_id)?.bytecode_module.clone()?;\n    eprintln!("P0_DISPATCH module_tools actor={} tools={}", actor_id, module.tools.len());\n    let response = rt\n        .complete_llm_with_tools(request, Vec::new(), &module)\n        .ok()?;\n    eprintln!("P0_DISPATCH agent_response actor={} tool_calls={} content={:?}", actor_id, response.tool_calls.len(), response.content);'''
+          if text.count(needle) != 1:
+              raise SystemExit('complete_agent_llm_inner shape changed')
+          text = text.replace(needle, repl, 1)
 
-          needle3 = '''    actor.set_state_field("usage_cost", crate::vm::Value::float(updated_cost));\n    Some(content)'''
-          repl3 = '''    actor.set_state_field("usage_cost", crate::vm::Value::float(updated_cost));\n    let semantic = actor\n        .get_state_field("semantic_memory")\n        .and_then(|value| vm_value_to_string(&value, actor.bytecode_module.as_ref()));\n    eprintln!("P0_DIAG semantic_after_finish_agent={:?}", semantic);\n    Some(content)'''
-          if text.count(needle3) != 1:
-              raise SystemExit('finish_agent_llm shape changed')
-          text = text.replace(needle3, repl3, 1)
-          path.write_text(text)
+          needle = '''    let response = complete_llm_request(rt, request.clone(), memory.clone())?;\n    finish_tool_calls(rt, module, response)'''
+          repl = '''    let response = complete_llm_request(rt, request.clone(), memory.clone())?;\n    eprintln!("P0_DISPATCH provider_response tool_calls={} content={:?}", response.tool_calls.len(), response.content);\n    finish_tool_calls(rt, module, response)'''
+          if text.count(needle) != 1:
+              raise SystemExit('complete_llm_with_tools shape changed')
+          text = text.replace(needle, repl, 1)
+
+          needle = '''pub(crate) fn finish_tool_calls(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    mut response: LlmResponse,\n) -> Result<LlmResponse, nulang_ai::LlmError> {\n    if !response.tool_calls.is_empty() {'''
+          repl = '''pub(crate) fn finish_tool_calls(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    mut response: LlmResponse,\n) -> Result<LlmResponse, nulang_ai::LlmError> {\n    eprintln!("P0_DISPATCH finish_tool_calls current_actor={:?} calls={} module_tools={}", rt.current_actor, response.tool_calls.len(), module.tools.len());\n    if !response.tool_calls.is_empty() {'''
+          if text.count(needle) != 1:
+              raise SystemExit('finish_tool_calls shape changed')
+          text = text.replace(needle, repl, 1)
+
+          needle = '''pub(crate) fn invoke_agent_tool_function(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    name: &str,\n    arguments: &serde_json::Map<String, serde_json::Value>,\n) -> Result<String, String> {\n    if let Some(actor_id) = rt.current_actor {'''
+          repl = '''pub(crate) fn invoke_agent_tool_function(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    name: &str,\n    arguments: &serde_json::Map<String, serde_json::Value>,\n) -> Result<String, String> {\n    eprintln!("P0_DISPATCH invoke_tool name={} current_actor={:?}", name, rt.current_actor);\n    if let Some(actor_id) = rt.current_actor {'''
+          if text.count(needle) != 1:
+              raise SystemExit('invoke tool shape changed')
+          text = text.replace(needle, repl, 1)
+          agent.write_text(text)
+
+          callbacks = Path('src/runtime/callbacks.rs')
+          text = callbacks.read_text()
+          needle = '''    fn complete_llm(&mut self, model: &str, prompt: &str) -> Option<String> {\n        let mut rt = self.runtime.borrow_mut();'''
+          repl = '''    fn complete_llm(&mut self, model: &str, prompt: &str) -> Option<String> {\n        let mut rt = self.runtime.borrow_mut();\n        eprintln!("P0_DISPATCH runtime_vm_complete current_actor={:?} actor_is_agent={:?}", rt.current_actor, rt.current_actor.and_then(|id| rt.actors.get(&id).map(|a| a.is_agent)));'''
+          count = text.count(needle)
+          if count != 1:
+              raise SystemExit(f'expected one Rc RuntimeVm complete_llm, got {count}')
+          text = text.replace(needle, repl, 1)
+
+          needle = '''    fn complete_llm(&mut self, model: &str, prompt: &str) -> Option<String> {\n        unsafe {'''
+          repl = '''    fn complete_llm(&mut self, model: &str, prompt: &str) -> Option<String> {\n        unsafe {\n            eprintln!("P0_DISPATCH bytecode_complete bound_actor={} runtime_current={:?} is_agent={}", self.actor_id, (*self.runtime).current_actor, (*self.runtime).actor_is_agent(self.actor_id));'''
+          count = text.count(needle)
+          if count != 1:
+              raise SystemExit(f'expected one Bytecode complete_llm, got {count}')
+          text = text.replace(needle, repl, 1)
+          callbacks.write_text(text)
           PY
 
-      - name: Run isolated failing regression with diagnostics
+      - name: Run isolated failing regression with dispatch diagnostics
         env:
           RUST_BACKTRACE: "1"
         run: cargo +1.95.0 test --lib integration_tests::tests::test_agent_workflow_recovers_semantic_memory_after_restart -- --exact --nocapture
