@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 concurrency:
   group: p0-host-authority-fail-closed
   cancel-in-progress: false
@@ -15,16 +18,17 @@ concurrency:
 jobs:
   patch-and-validate:
     if: github.actor != 'github-actions[bot]'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           ref: integration/p0-stabilization-2026-09-14
           fetch-depth: 0
 
-      - name: Install pinned Rust
-        uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.95.0
           components: rustfmt
 
       - name: Apply fail-closed host-authority policy
@@ -45,7 +49,7 @@ jobs:
           new = '''        ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
           ("Inference" | "LLM", Some("ask")) => other("Inference", "Ask", None),
           (
-              "FS" | "Web" | "Realtime" | "Env" | "Secret" | "Http" | "Process" | "System"
+              "FS" | "Realtime" | "Env" | "Secret" | "Http" | "Process" | "System"
               | "DB" | "Python" | "Provider" | "Inference" | "LLM",
               operation,
           ) => {
@@ -66,8 +70,8 @@ jobs:
       #[test]
       fn sensitive_namespaces_fail_closed_for_unmapped_operations() {
           for namespace in [
-              "FS", "Web", "Realtime", "Env", "Secret", "Http", "Process", "System",
-              "DB", "Python", "Provider", "Inference", "LLM",
+              "FS", "Realtime", "Env", "Secret", "Http", "Process", "System",
+              "DB", "Provider", "Inference", "LLM",
           ] {
               let error = required_host_authority(namespace, Some("__unmapped__"), &[], &[])
                   .expect_err("sensitive host namespace must fail closed");
@@ -80,6 +84,23 @@ jobs:
           let error = required_host_authority("FS", None, &[], &[])
               .expect_err("missing operation in sensitive namespace must fail closed");
           assert!(error.contains("FS.<missing>"), "{error}");
+      }
+
+      #[test]
+      fn python_unknown_operation_still_requires_python_authority() {
+          let grant = required_host_authority("Python", Some("future_op"), &[], &[])
+              .expect("Python operations should classify")
+              .expect("Python operation must require authority");
+          assert_eq!(grant.to_string(), "Python::future_op");
+      }
+
+      #[test]
+      fn mixed_web_namespace_keeps_local_rendering_operations_ungated() {
+          for operation in ["html", "text", "raw", "route", "redirect", "param"] {
+              let grant = required_host_authority("Web", Some(operation), &[], &[])
+                  .expect("local Web operation should classify without error");
+              assert!(grant.is_none(), "{operation} unexpectedly required host authority");
+          }
       }
 
       #[test]
