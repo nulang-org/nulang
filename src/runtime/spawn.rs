@@ -45,9 +45,8 @@ fn preflight_persistent_snapshot(
     let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
         return Ok(None);
     };
-    let manifest = AuthorityManifest::from_tokens(
-        snapshot.authority_tokens.iter().map(String::as_str),
-    )?;
+    let manifest =
+        AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))?;
     Ok(Some((snapshot, manifest)))
 }
 
@@ -558,7 +557,7 @@ mod authority_tests {
                 actor_id,
                 sequence: 7,
                 authority_tokens: std::collections::BTreeSet::from([
-                    "Secret::Read(RESTART_KEY)".to_string(),
+                    "Secret::Read(RESTART_KEY)".to_string()
                 ]),
                 ..ActorSnapshot::default()
             })
@@ -574,7 +573,10 @@ mod authority_tests {
         );
 
         assert_eq!(returned, actor_id);
-        let actor = rt.actors.get(&actor_id).expect("persistent actor published");
+        let actor = rt
+            .actors
+            .get(&actor_id)
+            .expect("persistent actor published");
         assert_eq!(actor.sequence, 7);
         assert!(actor
             .authority_manifest()
@@ -595,7 +597,7 @@ mod authority_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 authority_tokens: std::collections::BTreeSet::from([
-                    "Net::TcpOut(malformed)".to_string(),
+                    "Net::TcpOut(malformed)".to_string()
                 ]),
                 ..ActorSnapshot::default()
             })

@@ -879,7 +879,7 @@ macro_rules! define_aot_perform {
         pub unsafe extern "C" fn $name(eff_raw: u64, op_raw: u64 $(, $arg: u64)*) -> u64 {
             let effect = crate::jit::runtime::resolve_string_coerce(eff_raw).unwrap_or_default();
             let op = crate::jit::runtime::resolve_string_coerce(op_raw).unwrap_or_default();
-            let regs = [$(crate::vm::Value::from_bits($arg)),*];
+            let regs = [$(unsafe { crate::vm::Value::from_bits($arg) }),*];
             // The module is only needed by `perform_builtin_effect_in_module`
             // for a few effects (Otp/Http resolve against it); the common
             // IO/Actor/Timer path ignores it.
@@ -1241,6 +1241,18 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
         Some(self.actor_id)
     }
 
+    fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
+        unsafe {
+            crate::runtime::callbacks::authorize_actor_ffi(
+                &*self.runtime,
+                Some(self.actor_id),
+                library,
+                symbol,
+            )
+            .is_ok()
+        }
+    }
+
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
         // SAFETY: the scheduler holds `&mut Runtime`; re-borrow through the
         // raw pointer, mirroring `BytecodeRuntimeCallbacks`.
@@ -1431,6 +1443,14 @@ impl std::fmt::Debug for AotTopLevelCallbacks {
 impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
     fn current_actor_id(&self) -> Option<u64> {
         self.current_actor_id()
+    }
+
+    fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
+        unsafe {
+            let rt = &*self.runtime;
+            crate::runtime::callbacks::authorize_actor_ffi(rt, rt.current_actor, library, symbol)
+                .is_ok()
+        }
     }
 
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {

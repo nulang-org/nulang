@@ -173,13 +173,10 @@ impl WasmFxRuntime {
 /// offset or arbitrary integer to masquerade as a host heap pointer. `TAG_PTR`
 /// is process-local host provenance in `Value`; a guest cannot establish it.
 fn guest_result_value(raw: u64) -> NuResult<crate::vm::Value> {
-    if value_layout::is_ptr_raw(raw) {
-        return Err(NuError::VMError {
-            msg: "wasmfx guest returned a host pointer-tagged value".into(),
-            span: crate::types::Span::default(),
-        });
-    }
-    Ok(crate::vm::Value::from_raw(raw))
+    crate::vm::Value::try_from_untrusted_bits(raw).map_err(|_| NuError::VMError {
+        msg: "wasmfx guest returned a host pointer-tagged value".into(),
+        span: crate::types::Span::default(),
+    })
 }
 
 // ── Host import functions ──────────────────────────────────────────────

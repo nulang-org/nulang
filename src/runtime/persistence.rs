@@ -2030,7 +2030,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
-            authority_tokens: Default::default(),
+                authority_tokens: Default::default(),
             })
             .unwrap();
 
@@ -2092,7 +2092,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
-            authority_tokens: Default::default(),
+                authority_tokens: Default::default(),
             })
             .unwrap();
         store
@@ -2121,7 +2121,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
-            authority_tokens: Default::default(),
+                authority_tokens: Default::default(),
             })
             .unwrap();
         store
@@ -2157,7 +2157,7 @@ mod json_file_store_tests {
                     waiting_signal: None,
                     crdt_snapshot: None,
                     crdt_field_map: None,
-                authority_tokens: Default::default(),
+                    authority_tokens: Default::default(),
                 })
                 .unwrap();
             store
@@ -2196,7 +2196,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
-            authority_tokens: Default::default(),
+                authority_tokens: Default::default(),
             })
             .unwrap();
 
@@ -2317,7 +2317,7 @@ mod rocksdb_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
-            authority_tokens: Default::default(),
+                authority_tokens: Default::default(),
             })
             .unwrap();
 
@@ -2373,7 +2373,7 @@ mod rocksdb_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
-            authority_tokens: Default::default(),
+                authority_tokens: Default::default(),
             })
             .unwrap();
         store
@@ -2402,7 +2402,7 @@ mod rocksdb_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
-            authority_tokens: Default::default(),
+                authority_tokens: Default::default(),
             })
             .unwrap();
         store
@@ -2438,7 +2438,7 @@ mod rocksdb_store_tests {
                     waiting_signal: None,
                     crdt_snapshot: None,
                     crdt_field_map: None,
-                authority_tokens: Default::default(),
+                    authority_tokens: Default::default(),
                 })
                 .unwrap();
             store
@@ -2509,7 +2509,7 @@ mod postgres_store_tests {
                 waiting_signal: Some("signal".to_string()),
                 crdt_snapshot: None,
                 crdt_field_map: None,
-            authority_tokens: Default::default(),
+                authority_tokens: Default::default(),
             })
             .unwrap();
 
@@ -2574,7 +2574,7 @@ mod postgres_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
-            authority_tokens: Default::default(),
+                authority_tokens: Default::default(),
             })
             .unwrap();
         store
@@ -2607,7 +2607,7 @@ mod postgres_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
-            authority_tokens: Default::default(),
+                authority_tokens: Default::default(),
             })
             .unwrap();
         store

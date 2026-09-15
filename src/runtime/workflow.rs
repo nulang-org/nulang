@@ -66,7 +66,8 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
         Err(err) => {
             tracing::warn!(
                 "nulang-persist: refusing to checkpoint actor {} with invalid authority: {}",
-                actor_id, err
+                actor_id,
+                err
             );
             return;
         }

@@ -254,10 +254,7 @@ fn lookup<'a>(
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(&binding.source_name))
             .map(|(_, value)| value.as_str()),
-        RouteBindingSource::Cookie => values
-            .cookies
-            .get(&binding.source_name)
-            .map(String::as_str),
+        RouteBindingSource::Cookie => values.cookies.get(&binding.source_name).map(String::as_str),
         RouteBindingSource::Body => values.body,
         RouteBindingSource::Form => values.form.get(&binding.source_name).map(String::as_str),
     }
@@ -484,10 +481,7 @@ mod tests {
     fn parses_target_form_and_cookies() {
         let (path, query) = split_request_target("/users?term=hello+world&tag=a%2Fb");
         assert_eq!(path, "/users");
-        assert_eq!(
-            query.get("term").map(String::as_str),
-            Some("hello world")
-        );
+        assert_eq!(query.get("term").map(String::as_str), Some("hello world"));
         assert_eq!(query.get("tag").map(String::as_str), Some("a/b"));
         assert_eq!(
             parse_urlencoded(b"title=hello+world")

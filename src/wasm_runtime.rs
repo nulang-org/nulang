@@ -84,10 +84,8 @@ impl Default for HostState {
 /// denotes a linear-memory offset and is valid guest state; it becomes unsafe
 /// only when those bits cross the guest/host boundary as a host `Value`.
 fn guest_non_pointer_value(raw: u64) -> Result<crate::vm::Value, &'static str> {
-    if value_layout::is_ptr_raw(raw) {
-        return Err("wasm guest pointer-tagged value has no host heap provenance");
-    }
-    Ok(crate::vm::Value::from_raw(raw))
+    crate::vm::Value::try_from_untrusted_bits(raw)
+        .map_err(|_| "wasm guest pointer-tagged value has no host heap provenance")
 }
 
 // ── WASM Runtime ─────────────────────────────────────────────────────
@@ -252,7 +250,7 @@ impl WasmRuntime {
             }
         })?;
         guest_non_pointer_value(raw as u64)
-            .map_err(|msg| NuError::runtime_error(msg, Span::default()))
+            .map_err(|msg| NuError::runtime_error(msg.to_string(), Span::default()))
     }
 
     /// Resolve a tagged string `Value` (`TAG_STRING | offset`) to its text by
@@ -421,7 +419,7 @@ fn host_str_concat(mut caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<
                 // converting a guest linear-memory pointer into a host Value.
                 format!("#Value({:x})", raw)
             } else {
-                crate::vm::Value::from_raw(raw).to_string_repr()
+                unsafe { crate::vm::Value::from_raw(raw) }.to_string_repr()
             }
         };
         (read(a), read(b))
@@ -664,7 +662,7 @@ fn host_ffi_call_impl(
         if *p == crate::ffi::marshal::CType::CStr {
             let s = read_wasm_string(&mut caller, args[i]);
             let c = std::ffi::CString::new(s).map_err(|_| Error::msg("bad cstr"))?;
-            cargs.push(crate::vm::Value::ptr(c.as_ptr() as *mut u8));
+            cargs.push(unsafe { /* SAFETY: host-side storage owns this pointer for the duration required by the guest/host bridge. */ crate::vm::Value::ptr(c.as_ptr() as *mut u8) });
             cstrings.push(c);
         } else {
             cargs.push(guest_non_pointer_value(args[i] as u64).map_err(Error::msg)?);
