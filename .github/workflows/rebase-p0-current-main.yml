@@ -1,4 +1,4 @@
-name: P0 AI Authority Fixture Migration
+name: P0 Agent Tool-State Diagnostic
 
 on:
   push:
@@ -6,14 +6,14 @@ on:
       - ops/rebase-p0-current-main
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: rebase-p0-current-main
   cancel-in-progress: true
 
 jobs:
-  migrate-and-validate:
+  diagnose:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
@@ -23,21 +23,9 @@ jobs:
           fetch-depth: 0
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.95.0 --profile minimal
 
-      - name: Record exact source heads
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch origin main integration/p0-stabilization-2026-09-14
-          printf '%s\n' "$(git rev-parse HEAD)" > /tmp/p0-start-head
-          printf '%s\n' "$(git rev-parse origin/main)" > /tmp/main-start-head
-          git merge-base --is-ancestor origin/main HEAD || {
-            echo 'P0 branch is no longer based on current main.'
-            exit 1
-          }
-
-      - name: Migrate only known failing AI fixtures
+      - name: Stage exact failing fixture authority
         shell: bash
         run: |
           set -euo pipefail
@@ -47,139 +35,54 @@ jobs:
 
           path = Path('src/integration_tests/mod.rs')
           text = path.read_text()
-          tests = [
-              'test_agent_ask_tracks_usage_and_cost',
-              'test_agent_ask_uses_memory',
-              'test_agent_usage_behavior',
-              'test_agent_workflow_recovers_semantic_memory_after_restart',
-              'test_agent_workflow_researches_and_reports',
-              'test_debate_source_end_to_end',
-              'test_inference_ask_actor_behavior_suspends_and_resumes',
-              'test_inference_ask_chained_suspensions_resume_in_order',
-              'test_inference_ask_nonblocking_other_actors_run_first',
-              'test_inference_ask_queued_messages_wait_for_suspended_behavior',
-              'test_mir_agent_ask_uses_memory',
-              'test_pipeline_source_end_to_end',
-              'test_supervisor_source_end_to_end',
-              'test_workflow_inference_ask_step_records_completion',
-              'test_workflow_inference_ask_step_redriven_after_restart',
-              'test_workflow_step_inference_ask_then_signal_wait',
-              'test_workflow_step_signal_wait_then_inference_ask',
-          ]
-
-          for name in tests:
-              marker = f'fn {name}()'
-              start = text.find(marker)
-              if start < 0:
-                  raise SystemExit(f'missing target test: {name}')
-              next_candidates = [
-                  p for p in (
-                      text.find('\n    #[test]', start + len(marker)),
-                      text.find('\n    #[cfg(', start + len(marker)),
-                  ) if p >= 0
-              ]
-              end = min(next_candidates) if next_candidates else len(text)
-              segment = text[start:end]
-              pattern = re.compile(r'(spawn\s+[A-Za-z_][A-Za-z0-9_]*\s+\{[^{}]*\})(?!\s+with\s*\[)', re.S)
-              migrated, count = pattern.subn(r'\1 with [Inference::Ask]', segment)
-              if count == 0:
-                  if 'with [Inference::Ask]' in segment:
-                      print(f'{name}: already migrated')
-                      continue
-                  raise SystemExit(f'{name}: expected an unprivileged spawn fixture')
-              text = text[:start] + migrated + text[end:]
-              print(f'{name}: migrated {count} spawn site(s)')
-
-          path.write_text(text)
-
-          http = Path('src/runtime/http_server.rs')
-          http_text = http.read_text()
-          replacement = "/// Match a route pattern against a request path, returning captured parameters.\n/// Patterns use `:name` segments, e.g. `/products/:id`.\n#[cfg(test)]\npub fn match_route("
-          if replacement not in http_text:
-              needle = "/// Match a route pattern against a request path, returning captured parameters.\n/// Patterns use `:name` segments, e.g. `/products/:id`.\npub fn match_route("
-              if http_text.count(needle) != 1:
-                  raise SystemExit('expected exactly one legacy match_route declaration')
-              http_text = http_text.replace(needle, replacement, 1)
-              http.write_text(http_text)
+          name = 'test_agent_workflow_recovers_semantic_memory_after_restart'
+          marker = f'fn {name}()'
+          start = text.find(marker)
+          if start < 0:
+              raise SystemExit('missing target test')
+          next_candidates = [p for p in (
+              text.find('\n    #[test]', start + len(marker)),
+              text.find('\n    #[cfg(', start + len(marker)),
+          ) if p >= 0]
+          end = min(next_candidates) if next_candidates else len(text)
+          segment = text[start:end]
+          pattern = re.compile(r'(spawn\s+[A-Za-z_][A-Za-z0-9_]*\s+\{[^{}]*\})(?!\s+with\s*\[)', re.S)
+          migrated, count = pattern.subn(r'\1 with [Inference::Ask]', segment)
+          if count != 1:
+              raise SystemExit(f'expected one spawn migration, got {count}')
+          path.write_text(text[:start] + migrated + text[end:])
           PY
 
-          changed="$(git diff --name-only)"
-          printf '%s\n' "$changed"
-          test -n "$changed"
-          unexpected="$(printf '%s\n' "$changed" | grep -Ev '^(src/integration_tests/mod.rs|src/runtime/http_server.rs)$' || true)"
-          test -z "$unexpected" || {
-            echo "Unexpected migration changes:"
-            printf '%s\n' "$unexpected"
-            exit 1
-          }
-
-      - name: Verify formatting and diff hygiene
-        run: |
-          set -euo pipefail
-          cargo +1.95.0 fmt --all -- --check
-          git diff --check
-
-      - name: Validate builds and zero-warning contract
+      - name: Instrument tool-state path locally
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.95.0 check --all-targets
-          cargo +1.95.0 check --all-targets --no-default-features
-          RUSTFLAGS='-D warnings' cargo +1.95.0 check --lib
-          RUSTFLAGS='-D warnings' cargo +1.95.0 check --release --lib
+          python3 - <<'PY'
+          from pathlib import Path
 
-      - name: Run every migrated regression exactly
-        shell: bash
-        run: |
-          set -euo pipefail
-          tests=(
-            test_agent_ask_tracks_usage_and_cost
-            test_agent_ask_uses_memory
-            test_agent_usage_behavior
-            test_agent_workflow_recovers_semantic_memory_after_restart
-            test_agent_workflow_researches_and_reports
-            test_debate_source_end_to_end
-            test_inference_ask_actor_behavior_suspends_and_resumes
-            test_inference_ask_chained_suspensions_resume_in_order
-            test_inference_ask_nonblocking_other_actors_run_first
-            test_inference_ask_queued_messages_wait_for_suspended_behavior
-            test_mir_agent_ask_uses_memory
-            test_pipeline_source_end_to_end
-            test_supervisor_source_end_to_end
-            test_workflow_inference_ask_step_records_completion
-            test_workflow_inference_ask_step_redriven_after_restart
-            test_workflow_step_inference_ask_then_signal_wait
-            test_workflow_step_signal_wait_then_inference_ask
-          )
-          for t in "${tests[@]}"; do
-            cargo +1.95.0 test --lib "integration_tests::tests::$t" -- --exact --nocapture
-          done
+          path = Path('src/runtime/agent.rs')
+          text = path.read_text()
+          needle = '''pub(crate) fn invoke_agent_tool_function(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    name: &str,\n    arguments: &serde_json::Map<String, serde_json::Value>,\n) -> Result<String, String> {\n    if let Some(actor_id) = rt.current_actor {'''
+          repl = '''pub(crate) fn invoke_agent_tool_function(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    name: &str,\n    arguments: &serde_json::Map<String, serde_json::Value>,\n) -> Result<String, String> {\n    eprintln!("P0_DIAG tool={} current_actor={:?}", name, rt.current_actor);\n    if let Some(actor_id) = rt.current_actor {\n        eprintln!("P0_DIAG actor={} is_agent={} semantic_behavior={}", actor_id, rt.actor_is_agent(actor_id), rt.is_semantic_memory_behavior(name));'''
+          if text.count(needle) != 1:
+              raise SystemExit('invoke_agent_tool_function shape changed')
+          text = text.replace(needle, repl, 1)
 
-      - name: Re-run core P0 authority regressions
-        run: |
-          set -euo pipefail
-          cargo +1.95.0 test --lib host_authority
-          cargo +1.95.0 test --lib authority
-          cargo +1.95.0 test --test spawn_authority_provenance
+          needle2 = '''        let id = rt.semantic_memory_store_with_metadata(actor_id, &content, metadata);\n        Ok(format!('''
+          repl2 = '''        eprintln!("P0_DIAG store_fact actor={} content={}", actor_id, content);\n        let id = rt.semantic_memory_store_with_metadata(actor_id, &content, metadata);\n        if let Some(actor) = rt.actors.get(&actor_id) {\n            let state = actor\n                .get_state_field("semantic_memory")\n                .and_then(|value| vm_value_to_string(&value, actor.bytecode_module.as_ref()));\n            eprintln!("P0_DIAG semantic_after_store={:?}", state);\n        }\n        Ok(format!('''
+          if text.count(needle2) != 1:
+              raise SystemExit('semantic store shape changed')
+          text = text.replace(needle2, repl2, 1)
 
-      - name: Commit with branch and main stale-head protection
-        shell: bash
-        run: |
-          set -euo pipefail
-          START_HEAD="$(cat /tmp/p0-start-head)"
-          MAIN_HEAD="$(cat /tmp/main-start-head)"
-          git fetch origin main integration/p0-stabilization-2026-09-14
-          test "$(git rev-parse origin/integration/p0-stabilization-2026-09-14)" = "$START_HEAD" || {
-            echo 'P0 branch advanced during validation; refusing stale push.'
-            exit 1
-          }
-          test "$(git rev-parse origin/main)" = "$MAIN_HEAD" || {
-            echo 'main advanced during validation; refusing stale push.'
-            exit 1
-          }
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/integration_tests/mod.rs src/runtime/http_server.rs
-          git diff --cached --check
-          git commit -m 'test(ai): require explicit inference authority in actor fixtures'
-          git push origin HEAD:integration/p0-stabilization-2026-09-14
+          needle3 = '''    actor.set_state_field("usage_cost", crate::vm::Value::float(updated_cost));\n    Some(content)'''
+          repl3 = '''    actor.set_state_field("usage_cost", crate::vm::Value::float(updated_cost));\n    let semantic = actor\n        .get_state_field("semantic_memory")\n        .and_then(|value| vm_value_to_string(&value, actor.bytecode_module.as_ref()));\n    eprintln!("P0_DIAG semantic_after_finish_agent={:?}", semantic);\n    Some(content)'''
+          if text.count(needle3) != 1:
+              raise SystemExit('finish_agent_llm shape changed')
+          text = text.replace(needle3, repl3, 1)
+          path.write_text(text)
+          PY
+
+      - name: Run isolated failing regression with diagnostics
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo +1.95.0 test --lib integration_tests::tests::test_agent_workflow_recovers_semantic_memory_after_restart -- --exact --nocapture
