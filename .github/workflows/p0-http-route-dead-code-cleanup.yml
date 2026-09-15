@@ -1,0 +1,167 @@
+name: P0 HTTP Route Dead-Code Cleanup
+
+on:
+  push:
+    branches:
+      - integration/p0-stabilization-2026-09-14
+    paths:
+      - .github/workflows/p0-http-route-dead-code-cleanup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: integration/p0-stabilization-2026-09-14
+          fetch-depth: 0
+
+      - name: Pin cleanup base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "BASE_HTTP_SHA=$(git rev-parse HEAD:src/runtime/http_server.rs)" >> "$GITHUB_ENV"
+          echo "BASE_AUTH_WORKFLOW_SHA=$(git rev-parse HEAD:.github/workflows/p0-authority-spawn-ordering.yml)" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: p0-http-route-dead-code-cleanup
+
+      - name: Remove superseded local route matcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/runtime/http_server.rs')
+          src = path.read_text()
+
+          matcher = '''/// Match a route pattern against a request path, returning captured parameters.
+          /// Patterns use `:name` segments, e.g. `/products/:id`.
+          pub fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
+              let pattern = pattern.trim_start_matches('/');
+              let path = path.trim_start_matches('/');
+              let pattern_parts: Vec<&str> = if pattern.is_empty() {
+                  vec![""]
+              } else {
+                  pattern.split('/').collect()
+              };
+              let path_parts: Vec<&str> = if path.is_empty() {
+                  vec![""]
+              } else {
+                  path.split('/').collect()
+              };
+              if pattern_parts.len() != path_parts.len() {
+                  return None;
+              }
+              let mut params = HashMap::new();
+              for (pat, seg) in pattern_parts.iter().zip(path_parts.iter()) {
+                  if pat.starts_with(':') {
+                      let name = &pat[1..];
+                      params.insert(name.to_string(), seg.to_string());
+                  } else if *pat != *seg {
+                      return None;
+                  }
+              }
+              Some(params)
+          }
+
+          '''
+          tests = '''    #[test]
+              fn test_match_route_exact() {
+                  let params = match_route("/", "/").unwrap();
+                  assert!(params.is_empty());
+              }
+
+              #[test]
+              fn test_match_route_no_match() {
+                  assert!(match_route("/foo", "/bar").is_none());
+              }
+
+              #[test]
+              fn test_match_route_captures_param() {
+                  let params = match_route("/products/:id", "/products/42").unwrap();
+                  assert_eq!(params.get("id"), Some(&"42".to_string()));
+              }
+
+              #[test]
+              fn test_match_route_length_mismatch() {
+                  assert!(match_route("/products/:id", "/products/42/extra").is_none());
+              }
+
+          '''
+
+          # Dedent the exact source blocks before matching. Keeping the literals
+          # visibly indented here makes this workflow itself easier to review.
+          import textwrap
+          matcher = textwrap.dedent(matcher)
+          tests = textwrap.dedent(tests)
+          assert src.count(matcher) == 1, 'legacy matcher source drifted'
+          assert src.count(tests) == 1, 'legacy matcher tests source drifted'
+          src = src.replace(matcher, '', 1).replace(tests, '', 1)
+          path.write_text(src)
+          PY
+          cargo fmt --all
+          git diff --check
+
+      - name: Verify HTTP and warning gates
+        run: |
+          cargo test --lib runtime::http_server::tests:: -- --nocapture
+          RUSTFLAGS='-D warnings' cargo check --lib
+          cargo fmt --all -- --check
+
+      - name: Enforce isolated product diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t changed < <(git diff --name-only | sort)
+          printf 'changed paths:\n%s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq 1
+          test "${changed[0]}" = "src/runtime/http_server.rs"
+
+      - name: Land cleanup and retrigger authority validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff src/runtime/http_server.rs > /tmp/http-cleanup.patch
+          git fetch origin integration/p0-stabilization-2026-09-14
+          remote_head="$(git rev-parse origin/integration/p0-stabilization-2026-09-14)"
+          remote_http_sha="$(git rev-parse origin/integration/p0-stabilization-2026-09-14:src/runtime/http_server.rs)"
+          remote_auth_sha="$(git rev-parse origin/integration/p0-stabilization-2026-09-14:.github/workflows/p0-authority-spawn-ordering.yml)"
+          if [ "$remote_http_sha" != "$BASE_HTTP_SHA" ]; then
+            echo "http_server.rs advanced during validation: $remote_http_sha (expected $BASE_HTTP_SHA)" >&2
+            exit 1
+          fi
+          if [ "$remote_auth_sha" != "$BASE_AUTH_WORKFLOW_SHA" ]; then
+            echo "authority workflow advanced during validation: $remote_auth_sha (expected $BASE_AUTH_WORKFLOW_SHA)" >&2
+            exit 1
+          fi
+          git reset --hard "$remote_head"
+          git apply /tmp/http-cleanup.patch
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/p0-authority-spawn-ordering.yml')
+          src = path.read_text()
+          old = 'key: p0-authority-spawn-ordering-v2'
+          new = 'key: p0-authority-spawn-ordering-v3'
+          assert src.count(old) == 1, 'authority cache-key anchor drifted'
+          path.write_text(src.replace(old, new, 1))
+          PY
+          rm .github/workflows/p0-http-route-dead-code-cleanup.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime/http_server.rs .github/workflows/p0-authority-spawn-ordering.yml .github/workflows/p0-http-route-dead-code-cleanup.yml
+          git diff --cached --check
+          git commit -m 'fix(web): remove superseded route matcher'
+          git push origin HEAD:integration/p0-stabilization-2026-09-14
