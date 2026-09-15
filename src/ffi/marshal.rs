@@ -98,6 +98,7 @@ pub unsafe fn value_to_voidptr(v: &Value) -> Result<*mut c_void, String> {
 /// Extract an opaque tagged value returned by C without allowing C to mint a
 /// host heap pointer. `CType::Value` is a raw integer ABI, so a `TAG_PTR`
 /// payload has no host-heap provenance and must fail closed.
+#[cfg(feature = "ffi")]
 fn opaque_c_value_to_value(raw: u64) -> Result<Value, String> {
     if crate::value_layout::is_ptr_raw(raw) {
         return Err(
