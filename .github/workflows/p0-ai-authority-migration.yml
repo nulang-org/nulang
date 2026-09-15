@@ -28,6 +28,47 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt
 
+      - name: Rebase function-local spawn metadata to module PCs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/mir_codegen.rs')
+          text = path.read_text()
+
+          before = '''        let function_start = saved_instructions.len();\n        // Build the spill map: locals whose id exceeds the register file'''
+          after = '''        let function_start = saved_instructions.len();\n        // Spawn-site metadata is emitted while this function's instruction\n        // vector is isolated, so its PCs are function-local until the code is\n        // appended back to the module. Remember each table's starting length\n        // and rebase only entries produced by this function at the end.\n        let spawn_init_metadata_start = self.module.spawn_init_overrides.len();\n        let spawn_authority_metadata_start = self.module.spawn_capability_grants.len();\n        let remote_spawn_metadata_start = self.module.remote_spawn_init_fields.len();\n        // Build the spill map: locals whose id exceeds the register file'''
+          if text.count(before) != 1:
+              raise SystemExit('compile_function start shape changed')
+          text = text.replace(before, after, 1)
+
+          before = '''        let code_len = function_code.len();\n        self.module.instructions.extend(function_code);\n\n        // Publish the debugger's pc<->line map and per-function debug info.'''
+          after = '''        let code_len = function_code.len();\n        self.module.instructions.extend(function_code);\n\n        // Metadata recorded while `module.instructions` held only this\n        // function used function-local PCs. Runtime spawn dispatch indexes\n        // these tables with module-absolute PCs, so relocate every entry\n        // emitted by this function by the same base as its bytecode.\n        for (pc, _) in &mut self.module.spawn_init_overrides[spawn_init_metadata_start..] {\n            *pc += function_start;\n        }\n        for (pc, _) in &mut self.module.spawn_capability_grants[spawn_authority_metadata_start..] {\n            *pc += function_start;\n        }\n        for (pc, _) in &mut self.module.remote_spawn_init_fields[remote_spawn_metadata_start..] {\n            *pc += function_start;\n        }\n\n        // Publish the debugger's pc<->line map and per-function debug info.'''
+          if text.count(before) != 1:
+              raise SystemExit('compile_function end shape changed')
+          text = text.replace(before, after, 1)
+          path.write_text(text)
+          PY
+
+      - name: Add nonzero-function-base authority regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('tests/spawn_authority_provenance.rs')
+          text = path.read_text()
+          marker = '#[test]\nfn source_grants_survive_frontend_and_bind_to_exact_spawn_pc() {'
+          if text.count(marker) != 1:
+              raise SystemExit('authority regression insertion point changed')
+          test = '''#[test]\nfn spawn_site_authority_pc_is_module_absolute_after_prior_function_code() {\n    let mut mir = lower(\n        r#"\nfn helper() { 41 }\nactor Child { behavior ping() { 1 } }\nfn main() {\n    spawn Child {} with [Inference::Ask]\n}\n"#,\n    );\n    let module = compile_mir(&mut mir, "authority-absolute-pc").unwrap();\n    let spawn_pc = module\n        .instructions\n        .iter()\n        .position(|instr| instr.opcode == OpCode::Spawn)\n        .unwrap();\n    assert!(spawn_pc > 0, "regression requires a nonzero function base");\n    assert_eq!(\n        spawn_grants(&module, spawn_pc),\n        vec!["Inference::Ask".to_string()]\n    );\n    assert_eq!(module.spawn_capability_grants[0].0, spawn_pc);\n\n    let runtime = Rc::new(RefCell::new(Runtime::new()));\n    let mut vm = VM::new();\n    vm.load_module(module);\n    vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(runtime.clone())));\n    let child = vm.run().unwrap();\n    let child_id = child.as_actor_id().expect("spawn should return actor ref");\n    assert_eq!(\n        runtime\n            .borrow()\n            .actors\n            .get(&child_id)\n            .unwrap()\n            .authority_manifest()\n            .unwrap()\n            .canonical_tokens(),\n        vec!["Inference::Ask".to_string()]\n    );\n}\n\n'''
+          text = text.replace(marker, test + marker, 1)
+          path.write_text(text)
+          PY
+
       - name: Migrate legacy AI fixtures to explicit inference authority
         shell: bash
         run: |
@@ -135,7 +176,9 @@ jobs:
           http.write_text(http_text.replace(needle, replacement, 1))
           PY
 
-          git diff -- src/integration_tests/mod.rs src/runtime/http_server.rs
+          git diff -- src/mir_codegen.rs tests/spawn_authority_provenance.rs src/integration_tests/mod.rs src/runtime/http_server.rs
+          test -n "$(git diff -- src/mir_codegen.rs)"
+          test -n "$(git diff -- tests/spawn_authority_provenance.rs)"
           test -n "$(git diff -- src/integration_tests/mod.rs)"
           test -n "$(git diff -- src/runtime/http_server.rs)"
 
@@ -151,6 +194,9 @@ jobs:
         run: |
           RUSTFLAGS='-D warnings' cargo check --lib
           RUSTFLAGS='-D warnings' cargo check --release --lib
+
+      - name: Run spawn authority provenance suite
+        run: cargo test --test spawn_authority_provenance -- --nocapture
 
       - name: AI regression 01 — usage and cost
         run: cargo test --lib integration_tests::tests::test_agent_ask_tracks_usage_and_cost -- --exact --nocapture
@@ -190,23 +236,39 @@ jobs:
       - name: Re-run host authority regressions
         run: cargo test --lib host_authority -- --nocapture
 
-      - name: Diff hygiene
-        run: git diff --check
-
-      - name: Commit validated product migration and remove helper
+      - name: Diff hygiene and scope
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin integration/p0-stabilization-2026-09-14
+          git diff --check
+          mapfile -t changed < <(git diff --name-only | sort)
+          printf 'changed paths:\n%s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq 4
+          test "${changed[0]}" = "src/integration_tests/mod.rs"
+          test "${changed[1]}" = "src/mir_codegen.rs"
+          test "${changed[2]}" = "src/runtime/http_server.rs"
+          test "${changed[3]}" = "tests/spawn_authority_provenance.rs"
+
+      - name: Commit validated P0 migration and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin integration/p0-stabilization-2026-09-14 main
           remote_head="$(git rev-parse origin/integration/p0-stabilization-2026-09-14)"
           if [ "$remote_head" != "$GITHUB_SHA" ]; then
             echo "integration branch advanced during validation: $remote_head (expected $GITHUB_SHA)" >&2
             exit 1
           fi
+          main_head="$(git rev-parse origin/main)"
+          expected_main="439070db0ac2f902d1692c393799e6d25bbad903"
+          if [ "$main_head" != "$expected_main" ]; then
+            echo "main advanced during validation: $main_head (expected $expected_main)" >&2
+            exit 1
+          fi
           rm .github/workflows/p0-ai-authority-migration.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/integration_tests/mod.rs src/runtime/http_server.rs .github/workflows/p0-ai-authority-migration.yml
+          git add src/mir_codegen.rs tests/spawn_authority_provenance.rs src/integration_tests/mod.rs src/runtime/http_server.rs .github/workflows/p0-ai-authority-migration.yml
           git diff --cached --check
-          git commit -m 'test(ai): require explicit inference authority in legacy fixtures'
+          git commit -m 'fix(authority): rebase spawn metadata and migrate AI fixtures'
           git push origin HEAD:integration/p0-stabilization-2026-09-14
