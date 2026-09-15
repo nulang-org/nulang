@@ -33,6 +33,7 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('src/integration_tests/mod.rs')
           text = path.read_text()
@@ -55,20 +56,22 @@ jobs:
               'test_workflow_step_inference_ask_then_signal_wait',
               'test_workflow_step_signal_wait_then_inference_ask',
           ]
+          spawn_expr = re.compile(r'\bspawn\s+[A-Za-z_][A-Za-z0-9_]*\s*\{')
 
           def add_authority_to_spawns(segment: str, test_name: str) -> tuple[str, int]:
               out = []
               cursor = 0
               changed = 0
               while True:
-                  start = segment.find('spawn ', cursor)
-                  if start < 0:
+                  match = spawn_expr.search(segment, cursor)
+                  if match is None:
                       out.append(segment[cursor:])
                       break
+                  start = match.start()
                   out.append(segment[cursor:start])
-                  brace = segment.find('{', start)
+                  brace = segment.find('{', start, match.end())
                   if brace < 0:
-                      raise SystemExit(f'{test_name}: spawn without initializer brace')
+                      raise SystemExit(f'{test_name}: matched spawn without initializer brace')
                   depth = 0
                   quote = None
                   escaped = False
