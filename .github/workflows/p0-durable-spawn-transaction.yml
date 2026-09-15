@@ -1,0 +1,421 @@
+name: P0 Durable Spawn Transaction
+
+on:
+  push:
+    branches:
+      - fix/p0-durable-spawn-transaction
+    paths:
+      - .github/workflows/p0-durable-spawn-transaction.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/p0-durable-spawn-transaction
+          fetch-depth: 0
+
+      - name: Pin product blobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in src/runtime/spawn.rs src/runtime/workflow.rs src/runtime/callbacks.rs src/runtime/crdt_manager.rs; do
+            key=$(echo "$path" | tr '/.' '__' | tr '[:lower:]' '[:upper:]')
+            echo "BASE_${key}=$(git rev-parse HEAD:$path)" >> "$GITHUB_ENV"
+          done
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: p0-durable-spawn-transaction-v1
+
+      - name: Apply fail-closed durable spawn transaction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new, label):
+              text = Path(path).read_text()
+              count = text.count(old)
+              assert count == 1, f"{label}: expected one anchor, found {count}"
+              Path(path).write_text(text.replace(old, new, 1))
+
+          # workflow.rs: preserve legacy best-effort checkpoint semantics, add a
+          # fallible local-commit-first path for initial workflow publication.
+          path = Path("src/runtime/workflow.rs")
+          text = path.read_text()
+          start = text.index("/// Snapshot the durable and CRDT state of a persistent actor.\npub(crate) fn checkpoint_actor")
+          end = text.index("// ---------------------------------------------------------------------------\n// Event emission", start)
+          replacement = r'''/// Build the next persistent snapshot without producing external side effects.
+fn build_actor_snapshot(
+    rt: &Runtime,
+    actor_id: u64,
+) -> std::io::Result<Option<(crate::runtime::persistence::ActorSnapshot, u64)>> {
+    let actor = match rt.actors.get(&actor_id) {
+        Some(actor) => actor,
+        None => return Ok(None),
+    };
+    if !actor.persistent {
+        return Ok(None);
+    }
+    let seq = next_sequence(rt, actor_id);
+    let mut state = std::collections::HashMap::new();
+    for (name, value) in &actor.state_data {
+        let model = actor
+            .state_models
+            .get(name)
+            .copied()
+            .unwrap_or(StateModel::Local);
+        if model == StateModel::Durable || model.is_crdt() {
+            let persisted = if name == "semantic_memory" || name == "procedural_memory" {
+                vm_value_to_string_in_actor(value, actor)
+                    .map(PersistedValue::String)
+                    .unwrap_or_else(|| {
+                        PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
+                    })
+            } else {
+                PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
+            };
+            state.insert(name.clone(), persisted);
+        }
+    }
+    let authority_tokens = actor.authority_manifest().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid actor authority during checkpoint: {error}"),
+        )
+    })?.canonical_token_set();
+    let crdt_snapshot = rt.crdt_manager.as_ref().map(|manager| {
+        manager
+            .snapshot()
+            .into_iter()
+            .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
+            .collect()
+    });
+    let crdt_field_map = rt.crdt_manager.as_ref().map(|manager| {
+        manager
+            .field_map
+            .iter()
+            .filter(|((aid, _), _)| *aid == actor_id)
+            .map(|((_, name), id)| (name.clone(), id.0))
+            .collect()
+    });
+    Ok(Some((
+        crate::runtime::persistence::ActorSnapshot {
+            actor_id,
+            sequence: seq,
+            state,
+            waiting_signal: actor.waiting_signal.clone(),
+            crdt_snapshot,
+            crdt_field_map,
+            authority_tokens,
+        },
+        seq,
+    )))
+}
+
+/// Fallible checkpoint used by initial durable publication. The local snapshot
+/// commits before any shadow replica is emitted, so a failed local commit
+/// cannot leave a remotely recoverable actor that was never published here.
+pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
+    let Some((snapshot, seq)) = build_actor_snapshot(rt, actor_id)? else {
+        return Ok(());
+    };
+    rt.persistence.save_snapshot(snapshot.clone())?;
+    rt.maybe_shadow_replicate(actor_id, &snapshot);
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = seq;
+        actor.dirty_fields.clear();
+    }
+    Ok(())
+}
+
+/// Snapshot the durable and CRDT state of a persistent actor.
+///
+/// Existing runtime checkpoint sites remain best-effort for compatibility;
+/// security-sensitive initial publication uses [`try_checkpoint_actor`].
+pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
+    let Some((snapshot, seq)) = (match build_actor_snapshot(rt, actor_id) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(actor_id, %error, "refusing invalid actor checkpoint");
+            return;
+        }
+    }) else {
+        return;
+    };
+    // RFC 0014 compatibility: ordinary checkpoints retain the existing
+    // shadow-before-local ordering. Initial publication uses the fallible path
+    // above and therefore cannot leak a shadow before local durability.
+    rt.maybe_shadow_replicate(actor_id, &snapshot);
+    if let Err(error) = rt.persistence.save_snapshot(snapshot) {
+        tracing::warn!(actor_id, %error, "failed to save actor checkpoint");
+    }
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = seq;
+        actor.dirty_fields.clear();
+    }
+}
+
+'''
+          path.write_text(text[:start] + replacement + text[end:])
+
+          # crdt_manager.rs: rollback primitive for failed pre-publication actors.
+          replace_once(
+              "src/runtime/crdt_manager.rs",
+              '''    /// Register a CRDT-backed state field for an actor.\n'''.replace('\\n','\n'),
+              '''    /// Remove every CRDT registration owned by one actor.\n    ///\n    /// Used when actor construction fails before publication. This removes the\n    /// forward/reverse mappings, local replicas, and delta-sync bases so a\n    /// failed spawn cannot leave externally synchronizable CRDT residue.\n    pub fn unregister_actor_fields(&mut self, actor_id: u64) {\n        let owned: Vec<(String, CrdtId)> = self\n            .field_map\n            .iter()\n            .filter_map(|((aid, name), id)| {\n                (*aid == actor_id).then(|| (name.clone(), *id))\n            })\n            .collect();\n        for (field_name, id) in owned {\n            self.field_map.remove(&(actor_id, field_name));\n            self.field_reverse.remove(&id);\n            self.entries.remove(&id);\n            self.sync_base.remove(&id);\n        }\n    }\n\n    /// Register a CRDT-backed state field for an actor.\n'''.replace('\\n','\n'),
+              "CRDT registration anchor drifted",
+          )
+
+          # spawn.rs: add a typed spawn error and make initial workflow
+          # persistence transactional before scheduler publication.
+          replace_once(
+              "src/runtime/spawn.rs",
+              "use std::collections::HashMap;\n",
+              "use std::collections::HashMap;\nuse std::fmt;\nuse std::io;\n",
+              "spawn imports drifted",
+          )
+          replace_once(
+              "src/runtime/spawn.rs",
+              "use crate::vm::Value;\n\n",
+              '''use crate::vm::Value;\n\n#[derive(Debug)]\npub(crate) enum SpawnWithAuthorityError {\n    Authority(RuntimeAuthorityError),\n    Persistence(io::Error),\n}\n\nimpl fmt::Display for SpawnWithAuthorityError {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        match self {\n            Self::Authority(error) => write!(f, "{error}"),\n            Self::Persistence(error) => write!(f, "durable spawn persistence failed: {error}"),\n        }\n    }\n}\n\nimpl std::error::Error for SpawnWithAuthorityError {}\n\nimpl From<RuntimeAuthorityError> for SpawnWithAuthorityError {\n    fn from(error: RuntimeAuthorityError) -> Self {\n        Self::Authority(error)\n    }\n}\n\nimpl From<io::Error> for SpawnWithAuthorityError {\n    fn from(error: io::Error) -> Self {\n        Self::Persistence(error)\n    }\n}\n\n'''.replace('\\n','\n'),
+              "spawn error anchor drifted",
+          )
+
+          replace_once(
+              "src/runtime/spawn.rs",
+              '''pub(crate) fn spawn_actor_with_models(\n    rt: &mut Runtime,\n    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,\n    state_models: HashMap<String, StateModel>,\n    persistent: bool,\n    workflow: Option<&str>,\n) -> u64 {\n    spawn_actor_with_models_with_authority(rt, init, state_models, persistent, workflow, None)\n}\n\nfn spawn_actor_with_models_with_authority(\n    rt: &mut Runtime,\n    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,\n    state_models: HashMap<String, StateModel>,\n    persistent: bool,\n    workflow: Option<&str>,\n    initial_authority: Option<&AuthorityManifest>,\n) -> u64 {\n    spawn_actor_with_id_with_authority(\n        rt,\n        fresh_actor_id(),\n        init,\n        state_models,\n        persistent,\n        workflow,\n        initial_authority,\n    )\n}\n'''.replace('\\n','\n'),
+              '''pub(crate) fn spawn_actor_with_models(\n    rt: &mut Runtime,\n    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,\n    state_models: HashMap<String, StateModel>,\n    persistent: bool,\n    workflow: Option<&str>,\n) -> u64 {\n    let id = fresh_actor_id();\n    match spawn_actor_with_id_with_authority(\n        rt, id, init, state_models, persistent, workflow, None,\n    ) {\n        Ok(id) => id,\n        Err(error) => {\n            tracing::warn!(actor_id = id, %error, "actor spawn persistence failed");\n            id\n        }\n    }\n}\n\nfn spawn_actor_with_models_with_authority(\n    rt: &mut Runtime,\n    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,\n    state_models: HashMap<String, StateModel>,\n    persistent: bool,\n    workflow: Option<&str>,\n    initial_authority: Option<&AuthorityManifest>,\n) -> io::Result<u64> {\n    spawn_actor_with_id_with_authority(\n        rt,\n        fresh_actor_id(),\n        init,\n        state_models,\n        persistent,\n        workflow,\n        initial_authority,\n    )\n}\n'''.replace('\\n','\n'),
+              "spawn_actor_with_models block drifted",
+          )
+
+          replace_once(
+              "src/runtime/spawn.rs",
+              '''pub(crate) fn spawn_actor_with_id(\n    rt: &mut Runtime,\n    id: u64,\n    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,\n    state_models: HashMap<String, StateModel>,\n    persistent: bool,\n    workflow: Option<&str>,\n) -> u64 {\n    spawn_actor_with_id_with_authority(rt, id, init, state_models, persistent, workflow, None)\n}\n\nfn spawn_actor_with_id_with_authority(\n    rt: &mut Runtime,\n    id: u64,\n    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,\n    state_models: HashMap<String, StateModel>,\n    persistent: bool,\n    workflow: Option<&str>,\n    initial_authority: Option<&AuthorityManifest>,\n) -> u64 {\n'''.replace('\\n','\n'),
+              '''pub(crate) fn spawn_actor_with_id(\n    rt: &mut Runtime,\n    id: u64,\n    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,\n    state_models: HashMap<String, StateModel>,\n    persistent: bool,\n    workflow: Option<&str>,\n) -> u64 {\n    match spawn_actor_with_id_with_authority(\n        rt, id, init, state_models, persistent, workflow, None,\n    ) {\n        Ok(id) => id,\n        Err(error) => {\n            tracing::warn!(actor_id = id, %error, "actor spawn persistence failed");\n            id\n        }\n    }\n}\n\nfn spawn_actor_with_id_with_authority(\n    rt: &mut Runtime,\n    id: u64,\n    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,\n    state_models: HashMap<String, StateModel>,\n    persistent: bool,\n    workflow: Option<&str>,\n    initial_authority: Option<&AuthorityManifest>,\n) -> io::Result<u64> {\n'''.replace('\\n','\n'),
+              "spawn_actor_with_id block drifted",
+          )
+          replace_once(
+              "src/runtime/spawn.rs",
+              "                return id;\n",
+              "                return Ok(id);\n",
+              "preflight invalid authority return drifted",
+          )
+          replace_once(
+              "src/runtime/spawn.rs",
+              '''        let _ = rt.persistence.append_workflow_event(\n            id,\n            WorkflowEvent::WorkflowStarted {\n                sequence: seq,\n                name: workflow_name.as_ref().unwrap().clone(),\n                state,\n            },\n        );\n        crate::runtime::workflow::checkpoint_actor(rt, id);\n    }\n    rt.enqueue_actor(id);\n    id\n}\n'''.replace('\\n','\n'),
+              '''        let initial_commit = (|| -> io::Result<()> {\n            rt.persistence.append_workflow_event(\n                id,\n                WorkflowEvent::WorkflowStarted {\n                    sequence: seq,\n                    name: workflow_name.as_ref().unwrap().clone(),\n                    state,\n                },\n            )?;\n            crate::runtime::workflow::try_checkpoint_actor(rt, id)?;\n            Ok(())\n        })();\n        if let Err(error) = initial_commit {\n            rollback_failed_initial_workflow_spawn(rt, id);\n            return Err(error);\n        }\n    }\n    rt.enqueue_actor(id);\n    Ok(id)\n}\n\nfn rollback_failed_initial_workflow_spawn(rt: &mut Runtime, actor_id: u64) {\n    rt.actors.remove(&actor_id);\n    if let Some(manager) = rt.crdt_manager.as_mut() {\n        manager.unregister_actor_fields(actor_id);\n    }\n    if let Err(error) = rt.persistence.clear(actor_id) {\n        tracing::warn!(\n            actor_id,\n            %error,\n            "failed to clear partial durable state after rejected workflow spawn"\n        );\n    }\n}\n'''.replace('\\n','\n'),
+              "initial workflow persistence block drifted",
+          )
+
+          replace_once(
+              "src/runtime/spawn.rs",
+              '''pub(crate) fn spawn_from_module(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    behavior_idx: usize,\n    init: Vec<(String, Value)>,\n) -> Value {\n    spawn_from_module_with_initial_authority(rt, module, behavior_idx, init, None)\n}\n\nfn spawn_from_module_with_initial_authority(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    behavior_idx: usize,\n    init: Vec<(String, Value)>,\n    initial_authority: Option<&AuthorityManifest>,\n) -> Value {\n'''.replace('\\n','\n'),
+              '''pub(crate) fn spawn_from_module(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    behavior_idx: usize,\n    init: Vec<(String, Value)>,\n) -> Value {\n    match spawn_from_module_with_initial_authority(rt, module, behavior_idx, init, None) {\n        Ok(value) => value,\n        Err(error) => {\n            tracing::warn!(%error, "actor spawn persistence failed");\n            Value::nil()\n        }\n    }\n}\n\nfn spawn_from_module_with_initial_authority(\n    rt: &mut Runtime,\n    module: &crate::bytecode::CodeModule,\n    behavior_idx: usize,\n    init: Vec<(String, Value)>,\n    initial_authority: Option<&AuthorityManifest>,\n) -> io::Result<Value> {\n'''.replace('\\n','\n'),
+              "spawn_from_module signature drifted",
+          )
+          replace_once(
+              "src/runtime/spawn.rs",
+              "                return Value::nil();\n",
+              "                return Ok(Value::nil());\n",
+              "conflicting role return drifted",
+          )
+          # Two authority-aware helper calls produce Result<u64> and need propagation.
+          text = Path("src/runtime/spawn.rs").read_text()
+          marker = "            initial_authority,\n        )\n    } else {"
+          assert text.count(marker) == 1, "metadata authority call tail drifted"
+          text = text.replace(marker, "            initial_authority,\n        )?\n    } else {", 1)
+          marker2 = "            initial_authority,\n        )\n    };"
+          assert text.count(marker2) == 1, "plain authority call tail drifted"
+          text = text.replace(marker2, "            initial_authority,\n        )?\n    };", 1)
+          marker3 = "    Value::actor_ref(id)\n}\n\n/// Spawn from a bytecode module while enforcing"
+          assert text.count(marker3) == 1, "spawn_from_module return drifted"
+          text = text.replace(marker3, "    Ok(Value::actor_ref(id))\n}\n\n/// Spawn from a bytecode module while enforcing", 1)
+          Path("src/runtime/spawn.rs").write_text(text)
+
+          replace_once(
+              "src/runtime/spawn.rs",
+              ") -> Result<Value, RuntimeAuthorityError> {\n",
+              ") -> Result<Value, SpawnWithAuthorityError> {\n",
+              "privileged spawn result drifted",
+          )
+          replace_once(
+              "src/runtime/spawn.rs",
+              "            return Err(RuntimeAuthorityError::Denied(grant.clone()));\n",
+              "            return Err(RuntimeAuthorityError::Denied(grant.clone()).into());\n",
+              "missing parent denial drifted",
+          )
+          replace_once(
+              "src/runtime/spawn.rs",
+              '''    Ok(spawn_from_module_with_initial_authority(\n        rt,\n        module,\n        behavior_idx,\n        init,\n        Some(requested),\n    ))\n'''.replace('\\n','\n'),
+              '''    Ok(spawn_from_module_with_initial_authority(\n        rt,\n        module,\n        behavior_idx,\n        init,\n        Some(requested),\n    )?)\n'''.replace('\\n','\n'),
+              "privileged spawn propagation drifted",
+          )
+
+          # Update direct authority-error assertions to the typed wrapper.
+          replace_once(
+              "src/runtime/spawn.rs",
+              '''        assert_eq!(\n            result,\n            Err(RuntimeAuthorityError::Denied(AuthorityGrant::SecretRead {\n                name: "STRIPE_KEY".into(),\n            }))\n        );\n'''.replace('\\n','\n'),
+              '''        assert!(matches!(\n            result,\n            Err(SpawnWithAuthorityError::Authority(RuntimeAuthorityError::Denied(\n                AuthorityGrant::SecretRead { ref name }\n            ))) if name == "STRIPE_KEY"\n        ));\n'''.replace('\\n','\n'),
+              "denied authority assertion drifted",
+          )
+          replace_once(
+              "src/runtime/spawn.rs",
+              '''        assert!(matches!(\n            result,\n            Err(RuntimeAuthorityError::InvalidManifest(_))\n        ));\n'''.replace('\\n','\n'),
+              '''        assert!(matches!(\n            result,\n            Err(SpawnWithAuthorityError::Authority(\n                RuntimeAuthorityError::InvalidManifest(_)\n            ))\n        ));\n'''.replace('\\n','\n'),
+              "invalid manifest assertion drifted",
+          )
+
+          # Failure-injection store + P0 regressions inside spawn's private test module.
+          replace_once(
+              "src/runtime/spawn.rs",
+              '''    use crate::bytecode::CodeModule;\n\n    fn secret_manifest'''.replace('\\n','\n'),
+              '''    use crate::bytecode::CodeModule;\n    use crate::runtime::persistence::{\n        EventEntry, JournalEntry, MemoryStore, PersistenceStore,\n    };\n\n    struct FailingStore {\n        inner: MemoryStore,\n        fail_workflow_start: bool,\n        fail_snapshot: bool,\n    }\n\n    impl FailingStore {\n        fn new(fail_workflow_start: bool, fail_snapshot: bool) -> Self {\n            Self {\n                inner: MemoryStore::new(),\n                fail_workflow_start,\n                fail_snapshot,\n            }\n        }\n    }\n\n    impl PersistenceStore for FailingStore {\n        fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {\n            if self.fail_snapshot {\n                return Err(io::Error::new(io::ErrorKind::Other, "injected snapshot failure"));\n            }\n            self.inner.save_snapshot(snapshot)\n        }\n\n        fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {\n            self.inner.load_snapshot(actor_id)\n        }\n\n        fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {\n            self.inner.append_journal(actor_id, entry)\n        }\n\n        fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {\n            self.inner.read_journal(actor_id)\n        }\n\n        fn append_workflow_event(\n            &mut self,\n            actor_id: u64,\n            event: WorkflowEvent,\n        ) -> io::Result<()> {\n            if self.fail_workflow_start\n                && matches!(event, WorkflowEvent::WorkflowStarted { .. })\n            {\n                return Err(io::Error::new(\n                    io::ErrorKind::Other,\n                    "injected workflow-start failure",\n                ));\n            }\n            self.inner.append_workflow_event(actor_id, event)\n        }\n\n        fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {\n            self.inner.read_workflow_events(actor_id)\n        }\n\n        fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {\n            self.inner.append_event(actor_id, entry)\n        }\n\n        fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {\n            self.inner.read_events(actor_id)\n        }\n\n        fn latest_sequence(&self, actor_id: u64) -> u64 {\n            self.inner.latest_sequence(actor_id)\n        }\n\n        fn clear(&mut self, actor_id: u64) -> io::Result<()> {\n            self.inner.clear(actor_id)\n        }\n    }\n\n    fn secret_manifest'''.replace('\\n','\n'),
+              "authority test imports drifted",
+          )
+
+          insert_marker = '''    #[test]\n    fn workflow_spawn_authority_snapshot_survives_recovery() {'''.replace('\\n','\n')
+          tests = r'''    #[test]
+    fn workflow_start_append_failure_rolls_back_before_publication() {
+        let mut rt = Runtime::new();
+        rt.persistence = Box::new(FailingStore::new(true, false));
+        rt.crdt_manager = Some(crate::runtime::crdt_manager::CrdtManager::new(1));
+        let actor_id = 910_101;
+        let requested = secret_manifest("WORKFLOW_KEY");
+        let state_models = HashMap::from([(
+            "counter".to_string(),
+            StateModel::Crdt(crate::ast::CrdtType::GCounter),
+        )]);
+
+        let result = spawn_actor_with_id_with_authority(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![("counter".to_string(), Value::int(1))]),
+            state_models,
+            true,
+            Some("append-fails"),
+            Some(&requested),
+        );
+
+        assert!(result.is_err());
+        assert!(!rt.actors.contains_key(&actor_id));
+        let manager = rt.crdt_manager.as_ref().unwrap();
+        assert!(manager.get_field_id(actor_id, "counter").is_none());
+        assert!(rt.persistence.load_snapshot(actor_id).is_none());
+        assert!(rt.persistence.read_workflow_events(actor_id).is_empty());
+        assert_eq!(rt.recover_actor(actor_id), None);
+    }
+
+    #[test]
+    fn initial_snapshot_failure_rolls_back_journal_and_crdt_state() {
+        let mut rt = Runtime::new();
+        rt.persistence = Box::new(FailingStore::new(false, true));
+        rt.crdt_manager = Some(crate::runtime::crdt_manager::CrdtManager::new(1));
+        let actor_id = 910_102;
+        let requested = secret_manifest("WORKFLOW_KEY");
+        let state_models = HashMap::from([(
+            "counter".to_string(),
+            StateModel::Crdt(crate::ast::CrdtType::GCounter),
+        )]);
+
+        let result = spawn_actor_with_id_with_authority(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![("counter".to_string(), Value::int(1))]),
+            state_models,
+            true,
+            Some("snapshot-fails"),
+            Some(&requested),
+        );
+
+        assert!(result.is_err());
+        assert!(!rt.actors.contains_key(&actor_id));
+        let manager = rt.crdt_manager.as_ref().unwrap();
+        assert!(manager.get_field_id(actor_id, "counter").is_none());
+        assert!(rt.persistence.load_snapshot(actor_id).is_none());
+        assert!(rt.persistence.read_workflow_events(actor_id).is_empty());
+        assert_eq!(rt.persistence.latest_sequence(actor_id), 0);
+        assert_eq!(rt.recover_actor(actor_id), None);
+    }
+
+'''
+          text = Path("src/runtime/spawn.rs").read_text()
+          assert text.count(insert_marker) == 1, "durability test insertion anchor drifted"
+          Path("src/runtime/spawn.rs").write_text(text.replace(insert_marker, tests + insert_marker, 1))
+
+          # callbacks.rs: distinguish persistence rejection from authority denial.
+          replace_once(
+              "src/runtime/callbacks.rs",
+              '''        Err(error) => {\n            tracing::warn!(\n                spawn_pc,\n                behavior_idx,\n                %error,\n                "refusing actor spawn whose authority is not delegated by the parent"\n            );\n            crate::vm::Value::nil()\n        }\n'''.replace('\\n','\n'),
+              '''        Err(super::spawn::SpawnWithAuthorityError::Authority(error)) => {\n            tracing::warn!(\n                spawn_pc,\n                behavior_idx,\n                %error,\n                "refusing actor spawn whose authority is not delegated by the parent"\n            );\n            crate::vm::Value::nil()\n        }\n        Err(super::spawn::SpawnWithAuthorityError::Persistence(error)) => {\n            tracing::error!(\n                spawn_pc,\n                behavior_idx,\n                %error,\n                "refusing durable actor spawn because initial persistence failed"\n            );\n            crate::vm::Value::nil()\n        }\n'''.replace('\\n','\n'),
+              "callback spawn error branch drifted",
+          )
+          PY
+          cargo fmt --all
+          git diff --check
+
+      - name: Focused durability and authority regressions
+        run: |
+          cargo test --lib runtime::spawn::authority_tests:: -- --nocapture
+          cargo test --lib runtime::crdt_manager:: -- --nocapture
+          cargo test --test spawn_authority_provenance -- --nocapture
+
+      - name: Compile and warning gates
+        run: |
+          cargo check --all-targets
+          cargo check --all-targets --no-default-features
+          RUSTFLAGS='-D warnings' cargo check --lib
+          cargo fmt --all -- --check
+          git diff --check
+
+      - name: Enforce product diff scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t changed < <(git diff --name-only | sort)
+          printf 'changed paths:\n%s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq 4
+          printf '%s\n' "${changed[@]}" | grep -qx 'src/runtime/callbacks.rs'
+          printf '%s\n' "${changed[@]}" | grep -qx 'src/runtime/crdt_manager.rs'
+          printf '%s\n' "${changed[@]}" | grep -qx 'src/runtime/spawn.rs'
+          printf '%s\n' "${changed[@]}" | grep -qx 'src/runtime/workflow.rs'
+
+      - name: Land validated transaction
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff -- src/runtime/spawn.rs src/runtime/workflow.rs src/runtime/callbacks.rs src/runtime/crdt_manager.rs > /tmp/product.patch
+          git fetch origin fix/p0-durable-spawn-transaction
+          remote_head=$(git rev-parse origin/fix/p0-durable-spawn-transaction)
+          for path in src/runtime/spawn.rs src/runtime/workflow.rs src/runtime/callbacks.rs src/runtime/crdt_manager.rs; do
+            key=$(echo "$path" | tr '/.' '__' | tr '[:lower:]' '[:upper:]')
+            expected_var="BASE_${key}"
+            expected=${!expected_var}
+            actual=$(git rev-parse "origin/fix/p0-durable-spawn-transaction:$path")
+            if [ "$actual" != "$expected" ]; then
+              echo "$path advanced during validation: $actual (expected $expected)" >&2
+              exit 1
+            fi
+          done
+          git reset --hard "$remote_head"
+          git apply /tmp/product.patch
+          rm .github/workflows/p0-durable-spawn-transaction.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime/spawn.rs src/runtime/workflow.rs src/runtime/callbacks.rs src/runtime/crdt_manager.rs .github/workflows/p0-durable-spawn-transaction.yml
+          git diff --cached --check
+          git commit -m 'fix(durability): fail closed on initial workflow persistence'
+          git push origin HEAD:fix/p0-durable-spawn-transaction
