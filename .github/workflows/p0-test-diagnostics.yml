@@ -1,0 +1,53 @@
+name: P0 Test Diagnostics
+
+on:
+  push:
+    branches:
+      - integration/p0-stabilization-2026-09-14
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  diagnose:
+    name: Diagnose ${{ matrix.profile }} tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: default
+            test_args: ""
+          - profile: release
+            test_args: "--release"
+          - profile: wasm
+            test_args: "--features wasm-backend"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests and capture failure
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test ${{ matrix.test_args }} -- --nocapture 2>&1 | tee "test-${{ matrix.profile }}.log"
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p0-test-${{ matrix.profile }}-${{ github.sha }}
+          path: test-${{ matrix.profile }}.log
+          if-no-files-found: error
+          retention-days: 3
