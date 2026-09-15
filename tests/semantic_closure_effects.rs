@@ -5,6 +5,7 @@
 //! 2. a restricted backend must reject unsupported continuation forms
 //!    deterministically rather than silently changing semantics.
 
+#[cfg(feature = "native-codegen")]
 use nulang::aot::AotModule;
 use nulang::hir_lower;
 use nulang::lexer::Lexer;
@@ -94,12 +95,14 @@ fn run_bytecode(source: &str) -> Result<Value, NuError> {
     vm.run()
 }
 
+#[cfg(feature = "native-codegen")]
 fn run_native(source: &str) -> Result<Value, NuError> {
     let mir = lower(source)?;
     let module = AotModule::compile(&mir)?;
-    module.run().map(Value::from_raw)
+    module.run().map(|raw| unsafe { Value::from_raw(raw) })
 }
 
+#[cfg(feature = "native-codegen")]
 fn explicit_resume_mir() -> mir::Module {
     use nulang::bytecode::Constant;
     use nulang::types::Type;
@@ -121,6 +124,7 @@ fn explicit_resume_mir() -> mir::Module {
     module
 }
 
+#[cfg(feature = "native-codegen")]
 fn assert_bytecode_native_int(source: &str, expected: i64) {
     let bytecode = run_bytecode(source).expect("bytecode should execute semantic-closure case");
     let native = run_native(source).expect("native should execute supported semantic-closure case");
@@ -134,11 +138,13 @@ fn assert_bytecode_native_int(source: &str, expected: i64) {
     );
 }
 
+#[cfg(feature = "native-codegen")]
 #[test]
 fn resumable_handler_matches_bytecode_and_native() {
     assert_bytecode_native_int(IMPLICIT_RESUME, 43);
 }
 
+#[cfg(feature = "native-codegen")]
 #[test]
 fn abortive_handler_matches_bytecode_and_native() {
     // A non-resuming arm aborts the captured continuation. The expression
@@ -146,6 +152,7 @@ fn abortive_handler_matches_bytecode_and_native() {
     assert_bytecode_native_int(ABORTIVE_HANDLER, 41);
 }
 
+#[cfg(feature = "native-codegen")]
 #[test]
 fn nested_same_effect_uses_innermost_handler_on_both_backends() {
     // Handler lookup is dynamically nested: the inner Shared.get arm must win
@@ -153,6 +160,7 @@ fn nested_same_effect_uses_innermost_handler_on_both_backends() {
     assert_bytecode_native_int(NESTED_INNERMOST_HANDLER, 1);
 }
 
+#[cfg(feature = "native-codegen")]
 #[test]
 fn sequential_performs_capture_fresh_continuations_on_both_backends() {
     // This formerly stressed the native multi-perform resuming-handler path.
@@ -161,6 +169,7 @@ fn sequential_performs_capture_fresh_continuations_on_both_backends() {
     assert_bytecode_native_int(SEQUENTIAL_RESUMES, 52);
 }
 
+#[cfg(feature = "native-codegen")]
 #[test]
 fn explicit_resume_rvalue_is_a_deterministic_native_restriction() {
     let mir = explicit_resume_mir();
