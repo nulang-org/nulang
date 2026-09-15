@@ -26,6 +26,7 @@ pub mod cir;
 pub mod cir_analysis;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir_lower;
+pub mod compiler_identity;
 pub mod content_identity;
 pub mod core_vm;
 #[cfg(feature = "native-codegen")]
@@ -76,6 +77,8 @@ pub mod registry;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
+pub mod semantic_identity;
+pub mod semantic_schema;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;
