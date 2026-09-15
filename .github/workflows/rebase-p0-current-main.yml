@@ -1,4 +1,4 @@
-name: P0 Spawn Metadata Relocation Fix
+name: P0 Spawn Metadata Relocation Validation
 
 on:
   push:
@@ -6,14 +6,14 @@ on:
       - ops/rebase-p0-current-main
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: rebase-p0-current-main
   cancel-in-progress: true
 
 jobs:
-  validate-and-land:
+  validate:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
@@ -30,15 +30,6 @@ jobs:
         with:
           key: p0-spawn-metadata-relocation
           cache-on-failure: true
-
-      - name: Capture exact heads
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch origin main integration/p0-stabilization-2026-09-14
-          echo "P0_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "MAIN_HEAD=$(git rev-parse origin/main)" >> "$GITHUB_ENV"
-          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/integration/p0-stabilization-2026-09-14)"
 
       - name: Rebase function-local spawn metadata to module PCs
         shell: bash
@@ -180,17 +171,4 @@ fn main() {
           test "${#changed[@]}" -eq 2
           test "${changed[0]}" = "src/mir_codegen.rs"
           test "${changed[1]}" = "tests/spawn_authority_provenance.rs"
-
-      - name: Stale-head protection and push
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch origin main integration/p0-stabilization-2026-09-14
-          test "$(git rev-parse origin/main)" = "$MAIN_HEAD"
-          test "$(git rev-parse origin/integration/p0-stabilization-2026-09-14)" = "$P0_HEAD"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/mir_codegen.rs tests/spawn_authority_provenance.rs
-          git diff --cached --check
-          git commit -m "fix(bytecode): rebase spawn-site metadata to module PCs"
-          git push origin HEAD:integration/p0-stabilization-2026-09-14
+          git diff -- src/mir_codegen.rs tests/spawn_authority_provenance.rs
