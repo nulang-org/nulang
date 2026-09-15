@@ -1,0 +1,70 @@
+diff --git a/.github/workflows/fuzz-nightly.yml b/.github/workflows/fuzz-nightly.yml
+--- a/.github/workflows/fuzz-nightly.yml
++++ b/.github/workflows/fuzz-nightly.yml
+@@
+ on:
+   schedule:
+     # 03:00 UTC daily -- off-peak, doesn't compete with interactive CI runs.
+     - cron: "0 3 * * *"
+   workflow_dispatch: {} # allow manual runs for investigation
+ 
++permissions:
++  contents: read
++
++concurrency:
++  group: fuzz-nightly
++  cancel-in-progress: true
++
+ env:
+   CARGO_TERM_COLOR: always
++  RUST_BACKTRACE: "1"
+ 
+ jobs:
+   fuzz-shard:
+     name: Differential fuzz shard ${{ matrix.shard }}
+     runs-on: ubuntu-latest
++    timeout-minutes: 120
+     strategy:
+       fail-fast: false # one shard's divergence shouldn't hide another's
+@@
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+@@
+-      - name: Install Rust
+-        uses: dtolnay/rust-toolchain@stable
++      # rust-toolchain.toml already pins Nulang to 1.95.0. Installing moving
++      # `stable` first downloaded 1.98.x on 2026-09-08 even though Cargo then
++      # used the repository override; pin the action to the actual toolchain.
++      - name: Install Rust 1.95.0
++        uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
+@@
+       - name: Cache cargo
+-        uses: Swatinem/rust-cache@v2
++        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+         with:
+           key: fuzz-shard-${{ matrix.shard }}
+@@
+       - name: Run differential fuzz shard
+         env:
+           NULANG_FUZZ_ITERATIONS: "100000"
+           NULANG_FUZZ_SHARD_ID: ${{ matrix.shard }}
+-        run: cargo test --lib --features wasm-backend fuzz_differential_extended -- --ignored --nocapture
++        shell: bash
++        run: |
++          set -o pipefail
++          LOG="/tmp/nulang-fuzz-shard-${{ matrix.shard }}.log"
++          cargo test --lib --features wasm-backend \
++            fuzz_differential_extended -- --ignored --nocapture 2>&1 | tee "$LOG"
+ 
+       - name: Upload divergence log on failure
+         if: failure()
+-        uses: actions/upload-artifact@v7
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+         with:
+           name: fuzz-divergence-shard-${{ matrix.shard }}
+-          path: |
+-            /tmp/*.log
+-          if-no-files-found: ignore
++          path: /tmp/nulang-fuzz-shard-${{ matrix.shard }}.log
++          if-no-files-found: error
+           retention-days: 30

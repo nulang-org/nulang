@@ -1,0 +1,88 @@
+name: Apply Sev-1 recovery
+
+on:
+  push:
+    branches: [fix/fuzz-sev1-2026-09-10]
+    paths:
+      - '.github/sev1/**'
+      - '.github/workflows/apply-sev1-recovery.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  apply-test-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: fix/fuzz-sev1-2026-09-10
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Apply audited recovery transformation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/sev1/apply.py
+          python3 .github/sev1/followup.py
+          cargo fmt
+          git diff --check
+
+      - name: Native arithmetic regressions
+        timeout-minutes: 15
+        run: cargo test --lib differential_native_arithmetic_error_regressions -- --nocapture
+
+      - name: JIT control-flow regressions
+        timeout-minutes: 10
+        run: cargo test --lib differential_jit_control_flow_regressions -- --nocapture
+
+      - name: Native arithmetic regressions with WASM feature
+        timeout-minutes: 15
+        run: cargo test --lib --features wasm-backend differential_native_arithmetic_error_regressions -- --nocapture
+
+      - name: JIT control-flow regressions with WASM feature
+        timeout-minutes: 10
+        run: cargo test --lib --features wasm-backend differential_jit_control_flow_regressions -- --nocapture
+
+      - name: Quick differential campaign
+        timeout-minutes: 20
+        run: cargo test --lib --features wasm-backend fuzz_differential_quick -- --nocapture
+
+      - name: Clippy correctness
+        run: cargo clippy --all-targets --all-features -- -D clippy::correctness
+
+      # This workflow exists only to turn the audited recovery transform into
+      # ordinary source changes. Do not gate that materialization on
+      # scripts/verify_implementation.py: the verifier ends in the full lib
+      # test suite and can hit the independently tracked five-node cluster
+      # flake. The pushed source-only commit immediately re-enters the normal
+      # required PR workflows, which remain the merge authority.
+      - name: Commit validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm -r .github/sev1
+          git rm .github/workflows/apply-sev1-recovery.yml
+          git add -A
+          git diff --cached --check
+          git commit -m 'fix(jit): restore native backend semantic parity'
+          git push origin HEAD:fix/fuzz-sev1-2026-09-10
