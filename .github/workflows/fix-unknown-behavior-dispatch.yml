@@ -1,0 +1,416 @@
+name: Fix Unknown Behavior Dispatch
+
+on:
+  push:
+    branches:
+      - fix/unknown-behavior-dispatch
+    paths:
+      - .github/workflows/fix-unknown-behavior-dispatch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/unknown-behavior-dispatch
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Apply fail-closed behavior dispatch fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement target, found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          old_send = '''    /// Send a message to `target_id`'s `behavior` mailbox by name.
+    ///
+    /// KNOWN SURPRISING BEHAVIOR (verified 2026-08-02, not fixed --
+    /// see the comment in `flush_actor_mailbox` for why): a `behavior`
+    /// name that doesn't match any of the target's registered
+    /// behaviors resolves to behavior id 0 via `unwrap_or(0)` below,
+    /// NOT a dropped/no-op message -- a typo'd or undeclared behavior
+    /// name silently runs the actor's FIRST declared behavior instead
+    /// of erroring or being ignored. See SPEC2.md Chapter 8 (message
+    /// passing) and `conformance/behavior/lifecycle_03/04_*.nula`.
+    pub fn send_message(&mut self, target_id: u64, behavior: &str, args: &[Value]) {
+        // Name-based sends already carry the wire behavior name, so route
+        // remote refs directly (same local-existence guard as
+        // `send_message_by_id`; see RFC-0007 note there).
+        if !self.actors.contains_key(&target_id) {
+            if let Some(node) = self.remote_refs.get(&target_id).copied() {
+                self.route_ref_send(target_id, node, behavior, args);
+                return;
+            }
+        }
+        let behavior_id = self.behavior_id_for(target_id, behavior).unwrap_or(0);
+        self.send_message_by_id(target_id, behavior_id, args);
+    }
+'''
+          new_send = '''    /// Send a message to `target_id`'s `behavior` mailbox by name.
+    ///
+    /// Behavior resolution is fail-closed: an unknown name is never coerced
+    /// to behavior id 0. Remote refs are forwarded by name so the receiving
+    /// node resolves the target actor's own behavior table.
+    pub fn send_message(&mut self, target_id: u64, behavior: &str, args: &[Value]) {
+        if !self.actors.contains_key(&target_id) {
+            if let Some(node) = self.remote_refs.get(&target_id).copied() {
+                self.route_ref_send(target_id, node, behavior, args);
+                return;
+            }
+            if let Some(&(node, _)) = self.migrated_actors.get(&target_id) {
+                self.send_distributed(ActorAddress::remote(node, target_id), behavior, args);
+                return;
+            }
+            tracing::warn!(target_id, behavior, "nulang-runtime: target actor not found");
+            let failed = Message {
+                behavior_id: 0,
+                payload: Arc::new(args.to_vec()),
+                sender: self.current_actor.unwrap_or(0),
+                priority: MessagePriority::System,
+                trace_id: self.current_trace.as_ref().map(|t| t.to_traceparent()),
+            };
+            self.route_to_dlq(&failed, "target actor not found");
+            return;
+        }
+
+        let Some(behavior_id) = self.behavior_id_for(target_id, behavior) else {
+            tracing::warn!(target_id, behavior, "nulang-runtime: unknown actor behavior");
+            let failed = Message {
+                behavior_id: 0,
+                payload: Arc::new(args.to_vec()),
+                sender: self.current_actor.unwrap_or(0),
+                priority: MessagePriority::System,
+                trace_id: self.current_trace.as_ref().map(|t| t.to_traceparent()),
+            };
+            self.route_to_dlq(&failed, "unknown behavior");
+            return;
+        };
+        self.send_message_by_id(target_id, behavior_id, args);
+    }
+'''
+          replace_once('src/runtime/mod.rs', old_send, new_send)
+
+          old_flush = '''            // A behavior_idx with neither a bytecode nor native handler
+            // falls through here silently. In practice this branch is
+            // unreachable for messages sent via `send_message`/
+            // `send_message_by_id` today: `send_message` resolves an
+            // unknown behavior NAME to id 0 via
+            // `behavior_id_for(..).unwrap_or(0)` (see its doc comment) --
+            // NOT a genuinely unknown numeric id -- so a typo'd or
+            // undeclared behavior name silently runs behavior 0 well
+            // before reaching this point, rather than being skipped as
+            // this comment used to claim. Tracked as a known surprising
+            // behavior in SPEC2.md (Chapter 8, message passing), not
+            // fixed here -- `send_message` is called pervasively and
+            // AGENTS.md documents the remote-message path as
+            // deliberately mirroring this same fallback, so correcting
+            // it needs a wider, carefully-audited change, not a
+            // single-site patch.
+'''
+          new_flush = '''            // A numeric behavior id with neither a bytecode nor native handler
+            // is invalid and therefore performs no user behavior. Name-based
+            // dispatch is resolved before enqueue and never fabricates id 0.
+'''
+          replace_once('src/runtime/mod.rs', old_flush, new_flush)
+
+          dist = Path('src/runtime/distributed.rs')
+          text = dist.read_text()
+
+          old_initial = '''                    // Resolve the behavior name against the target actor's
+                    // behavior table — the same rule local sends use
+                    // (`Runtime::send_message`). An unknown name falls back
+                    // to behavior 0, mirroring `send_message`'s
+                    // `unwrap_or(0)`.
+                    msg.behavior_id = runtime
+                        .behavior_id_for(target_actor, &behavior_name)
+                        .unwrap_or(0);
+'''
+          new_initial = '''                    // Resolve the behavior name against the target actor's
+                    // declared interface before any content-hash repair. A
+                    // sender may update the implementation of a known behavior,
+                    // but it may not introduce an undeclared behavior by message.
+                    let Some(behavior_id) =
+                        runtime.behavior_id_for(target_actor, &behavior_name)
+                    else {
+                        warn!(
+                            "nulang-net: rejecting message to actor {}: unknown behavior '{}'",
+                            target_actor, behavior_name
+                        );
+                        notify_delivery_failed(runtime, msg.sender, "unknown behavior");
+                        ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+                        continue;
+                    };
+                    msg.behavior_id = behavior_id;
+'''
+          if text.count(old_initial) != 1:
+              raise SystemExit(f'distributed initial resolution target count={text.count(old_initial)}')
+          text = text.replace(old_initial, new_initial, 1)
+
+          old_hot = '''                                // Retry resolution after hot-reload
+                                msg.behavior_id = runtime
+                                    .behavior_id_for(target_actor, &behavior_name)
+                                    .unwrap_or(0);
+'''
+          new_hot = '''                                // Retry resolution after hot-reload. A replacement
+                                // module that removes the declared behavior is
+                                // incompatible with the queued message.
+                                let Some(behavior_id) =
+                                    runtime.behavior_id_for(target_actor, &behavior_name)
+                                else {
+                                    notify_delivery_failed(
+                                        runtime,
+                                        msg.sender,
+                                        "unknown behavior",
+                                    );
+                                    ack_packet(
+                                        transport,
+                                        cluster,
+                                        incoming.from_node,
+                                        incoming.seq,
+                                    );
+                                    continue;
+                                };
+                                msg.behavior_id = behavior_id;
+'''
+          if text.count(old_hot) != 1:
+              raise SystemExit(f'distributed hot-reload resolution target count={text.count(old_hot)}')
+          text = text.replace(old_hot, new_hot, 1)
+
+          old_retry = '''                                    // Resolve behavior_id against the updated module
+                                    msg.behavior_id = runtime
+                                        .behavior_id_for(target_actor, &behavior_name)
+                                        .unwrap_or(0);
+'''
+          new_retry = '''                                    // Resolve behavior_id against the updated module.
+                                    // If the fetched artifact does not actually
+                                    // provide the declared behavior, reject it.
+                                    let Some(behavior_id) =
+                                        runtime.behavior_id_for(target_actor, &behavior_name)
+                                    else {
+                                        notify_delivery_failed(
+                                            runtime,
+                                            msg.sender,
+                                            "unknown behavior",
+                                        );
+                                        continue;
+                                    };
+                                    msg.behavior_id = behavior_id;
+'''
+          if text.count(old_retry) != 1:
+              raise SystemExit(f'distributed fetch-retry resolution target count={text.count(old_retry)}')
+          text = text.replace(old_retry, new_retry, 1)
+
+          old_codes = '''/// Codes: 0=unresolvable, 1=node left cluster, 2=string payload unresolvable,
+/// 3=string intern failed on receiver, 4=target actor not found,
+/// 6=object ref unresolvable, 7=object intern failed on receiver, 5=unknown.
+'''
+          new_codes = '''/// Codes: 0=unresolvable, 1=node left cluster, 2=string payload unresolvable,
+/// 3=string intern failed on receiver, 4=target actor not found,
+/// 5=unknown, 6=object ref unresolvable, 7=object intern failed on receiver,
+/// 8=unknown behavior.
+'''
+          if text.count(old_codes) != 1:
+              raise SystemExit('delivery code comment target missing')
+          text = text.replace(old_codes, new_codes, 1)
+
+          old_map = '''        "object ref unresolvable" => 6,
+        "object intern failed on receiver" => 7,
+        _ => 5,
+'''
+          new_map = '''        "object ref unresolvable" => 6,
+        "object intern failed on receiver" => 7,
+        "unknown behavior" => 8,
+        _ => 5,
+'''
+          if text.count(old_map) != 1:
+              raise SystemExit('delivery code map target missing')
+          text = text.replace(old_map, new_map, 1)
+
+          old_test = '''        // Unknown behavior name: falls back to behavior 0, mirroring
+        // `Runtime::send_message`'s `unwrap_or(0)` for local sends.
+'''
+          new_test = '''        // Unknown behavior name: reject it without dispatching behavior 0.
+'''
+          if text.count(old_test) != 1:
+              raise SystemExit('remote test comment target missing')
+          text = text.replace(old_test, new_test, 1)
+
+          old_assert = '''        assert_eq!(
+            count, 4,
+            "unknown behavior name must fall back to behavior 0 (\\"dec\\")"
+        );
+'''
+          new_assert = '''        assert_eq!(
+            count, 5,
+            "unknown behavior name must not execute behavior 0 (\\"dec\\")"
+        );
+'''
+          if text.count(old_assert) != 1:
+              raise SystemExit('remote test assertion target missing')
+          text = text.replace(old_assert, new_assert, 1)
+          dist.write_text(text)
+
+          tests = Path('src/runtime/tests.rs')
+          tests_text = tests.read_text()
+          marker = 'fn test_unknown_behavior_name_does_not_execute_behavior_zero()'
+          if marker in tests_text:
+              raise SystemExit('local regression already exists unexpectedly')
+          tests_text += r'''
+
+/// A name-resolution miss must never be reinterpreted as behavior id 0.
+#[test]
+fn test_unknown_behavior_name_does_not_execute_behavior_zero() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.register_behavior("dec", |actor, _args| {
+            let n = actor
+                .get_state_field("count")
+                .and_then(|v| v.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("count", Value::int(n - 1));
+        });
+    }
+
+    rt.send_message(actor_id, "no_such_behavior", &[]);
+    rt.run_scheduler();
+    let count = rt
+        .actors
+        .get(&actor_id)
+        .unwrap()
+        .get_state_field("count")
+        .and_then(|v| v.as_int())
+        .unwrap();
+    assert_eq!(count, 0, "unknown behavior must not execute behavior 0");
+    assert_eq!(rt.dlq_depth(), 1, "failed named dispatch must be observable");
+
+    rt.send_message(actor_id, "dec", &[]);
+    rt.run_scheduler();
+    let count = rt
+        .actors
+        .get(&actor_id)
+        .unwrap()
+        .get_state_field("count")
+        .and_then(|v| v.as_int())
+        .unwrap();
+    assert_eq!(count, -1, "valid behavior 0 must remain dispatchable by name");
+}
+'''
+          tests.write_text(tests_text)
+
+          spec = Path('SPEC2.md')
+          spec_text = spec.read_text()
+          old_spec = '''**Implementation status (verified 2026-08-02).** Behavior name resolution has two surprising edge cases, neither caught at compile time:
+1. A `send`/`ask` naming a behavior the target actor doesn't declare does not drop the message or error -- it silently runs the actor's first declared behavior instead (`Runtime::send_message` resolves an unknown name to behavior id 0; see the doc comment on `send_message` in `src/runtime/mod.rs`).
+2. Two different actor types that happen to declare a same-named behavior can collide: dispatch resolves by suffix-matching the *variable's* name hint, not the target's concrete actor type, so addressing one type's variable can run the *other* type's same-named behavior against the first type's state. See `conformance/behavior/lifecycle_03/04/05_*.nula` for the evidence trail. Both are tracked as known gaps, not fixed.
+'''
+          new_spec = '''**Implementation status (updated 2026-09-15).** Runtime name-based delivery is fail-closed for unknown behavior names: local sends route the failed dispatch to the DLQ, and distributed delivery rejects the message and reports a delivery failure; neither path fabricates behavior id 0. The compiler still does not reject every invalid actor call statically, so an unresolved numeric behavior id can remain a runtime no-op/error boundary rather than a compile-time diagnostic. One separate ambiguity remains: two different actor types that declare the same behavior name can collide during compile-time suffix resolution when receiver type information is insufficient. See `conformance/behavior/lifecycle_03/04/05_*.nula` for the historical evidence trail.
+'''
+          if spec_text.count(old_spec) != 1:
+              raise SystemExit('SPEC behavior-status block did not match exactly')
+          spec.write_text(spec_text.replace(old_spec, new_spec, 1))
+
+          beam = Path('docs/BEAM_PRIMITIVES.md')
+          beam_text = beam.read_text()
+          beam_text = beam_text.replace(
+              'unknown names fall back to behavior 0, mirroring local sends',
+              'unknown names are rejected without executing behavior 0',
+          )
+          beam_text = beam_text.replace(
+              'falling back to behavior 0 for unknown names — mirroring local `send_message`\'s `unwrap_or(0)`',
+              'rejecting unknown names before mailbox delivery, matching fail-closed local name dispatch',
+          )
+          beam.write_text(beam_text)
+
+          agents = Path('AGENTS.md')
+          agents_text = agents.read_text()
+          agents_text = agents_text.replace(
+              'falling back to behavior id 0 for unknown names — mirroring local `send_message`\'s `unwrap_or(0)`',
+              'rejecting unknown behavior names before mailbox delivery, matching fail-closed local name dispatch',
+          )
+          agents.write_text(agents_text)
+
+          plan = Path('docs/PLAN.md')
+          plan_text = plan.read_text()
+          plan_text = plan_text.replace(
+              'behavior-dispatch surprises (unknown behavior names silently run\n    behavior 0; same-named behaviors across different actor types can\n    collide) — both documented, not fixed given the blast radius',
+              'behavior-dispatch surprises (unknown behavior names silently ran\n    behavior 0; same-named behaviors across different actor types can\n    collide). The unknown-name fallback was fixed 2026-09-15; the\n    cross-type suffix-resolution ambiguity remains tracked',
+          )
+          plan.write_text(plan_text)
+
+          changelog = Path('CHANGELOG.md')
+          changelog_text = changelog.read_text()
+          anchor = '### Added since 1.0.0-frozen — 2026-08-19\n'
+          if changelog_text.count(anchor) != 1:
+              raise SystemExit('changelog experimental anchor missing')
+          entry = '''### Added since 1.0.0-frozen — 2026-08-19
+- **Fail-closed actor behavior-name dispatch.** Local `Runtime::send_message`
+  and distributed actor delivery now reject unknown behavior names instead of
+  coercing them to behavior id 0 and executing the actor's first behavior.
+  Local failures are observable through the DLQ; remote failures use the
+  delivery-failure path. Content-hash hot reload remains allowed only for a
+  behavior name already declared by the target actor. (Experimental runtime)
+'''
+          changelog.write_text(changelog_text.replace(anchor, entry, 1))
+          PY
+
+          git diff -- src/runtime/mod.rs src/runtime/distributed.rs src/runtime/tests.rs SPEC2.md docs/BEAM_PRIMITIVES.md AGENTS.md docs/PLAN.md CHANGELOG.md
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Compile default and minimal profiles
+        run: |
+          cargo check --all-targets
+          cargo check --all-targets --no-default-features
+
+      - name: Run focused behavior dispatch regressions
+        shell: bash
+        run: |
+          cargo test --lib runtime::tests::test_unknown_behavior_name_does_not_execute_behavior_zero -- --exact --nocapture
+          cargo test --lib runtime::distributed::tests::test_remote_send_dispatches_named_behavior -- --exact --nocapture
+
+      - name: Run conformance suite
+        run: ./conformance/run.py
+
+      - name: Diff hygiene
+        run: git diff --check
+
+      - name: Commit validated fix and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin fix/unknown-behavior-dispatch
+          remote_head="$(git rev-parse origin/fix/unknown-behavior-dispatch)"
+          if [ "$remote_head" != "$GITHUB_SHA" ]; then
+            echo "branch advanced during validation: $remote_head (expected $GITHUB_SHA)" >&2
+            exit 1
+          fi
+          rm .github/workflows/fix-unknown-behavior-dispatch.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime/mod.rs src/runtime/distributed.rs src/runtime/tests.rs SPEC2.md docs/BEAM_PRIMITIVES.md AGENTS.md docs/PLAN.md CHANGELOG.md .github/workflows/fix-unknown-behavior-dispatch.yml
+          git diff --cached --check
+          git commit -m 'fix(runtime): reject unknown actor behavior names'
+          git push origin HEAD:fix/unknown-behavior-dispatch
