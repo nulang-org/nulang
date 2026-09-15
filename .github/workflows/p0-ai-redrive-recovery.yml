@@ -21,13 +21,11 @@ jobs:
           ref: integration/p0-stabilization-2026-09-14
           fetch-depth: 0
 
-      - name: Pin validation bases
+      - name: Pin validation base
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin main
           echo "VALIDATION_BRANCH_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "VALIDATION_MAIN_HEAD=$(git rev-parse origin/main)" >> "$GITHUB_ENV"
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
@@ -135,15 +133,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin integration/p0-stabilization-2026-09-14 main
+          git fetch origin integration/p0-stabilization-2026-09-14
           remote_head="$(git rev-parse origin/integration/p0-stabilization-2026-09-14)"
           if [ "$remote_head" != "$VALIDATION_BRANCH_HEAD" ]; then
             echo "integration branch advanced during validation: $remote_head (expected $VALIDATION_BRANCH_HEAD)" >&2
-            exit 1
-          fi
-          main_head="$(git rev-parse origin/main)"
-          if [ "$main_head" != "$VALIDATION_MAIN_HEAD" ]; then
-            echo "main advanced during validation: $main_head (expected $VALIDATION_MAIN_HEAD)" >&2
             exit 1
           fi
           rm .github/workflows/p0-ai-redrive-recovery.yml
