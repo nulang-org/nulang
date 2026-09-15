@@ -1,4 +1,4 @@
-name: P0 AI Redrive Recovery
+name: P0 Authority Snapshot Final Validation
 
 on:
   push:
@@ -36,12 +36,18 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt
 
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: p0-authority-snapshot-final
+
       - name: Reuse reviewed authority migration transforms
         shell: bash
         run: |
           set -euo pipefail
+          git show 1fdf442695f82f1c9c50bd8563999174d28afaaa:.github/workflows/p0-ai-authority-migration.yml > /tmp/p0-ai-authority-migration.yml
           ruby -ryaml - <<'RUBY'
-          workflow = YAML.load_file('.github/workflows/p0-ai-authority-migration.yml')
+          workflow = YAML.load_file('/tmp/p0-ai-authority-migration.yml')
           wanted = [
             'Rebase function-local spawn metadata to module PCs',
             'Add nonzero-function-base authority regression',
@@ -70,6 +76,11 @@ jobs:
         run: |
           RUSTFLAGS='-D warnings' cargo check --lib
           RUSTFLAGS='-D warnings' cargo check --release --lib
+
+      - name: Verify workflow authority persistence regressions
+        run: |
+          cargo test --lib runtime::spawn::authority_tests::workflow_spawn_authority_snapshot_survives_recovery -- --exact --nocapture
+          cargo test --lib runtime::spawn::authority_tests::unprivileged_workflow_restart_remains_denied -- --exact --nocapture
 
       - name: Run spawn authority provenance suite
         run: cargo test --test spawn_authority_provenance -- --nocapture
@@ -118,7 +129,7 @@ jobs:
           test "${changed[2]}" = "src/runtime/http_server.rs"
           test "${changed[3]}" = "tests/spawn_authority_provenance.rs"
 
-      - name: Commit validated stabilization changes and remove helpers
+      - name: Commit validated stabilization changes and remove helper
         shell: bash
         run: |
           set -euo pipefail
@@ -133,11 +144,10 @@ jobs:
             echo "main advanced during validation: $main_head (expected $VALIDATION_MAIN_HEAD)" >&2
             exit 1
           fi
-          rm .github/workflows/p0-ai-authority-migration.yml
           rm .github/workflows/p0-ai-redrive-recovery.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/mir_codegen.rs tests/spawn_authority_provenance.rs src/integration_tests/mod.rs src/runtime/http_server.rs .github/workflows/p0-ai-authority-migration.yml .github/workflows/p0-ai-redrive-recovery.yml
+          git add src/mir_codegen.rs tests/spawn_authority_provenance.rs src/integration_tests/mod.rs src/runtime/http_server.rs .github/workflows/p0-ai-redrive-recovery.yml
           git diff --cached --check
           git commit -m 'fix(authority): persist workflow grants and migrate AI fixtures'
           git push origin HEAD:integration/p0-stabilization-2026-09-14
