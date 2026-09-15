@@ -677,36 +677,6 @@ impl Middleware {
     }
 }
 
-/// Match a route pattern against a request path, returning captured parameters.
-/// Patterns use `:name` segments, e.g. `/products/:id`.
-pub fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
-    let pattern = pattern.trim_start_matches('/');
-    let path = path.trim_start_matches('/');
-    let pattern_parts: Vec<&str> = if pattern.is_empty() {
-        vec![""]
-    } else {
-        pattern.split('/').collect()
-    };
-    let path_parts: Vec<&str> = if path.is_empty() {
-        vec![""]
-    } else {
-        path.split('/').collect()
-    };
-    if pattern_parts.len() != path_parts.len() {
-        return None;
-    }
-    let mut params = HashMap::new();
-    for (pat, seg) in pattern_parts.iter().zip(path_parts.iter()) {
-        if pat.starts_with(':') {
-            let name = &pat[1..];
-            params.insert(name.to_string(), seg.to_string());
-        } else if *pat != *seg {
-            return None;
-        }
-    }
-    Some(params)
-}
-
 /// Render a static route by calling its handler with no arguments.
 /// Returns the resulting HTML string, or None if execution fails.
 pub fn render_route_handler(
@@ -1116,28 +1086,6 @@ fn guess_content_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_match_route_exact() {
-        let params = match_route("/", "/").unwrap();
-        assert!(params.is_empty());
-    }
-
-    #[test]
-    fn test_match_route_no_match() {
-        assert!(match_route("/foo", "/bar").is_none());
-    }
-
-    #[test]
-    fn test_match_route_captures_param() {
-        let params = match_route("/products/:id", "/products/42").unwrap();
-        assert_eq!(params.get("id"), Some(&"42".to_string()));
-    }
-
-    #[test]
-    fn test_match_route_length_mismatch() {
-        assert!(match_route("/products/:id", "/products/42/extra").is_none());
-    }
 
     #[test]
     fn test_parse_form_urlencoded() {
