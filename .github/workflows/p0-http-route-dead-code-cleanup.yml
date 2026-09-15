@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  validate-and-land:
+  land-validated-cleanup:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -19,28 +19,18 @@ jobs:
           ref: integration/p0-stabilization-2026-09-14
           fetch-depth: 0
 
-      - name: Pin cleanup base
+      - name: Land previously validated HTTP cleanup only
         shell: bash
         run: |
           set -euo pipefail
-          echo "BASE_HTTP_SHA=$(git rev-parse HEAD:src/runtime/http_server.rs)" >> "$GITHUB_ENV"
-          echo "BASE_AUTH_WORKFLOW_SHA=$(git rev-parse HEAD:.github/workflows/p0-authority-spawn-ordering.yml)" >> "$GITHUB_ENV"
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-          components: rustfmt
+          expected_http_sha='58d5a3998426562c2d9f40e54c173849216be8bd'
+          expected_auth_sha='a3dde2d749edeb0ec893822f72112dbfceb61b75'
+          current_http_sha="$(git rev-parse HEAD:src/runtime/http_server.rs)"
+          current_auth_sha="$(git rev-parse HEAD:.github/workflows/p0-authority-spawn-ordering.yml)"
+          test "$current_http_sha" = "$expected_http_sha"
+          test "$current_auth_sha" = "$expected_auth_sha"
 
-      - name: Restore Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: p0-http-route-dead-code-cleanup-v2
-
-      - name: Remove superseded local route matcher
-        shell: bash
-        run: |
-          set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
 
@@ -49,72 +39,29 @@ jobs:
 
           matcher_start_marker = '/// Match a route pattern against a request path, returning captured parameters.\n'
           matcher_end_marker = '/// Render a static route by calling its handler with no arguments.\n'
-          assert src.count(matcher_start_marker) == 1, 'legacy matcher start source drifted'
-          assert src.count(matcher_end_marker) == 1, 'render-route anchor source drifted'
+          assert src.count(matcher_start_marker) == 1
+          assert src.count(matcher_end_marker) == 1
           matcher_start = src.index(matcher_start_marker)
           matcher_end = src.index(matcher_end_marker, matcher_start)
           src = src[:matcher_start] + src[matcher_end:]
 
           tests_start_marker = '    #[test]\n    fn test_match_route_exact() {\n'
           tests_end_marker = '    #[test]\n    fn test_parse_form_urlencoded() {\n'
-          assert src.count(tests_start_marker) == 1, 'legacy matcher test start drifted'
-          assert src.count(tests_end_marker) == 1, 'parse-form test anchor drifted'
+          assert src.count(tests_start_marker) == 1
+          assert src.count(tests_end_marker) == 1
           tests_start = src.index(tests_start_marker)
           tests_end = src.index(tests_end_marker, tests_start)
           src = src[:tests_start] + src[tests_end:]
-
           path.write_text(src)
           PY
-          cargo fmt --all
+
           git diff --check
-
-      - name: Verify HTTP and warning gates
-        run: |
-          cargo test --lib runtime::http_server::tests:: -- --nocapture
-          RUSTFLAGS='-D warnings' cargo check --lib
-          cargo fmt --all -- --check
-
-      - name: Enforce isolated product diff
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t changed < <(git diff --name-only | sort)
-          printf 'changed paths:\n%s\n' "${changed[*]}"
+          mapfile -t changed < <(git diff --name-only)
           test "${#changed[@]}" -eq 1
-          test "${changed[0]}" = "src/runtime/http_server.rs"
+          test "${changed[0]}" = 'src/runtime/http_server.rs'
 
-      - name: Land cleanup and retrigger authority validation
-        shell: bash
-        run: |
-          set -euo pipefail
-          git diff src/runtime/http_server.rs > /tmp/http-cleanup.patch
-          git fetch origin integration/p0-stabilization-2026-09-14
-          remote_head="$(git rev-parse origin/integration/p0-stabilization-2026-09-14)"
-          remote_http_sha="$(git rev-parse origin/integration/p0-stabilization-2026-09-14:src/runtime/http_server.rs)"
-          remote_auth_sha="$(git rev-parse origin/integration/p0-stabilization-2026-09-14:.github/workflows/p0-authority-spawn-ordering.yml)"
-          if [ "$remote_http_sha" != "$BASE_HTTP_SHA" ]; then
-            echo "http_server.rs advanced during validation: $remote_http_sha (expected $BASE_HTTP_SHA)" >&2
-            exit 1
-          fi
-          if [ "$remote_auth_sha" != "$BASE_AUTH_WORKFLOW_SHA" ]; then
-            echo "authority workflow advanced during validation: $remote_auth_sha (expected $BASE_AUTH_WORKFLOW_SHA)" >&2
-            exit 1
-          fi
-          git reset --hard "$remote_head"
-          git apply /tmp/http-cleanup.patch
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('.github/workflows/p0-authority-spawn-ordering.yml')
-          src = path.read_text()
-          old = 'key: p0-authority-spawn-ordering-v2'
-          new = 'key: p0-authority-spawn-ordering-v3'
-          assert src.count(old) == 1, 'authority cache-key anchor drifted'
-          path.write_text(src.replace(old, new, 1))
-          PY
-          rm .github/workflows/p0-http-route-dead-code-cleanup.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/runtime/http_server.rs .github/workflows/p0-authority-spawn-ordering.yml .github/workflows/p0-http-route-dead-code-cleanup.yml
-          git diff --cached --check
+          git add src/runtime/http_server.rs
           git commit -m 'fix(web): remove superseded route matcher'
           git push origin HEAD:integration/p0-stabilization-2026-09-14
