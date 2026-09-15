@@ -46,16 +46,17 @@ jobs:
           start = text.index(start_marker)
           end = text.index(end_marker, start)
           block = text[start:end]
-          expected = '''        if self.actors.contains_key(&target_id)
-              && !self.actor_has_behavior_id(target_id, behavior_id)
-          {
-              warn!(
-                  "nulang-runtime: rejecting message to actor {}: unknown behavior id {}",
-                  target_id, behavior_id
-              );
-              return;
-          }
-'''
+          expected = "".join([
+              "        if self.actors.contains_key(&target_id)\n",
+              "            && !self.actor_has_behavior_id(target_id, behavior_id)\n",
+              "        {\n",
+              "            warn!(\n",
+              "                \"nulang-runtime: rejecting message to actor {}: unknown behavior id {}\",\n",
+              "                target_id, behavior_id\n",
+              "            );\n",
+              "            return;\n",
+              "        }\n",
+          ])
           if block != expected:
               raise SystemExit(f"unexpected send_message_by_id guard shape:\n{block}")
 
