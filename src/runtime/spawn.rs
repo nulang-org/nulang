@@ -3,14 +3,47 @@
 //! the runtime's public fields.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::io;
 
+use crate::authority::AuthorityManifest;
+use crate::authority_runtime::RuntimeAuthorityError;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::{Actor, ActorBackend, BehaviorEntry};
-use crate::runtime::persistence::{PersistedValue, StateModel, WorkflowEvent};
+use crate::runtime::persistence::{ActorSnapshot, PersistedValue, StateModel, WorkflowEvent};
 use crate::runtime::timer_fired_handler;
 use crate::runtime::Runtime;
 use crate::runtime::{bytecode_step_placeholder, fresh_actor_id, map_ast_state_model};
 use crate::vm::Value;
+
+#[derive(Debug)]
+pub(crate) enum SpawnWithAuthorityError {
+    Authority(RuntimeAuthorityError),
+    Persistence(io::Error),
+}
+
+impl fmt::Display for SpawnWithAuthorityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authority(error) => write!(f, "{error}"),
+            Self::Persistence(error) => write!(f, "durable spawn persistence failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SpawnWithAuthorityError {}
+
+impl From<RuntimeAuthorityError> for SpawnWithAuthorityError {
+    fn from(error: RuntimeAuthorityError) -> Self {
+        Self::Authority(error)
+    }
+}
+
+impl From<io::Error> for SpawnWithAuthorityError {
+    fn from(error: io::Error) -> Self {
+        Self::Persistence(error)
+    }
+}
 
 /// Core spawn logic shared by all spawn entry points.
 pub(crate) fn spawn_actor_with_models(
@@ -20,14 +53,52 @@ pub(crate) fn spawn_actor_with_models(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
-    spawn_actor_with_id(
+    let id = fresh_actor_id();
+    match spawn_actor_with_id_with_authority(rt, id, init, state_models, persistent, workflow, None)
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(actor_id = id, %error, "actor spawn persistence failed");
+            id
+        }
+    }
+}
+
+fn spawn_actor_with_models_with_authority(
+    rt: &mut Runtime,
+    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+    state_models: HashMap<String, StateModel>,
+    persistent: bool,
+    workflow: Option<&str>,
+    initial_authority: Option<&AuthorityManifest>,
+) -> io::Result<u64> {
+    spawn_actor_with_id_with_authority(
         rt,
         fresh_actor_id(),
         init,
         state_models,
         persistent,
         workflow,
+        initial_authority,
     )
+}
+
+/// Load and validate legacy restart snapshot authority before actor initialization.
+///
+/// A malformed persisted manifest aborts activation before the init closure,
+/// CRDT registration, actor insertion, or scheduler enqueue. Pre-authority
+/// snapshots deserialize with an empty token set and therefore remain
+/// deny-by-default.
+fn preflight_persistent_snapshot(
+    rt: &Runtime,
+    actor_id: u64,
+) -> Result<Option<(ActorSnapshot, AuthorityManifest)>, RuntimeAuthorityError> {
+    let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
+        return Ok(None);
+    };
+    let manifest =
+        AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))?;
+    Ok(Some((snapshot, manifest)))
 }
 
 /// Spawn an actor with a pre-assigned id. `Runtime::spawn_actor_near` uses
@@ -41,16 +112,47 @@ pub(crate) fn spawn_actor_with_id(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
+    match spawn_actor_with_id_with_authority(rt, id, init, state_models, persistent, workflow, None)
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(actor_id = id, %error, "actor spawn persistence failed");
+            id
+        }
+    }
+}
+
+fn spawn_actor_with_id_with_authority(
+    rt: &mut Runtime,
+    id: u64,
+    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+    state_models: HashMap<String, StateModel>,
+    persistent: bool,
+    workflow: Option<&str>,
+    initial_authority: Option<&AuthorityManifest>,
+) -> io::Result<u64> {
+    let restart_snapshot = if persistent && workflow.is_none() {
+        match preflight_persistent_snapshot(rt, id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    actor_id = id,
+                    %error,
+                    "refusing to activate persistent actor with invalid authority snapshot"
+                );
+                return Ok(id);
+            }
+        }
+    } else {
+        None
+    };
+
     let mut actor = Actor::new(id, format!("actor_{}", id), 0);
     let state_fields = init();
     for (name, value) in state_fields {
         actor.set_state_field(name, value);
     }
     actor.state_models = state_models;
-    // Register CRDT-backed fields with the CrdtManager.
-    if let Some(ref mut mgr) = rt.crdt_manager {
-        mgr.register_actor_fields(id, &actor);
-    }
     actor.persistent = persistent;
     let workflow_name = workflow.map(|n| n.to_string());
     if let Some(name) = workflow {
@@ -72,7 +174,15 @@ pub(crate) fn spawn_actor_with_id(
     // and are unaffected. Workflow actors have their own journal-based
     // recovery path (`recover_actor`), so they are skipped here.
     if persistent && workflow.is_none() {
-        restore_persistent_state(rt, &mut actor);
+        restore_persistent_state(rt, &mut actor, restart_snapshot);
+    }
+    if let Some(authority) = initial_authority {
+        actor.install_authority_manifest(authority);
+    }
+    // Register CRDT-backed fields only after persisted authority has been
+    // validated and installed, so rejected activations leave no manager state.
+    if let Some(ref mut mgr) = rt.crdt_manager {
+        mgr.register_actor_fields(id, &actor);
     }
     rt.actors.insert(id, actor);
     if workflow.is_some() {
@@ -95,29 +205,56 @@ pub(crate) fn spawn_actor_with_id(
             }
             state
         };
-        let _ = rt.persistence.append_workflow_event(
-            id,
-            WorkflowEvent::WorkflowStarted {
-                sequence: seq,
-                name: workflow_name.as_ref().unwrap().clone(),
-                state,
-            },
-        );
-        crate::runtime::workflow::checkpoint_actor(rt, id);
+        let initial_commit = (|| -> io::Result<()> {
+            rt.persistence.append_workflow_event(
+                id,
+                WorkflowEvent::WorkflowStarted {
+                    sequence: seq,
+                    name: workflow_name.as_ref().unwrap().clone(),
+                    state,
+                },
+            )?;
+            crate::runtime::workflow::try_checkpoint_actor(rt, id)?;
+            Ok(())
+        })();
+        if let Err(error) = initial_commit {
+            rollback_failed_initial_workflow_spawn(rt, id);
+            return Err(error);
+        }
     }
     rt.enqueue_actor(id);
-    id
+    Ok(id)
+}
+
+fn rollback_failed_initial_workflow_spawn(rt: &mut Runtime, actor_id: u64) {
+    rt.actors.remove(&actor_id);
+    if let Some(manager) = rt.crdt_manager.as_mut() {
+        manager.unregister_actor_fields(actor_id);
+    }
+    if let Err(error) = rt.persistence.clear(actor_id) {
+        tracing::warn!(
+            actor_id,
+            %error,
+            "failed to clear partial durable state after rejected workflow spawn"
+        );
+    }
 }
 
 /// Overlay previously persisted state onto a freshly spawned persistent
 /// actor: restore the durable-field snapshot, then replay the event-sourced
 /// event log (mirroring the restore portion of `Runtime::recover_actor`).
 /// A no-op when the store holds no snapshot for this actor id.
-fn restore_persistent_state(rt: &Runtime, actor: &mut Actor) {
+fn restore_persistent_state(
+    rt: &Runtime,
+    actor: &mut Actor,
+    snapshot: Option<(ActorSnapshot, AuthorityManifest)>,
+) {
     // Event-sourced-only actors may have an event log but no snapshot
     // (EventSourced fields are excluded from snapshots by design), so both
-    // halves run independently.
-    if let Some(snapshot) = rt.persistence.load_snapshot(actor.id) {
+    // halves run independently. Authority was parsed in the preflight phase
+    // before the actor was initialized or made observable.
+    if let Some((snapshot, authority)) = snapshot {
+        actor.install_authority_manifest(&authority);
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal;
         for (name, value) in snapshot.state {
@@ -194,6 +331,22 @@ pub(crate) fn spawn_from_module(
     behavior_idx: usize,
     init: Vec<(String, Value)>,
 ) -> Value {
+    match spawn_from_module_with_initial_authority(rt, module, behavior_idx, init, None) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "actor spawn persistence failed");
+            Value::nil()
+        }
+    }
+}
+
+fn spawn_from_module_with_initial_authority(
+    rt: &mut Runtime,
+    module: &crate::bytecode::CodeModule,
+    behavior_idx: usize,
+    init: Vec<(String, Value)>,
+    initial_authority: Option<&AuthorityManifest>,
+) -> io::Result<Value> {
     rt.register_module_grains(module);
     let meta = module
         .actor_metadata
@@ -208,7 +361,7 @@ pub(crate) fn spawn_from_module(
                     %error,
                     "refusing to spawn actor with conflicting role metadata"
                 );
-                return Value::nil();
+                return Ok(Value::nil());
             }
         },
         None => ActorRole::Plain,
@@ -221,7 +374,7 @@ pub(crate) fn spawn_from_module(
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
         let defaults = meta.state_defaults.clone();
-        spawn_actor_with_models(
+        spawn_actor_with_models_with_authority(
             rt,
             Box::new(move || {
                 let mut fields: Vec<(String, Value)> = defaults
@@ -238,9 +391,17 @@ pub(crate) fn spawn_from_module(
             } else {
                 None
             },
-        )
+            initial_authority,
+        )?
     } else {
-        spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
+        spawn_actor_with_models_with_authority(
+            rt,
+            Box::new(move || init),
+            HashMap::new(),
+            false,
+            None,
+            initial_authority,
+        )?
     };
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
@@ -332,7 +493,44 @@ pub(crate) fn spawn_from_module(
         layout_workflow_behavior_table(rt, id);
     }
     register_recovery_module(rt, id, module.clone(), offsets, compensation_offsets);
-    Value::actor_ref(id)
+    Ok(Value::actor_ref(id))
+}
+
+/// Spawn from a bytecode module while enforcing one validated external-authority
+/// manifest atomically with actor creation.
+///
+/// If a parent actor is currently executing, delegation is validated before
+/// the child is created, so a denied or malformed grant cannot leave a
+/// partially-created privileged actor behind. With no current actor, the
+/// runtime is the root trust boundary and may install the supplied manifest
+/// directly; host policy can further constrain that root boundary later.
+///
+/// This is staged migration plumbing and becomes live once exact spawn
+/// provenance is threaded through the VM callback boundary.
+pub(crate) fn spawn_from_module_with_authority(
+    rt: &mut Runtime,
+    module: &crate::bytecode::CodeModule,
+    behavior_idx: usize,
+    init: Vec<(String, Value)>,
+    requested: &AuthorityManifest,
+) -> Result<Value, SpawnWithAuthorityError> {
+    if let Some(parent_id) = rt.current_actor {
+        if let Some(parent) = rt.actors.get(&parent_id) {
+            parent.delegate_authority(requested)?;
+        } else if let Some(grant) = requested.iter().next() {
+            // A non-empty request with a missing current actor has no valid
+            // authority source. Treat it like an empty parent manifest.
+            return Err(RuntimeAuthorityError::Denied(grant.clone()).into());
+        }
+    }
+
+    Ok(spawn_from_module_with_initial_authority(
+        rt,
+        module,
+        behavior_idx,
+        init,
+        Some(requested),
+    )?)
 }
 
 /// Populate a workflow actor's behavior table with placeholder entries for
@@ -367,4 +565,379 @@ pub(crate) fn register_recovery_module(
 ) {
     rt.recovery_modules
         .insert(actor_id, (module, offsets, compensation_offsets));
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use crate::authority::AuthorityGrant;
+    use crate::bytecode::CodeModule;
+    use crate::runtime::persistence::{EventEntry, JournalEntry, MemoryStore, PersistenceStore};
+
+    struct FailingStore {
+        inner: MemoryStore,
+        fail_workflow_start: bool,
+        fail_snapshot: bool,
+    }
+
+    impl FailingStore {
+        fn new(fail_workflow_start: bool, fail_snapshot: bool) -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_workflow_start,
+                fail_snapshot,
+            }
+        }
+    }
+
+    impl PersistenceStore for FailingStore {
+        fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+            if self.fail_snapshot {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected snapshot failure",
+                ));
+            }
+            self.inner.save_snapshot(snapshot)
+        }
+
+        fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+            self.inner.load_snapshot(actor_id)
+        }
+
+        fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
+            self.inner.append_journal(actor_id, entry)
+        }
+
+        fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+            self.inner.read_journal(actor_id)
+        }
+
+        fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
+            if self.fail_workflow_start && matches!(event, WorkflowEvent::WorkflowStarted { .. }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected workflow-start failure",
+                ));
+            }
+            self.inner.append_workflow_event(actor_id, event)
+        }
+
+        fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+            self.inner.read_workflow_events(actor_id)
+        }
+
+        fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
+            self.inner.append_event(actor_id, entry)
+        }
+
+        fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+            self.inner.read_events(actor_id)
+        }
+
+        fn latest_sequence(&self, actor_id: u64) -> u64 {
+            self.inner.latest_sequence(actor_id)
+        }
+
+        fn clear(&mut self, actor_id: u64) -> io::Result<()> {
+            self.inner.clear(actor_id)
+        }
+    }
+
+    fn secret_manifest(name: &str) -> AuthorityManifest {
+        AuthorityManifest::from_tokens([format!("Secret::Read({name})")].iter().map(String::as_str))
+            .unwrap()
+    }
+
+    #[test]
+    fn root_spawn_installs_requested_authority() {
+        let mut rt = Runtime::new();
+        let module = CodeModule::new("root-authority");
+        let requested = secret_manifest("STRIPE_KEY");
+
+        let value =
+            spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested).unwrap();
+        let actor_id = value.as_actor_id().unwrap();
+        let actor = rt.actors.get(&actor_id).unwrap();
+
+        assert!(actor
+            .authority_manifest()
+            .unwrap()
+            .allows(&AuthorityGrant::SecretRead {
+                name: "STRIPE_KEY".into(),
+            }));
+    }
+
+    #[test]
+    fn parent_can_delegate_only_authority_it_holds() {
+        let mut rt = Runtime::new();
+        let parent_id = rt.spawn_actor(Box::new(|| vec![]));
+        let parent_manifest = secret_manifest("STRIPE_KEY");
+        rt.actors
+            .get_mut(&parent_id)
+            .unwrap()
+            .install_authority_manifest(&parent_manifest);
+        rt.current_actor = Some(parent_id);
+
+        let module = CodeModule::new("delegated-authority");
+        let value = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &parent_manifest)
+            .unwrap();
+        let child_id = value.as_actor_id().unwrap();
+
+        assert_eq!(
+            rt.actors
+                .get(&child_id)
+                .unwrap()
+                .authority_manifest()
+                .unwrap(),
+            parent_manifest
+        );
+    }
+
+    #[test]
+    fn denied_delegation_does_not_create_child() {
+        let mut rt = Runtime::new();
+        let parent_id = rt.spawn_actor(Box::new(|| vec![]));
+        rt.current_actor = Some(parent_id);
+        let before = rt.actors.len();
+        let requested = secret_manifest("STRIPE_KEY");
+        let module = CodeModule::new("denied-authority");
+
+        let result = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested);
+
+        assert!(matches!(
+            result,
+            Err(SpawnWithAuthorityError::Authority(RuntimeAuthorityError::Denied(
+                AuthorityGrant::SecretRead { ref name }
+            ))) if name == "STRIPE_KEY"
+        ));
+        assert_eq!(rt.actors.len(), before);
+    }
+
+    #[test]
+    fn malformed_parent_manifest_fails_before_child_creation() {
+        let mut rt = Runtime::new();
+        let parent_id = rt.spawn_actor(Box::new(|| vec![]));
+        rt.actors
+            .get_mut(&parent_id)
+            .unwrap()
+            .capabilities
+            .insert("Net::TcpOut(malformed)".to_string());
+        rt.current_actor = Some(parent_id);
+        let before = rt.actors.len();
+        let requested = AuthorityManifest::new();
+        let module = CodeModule::new("malformed-parent-authority");
+
+        let result = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested);
+
+        assert!(matches!(
+            result,
+            Err(SpawnWithAuthorityError::Authority(
+                RuntimeAuthorityError::InvalidManifest(_)
+            ))
+        ));
+        assert_eq!(rt.actors.len(), before);
+    }
+
+    #[test]
+    fn workflow_start_append_failure_rolls_back_before_publication() {
+        let mut rt = Runtime::new();
+        rt.persistence = Box::new(FailingStore::new(true, false));
+        rt.crdt_manager = Some(crate::runtime::crdt_manager::CrdtManager::new(1));
+        let actor_id = 910_101;
+        let requested = secret_manifest("WORKFLOW_KEY");
+        let state_models = HashMap::from([(
+            "counter".to_string(),
+            StateModel::Crdt(crate::ast::CrdtType::GCounter),
+        )]);
+
+        let result = spawn_actor_with_id_with_authority(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![("counter".to_string(), Value::int(1))]),
+            state_models,
+            true,
+            Some("append-fails"),
+            Some(&requested),
+        );
+
+        assert!(result.is_err());
+        assert!(!rt.actors.contains_key(&actor_id));
+        let manager = rt.crdt_manager.as_ref().unwrap();
+        assert!(manager.get_field_id(actor_id, "counter").is_none());
+        assert!(rt.persistence.load_snapshot(actor_id).is_none());
+        assert!(rt.persistence.read_workflow_events(actor_id).is_empty());
+        assert_eq!(rt.recover_actor(actor_id), None);
+    }
+
+    #[test]
+    fn initial_snapshot_failure_rolls_back_journal_and_crdt_state() {
+        let mut rt = Runtime::new();
+        rt.persistence = Box::new(FailingStore::new(false, true));
+        rt.crdt_manager = Some(crate::runtime::crdt_manager::CrdtManager::new(1));
+        let actor_id = 910_102;
+        let requested = secret_manifest("WORKFLOW_KEY");
+        let state_models = HashMap::from([(
+            "counter".to_string(),
+            StateModel::Crdt(crate::ast::CrdtType::GCounter),
+        )]);
+
+        let result = spawn_actor_with_id_with_authority(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![("counter".to_string(), Value::int(1))]),
+            state_models,
+            true,
+            Some("snapshot-fails"),
+            Some(&requested),
+        );
+
+        assert!(result.is_err());
+        assert!(!rt.actors.contains_key(&actor_id));
+        let manager = rt.crdt_manager.as_ref().unwrap();
+        assert!(manager.get_field_id(actor_id, "counter").is_none());
+        assert!(rt.persistence.load_snapshot(actor_id).is_none());
+        assert!(rt.persistence.read_workflow_events(actor_id).is_empty());
+        assert_eq!(rt.persistence.latest_sequence(actor_id), 0);
+        assert_eq!(rt.recover_actor(actor_id), None);
+    }
+
+    #[test]
+    fn workflow_spawn_authority_snapshot_survives_recovery() {
+        let mut rt = Runtime::new();
+        let actor_id = 910_003;
+        let requested = secret_manifest("WORKFLOW_KEY");
+        spawn_actor_with_id_with_authority(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+            true,
+            Some("recoverable"),
+            Some(&requested),
+        );
+
+        let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+        assert_eq!(snapshot.authority_tokens, requested.canonical_token_set());
+
+        rt.actors.remove(&actor_id);
+        assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+        assert!(rt
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .authority_manifest()
+            .unwrap()
+            .allows(&AuthorityGrant::SecretRead {
+                name: "WORKFLOW_KEY".into(),
+            }));
+    }
+
+    #[test]
+    fn unprivileged_workflow_restart_remains_denied() {
+        let mut rt = Runtime::new();
+        let actor_id = 910_004;
+        let requested = AuthorityManifest::new();
+        spawn_actor_with_id_with_authority(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+            true,
+            Some("unprivileged"),
+            Some(&requested),
+        );
+
+        let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+        assert!(snapshot.authority_tokens.is_empty());
+
+        rt.actors.remove(&actor_id);
+        assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+        assert!(!rt
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .authority_manifest()
+            .unwrap()
+            .allows(&AuthorityGrant::SecretRead {
+                name: "UNGRANTED_KEY".into(),
+            }));
+    }
+
+    #[test]
+    fn legacy_restart_restores_snapshot_authority() {
+        let mut rt = Runtime::new();
+        let actor_id = 910_001;
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                sequence: 7,
+                authority_tokens: std::collections::BTreeSet::from([
+                    "Secret::Read(RESTART_KEY)".to_string()
+                ]),
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+            true,
+            None,
+        );
+
+        assert_eq!(returned, actor_id);
+        let actor = rt
+            .actors
+            .get(&actor_id)
+            .expect("persistent actor published");
+        assert_eq!(actor.sequence, 7);
+        assert!(actor
+            .authority_manifest()
+            .unwrap()
+            .allows(&AuthorityGrant::SecretRead {
+                name: "RESTART_KEY".into(),
+            }));
+    }
+
+    #[test]
+    fn malformed_legacy_restart_authority_fails_before_init_or_publish() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut rt = Runtime::new();
+        let actor_id = 910_002;
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                authority_tokens: std::collections::BTreeSet::from([
+                    "Net::TcpOut(malformed)".to_string()
+                ]),
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+        );
+
+        assert_eq!(returned, actor_id);
+        assert!(!init_ran.get(), "invalid authority must abort before init");
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "invalid authority must not publish a runnable actor"
+        );
+    }
 }

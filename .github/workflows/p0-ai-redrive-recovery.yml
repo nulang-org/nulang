@@ -1,0 +1,161 @@
+name: P0 Authority Snapshot Final Validation
+
+on:
+  push:
+    branches:
+      - integration/p0-stabilization-2026-09-14
+
+concurrency:
+  group: p0-authority-snapshot-final
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: integration/p0-stabilization-2026-09-14
+          fetch-depth: 0
+
+      - name: Pin validation base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "VALIDATION_BRANCH_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: p0-authority-snapshot-final-v2
+
+      - name: Replay reviewed authority migration transforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show 1fdf442695f82f1c9c50bd8563999174d28afaaa:.github/workflows/p0-ai-authority-migration.yml > /tmp/p0-ai-authority-migration.yml
+          ruby -ryaml - <<'RUBY'
+          workflow = YAML.load_file('/tmp/p0-ai-authority-migration.yml')
+          wanted = [
+            'Rebase function-local spawn metadata to module PCs',
+            'Add nonzero-function-base authority regression',
+            'Migrate legacy AI fixtures to explicit inference authority',
+          ]
+          steps = workflow.fetch('jobs').fetch('migrate-and-validate').fetch('steps')
+          wanted.each_with_index do |name, index|
+            step = steps.find { |candidate| candidate['name'] == name }
+            raise "missing migration step: #{name}" unless step
+            File.write("/tmp/p0-migration-#{index}.sh", step.fetch('run'))
+          end
+          RUBY
+
+          bash /tmp/p0-migration-0.sh
+          bash /tmp/p0-migration-1.sh
+
+          # The reviewed fixture migration also classified the old local HTTP
+          # matcher as test-only. That matcher has since been removed entirely by
+          # the separately validated HTTP cleanup. Provide a temporary textual
+          # compatibility shim so the immutable migration script can be replayed
+          # unchanged, then restore the already-clean HTTP source before builds.
+          cat >> src/runtime/http_server.rs <<'EOF'
+
+          /// Match a route pattern against a request path, returning captured parameters.
+          /// Patterns use `:name` segments, e.g. `/products/:id`.
+          pub fn match_route(_pattern: &str, _path: &str) -> Option<()> { None }
+          EOF
+          bash /tmp/p0-migration-2.sh
+          git restore --source=HEAD -- src/runtime/http_server.rs
+          git diff --check
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check default and minimal builds
+        run: |
+          cargo check --all-targets
+          cargo check --all-targets --no-default-features
+
+      - name: Enforce zero-warning library builds
+        run: |
+          RUSTFLAGS='-D warnings' cargo check --lib
+          RUSTFLAGS='-D warnings' cargo check --release --lib
+
+      - name: Verify workflow authority persistence regressions
+        run: |
+          cargo test --lib runtime::spawn::authority_tests::workflow_spawn_authority_snapshot_survives_recovery -- --exact --nocapture
+          cargo test --lib runtime::spawn::authority_tests::unprivileged_workflow_restart_remains_denied -- --exact --nocapture
+
+      - name: Run spawn authority provenance suite
+        run: cargo test --test spawn_authority_provenance -- --nocapture
+
+      - name: Run all migrated AI regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          tests=(
+            test_agent_ask_tracks_usage_and_cost
+            test_agent_ask_uses_memory
+            test_agent_usage_behavior
+            test_agent_workflow_recovers_semantic_memory_after_restart
+            test_agent_workflow_researches_and_reports
+            test_debate_source_end_to_end
+            test_inference_ask_actor_behavior_suspends_and_resumes
+            test_inference_ask_chained_suspensions_resume_in_order
+            test_inference_ask_nonblocking_other_actors_run_first
+            test_inference_ask_queued_messages_wait_for_suspended_behavior
+            test_mir_agent_ask_uses_memory
+            test_pipeline_source_end_to_end
+            test_supervisor_source_end_to_end
+            test_workflow_inference_ask_step_records_completion
+            test_workflow_inference_ask_step_redriven_after_restart
+            test_workflow_step_inference_ask_then_signal_wait
+            test_workflow_step_signal_wait_then_inference_ask
+          )
+          for test_name in "${tests[@]}"; do
+            echo "==> $test_name"
+            cargo test --lib "integration_tests::tests::$test_name" -- --exact --nocapture
+          done
+
+      - name: Re-run host authority regressions
+        run: cargo test --lib host_authority -- --nocapture
+
+      - name: Diff hygiene and product scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          mapfile -t changed < <(git diff --name-only | sort)
+          printf 'changed paths:\n%s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq 3
+          test "${changed[0]}" = 'src/integration_tests/mod.rs'
+          test "${changed[1]}" = 'src/mir_codegen.rs'
+          test "${changed[2]}" = 'tests/spawn_authority_provenance.rs'
+
+      - name: Commit validated stabilization source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin integration/p0-stabilization-2026-09-14
+          remote_head="$(git rev-parse origin/integration/p0-stabilization-2026-09-14)"
+          if [ "$remote_head" != "$VALIDATION_BRANCH_HEAD" ]; then
+            echo "integration branch advanced during validation: $remote_head (expected $VALIDATION_BRANCH_HEAD)" >&2
+            exit 1
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/mir_codegen.rs tests/spawn_authority_provenance.rs src/integration_tests/mod.rs
+          git diff --cached --check
+          git commit -m 'fix(authority): rebase spawn metadata and migrate AI fixtures [skip ci]'
+          git push origin HEAD:integration/p0-stabilization-2026-09-14
