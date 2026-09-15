@@ -61,56 +61,58 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import textwrap
 
           path = Path('tests/spawn_authority_provenance.rs')
           text = path.read_text()
           marker = '#[test]\nfn source_grants_survive_frontend_and_bind_to_exact_spawn_pc() {'
           if text.count(marker) != 1:
               raise SystemExit('authority regression insertion point changed')
-          test = r'''#[test]
-fn spawn_site_authority_pc_is_module_absolute_after_prior_function_code() {
-    let mut mir = lower(
-        r#"
-fn helper() { 41 }
-actor Child { behavior ping() { 1 } }
-fn main() {
-    spawn Child {} with [Inference::Ask]
-}
-"#,
-    );
-    let module = compile_mir(&mut mir, "authority-absolute-pc").unwrap();
-    let spawn_pc = module
-        .instructions
-        .iter()
-        .position(|instr| instr.opcode == OpCode::Spawn)
-        .unwrap();
-    assert!(spawn_pc > 0, "regression requires a nonzero function base");
-    assert_eq!(
-        spawn_grants(&module, spawn_pc),
-        vec!["Inference::Ask".to_string()]
-    );
-    assert_eq!(module.spawn_capability_grants[0].0, spawn_pc);
+          test = textwrap.dedent(r'''
+          #[test]
+          fn spawn_site_authority_pc_is_module_absolute_after_prior_function_code() {
+              let mut mir = lower(
+                  r#"
+          fn helper() { 41 }
+          actor Child { behavior ping() { 1 } }
+          fn main() {
+              spawn Child {} with [Inference::Ask]
+          }
+          "#,
+              );
+              let module = compile_mir(&mut mir, "authority-absolute-pc").unwrap();
+              let spawn_pc = module
+                  .instructions
+                  .iter()
+                  .position(|instr| instr.opcode == OpCode::Spawn)
+                  .unwrap();
+              assert!(spawn_pc > 0, "regression requires a nonzero function base");
+              assert_eq!(
+                  spawn_grants(&module, spawn_pc),
+                  vec!["Inference::Ask".to_string()]
+              );
+              assert_eq!(module.spawn_capability_grants[0].0, spawn_pc);
 
-    let runtime = Rc::new(RefCell::new(Runtime::new()));
-    let mut vm = VM::new();
-    vm.load_module(module);
-    vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(runtime.clone())));
-    let child = vm.run().unwrap();
-    let child_id = child.as_actor_id().expect("spawn should return actor ref");
-    assert_eq!(
-        runtime
-            .borrow()
-            .actors
-            .get(&child_id)
-            .unwrap()
-            .authority_manifest()
-            .unwrap()
-            .canonical_tokens(),
-        vec!["Inference::Ask".to_string()]
-    );
-}
+              let runtime = Rc::new(RefCell::new(Runtime::new()));
+              let mut vm = VM::new();
+              vm.load_module(module);
+              vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(runtime.clone())));
+              let child = vm.run().unwrap();
+              let child_id = child.as_actor_id().expect("spawn should return actor ref");
+              assert_eq!(
+                  runtime
+                      .borrow()
+                      .actors
+                      .get(&child_id)
+                      .unwrap()
+                      .authority_manifest()
+                      .unwrap()
+                      .canonical_tokens(),
+                  vec!["Inference::Ask".to_string()]
+              );
+          }
 
-'''
+          ''').lstrip()
           text = text.replace(marker, test + marker, 1)
           path.write_text(text)
           PY
