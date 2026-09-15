@@ -18,10 +18,7 @@ use std::fmt;
 
 use crate::migration_manifest::MigrationManifest;
 
-/// Schema version assigned to durable records written before RFC 0008 version
-/// metadata existed.
 pub const LEGACY_SCHEMA_VERSION: u32 = 1;
-/// Stable JSON key used by snapshot and journal record encodings.
 pub const SCHEMA_VERSION_FIELD: &str = "schema_version";
 
 #[derive(Debug)]
@@ -33,7 +30,10 @@ pub enum PersistenceSchemaError {
     ReservedFieldCollision,
     AmbiguousActorMetadata(usize),
     InvalidMigrationManifest(String),
-    ManifestVersionMismatch { actor_version: u32, manifest_version: u32 },
+    ManifestVersionMismatch {
+        actor_version: u32,
+        manifest_version: u32,
+    },
     Json(serde_json::Error),
 }
 
@@ -86,20 +86,12 @@ impl From<serde_json::Error> for PersistenceSchemaError {
     }
 }
 
-/// A decoded persistence record plus the schema version under which it was
-/// written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedRecord<T> {
     pub schema_version: u32,
     pub record: T,
 }
 
-/// Immutable schema provenance for the code attached to one runtime actor.
-///
-/// Native/test actors without compiled entity metadata are legacy-v1 by
-/// definition. Bytecode-backed actors must have zero or one actor metadata
-/// record in their actor-local module; more than one is rejected rather than
-/// guessing which entity type produced a persistence record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorSchemaIdentity {
     pub entity_type_name: Option<String>,
@@ -119,11 +111,9 @@ impl ActorSchemaIdentity {
 
 /// Resolve the authoritative schema identity attached to one actor.
 ///
-/// `spawn_from_module` narrows the actor-local `CodeModule.actor_metadata`
-/// vector to the concrete entity that was spawned. Recovery code should uphold
-/// the same invariant. This helper deliberately fails on ambiguous metadata so
-/// persistence never stamps a record using an arbitrary actor type from a
-/// multi-entity module.
+/// Actor-local bytecode modules are projected to zero or one metadata record at
+/// spawn/recovery registration. Ambiguous metadata is rejected rather than
+/// guessing which entity type produced a persistence record.
 pub fn actor_schema_identity(
     actor: &crate::runtime::Actor,
 ) -> Result<ActorSchemaIdentity, PersistenceSchemaError> {
@@ -139,19 +129,18 @@ pub fn actor_schema_identity(
             let migration_manifest_hash = if meta.migrations.trim().is_empty() {
                 None
             } else {
-                let manifest = MigrationManifest::from_json(&meta.migrations)
-                    .map_err(PersistenceSchemaError::InvalidMigrationManifest)?;
+                let manifest = MigrationManifest::from_json(&meta.migrations).map_err(|error| {
+                    PersistenceSchemaError::InvalidMigrationManifest(error.to_string())
+                })?;
                 if manifest.target_version != meta.version {
                     return Err(PersistenceSchemaError::ManifestVersionMismatch {
                         actor_version: meta.version,
                         manifest_version: manifest.target_version,
                     });
                 }
-                Some(
-                    manifest
-                        .digest()
-                        .map_err(PersistenceSchemaError::InvalidMigrationManifest)?,
-                )
+                Some(manifest.digest().map_err(|error| {
+                    PersistenceSchemaError::InvalidMigrationManifest(error.to_string())
+                })?)
             };
             Ok(ActorSchemaIdentity {
                 entity_type_name: Some(meta.name.clone()),
@@ -163,7 +152,6 @@ pub fn actor_schema_identity(
     }
 }
 
-/// Serialize a durable record with an explicit top-level `schema_version`.
 pub fn encode_record<T: Serialize>(
     record: &T,
     schema_version: u32,
@@ -185,7 +173,6 @@ pub fn encode_record<T: Serialize>(
     Ok(serde_json::to_string(&value)?)
 }
 
-/// Deserialize a durable record, treating an absent schema version as v1.
 pub fn decode_record<T: DeserializeOwned>(
     json: &str,
 ) -> Result<DecodedRecord<T>, PersistenceSchemaError> {
@@ -214,7 +201,6 @@ fn decode_version(value: Option<Value>) -> Result<u32, PersistenceSchemaError> {
     u32::try_from(version).map_err(|_| PersistenceSchemaError::VersionOutOfRange(version))
 }
 
-/// Insert a schema version into an already-serialized JSON object.
 pub fn add_version_to_value(
     mut value: Value,
     schema_version: u32,
@@ -238,7 +224,9 @@ pub fn add_version_to_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migration_manifest::{MigrationContractManifest, MIGRATION_MANIFEST_VERSION};
+    use crate::migration_manifest::{
+        MigrationContractMeta, MIGRATION_MANIFEST_FORMAT_VERSION,
+    };
     use crate::runtime::{Actor, ActorSnapshot, EventEntry, JournalEntry, PersistedValue};
 
     #[test]
@@ -307,15 +295,18 @@ mod tests {
     #[test]
     fn native_actor_defaults_to_legacy_v1_identity() {
         let actor = Actor::new(1, "native", 0);
-        assert_eq!(actor_schema_identity(&actor).unwrap(), ActorSchemaIdentity::legacy_v1());
+        assert_eq!(
+            actor_schema_identity(&actor).unwrap(),
+            ActorSchemaIdentity::legacy_v1()
+        );
     }
 
     #[test]
     fn actor_identity_comes_from_single_attached_metadata_record() {
         let manifest = MigrationManifest {
-            format_version: MIGRATION_MANIFEST_VERSION,
+            format_version: MIGRATION_MANIFEST_FORMAT_VERSION,
             target_version: 2,
-            contracts: vec![MigrationContractManifest {
+            contracts: vec![MigrationContractMeta {
                 from_version: 1,
                 to_version: 2,
                 has_state_transform: true,
@@ -334,14 +325,21 @@ mod tests {
         let identity = actor_schema_identity(&actor).unwrap();
         assert_eq!(identity.entity_type_name.as_deref(), Some("Counter"));
         assert_eq!(identity.schema_version, 2);
-        assert_eq!(identity.migration_manifest_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(
+            identity.migration_manifest_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
     }
 
     #[test]
     fn ambiguous_multi_entity_metadata_is_rejected() {
         let mut module = crate::bytecode::CodeModule::new("app");
-        module.actor_metadata.push(crate::bytecode::ActorMeta::new("A"));
-        module.actor_metadata.push(crate::bytecode::ActorMeta::new("B"));
+        module
+            .actor_metadata
+            .push(crate::bytecode::ActorMeta::new("A"));
+        module
+            .actor_metadata
+            .push(crate::bytecode::ActorMeta::new("B"));
         let mut actor = Actor::new(1, "actor_1", 0);
         actor.bytecode_module = Some(module);
         assert!(matches!(
@@ -353,9 +351,9 @@ mod tests {
     #[test]
     fn manifest_target_must_match_actor_schema_version() {
         let manifest = MigrationManifest {
-            format_version: MIGRATION_MANIFEST_VERSION,
+            format_version: MIGRATION_MANIFEST_FORMAT_VERSION,
             target_version: 2,
-            contracts: vec![MigrationContractManifest {
+            contracts: vec![MigrationContractMeta {
                 from_version: 1,
                 to_version: 2,
                 has_state_transform: false,
