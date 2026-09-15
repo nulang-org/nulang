@@ -92,6 +92,203 @@ impl Goal {
     }
 }
 
+/// Runtime lifecycle for a mission.
+///
+/// A mission is a higher-level Cloud SDK concept built on top of a durable
+/// [`Goal`]. It deliberately does not add a new Nulang language keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionStatus {
+    Created,
+    Running,
+    Blocked,
+    Verifying,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Hard resource ceilings for one autonomous mission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MissionBudget {
+    /// Maximum total provider/tool spend for the mission.
+    pub max_cost_usd: f64,
+    /// Maximum number of tasks the planner may materialize.
+    pub max_tasks: u32,
+    /// Maximum number of tasks that may execute concurrently.
+    pub max_parallelism: u16,
+    /// Wall-clock budget for the mission.
+    #[serde(rename = "max_duration_secs", with = "duration_secs")]
+    pub max_duration: Duration,
+    /// Optional aggregate model-token ceiling. `None` leaves token accounting
+    /// to the provider budget while cost/task/time limits still apply.
+    pub max_tokens: Option<u64>,
+}
+
+impl Default for MissionBudget {
+    fn default() -> Self {
+        Self {
+            max_cost_usd: 25.0,
+            max_tasks: 64,
+            max_parallelism: 8,
+            max_duration: Duration::from_secs(60 * 60),
+            max_tokens: None,
+        }
+    }
+}
+
+/// Human-approval policy for side-effecting mission steps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    /// The mission may execute without human approval.
+    Never,
+    /// Every task requires approval before execution.
+    Always,
+    /// Only tasks that request one of the listed capabilities require approval.
+    CapabilityGated { capabilities: Vec<String> },
+}
+
+impl Default for ApprovalPolicy {
+    fn default() -> Self {
+        Self::CapabilityGated {
+            capabilities: vec![
+                "deploy.production".into(),
+                "secrets.write".into(),
+                "billing.write".into(),
+            ],
+        }
+    }
+}
+
+impl ApprovalPolicy {
+    pub fn requires_approval(&self, required_capabilities: &[String]) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Always => true,
+            Self::CapabilityGated { capabilities } => required_capabilities
+                .iter()
+                .any(|required| capabilities.iter().any(|gated| gated == required)),
+        }
+    }
+}
+
+/// Verification and repair policy applied before a mission may complete.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationPolicy {
+    pub required: bool,
+    pub min_successful_checks: u16,
+    pub max_repair_attempts: u16,
+}
+
+impl Default for VerificationPolicy {
+    fn default() -> Self {
+        Self {
+            required: true,
+            min_successful_checks: 1,
+            max_repair_attempts: 2,
+        }
+    }
+}
+
+/// Typed execution contract for long-running autonomous work.
+///
+/// `MissionSpec` is intentionally a library/domain type rather than language
+/// syntax. Nulang programs can represent missions with ordinary durable
+/// entities/actors while Nulang Cloud interprets this policy at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MissionSpec {
+    pub goal: Goal,
+    pub budget: MissionBudget,
+    pub approval: ApprovalPolicy,
+    pub verification: VerificationPolicy,
+    pub required_capabilities: Vec<String>,
+}
+
+impl MissionSpec {
+    pub fn from_goal(goal: Goal) -> Self {
+        let max_cost_usd = goal.budget_usd.max(0.0);
+        Self {
+            goal,
+            budget: MissionBudget {
+                max_cost_usd,
+                ..MissionBudget::default()
+            },
+            approval: ApprovalPolicy::default(),
+            verification: VerificationPolicy::default(),
+            required_capabilities: Vec::new(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), MissionValidationError> {
+        if !self.budget.max_cost_usd.is_finite() || self.budget.max_cost_usd < 0.0 {
+            return Err(MissionValidationError::InvalidCostBudget);
+        }
+        if !self.goal.budget_usd.is_finite()
+            || self.goal.budget_usd < 0.0
+            || self.goal.budget_usd > self.budget.max_cost_usd
+        {
+            return Err(MissionValidationError::GoalBudgetExceedsMissionBudget);
+        }
+        if self.budget.max_tasks == 0 {
+            return Err(MissionValidationError::ZeroTaskBudget);
+        }
+        if self.budget.max_parallelism == 0
+            || u32::from(self.budget.max_parallelism) > self.budget.max_tasks
+        {
+            return Err(MissionValidationError::InvalidParallelism);
+        }
+        if self.budget.max_duration.is_zero() {
+            return Err(MissionValidationError::ZeroDurationBudget);
+        }
+        if self.verification.required && self.verification.min_successful_checks == 0 {
+            return Err(MissionValidationError::InvalidVerificationPolicy);
+        }
+        if self
+            .required_capabilities
+            .iter()
+            .any(|capability| capability.trim().is_empty())
+        {
+            return Err(MissionValidationError::EmptyCapability);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionValidationError {
+    InvalidCostBudget,
+    GoalBudgetExceedsMissionBudget,
+    ZeroTaskBudget,
+    InvalidParallelism,
+    ZeroDurationBudget,
+    InvalidVerificationPolicy,
+    EmptyCapability,
+}
+
+impl std::fmt::Display for MissionValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::InvalidCostBudget => "mission max_cost_usd must be finite and non-negative",
+            Self::GoalBudgetExceedsMissionBudget => {
+                "goal budget must be finite, non-negative, and within the mission cost budget"
+            }
+            Self::ZeroTaskBudget => "mission max_tasks must be greater than zero",
+            Self::InvalidParallelism => {
+                "mission max_parallelism must be greater than zero and no larger than max_tasks"
+            }
+            Self::ZeroDurationBudget => "mission max_duration must be greater than zero",
+            Self::InvalidVerificationPolicy => {
+                "required verification needs at least one successful check"
+            }
+            Self::EmptyCapability => "mission capabilities cannot contain empty names",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for MissionValidationError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
     pub id: Uuid,
@@ -247,5 +444,34 @@ mod tests {
         );
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("goal_created"));
+    }
+
+    #[test]
+    fn mission_spec_roundtrip_and_validation() {
+        let goal = Goal::new("demo", "Ship a production feature", 10.0);
+        let mut mission = MissionSpec::from_goal(goal);
+        mission.required_capabilities = vec!["code".into(), "deploy.production".into()];
+
+        mission.validate().unwrap();
+        assert!(mission
+            .approval
+            .requires_approval(&mission.required_capabilities));
+
+        let json = serde_json::to_string(&mission).unwrap();
+        let back: MissionSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(mission, back);
+    }
+
+    #[test]
+    fn mission_rejects_parallelism_above_task_budget() {
+        let goal = Goal::new("demo", "Do work", 5.0);
+        let mut mission = MissionSpec::from_goal(goal);
+        mission.budget.max_tasks = 2;
+        mission.budget.max_parallelism = 3;
+
+        assert_eq!(
+            mission.validate(),
+            Err(MissionValidationError::InvalidParallelism)
+        );
     }
 }
