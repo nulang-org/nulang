@@ -36,49 +36,6 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt
 
-      - name: Recover interrupted workflow inference by redriving the durable step
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('src/runtime/mod.rs')
-          text = path.read_text()
-          before = '''            let should_resume = self
-              .actors
-              .get(&actor_id)
-              .map(|a| a.waiting_signal.is_some() || a.suspended_execution.is_some())
-              .unwrap_or(false);
-          if should_resume {
-          '''
-          after = '''            let (should_resume, interrupted_llm) = self
-              .actors
-              .get(&actor_id)
-              .map(|a| {
-                  (
-                      a.waiting_signal.is_some() || a.suspended_execution.is_some(),
-                      a.waiting_signal.as_deref() == Some(LLM_SUSPEND_MARKER),
-                  )
-              })
-              .unwrap_or((false, false));
-          if interrupted_llm {
-              // VM continuations are process-local and cannot survive recovery. The
-              // durable marker means this workflow step must be re-driven instead
-              // of leaving the recovered actor blocked on the abandoned call.
-              if let Some(actor) = self.actors.get_mut(&actor_id) {
-                  actor.waiting_signal = None;
-                  actor.llm_inflight = false;
-                  actor.suspended_execution = None;
-              }
-          }
-          if should_resume {
-          '''
-          if text.count(before) != 1:
-              raise SystemExit('recover_actor resume shape changed')
-          path.write_text(text.replace(before, after, 1))
-          PY
-
       - name: Reuse reviewed authority migration transforms
         shell: bash
         run: |
@@ -155,12 +112,11 @@ jobs:
           git diff --check
           mapfile -t changed < <(git diff --name-only | sort)
           printf 'changed paths:\n%s\n' "${changed[*]}"
-          test "${#changed[@]}" -eq 5
+          test "${#changed[@]}" -eq 4
           test "${changed[0]}" = "src/integration_tests/mod.rs"
           test "${changed[1]}" = "src/mir_codegen.rs"
           test "${changed[2]}" = "src/runtime/http_server.rs"
-          test "${changed[3]}" = "src/runtime/mod.rs"
-          test "${changed[4]}" = "tests/spawn_authority_provenance.rs"
+          test "${changed[3]}" = "tests/spawn_authority_provenance.rs"
 
       - name: Commit validated stabilization changes and remove helpers
         shell: bash
@@ -181,7 +137,7 @@ jobs:
           rm .github/workflows/p0-ai-redrive-recovery.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/mir_codegen.rs tests/spawn_authority_provenance.rs src/integration_tests/mod.rs src/runtime/http_server.rs src/runtime/mod.rs .github/workflows/p0-ai-authority-migration.yml .github/workflows/p0-ai-redrive-recovery.yml
+          git add src/mir_codegen.rs tests/spawn_authority_provenance.rs src/integration_tests/mod.rs src/runtime/http_server.rs .github/workflows/p0-ai-authority-migration.yml .github/workflows/p0-ai-redrive-recovery.yml
           git diff --cached --check
-          git commit -m 'fix(runtime): recover interrupted inference and migrate authority fixtures'
+          git commit -m 'fix(authority): persist workflow grants and migrate AI fixtures'
           git push origin HEAD:integration/p0-stabilization-2026-09-14
