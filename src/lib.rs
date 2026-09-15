@@ -31,7 +31,8 @@ pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
 #[path = "effect_checker.rs"]
-mod effect_checker_impl;
+#[doc(hidden)]
+pub mod effect_checker_impl;
 #[path = "effect_checker_wrapper.rs"]
 pub mod effect_checker;
 pub mod migration_purity;
