@@ -182,11 +182,15 @@ jobs:
           PY
           git add tests/spawn_authority_provenance.rs
 
-      - name: Format
+      - name: Normalize and verify formatting
         shell: bash
         run: |
           set -euo pipefail
+          cargo +1.95.0 fmt --all
+          git diff --name-only | tee /tmp/10-fmt-paths.log
           cargo +1.95.0 fmt --all -- --check 2>&1 | tee /tmp/10-fmt.log
+          git diff --check
+          git add -A
 
       - name: Check no-default-features
         shell: bash
@@ -236,7 +240,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git diff --check 2>&1 | tee /tmp/21-diff.log
+          git diff --cached --check 2>&1 | tee /tmp/21-diff.log
 
       - name: Upload integration diagnostics
         if: always()
@@ -246,6 +250,7 @@ jobs:
           path: |
             /tmp/*.patch
             /tmp/*-apply.log
+            /tmp/10-fmt-paths.log
             /tmp/10-fmt.log
             /tmp/11-no-default.log
             /tmp/12-default.log
