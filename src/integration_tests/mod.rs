@@ -6273,7 +6273,7 @@ match { a: 2, b: 9 } with {
                 system_prompt: "You are helpful.",
                 memory: { max_turns: 10 }
             }
-            let a = spawn Agent {} in
+            let a = spawn Agent {} with [Inference::Ask] in
             let r1 = ask a ask("hello") in
             let r2 = ask a ask("world") in
             r1
@@ -7804,7 +7804,7 @@ match { a: 2, b: 9 } with {
                     self.answer = perform Inference.ask("hello")
                 }
             }
-            let a = spawn LlmActor { answer = "" } in a
+            let a = spawn LlmActor { answer = "" } with [Inference::Ask] in a
         "#;
         let value = run_source_new_with_runtime(source, rt.clone()).unwrap();
         let actor_id = value
@@ -7857,7 +7857,7 @@ match { a: 2, b: 9 } with {
                     self.answer = perform Inference.ask("hello")
                 }
             }
-            let a = spawn LlmActor { answer = "" } in a
+            let a = spawn LlmActor { answer = "" } with [Inference::Ask] in a
         "#;
         let value = run_source_new_with_runtime(source, rt.clone()).unwrap();
         let llm_actor = value
@@ -7964,7 +7964,7 @@ match { a: 2, b: 9 } with {
                     self.second = perform Inference.ask("two")
                 }
             }
-            let a = spawn Chained { first = ""; second = "" } in a
+            let a = spawn Chained { first = ""; second = "" } with [Inference::Ask] in a
         "#;
         let value = run_source_new_with_runtime(source, rt.clone()).unwrap();
         let actor_id = value
@@ -8027,7 +8027,7 @@ match { a: 2, b: 9 } with {
                     self.second = perform Inference.ask("two")
                 }
             }
-            let a = spawn LlmPair { first = ""; second = "" } in a
+            let a = spawn LlmPair { first = ""; second = "" } with [Inference::Ask] in a
         "#;
         let value = run_source_new_with_runtime(source, rt.clone()).unwrap();
         let actor_id = value
@@ -8086,7 +8086,7 @@ match { a: 2, b: 9 } with {
             workflow LlmFlow {
                 step ask_step { self.answer = perform Inference.ask("hello") }
             }
-            let w = spawn LlmFlow {} in { w }
+            let w = spawn LlmFlow {} with [Inference::Ask] in { w }
         "#;
 
         let store = SharedMemoryStore::new();
@@ -8145,7 +8145,7 @@ match { a: 2, b: 9 } with {
             workflow LlmFlowRecover {
                 step ask_step { self.answer = perform Inference.ask("hello") }
             }
-            let w = spawn LlmFlowRecover {} in { w }
+            let w = spawn LlmFlowRecover {} with [Inference::Ask] in { w }
         "#;
 
         let store = SharedMemoryStore::new();
@@ -8265,7 +8265,7 @@ match { a: 2, b: 9 } with {
                     (perform Signal.wait("go"), self.answer = perform Inference.ask("hello"))
                 }
             }
-            let w = spawn SignalThenLlm {} in { w }
+            let w = spawn SignalThenLlm {} with [Inference::Ask] in { w }
         "#;
 
         let store = SharedMemoryStore::new();
@@ -8384,7 +8384,7 @@ match { a: 2, b: 9 } with {
                     (self.answer = perform Inference.ask("hello"), perform Signal.wait("go"))
                 }
             }
-            let w = spawn LlmThenSignal {} in { w }
+            let w = spawn LlmThenSignal {} with [Inference::Ask] in { w }
         "#;
 
         let store = SharedMemoryStore::new();
@@ -8467,7 +8467,7 @@ match { a: 2, b: 9 } with {
                 system_prompt: "You are helpful.",
                 memory: { max_turns: 10 }
             }
-            let a = spawn Agent {} in
+            let a = spawn Agent {} with [Inference::Ask] in
             let r1 = ask a ask("hello") in
             let r2 = ask a ask("world") in
             r1
@@ -8518,7 +8518,7 @@ match { a: 2, b: 9 } with {
                 system_prompt: "You are helpful.",
                 pricing: { input: 0.01, output: 0.02 }
             }
-            let a = spawn Agent {} in
+            let a = spawn Agent {} with [Inference::Ask] in
             ask a ask("hello")
         "#;
         let (module, _ty) = compile_source(source).unwrap();
@@ -8572,7 +8572,7 @@ match { a: 2, b: 9 } with {
                 system_prompt: "You are helpful.",
                 pricing: { input: 0.01, output: 0.02 }
             }
-            let a = spawn Agent {} in
+            let a = spawn Agent {} with [Inference::Ask] in
             let _ = ask a ask("hello") in
             ask a usage()
         "#;
@@ -8657,7 +8657,7 @@ match { a: 2, b: 9 } with {
                 semantic_memory: { dimensions: 64 }
             }
 
-            let researcher = spawn Researcher {} in
+            let researcher = spawn Researcher {} with [Inference::Ask] in
             let _ = ask researcher ask("Research CRDTs") in
             let report = ask researcher ask("Synthesize a report on CRDTs") in
             report
@@ -8759,7 +8759,7 @@ match { a: 2, b: 9 } with {
                 semantic_memory: { dimensions: 64 }
             }
 
-            let researcher = spawn Researcher {} in
+            let researcher = spawn Researcher {} with [Inference::Ask] in
             let _ = ask researcher ask("Research CRDTs") in
             researcher
         "#;
@@ -9019,8 +9019,8 @@ match { a: 2, b: 9 } with {
             }
 
             fn main() {
-                let researcher = spawn Researcher {} in
-                let writer = spawn Writer {} in
+                let researcher = spawn Researcher {} with [Inference::Ask] in
+                let writer = spawn Writer {} with [Inference::Ask] in
                 let pipeline = Pipeline.new()
                     |> Pipeline.stage("research", researcher, "Research: {input}")
                     |> Pipeline.stage("write", writer, "Write based on: {input}")
@@ -9075,8 +9075,8 @@ match { a: 2, b: 9 } with {
             }
 
             fn main() {
-                let researcher = spawn Researcher {} in
-                let writer = spawn Writer {} in
+                let researcher = spawn Researcher {} with [Inference::Ask] in
+                let writer = spawn Writer {} with [Inference::Ask] in
                 let team = Supervisor.new()
                     |> Supervisor.worker("researcher", researcher, "Finds information")
                     |> Supervisor.worker("writer", writer, "Writes content")
@@ -9136,9 +9136,9 @@ match { a: 2, b: 9 } with {
             }
 
             fn main() {
-                let pro = spawn ProAgent {} in
-                let con = spawn ConAgent {} in
-                let moderator = spawn Moderator {} in
+                let pro = spawn ProAgent {} with [Inference::Ask] in
+                let con = spawn ConAgent {} with [Inference::Ask] in
+                let moderator = spawn Moderator {} with [Inference::Ask] in
                 let debate = Debate.new("microservices vs monolith", 1, 0.8)
                     |> Debate.participant("pro", "pro", pro)
                     |> Debate.participant("con", "con", con)

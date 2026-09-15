@@ -440,6 +440,13 @@ impl MirCodegen {
         let mut saved_instructions = Vec::new();
         std::mem::swap(&mut saved_instructions, &mut self.module.instructions);
         let function_start = saved_instructions.len();
+        // Spawn-site metadata is emitted while this function's instruction
+        // vector is isolated, so its PCs are function-local until the code is
+        // appended back to the module. Remember each table's starting length
+        // and rebase only entries produced by this function at the end.
+        let spawn_init_metadata_start = self.module.spawn_init_overrides.len();
+        let spawn_authority_metadata_start = self.module.spawn_capability_grants.len();
+        let remote_spawn_metadata_start = self.module.remote_spawn_init_fields.len();
         // Build the spill map: locals whose id exceeds the register file
         // get a slot in the frame's spill vector.  Inline spilling via
         // local_reg / local_dst / spill_write_done emits SpillLoad/SpillStore
@@ -646,6 +653,20 @@ impl MirCodegen {
         self.module.instructions = saved_instructions;
         let code_len = function_code.len();
         self.module.instructions.extend(function_code);
+
+        // Metadata recorded while `module.instructions` held only this
+        // function used function-local PCs. Runtime spawn dispatch indexes
+        // these tables with module-absolute PCs, so relocate every entry
+        // emitted by this function by the same base as its bytecode.
+        for (pc, _) in &mut self.module.spawn_init_overrides[spawn_init_metadata_start..] {
+            *pc += function_start;
+        }
+        for (pc, _) in &mut self.module.spawn_capability_grants[spawn_authority_metadata_start..] {
+            *pc += function_start;
+        }
+        for (pc, _) in &mut self.module.remote_spawn_init_fields[remote_spawn_metadata_start..] {
+            *pc += function_start;
+        }
 
         // Publish the debugger's pc<->line map and per-function debug info.
         for (rel, line) in func_lines {
