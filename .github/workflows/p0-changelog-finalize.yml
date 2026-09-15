@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   finalize:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -51,10 +51,9 @@ jobs:
           path.write_text(text.replace(marker, block + marker, 1))
           PY
           git diff --check
-          mapfile -t changed < <(git diff --name-only | sort)
-          printf 'working-tree paths:\n%s\n' "${changed[*]}"
-          test "${#changed[@]}" -eq 1
-          test "${changed[0]}" = 'CHANGELOG.md'
+          changed="$(git diff --name-only)"
+          printf 'working-tree paths:\n%s\n' "$changed"
+          test "$changed" = 'CHANGELOG.md'
 
       - name: Guard head, self-remove, and commit
         shell: bash
@@ -71,10 +70,9 @@ jobs:
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add CHANGELOG.md .github/workflows/p0-changelog-finalize.yml
           git diff --cached --check
-          mapfile -t staged < <(git diff --cached --name-only | sort)
-          printf 'staged paths:\n%s\n' "${staged[*]}"
-          test "${#staged[@]}" -eq 2
-          test "${staged[0]}" = '.github/workflows/p0-changelog-finalize.yml'
-          test "${staged[1]}" = 'CHANGELOG.md'
+          staged="$(git diff --cached --name-only | sort)"
+          printf 'staged paths:\n%s\n' "$staged"
+          expected="$(printf '%s\n%s' '.github/workflows/p0-changelog-finalize.yml' 'CHANGELOG.md')"
+          test "$staged" = "$expected"
           git commit -m 'docs(changelog): record P0 runtime authority stabilization'
           git push origin HEAD:integration/p0-stabilization-2026-09-14
