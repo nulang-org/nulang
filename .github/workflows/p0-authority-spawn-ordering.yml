@@ -1,0 +1,396 @@
+name: P0 Authority Spawn Ordering
+
+on:
+  push:
+    branches:
+      - integration/p0-stabilization-2026-09-14
+    paths:
+      - .github/workflows/p0-authority-spawn-ordering.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: integration/p0-stabilization-2026-09-14
+          fetch-depth: 0
+
+      - name: Pin validated spawn base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "BASE_SPAWN_SHA=$(git rev-parse HEAD:src/runtime/spawn.rs)" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: p0-authority-spawn-ordering
+
+      - name: Install workflow authority before first checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/runtime/spawn.rs')
+          src = path.read_text()
+
+          old = '''pub(crate) fn spawn_actor_with_models(
+              rt: &mut Runtime,
+              init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+              state_models: HashMap<String, StateModel>,
+              persistent: bool,
+              workflow: Option<&str>,
+          ) -> u64 {
+              spawn_actor_with_id(
+                  rt,
+                  fresh_actor_id(),
+                  init,
+                  state_models,
+                  persistent,
+                  workflow,
+              )
+          }
+          '''
+          new = '''pub(crate) fn spawn_actor_with_models(
+              rt: &mut Runtime,
+              init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+              state_models: HashMap<String, StateModel>,
+              persistent: bool,
+              workflow: Option<&str>,
+          ) -> u64 {
+              spawn_actor_with_models_with_authority(
+                  rt,
+                  init,
+                  state_models,
+                  persistent,
+                  workflow,
+                  None,
+              )
+          }
+
+          fn spawn_actor_with_models_with_authority(
+              rt: &mut Runtime,
+              init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+              state_models: HashMap<String, StateModel>,
+              persistent: bool,
+              workflow: Option<&str>,
+              initial_authority: Option<&AuthorityManifest>,
+          ) -> u64 {
+              spawn_actor_with_id_with_authority(
+                  rt,
+                  fresh_actor_id(),
+                  init,
+                  state_models,
+                  persistent,
+                  workflow,
+                  initial_authority,
+              )
+          }
+          '''
+          assert src.count(old) == 1, 'spawn_actor_with_models source drifted'
+          src = src.replace(old, new, 1)
+
+          old = '''pub(crate) fn spawn_actor_with_id(
+              rt: &mut Runtime,
+              id: u64,
+              init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+              state_models: HashMap<String, StateModel>,
+              persistent: bool,
+              workflow: Option<&str>,
+          ) -> u64 {
+              let restart_snapshot = if persistent && workflow.is_none() {
+          '''
+          new = '''pub(crate) fn spawn_actor_with_id(
+              rt: &mut Runtime,
+              id: u64,
+              init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+              state_models: HashMap<String, StateModel>,
+              persistent: bool,
+              workflow: Option<&str>,
+          ) -> u64 {
+              spawn_actor_with_id_with_authority(
+                  rt,
+                  id,
+                  init,
+                  state_models,
+                  persistent,
+                  workflow,
+                  None,
+              )
+          }
+
+          fn spawn_actor_with_id_with_authority(
+              rt: &mut Runtime,
+              id: u64,
+              init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+              state_models: HashMap<String, StateModel>,
+              persistent: bool,
+              workflow: Option<&str>,
+              initial_authority: Option<&AuthorityManifest>,
+          ) -> u64 {
+              let restart_snapshot = if persistent && workflow.is_none() {
+          '''
+          assert src.count(old) == 1, 'spawn_actor_with_id source drifted'
+          src = src.replace(old, new, 1)
+
+          old = '''    if persistent && workflow.is_none() {
+              restore_persistent_state(rt, &mut actor, restart_snapshot);
+          }
+              // Register CRDT-backed fields only after persisted authority has been
+          '''
+          new = '''    if persistent && workflow.is_none() {
+              restore_persistent_state(rt, &mut actor, restart_snapshot);
+          }
+              if let Some(authority) = initial_authority {
+                  actor.install_authority_manifest(authority);
+              }
+              // Register CRDT-backed fields only after persisted authority has been
+          '''
+          assert src.count(old) == 1, 'pre-insertion authority anchor drifted'
+          src = src.replace(old, new, 1)
+
+          old = '''pub(crate) fn spawn_from_module(
+              rt: &mut Runtime,
+              module: &crate::bytecode::CodeModule,
+              behavior_idx: usize,
+              init: Vec<(String, Value)>,
+          ) -> Value {
+              rt.register_module_grains(module);
+          '''
+          new = '''pub(crate) fn spawn_from_module(
+              rt: &mut Runtime,
+              module: &crate::bytecode::CodeModule,
+              behavior_idx: usize,
+              init: Vec<(String, Value)>,
+          ) -> Value {
+              spawn_from_module_with_initial_authority(rt, module, behavior_idx, init, None)
+          }
+
+          fn spawn_from_module_with_initial_authority(
+              rt: &mut Runtime,
+              module: &crate::bytecode::CodeModule,
+              behavior_idx: usize,
+              init: Vec<(String, Value)>,
+              initial_authority: Option<&AuthorityManifest>,
+          ) -> Value {
+              rt.register_module_grains(module);
+          '''
+          assert src.count(old) == 1, 'spawn_from_module source drifted'
+          src = src.replace(old, new, 1)
+
+          old = '''        spawn_actor_with_models(
+                  rt,
+                  Box::new(move || {
+          '''
+          new = '''        spawn_actor_with_models_with_authority(
+                  rt,
+                  Box::new(move || {
+          '''
+          assert src.count(old) == 1, 'metadata spawn call source drifted'
+          src = src.replace(old, new, 1)
+
+          old = '''            if matches!(role, ActorRole::Workflow) {
+                      Some(meta.name.as_str())
+                  } else {
+                      None
+                  },
+              )
+          '''
+          new = '''            if matches!(role, ActorRole::Workflow) {
+                      Some(meta.name.as_str())
+                  } else {
+                      None
+                  },
+                  initial_authority,
+              )
+          '''
+          assert src.count(old) == 1, 'metadata spawn tail source drifted'
+          src = src.replace(old, new, 1)
+
+          old = '''        spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
+          '''
+          new = '''        spawn_actor_with_models_with_authority(
+                  rt,
+                  Box::new(move || init),
+                  HashMap::new(),
+                  false,
+                  None,
+                  initial_authority,
+              )
+          '''
+          assert src.count(old) == 1, 'plain spawn call source drifted'
+          src = src.replace(old, new, 1)
+
+          old = '''    let value = spawn_from_module(rt, module, behavior_idx, init);
+              if let Some(child_id) = value.as_actor_id() {
+                  if let Some(child) = rt.actors.get_mut(&child_id) {
+                      child.install_authority_manifest(requested);
+                  }
+                  persist_initial_workflow_authority(rt, child_id, requested);
+              }
+              Ok(value)
+          }
+
+          /// Align a freshly-created workflow snapshot with the authority that was
+          /// explicitly validated and installed at its spawn site. Workflows create
+          /// their first checkpoint inside `spawn_from_module`, before this wrapper
+          /// installs the requested manifest; rewriting only the snapshot's authority
+          /// tokens preserves its sequence and durable state while closing that ordering
+          /// gap. Recovery still derives authority solely from persisted tokens.
+          fn persist_initial_workflow_authority(
+              rt: &mut Runtime,
+              actor_id: u64,
+              requested: &AuthorityManifest,
+          ) {
+              let should_persist = rt
+                  .actors
+                  .get(&actor_id)
+                  .map(|actor| actor.persistent && actor.is_workflow)
+                  .unwrap_or(false);
+              if !should_persist {
+                  return;
+              }
+              let Some(mut snapshot) = rt.persistence.load_snapshot(actor_id) else {
+                  return;
+              };
+              snapshot.authority_tokens = requested.canonical_token_set();
+              if let Err(error) = rt.persistence.save_snapshot(snapshot) {
+                  tracing::warn!(
+                      actor_id,
+                      %error,
+                      "failed to persist initial workflow authority snapshot"
+                  );
+              }
+          }
+          '''
+          new = '''    Ok(spawn_from_module_with_initial_authority(
+                  rt,
+                  module,
+                  behavior_idx,
+                  init,
+                  Some(requested),
+              ))
+          }
+          '''
+          assert src.count(old) == 1, 'post-hoc authority persistence block drifted'
+          src = src.replace(old, new, 1)
+
+          old = '''        let actor_id = 910_003;
+                  spawn_actor_with_id(
+                      &mut rt,
+                      actor_id,
+                      Box::new(|| vec![]),
+                      std::collections::HashMap::new(),
+                      true,
+                      Some("recoverable"),
+                  );
+                  let requested = secret_manifest("WORKFLOW_KEY");
+                  rt.actors
+                      .get_mut(&actor_id)
+                      .unwrap()
+                      .install_authority_manifest(&requested);
+                  persist_initial_workflow_authority(&mut rt, actor_id, &requested);
+          '''
+          new = '''        let actor_id = 910_003;
+                  let requested = secret_manifest("WORKFLOW_KEY");
+                  spawn_actor_with_id_with_authority(
+                      &mut rt,
+                      actor_id,
+                      Box::new(|| vec![]),
+                      std::collections::HashMap::new(),
+                      true,
+                      Some("recoverable"),
+                      Some(&requested),
+                  );
+          '''
+          assert src.count(old) == 1, 'privileged workflow regression source drifted'
+          src = src.replace(old, new, 1)
+
+          old = '''        let actor_id = 910_004;
+                  spawn_actor_with_id(
+                      &mut rt,
+                      actor_id,
+                      Box::new(|| vec![]),
+                      std::collections::HashMap::new(),
+                      true,
+                      Some("unprivileged"),
+                  );
+                  let requested = AuthorityManifest::new();
+                  rt.actors
+                      .get_mut(&actor_id)
+                      .unwrap()
+                      .install_authority_manifest(&requested);
+                  persist_initial_workflow_authority(&mut rt, actor_id, &requested);
+          '''
+          new = '''        let actor_id = 910_004;
+                  let requested = AuthorityManifest::new();
+                  spawn_actor_with_id_with_authority(
+                      &mut rt,
+                      actor_id,
+                      Box::new(|| vec![]),
+                      std::collections::HashMap::new(),
+                      true,
+                      Some("unprivileged"),
+                      Some(&requested),
+                  );
+          '''
+          assert src.count(old) == 1, 'unprivileged workflow regression source drifted'
+          src = src.replace(old, new, 1)
+
+          path.write_text(src)
+          PY
+          cargo fmt --all
+          git diff --check
+
+      - name: Verify focused authority regressions
+        run: |
+          cargo test --lib runtime::spawn::authority_tests:: -- --nocapture
+          cargo test --test spawn_authority_provenance -- --nocapture
+
+      - name: Verify warning and format gates
+        run: |
+          cargo fmt --all -- --check
+          RUSTFLAGS='-D warnings' cargo check --lib
+
+      - name: Enforce isolated product diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t changed < <(git diff --name-only | sort)
+          printf 'changed paths:\n%s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq 1
+          test "${changed[0]}" = "src/runtime/spawn.rs"
+
+      - name: Land validated spawn ordering fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff src/runtime/spawn.rs > /tmp/spawn-ordering.patch
+          git fetch origin integration/p0-stabilization-2026-09-14
+          remote_head="$(git rev-parse origin/integration/p0-stabilization-2026-09-14)"
+          remote_spawn_sha="$(git rev-parse origin/integration/p0-stabilization-2026-09-14:src/runtime/spawn.rs)"
+          if [ "$remote_spawn_sha" != "$BASE_SPAWN_SHA" ]; then
+            echo "spawn.rs advanced during validation: $remote_spawn_sha (expected $BASE_SPAWN_SHA)" >&2
+            exit 1
+          fi
+          git reset --hard "$remote_head"
+          git apply /tmp/spawn-ordering.patch
+          rm .github/workflows/p0-authority-spawn-ordering.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime/spawn.rs .github/workflows/p0-authority-spawn-ordering.yml
+          git diff --cached --check
+          git commit -m 'fix(authority): checkpoint workflow grants at spawn'
+          git push origin HEAD:integration/p0-stabilization-2026-09-14
