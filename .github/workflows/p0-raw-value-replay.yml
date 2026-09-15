@@ -90,7 +90,15 @@ jobs:
             src/vm.rs \
             > /tmp/03-host-authority.patch
           test -s /tmp/03-host-authority.patch
+          set +e
           git apply --3way --index /tmp/03-host-authority.patch 2>&1 | tee /tmp/03-host-authority-apply.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            cp src/runtime/callbacks.rs /tmp/03-callbacks-conflicted.rs || true
+            git diff --cc src/runtime/callbacks.rs > /tmp/03-callbacks-conflict.diff || true
+            exit "$status"
+          fi
 
       - name: Format
         shell: bash
@@ -157,6 +165,8 @@ jobs:
           path: |
             /tmp/*.patch
             /tmp/*-apply.log
+            /tmp/03-callbacks-conflicted.rs
+            /tmp/03-callbacks-conflict.diff
             /tmp/10-fmt.log
             /tmp/11-no-default.log
             /tmp/12-default.log
