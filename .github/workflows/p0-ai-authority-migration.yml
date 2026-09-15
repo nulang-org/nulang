@@ -152,32 +152,40 @@ jobs:
           RUSTFLAGS='-D warnings' cargo check --lib
           RUSTFLAGS='-D warnings' cargo check --release --lib
 
-      - name: Run exact migrated regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          tests=(
-            test_agent_ask_tracks_usage_and_cost
-            test_agent_ask_uses_memory
-            test_agent_usage_behavior
-            test_agent_workflow_recovers_semantic_memory_after_restart
-            test_agent_workflow_researches_and_reports
-            test_debate_source_end_to_end
-            test_inference_ask_actor_behavior_suspends_and_resumes
-            test_inference_ask_chained_suspensions_resume_in_order
-            test_inference_ask_nonblocking_other_actors_run_first
-            test_inference_ask_queued_messages_wait_for_suspended_behavior
-            test_mir_agent_ask_uses_memory
-            test_pipeline_source_end_to_end
-            test_supervisor_source_end_to_end
-            test_workflow_inference_ask_step_records_completion
-            test_workflow_inference_ask_step_redriven_after_restart
-            test_workflow_step_inference_ask_then_signal_wait
-            test_workflow_step_signal_wait_then_inference_ask
-          )
-          for t in "${tests[@]}"; do
-            cargo test --lib "integration_tests::tests::$t" -- --exact --nocapture
-          done
+      - name: AI regression 01 — usage and cost
+        run: cargo test --lib integration_tests::tests::test_agent_ask_tracks_usage_and_cost -- --exact --nocapture
+      - name: AI regression 02 — memory
+        run: cargo test --lib integration_tests::tests::test_agent_ask_uses_memory -- --exact --nocapture
+      - name: AI regression 03 — usage behavior
+        run: cargo test --lib integration_tests::tests::test_agent_usage_behavior -- --exact --nocapture
+      - name: AI regression 04 — recovered semantic memory
+        run: cargo test --lib integration_tests::tests::test_agent_workflow_recovers_semantic_memory_after_restart -- --exact --nocapture
+      - name: AI regression 05 — workflow research and report
+        run: cargo test --lib integration_tests::tests::test_agent_workflow_researches_and_reports -- --exact --nocapture
+      - name: AI regression 06 — debate source
+        run: cargo test --lib integration_tests::tests::test_debate_source_end_to_end -- --exact --nocapture
+      - name: AI regression 07 — suspends and resumes
+        run: cargo test --lib integration_tests::tests::test_inference_ask_actor_behavior_suspends_and_resumes -- --exact --nocapture
+      - name: AI regression 08 — chained suspensions
+        run: cargo test --lib integration_tests::tests::test_inference_ask_chained_suspensions_resume_in_order -- --exact --nocapture
+      - name: AI regression 09 — nonblocking scheduling
+        run: cargo test --lib integration_tests::tests::test_inference_ask_nonblocking_other_actors_run_first -- --exact --nocapture
+      - name: AI regression 10 — queued messages
+        run: cargo test --lib integration_tests::tests::test_inference_ask_queued_messages_wait_for_suspended_behavior -- --exact --nocapture
+      - name: AI regression 11 — MIR memory
+        run: cargo test --lib integration_tests::tests::test_mir_agent_ask_uses_memory -- --exact --nocapture
+      - name: AI regression 12 — pipeline source
+        run: cargo test --lib integration_tests::tests::test_pipeline_source_end_to_end -- --exact --nocapture
+      - name: AI regression 13 — supervisor source
+        run: cargo test --lib integration_tests::tests::test_supervisor_source_end_to_end -- --exact --nocapture
+      - name: AI regression 14 — workflow completion
+        run: cargo test --lib integration_tests::tests::test_workflow_inference_ask_step_records_completion -- --exact --nocapture
+      - name: AI regression 15 — workflow redrive
+        run: cargo test --lib integration_tests::tests::test_workflow_inference_ask_step_redriven_after_restart -- --exact --nocapture
+      - name: AI regression 16 — ask then signal
+        run: cargo test --lib integration_tests::tests::test_workflow_step_inference_ask_then_signal_wait -- --exact --nocapture
+      - name: AI regression 17 — signal then ask
+        run: cargo test --lib integration_tests::tests::test_workflow_step_signal_wait_then_inference_ask -- --exact --nocapture
 
       - name: Re-run host authority regressions
         run: cargo test --lib host_authority -- --nocapture
