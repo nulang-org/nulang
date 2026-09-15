@@ -1,0 +1,88 @@
+name: P0 Authority Spawn Ordering Source Land
+
+on:
+  push:
+    branches:
+      - integration/p0-stabilization-2026-09-14
+    paths:
+      - .github/workflows/p0-authority-spawn-ordering-source-land.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: integration/p0-stabilization-2026-09-14
+          fetch-depth: 0
+
+      - name: Pin spawn source
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "BASE_SPAWN_SHA=$(git rev-parse HEAD:src/runtime/spawn.rs)" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: p0-authority-spawn-ordering-source-land
+
+      - name: Apply reviewed spawn-ordering transform
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -ryaml - <<'RUBY'
+          workflow = YAML.load_file('.github/workflows/p0-authority-spawn-ordering.yml')
+          steps = workflow.fetch('jobs').fetch('validate-and-land').fetch('steps')
+          step = steps.find { |candidate| candidate['name'] == 'Install workflow authority before first checkpoint' }
+          raise 'missing reviewed spawn-ordering transform' unless step
+          File.write('/tmp/p0-spawn-ordering-transform.sh', step.fetch('run'))
+          RUBY
+          bash /tmp/p0-spawn-ordering-transform.sh
+
+      - name: Verify authority, format, and warning gates
+        run: |
+          cargo test --lib runtime::spawn::authority_tests:: -- --nocapture
+          cargo test --test spawn_authority_provenance -- --nocapture
+          cargo fmt --all -- --check
+          RUSTFLAGS='-D warnings' cargo check --lib
+
+      - name: Enforce isolated source diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          mapfile -t changed < <(git diff --name-only | sort)
+          printf 'changed paths:\n%s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq 1
+          test "${changed[0]}" = 'src/runtime/spawn.rs'
+
+      - name: Land validated spawn source only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff src/runtime/spawn.rs > /tmp/spawn-ordering.patch
+          git fetch origin integration/p0-stabilization-2026-09-14
+          remote_head="$(git rev-parse origin/integration/p0-stabilization-2026-09-14)"
+          remote_spawn_sha="$(git rev-parse origin/integration/p0-stabilization-2026-09-14:src/runtime/spawn.rs)"
+          if [ "$remote_spawn_sha" != "$BASE_SPAWN_SHA" ]; then
+            echo "spawn.rs advanced during validation: $remote_spawn_sha (expected $BASE_SPAWN_SHA)" >&2
+            exit 1
+          fi
+          git reset --hard "$remote_head"
+          git apply /tmp/spawn-ordering.patch
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime/spawn.rs
+          git diff --cached --check
+          git commit -m 'fix(authority): checkpoint workflow grants at spawn'
+          git push origin HEAD:integration/p0-stabilization-2026-09-14
