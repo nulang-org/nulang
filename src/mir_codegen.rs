@@ -1090,9 +1090,15 @@ impl MirCodegen {
                 behavior_idx,
                 init,
                 target_node,
-                capabilities: _,
+                capabilities,
             } => {
                 if let Some(node) = target_node {
+                    if !capabilities.is_empty() {
+                        return Err(compile_err(
+                            "spawn@node authority grants are unsupported until the distributed spawn protocol carries typed authority",
+                            Span::default(),
+                        ));
+                    }
                     let node_reg = self.local_reg(*node);
                     if init.len() > MAX_STAGED_ARGS {
                         return Err(compile_err(
@@ -1120,6 +1126,15 @@ impl MirCodegen {
                     ));
                     self.emit(Instruction::new2(OpCode::Move, node_reg, dst));
                 } else {
+                    let authority_manifest = crate::authority::AuthorityManifest::from_tokens(
+                        capabilities.iter().map(String::as_str),
+                    )
+                    .map_err(|err| {
+                        compile_err(
+                            format!("invalid spawn authority grant: {err}"),
+                            Span::default(),
+                        )
+                    })?;
                     let pc = self.current_offset();
                     self.emit(Instruction::new3(
                         OpCode::Spawn,
@@ -1127,6 +1142,11 @@ impl MirCodegen {
                         (*behavior_idx & 0xFF) as u8,
                         dst,
                     ));
+                    if !authority_manifest.is_empty() {
+                        self.module
+                            .spawn_capability_grants
+                            .push((pc, authority_manifest.canonical_tokens()));
+                    }
                     if !init.is_empty() {
                         let overrides: Vec<(String, crate::bytecode::Constant)> = init
                             .iter()
