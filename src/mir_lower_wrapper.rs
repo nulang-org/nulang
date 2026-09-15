@@ -27,7 +27,7 @@ fn attach_manifests(decls: &[hir::Decl], module: &mut mir::Module) -> NuResult<(
         match decl {
             hir::Decl::Actor(actor) => {
                 let manifest = MigrationManifest::from_decls(actor.version, &actor.migrations)
-                    .map_err(|error| NuError::VMError {
+                    .map_err(|error| NuError::TypeError {
                         msg: format!(
                             "invalid RFC 0008 migration chain for entity '{}': {error}",
                             actor.name
