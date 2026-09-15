@@ -150,9 +150,83 @@ fn required_host_authority(
         ("Python", Some(op)) if !op.is_empty() => other("Python", op, None),
         ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
         ("Inference" | "LLM", Some("ask")) => other("Inference", "Ask", None),
+        (
+            "FS" | "Realtime" | "Env" | "Secret" | "Http" | "Process" | "System" | "DB" | "Python"
+            | "Provider" | "Inference" | "LLM",
+            operation,
+        ) => {
+            return Err(format!(
+                "unmapped host-authority operation {effect_name}.{}",
+                operation.unwrap_or("<missing>")
+            ));
+        }
         _ => return Ok(None),
     };
     Ok(Some(grant))
+}
+
+#[cfg(test)]
+mod host_authority_policy_tests {
+    use super::required_host_authority;
+
+    #[test]
+    fn sensitive_namespaces_fail_closed_for_unmapped_operations() {
+        for namespace in [
+            "FS",
+            "Realtime",
+            "Env",
+            "Secret",
+            "Http",
+            "Process",
+            "System",
+            "DB",
+            "Provider",
+            "Inference",
+            "LLM",
+        ] {
+            let error = required_host_authority(namespace, Some("__unmapped__"), &[], &[])
+                .expect_err("sensitive host namespace must fail closed");
+            assert!(
+                error.contains("unmapped host-authority operation"),
+                "{namespace}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_operation_in_sensitive_namespace_fails_closed() {
+        for namespace in ["FS", "Python", "Http", "DB"] {
+            let error = required_host_authority(namespace, None, &[], &[])
+                .expect_err("missing operation in sensitive namespace must fail closed");
+            assert!(error.contains("<missing>"), "{namespace}: {error}");
+        }
+    }
+
+    #[test]
+    fn python_unknown_operation_still_requires_authority() {
+        let grant = required_host_authority("Python", Some("future_op"), &[], &[])
+            .expect("Python operation should classify");
+        assert!(grant.is_some());
+    }
+
+    #[test]
+    fn mixed_web_namespace_keeps_local_rendering_operations_ungated() {
+        for operation in ["html", "text", "raw", "route", "redirect", "param"] {
+            let grant = required_host_authority("Web", Some(operation), &[], &[])
+                .expect("local Web operation should classify without error");
+            assert!(
+                grant.is_none(),
+                "{operation} unexpectedly required host authority"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_non_sensitive_namespace_remains_outside_authority_gate() {
+        let grant = required_host_authority("Test", Some("mock"), &[], &[])
+            .expect("non-sensitive namespace should remain outside host-authority gate");
+        assert!(grant.is_none());
+    }
 }
 
 /// Parse an outbound HTTP URL into the exact TCP authority it needs. This is
