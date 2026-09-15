@@ -1,4 +1,4 @@
-name: P0 Test Diagnostics
+name: P0 AI Authority Test Migration
 
 on:
   push:
@@ -6,48 +6,136 @@ on:
       - integration/p0-stabilization-2026-09-14
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: p0-ai-authority-test-migration
+  cancel-in-progress: false
+
 jobs:
-  diagnose:
-    name: Diagnose ${{ matrix.profile }} tests
+  migrate-and-validate:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - profile: default
-            test_args: ""
-          - profile: release
-            test_args: "--release"
-          - profile: wasm
-            test_args: "--features wasm-backend"
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run tests and capture failure
+      - name: Migrate only known failing AI fixtures
         shell: bash
         run: |
-          set -o pipefail
-          cargo test ${{ matrix.test_args }} -- --nocapture 2>&1 | tee "test-${{ matrix.profile }}.log"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
 
-      - name: Upload test log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: p0-test-${{ matrix.profile }}-${{ github.sha }}
-          path: test-${{ matrix.profile }}.log
-          if-no-files-found: error
-          retention-days: 3
+          path = Path('src/integration_tests/mod.rs')
+          text = path.read_text()
+          tests = [
+              'test_agent_ask_tracks_usage_and_cost',
+              'test_agent_ask_uses_memory',
+              'test_agent_usage_behavior',
+              'test_agent_workflow_recovers_semantic_memory_after_restart',
+              'test_agent_workflow_researches_and_reports',
+              'test_debate_source_end_to_end',
+              'test_inference_ask_actor_behavior_suspends_and_resumes',
+              'test_inference_ask_chained_suspensions_resume_in_order',
+              'test_inference_ask_nonblocking_other_actors_run_first',
+              'test_inference_ask_queued_messages_wait_for_suspended_behavior',
+              'test_mir_agent_ask_uses_memory',
+              'test_pipeline_source_end_to_end',
+              'test_supervisor_source_end_to_end',
+              'test_workflow_inference_ask_step_records_completion',
+              'test_workflow_inference_ask_step_redriven_after_restart',
+              'test_workflow_step_inference_ask_then_signal_wait',
+              'test_workflow_step_signal_wait_then_inference_ask',
+          ]
+
+          # Limit edits to each named test's lexical region (up to the next
+          # test/cfg attribute), then grant the exact external authority to
+          # every source-level spawn in that fixture. Production semantics are
+          # unchanged: the runtime remains deny-by-default.
+          for i, name in enumerate(tests):
+              marker = f'fn {name}()'
+              start = text.find(marker)
+              if start < 0:
+                  raise SystemExit(f'missing target test: {name}')
+              next_candidates = [
+                  p for p in (
+                      text.find('\n    #[test]', start + len(marker)),
+                      text.find('\n    #[cfg(', start + len(marker)),
+                  ) if p >= 0
+              ]
+              end = min(next_candidates) if next_candidates else len(text)
+              segment = text[start:end]
+              pattern = re.compile(r'(spawn\s+[A-Za-z_][A-Za-z0-9_]*\s+\{[^{}]*\})(?!\s+with\s*\[)', re.S)
+              migrated, count = pattern.subn(r'\1 with [Inference::Ask]', segment)
+              if count == 0:
+                  raise SystemExit(f'{name}: expected at least one unprivileged spawn fixture')
+              text = text[:start] + migrated + text[end:]
+              print(f'{name}: migrated {count} spawn site(s)')
+
+          path.write_text(text)
+          PY
+
+          # The migration must be narrowly scoped.
+          git diff -- src/integration_tests/mod.rs
+          test -n "$(git diff -- src/integration_tests/mod.rs)"
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check default build
+        run: cargo check --all-targets
+
+      - name: Run focused migrated regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          tests=(
+            test_agent_ask_tracks_usage_and_cost
+            test_agent_ask_uses_memory
+            test_agent_usage_behavior
+            test_agent_workflow_recovers_semantic_memory_after_restart
+            test_agent_workflow_researches_and_reports
+            test_debate_source_end_to_end
+            test_inference_ask_actor_behavior_suspends_and_resumes
+            test_inference_ask_chained_suspensions_resume_in_order
+            test_inference_ask_nonblocking_other_actors_run_first
+            test_inference_ask_queued_messages_wait_for_suspended_behavior
+            test_mir_agent_ask_uses_memory
+            test_pipeline_source_end_to_end
+            test_supervisor_source_end_to_end
+            test_workflow_inference_ask_step_records_completion
+            test_workflow_inference_ask_step_redriven_after_restart
+            test_workflow_step_inference_ask_then_signal_wait
+            test_workflow_step_signal_wait_then_inference_ask
+          )
+          for t in "${tests[@]}"; do
+            cargo test --lib "$t" -- --exact --nocapture
+          done
+
+      - name: Verify diff hygiene
+        run: git diff --check
+
+      - name: Commit validated migration and self-remove
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/p0-test-diagnostics.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/integration_tests/mod.rs .github/workflows/p0-test-diagnostics.yml
+          git commit -m 'test(ai): require explicit inference authority in actor fixtures'
+          git push origin HEAD:integration/p0-stabilization-2026-09-14
