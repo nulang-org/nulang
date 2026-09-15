@@ -67,6 +67,14 @@ two major versions.*
   `futures-timer`); a timed-out provider is recorded as a retryable
   `ProviderErrorKind::Unavailable` and isolated, preserving the existing
   failure-isolation guarantee.
+- **Path capture decoding + finite Float params** (Experimental,
+  `src/web/runtime_bindings.rs`, `src/web/request_bindings.rs`). Request
+  path segments are now percent-decoded at match time (split on raw `/`
+  first, so an encoded `%2F` stays inside its segment; `+` stays literal
+  per RFC 3986) and route literals are decoded at pattern-compile time,
+  aligning captures with query/form/cookie decoding. Float-typed params
+  now reject `NaN`/`inf` instead of passing non-finite values to
+  handlers.
 
 ### Added since 1.0.0-frozen — 2026-09-13 (mobile runtime boundary)
 - **Interpreter-only mobile runtime profile** (`Cargo.toml`, `src/runtime/`, `src/backends/`, `src/vm.rs`): native Cranelift/AOT code generation is now owned by the optional `native-codegen` feature while remaining enabled in default builds. The `mobile-runtime` profile excludes executable-code-generation and dynamic-loader dependencies, gates native backend wiring and benchmarks, and keeps Wasm support independently selectable. `scripts/check_mobile_runtime_profile.sh` provides the release gate for dependency-graph isolation and interpreter-only correctness.
