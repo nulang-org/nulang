@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: p0-runtime-stabilization-integration
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   integrate:
