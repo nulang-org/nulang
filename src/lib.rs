@@ -30,7 +30,13 @@ pub mod diagnostic;
 pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
+#[path = "effect_checker.rs"]
+#[doc(hidden)]
+pub mod effect_checker_impl;
+#[path = "effect_checker_wrapper.rs"]
 pub mod effect_checker;
+pub mod migration_manifest;
+pub mod migration_purity;
 pub mod ffi;
 pub mod fmt;
 pub mod format;
@@ -49,6 +55,10 @@ pub mod lsp;
 pub mod mir;
 pub mod mir_codegen;
 pub mod mir_inline;
+#[path = "mir_lower.rs"]
+#[doc(hidden)]
+pub mod mir_lower_impl;
+#[path = "mir_lower_wrapper.rs"]
 pub mod mir_lower;
 #[cfg(feature = "wasm-backend")]
 pub mod mir_wasm;
