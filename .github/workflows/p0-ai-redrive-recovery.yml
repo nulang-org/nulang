@@ -1,6 +1,7 @@
 name: P0 Authority Snapshot Final Validation
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - integration/p0-stabilization-2026-09-14
