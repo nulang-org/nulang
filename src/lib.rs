@@ -37,6 +37,7 @@ pub mod effect_checker_impl;
 pub mod effect_checker;
 pub mod migration_manifest;
 pub mod migration_purity;
+pub mod persistence_schema;
 pub mod ffi;
 pub mod fmt;
 pub mod format;
