@@ -1,0 +1,144 @@
+name: P0 Host Authority Fail Closed
+
+on:
+  push:
+    branches:
+      - integration/p0-stabilization-2026-09-14
+
+permissions:
+  contents: write
+
+concurrency:
+  group: p0-host-authority-fail-closed
+  cancel-in-progress: false
+
+jobs:
+  patch-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: integration/p0-stabilization-2026-09-14
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt
+
+      - name: Apply fail-closed host-authority policy
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/runtime/callbacks.rs")
+          text = path.read_text()
+
+          old = '''        ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
+        ("Inference" | "LLM", Some("ask")) => other("Inference", "Ask", None),
+        _ => return Ok(None),
+    };
+    Ok(Some(grant))
+}
+'''
+          new = '''        ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
+        ("Inference" | "LLM", Some("ask")) => other("Inference", "Ask", None),
+        (
+            "FS" | "Web" | "Realtime" | "Env" | "Secret" | "Http" | "Process" | "System"
+            | "DB" | "Python" | "Provider" | "Inference" | "LLM",
+            operation,
+        ) => {
+            return Err(format!(
+                "unmapped host-authority operation {effect_name}.{}",
+                operation.unwrap_or("<missing>")
+            ));
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(grant))
+}
+
+#[cfg(test)]
+mod host_authority_policy_tests {
+    use super::required_host_authority;
+
+    #[test]
+    fn sensitive_namespaces_fail_closed_for_unmapped_operations() {
+        for namespace in [
+            "FS",
+            "Web",
+            "Realtime",
+            "Env",
+            "Secret",
+            "Http",
+            "Process",
+            "System",
+            "DB",
+            "Python",
+            "Provider",
+            "Inference",
+            "LLM",
+        ] {
+            let error = required_host_authority(namespace, Some("__unmapped__"), &[], &[])
+                .expect_err("sensitive host namespace must fail closed");
+            assert!(
+                error.contains("unmapped host-authority operation"),
+                "unexpected error for {namespace}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_operation_in_sensitive_namespace_fails_closed() {
+        let error = required_host_authority("FS", None, &[], &[])
+            .expect_err("missing operation in sensitive namespace must fail closed");
+        assert!(error.contains("FS.<missing>"), "{error}");
+    }
+
+    #[test]
+    fn unknown_non_sensitive_namespace_remains_outside_authority_gate() {
+        let grant = required_host_authority("Test", Some("mock"), &[], &[])
+            .expect("non-sensitive namespace should remain outside the host-authority gate");
+        assert!(grant.is_none());
+    }
+}
+'''
+
+          if old not in text:
+              raise SystemExit("authority mapping anchor not found; refusing non-deterministic patch")
+          if "mod host_authority_policy_tests" in text:
+              raise SystemExit("host-authority regression tests already present")
+
+          path.write_text(text.replace(old, new, 1))
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run focused authority regressions
+        run: |
+          cargo test --lib host_authority_policy_tests -- --nocapture
+          cargo test --lib host_authority -- --nocapture
+
+      - name: Check default and minimal builds
+        run: |
+          cargo check --lib
+          cargo check --lib --no-default-features
+
+      - name: Verify diff
+        run: git diff --check
+
+      - name: Commit validated product change and remove staging workflow
+        env:
+          BRANCH: integration/p0-stabilization-2026-09-14
+        run: |
+          rm .github/workflows/p0-host-authority-fail-closed.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/runtime/callbacks.rs .github/workflows/p0-host-authority-fail-closed.yml
+          git diff --cached --check
+          git commit -m "fix(authority): fail closed on unmapped host operations"
+          git push origin "HEAD:${BRANCH}"
