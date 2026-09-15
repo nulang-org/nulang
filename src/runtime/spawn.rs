@@ -258,7 +258,21 @@ pub(crate) fn spawn_from_module(
             .collect()
     };
     if let Some(actor) = rt.actors.get_mut(&id) {
-        actor.bytecode_module = Some(module.clone());
+        // The actor keeps the full executable module (constants, instructions,
+        // behaviors, handlers), but its metadata is narrowed to the concrete
+        // entity type that was spawned. This makes schema/version/type-hash
+        // provenance unambiguous for persistence and diagnostics in modules
+        // containing multiple entity declarations. `recovery_modules` below
+        // still receives the untouched full module.
+        let mut actor_module = module.clone();
+        if let Some(meta) = meta {
+            actor_module
+                .actor_metadata
+                .retain(|candidate| candidate.name == meta.name);
+        } else {
+            actor_module.actor_metadata.clear();
+        }
+        actor.bytecode_module = Some(actor_module);
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
         if let Some(meta) = meta {
