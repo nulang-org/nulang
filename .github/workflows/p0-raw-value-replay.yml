@@ -25,12 +25,12 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
 
-      - name: Replay reviewed raw Value provenance migration
+      - name: Replay final reviewed raw Value provenance state
         shell: bash
         run: |
           set -euo pipefail
           git fetch origin integration/raw-value-provenance
-          git diff 79ce4c9fdac9fba2c49f828054697f7989148c97 daabcaa369f6eaccf4788dd355ada570f80d5160 -- \
+          git diff 79ce4c9fdac9fba2c49f828054697f7989148c97 9adb6f81bed13e446c925c5f357a03070d225117 -- \
             src/aot/codegen.rs \
             src/aot/mod.rs \
             src/ffi/c_api.rs \
@@ -46,6 +46,7 @@ jobs:
             src/vm.rs \
             src/wasm_runtime.rs \
             src/wasmfx_runtime.rs \
+            tests/raw_value_provenance.rs \
             > /tmp/raw-value-provenance.patch
           test -s /tmp/raw-value-provenance.patch
           git apply --3way --index /tmp/raw-value-provenance.patch
@@ -58,6 +59,8 @@ jobs:
           cargo +1.95.0 fmt --all -- --check
           cargo +1.95.0 check --all-targets --no-default-features
           cargo +1.95.0 check --all-targets
+          cargo +1.95.0 check --all-targets --all-features
+          cargo +1.95.0 test --test raw_value_provenance
           git diff --check
 
       - name: Commit validated replay and self-remove
