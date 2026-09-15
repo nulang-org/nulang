@@ -12,6 +12,7 @@ mod interp_bench;
 #[cfg(feature = "native-codegen")]
 mod jit_bench;
 mod persist_bench;
+mod runtime_hot_path_bench;
 mod scheduler_bench;
 mod vm_bench;
 
@@ -27,6 +28,7 @@ criterion_main!(
     gc_bench::benches,
     dist_bench::benches,
     persist_bench::benches,
+    runtime_hot_path_bench::benches,
     scheduler_bench::benches,
 );
 
