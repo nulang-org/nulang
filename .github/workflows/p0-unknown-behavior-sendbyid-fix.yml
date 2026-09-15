@@ -1,0 +1,121 @@
+name: P0 Unknown Behavior SendById Fix
+
+on:
+  push:
+    branches:
+      - fix/fail-closed-unknown-behavior
+
+concurrency:
+  group: p0-unknown-behavior-sendbyid-fix
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/fail-closed-unknown-behavior
+          fetch-depth: 0
+
+      - name: Pin branch head
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "START_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Remove only the over-broad numeric send guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/runtime/mod.rs")
+          text = path.read_text()
+          start_marker = "        if self.actors.contains_key(&target_id)\n            && !self.actor_has_behavior_id(target_id, behavior_id)\n        {\n"
+          end_marker = "        let msg = Message {\n"
+
+          if start_marker not in text:
+              print("numeric send guard already absent; nothing to patch")
+              raise SystemExit(0)
+
+          start = text.index(start_marker)
+          end = text.index(end_marker, start)
+          block = text[start:end]
+          expected = "".join([
+              "        if self.actors.contains_key(&target_id)\n",
+              "            && !self.actor_has_behavior_id(target_id, behavior_id)\n",
+              "        {\n",
+              "            warn!(\n",
+              "                \"nulang-runtime: rejecting message to actor {}: unknown behavior id {}\",\n",
+              "                target_id, behavior_id\n",
+              "            );\n",
+              "            return;\n",
+              "        }\n",
+          ])
+          if block != expected:
+              raise SystemExit(f"unexpected send_message_by_id guard shape:\n{block}")
+
+          path.write_text(text[:start] + text[end:])
+          PY
+          git diff --check
+
+      - name: Validate focused fail-closed invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features runtime::tests::p0_unknown_named_send_is_rejected -- --exact
+          cargo test --no-default-features runtime::tests::p0_unknown_numeric_ask_is_rejected_without_running_behavior_zero -- --exact
+
+      - name: Revalidate representative internal numeric delivery paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features runtime::tests::test_send_carries_current_trace_span -- --exact
+          cargo test --no-default-features runtime::tests::test_cross_actor_send_foreign_count_lifecycle -- --exact
+          cargo test --no-default-features runtime::tests::test_distributed_remote_address_local_fallback -- --exact
+          cargo test --no-default-features integration_tests::tests::test_flight_recorder_records_messages -- --exact
+
+      - name: Revalidate full no-default suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features
+
+      - name: Format and diff gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          git diff --check
+          changed="$(git diff --name-only)"
+          printf 'working-tree paths:\n%s\n' "$changed"
+          if [ -n "$changed" ]; then
+            test "$changed" = 'src/runtime/mod.rs'
+          fi
+
+      - name: Guard exact head and land validated product file
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/runtime/mod.rs; then
+            echo "product guard already absent; no landing commit needed"
+            exit 0
+          fi
+          git fetch origin fix/fail-closed-unknown-behavior
+          remote_head="$(git rev-parse origin/fix/fail-closed-unknown-behavior)"
+          if [ "$remote_head" != "$START_HEAD" ]; then
+            echo "branch advanced during validation: $remote_head (expected $START_HEAD)" >&2
+            exit 1
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime/mod.rs
+          git diff --cached --check
+          test "$(git diff --cached --name-only)" = 'src/runtime/mod.rs'
+          git commit -m 'fix(runtime): preserve trusted numeric delivery'
+          git push origin HEAD:fix/fail-closed-unknown-behavior

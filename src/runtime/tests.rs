@@ -7064,3 +7064,85 @@ fn test_send_to_grain_cross_shard_routes_and_hydrates() {
         "inc message should be processed on shard 1"
     );
 }
+
+#[test]
+fn p0_unknown_named_send_is_rejected() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let n = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(n + 1));
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", increment);
+
+    rt.send_message(actor_id, "does_not_exist", &[]);
+    assert!(rt.actors.get(&actor_id).unwrap().mailbox.is_empty());
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
+
+    rt.send_message(actor_id, "first", &[]);
+    rt.run_scheduler();
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1)
+    );
+}
+
+#[test]
+fn p0_unknown_numeric_ask_is_rejected_without_running_behavior_zero() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let n = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(n + 1));
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", increment);
+
+    let err = rt
+        .ask_actor_sync(actor_id, 99, &[])
+        .expect_err("unknown behavior id must fail closed");
+    assert!(err.to_string().contains("does not declare behavior id 99"));
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
+
+    rt.ask_actor_sync(actor_id, 0, &[])
+        .expect("declared behavior zero remains callable");
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1)
+    );
+}
