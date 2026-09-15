@@ -411,8 +411,41 @@ pub(crate) fn spawn_from_module_with_authority(
         if let Some(child) = rt.actors.get_mut(&child_id) {
             child.install_authority_manifest(requested);
         }
+        persist_initial_workflow_authority(rt, child_id, requested);
     }
     Ok(value)
+}
+
+/// Align a freshly-created workflow snapshot with the authority that was
+/// explicitly validated and installed at its spawn site. Workflows create
+/// their first checkpoint inside `spawn_from_module`, before this wrapper
+/// installs the requested manifest; rewriting only the snapshot's authority
+/// tokens preserves its sequence and durable state while closing that ordering
+/// gap. Recovery still derives authority solely from persisted tokens.
+fn persist_initial_workflow_authority(
+    rt: &mut Runtime,
+    actor_id: u64,
+    requested: &AuthorityManifest,
+) {
+    let should_persist = rt
+        .actors
+        .get(&actor_id)
+        .map(|actor| actor.persistent && actor.is_workflow)
+        .unwrap_or(false);
+    if !should_persist {
+        return;
+    }
+    let Some(mut snapshot) = rt.persistence.load_snapshot(actor_id) else {
+        return;
+    };
+    snapshot.authority_tokens = requested.canonical_token_set();
+    if let Err(error) = rt.persistence.save_snapshot(snapshot) {
+        tracing::warn!(
+            actor_id,
+            %error,
+            "failed to persist initial workflow authority snapshot"
+        );
+    }
 }
 
 /// Populate a workflow actor's behavior table with placeholder entries for
@@ -546,6 +579,76 @@ mod authority_tests {
             Err(RuntimeAuthorityError::InvalidManifest(_))
         ));
         assert_eq!(rt.actors.len(), before);
+    }
+
+    #[test]
+    fn workflow_spawn_authority_snapshot_survives_recovery() {
+        let mut rt = Runtime::new();
+        let actor_id = 910_003;
+        spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+            true,
+            Some("recoverable"),
+        );
+        let requested = secret_manifest("WORKFLOW_KEY");
+        rt.actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .install_authority_manifest(&requested);
+        persist_initial_workflow_authority(&mut rt, actor_id, &requested);
+
+        let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+        assert_eq!(snapshot.authority_tokens, requested.canonical_token_set());
+
+        rt.actors.remove(&actor_id);
+        assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+        assert!(rt
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .authority_manifest()
+            .unwrap()
+            .allows(&AuthorityGrant::SecretRead {
+                name: "WORKFLOW_KEY".into(),
+            }));
+    }
+
+    #[test]
+    fn unprivileged_workflow_restart_remains_denied() {
+        let mut rt = Runtime::new();
+        let actor_id = 910_004;
+        spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+            true,
+            Some("unprivileged"),
+        );
+        let requested = AuthorityManifest::new();
+        rt.actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .install_authority_manifest(&requested);
+        persist_initial_workflow_authority(&mut rt, actor_id, &requested);
+
+        let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+        assert!(snapshot.authority_tokens.is_empty());
+
+        rt.actors.remove(&actor_id);
+        assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+        assert!(!rt
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .authority_manifest()
+            .unwrap()
+            .allows(&AuthorityGrant::SecretRead {
+                name: "UNGRANTED_KEY".into(),
+            }));
     }
 
     #[test]
