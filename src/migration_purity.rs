@@ -91,11 +91,7 @@ impl<'a> MigrationPurityChecker<'a> {
         )
     }
 
-    fn expand_function(
-        &mut self,
-        scope: &str,
-        name: &str,
-    ) -> NuResult<()> {
+    fn expand_function(&mut self, scope: &str, name: &str) -> NuResult<()> {
         if self.visiting.iter().any(|n| n == name) {
             return Ok(());
         }
@@ -120,11 +116,9 @@ impl<'a> MigrationPurityChecker<'a> {
             Expr::Ask { span, .. } => Err(self.forbidden(scope, "ask", *span)),
             Expr::Receive { span, .. } => Err(self.forbidden(scope, "receive/after", *span)),
             Expr::Migrate { span, .. } => Err(self.forbidden(scope, "actor migrate", *span)),
-            Expr::GrainRef { span, .. } => Err(self.forbidden(
-                scope,
-                "virtual-entity lookup",
-                *span,
-            )),
+            Expr::GrainRef { span, .. } => {
+                Err(self.forbidden(scope, "virtual-entity lookup", *span))
+            }
             Expr::Resume { span, .. } => Err(self.forbidden(scope, "resume", *span)),
             Expr::Defer { span, .. } => Err(self.forbidden(scope, "defer/errdefer", *span)),
 
@@ -233,7 +227,9 @@ impl<'a> MigrationPurityChecker<'a> {
             | Expr::CapAnnotate { expr, .. }
             | Expr::TypeAnnotate { expr, .. }
             | Expr::Consume { expr, .. }
-            | Expr::Recover { body: expr, .. } => self.walk(scope, expr, bound),
+            | Expr::Recover { body: expr, .. }
+            | Expr::Hide { body: expr, .. }
+            | Expr::Seal { body: expr, .. } => self.walk(scope, expr, bound),
             Expr::Index { arr, idx, .. } => {
                 self.walk(scope, arr, bound)?;
                 self.walk(scope, idx, bound)
@@ -254,7 +250,9 @@ impl<'a> MigrationPurityChecker<'a> {
                 }
                 Ok(())
             }
-            Expr::Handle { body, handlers, .. } => {
+            Expr::Handle {
+                body, handlers, ..
+            } => {
                 // Handling does not launder a forbidden `perform`: recurse into
                 // both the handled body and handler arms without exemptions.
                 self.walk(scope, body, bound)?;
