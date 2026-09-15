@@ -28,6 +28,44 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+/// Spawn using authority metadata attached to the exact executing bytecode PC.
+/// Any malformed metadata or parent escalation fails closed before a child is
+/// created or enqueued.
+pub(crate) fn spawn_with_site_authority(
+    rt: &mut Runtime,
+    module: &crate::bytecode::CodeModule,
+    spawn_pc: usize,
+    behavior_idx: usize,
+    init: Vec<(String, crate::vm::Value)>,
+) -> crate::vm::Value {
+    let requested = match crate::authority_runtime::spawn_authority_manifest(module, spawn_pc) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            tracing::warn!(
+                spawn_pc,
+                behavior_idx,
+                %error,
+                "refusing actor spawn with invalid authority metadata"
+            );
+            return crate::vm::Value::nil();
+        }
+    };
+
+    match super::spawn::spawn_from_module_with_authority(rt, module, behavior_idx, init, &requested)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                spawn_pc,
+                behavior_idx,
+                %error,
+                "refusing actor spawn whose authority is not delegated by the parent"
+            );
+            crate::vm::Value::nil()
+        }
+    }
+}
+
 /// Shared Web effect host implementation for all runtime callback types.
 /// Mirrors the standalone VM dispatch in `src/vm.rs`.
 pub(crate) fn perform_web_builtin(
@@ -405,12 +443,12 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
     fn spawn_actor(
         &mut self,
         module: &crate::bytecode::CodeModule,
+        spawn_pc: usize,
         behavior_idx: usize,
         init: Vec<(String, crate::vm::Value)>,
     ) -> crate::vm::Value {
-        self.runtime
-            .borrow_mut()
-            .spawn_from_module(module, behavior_idx, init)
+        let mut rt = self.runtime.borrow_mut();
+        spawn_with_site_authority(&mut rt, module, spawn_pc, behavior_idx, init)
     }
 
     fn send_message(
@@ -1172,6 +1210,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     fn spawn_actor(
         &mut self,
         module: &crate::bytecode::CodeModule,
+        spawn_pc: usize,
         behavior_idx: usize,
         init: Vec<(String, crate::vm::Value)>,
     ) -> crate::vm::Value {
@@ -1179,7 +1218,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         // while the runtime drives a behavior on the single scheduler
         // thread, so `runtime` is a live, exclusively-borrowed pointer.
         // Spawning mutates runtime state but never re-enters the VM.
-        unsafe { (*self.runtime).spawn_from_module(module, behavior_idx, init) }
+        unsafe {
+            spawn_with_site_authority(&mut *self.runtime, module, spawn_pc, behavior_idx, init)
+        }
     }
 
     fn send_message(
