@@ -1,4 +1,4 @@
-name: P0 Raw Value Provenance Replay
+name: P0 Runtime Stabilization Integration
 
 on:
   push:
@@ -9,11 +9,11 @@ permissions:
   contents: write
 
 concurrency:
-  group: p0-raw-value-provenance-replay
+  group: p0-runtime-stabilization-integration
   cancel-in-progress: false
 
 jobs:
-  replay:
+  integrate:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
@@ -23,13 +23,21 @@ jobs:
           fetch-depth: 0
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt clippy
 
-      - name: Replay final reviewed raw Value provenance state
+      - name: Fetch reviewed P0 branches
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin integration/raw-value-provenance
+          git fetch origin \
+            integration/raw-value-provenance \
+            fix/p0-value-ptr-provenance-v2 \
+            feat/authority-host-boundaries-clean
+
+      - name: Replay raw Value provenance (#200)
+        shell: bash
+        run: |
+          set -euo pipefail
           git diff 79ce4c9fdac9fba2c49f828054697f7989148c97 9adb6f81bed13e446c925c5f357a03070d225117 -- \
             src/aot/codegen.rs \
             src/aot/mod.rs \
@@ -47,64 +55,124 @@ jobs:
             src/wasm_runtime.rs \
             src/wasmfx_runtime.rs \
             tests/raw_value_provenance.rs \
-            > /tmp/raw-value-provenance.patch
-          test -s /tmp/raw-value-provenance.patch
-          git apply --3way --index /tmp/raw-value-provenance.patch
+            > /tmp/01-raw-value.patch
+          test -s /tmp/01-raw-value.patch
+          git apply --3way --index /tmp/01-raw-value.patch 2>&1 | tee /tmp/01-raw-value-apply.log
+
+      - name: Replay pointer provenance (#197)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff 9adb6f81bed13e446c925c5f357a03070d225117 c7e3ce37c171298c06012b7185c26ab7b932788c -- \
+            docs/UNSAFE_AUDIT.md \
+            src/ffi/marshal.rs \
+            src/jit/runtime.rs \
+            src/runtime/actor.rs \
+            src/runtime/callbacks.rs \
+            src/runtime/heap_serialize.rs \
+            src/runtime/network.rs \
+            src/runtime/tests.rs \
+            src/stress_tests.rs \
+            src/vm.rs \
+            src/wasm_runtime.rs \
+            > /tmp/02-pointer-provenance.patch
+          test -s /tmp/02-pointer-provenance.patch
+          git apply --3way --index /tmp/02-pointer-provenance.patch 2>&1 | tee /tmp/02-pointer-provenance-apply.log
+
+      - name: Replay host-boundary authority (#178)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff 5622d5271e30143cb8bee9f81f53f77119603175 8ff33558243499822ec46a43c3e4e2d6f870bc5b -- \
+            src/aot/mod.rs \
+            src/jit/runtime.rs \
+            src/runtime/callbacks.rs \
+            src/vm.rs \
+            > /tmp/03-host-authority.patch
+          test -s /tmp/03-host-authority.patch
+          git apply --3way --index /tmp/03-host-authority.patch 2>&1 | tee /tmp/03-host-authority-apply.log
 
       - name: Format
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.95.0 fmt --all 2>&1 | tee /tmp/01-fmt.log
-          cargo +1.95.0 fmt --all -- --check 2>&1 | tee -a /tmp/01-fmt.log
+          cargo +1.95.0 fmt --all 2>&1 | tee /tmp/10-fmt.log
+          cargo +1.95.0 fmt --all -- --check 2>&1 | tee -a /tmp/10-fmt.log
 
       - name: Check no-default-features
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.95.0 check --all-targets --no-default-features 2>&1 | tee /tmp/02-no-default.log
+          cargo +1.95.0 check --all-targets --no-default-features 2>&1 | tee /tmp/11-no-default.log
 
       - name: Check default features
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.95.0 check --all-targets 2>&1 | tee /tmp/03-default.log
+          cargo +1.95.0 check --all-targets 2>&1 | tee /tmp/12-default.log
 
       - name: Check all features
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.95.0 check --all-targets --all-features 2>&1 | tee /tmp/04-all-features.log
+          cargo +1.95.0 check --all-targets --all-features 2>&1 | tee /tmp/13-all-features.log
 
-      - name: Raw provenance regression test
+      - name: Validate provenance regressions
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.95.0 test --test raw_value_provenance 2>&1 | tee /tmp/05-test.log
+          cargo +1.95.0 test --test raw_value_provenance 2>&1 | tee /tmp/14-raw-value-test.log
+          cargo +1.95.0 test --doc 2>&1 | tee /tmp/15-doctest.log
+          if grep -nE 'pub[[:space:]]+(const[[:space:]]+)?fn[[:space:]]+ptr[[:space:]]*\(' src/vm.rs; then
+            echo 'safe public Value::ptr constructor detected' >&2
+            exit 1
+          fi
+
+      - name: Validate actor authority regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.95.0 test --lib host_authority -- --nocapture 2>&1 | tee /tmp/16-host-authority-test.log
+          cargo +1.95.0 test --lib authority -- --nocapture 2>&1 | tee /tmp/17-authority-test.log
+          cargo +1.95.0 test --test spawn_authority_provenance -- --nocapture 2>&1 | tee /tmp/18-spawn-authority-test.log
+
+      - name: Validate receive ownership regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.95.0 test --lib selective_receive -- --nocapture 2>&1 | tee /tmp/19-selective-receive-test.log
+          cargo +1.95.0 test --lib orca -- --nocapture 2>&1 | tee /tmp/20-orca-test.log
 
       - name: Diff check
         shell: bash
         run: |
           set -euo pipefail
-          git diff --check 2>&1 | tee /tmp/06-diff.log
+          git diff --check 2>&1 | tee /tmp/21-diff.log
 
-      - name: Upload validation diagnostics
+      - name: Upload integration diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: raw-value-provenance-validation
+          name: p0-runtime-stabilization-diagnostics
           path: |
-            /tmp/raw-value-provenance.patch
-            /tmp/01-fmt.log
-            /tmp/02-no-default.log
-            /tmp/03-default.log
-            /tmp/04-all-features.log
-            /tmp/05-test.log
-            /tmp/06-diff.log
+            /tmp/*.patch
+            /tmp/*-apply.log
+            /tmp/10-fmt.log
+            /tmp/11-no-default.log
+            /tmp/12-default.log
+            /tmp/13-all-features.log
+            /tmp/14-raw-value-test.log
+            /tmp/15-doctest.log
+            /tmp/16-host-authority-test.log
+            /tmp/17-authority-test.log
+            /tmp/18-spawn-authority-test.log
+            /tmp/19-selective-receive-test.log
+            /tmp/20-orca-test.log
+            /tmp/21-diff.log
           if-no-files-found: ignore
           retention-days: 1
 
-      - name: Commit validated replay and self-remove
+      - name: Commit validated P0 integration and self-remove
         shell: bash
         run: |
           set -euo pipefail
@@ -118,5 +186,5 @@ jobs:
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'fix(runtime): enforce raw Value provenance boundaries on stabilization'
+          git commit -m 'fix(runtime): integrate P0 provenance and host authority stabilization'
           git push origin HEAD:integration/p0-stabilization-2026-09-14
