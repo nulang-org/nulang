@@ -1,0 +1,78 @@
+name: P0 Raw Value Provenance Replay
+
+on:
+  push:
+    branches:
+      - integration/p0-stabilization-2026-09-14
+
+permissions:
+  contents: write
+
+concurrency:
+  group: p0-raw-value-provenance-replay
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: integration/p0-stabilization-2026-09-14
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+
+      - name: Replay reviewed raw Value provenance migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin integration/raw-value-provenance
+          git diff 79ce4c9fdac9fba2c49f828054697f7989148c97 daabcaa369f6eaccf4788dd355ada570f80d5160 -- \
+            src/aot/codegen.rs \
+            src/aot/mod.rs \
+            src/ffi/c_api.rs \
+            src/ffi/marshal.rs \
+            src/fuzz.rs \
+            src/integration_tests/mod.rs \
+            src/jit/runtime.rs \
+            src/jit/tests.rs \
+            src/jit/typed_compiler.rs \
+            src/main.rs \
+            src/python/marshal.rs \
+            src/runtime/heap_serialize.rs \
+            src/vm.rs \
+            src/wasm_runtime.rs \
+            src/wasmfx_runtime.rs \
+            > /tmp/raw-value-provenance.patch
+          test -s /tmp/raw-value-provenance.patch
+          git apply --3way --index /tmp/raw-value-provenance.patch
+
+      - name: Validate merged provenance boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.95.0 fmt --all
+          cargo +1.95.0 fmt --all -- --check
+          cargo +1.95.0 check --all-targets --no-default-features
+          cargo +1.95.0 check --all-targets
+          git diff --check
+
+      - name: Commit validated replay and self-remove
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/p0-raw-value-replay.yml
+          git add -A
+          git diff --cached --check
+          git fetch origin integration/p0-stabilization-2026-09-14
+          if [ "$(git rev-parse origin/integration/p0-stabilization-2026-09-14)" != "$GITHUB_SHA" ]; then
+            echo 'stabilization branch advanced during validation; refusing stale push'
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(runtime): enforce raw Value provenance boundaries on stabilization'
+          git push origin HEAD:integration/p0-stabilization-2026-09-14
