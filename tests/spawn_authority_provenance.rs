@@ -359,7 +359,10 @@ fn main() { spawn Child {} with [Secret::Read("UNHELD_KEY")] }
         .insert(PARENT, Actor::new(PARENT, "unprivileged-parent", 0));
     native_runtime.current_actor = Some(PARENT);
     let raw = aot.run_in_runtime(&mut native_runtime).unwrap();
-    assert!(nulang::vm::Value::from_bits(raw).is_nil());
+    // SAFETY: `raw` comes directly from Nulang's in-process AOT runtime, so any
+    // pointer-tagged value retains the originating runtime's provenance/lifetime.
+    let native_value = unsafe { nulang::vm::Value::from_bits(raw) };
+    assert!(native_value.is_nil());
     assert_eq!(native_runtime.actors.len(), 1);
     assert!(native_runtime.actors.contains_key(&PARENT));
 }
