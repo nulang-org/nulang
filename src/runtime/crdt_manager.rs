@@ -742,6 +742,25 @@ impl CrdtManager {
         }
     }
 
+    /// Remove every CRDT registration owned by one actor.
+    ///
+    /// Used when actor construction fails before publication. This removes the
+    /// forward/reverse mappings, local replicas, and delta-sync bases so a
+    /// failed spawn cannot leave externally synchronizable CRDT residue.
+    pub fn unregister_actor_fields(&mut self, actor_id: u64) {
+        let owned: Vec<(String, CrdtId)> = self
+            .field_map
+            .iter()
+            .filter_map(|((aid, name), id)| (*aid == actor_id).then(|| (name.clone(), *id)))
+            .collect();
+        for (field_name, id) in owned {
+            self.field_map.remove(&(actor_id, field_name));
+            self.field_reverse.remove(&id);
+            self.entries.remove(&id);
+            self.sync_base.remove(&id);
+        }
+    }
+
     /// Register a CRDT-backed state field for an actor.
     ///
     /// Creates a CRDT entry of the given type initialized from `initial_value`,

@@ -31,14 +31,17 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
 // Checkpoint
 // ---------------------------------------------------------------------------
 
-/// Snapshot the durable and CRDT state of a persistent actor.
-pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
+/// Build the next persistent snapshot without producing external side effects.
+fn build_actor_snapshot(
+    rt: &Runtime,
+    actor_id: u64,
+) -> std::io::Result<Option<(crate::runtime::persistence::ActorSnapshot, u64)>> {
     let actor = match rt.actors.get(&actor_id) {
-        Some(a) => a,
-        None => return,
+        Some(actor) => actor,
+        None => return Ok(None),
     };
     if !actor.persistent {
-        return;
+        return Ok(None);
     }
     let seq = next_sequence(rt, actor_id);
     let mut state = std::collections::HashMap::new();
@@ -61,45 +64,81 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
             state.insert(name.clone(), persisted);
         }
     }
-    let authority_tokens = match actor.authority_manifest() {
-        Ok(manifest) => manifest.canonical_token_set(),
-        Err(err) => {
-            tracing::warn!(
-                "nulang-persist: refusing to checkpoint actor {} with invalid authority: {}",
-                actor_id,
-                err
-            );
-            return;
-        }
-    };
-    // Snapshot the global CRDT state alongside durable actor fields.
-    let crdt_snapshot = rt.crdt_manager.as_ref().map(|m| {
-        m.snapshot()
+    let authority_tokens = actor
+        .authority_manifest()
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid actor authority during checkpoint: {error}"),
+            )
+        })?
+        .canonical_token_set();
+    let crdt_snapshot = rt.crdt_manager.as_ref().map(|manager| {
+        manager
+            .snapshot()
             .into_iter()
             .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
             .collect()
     });
-    let crdt_field_map = rt.crdt_manager.as_ref().map(|m| {
-        m.field_map
+    let crdt_field_map = rt.crdt_manager.as_ref().map(|manager| {
+        manager
+            .field_map
             .iter()
             .filter(|((aid, _), _)| *aid == actor_id)
             .map(|((_, name), id)| (name.clone(), id.0))
             .collect()
     });
-    let snapshot = crate::runtime::persistence::ActorSnapshot {
-        actor_id,
-        sequence: seq,
-        state,
-        waiting_signal: actor.waiting_signal.clone(),
-        crdt_snapshot,
-        crdt_field_map,
-        authority_tokens,
+    Ok(Some((
+        crate::runtime::persistence::ActorSnapshot {
+            actor_id,
+            sequence: seq,
+            state,
+            waiting_signal: actor.waiting_signal.clone(),
+            crdt_snapshot,
+            crdt_field_map,
+            authority_tokens,
+        },
+        seq,
+    )))
+}
+
+/// Fallible checkpoint used by initial durable publication. The local snapshot
+/// commits before any shadow replica is emitted, so a failed local commit
+/// cannot leave a remotely recoverable actor that was never published here.
+pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
+    let Some((snapshot, seq)) = build_actor_snapshot(rt, actor_id)? else {
+        return Ok(());
     };
-    // RFC 0014 §3: re-spawn-opted actors replicate the snapshot to their
-    // deterministic shadow node before the local save, so the replica is a
-    // byte-identical copy of exactly what the local store will hold.
+    rt.persistence.save_snapshot(snapshot.clone())?;
     rt.maybe_shadow_replicate(actor_id, &snapshot);
-    let _ = rt.persistence.save_snapshot(snapshot);
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = seq;
+        actor.dirty_fields.clear();
+    }
+    Ok(())
+}
+
+/// Snapshot the durable and CRDT state of a persistent actor.
+///
+/// Existing runtime checkpoint sites remain best-effort for compatibility;
+/// security-sensitive initial publication uses [`try_checkpoint_actor`].
+pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
+    let Some((snapshot, seq)) = (match build_actor_snapshot(rt, actor_id) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(actor_id, %error, "refusing invalid actor checkpoint");
+            return;
+        }
+    }) else {
+        return;
+    };
+    // RFC 0014 compatibility: ordinary checkpoints retain the existing
+    // shadow-before-local ordering. Initial publication uses the fallible path
+    // above and therefore cannot leak a shadow before local durability.
+    rt.maybe_shadow_replicate(actor_id, &snapshot);
+    if let Err(error) = rt.persistence.save_snapshot(snapshot) {
+        tracing::warn!(actor_id, %error, "failed to save actor checkpoint");
+    }
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = seq;
         actor.dirty_fields.clear();

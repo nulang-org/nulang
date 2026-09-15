@@ -3,6 +3,8 @@
 //! the runtime's public fields.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::io;
 
 use crate::authority::AuthorityManifest;
 use crate::authority_runtime::RuntimeAuthorityError;
@@ -14,6 +16,35 @@ use crate::runtime::Runtime;
 use crate::runtime::{bytecode_step_placeholder, fresh_actor_id, map_ast_state_model};
 use crate::vm::Value;
 
+#[derive(Debug)]
+pub(crate) enum SpawnWithAuthorityError {
+    Authority(RuntimeAuthorityError),
+    Persistence(io::Error),
+}
+
+impl fmt::Display for SpawnWithAuthorityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authority(error) => write!(f, "{error}"),
+            Self::Persistence(error) => write!(f, "durable spawn persistence failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SpawnWithAuthorityError {}
+
+impl From<RuntimeAuthorityError> for SpawnWithAuthorityError {
+    fn from(error: RuntimeAuthorityError) -> Self {
+        Self::Authority(error)
+    }
+}
+
+impl From<io::Error> for SpawnWithAuthorityError {
+    fn from(error: io::Error) -> Self {
+        Self::Persistence(error)
+    }
+}
+
 /// Core spawn logic shared by all spawn entry points.
 pub(crate) fn spawn_actor_with_models(
     rt: &mut Runtime,
@@ -22,7 +53,15 @@ pub(crate) fn spawn_actor_with_models(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
-    spawn_actor_with_models_with_authority(rt, init, state_models, persistent, workflow, None)
+    let id = fresh_actor_id();
+    match spawn_actor_with_id_with_authority(rt, id, init, state_models, persistent, workflow, None)
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(actor_id = id, %error, "actor spawn persistence failed");
+            id
+        }
+    }
 }
 
 fn spawn_actor_with_models_with_authority(
@@ -32,7 +71,7 @@ fn spawn_actor_with_models_with_authority(
     persistent: bool,
     workflow: Option<&str>,
     initial_authority: Option<&AuthorityManifest>,
-) -> u64 {
+) -> io::Result<u64> {
     spawn_actor_with_id_with_authority(
         rt,
         fresh_actor_id(),
@@ -73,7 +112,14 @@ pub(crate) fn spawn_actor_with_id(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
-    spawn_actor_with_id_with_authority(rt, id, init, state_models, persistent, workflow, None)
+    match spawn_actor_with_id_with_authority(rt, id, init, state_models, persistent, workflow, None)
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(actor_id = id, %error, "actor spawn persistence failed");
+            id
+        }
+    }
 }
 
 fn spawn_actor_with_id_with_authority(
@@ -84,7 +130,7 @@ fn spawn_actor_with_id_with_authority(
     persistent: bool,
     workflow: Option<&str>,
     initial_authority: Option<&AuthorityManifest>,
-) -> u64 {
+) -> io::Result<u64> {
     let restart_snapshot = if persistent && workflow.is_none() {
         match preflight_persistent_snapshot(rt, id) {
             Ok(snapshot) => snapshot,
@@ -94,7 +140,7 @@ fn spawn_actor_with_id_with_authority(
                     %error,
                     "refusing to activate persistent actor with invalid authority snapshot"
                 );
-                return id;
+                return Ok(id);
             }
         }
     } else {
@@ -159,18 +205,39 @@ fn spawn_actor_with_id_with_authority(
             }
             state
         };
-        let _ = rt.persistence.append_workflow_event(
-            id,
-            WorkflowEvent::WorkflowStarted {
-                sequence: seq,
-                name: workflow_name.as_ref().unwrap().clone(),
-                state,
-            },
-        );
-        crate::runtime::workflow::checkpoint_actor(rt, id);
+        let initial_commit = (|| -> io::Result<()> {
+            rt.persistence.append_workflow_event(
+                id,
+                WorkflowEvent::WorkflowStarted {
+                    sequence: seq,
+                    name: workflow_name.as_ref().unwrap().clone(),
+                    state,
+                },
+            )?;
+            crate::runtime::workflow::try_checkpoint_actor(rt, id)?;
+            Ok(())
+        })();
+        if let Err(error) = initial_commit {
+            rollback_failed_initial_workflow_spawn(rt, id);
+            return Err(error);
+        }
     }
     rt.enqueue_actor(id);
-    id
+    Ok(id)
+}
+
+fn rollback_failed_initial_workflow_spawn(rt: &mut Runtime, actor_id: u64) {
+    rt.actors.remove(&actor_id);
+    if let Some(manager) = rt.crdt_manager.as_mut() {
+        manager.unregister_actor_fields(actor_id);
+    }
+    if let Err(error) = rt.persistence.clear(actor_id) {
+        tracing::warn!(
+            actor_id,
+            %error,
+            "failed to clear partial durable state after rejected workflow spawn"
+        );
+    }
 }
 
 /// Overlay previously persisted state onto a freshly spawned persistent
@@ -264,7 +331,13 @@ pub(crate) fn spawn_from_module(
     behavior_idx: usize,
     init: Vec<(String, Value)>,
 ) -> Value {
-    spawn_from_module_with_initial_authority(rt, module, behavior_idx, init, None)
+    match spawn_from_module_with_initial_authority(rt, module, behavior_idx, init, None) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "actor spawn persistence failed");
+            Value::nil()
+        }
+    }
 }
 
 fn spawn_from_module_with_initial_authority(
@@ -273,7 +346,7 @@ fn spawn_from_module_with_initial_authority(
     behavior_idx: usize,
     init: Vec<(String, Value)>,
     initial_authority: Option<&AuthorityManifest>,
-) -> Value {
+) -> io::Result<Value> {
     rt.register_module_grains(module);
     let meta = module
         .actor_metadata
@@ -288,7 +361,7 @@ fn spawn_from_module_with_initial_authority(
                     %error,
                     "refusing to spawn actor with conflicting role metadata"
                 );
-                return Value::nil();
+                return Ok(Value::nil());
             }
         },
         None => ActorRole::Plain,
@@ -319,7 +392,7 @@ fn spawn_from_module_with_initial_authority(
                 None
             },
             initial_authority,
-        )
+        )?
     } else {
         spawn_actor_with_models_with_authority(
             rt,
@@ -328,7 +401,7 @@ fn spawn_from_module_with_initial_authority(
             false,
             None,
             initial_authority,
-        )
+        )?
     };
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
@@ -420,7 +493,7 @@ fn spawn_from_module_with_initial_authority(
         layout_workflow_behavior_table(rt, id);
     }
     register_recovery_module(rt, id, module.clone(), offsets, compensation_offsets);
-    Value::actor_ref(id)
+    Ok(Value::actor_ref(id))
 }
 
 /// Spawn from a bytecode module while enforcing one validated external-authority
@@ -440,14 +513,14 @@ pub(crate) fn spawn_from_module_with_authority(
     behavior_idx: usize,
     init: Vec<(String, Value)>,
     requested: &AuthorityManifest,
-) -> Result<Value, RuntimeAuthorityError> {
+) -> Result<Value, SpawnWithAuthorityError> {
     if let Some(parent_id) = rt.current_actor {
         if let Some(parent) = rt.actors.get(&parent_id) {
             parent.delegate_authority(requested)?;
         } else if let Some(grant) = requested.iter().next() {
             // A non-empty request with a missing current actor has no valid
             // authority source. Treat it like an empty parent manifest.
-            return Err(RuntimeAuthorityError::Denied(grant.clone()));
+            return Err(RuntimeAuthorityError::Denied(grant.clone()).into());
         }
     }
 
@@ -457,7 +530,7 @@ pub(crate) fn spawn_from_module_with_authority(
         behavior_idx,
         init,
         Some(requested),
-    ))
+    )?)
 }
 
 /// Populate a workflow actor's behavior table with placeholder entries for
@@ -499,6 +572,77 @@ mod authority_tests {
     use super::*;
     use crate::authority::AuthorityGrant;
     use crate::bytecode::CodeModule;
+    use crate::runtime::persistence::{EventEntry, JournalEntry, MemoryStore, PersistenceStore};
+
+    struct FailingStore {
+        inner: MemoryStore,
+        fail_workflow_start: bool,
+        fail_snapshot: bool,
+    }
+
+    impl FailingStore {
+        fn new(fail_workflow_start: bool, fail_snapshot: bool) -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_workflow_start,
+                fail_snapshot,
+            }
+        }
+    }
+
+    impl PersistenceStore for FailingStore {
+        fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+            if self.fail_snapshot {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected snapshot failure",
+                ));
+            }
+            self.inner.save_snapshot(snapshot)
+        }
+
+        fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+            self.inner.load_snapshot(actor_id)
+        }
+
+        fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
+            self.inner.append_journal(actor_id, entry)
+        }
+
+        fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+            self.inner.read_journal(actor_id)
+        }
+
+        fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
+            if self.fail_workflow_start && matches!(event, WorkflowEvent::WorkflowStarted { .. }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected workflow-start failure",
+                ));
+            }
+            self.inner.append_workflow_event(actor_id, event)
+        }
+
+        fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+            self.inner.read_workflow_events(actor_id)
+        }
+
+        fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
+            self.inner.append_event(actor_id, entry)
+        }
+
+        fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+            self.inner.read_events(actor_id)
+        }
+
+        fn latest_sequence(&self, actor_id: u64) -> u64 {
+            self.inner.latest_sequence(actor_id)
+        }
+
+        fn clear(&mut self, actor_id: u64) -> io::Result<()> {
+            self.inner.clear(actor_id)
+        }
+    }
 
     fn secret_manifest(name: &str) -> AuthorityManifest {
         AuthorityManifest::from_tokens([format!("Secret::Read({name})")].iter().map(String::as_str))
@@ -561,12 +705,12 @@ mod authority_tests {
 
         let result = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested);
 
-        assert_eq!(
+        assert!(matches!(
             result,
-            Err(RuntimeAuthorityError::Denied(AuthorityGrant::SecretRead {
-                name: "STRIPE_KEY".into(),
-            }))
-        );
+            Err(SpawnWithAuthorityError::Authority(RuntimeAuthorityError::Denied(
+                AuthorityGrant::SecretRead { ref name }
+            ))) if name == "STRIPE_KEY"
+        ));
         assert_eq!(rt.actors.len(), before);
     }
 
@@ -588,9 +732,74 @@ mod authority_tests {
 
         assert!(matches!(
             result,
-            Err(RuntimeAuthorityError::InvalidManifest(_))
+            Err(SpawnWithAuthorityError::Authority(
+                RuntimeAuthorityError::InvalidManifest(_)
+            ))
         ));
         assert_eq!(rt.actors.len(), before);
+    }
+
+    #[test]
+    fn workflow_start_append_failure_rolls_back_before_publication() {
+        let mut rt = Runtime::new();
+        rt.persistence = Box::new(FailingStore::new(true, false));
+        rt.crdt_manager = Some(crate::runtime::crdt_manager::CrdtManager::new(1));
+        let actor_id = 910_101;
+        let requested = secret_manifest("WORKFLOW_KEY");
+        let state_models = HashMap::from([(
+            "counter".to_string(),
+            StateModel::Crdt(crate::ast::CrdtType::GCounter),
+        )]);
+
+        let result = spawn_actor_with_id_with_authority(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![("counter".to_string(), Value::int(1))]),
+            state_models,
+            true,
+            Some("append-fails"),
+            Some(&requested),
+        );
+
+        assert!(result.is_err());
+        assert!(!rt.actors.contains_key(&actor_id));
+        let manager = rt.crdt_manager.as_ref().unwrap();
+        assert!(manager.get_field_id(actor_id, "counter").is_none());
+        assert!(rt.persistence.load_snapshot(actor_id).is_none());
+        assert!(rt.persistence.read_workflow_events(actor_id).is_empty());
+        assert_eq!(rt.recover_actor(actor_id), None);
+    }
+
+    #[test]
+    fn initial_snapshot_failure_rolls_back_journal_and_crdt_state() {
+        let mut rt = Runtime::new();
+        rt.persistence = Box::new(FailingStore::new(false, true));
+        rt.crdt_manager = Some(crate::runtime::crdt_manager::CrdtManager::new(1));
+        let actor_id = 910_102;
+        let requested = secret_manifest("WORKFLOW_KEY");
+        let state_models = HashMap::from([(
+            "counter".to_string(),
+            StateModel::Crdt(crate::ast::CrdtType::GCounter),
+        )]);
+
+        let result = spawn_actor_with_id_with_authority(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![("counter".to_string(), Value::int(1))]),
+            state_models,
+            true,
+            Some("snapshot-fails"),
+            Some(&requested),
+        );
+
+        assert!(result.is_err());
+        assert!(!rt.actors.contains_key(&actor_id));
+        let manager = rt.crdt_manager.as_ref().unwrap();
+        assert!(manager.get_field_id(actor_id, "counter").is_none());
+        assert!(rt.persistence.load_snapshot(actor_id).is_none());
+        assert!(rt.persistence.read_workflow_events(actor_id).is_empty());
+        assert_eq!(rt.persistence.latest_sequence(actor_id), 0);
+        assert_eq!(rt.recover_actor(actor_id), None);
     }
 
     #[test]

@@ -65,12 +65,21 @@ pub(crate) fn spawn_with_site_authority(
     match super::spawn::spawn_from_module_with_authority(rt, module, behavior_idx, init, &requested)
     {
         Ok(value) => value,
-        Err(error) => {
+        Err(super::spawn::SpawnWithAuthorityError::Authority(error)) => {
             tracing::warn!(
                 spawn_pc,
                 behavior_idx,
                 %error,
                 "refusing actor spawn whose authority is not delegated by the parent"
+            );
+            crate::vm::Value::nil()
+        }
+        Err(super::spawn::SpawnWithAuthorityError::Persistence(error)) => {
+            tracing::error!(
+                spawn_pc,
+                behavior_idx,
+                %error,
+                "refusing durable actor spawn because initial persistence failed"
             );
             crate::vm::Value::nil()
         }
