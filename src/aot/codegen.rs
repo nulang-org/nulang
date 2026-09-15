@@ -1562,6 +1562,16 @@ pub fn compile_mir_function_body(
             let func_ref = module.declare_func_in_func(h_id, builder.func);
             h.insert("nulang_aot_spawn_push", func_ref);
         }
+        // spawn_grant_push: (i64) -> () (queue one canonical authority token)
+        {
+            let mut h_sig = module.make_signature();
+            h_sig.params.push(AbiParam::new(types::I64));
+            let h_id = module
+                .declare_function("nulang_aot_spawn_grant_push", Linkage::Import, &h_sig)
+                .map_err(|e| AotCompileError::Cranelift(e.to_string()))?;
+            let func_ref = module.declare_func_in_func(h_id, builder.func);
+            h.insert("nulang_aot_spawn_grant_push", func_ref);
+        }
         // spawn: (i64) -> i64 (create a standalone actor)
         {
             let mut h_sig = module.make_signature();
@@ -2914,7 +2924,7 @@ fn compile_rvalue(
             behavior_idx,
             init,
             target_node,
-            capabilities: _,
+            capabilities,
         } => {
             if target_node.is_some() {
                 return Err(AotCompileError::Unsupported(
@@ -2944,6 +2954,28 @@ fn compile_rvalue(
                 )?;
                 let name_val = builder.ins().iconst(types::I64, name_idx);
                 call_void_helper(builder, helpers, "nulang_aot_spawn_push", &[name_val, val])?;
+            }
+            let manifest = crate::authority::AuthorityManifest::from_tokens(
+                capabilities.iter().map(String::as_str),
+            )
+            .map_err(|err| {
+                AotCompileError::Internal(format!(
+                    "invalid spawn authority grant in native backend: {err}"
+                ))
+            })?;
+            for token in manifest.canonical_tokens() {
+                let token_val = compile_const(
+                    builder,
+                    &crate::bytecode::Constant::String(token),
+                    mode,
+                    constants,
+                )?;
+                call_void_helper(
+                    builder,
+                    helpers,
+                    "nulang_aot_spawn_grant_push",
+                    &[token_val],
+                )?;
             }
             let behavior_val = builder.ins().iconst(types::I64, *behavior_idx as i64);
             call_helper(builder, helpers, "nulang_aot_spawn", &[behavior_val])

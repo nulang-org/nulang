@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use nulang::aot::AotModule;
 use nulang::bytecode::OpCode;
 use nulang::lexer::Lexer;
 use nulang::mir::{Module, RValue, Stmt};
@@ -280,4 +281,85 @@ fn main() { spawn Child {} }
     let rt = runtime.borrow();
     assert_eq!(rt.actors.len(), 1, "denied spawn must not create a child");
     assert!(rt.actors.contains_key(&900_001));
+}
+
+
+fn sorted_actor_manifests(rt: &Runtime) -> Vec<Vec<String>> {
+    let mut manifests: Vec<Vec<String>> = rt
+        .actors
+        .values()
+        .map(|actor| actor.authority_manifest().unwrap().canonical_tokens())
+        .collect();
+    manifests.sort();
+    manifests
+}
+
+#[test]
+fn vm_and_native_agree_on_exact_site_spawn_authority() {
+    let source = r#"
+actor Child { behavior ping() { 1 } }
+fn main() {
+    let first = spawn Child {} with [Secret::Read("FIRST_KEY")]
+    let second = spawn Child {} with [Secret::Read("SECOND_KEY")]
+    second
+}
+"#;
+
+    let mut vm_mir = lower(source);
+    let vm_module = compile_mir(&mut vm_mir, "authority-vm-native-vm").unwrap();
+    let vm_runtime = Rc::new(RefCell::new(Runtime::new()));
+    let mut vm = VM::new();
+    vm.load_module(vm_module);
+    vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(vm_runtime.clone())));
+    vm.run().unwrap();
+    let vm_manifests = sorted_actor_manifests(&vm_runtime.borrow());
+
+    let native_mir = lower(source);
+    let aot = AotModule::compile(&native_mir).unwrap();
+    let mut native_runtime = Runtime::new();
+    aot.run_in_runtime(&mut native_runtime).unwrap();
+    let native_manifests = sorted_actor_manifests(&native_runtime);
+
+    let expected = vec![
+        vec!["Secret::Read(FIRST_KEY)".to_string()],
+        vec!["Secret::Read(SECOND_KEY)".to_string()],
+    ];
+    assert_eq!(vm_manifests, expected);
+    assert_eq!(native_manifests, expected);
+}
+
+#[test]
+fn vm_and_native_both_reject_parent_authority_escalation_before_creation() {
+    let source = r#"
+actor Child { behavior ping() { 1 } }
+fn main() { spawn Child {} with [Secret::Read("UNHELD_KEY")] }
+"#;
+    const PARENT: u64 = 900_101;
+
+    let mut vm_mir = lower(source);
+    let vm_module = compile_mir(&mut vm_mir, "authority-vm-native-denied-vm").unwrap();
+    let vm_runtime = Rc::new(RefCell::new(Runtime::new()));
+    {
+        let mut rt = vm_runtime.borrow_mut();
+        rt.actors
+            .insert(PARENT, Actor::new(PARENT, "unprivileged-parent", 0));
+        rt.current_actor = Some(PARENT);
+    }
+    let mut vm = VM::new();
+    vm.load_module(vm_module);
+    vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(vm_runtime.clone())));
+    assert!(vm.run().unwrap().is_nil());
+    assert_eq!(vm_runtime.borrow().actors.len(), 1);
+
+    let native_mir = lower(source);
+    let aot = AotModule::compile(&native_mir).unwrap();
+    let mut native_runtime = Runtime::new();
+    native_runtime
+        .actors
+        .insert(PARENT, Actor::new(PARENT, "unprivileged-parent", 0));
+    native_runtime.current_actor = Some(PARENT);
+    let raw = aot.run_in_runtime(&mut native_runtime).unwrap();
+    assert!(nulang::vm::Value::from_bits(raw).is_nil());
+    assert_eq!(native_runtime.actors.len(), 1);
+    assert!(native_runtime.actors.contains_key(&PARENT));
 }
