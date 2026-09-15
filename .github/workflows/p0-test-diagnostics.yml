@@ -33,7 +33,7 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt
 
-      - name: Migrate only known failing AI fixtures
+      - name: Migrate known failing AI fixtures and test-only legacy matcher
         shell: bash
         run: |
           python3 - <<'PY'
@@ -87,16 +87,35 @@ jobs:
               print(f'{name}: migrated {count} spawn site(s)')
 
           path.write_text(text)
+
+          # The legacy matcher in runtime/http_server.rs is only referenced by
+          # its colocated tests. Production web dispatch now uses
+          # crate::web::dispatch::match_route. Compile the legacy helper only
+          # for tests instead of carrying a release dead_code warning.
+          http = Path('src/runtime/http_server.rs')
+          http_text = http.read_text()
+          needle = "/// Match a route pattern against a request path, returning captured parameters.\n/// Patterns use `:name` segments, e.g. `/products/:id`.\npub fn match_route("
+          replacement = "/// Match a route pattern against a request path, returning captured parameters.\n/// Patterns use `:name` segments, e.g. `/products/:id`.\n#[cfg(test)]\npub fn match_route("
+          if http_text.count(needle) != 1:
+              raise SystemExit('expected exactly one legacy match_route declaration')
+          http.write_text(http_text.replace(needle, replacement, 1))
           PY
 
-          git diff -- src/integration_tests/mod.rs
+          git diff -- src/integration_tests/mod.rs src/runtime/http_server.rs
           test -n "$(git diff -- src/integration_tests/mod.rs)"
+          test -n "$(git diff -- src/runtime/http_server.rs)"
 
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Check default build
         run: cargo check --all-targets
+
+      - name: Enforce zero-warning library builds
+        shell: bash
+        run: |
+          RUSTFLAGS='-D warnings' cargo check --lib
+          RUSTFLAGS='-D warnings' cargo check --release --lib
 
       - name: Run focused migrated regressions
         shell: bash
@@ -135,6 +154,6 @@ jobs:
           rm .github/workflows/p0-test-diagnostics.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/integration_tests/mod.rs .github/workflows/p0-test-diagnostics.yml
+          git add src/integration_tests/mod.rs src/runtime/http_server.rs .github/workflows/p0-test-diagnostics.yml
           git commit -m 'test(ai): require explicit inference authority in actor fixtures'
           git push origin HEAD:integration/p0-stabilization-2026-09-14
