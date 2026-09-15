@@ -51,17 +51,58 @@ jobs:
           test -s /tmp/raw-value-provenance.patch
           git apply --3way --index /tmp/raw-value-provenance.patch
 
-      - name: Validate merged provenance boundary
+      - name: Format
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.95.0 fmt --all
-          cargo +1.95.0 fmt --all -- --check
-          cargo +1.95.0 check --all-targets --no-default-features
-          cargo +1.95.0 check --all-targets
-          cargo +1.95.0 check --all-targets --all-features
-          cargo +1.95.0 test --test raw_value_provenance
-          git diff --check
+          cargo +1.95.0 fmt --all 2>&1 | tee /tmp/01-fmt.log
+          cargo +1.95.0 fmt --all -- --check 2>&1 | tee -a /tmp/01-fmt.log
+
+      - name: Check no-default-features
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.95.0 check --all-targets --no-default-features 2>&1 | tee /tmp/02-no-default.log
+
+      - name: Check default features
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.95.0 check --all-targets 2>&1 | tee /tmp/03-default.log
+
+      - name: Check all features
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.95.0 check --all-targets --all-features 2>&1 | tee /tmp/04-all-features.log
+
+      - name: Raw provenance regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.95.0 test --test raw_value_provenance 2>&1 | tee /tmp/05-test.log
+
+      - name: Diff check
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check 2>&1 | tee /tmp/06-diff.log
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-value-provenance-validation
+          path: |
+            /tmp/raw-value-provenance.patch
+            /tmp/01-fmt.log
+            /tmp/02-no-default.log
+            /tmp/03-default.log
+            /tmp/04-all-features.log
+            /tmp/05-test.log
+            /tmp/06-diff.log
+          if-no-files-found: ignore
+          retention-days: 1
 
       - name: Commit validated replay and self-remove
         shell: bash
