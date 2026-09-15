@@ -162,3 +162,21 @@ F4-vm site), `src/aot/codegen.rs`, `src/mir_wasm.rs`,
   is the pre-existing
   `aot::codegen::tests::test_aot_runtime_native_perform_async`, identical
   before and after.
+
+
+### F1b — CLOSED — raw pointer construction requires provenance
+`Value::ptr(*mut u8)` is an `unsafe fn`: safe Rust can no longer manufacture a
+pointer-tagged `Value` from an arbitrary/dangling raw pointer. Its safety
+contract requires a live pointer with provenance, layout, and lifetime valid
+for every runtime consumer that may dereference it. The VM allocation API now
+exposes `ActorVmCallbacks::alloc_value`, which allocates storage and constructs
+the associated pointer `Value` in one safe operation, so normal heap allocation
+does not require callers to assert provenance manually.
+
+Remaining raw-pointer crossings are explicit `unsafe` call sites and fall into
+reviewable boundary classes: runtime/GC pointers obtained from the actor/VM
+allocator or an existing pointer `Value`; persistence pointers reconstructed
+through the live object table; host/WASM bridge storage whose lifetime is held
+by the host; and native/FFI pointers governed by the enclosing unsafe ABI
+contract. `Value::ptr` also carries a `compile_fail` doctest so a future safe
+constructor regression is caught by doctests.

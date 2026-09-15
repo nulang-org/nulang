@@ -45,6 +45,12 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Added since 1.0.0-frozen — 2026-09-15 (P0 runtime authority stabilization)
+- **Runtime authority and value-provenance hardening** (`src/runtime/`, `src/vm.rs`, `src/mir_codegen.rs`). Actor spawn authority is now enforced fail-closed across VM/native/host boundaries, preserved through durable recovery and migration, and installed on workflow actors before their first durable checkpoint. Legacy pre-authority recovery remains deny-by-default. Raw `Value` reconstruction and pointer construction now require explicit trusted/unsafe boundaries so untrusted persisted, FFI, and Wasm bits cannot manufacture pointer-tagged values.
+- **Exact spawn-site authority metadata** (`src/mir_codegen.rs`, `tests/spawn_authority_provenance.rs`). Spawn metadata emitted while compiling an isolated function is relocated from function-local PCs to module-absolute PCs before publication, matching the VM's runtime `Spawn` program counter. A non-zero-function-base regression prevents local-PC metadata from silently passing again.
+- **Explicit AI inference authority** (`src/integration_tests/mod.rs`). Actor- and workflow-backed inference fixtures now request `Inference::Ask` at the exact spawn site instead of relying on ambient authority. Restart/redrive, semantic-memory, pipeline, supervisor, debate, and suspended-inference paths retain their behavior under the explicit grant model.
+- **Transactional actor ownership stabilization** (`src/runtime/`). Selective receive and ORCA ownership transfers use transactional bookkeeping so failed or unmatched receive paths do not leak ownership state while successful delivery preserves the intended transfer semantics.
+
 ### Added since 1.0.0-frozen — 2026-09-14 (web contract + capacity broker hardening)
 - **Web request decoding fixes** (Experimental, `src/web/request_bindings.rs`,
   `src/web/bindings.rs`, `src/web/contracts.rs`, `src/web/dispatch.rs`).
