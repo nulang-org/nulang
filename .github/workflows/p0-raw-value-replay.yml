@@ -147,12 +147,46 @@ jobs:
           PY
           git add src/runtime/callbacks.rs
 
+      - name: Restore minimal-build authority test boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('tests/spawn_authority_provenance.rs')
+          text = path.read_text()
+          replacements = [
+              (
+                  'use nulang::aot::AotModule;\n',
+                  '#[cfg(feature = "native-codegen")]\nuse nulang::aot::AotModule;\n',
+              ),
+              (
+                  'fn sorted_actor_manifests(rt: &Runtime) -> Vec<Vec<String>> {',
+                  '#[cfg(feature = "native-codegen")]\nfn sorted_actor_manifests(rt: &Runtime) -> Vec<Vec<String>> {',
+              ),
+              (
+                  '#[test]\nfn vm_and_native_agree_on_exact_site_spawn_authority() {',
+                  '#[cfg(feature = "native-codegen")]\n#[test]\nfn vm_and_native_agree_on_exact_site_spawn_authority() {',
+              ),
+              (
+                  '#[test]\nfn vm_and_native_both_reject_parent_authority_escalation_before_creation() {',
+                  '#[cfg(feature = "native-codegen")]\n#[test]\nfn vm_and_native_both_reject_parent_authority_escalation_before_creation() {',
+              ),
+          ]
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit(f'expected exactly one match for {old!r}')
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+          git add tests/spawn_authority_provenance.rs
+
       - name: Format
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.95.0 fmt --all 2>&1 | tee /tmp/10-fmt.log
-          cargo +1.95.0 fmt --all -- --check 2>&1 | tee -a /tmp/10-fmt.log
+          cargo +1.95.0 fmt --all -- --check 2>&1 | tee /tmp/10-fmt.log
 
       - name: Check no-default-features
         shell: bash
