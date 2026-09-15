@@ -279,8 +279,10 @@ pub fn decode_scalar_constant(raw: &str, ty: Option<&str>) -> Result<Constant, S
             .map_err(|_| format!("expected Int, got '{raw}'")),
         Some("Float") => raw
             .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
             .map(Constant::Float)
-            .map_err(|_| format!("expected Float, got '{raw}'")),
+            .ok_or_else(|| format!("expected finite Float, got '{raw}'")),
         Some("Bool") => match raw {
             "true" => Ok(Constant::Bool(true)),
             "false" => Ok(Constant::Bool(false)),
@@ -318,26 +320,40 @@ pub fn parse_cookie_header(header: &str) -> HashMap<String, String> {
 }
 
 fn percent_decode(input: &str) -> String {
+    percent_decode_impl(input, true)
+}
+
+/// Path-segment decoding: identical to [`percent_decode`] except `+` is a
+/// literal plus, not a space (RFC 3986; `+`-means-space is a query/form
+/// convention only).
+pub(crate) fn percent_decode_path(input: &str) -> String {
+    percent_decode_impl(input, false)
+}
+
+fn percent_decode_impl(input: &str, plus_as_space: bool) -> String {
+    // Decode into bytes first: pushing individual bytes as chars would
+    // widen each UTF-8 continuation byte into a separate code point,
+    // corrupting every non-ASCII value ("é" -> "Ã©").
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'+' {
-            out.push(' ');
+        if bytes[i] == b'+' && plus_as_space {
+            out.push(b' ');
             i += 1;
             continue;
         }
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(a), Some(b)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push(((a << 4) | b) as char);
+                out.push((a << 4) | b);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex(byte: u8) -> Option<u8> {
@@ -494,6 +510,38 @@ mod tests {
                 .get("theme")
                 .map(String::as_str),
             Some("dark mode")
+        );
+    }
+
+    #[test]
+    fn percent_decode_preserves_non_ascii_utf8() {
+        // Raw and percent-encoded UTF-8 must survive decoding intact.
+        assert_eq!(percent_decode("café"), "café");
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        assert_eq!(percent_decode("Jos%C3%A9+M%C3%BCller"), "José Müller");
+        assert_eq!(percent_decode("100%E2%82%AC"), "100€");
+        // Malformed sequences pass through rather than corrupting neighbors.
+        assert_eq!(percent_decode("100%ZZ"), "100%ZZ");
+        assert_eq!(percent_decode("truncated%4"), "truncated%4");
+    }
+
+    #[test]
+    fn percent_decode_path_keeps_plus_literal() {
+        assert_eq!(percent_decode_path("a+b"), "a+b");
+        assert_eq!(percent_decode_path("a%20b"), "a b");
+        assert_eq!(percent_decode_path("a%2Fb"), "a/b");
+        assert_eq!(percent_decode_path("caf%C3%A9"), "café");
+    }
+
+    #[test]
+    fn non_finite_float_query_value_is_client_error() {
+        for raw in ["NaN", "inf", "-inf", "infinity"] {
+            let err = decode_scalar_constant(raw, Some("Float")).unwrap_err();
+            assert!(err.contains("finite Float"), "{raw}: {err}");
+        }
+        assert_eq!(
+            decode_scalar_constant("1.5", Some("Float")).unwrap(),
+            crate::bytecode::Constant::Float(1.5)
         );
     }
 }

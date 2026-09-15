@@ -45,6 +45,37 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Added since 1.0.0-frozen — 2026-09-14 (web contract + capacity broker hardening)
+- **Web request decoding fixes** (Experimental, `src/web/request_bindings.rs`,
+  `src/web/bindings.rs`, `src/web/contracts.rs`, `src/web/dispatch.rs`).
+  `percent_decode` no longer maps UTF-8 bytes to Latin-1 code points, so
+  non-ASCII query/form/cookie values survive intact. Route handlers with
+  `using` or typeclass-dictionary parameters, and handler parameters with
+  neither a request binding nor a matching route parameter, are now rejected
+  at contract compile time (serve refuses to start) instead of silently
+  staging the closure value into a parameter register. An attached but
+  incomplete binding plan for a handler that declares parameters now returns
+  a 500-series error instead of falling back to the legacy zero-argument
+  call; zero-parameter ambient-`Web.param` handlers keep the legacy path.
+- **Capacity broker fetch deadline + concurrency** (Experimental,
+  `crates/nulang-capacity/src/broker.rs`). `CapacityBroker::collect_snapshots`
+  awaited each provider's `fetch_offers` sequentially with no deadline, so a
+  hung endpoint stalled `rank`/`rank_at` forever and N provider latencies
+  added instead of overlapping. Provider fetches now fan out concurrently
+  (`futures::join_all`) and each is raced against
+  `BrokerPolicy::fetch_timeout` (default 10s, runtime-agnostic via
+  `futures-timer`); a timed-out provider is recorded as a retryable
+  `ProviderErrorKind::Unavailable` and isolated, preserving the existing
+  failure-isolation guarantee.
+- **Path capture decoding + finite Float params** (Experimental,
+  `src/web/runtime_bindings.rs`, `src/web/request_bindings.rs`). Request
+  path segments are now percent-decoded at match time (split on raw `/`
+  first, so an encoded `%2F` stays inside its segment; `+` stays literal
+  per RFC 3986) and route literals are decoded at pattern-compile time,
+  aligning captures with query/form/cookie decoding. Float-typed params
+  now reject `NaN`/`inf` instead of passing non-finite values to
+  handlers.
+
 ### Added since 1.0.0-frozen — 2026-09-13 (mobile runtime boundary)
 - **Interpreter-only mobile runtime profile** (`Cargo.toml`, `src/runtime/`, `src/backends/`, `src/vm.rs`): native Cranelift/AOT code generation is now owned by the optional `native-codegen` feature while remaining enabled in default builds. The `mobile-runtime` profile excludes executable-code-generation and dynamic-loader dependencies, gates native backend wiring and benchmarks, and keeps Wasm support independently selectable. `scripts/check_mobile_runtime_profile.sh` provides the release gate for dependency-graph isolation and interpreter-only correctness.
 

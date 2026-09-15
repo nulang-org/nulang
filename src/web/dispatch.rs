@@ -85,6 +85,16 @@ pub fn render_direct_route(
         return Ok(None);
     };
     if !plan.direct_call {
+        // Legacy fallback is only safe for zero-parameter handlers that read
+        // the request through ambient state. A declared-parameter handler with
+        // an incomplete plan would receive the closure value and stale
+        // registers for its parameters (ClosureCall copies the whole bank).
+        if plan.handler_param_count > 0 {
+            return Err(format!(
+                "route {} {}: handler declares {} parameters but the binding plan is incomplete",
+                plan.method, plan.path, plan.handler_param_count
+            ));
+        }
         return Ok(None);
     }
 
@@ -138,6 +148,14 @@ pub fn render_direct_request(
         return Ok(None);
     };
     if !has_complete_request_binding_plan(plan) {
+        // See render_direct_route: only zero-parameter handlers may fall back
+        // to the legacy ambient-request path.
+        if plan.handler_param_count > 0 {
+            return Err(DirectRequestRenderError::Execution(format!(
+                "route {} {}: handler declares {} parameters but the binding plan is incomplete",
+                plan.method, plan.path, plan.handler_param_count
+            )));
+        }
         return Ok(None);
     }
 
@@ -294,6 +312,42 @@ fn show() -> String { "ok" }
     fn ambient_legacy_path_prevents_generalized_direct_call() {
         let query_only = plan(vec![binding(RouteBindingSource::Query, "id", 0)], 1);
         assert!(!has_complete_request_binding_plan(&query_only));
+    }
+
+    #[test]
+    fn incomplete_plan_with_declared_params_errors_instead_of_legacy_fallback() {
+        // render_direct_route must not fall back to the legacy zero-argument
+        // call for a handler that declares parameters: ClosureCall copies the
+        // whole register bank, so the parameters would receive the closure
+        // value and stale registers.
+        let route = RuntimeWebRoute {
+            route: crate::runtime::WebRoute {
+                method: crate::runtime::HttpMethod::Get,
+                path: "/users/{id}".to_string(),
+                handler_module: crate::bytecode::CodeModule::new("gate_test"),
+                handler_func_idx: 0,
+            },
+            plan: Some(plan(
+                vec![binding(RouteBindingSource::Query, "id", 0)],
+                1,
+            )),
+        };
+        let err = render_direct_route(&route, &HashMap::new()).unwrap_err();
+        assert!(err.contains("incomplete"), "{err}");
+    }
+
+    #[test]
+    fn incomplete_plan_with_zero_param_handler_keeps_legacy_fallback() {
+        let route = RuntimeWebRoute {
+            route: crate::runtime::WebRoute {
+                method: crate::runtime::HttpMethod::Get,
+                path: "/users/{id}".to_string(),
+                handler_module: crate::bytecode::CodeModule::new("gate_test"),
+                handler_func_idx: 0,
+            },
+            plan: Some(plan(vec![], 0)),
+        };
+        assert!(render_direct_route(&route, &HashMap::new()).unwrap().is_none());
     }
 
     #[test]
