@@ -798,10 +798,10 @@ impl CodeModule {
         self.add_constant(Constant::String(s.into()))
     }
 
-    /// Find the bytecode offset of a top-level function by name using the
+    /// Find the function-table index of a top-level function by name using the
     /// debug-function table. Returns `None` if the name is not found or belongs
     /// to an actor behavior (behaviors are not in `function_table`).
-    pub fn function_offset_by_name(&self, name: &str) -> Option<usize> {
+    pub fn function_index_by_name(&self, name: &str) -> Option<usize> {
         let info = self.debug_functions.iter().find(|d| d.name == name)?;
         // `debug_functions` and `function_table` are populated in the same order
         // for ordinary functions, but behaviors also appear in `debug_functions`
@@ -809,6 +809,12 @@ impl CodeModule {
         self.function_table
             .iter()
             .position(|&off| off == info.code_offset)
+    }
+
+    /// Find the bytecode offset of a top-level function by name.
+    pub fn function_offset_by_name(&self, name: &str) -> Option<usize> {
+        let index = self.function_index_by_name(name)?;
+        self.function_table.get(index).copied()
     }
 
     pub fn add_behavior(&mut self, b: BehaviorTableEntry) -> usize {
@@ -1040,6 +1046,33 @@ mod tests {
     // -----------------------------------------------------------------------
     // CodeModule operations
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_function_name_resolves_distinct_index_and_offset() {
+        let mut module = CodeModule::new("function-resolution");
+        module.function_table = vec![3, 11];
+        module.debug_functions = vec![
+            DebugFunctionInfo {
+                name: "first".to_string(),
+                code_offset: 3,
+                code_len: 2,
+                params: Vec::new(),
+                locals: Vec::new(),
+            },
+            DebugFunctionInfo {
+                name: "second".to_string(),
+                code_offset: 11,
+                code_len: 2,
+                params: Vec::new(),
+                locals: Vec::new(),
+            },
+        ];
+
+        assert_eq!(module.function_index_by_name("second"), Some(1));
+        assert_eq!(module.function_offset_by_name("second"), Some(11));
+        assert_eq!(module.function_index_by_name("missing"), None);
+        assert_eq!(module.function_offset_by_name("missing"), None);
+    }
 
     #[test]
     fn test_code_module_emit_and_patch() {
