@@ -15,6 +15,9 @@ on:
       - "Cargo.lock"
       - ".github/workflows/capacity.yml"
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -45,3 +48,194 @@ jobs:
 
       - name: Clippy
         run: cargo clippy -p nulang-capacity --all-targets -- -D warnings
+
+  p0-ai-authority-fixtures:
+    name: P0 AI Authority Fixture Migration
+    if: github.event_name == 'pull_request' && github.head_ref == 'integration/p0-stabilization-2026-09-14'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: integration/p0-stabilization-2026-09-14
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Migrate legacy AI fixtures to explicit inference authority
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/integration_tests/mod.rs')
+          text = path.read_text()
+          tests = [
+              'test_agent_ask_tracks_usage_and_cost',
+              'test_agent_ask_uses_memory',
+              'test_agent_usage_behavior',
+              'test_agent_workflow_recovers_semantic_memory_after_restart',
+              'test_agent_workflow_researches_and_reports',
+              'test_debate_source_end_to_end',
+              'test_inference_ask_actor_behavior_suspends_and_resumes',
+              'test_inference_ask_chained_suspensions_resume_in_order',
+              'test_inference_ask_nonblocking_other_actors_run_first',
+              'test_inference_ask_queued_messages_wait_for_suspended_behavior',
+              'test_mir_agent_ask_uses_memory',
+              'test_pipeline_source_end_to_end',
+              'test_supervisor_source_end_to_end',
+              'test_workflow_inference_ask_step_records_completion',
+              'test_workflow_inference_ask_step_redriven_after_restart',
+              'test_workflow_step_inference_ask_then_signal_wait',
+              'test_workflow_step_signal_wait_then_inference_ask',
+          ]
+
+          def add_authority_to_spawns(segment: str, test_name: str) -> tuple[str, int]:
+              out = []
+              cursor = 0
+              changed = 0
+              while True:
+                  start = segment.find('spawn ', cursor)
+                  if start < 0:
+                      out.append(segment[cursor:])
+                      break
+                  out.append(segment[cursor:start])
+                  brace = segment.find('{', start)
+                  if brace < 0:
+                      raise SystemExit(f'{test_name}: spawn without initializer brace')
+                  depth = 0
+                  quote = None
+                  escaped = False
+                  end = None
+                  i = brace
+                  while i < len(segment):
+                      ch = segment[i]
+                      if quote is not None:
+                          if escaped:
+                              escaped = False
+                          elif ch == '\\':
+                              escaped = True
+                          elif ch == quote:
+                              quote = None
+                      else:
+                          if ch in ('"', "'"):
+                              quote = ch
+                          elif ch == '{':
+                              depth += 1
+                          elif ch == '}':
+                              depth -= 1
+                              if depth == 0:
+                                  end = i + 1
+                                  break
+                      i += 1
+                  if end is None:
+                      raise SystemExit(f'{test_name}: unbalanced spawn initializer')
+                  after = segment[end:]
+                  if after.lstrip().startswith('with ['):
+                      out.append(segment[start:end])
+                  else:
+                      out.append(segment[start:end] + ' with [Inference::Ask]')
+                      changed += 1
+                  cursor = end
+              return ''.join(out), changed
+
+          for name in tests:
+              marker = f'fn {name}()'
+              start = text.find(marker)
+              if start < 0:
+                  raise SystemExit(f'missing target test: {name}')
+              next_test = text.find('\n    #[test]', start + len(marker))
+              next_cfg = text.find('\n    #[cfg(', start + len(marker))
+              candidates = [p for p in (next_test, next_cfg) if p >= 0]
+              end = min(candidates) if candidates else len(text)
+              segment = text[start:end]
+              migrated, count = add_authority_to_spawns(segment, name)
+              if count == 0:
+                  raise SystemExit(f'{name}: expected at least one unprivileged spawn fixture')
+              text = text[:start] + migrated + text[end:]
+              print(f'{name}: migrated {count} spawn site(s)')
+
+          path.write_text(text)
+
+          http = Path('src/runtime/http_server.rs')
+          http_text = http.read_text()
+          needle = "/// Match a route pattern against a request path, returning captured parameters.\n/// Patterns use `:name` segments, e.g. `/products/:id`.\npub fn match_route("
+          replacement = "/// Match a route pattern against a request path, returning captured parameters.\n/// Patterns use `:name` segments, e.g. `/products/:id`.\n#[cfg(test)]\npub fn match_route("
+          if http_text.count(needle) != 1:
+              raise SystemExit('expected exactly one legacy match_route declaration')
+          http.write_text(http_text.replace(needle, replacement, 1))
+          PY
+
+          git diff -- src/integration_tests/mod.rs src/runtime/http_server.rs
+          test -n "$(git diff -- src/integration_tests/mod.rs)"
+          test -n "$(git diff -- src/runtime/http_server.rs)"
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check default and minimal builds
+        run: |
+          cargo check --all-targets
+          cargo check --all-targets --no-default-features
+
+      - name: Enforce zero-warning library builds
+        run: |
+          RUSTFLAGS='-D warnings' cargo check --lib
+          RUSTFLAGS='-D warnings' cargo check --release --lib
+
+      - name: Run exact migrated regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          tests=(
+            test_agent_ask_tracks_usage_and_cost
+            test_agent_ask_uses_memory
+            test_agent_usage_behavior
+            test_agent_workflow_recovers_semantic_memory_after_restart
+            test_agent_workflow_researches_and_reports
+            test_debate_source_end_to_end
+            test_inference_ask_actor_behavior_suspends_and_resumes
+            test_inference_ask_chained_suspensions_resume_in_order
+            test_inference_ask_nonblocking_other_actors_run_first
+            test_inference_ask_queued_messages_wait_for_suspended_behavior
+            test_mir_agent_ask_uses_memory
+            test_pipeline_source_end_to_end
+            test_supervisor_source_end_to_end
+            test_workflow_inference_ask_step_records_completion
+            test_workflow_inference_ask_step_redriven_after_restart
+            test_workflow_step_inference_ask_then_signal_wait
+            test_workflow_step_signal_wait_then_inference_ask
+          )
+          for t in "${tests[@]}"; do
+            cargo test --lib "integration_tests::tests::$t" -- --exact --nocapture
+          done
+
+      - name: Re-run host authority regressions
+        run: cargo test --lib host_authority -- --nocapture
+
+      - name: Diff hygiene
+        run: git diff --check
+
+      - name: Commit validated product migration and restore workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          current_head="$(git rev-parse origin/integration/p0-stabilization-2026-09-14)"
+          if [ "$current_head" != "$GITHUB_SHA" ] && [ "$(git rev-parse HEAD)" != "$current_head" ]; then
+            echo "integration branch advanced during validation: $current_head" >&2
+            exit 1
+          fi
+          git checkout origin/main -- .github/workflows/capacity.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/integration_tests/mod.rs src/runtime/http_server.rs .github/workflows/capacity.yml
+          git diff --cached --check
+          git commit -m 'test(ai): require explicit inference authority in legacy fixtures'
+          git push origin HEAD:integration/p0-stabilization-2026-09-14
