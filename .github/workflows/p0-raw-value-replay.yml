@@ -83,22 +83,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The production hunks merge cleanly. Replay them independently from
+          # the test-only EOF append because #176 added migration authority
+          # tests at the same EOF location after #178's original base.
           git diff 5622d5271e30143cb8bee9f81f53f77119603175 8ff33558243499822ec46a43c3e4e2d6f870bc5b -- \
             src/aot/mod.rs \
             src/jit/runtime.rs \
-            src/runtime/callbacks.rs \
             src/vm.rs \
-            > /tmp/03-host-authority.patch
-          test -s /tmp/03-host-authority.patch
-          set +e
-          git apply --3way --index /tmp/03-host-authority.patch 2>&1 | tee /tmp/03-host-authority-apply.log
-          status=${PIPESTATUS[0]}
-          set -e
-          if [ "$status" -ne 0 ]; then
-            cp src/runtime/callbacks.rs /tmp/03-callbacks-conflicted.rs || true
-            git diff --cc src/runtime/callbacks.rs > /tmp/03-callbacks-conflict.diff || true
-            exit "$status"
-          fi
+            > /tmp/03-host-authority-production-other.patch
+          test -s /tmp/03-host-authority-production-other.patch
+          git apply --3way --index /tmp/03-host-authority-production-other.patch 2>&1 | tee /tmp/03-host-authority-production-other-apply.log
+
+          git diff 5622d5271e30143cb8bee9f81f53f77119603175 8ff33558243499822ec46a43c3e4e2d6f870bc5b -- \
+            src/runtime/callbacks.rs \
+            > /tmp/03-host-authority-callbacks.patch
+          test -s /tmp/03-host-authority-callbacks.patch
+          awk '/^@@ -2213,3 +2505,377 @@/{exit} {print}' \
+            /tmp/03-host-authority-callbacks.patch \
+            > /tmp/03-host-authority-callbacks-production.patch
+          test -s /tmp/03-host-authority-callbacks-production.patch
+          git apply --3way --index /tmp/03-host-authority-callbacks-production.patch 2>&1 | tee /tmp/03-host-authority-callbacks-apply.log
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          source = subprocess.check_output(
+              ["git", "show", "8ff33558243499822ec46a43c3e4e2d6f870bc5b:src/runtime/callbacks.rs"],
+              text=True,
+          )
+          marker = "#[cfg(test)]\nmod host_authority_tests {"
+          start = source.find(marker)
+          if start < 0:
+              raise SystemExit("host_authority_tests marker missing from #178 head")
+          block = source[start:].rstrip() + "\n"
+          path = Path("src/runtime/callbacks.rs")
+          current = path.read_text()
+          if "mod host_authority_tests {" in current:
+              raise SystemExit("host_authority_tests already present before replay")
+          path.write_text(current.rstrip() + "\n\n" + block)
+          PY
+          git add src/runtime/callbacks.rs
 
       - name: Format
         shell: bash
@@ -165,8 +190,6 @@ jobs:
           path: |
             /tmp/*.patch
             /tmp/*-apply.log
-            /tmp/03-callbacks-conflicted.rs
-            /tmp/03-callbacks-conflict.diff
             /tmp/10-fmt.log
             /tmp/11-no-default.log
             /tmp/12-default.log
