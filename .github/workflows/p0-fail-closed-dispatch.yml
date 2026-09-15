@@ -1,0 +1,208 @@
+name: P0 Fail-Closed Actor Dispatch
+
+on:
+  push:
+    branches:
+      - fix/p0-actor-dispatch-identity
+    paths:
+      - .github/workflows/p0-fail-closed-dispatch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/p0-actor-dispatch-identity
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Make local actor dispatch fail closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/runtime/mod.rs')
+          text = path.read_text()
+
+          before = '''        let behavior_id = self.behavior_id_for(target_id, behavior).unwrap_or(0);\n        self.send_message_by_id(target_id, behavior_id, args);'''
+          after = '''        let Some(behavior_id) = self.behavior_id_for(target_id, behavior) else {\n            warn!(\n                "nulang-runtime: dropping message to actor {}: unknown behavior '{}'",\n                target_id, behavior\n            );\n            return;\n        };\n        self.send_message_by_id(target_id, behavior_id, args);'''
+          if text.count(before) != 1:
+              raise SystemExit('local name-dispatch fallback shape changed')
+          text = text.replace(before, after, 1)
+
+          cross_marker = '''        let msg = Message {\n            behavior_id,\n            payload: Arc::new(payload),\n            sender,\n            priority: MessagePriority::Normal,\n            trace_id: trace_id.clone(),\n        };'''
+          cross_replacement = '''        let behavior_idx = behavior_id as usize;\n        let behavior_exists = self.has_bytecode_handler(target_id, behavior_idx)\n            || self\n                .actors\n                .get(&target_id)\n                .and_then(|actor| actor.behavior_table.get(behavior_idx))\n                .is_some_and(|entry| !entry.name.is_empty());\n        if self.actors.contains_key(&target_id) && !behavior_exists {\n            warn!(\n                "nulang-runtime: dropping cross-shard message to actor {}: unknown behavior id {}",\n                target_id, behavior_id\n            );\n            self.route_to_dlq(\n                &Message {\n                    behavior_id,\n                    payload: Arc::new(payload),\n                    sender,\n                    priority: MessagePriority::System,\n                    trace_id,\n                },\n                "unknown behavior id (cross-shard)",\n            );\n            return;\n        }\n\n        let msg = Message {\n            behavior_id,\n            payload: Arc::new(payload),\n            sender,\n            priority: MessagePriority::Normal,\n            trace_id: trace_id.clone(),\n        };'''
+          if text.count(cross_marker) != 1:
+              raise SystemExit('cross-shard delivery shape changed')
+          text = text.replace(cross_marker, cross_replacement, 1)
+
+          local_marker = '''    fn deliver_local_message(\n        &mut self,\n        target_id: u64,\n        behavior_id: u16,\n        args: &[Value],\n        out_trace: Option<String>,\n    ) {\n        let msg = Message {'''
+          local_replacement = '''    fn deliver_local_message(\n        &mut self,\n        target_id: u64,\n        behavior_id: u16,\n        args: &[Value],\n        out_trace: Option<String>,\n    ) {\n        let behavior_idx = behavior_id as usize;\n        let behavior_exists = self.has_bytecode_handler(target_id, behavior_idx)\n            || self\n                .actors\n                .get(&target_id)\n                .and_then(|actor| actor.behavior_table.get(behavior_idx))\n                .is_some_and(|entry| !entry.name.is_empty());\n        if self.actors.contains_key(&target_id) && !behavior_exists {\n            warn!(\n                "nulang-runtime: dropping message to actor {}: unknown behavior id {}",\n                target_id, behavior_id\n            );\n            self.route_to_dlq(\n                &Message {\n                    behavior_id,\n                    payload: Arc::new(args.to_vec()),\n                    sender: self.current_actor.unwrap_or(0),\n                    priority: MessagePriority::System,\n                    trace_id: out_trace,\n                },\n                "unknown behavior id",\n            );\n            return;\n        }\n\n        let msg = Message {'''
+          if text.count(local_marker) != 1:
+              raise SystemExit('local delivery shape changed')
+          text = text.replace(local_marker, local_replacement, 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Make distributed name resolution fail closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('src/runtime/distributed.rs')
+          text = path.read_text()
+
+          pattern = re.compile(
+              r'''(?P<indent>[ \t]*)msg\.behavior_id = runtime\n'''
+              r'''(?P=indent)    \.behavior_id_for\(target_actor, &behavior_name\)\n'''
+              r'''(?P=indent)    \.unwrap_or\(0\);'''
+          )
+          matches = list(pattern.finditer(text))
+          if len(matches) != 3:
+              raise SystemExit(f'expected 3 distributed behavior fallbacks, found {len(matches)}')
+
+          def replace(match):
+              indent = match.group('indent')
+              return (
+                  f"{indent}let Some(resolved_behavior_id) = runtime\n"
+                  f"{indent}    .behavior_id_for(target_actor, &behavior_name)\n"
+                  f"{indent}else {{\n"
+                  f"{indent}    warn!(\n"
+                  f"{indent}        \"nulang-net: dropping message to actor {{}}: unknown behavior '{{}}'\",\n"
+                  f"{indent}        target_actor, behavior_name\n"
+                  f"{indent}    );\n"
+                  f"{indent}    notify_delivery_failed(runtime, msg.sender, \"unknown behavior\");\n"
+                  f"{indent}    continue;\n"
+                  f"{indent}}};\n"
+                  f"{indent}msg.behavior_id = resolved_behavior_id;"
+              )
+
+          text = pattern.sub(replace, text)
+
+          old = '''        // Unknown behavior name: falls back to behavior 0, mirroring\n        // `Runtime::send_message`'s `unwrap_or(0)` for local sends.'''
+          new = '''        // Unknown behavior names fail closed: they must never alias behavior 0.'''
+          if text.count(old) != 1:
+              raise SystemExit('remote unknown-behavior regression comment shape changed')
+          text = text.replace(old, new, 1)
+
+          old = '''        assert_eq!(\n            count, 4,\n            "unknown behavior name must fall back to behavior 0 (\\\"dec\\\")"\n        );'''
+          new = '''        assert_eq!(\n            count, 5,\n            "unknown behavior name must not execute behavior 0 (\\\"dec\\\")"\n        );'''
+          if text.count(old) != 1:
+              raise SystemExit('remote unknown-behavior assertion shape changed')
+          text = text.replace(old, new, 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Add local regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/runtime/tests.rs')
+          text = path.read_text()
+          name = 'test_unknown_behavior_name_does_not_execute_behavior_zero'
+          if name in text:
+              raise SystemExit(f'{name} already exists')
+          test = r'''
+
+#[test]
+fn test_unknown_behavior_name_does_not_execute_behavior_zero() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| {
+        vec![("count".to_string(), Value::int(0))]
+    }));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.register_behavior("inc", |actor, _args| {
+            let count = actor
+                .get_state_field("count")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("count", Value::int(count + 1));
+        });
+    }
+
+    assert_eq!(rt.behavior_id_for(actor_id, "inc"), Some(0));
+    assert_eq!(rt.behavior_id_for(actor_id, "no_such_behavior"), None);
+
+    rt.send_message(actor_id, "no_such_behavior", &[]);
+    rt.run_scheduler();
+
+    let count = rt
+        .actors
+        .get(&actor_id)
+        .unwrap()
+        .get_state_field("count")
+        .and_then(|value| value.as_int());
+    assert_eq!(count, Some(0));
+}
+'''
+          path.write_text(text.rstrip() + test + '\n')
+          PY
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Check default and minimal builds
+        run: |
+          cargo check --all-targets
+          cargo check --all-targets --no-default-features
+
+      - name: Run local fail-closed regression
+        run: cargo test --lib runtime::tests::test_unknown_behavior_name_does_not_execute_behavior_zero -- --exact --nocapture
+
+      - name: Run distributed fail-closed regression
+        run: cargo test --lib runtime::distributed::tests::test_remote_send_dispatches_named_behavior --features tcp -- --exact --nocapture
+
+      - name: Run focused runtime dispatch suites
+        run: |
+          cargo test --lib runtime::tests -- --nocapture
+          cargo test --lib runtime::distributed::tests --features tcp -- --nocapture
+
+      - name: Diff hygiene and scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          mapfile -t changed < <(git diff --name-only | sort)
+          printf 'changed paths:\n%s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq 3
+          test "${changed[0]}" = "src/runtime/distributed.rs"
+          test "${changed[1]}" = "src/runtime/mod.rs"
+          test "${changed[2]}" = "src/runtime/tests.rs"
+
+      - name: Commit validated dispatch fix and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin fix/p0-actor-dispatch-identity
+          remote_head="$(git rev-parse origin/fix/p0-actor-dispatch-identity)"
+          if [ "$remote_head" != "$GITHUB_SHA" ]; then
+            echo "branch advanced during validation: $remote_head (expected $GITHUB_SHA)" >&2
+            exit 1
+          fi
+          rm .github/workflows/p0-fail-closed-dispatch.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime/mod.rs src/runtime/distributed.rs src/runtime/tests.rs .github/workflows/p0-fail-closed-dispatch.yml
+          git diff --cached --check
+          git commit -m 'fix(runtime): reject unknown actor behavior dispatch'
+          git push origin HEAD:fix/p0-actor-dispatch-identity
