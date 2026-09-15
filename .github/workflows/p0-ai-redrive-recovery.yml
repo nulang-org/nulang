@@ -71,10 +71,10 @@ jobs:
           # unchanged, then restore the already-clean HTTP source before builds.
           cat >> src/runtime/http_server.rs <<'EOF'
 
-/// Match a route pattern against a request path, returning captured parameters.
-/// Patterns use `:name` segments, e.g. `/products/:id`.
-pub fn match_route(_pattern: &str, _path: &str) -> Option<()> { None }
-EOF
+          /// Match a route pattern against a request path, returning captured parameters.
+          /// Patterns use `:name` segments, e.g. `/products/:id`.
+          pub fn match_route(_pattern: &str, _path: &str) -> Option<()> { None }
+          EOF
           bash /tmp/p0-migration-2.sh
           git restore --source=HEAD -- src/runtime/http_server.rs
           git diff --check
