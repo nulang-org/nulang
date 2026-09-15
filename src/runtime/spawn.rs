@@ -22,13 +22,25 @@ pub(crate) fn spawn_actor_with_models(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
-    spawn_actor_with_id(
+    spawn_actor_with_models_with_authority(rt, init, state_models, persistent, workflow, None)
+}
+
+fn spawn_actor_with_models_with_authority(
+    rt: &mut Runtime,
+    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+    state_models: HashMap<String, StateModel>,
+    persistent: bool,
+    workflow: Option<&str>,
+    initial_authority: Option<&AuthorityManifest>,
+) -> u64 {
+    spawn_actor_with_id_with_authority(
         rt,
         fresh_actor_id(),
         init,
         state_models,
         persistent,
         workflow,
+        initial_authority,
     )
 }
 
@@ -60,6 +72,18 @@ pub(crate) fn spawn_actor_with_id(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+) -> u64 {
+    spawn_actor_with_id_with_authority(rt, id, init, state_models, persistent, workflow, None)
+}
+
+fn spawn_actor_with_id_with_authority(
+    rt: &mut Runtime,
+    id: u64,
+    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+    state_models: HashMap<String, StateModel>,
+    persistent: bool,
+    workflow: Option<&str>,
+    initial_authority: Option<&AuthorityManifest>,
 ) -> u64 {
     let restart_snapshot = if persistent && workflow.is_none() {
         match preflight_persistent_snapshot(rt, id) {
@@ -105,6 +129,9 @@ pub(crate) fn spawn_actor_with_id(
     // recovery path (`recover_actor`), so they are skipped here.
     if persistent && workflow.is_none() {
         restore_persistent_state(rt, &mut actor, restart_snapshot);
+    }
+    if let Some(authority) = initial_authority {
+        actor.install_authority_manifest(authority);
     }
     // Register CRDT-backed fields only after persisted authority has been
     // validated and installed, so rejected activations leave no manager state.
@@ -237,6 +264,16 @@ pub(crate) fn spawn_from_module(
     behavior_idx: usize,
     init: Vec<(String, Value)>,
 ) -> Value {
+    spawn_from_module_with_initial_authority(rt, module, behavior_idx, init, None)
+}
+
+fn spawn_from_module_with_initial_authority(
+    rt: &mut Runtime,
+    module: &crate::bytecode::CodeModule,
+    behavior_idx: usize,
+    init: Vec<(String, Value)>,
+    initial_authority: Option<&AuthorityManifest>,
+) -> Value {
     rt.register_module_grains(module);
     let meta = module
         .actor_metadata
@@ -264,7 +301,7 @@ pub(crate) fn spawn_from_module(
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
         let defaults = meta.state_defaults.clone();
-        spawn_actor_with_models(
+        spawn_actor_with_models_with_authority(
             rt,
             Box::new(move || {
                 let mut fields: Vec<(String, Value)> = defaults
@@ -281,9 +318,17 @@ pub(crate) fn spawn_from_module(
             } else {
                 None
             },
+            initial_authority,
         )
     } else {
-        spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
+        spawn_actor_with_models_with_authority(
+            rt,
+            Box::new(move || init),
+            HashMap::new(),
+            false,
+            None,
+            initial_authority,
+        )
     };
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
@@ -406,46 +451,13 @@ pub(crate) fn spawn_from_module_with_authority(
         }
     }
 
-    let value = spawn_from_module(rt, module, behavior_idx, init);
-    if let Some(child_id) = value.as_actor_id() {
-        if let Some(child) = rt.actors.get_mut(&child_id) {
-            child.install_authority_manifest(requested);
-        }
-        persist_initial_workflow_authority(rt, child_id, requested);
-    }
-    Ok(value)
-}
-
-/// Align a freshly-created workflow snapshot with the authority that was
-/// explicitly validated and installed at its spawn site. Workflows create
-/// their first checkpoint inside `spawn_from_module`, before this wrapper
-/// installs the requested manifest; rewriting only the snapshot's authority
-/// tokens preserves its sequence and durable state while closing that ordering
-/// gap. Recovery still derives authority solely from persisted tokens.
-fn persist_initial_workflow_authority(
-    rt: &mut Runtime,
-    actor_id: u64,
-    requested: &AuthorityManifest,
-) {
-    let should_persist = rt
-        .actors
-        .get(&actor_id)
-        .map(|actor| actor.persistent && actor.is_workflow)
-        .unwrap_or(false);
-    if !should_persist {
-        return;
-    }
-    let Some(mut snapshot) = rt.persistence.load_snapshot(actor_id) else {
-        return;
-    };
-    snapshot.authority_tokens = requested.canonical_token_set();
-    if let Err(error) = rt.persistence.save_snapshot(snapshot) {
-        tracing::warn!(
-            actor_id,
-            %error,
-            "failed to persist initial workflow authority snapshot"
-        );
-    }
+    Ok(spawn_from_module_with_initial_authority(
+        rt,
+        module,
+        behavior_idx,
+        init,
+        Some(requested),
+    ))
 }
 
 /// Populate a workflow actor's behavior table with placeholder entries for
@@ -585,20 +597,16 @@ mod authority_tests {
     fn workflow_spawn_authority_snapshot_survives_recovery() {
         let mut rt = Runtime::new();
         let actor_id = 910_003;
-        spawn_actor_with_id(
+        let requested = secret_manifest("WORKFLOW_KEY");
+        spawn_actor_with_id_with_authority(
             &mut rt,
             actor_id,
             Box::new(|| vec![]),
             std::collections::HashMap::new(),
             true,
             Some("recoverable"),
+            Some(&requested),
         );
-        let requested = secret_manifest("WORKFLOW_KEY");
-        rt.actors
-            .get_mut(&actor_id)
-            .unwrap()
-            .install_authority_manifest(&requested);
-        persist_initial_workflow_authority(&mut rt, actor_id, &requested);
 
         let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
         assert_eq!(snapshot.authority_tokens, requested.canonical_token_set());
@@ -620,20 +628,16 @@ mod authority_tests {
     fn unprivileged_workflow_restart_remains_denied() {
         let mut rt = Runtime::new();
         let actor_id = 910_004;
-        spawn_actor_with_id(
+        let requested = AuthorityManifest::new();
+        spawn_actor_with_id_with_authority(
             &mut rt,
             actor_id,
             Box::new(|| vec![]),
             std::collections::HashMap::new(),
             true,
             Some("unprivileged"),
+            Some(&requested),
         );
-        let requested = AuthorityManifest::new();
-        rt.actors
-            .get_mut(&actor_id)
-            .unwrap()
-            .install_authority_manifest(&requested);
-        persist_initial_workflow_authority(&mut rt, actor_id, &requested);
 
         let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
         assert!(snapshot.authority_tokens.is_empty());
