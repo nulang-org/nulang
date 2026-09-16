@@ -1,4 +1,4 @@
-# RFC 0019: Typed Actor Protocols
+# RFC 0023: Typed Actor Protocols
 
 - **Status:** Draft — Phase 1 implemented in this branch
 - **Tier:** Experimental
