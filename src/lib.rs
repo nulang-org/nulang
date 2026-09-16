@@ -37,6 +37,8 @@ pub mod effect_receipt;
 pub mod effect_receipt_fence;
 #[cfg(all(feature = "sqlite", feature = "ureq"))]
 pub mod effect_receipt_http;
+#[cfg(all(feature = "sqlite", feature = "ureq"))]
+pub mod effect_receipt_http_turn;
 #[cfg(feature = "sqlite")]
 pub mod effect_receipt_libsql;
 pub mod ffi;
