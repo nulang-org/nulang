@@ -34,6 +34,7 @@ pub mod diagnostic;
 pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
+pub mod durable_inbox;
 pub mod effect_checker;
 pub mod ffi;
 pub mod fmt;
