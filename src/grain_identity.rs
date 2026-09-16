@@ -8,6 +8,9 @@
 
 use crate::runtime::{grain_actor_id, GrainId, GRAIN_ACTOR_ID_ALGORITHM_VERSION};
 use crate::types::{NuError, Span};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::Path;
 
 /// Version of the durable grain-identity record schema.
 pub const GRAIN_IDENTITY_RECORD_VERSION: u8 = 1;
@@ -223,9 +226,104 @@ impl From<PersistedGrainIdentityError> for NuError {
     }
 }
 
+fn identity_io_error(error: PersistedGrainIdentityError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+/// Load a JSON identity sidecar. Missing is distinct from malformed: callers
+/// decide the legacy-state policy, while present-but-invalid metadata fails.
+pub(crate) fn load_json_identity(path: &Path) -> io::Result<Option<PersistedGrainIdentity>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+
+    let record = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(Some(record))
+}
+
+/// Read and validate an existing JSON identity record before state under the
+/// compact namespace is trusted.
+pub(crate) fn load_and_validate_json_identity(
+    path: &Path,
+    requested: &GrainId,
+    namespace_actor_id: u64,
+) -> io::Result<Option<PersistedGrainIdentity>> {
+    let Some(record) = load_json_identity(path)? else {
+        return Ok(None);
+    };
+    record
+        .validate_for_request(requested, namespace_actor_id)
+        .map_err(identity_io_error)?;
+    Ok(Some(record))
+}
+
+/// Atomically claim a previously-empty JSON identity namespace for a grain.
+///
+/// The file is created with `create_new`, so concurrent claimants cannot
+/// overwrite one another. The identity is synced before this function returns;
+/// durable state must only be written after a successful claim. If a process
+/// crashes during the write, a partial identity file fails closed on the next
+/// recovery instead of allowing a different logical grain to reuse the compact
+/// namespace.
+pub(crate) fn claim_json_identity(
+    path: &Path,
+    requested: &GrainId,
+) -> io::Result<PersistedGrainIdentity> {
+    let namespace_actor_id = grain_actor_id(requested);
+
+    if let Some(existing) =
+        load_and_validate_json_identity(path, requested, namespace_actor_id)?
+    {
+        return Ok(existing);
+    }
+
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+
+    let record = PersistedGrainIdentity::current(requested);
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok(record)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // Another claimant won the race. Never overwrite it: validate the
+            // winner against our logical request and fail closed on mismatch.
+            load_and_validate_json_identity(path, requested, namespace_actor_id)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "grain identity file disappeared during concurrent claim",
+                )
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_identity_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nulang-grain-identity-{label}-{}-{nonce}.json",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn current_record_freezes_projection_metadata() {
@@ -339,6 +437,48 @@ mod tests {
             record.validate_for_request(&grain, wrong_namespace),
             Err(PersistedGrainIdentityError::RequestedProjectionMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn json_claim_is_durable_and_idempotent_for_same_grain() {
+        let path = temp_identity_path("claim");
+        let grain = GrainId::new("User", "42");
+
+        let first = claim_json_identity(&path, &grain).unwrap();
+        let second = claim_json_identity(&path, &grain).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(load_json_identity(&path).unwrap(), Some(first));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupt_json_identity_fails_closed() {
+        let path = temp_identity_path("corrupt");
+        fs::write(&path, b"{not-json").unwrap();
+        let grain = GrainId::new("User", "42");
+
+        let error = claim_json_identity(&path, &grain).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&path).unwrap(), b"{not-json");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn existing_identity_is_never_overwritten_on_validation_failure() {
+        let path = temp_identity_path("no-overwrite");
+        let stored = GrainId::new("User", "42");
+        let requested = GrainId::new("Order", "42");
+        let record = PersistedGrainIdentity::current(&stored);
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let error = claim_json_identity(&path, &requested).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
