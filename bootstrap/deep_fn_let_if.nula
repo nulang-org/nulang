@@ -1,0 +1,11 @@
+let f = fn(a) => fn(b) => fn(c) => fn(d) => fn(e) => fn(g) => fn(h) => fn(i) => fn(j) => fn(k) => (
+    let x = a in
+    if x == 0 then (
+        let y = b in
+        if y == 0 then (
+            let z = c in
+            if z == 0 then 42 else 1
+        ) else 2
+    ) else 3
+) in
+f(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)

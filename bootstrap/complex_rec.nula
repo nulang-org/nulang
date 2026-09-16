@@ -1,0 +1,42 @@
+let comp = fn(src) => fn(pos) => fn(len) => fn(left) => fn(min_prec) => fn(nr) => fn(env) => fn(elen) => (
+    let no_left = 268435456 * 4096 in
+    let pair = if left == no_left then (
+        let p = pos in
+        if p >= len then ((nr * 65536)) + p
+        else (
+            let c = 97 in
+            if is_alpha(c) then (
+                let ident = 12345 in
+                let h = ident >> 16 in
+                let q = 6789 in
+                if h == 3321 then (
+                    let q2 = q in
+                    let var_id = 54321 in
+                    let vh = var_id >> 16 in
+                    let q3 = 9876 in
+                    let q4 = q3 in
+                    let c3 = 61 in
+                    if c3 == 61 then (
+                        let vh16 = 123 in
+                        let ne = nr + elen in
+                        let save_reg = if ne < 56 then 200 + ne else 143 + (ne - 56) in
+                        let env_rec = env in
+                        let bound = ((nr * 65536)) + q4 in
+                        let vr = bound >> 18 in
+                        let vp = bound in
+                        let vp2 = vp in
+                        let ci = 105 in
+                        let cn = 110 in
+                        if ci == 105 and cn == 110 then (
+                            let nxt = nr + 1 in
+                            ((nxt * 65536)) + vp2
+                        ) else ((save_reg * 65536)) + vp2
+                    ) else ((nr * 65536)) + p
+                ) else ((nr * 65536)) + p
+            ) else ((nr * 65536)) + p
+        )
+    ) else ((left * 65536)) + pos in
+    pair
+) in
+let is_alpha = fn(c) => (c >= 65 and c <= 90) or (c >= 97 and c <= 122) in
+comp("hello")(0)(5)(268435456 * 4096)(-1)(8)("")(0)

@@ -70,7 +70,7 @@ pub use distributed::*;
 pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
-pub use http_server::{render_route_handler, HttpServerState, WebDevServer, WebRoute};
+pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
 pub use mailbox::*;
 pub use network::NetworkTransport;
 pub use network::*;
@@ -425,9 +425,11 @@ pub struct Runtime {
     /// AOT-compiled modules registered for native behavior dispatch, keyed by
     /// actor type name → module pointer. Ownership lives in
     /// `aot_module_storage`; the pointers are stable (each module is Boxed).
+    #[cfg(feature = "native-codegen")]
     pub aot_modules: std::collections::HashMap<String, *const crate::aot::AotModule>,
     /// Owns the registered AOT modules so the raw pointers in `aot_modules`
     /// (and on actors) stay valid for the Runtime's lifetime.
+    #[cfg(feature = "native-codegen")]
     pub aot_module_storage: Vec<Box<crate::aot::AotModule>>,
     /// Actor ID of the dead-letter queue (created lazily).
     /// Undeliverable messages are routed here.
@@ -566,7 +568,9 @@ impl Runtime {
             supervisor_teams: SupervisorTeamRegistry::new(),
             crypto: Box::new(crate::backends::DefaultCryptoProvider::new()),
             spawnable_behaviors: HashMap::new(),
+            #[cfg(feature = "native-codegen")]
             aot_modules: std::collections::HashMap::new(),
+            #[cfg(feature = "native-codegen")]
             aot_module_storage: Vec::new(),
             #[cfg(any(feature = "ai-runtime", feature = "http-client"))]
             http: Box::new(crate::backends::ReqwestHttpProvider::new()),
@@ -1121,6 +1125,7 @@ impl Runtime {
     /// Mirrors the structure of `resume_suspended_llm_step` but without
     /// LLM-specific logic: re-installs callbacks, restores VM state,
     /// resets the safepoint counter, and resumes execution.
+    #[cfg(feature = "native-codegen")]
     fn resume_suspended_jit_yield(&mut self, actor_id: u64) {
         let suspended = match self.actors.get_mut(&actor_id) {
             Some(actor) => actor.suspended_execution.take(),
@@ -1146,7 +1151,7 @@ impl Runtime {
 
             // Reset the safepoint budget and wire the pointer for JIT code.
             if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
-                actor.jit_safepoint_counter = crate::jit::runtime::JIT_SAFEPOINT_BUDGET;
+                actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
                 crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
             }
 
@@ -2630,6 +2635,12 @@ impl Runtime {
             if ticks % DEHYDRATE_CHECK_INTERVAL == 0 {
                 self.dehydrate_idle_grains();
             }
+            if ticks % CRDT_SYNC_INTERVAL_TICKS == 0 {
+                // Cheap no-op when distribution is disabled: only local
+                // tombstone GC runs. When clustered, this ships delta-state
+                // syncs to healthy peers on the scheduler cadence.
+                self.sync_crdts();
+            }
         }
         // Deliver pending foreign-ref decrements and run cycle detection only
         // once the run queue has drained. Receiver-side holds now keep
@@ -2867,12 +2878,20 @@ impl Runtime {
                 .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
                 .collect()
         });
+        let crdt_field_map = self.crdt_manager.as_ref().map(|m| {
+            m.field_map
+                .iter()
+                .filter(|((aid, _), _)| *aid == actor_id)
+                .map(|((_, name), id)| (name.clone(), id.0))
+                .collect()
+        });
         Some(ActorSnapshot {
             actor_id,
             sequence,
             state,
             waiting_signal,
             crdt_snapshot,
+            crdt_field_map,
         })
     }
 
@@ -3180,13 +3199,16 @@ impl Runtime {
         // behavior (clearing suspended_execution) or re-suspend (setting it
         // again), after which the normal suspended_execution guard below
         // prevents processing new messages while the behavior is live.
-        let jit_yield = self
-            .actors
-            .get(&actor_id)
-            .map(|a| a.jit_yield_pending)
-            .unwrap_or(false);
-        if jit_yield {
-            self.resume_suspended_jit_yield(actor_id);
+        #[cfg(feature = "native-codegen")]
+        {
+            let jit_yield = self
+                .actors
+                .get(&actor_id)
+                .map(|a| a.jit_yield_pending)
+                .unwrap_or(false);
+            if jit_yield {
+                self.resume_suspended_jit_yield(actor_id);
+            }
         }
 
         let msg_opt = {
@@ -3442,6 +3464,7 @@ impl Runtime {
             };
             // AOT target to arm around the handler (None for bytecode/native
             // handlers or behaviors without an AOT-compiled version).
+            #[cfg(feature = "native-codegen")]
             let aot_target = self
                 .actors
                 .get(&actor_id)
@@ -3478,10 +3501,12 @@ impl Runtime {
                     };
                     // Arm the AOT native target so `aot_behavior_adapter` (the
                     // behavior's handler) dispatches through AOT code.
+                    #[cfg(feature = "native-codegen")]
                     if let Some(target) = aot_target {
                         crate::aot::set_aot_dispatch(Some(target));
                     }
                     handler(actor, &msg.payload);
+                    #[cfg(feature = "native-codegen")]
                     if aot_target.is_some() {
                         crate::aot::clear_aot_dispatch();
                     }
@@ -4439,30 +4464,36 @@ impl Runtime {
 
             (*self_ptr).vm_exec_begin();
 
-            // Reset JIT safepoint counter for this behavior invocation.
-            if let Some(actor) = self.actors.get_mut(&actor_id) {
-                actor.jit_safepoint_counter = crate::jit::runtime::JIT_SAFEPOINT_BUDGET;
-                crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
+            #[cfg(feature = "native-codegen")]
+            {
+                // Reset native-codegen safepoint counter for this behavior.
+                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                    actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
+                    crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
+                }
             }
 
             let result = vm.run_from(module_idx, code_offset);
 
-            // JIT safepoint yield: capture state for inline resume on next turn.
-            if vm.yield_pending {
-                if let Some(vm_state) = vm.take_suspended_state() {
-                    if let Some(actor) = self.actors.get_mut(&actor_id) {
-                        actor.suspended_execution =
-                            Some(crate::runtime::actor::SuspendedExecution {
-                                vm_state,
-                                behavior_idx: 0,
-                                step_name: String::new(),
-                            });
-                        actor.jit_yield_pending = true;
+            #[cfg(feature = "native-codegen")]
+            {
+                // JIT safepoint yield: capture state for inline resume.
+                if vm.yield_pending {
+                    if let Some(vm_state) = vm.take_suspended_state() {
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.suspended_execution =
+                                Some(crate::runtime::actor::SuspendedExecution {
+                                    vm_state,
+                                    behavior_idx: 0,
+                                    step_name: String::new(),
+                                });
+                            actor.jit_yield_pending = true;
+                        }
                     }
+                    crate::jit::runtime::clear_jit_safepoint_ptr();
+                    (*self_ptr).vm_exec_end();
+                    return Ok(Value::nil());
                 }
-                crate::jit::runtime::clear_jit_safepoint_ptr();
-                (*self_ptr).vm_exec_end();
-                return Ok(Value::nil());
             }
             // Capture VM state for a workflow signal wait, a non-blocking
             // LLM call, or a timed selective receive. Doing this here avoids
@@ -4491,6 +4522,7 @@ impl Runtime {
             // suspend still needs. Runs on every path, so wakes of other
             // actors are not lost when THIS actor suspends.
             (*self_ptr).vm_exec_end();
+            #[cfg(feature = "native-codegen")]
             crate::jit::runtime::clear_jit_safepoint_ptr();
             // String-id values index into this runtime VM's constant pool. When
             // the result is returned to a different VM (e.g. the top-level VM
@@ -4652,13 +4684,25 @@ impl Runtime {
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
-                let snapshot: HashMap<CrdtId, (CrdtType, Vec<u8>)> = crdt_snap
+                let crdt_map: HashMap<CrdtId, (CrdtType, Vec<u8>)> = crdt_snap
                     .iter()
                     .filter_map(|(id, ty, bytes)| {
                         CrdtType::from_u8(*ty).map(|t| (CrdtId(*id), (t, bytes.clone())))
                     })
                     .collect();
-                manager.restore(snapshot);
+                manager.restore(crdt_map);
+                // Rebuild the (actor_id, field_name) -> CrdtId mapping so
+                // `perform Crdt.*` can target recovered fields.
+                if let Some(field_map) = &snapshot.crdt_field_map {
+                    for (field_name, crdt_id) in field_map {
+                        manager
+                            .field_map
+                            .insert((actor_id, field_name.clone()), CrdtId(*crdt_id));
+                        manager
+                            .field_reverse
+                            .insert(CrdtId(*crdt_id), (actor_id, field_name.clone()));
+                    }
+                }
             }
         }
         for (name, value) in snapshot.state {
@@ -4770,6 +4814,15 @@ impl Runtime {
             self.layout_workflow_behavior_table(actor_id);
         } else {
             self.actors.insert(actor_id, actor);
+        }
+        // Ensure CRDT-backed fields are registered (or re-registered after
+        // recovery). `register_actor_fields` is idempotent, so declared fields
+        // not covered by the snapshot get fresh replicas while recovered fields
+        // reuse their restored CrdtIds.
+        if let Some(ref mut mgr) = self.crdt_manager {
+            if let Some(actor) = self.actors.get(&actor_id) {
+                mgr.register_actor_fields(actor_id, actor);
+            }
         }
 
         if is_workflow {
@@ -5151,6 +5204,16 @@ impl Runtime {
                     })
                     .collect();
                 manager.restore(crdt_map);
+                if let Some(field_map) = &snapshot.crdt_field_map {
+                    for (field_name, crdt_id) in field_map {
+                        manager
+                            .field_map
+                            .insert((actor_id, field_name.clone()), CrdtId(*crdt_id));
+                        manager
+                            .field_reverse
+                            .insert(CrdtId(*crdt_id), (actor_id, field_name.clone()));
+                    }
+                }
             }
         }
 
@@ -5158,6 +5221,11 @@ impl Runtime {
             self.layout_workflow_behavior_table(actor_id);
         }
         self.actors.insert(actor_id, actor);
+        if let Some(ref mut mgr) = self.crdt_manager {
+            if let Some(actor) = self.actors.get(&actor_id) {
+                mgr.register_actor_fields(actor_id, actor);
+            }
+        }
         self.enqueue_actor(actor_id);
 
         tracing::info!("nulang-migrate: actor {} received and enqueued", actor_id);
@@ -6065,7 +6133,11 @@ impl Runtime {
     /// their behaviors through AOT native code (bypassing the bytecode VM)
     /// when the behavior is compiled in the module; behaviors absent from the
     /// module keep their bytecode handlers.
-    pub fn register_aot_module(&mut self, module: crate::aot::AotModule) {
+    #[cfg(feature = "native-codegen")]
+    pub fn register_aot_module(
+        &mut self,
+        module: crate::aot::AotModule,
+    ) -> *const crate::aot::AotModule {
         // Box the module so its address is stable, then register the raw
         // pointer for every actor type it declares.
         let boxed = Box::new(module);
@@ -6074,6 +6146,7 @@ impl Runtime {
             self.aot_modules.entry(name).or_insert(module_ptr);
         }
         self.aot_module_storage.push(boxed);
+        module_ptr
     }
 
     /// Take the result of a previously issued remote spawn request.
@@ -6341,6 +6414,10 @@ pub(crate) struct ShadowReplica {
 /// Interval (in `sync_crdts` rounds) between full-state repair syncs.
 /// Round 1 is full; rounds 2..=N are delta; round N+1 is full again.
 const CRDT_FULL_SYNC_INTERVAL: u64 = 16;
+/// How often (in scheduler ticks) the runtime synchronizes CRDT state with
+/// healthy peers. Cheap when distribution is disabled: it only runs local
+/// tombstone GC and returns without counting a sync round.
+const CRDT_SYNC_INTERVAL_TICKS: u64 = 512;
 /// How often (in scheduler ticks) deferred local decrements are retried
 /// while actors are still running. Used by both the production
 /// `run_scheduler` and the deterministic DST scheduler.

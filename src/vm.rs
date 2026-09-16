@@ -26,7 +26,9 @@
 
 use std::ffi::{c_char, CStr, CString};
 
-use crate::backends::{create_default_jit, JitBackend, TieredAction};
+#[cfg(feature = "native-codegen")]
+use crate::backends::TieredAction;
+use crate::backends::{create_default_jit, JitBackend};
 use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
 use crate::ffi::{call_native, CType, Signature, FFI_REGISTRY};
 use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
@@ -2519,6 +2521,76 @@ impl VM {
         self.debug_hook = hook;
     }
 
+    /// Read the elements of a heap-allocated array value.
+    pub fn array_elements(&self, v: Value) -> Option<Vec<Value>> {
+        let ptr = v.as_ptr()?;
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag != HeapTypeTag::Array {
+                return None;
+            }
+            let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+            let len = payload_size / std::mem::size_of::<Value>();
+            let slots = std::slice::from_raw_parts(ptr as *const Value, len);
+            Some(slots.to_vec())
+        }
+    }
+
+    /// Read the elements of a heap-allocated tuple value.
+    pub fn tuple_elements(&self, v: Value) -> Option<Vec<Value>> {
+        let ptr = v.as_ptr()?;
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag != HeapTypeTag::Tuple {
+                return None;
+            }
+            let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+            let len = payload_size / std::mem::size_of::<Value>();
+            let slots = std::slice::from_raw_parts(ptr as *const Value, len);
+            Some(slots.to_vec())
+        }
+    }
+
+    /// Read the field values of a heap-allocated record value. Field names
+    /// are not stored on the heap; they must be recovered from the type
+    /// checker or from a separate name-to-index map.
+    pub fn record_field_values(&self, v: Value) -> Option<Vec<Value>> {
+        let ptr = v.as_ptr()?;
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag != HeapTypeTag::Record {
+                return None;
+            }
+            let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+            let len = payload_size / std::mem::size_of::<Value>();
+            let slots = std::slice::from_raw_parts(ptr as *const Value, len);
+            Some(slots.to_vec())
+        }
+    }
+
+    /// Return the UTF-8 bytes of a string value, whether it is an interned
+    /// string constant or a heap-allocated C string.
+    pub fn string_bytes(&self, v: Value) -> Option<Vec<u8>> {
+        if let Some(id) = v.as_string_id() {
+            let module_idx = self.modules.len().saturating_sub(1);
+            return self.modules.get(module_idx).and_then(|m| {
+                m.constants.get(id as usize).and_then(|c| match c {
+                    Constant::String(s) => Some(s.clone().into_bytes()),
+                    _ => None,
+                })
+            });
+        }
+        let ptr = v.as_ptr()?;
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag == HeapTypeTag::String {
+                Some(CStr::from_ptr(ptr as *const c_char).to_bytes().to_vec())
+            } else {
+                None
+            }
+        }
+    }
+
     /// Route `Print`/`SPrint`/`IO.print` output into `buf` instead of stdout
     /// (used by the DAP server to forward program output as `output` events
     /// without corrupting the DAP stream). `None` restores normal printing.
@@ -3086,6 +3158,35 @@ impl VM {
         }
     }
 
+    /// Call a top-level function in a loaded module by its bytecode offset.
+    ///
+    /// The first `args.len()` registers (r0..) receive the supplied arguments,
+    /// matching the MIR calling convention. Execution runs until the function
+    /// returns, halts, or errors; the value in register 0 is returned.
+    pub fn call_function(
+        &mut self,
+        module_idx: usize,
+        code_offset: usize,
+        args: &[Value],
+    ) -> NuResult<Value> {
+        if args.len() > 12 {
+            return Err(NuError::VMError {
+                msg: format!("call_function: too many arguments ({}, max 12)", args.len()),
+                span: Span::default(),
+            });
+        }
+        self.yield_pending = false;
+        self.frames.clear();
+        self.current_frame_idx = Some(0);
+        let mut frame = Frame::new(None, module_idx);
+        frame.pc = code_offset;
+        for (i, arg) in args.iter().enumerate() {
+            frame.regs[i] = *arg;
+        }
+        self.frames.push(frame);
+        self.run_from(module_idx, code_offset)
+    }
+
     /// Resume a previously suspended execution.
     ///
     /// Continues from the current frame state (set by `restore_suspended_state`)
@@ -3165,6 +3266,7 @@ impl VM {
     ///
     /// Returns `true` if the JIT executed a compiled region and advanced the
     /// PC — the caller should return `Ok(())` immediately.
+    #[cfg(feature = "native-codegen")]
     fn try_jit_execute(&mut self, frame_idx: usize) -> bool {
         let module_idx = self.frames[frame_idx].module_idx;
         let pc = self.frames[frame_idx].pc;
@@ -3266,6 +3368,11 @@ impl VM {
             // JIT executed but region not tracked — fall back to interpretation.
         }
         // JIT fell back to interpretation — continue in the interpreter.
+        false
+    }
+
+    #[cfg(not(feature = "native-codegen"))]
+    fn try_jit_execute(&mut self, _frame_idx: usize) -> bool {
         false
     }
 
@@ -3391,6 +3498,7 @@ impl VM {
     /// # Safety
     /// `regs` must point at the 256-entry register buffer of the compiled
     /// region that invoked this helper.
+    #[cfg(feature = "native-codegen")]
     pub(crate) fn jit_direct_call(
         &mut self,
         regs: *mut u64,
@@ -6493,6 +6601,7 @@ mod vm_tests {
     /// result. Guards the straight-line-region contract: compiled regions must
     /// not contain branches, because the VM advances pc by the full region
     /// length after a region runs.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_hot_loop_with_early_exit_branch() {
         let mut module = CodeModule::new("test_jit_early_exit");
@@ -6573,6 +6682,7 @@ mod vm_tests {
     /// back-edge, so `find_compilable_region` detects the loop and compiles
     /// it natively. Guards against silent regressions to interpreter-only
     /// arithmetic hot loops.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_source_hot_loop_tiers_up() {
         use crate::lexer::Lexer;
@@ -7300,6 +7410,7 @@ mod vm_tests {
     /// `constants_to_jit_bits` used to encode `Constant::String` as nil bits,
     /// so a hot loop loading a string constant produced nil once the region
     /// compiled, while the cold interpreter produced the string.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_hot_loop_string_constant_survives_tierup() {
         fn build_string_loop_module(limit: i64) -> CodeModule {
@@ -7372,6 +7483,7 @@ mod vm_tests {
     /// null/type/bounds checks and yield nil for out-of-bounds reads instead
     /// of dereferencing unchecked memory (a large offset used to read
     /// garbage or segfault after tier-up).
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_hot_oob_arrload_returns_nil() {
         fn build_oob_module(limit: i64) -> CodeModule {
@@ -7444,6 +7556,7 @@ mod vm_tests {
     /// Verify that a hot integer-arithmetic loop compiles through the
     /// type-directed (guard-stripped) path and produces the same result as
     /// the interpreter.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_typed_tiering_integer_loop() {
         let mut module = CodeModule::new("test_jit_typed_int_loop");
@@ -7894,6 +8007,7 @@ mod vm_tests {
     /// and panic in debug builds — 2^47 * 2^47 wraps to 0 once masked to
     /// 48 bits. The hot loop also exercises the `nulang_imul` JIT helper
     /// after tier-up.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_imul_boundary_value_wraps() {
         const BOUNDARY: i64 = 140737488355328; // 2^47

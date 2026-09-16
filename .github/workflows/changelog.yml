@@ -26,28 +26,29 @@ jobs:
           PR_TITLE="${{ github.event.pull_request.title }}"
           PR_LABELS="${{ toJson(github.event.pull_request.labels.*.name) }}"
 
-          # Types that always need a changelog entry
-          if echo "$PR_TITLE" | grep -qiE "^(feat|fix|perf)(\(|:)"; then
-            echo "needed=true" >> "$GITHUB_OUTPUT"
-            echo "reason=PR title indicates a user-visible change (feat/fix/perf)"
-            exit 0
-          fi
-
-          # Types that never need a changelog entry
-          if echo "$PR_TITLE" | grep -qiE "^(chore|ci|style|refactor|test|docs)(\(|:)"; then
-            echo "needed=false" >> "$GITHUB_OUTPUT"
-            echo "reason=PR title indicates an internal change (${PR_TITLE%%:*})"
-            exit 0
-          fi
-
-          # Check for skip-changelog label
+          # Explicit exemption wins over title classification. Without this
+          # ordering, feat/fix/perf PRs can never use the documented label.
           if echo "$PR_LABELS" | grep -qi "skip-changelog"; then
             echo "needed=false" >> "$GITHUB_OUTPUT"
             echo "reason=skip-changelog label present"
             exit 0
           fi
 
-          # Conservative: require changelog for unknown types
+          # Types that always need a changelog entry unless explicitly exempted.
+          if echo "$PR_TITLE" | grep -qiE "^(feat|fix|perf)(\(|:)"; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "reason=PR title indicates a user-visible change (feat/fix/perf)"
+            exit 0
+          fi
+
+          # Types that never need a changelog entry.
+          if echo "$PR_TITLE" | grep -qiE "^(chore|ci|style|refactor|test|docs)(\(|:)"; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "reason=PR title indicates an internal change (${PR_TITLE%%:*})"
+            exit 0
+          fi
+
+          # Conservative: require changelog for unknown types.
           echo "needed=true" >> "$GITHUB_OUTPUT"
           echo "reason=unknown PR type, changelog required by default"
 

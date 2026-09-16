@@ -42,7 +42,8 @@ use crate::vm::Value;
 
 /// The storage backend trait. This is the single point through which the
 /// runtime accesses durable storage. Concrete impls: `MemoryStore`,
-/// `JsonFileStore`, `SqliteStore` (feature `sqlite`).
+/// `JsonFileStore`, `SqliteStore` (feature `sqlite`), `RocksDbStore`
+/// (feature `rocksdb`), and `PostgresStore` (feature `postgres`).
 ///
 /// This is a re-export of [`crate::runtime::PersistenceStore`] — storage was
 /// already behind a trait. This alias makes the boundary discoverable from
@@ -536,13 +537,23 @@ impl CryptoProvider for DefaultCryptoProvider {
 // Factory functions — the only place concrete backend types are constructed
 // ---------------------------------------------------------------------------
 
-/// Create the default JIT backend (Cranelift via `JitSession`).
+/// Scheduler budget used by native-codegen safepoints.
 ///
-/// This is the **sole** call-site for `JitSession::new()` outside of tests.
-/// The VM calls this factory rather than importing `JitSession` directly,
-/// keeping the JIT implementation behind the `JitBackend` trait boundary.
+/// This lives outside `crate::jit` so interpreter-only runtimes can retain the
+/// actor bookkeeping fields without importing the Cranelift module tree.
+pub const JIT_SAFEPOINT_BUDGET: u64 = 1000;
+
+/// Create the default JIT backend when native code generation is compiled in.
+#[cfg(feature = "native-codegen")]
 pub fn create_default_jit() -> Option<Box<dyn JitBackend>> {
     crate::jit::JitSession::new().map(|j| Box::new(j) as Box<dyn JitBackend>)
+}
+
+/// Interpreter-only builds preserve the same VM trait boundary but have no
+/// native tier to instantiate.
+#[cfg(not(feature = "native-codegen"))]
+pub fn create_default_jit() -> Option<Box<dyn JitBackend>> {
+    None
 }
 #[cfg(test)]
 mod tests {

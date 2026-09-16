@@ -1,1 +1,1 @@
-{"exit_code":3,"stdout":"","stderr":"Error: Parse error at 1:21: Unexpected token in expression: as"}
+{"exit_code": 3, "stdout": "", "stderr": "Unexpected token in expression: as"}

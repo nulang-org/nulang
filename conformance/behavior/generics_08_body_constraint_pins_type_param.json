@@ -1,1 +1,1 @@
-{"exit_code": 4, "stdout": "", "stderr": "Type error at 5:1: Type mismatch: expected Int, found"}
+{"exit_code": 4, "stdout": "", "stderr": "Type mismatch: expected Int, found 't12"}

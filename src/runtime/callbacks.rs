@@ -466,6 +466,12 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                     .map(|m| m.is_crdt())
                     .unwrap_or(false)
                 {
+                    tracing::warn!(
+                        "nulang-crdt: ignoring raw assignment to CRDT field '{}' on actor {}; \
+                         use the Crdt.* effect module instead",
+                        field,
+                        actor.id
+                    );
                     return;
                 }
                 actor.set_state_field(field, value);
@@ -1214,6 +1220,12 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                     .map(|m| m.is_crdt())
                     .unwrap_or(false)
                 {
+                    tracing::warn!(
+                        "nulang-crdt: ignoring raw assignment to CRDT field '{}' on actor {}; \
+                         use the Crdt.* effect module instead",
+                        field,
+                        actor.id
+                    );
                     return;
                 }
                 actor.set_state_field(field, value);
@@ -2000,12 +2012,20 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                         .collect()
                 });
 
+                let crdt_field_map = rt.crdt_manager.as_ref().map(|m| {
+                    m.field_map
+                        .iter()
+                        .filter(|((aid, _), _)| *aid == actor_id)
+                        .map(|((_, name), id)| (name.clone(), id.0))
+                        .collect()
+                });
                 let snapshot = crate::runtime::persistence::ActorSnapshot {
                     actor_id,
                     sequence: actor.sequence,
                     state,
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,
+                    crdt_field_map,
                 };
 
                 let snapshot_json = match serde_json::to_vec(&snapshot) {

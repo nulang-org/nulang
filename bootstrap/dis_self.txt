@@ -1,0 +1,3803 @@
+magic=NLBC format_version=1 language_version=1
+source_hash=none
+instr_count=3493
+name=main
+function_table=[0, 1, 17, 33, 49, 65, 81, 99, 157, 169, 273, 276, 280, 285, 323, 326, 330, 335, 385, 388, 451, 454, 458, 522, 525, 529, 586, 589, 593, 598, 664, 667, 671, 676, 682, 824, 838, 865, 897, 925, 928, 932, 995, 998, 1002, 1007, 1097, 1100, 1104, 1109, 1207, 1210, 1214, 1219, 1289, 1292, 1296, 1353, 1356, 1360, 1447, 1450, 1454, 1533, 1536, 1611, 1614, 1617, 1620, 1747, 1795, 1798, 1801, 2037, 2040, 2043, 2137, 2140, 2143, 2231, 2234, 2237, 2240, 2243, 2246, 2249, 2252, 2255, 2258, 2644, 2647, 2650, 2653, 2656, 2659, 2662, 2665, 2668, 2671, 2894, 2897, 2900, 2903, 2906, 2982, 2985, 2988, 2991, 2994, 2997, 3000, 3003, 3006, 3009]
+exports=[]
+entry_point=None
+constants:
+  #  0 Int(131072)
+  #  1 Int(65536)
+  #  2 Int(256)
+  #  3 Int(16)
+  #  4 Int(64)
+  #  5 Int(10)
+  #  6 String('Int.to_string')
+  #  7 String('a')
+  #  8 Int(11)
+  #  9 String('b')
+  # 10 Int(12)
+  # 11 String('c')
+  # 12 Int(13)
+  # 13 String('d')
+  # 14 Int(14)
+  # 15 String('e')
+  # 16 String('f')
+  # 17 String('; ')
+  # 18 String('IO.print')
+  # 19 String('')
+  # 20 Int(268435456)
+  # 21 Int(16777216)
+  # 22 Int(1048576)
+  # 23 Int(4096)
+  # 24 String('String.charAt')
+  # 25 Int(3)
+  # 26 Int(262144)
+  # 27 Int(98)
+  # 28 Int(97)
+  # 29 Int(18)
+  # 30 Int(4)
+  # 31 Int(100)
+  # 32 Int(128)
+  # 33 Int(48)
+  # 34 Int(57)
+  # 35 Int(65)
+  # 36 Int(90)
+  # 37 Int(122)
+  # 38 Int(95)
+  # 39 Int(32)
+  # 40 Int(9)
+  # 41 Int(5)
+  # 42 Int(34)
+  # 43 String('String.from_char')
+  # 44 Int(6)
+  # 45 Int(8)
+  # 46 Int(43)
+  # 47 Int(45)
+  # 48 Int(42)
+  # 49 Int(47)
+  # 50 Int(38)
+  # 51 Int(61)
+  # 52 Int(33)
+  # 53 Int(255)
+  # 54 Int(60)
+  # 55 Int(67)
+  # 56 Int(62)
+  # 57 Int(68)
+  # 58 Int(66)
+  # 59 Int(58)
+  # 60 String('Jmp -> fn_end')
+  # 61 Int(80)
+  # 62 String('FN_START')
+  # 63 String('String.length')
+  # 64 Int(87)
+  # 65 String('fn_end:')
+  # 66 Int(96)
+  # 67 Int(40)
+  # 68 Int(41)
+  # 69 String('const ')
+  # 70 Int(144)
+  # 71 Int(44)
+  # 72 Int(21)
+instructions:
+
+; === fn #0 @ 0 ===
+      0: 50000e00  Jmp          r0   r14  r0   ; -> 15
+
+; === fn #1 @ 1 ===
+      1: 120a6500  Move         r10  r101 r0  
+      2: 12650b00  Move         r101 r11  r0  
+      3: 12650c00  Move         r101 r12  r0  
+      4: 0700000d  ConstU       r0   r0   r13  ; const #0 = Int(131072)
+      5: 230c0d0e  IDiv         r12  r13  r14 
+      6: 120ed600  Move         r14  r214 r0  
+      7: 12650d00  Move         r101 r13  r0  
+      8: 12d60e00  Move         r214 r14  r0  
+      9: 0700000f  ConstU       r0   r0   r15  ; const #0 = Int(131072)
+     10: 220e0f10  IMul         r14  r15  r16 
+     11: 210d100f  ISub         r13  r16  r15 
+     12: 120f0000  Move         r15  r0   r0  
+     13: 57000000  RetVal       r0   r0   r0  
+     14: 60000108  Closure      r0   r1   r8   ; fn #1 (offset 1)
+     15: 1208d000  Move         r8   r208 r0  
+     16: 50000e00  Jmp          r0   r14  r0   ; -> 31
+
+; === fn #2 @ 17 ===
+     17: 120a6600  Move         r10  r102 r0  
+     18: 12660b00  Move         r102 r11  r0  
+     19: 12660c00  Move         r102 r12  r0  
+     20: 0700010d  ConstU       r0   r1   r13  ; const #1 = Int(65536)
+     21: 230c0d0e  IDiv         r12  r13  r14 
+     22: 120ed700  Move         r14  r215 r0  
+     23: 12660d00  Move         r102 r13  r0  
+     24: 12d70e00  Move         r215 r14  r0  
+     25: 0700010f  ConstU       r0   r1   r15  ; const #1 = Int(65536)
+     26: 220e0f10  IMul         r14  r15  r16 
+     27: 210d100f  ISub         r13  r16  r15 
+     28: 120f0000  Move         r15  r0   r0  
+     29: 57000000  RetVal       r0   r0   r0  
+     30: 60000209  Closure      r0   r2   r9   ; fn #2 (offset 17)
+     31: 1209d200  Move         r9   r210 r0  
+     32: 50000e00  Jmp          r0   r14  r0   ; -> 47
+
+; === fn #3 @ 33 ===
+     33: 120a6700  Move         r10  r103 r0  
+     34: 12670b00  Move         r103 r11  r0  
+     35: 12670c00  Move         r103 r12  r0  
+     36: 0700020d  ConstU       r0   r2   r13  ; const #2 = Int(256)
+     37: 230c0d0e  IDiv         r12  r13  r14 
+     38: 120ed800  Move         r14  r216 r0  
+     39: 12670d00  Move         r103 r13  r0  
+     40: 12d80e00  Move         r216 r14  r0  
+     41: 0700020f  ConstU       r0   r2   r15  ; const #2 = Int(256)
+     42: 220e0f10  IMul         r14  r15  r16 
+     43: 210d100f  ISub         r13  r16  r15 
+     44: 120f0000  Move         r15  r0   r0  
+     45: 57000000  RetVal       r0   r0   r0  
+     46: 6000030a  Closure      r0   r3   r10  ; fn #3 (offset 33)
+     47: 120ad400  Move         r10  r212 r0  
+     48: 50000e00  Jmp          r0   r14  r0   ; -> 63
+
+; === fn #4 @ 49 ===
+     49: 120a6800  Move         r10  r104 r0  
+     50: 12680b00  Move         r104 r11  r0  
+     51: 12680c00  Move         r104 r12  r0  
+     52: 0700030d  ConstU       r0   r3   r13  ; const #3 = Int(16)
+     53: 230c0d0e  IDiv         r12  r13  r14 
+     54: 120ed900  Move         r14  r217 r0  
+     55: 12680d00  Move         r104 r13  r0  
+     56: 12d90e00  Move         r217 r14  r0  
+     57: 0700030f  ConstU       r0   r3   r15  ; const #3 = Int(16)
+     58: 220e0f10  IMul         r14  r15  r16 
+     59: 210d100f  ISub         r13  r16  r15 
+     60: 120f0000  Move         r15  r0   r0  
+     61: 57000000  RetVal       r0   r0   r0  
+     62: 6000040b  Closure      r0   r4   r11  ; fn #4 (offset 49)
+     63: 120bd600  Move         r11  r214 r0  
+     64: 50000e00  Jmp          r0   r14  r0   ; -> 79
+
+; === fn #5 @ 65 ===
+     65: 120a6900  Move         r10  r105 r0  
+     66: 12690b00  Move         r105 r11  r0  
+     67: 12690c00  Move         r105 r12  r0  
+     68: 0700040d  ConstU       r0   r4   r13  ; const #4 = Int(64)
+     69: 230c0d0e  IDiv         r12  r13  r14 
+     70: 120eda00  Move         r14  r218 r0  
+     71: 12690d00  Move         r105 r13  r0  
+     72: 12da0e00  Move         r218 r14  r0  
+     73: 0700040f  ConstU       r0   r4   r15  ; const #4 = Int(64)
+     74: 220e0f10  IMul         r14  r15  r16 
+     75: 210d100f  ISub         r13  r16  r15 
+     76: 120f0000  Move         r15  r0   r0  
+     77: 57000000  RetVal       r0   r0   r0  
+     78: 6000050c  Closure      r0   r5   r12  ; fn #5 (offset 65)
+     79: 120cd800  Move         r12  r216 r0  
+     80: 50001000  Jmp          r0   r16  r0   ; -> 97
+
+; === fn #6 @ 81 ===
+     81: 120a6a00  Move         r10  r106 r0  
+     82: 126a0b00  Move         r106 r11  r0  
+     83: 126a0c00  Move         r106 r12  r0  
+     84: 0700000d  ConstU       r0   r0   r13  ; const #0 = Int(131072)
+     85: 230c0d0e  IDiv         r12  r13  r14 
+     86: 120edb00  Move         r14  r219 r0  
+     87: 12db0d00  Move         r219 r13  r0  
+     88: 12db0e00  Move         r219 r14  r0  
+     89: 050f0000  Const2       r15  r0   r0  
+     90: 230e0f10  IDiv         r14  r15  r16 
+     91: 050f0000  Const2       r15  r0   r0  
+     92: 22100f10  IMul         r16  r15  r16 
+     93: 210d100f  ISub         r13  r16  r15 
+     94: 120f0000  Move         r15  r0   r0  
+     95: 57000000  RetVal       r0   r0   r0  
+     96: 6000060d  Closure      r0   r6   r13  ; fn #6 (offset 81)
+     97: 120dda00  Move         r13  r218 r0  
+     98: 50003800  Jmp          r0   r56  r0   ; -> 155
+
+; === fn #7 @ 99 ===
+     99: 120a6b00  Move         r10  r107 r0  
+    100: 126b0b00  Move         r107 r11  r0  
+    101: 126b0c00  Move         r107 r12  r0  
+    102: 0700050d  ConstU       r0   r5   r13  ; const #5 = Int(10)
+    103: 410c0d0e  ICmpLt       r12  r13  r14 
+    104: 520e0006  JmpF         r14  r0   r6   ; r14 ? -> 111
+    105: 126b0e00  Move         r107 r14  r0  
+    106: 120e0000  Move         r14  r0   r0  
+    107: 9000060d  Perform      r0   r6   r13  ; const #6 = String('Int.to_string')
+    108: 120d0e00  Move         r13  r14  r0  
+    109: 50002600  Jmp          r0   r38  r0   ; -> 148
+    110: 126b0d00  Move         r107 r13  r0  
+    111: 0700050e  ConstU       r0   r5   r14  ; const #5 = Int(10)
+    112: 400d0e0f  ICmpEq       r13  r14  r15 
+    113: 520f0004  JmpF         r15  r0   r4   ; r15 ? -> 118
+    114: 0700070e  ConstU       r0   r7   r14  ; const #7 = String('a')
+    115: 120e0f00  Move         r14  r15  r0  
+    116: 50001f00  Jmp          r0   r31  r0   ; -> 148
+    117: 126b0e00  Move         r107 r14  r0  
+    118: 0700080f  ConstU       r0   r8   r15  ; const #8 = Int(11)
+    119: 400e0f10  ICmpEq       r14  r15  r16 
+    120: 52100004  JmpF         r16  r0   r4   ; r16 ? -> 125
+    121: 0700090f  ConstU       r0   r9   r15  ; const #9 = String('b')
+    122: 120f1000  Move         r15  r16  r0  
+    123: 50001800  Jmp          r0   r24  r0   ; -> 148
+    124: 126b0f00  Move         r107 r15  r0  
+    125: 07000a10  ConstU       r0   r10  r16  ; const #10 = Int(12)
+    126: 400f1011  ICmpEq       r15  r16  r17 
+    127: 52110004  JmpF         r17  r0   r4   ; r17 ? -> 132
+    128: 07000b10  ConstU       r0   r11  r16  ; const #11 = String('c')
+    129: 12101100  Move         r16  r17  r0  
+    130: 50001100  Jmp          r0   r17  r0   ; -> 148
+    131: 126b1000  Move         r107 r16  r0  
+    132: 07000c11  ConstU       r0   r12  r17  ; const #12 = Int(13)
+    133: 40101112  ICmpEq       r16  r17  r18 
+    134: 52120004  JmpF         r18  r0   r4   ; r18 ? -> 139
+    135: 07000d11  ConstU       r0   r13  r17  ; const #13 = String('d')
+    136: 12111200  Move         r17  r18  r0  
+    137: 50000a00  Jmp          r0   r10  r0   ; -> 148
+    138: 126b1100  Move         r107 r17  r0  
+    139: 07000e12  ConstU       r0   r14  r18  ; const #14 = Int(14)
+    140: 40111213  ICmpEq       r17  r18  r19 
+    141: 52130004  JmpF         r19  r0   r4   ; r19 ? -> 146
+    142: 07000f12  ConstU       r0   r15  r18  ; const #15 = String('e')
+    143: 12121300  Move         r18  r19  r0  
+    144: 50000300  Jmp          r0   r3   r0   ; -> 148
+    145: 07001012  ConstU       r0   r16  r18  ; const #16 = String('f')
+    146: 12121300  Move         r18  r19  r0  
+    147: 12131200  Move         r19  r18  r0  
+    148: 12121100  Move         r18  r17  r0  
+    149: 12111000  Move         r17  r16  r0  
+    150: 12100f00  Move         r16  r15  r0  
+    151: 120f0e00  Move         r15  r14  r0  
+    152: 120e0000  Move         r14  r0   r0  
+    153: 57000000  RetVal       r0   r0   r0  
+    154: 6000070e  Closure      r0   r7   r14  ; fn #7 (offset 99)
+    155: 120edc00  Move         r14  r220 r0  
+    156: 50000a00  Jmp          r0   r10  r0   ; -> 167
+
+; === fn #8 @ 157 ===
+    157: 120a6c00  Move         r10  r108 r0  
+    158: 126c0b00  Move         r108 r11  r0  
+    159: 0700110d  ConstU       r0   r17  r13  ; const #17 = String('; ')
+    160: 126c0e00  Move         r108 r14  r0  
+    161: 200d0e0f  IAdd         r13  r14  r15 
+    162: 120f0000  Move         r15  r0   r0  
+    163: 9000120c  Perform      r0   r18  r12  ; const #18 = String('IO.print')
+    164: 120c0000  Move         r12  r0   r0  
+    165: 57000000  RetVal       r0   r0   r0  
+    166: 6000080f  Closure      r0   r8   r15  ; fn #8 (offset 157)
+    167: 120fde00  Move         r15  r222 r0  
+    168: 50006600  Jmp          r0   r102 r0   ; -> 271
+
+; === fn #9 @ 169 ===
+    169: 120a6d00  Move         r10  r109 r0  
+    170: 126d0b00  Move         r109 r11  r0  
+    171: 0700130d  ConstU       r0   r19  r13  ; const #19 = String('')
+    172: 12dc0e00  Move         r220 r14  r0  
+    173: 120eae00  Move         r14  r174 r0  
+    174: 12d60f00  Move         r214 r15  r0  
+    175: 120faf00  Move         r15  r175 r0  
+    176: 126d1000  Move         r109 r16  r0  
+    177: 07001411  ConstU       r0   r20  r17  ; const #20 = Int(268435456)
+    178: 23101112  IDiv         r16  r17  r18 
+    179: 12120a00  Move         r18  r10  r0  
+    180: 64af010f  ClosureCall  r175 r1   r15  ; closure r175 argc=1
+    181: 120f0a00  Move         r15  r10  r0  
+    182: 64ae010e  ClosureCall  r174 r1   r14  ; closure r174 argc=1
+    183: 12dc1000  Move         r220 r16  r0  
+    184: 1210b000  Move         r16  r176 r0  
+    185: 12d61100  Move         r214 r17  r0  
+    186: 1211b100  Move         r17  r177 r0  
+    187: 126d1200  Move         r109 r18  r0  
+    188: 07001513  ConstU       r0   r21  r19  ; const #21 = Int(16777216)
+    189: 23121314  IDiv         r18  r19  r20 
+    190: 12140a00  Move         r20  r10  r0  
+    191: 64b10111  ClosureCall  r177 r1   r17  ; closure r177 argc=1
+    192: 12110a00  Move         r17  r10  r0  
+    193: 64b00110  ClosureCall  r176 r1   r16  ; closure r176 argc=1
+    194: 12dc1200  Move         r220 r18  r0  
+    195: 1212b200  Move         r18  r178 r0  
+    196: 12d61300  Move         r214 r19  r0  
+    197: 1213b300  Move         r19  r179 r0  
+    198: 126d1400  Move         r109 r20  r0  
+    199: 07001615  ConstU       r0   r22  r21  ; const #22 = Int(1048576)
+    200: 23141516  IDiv         r20  r21  r22 
+    201: 12160a00  Move         r22  r10  r0  
+    202: 64b30113  ClosureCall  r179 r1   r19  ; closure r179 argc=1
+    203: 12130a00  Move         r19  r10  r0  
+    204: 64b20112  ClosureCall  r178 r1   r18  ; closure r178 argc=1
+    205: 12dc1400  Move         r220 r20  r0  
+    206: 1214b400  Move         r20  r180 r0  
+    207: 12d61500  Move         r214 r21  r0  
+    208: 1215b500  Move         r21  r181 r0  
+    209: 126d1600  Move         r109 r22  r0  
+    210: 07000117  ConstU       r0   r1   r23  ; const #1 = Int(65536)
+    211: 23161718  IDiv         r22  r23  r24 
+    212: 12180a00  Move         r24  r10  r0  
+    213: 64b50115  ClosureCall  r181 r1   r21  ; closure r181 argc=1
+    214: 12150a00  Move         r21  r10  r0  
+    215: 64b40114  ClosureCall  r180 r1   r20  ; closure r180 argc=1
+    216: 12dc1600  Move         r220 r22  r0  
+    217: 1216b600  Move         r22  r182 r0  
+    218: 12d61700  Move         r214 r23  r0  
+    219: 1217b700  Move         r23  r183 r0  
+    220: 126d1800  Move         r109 r24  r0  
+    221: 07001719  ConstU       r0   r23  r25  ; const #23 = Int(4096)
+    222: 2318191a  IDiv         r24  r25  r26 
+    223: 121a0a00  Move         r26  r10  r0  
+    224: 64b70117  ClosureCall  r183 r1   r23  ; closure r183 argc=1
+    225: 12170a00  Move         r23  r10  r0  
+    226: 64b60116  ClosureCall  r182 r1   r22  ; closure r182 argc=1
+    227: 12dc1800  Move         r220 r24  r0  
+    228: 1218b800  Move         r24  r184 r0  
+    229: 12d61900  Move         r214 r25  r0  
+    230: 1219b900  Move         r25  r185 r0  
+    231: 126d1a00  Move         r109 r26  r0  
+    232: 0700021b  ConstU       r0   r2   r27  ; const #2 = Int(256)
+    233: 231a1b1c  IDiv         r26  r27  r28 
+    234: 121c0a00  Move         r28  r10  r0  
+    235: 64b90119  ClosureCall  r185 r1   r25  ; closure r185 argc=1
+    236: 12190a00  Move         r25  r10  r0  
+    237: 64b80118  ClosureCall  r184 r1   r24  ; closure r184 argc=1
+    238: 12dc1a00  Move         r220 r26  r0  
+    239: 121aba00  Move         r26  r186 r0  
+    240: 12d61b00  Move         r214 r27  r0  
+    241: 121bbb00  Move         r27  r187 r0  
+    242: 126d1c00  Move         r109 r28  r0  
+    243: 0700031d  ConstU       r0   r3   r29  ; const #3 = Int(16)
+    244: 231c1d1e  IDiv         r28  r29  r30 
+    245: 121e0a00  Move         r30  r10  r0  
+    246: 64bb011b  ClosureCall  r187 r1   r27  ; closure r187 argc=1
+    247: 121b0a00  Move         r27  r10  r0  
+    248: 64ba011a  ClosureCall  r186 r1   r26  ; closure r186 argc=1
+    249: 12dc1c00  Move         r220 r28  r0  
+    250: 121cbc00  Move         r28  r188 r0  
+    251: 12d61d00  Move         r214 r29  r0  
+    252: 121dbd00  Move         r29  r189 r0  
+    253: 126d1e00  Move         r109 r30  r0  
+    254: 121e0a00  Move         r30  r10  r0  
+    255: 64bd011d  ClosureCall  r189 r1   r29  ; closure r189 argc=1
+    256: 121d0a00  Move         r29  r10  r0  
+    257: 64bc011c  ClosureCall  r188 r1   r28  ; closure r188 argc=1
+    258: 201a1c1d  IAdd         r26  r28  r29 
+    259: 20181d1b  IAdd         r24  r29  r27 
+    260: 20161b19  IAdd         r22  r27  r25 
+    261: 20141917  IAdd         r20  r25  r23 
+    262: 20121715  IAdd         r18  r23  r21 
+    263: 20101513  IAdd         r16  r21  r19 
+    264: 200e1311  IAdd         r14  r19  r17 
+    265: 200d110f  IAdd         r13  r17  r15 
+    266: 120f0000  Move         r15  r0   r0  
+    267: 9000120c  Perform      r0   r18  r12  ; const #18 = String('IO.print')
+    268: 120c0000  Move         r12  r0   r0  
+    269: 57000000  RetVal       r0   r0   r0  
+    270: 60000910  Closure      r0   r9   r16  ; fn #9 (offset 169)
+    271: 1210e000  Move         r16  r224 r0  
+    272: 50003000  Jmp          r0   r48  r0   ; -> 321
+
+; === fn #10 @ 273 ===
+    273: 120a6e00  Move         r10  r110 r0  
+    274: 126e0b00  Move         r110 r11  r0  
+    275: 50002900  Jmp          r0   r41  r0   ; -> 317
+
+; === fn #11 @ 276 ===
+    276: 120a6f00  Move         r10  r111 r0  
+    277: 61000b00  CapLoad      r0   r11  r0  
+    278: 126f0c00  Move         r111 r12  r0  
+    279: 50002000  Jmp          r0   r32  r0   ; -> 312
+
+; === fn #12 @ 280 ===
+    280: 120a7100  Move         r10  r113 r0  
+    281: 61000b00  CapLoad      r0   r11  r0  
+    282: 61010c00  CapLoad      r1   r12  r0  
+    283: 12710d00  Move         r113 r13  r0  
+    284: 50001500  Jmp          r0   r21  r0   ; -> 306
+
+; === fn #13 @ 285 ===
+    285: 120a7400  Move         r10  r116 r0  
+    286: 61000b00  CapLoad      r0   r11  r0  
+    287: 61010c00  CapLoad      r1   r12  r0  
+    288: 61020d00  CapLoad      r2   r13  r0  
+    289: 12740e00  Move         r116 r14  r0  
+    290: 120b0f00  Move         r11  r15  r0  
+    291: 07001510  ConstU       r0   r21  r16  ; const #21 = Int(16777216)
+    292: 220f1011  IMul         r15  r16  r17 
+    293: 120c1000  Move         r12  r16  r0  
+    294: 07000111  ConstU       r0   r1   r17  ; const #1 = Int(65536)
+    295: 22101112  IMul         r16  r17  r18 
+    296: 120d1100  Move         r13  r17  r0  
+    297: 07000212  ConstU       r0   r2   r18  ; const #2 = Int(256)
+    298: 22111213  IMul         r17  r18  r19 
+    299: 12741200  Move         r116 r18  r0  
+    300: 20131213  IAdd         r19  r18  r19 
+    301: 20121312  IAdd         r18  r19  r18 
+    302: 20111211  IAdd         r17  r18  r17 
+    303: 12110000  Move         r17  r0   r0  
+    304: 57000000  RetVal       r0   r0   r0  
+    305: 60000d0e  Closure      r0   r13  r14  ; fn #13 (offset 285)
+    306: 620e000b  CapStore     r14  r0   r11 
+    307: 620e010c  CapStore     r14  r1   r12 
+    308: 620e020d  CapStore     r14  r2   r13 
+    309: 120e0000  Move         r14  r0   r0  
+    310: 57000000  RetVal       r0   r0   r0  
+    311: 60000c0d  Closure      r0   r12  r13  ; fn #12 (offset 280)
+    312: 620d000b  CapStore     r13  r0   r11 
+    313: 620d010c  CapStore     r13  r1   r12 
+    314: 120d0000  Move         r13  r0   r0  
+    315: 57000000  RetVal       r0   r0   r0  
+    316: 60000b0c  Closure      r0   r11  r12  ; fn #11 (offset 276)
+    317: 620c000b  CapStore     r12  r0   r11 
+    318: 120c0000  Move         r12  r0   r0  
+    319: 57000000  RetVal       r0   r0   r0  
+    320: 60000a11  Closure      r0   r10  r17  ; fn #10 (offset 273)
+    321: 1211e200  Move         r17  r226 r0  
+    322: 50003c00  Jmp          r0   r60  r0   ; -> 383
+
+; === fn #14 @ 323 ===
+    323: 120a6f00  Move         r10  r111 r0  
+    324: 126f0b00  Move         r111 r11  r0  
+    325: 50003500  Jmp          r0   r53  r0   ; -> 379
+
+; === fn #15 @ 326 ===
+    326: 120a7000  Move         r10  r112 r0  
+    327: 61000b00  CapLoad      r0   r11  r0  
+    328: 12700c00  Move         r112 r12  r0  
+    329: 50002c00  Jmp          r0   r44  r0   ; -> 374
+
+; === fn #16 @ 330 ===
+    330: 120a7200  Move         r10  r114 r0  
+    331: 61000b00  CapLoad      r0   r11  r0  
+    332: 61010c00  CapLoad      r1   r12  r0  
+    333: 12720d00  Move         r114 r13  r0  
+    334: 50002100  Jmp          r0   r33  r0   ; -> 368
+
+; === fn #17 @ 335 ===
+    335: 120a7500  Move         r10  r117 r0  
+    336: 61000b00  CapLoad      r0   r11  r0  
+    337: 61010c00  CapLoad      r1   r12  r0  
+    338: 61020d00  CapLoad      r2   r13  r0  
+    339: 12750e00  Move         r117 r14  r0  
+    340: 12e20f00  Move         r226 r15  r0  
+    341: 120fbb00  Move         r15  r187 r0  
+    342: 120b1000  Move         r11  r16  r0  
+    343: 12100a00  Move         r16  r10  r0  
+    344: 64bb010f  ClosureCall  r187 r1   r15  ; closure r187 argc=1
+    345: 120fbc00  Move         r15  r188 r0  
+    346: 120c1100  Move         r12  r17  r0  
+    347: 12110a00  Move         r17  r10  r0  
+    348: 64bc0110  ClosureCall  r188 r1   r16  ; closure r188 argc=1
+    349: 1210bd00  Move         r16  r189 r0  
+    350: 120d1200  Move         r13  r18  r0  
+    351: 12120a00  Move         r18  r10  r0  
+    352: 64bd0111  ClosureCall  r189 r1   r17  ; closure r189 argc=1
+    353: 1211be00  Move         r17  r190 r0  
+    354: 12751300  Move         r117 r19  r0  
+    355: 12130a00  Move         r19  r10  r0  
+    356: 64be0112  ClosureCall  r190 r1   r18  ; closure r190 argc=1
+    357: 1212ec00  Move         r18  r236 r0  
+    358: 12e01000  Move         r224 r16  r0  
+    359: 1210bd00  Move         r16  r189 r0  
+    360: 12ec1100  Move         r236 r17  r0  
+    361: 12110a00  Move         r17  r10  r0  
+    362: 64bd0110  ClosureCall  r189 r1   r16  ; closure r189 argc=1
+    363: 1210ee00  Move         r16  r238 r0  
+    364: 03110000  Const0       r17  r0   r0  
+    365: 12110000  Move         r17  r0   r0  
+    366: 57000000  RetVal       r0   r0   r0  
+    367: 6000110e  Closure      r0   r17  r14  ; fn #17 (offset 335)
+    368: 620e000b  CapStore     r14  r0   r11 
+    369: 620e010c  CapStore     r14  r1   r12 
+    370: 620e020d  CapStore     r14  r2   r13 
+    371: 120e0000  Move         r14  r0   r0  
+    372: 57000000  RetVal       r0   r0   r0  
+    373: 6000100d  Closure      r0   r16  r13  ; fn #16 (offset 330)
+    374: 620d000b  CapStore     r13  r0   r11 
+    375: 620d010c  CapStore     r13  r1   r12 
+    376: 120d0000  Move         r13  r0   r0  
+    377: 57000000  RetVal       r0   r0   r0  
+    378: 60000f0c  Closure      r0   r15  r12  ; fn #15 (offset 326)
+    379: 620c000b  CapStore     r12  r0   r11 
+    380: 120c0000  Move         r12  r0   r0  
+    381: 57000000  RetVal       r0   r0   r0  
+    382: 60000e12  Closure      r0   r14  r18  ; fn #14 (offset 323)
+    383: 1212e400  Move         r18  r228 r0  
+    384: 50004000  Jmp          r0   r64  r0   ; -> 449
+
+; === fn #18 @ 385 ===
+    385: 120a7000  Move         r10  r112 r0  
+    386: 12700b00  Move         r112 r11  r0  
+    387: 50003900  Jmp          r0   r57  r0   ; -> 445
+
+; === fn #19 @ 388 ===
+    388: 120a7100  Move         r10  r113 r0  
+    389: 61000b00  CapLoad      r0   r11  r0  
+    390: 12710c00  Move         r113 r12  r0  
+    391: 120b0e00  Move         r11  r14  r0  
+    392: 120e0000  Move         r14  r0   r0  
+    393: 12711800  Move         r113 r24  r0  
+    394: 12180100  Move         r24  r1   r0  
+    395: 9000180d  Perform      r0   r24  r13  ; const #24 = String('String.charAt')
+    396: 040e0000  Const1       r14  r0   r0  
+    397: 210d0e0f  ISub         r13  r14  r15 
+    398: 120fe400  Move         r15  r228 r0  
+    399: 120b0f00  Move         r11  r15  r0  
+    400: 120f0000  Move         r15  r0   r0  
+    401: 12711900  Move         r113 r25  r0  
+    402: 041a0000  Const1       r26  r0   r0  
+    403: 20191a1b  IAdd         r25  r26  r27 
+    404: 121b0100  Move         r27  r1   r0  
+    405: 9000180e  Perform      r0   r24  r14  ; const #24 = String('String.charAt')
+    406: 040f0000  Const1       r15  r0   r0  
+    407: 210e0f10  ISub         r14  r15  r16 
+    408: 1210e600  Move         r16  r230 r0  
+    409: 120b1000  Move         r11  r16  r0  
+    410: 12100000  Move         r16  r0   r0  
+    411: 12711a00  Move         r113 r26  r0  
+    412: 051b0000  Const2       r27  r0   r0  
+    413: 201a1b1c  IAdd         r26  r27  r28 
+    414: 121c0100  Move         r28  r1   r0  
+    415: 9000180f  Perform      r0   r24  r15  ; const #24 = String('String.charAt')
+    416: 04100000  Const1       r16  r0   r0  
+    417: 210f1011  ISub         r15  r16  r17 
+    418: 1211e800  Move         r17  r232 r0  
+    419: 120b1100  Move         r11  r17  r0  
+    420: 12110000  Move         r17  r0   r0  
+    421: 12711b00  Move         r113 r27  r0  
+    422: 0700191c  ConstU       r0   r25  r28  ; const #25 = Int(3)
+    423: 201b1c1d  IAdd         r27  r28  r29 
+    424: 121d0100  Move         r29  r1   r0  
+    425: 90001810  Perform      r0   r24  r16  ; const #24 = String('String.charAt')
+    426: 04110000  Const1       r17  r0   r0  
+    427: 21101112  ISub         r16  r17  r18 
+    428: 1212ea00  Move         r18  r234 r0  
+    429: 12e41100  Move         r228 r17  r0  
+    430: 07001a12  ConstU       r0   r26  r18  ; const #26 = Int(262144)
+    431: 22111213  IMul         r17  r18  r19 
+    432: 12e61200  Move         r230 r18  r0  
+    433: 07001713  ConstU       r0   r23  r19  ; const #23 = Int(4096)
+    434: 22121314  IMul         r18  r19  r20 
+    435: 12e81300  Move         r232 r19  r0  
+    436: 07000414  ConstU       r0   r4   r20  ; const #4 = Int(64)
+    437: 22131415  IMul         r19  r20  r21 
+    438: 12ea1400  Move         r234 r20  r0  
+    439: 20151415  IAdd         r21  r20  r21 
+    440: 20141514  IAdd         r20  r21  r20 
+    441: 20131413  IAdd         r19  r20  r19 
+    442: 12130000  Move         r19  r0   r0  
+    443: 57000000  RetVal       r0   r0   r0  
+    444: 6000130c  Closure      r0   r19  r12  ; fn #19 (offset 388)
+    445: 620c000b  CapStore     r12  r0   r11 
+    446: 120c0000  Move         r12  r0   r0  
+    447: 57000000  RetVal       r0   r0   r0  
+    448: 60001213  Closure      r0   r18  r19  ; fn #18 (offset 385)
+    449: 1213e600  Move         r19  r230 r0  
+    450: 50004500  Jmp          r0   r69  r0   ; -> 520
+
+; === fn #20 @ 451 ===
+    451: 120a7100  Move         r10  r113 r0  
+    452: 12710b00  Move         r113 r11  r0  
+    453: 50003e00  Jmp          r0   r62  r0   ; -> 516
+
+; === fn #21 @ 454 ===
+    454: 120a7200  Move         r10  r114 r0  
+    455: 61000b00  CapLoad      r0   r11  r0  
+    456: 12720c00  Move         r114 r12  r0  
+    457: 50003500  Jmp          r0   r53  r0   ; -> 511
+
+; === fn #22 @ 458 ===
+    458: 120a7400  Move         r10  r116 r0  
+    459: 61000b00  CapLoad      r0   r11  r0  
+    460: 61010c00  CapLoad      r1   r12  r0  
+    461: 12740d00  Move         r116 r13  r0  
+    462: 0700080e  ConstU       r0   r8   r14  ; const #8 = Int(11)
+    463: 120c0f00  Move         r12  r15  r0  
+    464: 200e0f10  IAdd         r14  r15  r16 
+    465: 1210e900  Move         r16  r233 r0  
+    466: 12740f00  Move         r116 r15  r0  
+    467: 03100000  Const0       r16  r0   r0  
+    468: 400f1011  ICmpEq       r15  r16  r17 
+    469: 49111100  Not          r17  r17  r0  
+    470: 52110014  JmpF         r17  r0   r20  ; r17 ? -> 491
+    471: 12e41000  Move         r228 r16  r0  
+    472: 1210ba00  Move         r16  r186 r0  
+    473: 07001b11  ConstU       r0   r27  r17  ; const #27 = Int(98)
+    474: 12110a00  Move         r17  r10  r0  
+    475: 64ba0110  ClosureCall  r186 r1   r16  ; closure r186 argc=1
+    476: 1210bb00  Move         r16  r187 r0  
+    477: 120b1200  Move         r11  r18  r0  
+    478: 12120a00  Move         r18  r10  r0  
+    479: 64bb0111  ClosureCall  r187 r1   r17  ; closure r187 argc=1
+    480: 1211bc00  Move         r17  r188 r0  
+    481: 120c1300  Move         r12  r19  r0  
+    482: 12130a00  Move         r19  r10  r0  
+    483: 64bc0112  ClosureCall  r188 r1   r18  ; closure r188 argc=1
+    484: 1212bd00  Move         r18  r189 r0  
+    485: 12e91400  Move         r233 r20  r0  
+    486: 12140a00  Move         r20  r10  r0  
+    487: 64bd0113  ClosureCall  r189 r1   r19  ; closure r189 argc=1
+    488: 12131100  Move         r19  r17  r0  
+    489: 50017300  Jmp          r1   r115 r0   ; -> 861
+    490: 12e41000  Move         r228 r16  r0  
+    491: 1210ba00  Move         r16  r186 r0  
+    492: 07001c11  ConstU       r0   r28  r17  ; const #28 = Int(97)
+    493: 12110a00  Move         r17  r10  r0  
+    494: 64ba0110  ClosureCall  r186 r1   r16  ; closure r186 argc=1
+    495: 1210bb00  Move         r16  r187 r0  
+    496: 120c1200  Move         r12  r18  r0  
+    497: 12120a00  Move         r18  r10  r0  
+    498: 64bb0111  ClosureCall  r187 r1   r17  ; closure r187 argc=1
+    499: 1211bc00  Move         r17  r188 r0  
+    500: 12e91300  Move         r233 r19  r0  
+    501: 12130a00  Move         r19  r10  r0  
+    502: 64bc0112  ClosureCall  r188 r1   r18  ; closure r188 argc=1
+    503: 1212bd00  Move         r18  r189 r0  
+    504: 03140000  Const0       r20  r0   r0  
+    505: 12140a00  Move         r20  r10  r0  
+    506: 64bd0113  ClosureCall  r189 r1   r19  ; closure r189 argc=1
+    507: 12131100  Move         r19  r17  r0  
+    508: 12110000  Move         r17  r0   r0  
+    509: 57000000  RetVal       r0   r0   r0  
+    510: 6000160d  Closure      r0   r22  r13  ; fn #22 (offset 458)
+    511: 620d000b  CapStore     r13  r0   r11 
+    512: 620d010c  CapStore     r13  r1   r12 
+    513: 120d0000  Move         r13  r0   r0  
+    514: 57000000  RetVal       r0   r0   r0  
+    515: 6000150c  Closure      r0   r21  r12  ; fn #21 (offset 454)
+    516: 620c000b  CapStore     r12  r0   r11 
+    517: 120c0000  Move         r12  r0   r0  
+    518: 57000000  RetVal       r0   r0   r0  
+    519: 60001414  Closure      r0   r20  r20  ; fn #20 (offset 451)
+    520: 1214e800  Move         r20  r232 r0  
+    521: 50003e00  Jmp          r0   r62  r0   ; -> 584
+
+; === fn #23 @ 522 ===
+    522: 120a7200  Move         r10  r114 r0  
+    523: 12720b00  Move         r114 r11  r0  
+    524: 50003700  Jmp          r0   r55  r0   ; -> 580
+
+; === fn #24 @ 525 ===
+    525: 120a7300  Move         r10  r115 r0  
+    526: 61000b00  CapLoad      r0   r11  r0  
+    527: 12730c00  Move         r115 r12  r0  
+    528: 50002e00  Jmp          r0   r46  r0   ; -> 575
+
+; === fn #25 @ 529 ===
+    529: 120a7500  Move         r10  r117 r0  
+    530: 61000b00  CapLoad      r0   r11  r0  
+    531: 61010c00  CapLoad      r1   r12  r0  
+    532: 12750d00  Move         r117 r13  r0  
+    533: 0700080e  ConstU       r0   r8   r14  ; const #8 = Int(11)
+    534: 120c0f00  Move         r12  r15  r0  
+    535: 200e0f10  IAdd         r14  r15  r16 
+    536: 1210ea00  Move         r16  r234 r0  
+    537: 12e40f00  Move         r228 r15  r0  
+    538: 120fbb00  Move         r15  r187 r0  
+    539: 07001d10  ConstU       r0   r29  r16  ; const #29 = Int(18)
+    540: 12100a00  Move         r16  r10  r0  
+    541: 64bb010f  ClosureCall  r187 r1   r15  ; closure r187 argc=1
+    542: 120fbc00  Move         r15  r188 r0  
+    543: 120b1100  Move         r11  r17  r0  
+    544: 12110a00  Move         r17  r10  r0  
+    545: 64bc0110  ClosureCall  r188 r1   r16  ; closure r188 argc=1
+    546: 1210bd00  Move         r16  r189 r0  
+    547: 12ea1200  Move         r234 r18  r0  
+    548: 12120a00  Move         r18  r10  r0  
+    549: 64bd0111  ClosureCall  r189 r1   r17  ; closure r189 argc=1
+    550: 1211be00  Move         r17  r190 r0  
+    551: 03130000  Const0       r19  r0   r0  
+    552: 12130a00  Move         r19  r10  r0  
+    553: 64be0112  ClosureCall  r190 r1   r18  ; closure r190 argc=1
+    554: 1212ec00  Move         r18  r236 r0  
+    555: 12e41000  Move         r228 r16  r0  
+    556: 1210bc00  Move         r16  r188 r0  
+    557: 07001b11  ConstU       r0   r27  r17  ; const #27 = Int(98)
+    558: 12110a00  Move         r17  r10  r0  
+    559: 64bc0110  ClosureCall  r188 r1   r16  ; closure r188 argc=1
+    560: 1210bd00  Move         r16  r189 r0  
+    561: 12751200  Move         r117 r18  r0  
+    562: 12120a00  Move         r18  r10  r0  
+    563: 64bd0111  ClosureCall  r189 r1   r17  ; closure r189 argc=1
+    564: 1211be00  Move         r17  r190 r0  
+    565: 120c1300  Move         r12  r19  r0  
+    566: 12130a00  Move         r19  r10  r0  
+    567: 64be0112  ClosureCall  r190 r1   r18  ; closure r190 argc=1
+    568: 1212bf00  Move         r18  r191 r0  
+    569: 12ea1400  Move         r234 r20  r0  
+    570: 12140a00  Move         r20  r10  r0  
+    571: 64bf0113  ClosureCall  r191 r1   r19  ; closure r191 argc=1
+    572: 12130000  Move         r19  r0   r0  
+    573: 57000000  RetVal       r0   r0   r0  
+    574: 6000190d  Closure      r0   r25  r13  ; fn #25 (offset 529)
+    575: 620d000b  CapStore     r13  r0   r11 
+    576: 620d010c  CapStore     r13  r1   r12 
+    577: 120d0000  Move         r13  r0   r0  
+    578: 57000000  RetVal       r0   r0   r0  
+    579: 6000180c  Closure      r0   r24  r12  ; fn #24 (offset 525)
+    580: 620c000b  CapStore     r12  r0   r11 
+    581: 120c0000  Move         r12  r0   r0  
+    582: 57000000  RetVal       r0   r0   r0  
+    583: 60001715  Closure      r0   r23  r21  ; fn #23 (offset 522)
+    584: 1215ea00  Move         r21  r234 r0  
+    585: 50004c00  Jmp          r0   r76  r0   ; -> 662
+
+; === fn #26 @ 586 ===
+    586: 120a7300  Move         r10  r115 r0  
+    587: 12730b00  Move         r115 r11  r0  
+    588: 50004500  Jmp          r0   r69  r0   ; -> 658
+
+; === fn #27 @ 589 ===
+    589: 120a7400  Move         r10  r116 r0  
+    590: 61000b00  CapLoad      r0   r11  r0  
+    591: 12740c00  Move         r116 r12  r0  
+    592: 50003c00  Jmp          r0   r60  r0   ; -> 653
+
+; === fn #28 @ 593 ===
+    593: 120a7600  Move         r10  r118 r0  
+    594: 61000b00  CapLoad      r0   r11  r0  
+    595: 61010c00  CapLoad      r1   r12  r0  
+    596: 12760d00  Move         r118 r13  r0  
+    597: 50003100  Jmp          r0   r49  r0   ; -> 647
+
+; === fn #29 @ 598 ===
+    598: 120a7900  Move         r10  r121 r0  
+    599: 61000b00  CapLoad      r0   r11  r0  
+    600: 61010c00  CapLoad      r1   r12  r0  
+    601: 61020d00  CapLoad      r2   r13  r0  
+    602: 12790e00  Move         r121 r14  r0  
+    603: 120d0f00  Move         r13  r15  r0  
+    604: 120c1000  Move         r12  r16  r0  
+    605: 440f1011  ICmpGe       r15  r16  r17 
+    606: 52110004  JmpF         r17  r0   r4   ; r17 ? -> 611
+    607: 03100000  Const0       r16  r0   r0  
+    608: 12101100  Move         r16  r17  r0  
+    609: 5000fb00  Jmp          r0   r251 r0   ; -> 861
+    610: 12e81000  Move         r232 r16  r0  
+    611: 1210c000  Move         r16  r192 r0  
+    612: 120b1100  Move         r11  r17  r0  
+    613: 12110a00  Move         r17  r10  r0  
+    614: 64c00110  ClosureCall  r192 r1   r16  ; closure r192 argc=1
+    615: 1210c100  Move         r16  r193 r0  
+    616: 120d1200  Move         r13  r18  r0  
+    617: 12120a00  Move         r18  r10  r0  
+    618: 64c10111  ClosureCall  r193 r1   r17  ; closure r193 argc=1
+    619: 1211c200  Move         r17  r194 r0  
+    620: 12791300  Move         r121 r19  r0  
+    621: 12130a00  Move         r19  r10  r0  
+    622: 64c20112  ClosureCall  r194 r1   r18  ; closure r194 argc=1
+    623: 1212f100  Move         r18  r241 r0  
+    624: 12ec1100  Move         r236 r17  r0  
+    625: 1211c100  Move         r17  r193 r0  
+    626: 120b1200  Move         r11  r18  r0  
+    627: 12120a00  Move         r18  r10  r0  
+    628: 64c10111  ClosureCall  r193 r1   r17  ; closure r193 argc=1
+    629: 1211c200  Move         r17  r194 r0  
+    630: 120c1300  Move         r12  r19  r0  
+    631: 12130a00  Move         r19  r10  r0  
+    632: 64c20112  ClosureCall  r194 r1   r18  ; closure r194 argc=1
+    633: 1212c300  Move         r18  r195 r0  
+    634: 120d1400  Move         r13  r20  r0  
+    635: 04150000  Const1       r21  r0   r0  
+    636: 20141516  IAdd         r20  r21  r22 
+    637: 12160a00  Move         r22  r10  r0  
+    638: 64c30113  ClosureCall  r195 r1   r19  ; closure r195 argc=1
+    639: 1213c400  Move         r19  r196 r0  
+    640: 12791500  Move         r121 r21  r0  
+    641: 12150a00  Move         r21  r10  r0  
+    642: 64c40114  ClosureCall  r196 r1   r20  ; closure r196 argc=1
+    643: 12141100  Move         r20  r17  r0  
+    644: 12110000  Move         r17  r0   r0  
+    645: 57000000  RetVal       r0   r0   r0  
+    646: 60001d0e  Closure      r0   r29  r14  ; fn #29 (offset 598)
+    647: 620e000b  CapStore     r14  r0   r11 
+    648: 620e010c  CapStore     r14  r1   r12 
+    649: 620e020d  CapStore     r14  r2   r13 
+    650: 120e0000  Move         r14  r0   r0  
+    651: 57000000  RetVal       r0   r0   r0  
+    652: 60001c0d  Closure      r0   r28  r13  ; fn #28 (offset 593)
+    653: 620d000b  CapStore     r13  r0   r11 
+    654: 620d010c  CapStore     r13  r1   r12 
+    655: 120d0000  Move         r13  r0   r0  
+    656: 57000000  RetVal       r0   r0   r0  
+    657: 60001b0c  Closure      r0   r27  r12  ; fn #27 (offset 589)
+    658: 620c000b  CapStore     r12  r0   r11 
+    659: 120c0000  Move         r12  r0   r0  
+    660: 57000000  RetVal       r0   r0   r0  
+    661: 60001a16  Closure      r0   r26  r22  ; fn #26 (offset 586)
+    662: 1216ec00  Move         r22  r236 r0  
+    663: 50009e00  Jmp          r0   r158 r0   ; -> 822
+
+; === fn #30 @ 664 ===
+    664: 120a7400  Move         r10  r116 r0  
+    665: 12740b00  Move         r116 r11  r0  
+    666: 50009700  Jmp          r0   r151 r0   ; -> 818
+
+; === fn #31 @ 667 ===
+    667: 120a7500  Move         r10  r117 r0  
+    668: 61000b00  CapLoad      r0   r11  r0  
+    669: 12750c00  Move         r117 r12  r0  
+    670: 50008e00  Jmp          r0   r142 r0   ; -> 813
+
+; === fn #32 @ 671 ===
+    671: 120a7700  Move         r10  r119 r0  
+    672: 61000b00  CapLoad      r0   r11  r0  
+    673: 61010c00  CapLoad      r1   r12  r0  
+    674: 12770d00  Move         r119 r13  r0  
+    675: 50008300  Jmp          r0   r131 r0   ; -> 807
+
+; === fn #33 @ 676 ===
+    676: 120a7a00  Move         r10  r122 r0  
+    677: 61000b00  CapLoad      r0   r11  r0  
+    678: 61010c00  CapLoad      r1   r12  r0  
+    679: 61020d00  CapLoad      r2   r13  r0  
+    680: 127a0e00  Move         r122 r14  r0  
+    681: 50007600  Jmp          r0   r118 r0   ; -> 800
+
+; === fn #34 @ 682 ===
+    682: 120a7e00  Move         r10  r126 r0  
+    683: 61000b00  CapLoad      r0   r11  r0  
+    684: 61010c00  CapLoad      r1   r12  r0  
+    685: 61020d00  CapLoad      r2   r13  r0  
+    686: 61030e00  CapLoad      r3   r14  r0  
+    687: 127e0f00  Move         r126 r15  r0  
+    688: 120d1000  Move         r13  r16  r0  
+    689: 120c1100  Move         r12  r17  r0  
+    690: 44101112  ICmpGe       r16  r17  r18 
+    691: 52120004  JmpF         r18  r0   r4   ; r18 ? -> 696
+    692: 120e1100  Move         r14  r17  r0  
+    693: 12111200  Move         r17  r18  r0  
+    694: 5000a600  Jmp          r0   r166 r0   ; -> 861
+    695: 12e61100  Move         r230 r17  r0  
+    696: 1211c700  Move         r17  r199 r0  
+    697: 120b1200  Move         r11  r18  r0  
+    698: 12120a00  Move         r18  r10  r0  
+    699: 64c70111  ClosureCall  r199 r1   r17  ; closure r199 argc=1
+    700: 1211c800  Move         r17  r200 r0  
+    701: 120d1300  Move         r13  r19  r0  
+    702: 07001e14  ConstU       r0   r30  r20  ; const #30 = Int(4)
+    703: 22131415  IMul         r19  r20  r21 
+    704: 12150a00  Move         r21  r10  r0  
+    705: 64c80112  ClosureCall  r200 r1   r18  ; closure r200 argc=1
+    706: 1212f800  Move         r18  r248 r0  
+    707: 12d41200  Move         r212 r18  r0  
+    708: 1212c900  Move         r18  r201 r0  
+    709: 12f81300  Move         r248 r19  r0  
+    710: 12130a00  Move         r19  r10  r0  
+    711: 64c90112  ClosureCall  r201 r1   r18  ; closure r201 argc=1
+    712: 1212fa00  Move         r18  r250 r0  
+    713: 12fa1300  Move         r250 r19  r0  
+    714: 07001f14  ConstU       r0   r31  r20  ; const #31 = Int(100)
+    715: 44131415  ICmpGe       r19  r20  r21 
+    716: 52150004  JmpF         r21  r0   r4   ; r21 ? -> 721
+    717: 12fa1700  Move         r250 r23  r0  
+    718: 07002018  ConstU       r0   r32  r24  ; const #32 = Int(128)
+    719: 41171819  ICmpLt       r23  r24  r25 
+    720: 1219fc00  Move         r25  r252 r0  
+    721: 12fc1400  Move         r252 r20  r0  
+    722: 03070000  Const0       r7   r0   r0  
+    723: 40140716  ICmpEq       r20  r7   r22 
+    724: 49161600  Not          r22  r22  r0  
+    725: 5216002f  JmpF         r22  r0   r47  ; r22 ? -> 773
+    726: 04170000  Const1       r23  r0   r0  
+    727: 40071718  ICmpEq       r7   r23  r24 
+    728: 40141819  ICmpEq       r20  r24  r25 
+    729: 49191900  Not          r25  r25  r0  
+    730: 5219002a  JmpF         r25  r0   r42  ; r25 ? -> 773
+    731: 12ea1500  Move         r234 r21  r0  
+    732: 12155d00  Move         r21  r93  r0  
+    733: 12fa1600  Move         r250 r22  r0  
+    734: 12160a00  Move         r22  r10  r0  
+    735: 645d0115  ClosureCall  r93  r1   r21  ; closure r93 argc=1
+    736: 12155e00  Move         r21  r94  r0  
+    737: 120e1700  Move         r14  r23  r0  
+    738: 12170a00  Move         r23  r10  r0  
+    739: 645e0116  ClosureCall  r94  r1   r22  ; closure r94 argc=1
+    740: 12165f00  Move         r22  r95  r0  
+    741: 127e1800  Move         r126 r24  r0  
+    742: 12180a00  Move         r24  r10  r0  
+    743: 645f0117  ClosureCall  r95  r1   r23  ; closure r95 argc=1
+    744: 1217ff00  Move         r23  r255 r0  
+    745: 12ee1600  Move         r238 r22  r0  
+    746: 12165e00  Move         r22  r94  r0  
+    747: 120b1700  Move         r11  r23  r0  
+    748: 12170a00  Move         r23  r10  r0  
+    749: 645e0116  ClosureCall  r94  r1   r22  ; closure r94 argc=1
+    750: 12165f00  Move         r22  r95  r0  
+    751: 120c1800  Move         r12  r24  r0  
+    752: 12180a00  Move         r24  r10  r0  
+    753: 645f0117  ClosureCall  r95  r1   r23  ; closure r95 argc=1
+    754: 12176000  Move         r23  r96  r0  
+    755: 120d1900  Move         r13  r25  r0  
+    756: 041a0000  Const1       r26  r0   r0  
+    757: 20191a1b  IAdd         r25  r26  r27 
+    758: 121b0a00  Move         r27  r10  r0  
+    759: 64600118  ClosureCall  r96  r1   r24  ; closure r96 argc=1
+    760: 12186100  Move         r24  r97  r0  
+    761: 120e1a00  Move         r14  r26  r0  
+    762: 041b0000  Const1       r27  r0   r0  
+    763: 201a1b1c  IAdd         r26  r27  r28 
+    764: 121c0a00  Move         r28  r10  r0  
+    765: 64610119  ClosureCall  r97  r1   r25  ; closure r97 argc=1
+    766: 12196200  Move         r25  r98  r0  
+    767: 127e1b00  Move         r126 r27  r0  
+    768: 121b0a00  Move         r27  r10  r0  
+    769: 6462011a  ClosureCall  r98  r1   r26  ; closure r98 argc=1
+    770: 121a1600  Move         r26  r22  r0  
+    771: 50005900  Jmp          r0   r89  r0   ; -> 861
+    772: 12ee1500  Move         r238 r21  r0  
+    773: 1215cd00  Move         r21  r205 r0  
+    774: 120b1600  Move         r11  r22  r0  
+    775: 12160a00  Move         r22  r10  r0  
+    776: 64cd0115  ClosureCall  r205 r1   r21  ; closure r205 argc=1
+    777: 12155d00  Move         r21  r93  r0  
+    778: 120c1700  Move         r12  r23  r0  
+    779: 12170a00  Move         r23  r10  r0  
+    780: 645d0116  ClosureCall  r93  r1   r22  ; closure r93 argc=1
+    781: 12165e00  Move         r22  r94  r0  
+    782: 120d1800  Move         r13  r24  r0  
+    783: 04190000  Const1       r25  r0   r0  
+    784: 2018191a  IAdd         r24  r25  r26 
+    785: 121a0a00  Move         r26  r10  r0  
+    786: 645e0117  ClosureCall  r94  r1   r23  ; closure r94 argc=1
+    787: 12175f00  Move         r23  r95  r0  
+    788: 120e1900  Move         r14  r25  r0  
+    789: 12190a00  Move         r25  r10  r0  
+    790: 645f0118  ClosureCall  r95  r1   r24  ; closure r95 argc=1
+    791: 12186000  Move         r24  r96  r0  
+    792: 127e1a00  Move         r126 r26  r0  
+    793: 121a0a00  Move         r26  r10  r0  
+    794: 64600119  ClosureCall  r96  r1   r25  ; closure r96 argc=1
+    795: 12191600  Move         r25  r22  r0  
+    796: 12161200  Move         r22  r18  r0  
+    797: 12120000  Move         r18  r0   r0  
+    798: 57000000  RetVal       r0   r0   r0  
+    799: 6000220f  Closure      r0   r34  r15  ; fn #34 (offset 682)
+    800: 620f000b  CapStore     r15  r0   r11 
+    801: 620f010c  CapStore     r15  r1   r12 
+    802: 620f020d  CapStore     r15  r2   r13 
+    803: 620f030e  CapStore     r15  r3   r14 
+    804: 120f0000  Move         r15  r0   r0  
+    805: 57000000  RetVal       r0   r0   r0  
+    806: 6000210e  Closure      r0   r33  r14  ; fn #33 (offset 676)
+    807: 620e000b  CapStore     r14  r0   r11 
+    808: 620e010c  CapStore     r14  r1   r12 
+    809: 620e020d  CapStore     r14  r2   r13 
+    810: 120e0000  Move         r14  r0   r0  
+    811: 57000000  RetVal       r0   r0   r0  
+    812: 6000200d  Closure      r0   r32  r13  ; fn #32 (offset 671)
+    813: 620d000b  CapStore     r13  r0   r11 
+    814: 620d010c  CapStore     r13  r1   r12 
+    815: 120d0000  Move         r13  r0   r0  
+    816: 57000000  RetVal       r0   r0   r0  
+    817: 60001f0c  Closure      r0   r31  r12  ; fn #31 (offset 667)
+    818: 620c000b  CapStore     r12  r0   r11 
+    819: 120c0000  Move         r12  r0   r0  
+    820: 57000000  RetVal       r0   r0   r0  
+    821: 60001e17  Closure      r0   r30  r23  ; fn #30 (offset 664)
+    822: 1217ee00  Move         r23  r238 r0  
+    823: 50000c00  Jmp          r0   r12  r0   ; -> 836
+
+; === fn #35 @ 824 ===
+    824: 120a7500  Move         r10  r117 r0  
+    825: 12750b00  Move         r117 r11  r0  
+    826: 12750c00  Move         r117 r12  r0  
+    827: 0700210d  ConstU       r0   r33  r13  ; const #33 = Int(48)
+    828: 440c0d0e  ICmpGe       r12  r13  r14 
+    829: 520e0004  JmpF         r14  r0   r4   ; r14 ? -> 834
+    830: 12751000  Move         r117 r16  r0  
+    831: 07002211  ConstU       r0   r34  r17  ; const #34 = Int(57)
+    832: 43101112  ICmpLe       r16  r17  r18 
+    833: 12120000  Move         r18  r0   r0  
+    834: 57000000  RetVal       r0   r0   r0  
+    835: 60002318  Closure      r0   r35  r24  ; fn #35 (offset 824)
+    836: 1218f000  Move         r24  r240 r0  
+    837: 50001900  Jmp          r0   r25  r0   ; -> 863
+
+; === fn #36 @ 838 ===
+    838: 120a7600  Move         r10  r118 r0  
+    839: 12760b00  Move         r118 r11  r0  
+    840: 12760c00  Move         r118 r12  r0  
+    841: 0700230d  ConstU       r0   r35  r13  ; const #35 = Int(65)
+    842: 440c0d0e  ICmpGe       r12  r13  r14 
+    843: 520e0004  JmpF         r14  r0   r4   ; r14 ? -> 848
+    844: 12761000  Move         r118 r16  r0  
+    845: 07002411  ConstU       r0   r36  r17  ; const #36 = Int(90)
+    846: 43101112  ICmpLe       r16  r17  r18 
+    847: 03070000  Const0       r7   r0   r0  
+    848: 4012070d  ICmpEq       r18  r7   r13 
+    849: 490d0d00  Not          r13  r13  r0  
+    850: 520d0003  JmpF         r13  r0   r3   ; r13 ? -> 854
+    851: 040e0000  Const1       r14  r0   r0  
+    852: 50000800  Jmp          r0   r8   r0   ; -> 861
+    853: 12760f00  Move         r118 r15  r0  
+    854: 07001c10  ConstU       r0   r28  r16  ; const #28 = Int(97)
+    855: 440f1011  ICmpGe       r15  r16  r17 
+    856: 52110004  JmpF         r17  r0   r4   ; r17 ? -> 861
+    857: 12761300  Move         r118 r19  r0  
+    858: 07002514  ConstU       r0   r37  r20  ; const #37 = Int(122)
+    859: 43131415  ICmpLe       r19  r20  r21 
+    860: 12150000  Move         r21  r0   r0  
+    861: 57000000  RetVal       r0   r0   r0  
+    862: 60002419  Closure      r0   r36  r25  ; fn #36 (offset 838)
+    863: 1219f200  Move         r25  r242 r0  
+    864: 50001e00  Jmp          r0   r30  r0   ; -> 895
+
+; === fn #37 @ 865 ===
+    865: 120a7700  Move         r10  r119 r0  
+    866: 12770b00  Move         r119 r11  r0  
+    867: 12f20c00  Move         r242 r12  r0  
+    868: 120cb600  Move         r12  r182 r0  
+    869: 12770d00  Move         r119 r13  r0  
+    870: 120d0a00  Move         r13  r10  r0  
+    871: 64b6010c  ClosureCall  r182 r1   r12  ; closure r182 argc=1
+    872: 03070000  Const0       r7   r0   r0  
+    873: 400c070e  ICmpEq       r12  r7   r14 
+    874: 490e0e00  Not          r14  r14  r0  
+    875: 520e0003  JmpF         r14  r0   r3   ; r14 ? -> 879
+    876: 040f0000  Const1       r15  r0   r0  
+    877: 50000f00  Jmp          r0   r15  r0   ; -> 893
+    878: 12f01000  Move         r240 r16  r0  
+    879: 1210ba00  Move         r16  r186 r0  
+    880: 12771100  Move         r119 r17  r0  
+    881: 12110a00  Move         r17  r10  r0  
+    882: 64ba0110  ClosureCall  r186 r1   r16  ; closure r186 argc=1
+    883: 03070000  Const0       r7   r0   r0  
+    884: 40100712  ICmpEq       r16  r7   r18 
+    885: 49121200  Not          r18  r18  r0  
+    886: 52120003  JmpF         r18  r0   r3   ; r18 ? -> 890
+    887: 04130000  Const1       r19  r0   r0  
+    888: 50000400  Jmp          r0   r4   r0   ; -> 893
+    889: 12771400  Move         r119 r20  r0  
+    890: 07002615  ConstU       r0   r38  r21  ; const #38 = Int(95)
+    891: 40141516  ICmpEq       r20  r21  r22 
+    892: 12160000  Move         r22  r0   r0  
+    893: 57000000  RetVal       r0   r0   r0  
+    894: 6000251a  Closure      r0   r37  r26  ; fn #37 (offset 865)
+    895: 121af400  Move         r26  r244 r0  
+    896: 50001a00  Jmp          r0   r26  r0   ; -> 923
+
+; === fn #38 @ 897 ===
+    897: 120a7800  Move         r10  r120 r0  
+    898: 12780b00  Move         r120 r11  r0  
+    899: 12780c00  Move         r120 r12  r0  
+    900: 0700270d  ConstU       r0   r39  r13  ; const #39 = Int(32)
+    901: 400c0d0e  ICmpEq       r12  r13  r14 
+    902: 520e0003  JmpF         r14  r0   r3   ; r14 ? -> 906
+    903: 04110000  Const1       r17  r0   r0  
+    904: 50001000  Jmp          r0   r16  r0   ; -> 921
+    905: 12781200  Move         r120 r18  r0  
+    906: 07000513  ConstU       r0   r5   r19  ; const #5 = Int(10)
+    907: 40121314  ICmpEq       r18  r19  r20 
+    908: 52140003  JmpF         r20  r0   r3   ; r20 ? -> 912
+    909: 04170000  Const1       r23  r0   r0  
+    910: 50000a00  Jmp          r0   r10  r0   ; -> 921
+    911: 12781800  Move         r120 r24  r0  
+    912: 07000c19  ConstU       r0   r12  r25  ; const #12 = Int(13)
+    913: 4018191a  ICmpEq       r24  r25  r26 
+    914: 521a0003  JmpF         r26  r0   r3   ; r26 ? -> 918
+    915: 041d0000  Const1       r29  r0   r0  
+    916: 50000400  Jmp          r0   r4   r0   ; -> 921
+    917: 12781e00  Move         r120 r30  r0  
+    918: 0700281f  ConstU       r0   r40  r31  ; const #40 = Int(9)
+    919: 401e1f20  ICmpEq       r30  r31  r32 
+    920: 12200000  Move         r32  r0   r0  
+    921: 57000000  RetVal       r0   r0   r0  
+    922: 6000261b  Closure      r0   r38  r27  ; fn #38 (offset 897)
+    923: 121bf600  Move         r27  r246 r0  
+    924: 50004400  Jmp          r0   r68  r0   ; -> 993
+
+; === fn #39 @ 925 ===
+    925: 120a7900  Move         r10  r121 r0  
+    926: 12790b00  Move         r121 r11  r0  
+    927: 50003d00  Jmp          r0   r61  r0   ; -> 989
+
+; === fn #40 @ 928 ===
+    928: 120a7a00  Move         r10  r122 r0  
+    929: 61000b00  CapLoad      r0   r11  r0  
+    930: 127a0c00  Move         r122 r12  r0  
+    931: 50003400  Jmp          r0   r52  r0   ; -> 984
+
+; === fn #41 @ 932 ===
+    932: 120a7c00  Move         r10  r124 r0  
+    933: 61000b00  CapLoad      r0   r11  r0  
+    934: 61010c00  CapLoad      r1   r12  r0  
+    935: 127c0d00  Move         r124 r13  r0  
+    936: 120c0e00  Move         r12  r14  r0  
+    937: 127c0f00  Move         r124 r15  r0  
+    938: 440e0f10  ICmpGe       r14  r15  r16 
+    939: 52100004  JmpF         r16  r0   r4   ; r16 ? -> 944
+    940: 120c0f00  Move         r12  r15  r0  
+    941: 120f1000  Move         r15  r16  r0  
+    942: 50000100  Jmp          r0   r1   r0   ; -> 944
+    943: 12f60f00  Move         r246 r15  r0  
+    944: 120fc000  Move         r15  r192 r0  
+    945: 120b1100  Move         r11  r17  r0  
+    946: 12110000  Move         r17  r0   r0  
+    947: 120c1b00  Move         r12  r27  r0  
+    948: 121b0100  Move         r27  r1   r0  
+    949: 90001810  Perform      r0   r24  r16  ; const #24 = String('String.charAt')
+    950: 12100a00  Move         r16  r10  r0  
+    951: 64c0010f  ClosureCall  r192 r1   r15  ; closure r192 argc=1
+    952: 03070000  Const0       r7   r0   r0  
+    953: 400f0711  ICmpEq       r15  r7   r17 
+    954: 49111100  Not          r17  r17  r0  
+    955: 52110017  JmpF         r17  r0   r23  ; r17 ? -> 979
+    956: 04120000  Const1       r18  r0   r0  
+    957: 40071213  ICmpEq       r7   r18  r19 
+    958: 400f1314  ICmpEq       r15  r19  r20 
+    959: 49141400  Not          r20  r20  r0  
+    960: 52140012  JmpF         r20  r0   r18  ; r20 ? -> 979
+    961: 12f81000  Move         r248 r16  r0  
+    962: 1210c100  Move         r16  r193 r0  
+    963: 120b1100  Move         r11  r17  r0  
+    964: 12110a00  Move         r17  r10  r0  
+    965: 64c10110  ClosureCall  r193 r1   r16  ; closure r193 argc=1
+    966: 1210c200  Move         r16  r194 r0  
+    967: 120c1200  Move         r12  r18  r0  
+    968: 04130000  Const1       r19  r0   r0  
+    969: 20121314  IAdd         r18  r19  r20 
+    970: 12140a00  Move         r20  r10  r0  
+    971: 64c20111  ClosureCall  r194 r1   r17  ; closure r194 argc=1
+    972: 1211c300  Move         r17  r195 r0  
+    973: 127c1300  Move         r124 r19  r0  
+    974: 12130a00  Move         r19  r10  r0  
+    975: 64c30112  ClosureCall  r195 r1   r18  ; closure r195 argc=1
+    976: 12121100  Move         r18  r17  r0  
+    977: 50000100  Jmp          r0   r1   r0   ; -> 979
+    978: 120c1000  Move         r12  r16  r0  
+    979: 12101100  Move         r16  r17  r0  
+    980: 12111000  Move         r17  r16  r0  
+    981: 12100000  Move         r16  r0   r0  
+    982: 57000000  RetVal       r0   r0   r0  
+    983: 6000290d  Closure      r0   r41  r13  ; fn #41 (offset 932)
+    984: 620d000b  CapStore     r13  r0   r11 
+    985: 620d010c  CapStore     r13  r1   r12 
+    986: 120d0000  Move         r13  r0   r0  
+    987: 57000000  RetVal       r0   r0   r0  
+    988: 6000280c  Closure      r0   r40  r12  ; fn #40 (offset 928)
+    989: 620c000b  CapStore     r12  r0   r11 
+    990: 120c0000  Move         r12  r0   r0  
+    991: 57000000  RetVal       r0   r0   r0  
+    992: 6000271c  Closure      r0   r39  r28  ; fn #39 (offset 925)
+    993: 121cf800  Move         r28  r248 r0  
+    994: 50006400  Jmp          r0   r100 r0   ; -> 1095
+
+; === fn #42 @ 995 ===
+    995: 120a7a00  Move         r10  r122 r0  
+    996: 127a0b00  Move         r122 r11  r0  
+    997: 50005d00  Jmp          r0   r93  r0   ; -> 1091
+
+; === fn #43 @ 998 ===
+    998: 120a7b00  Move         r10  r123 r0  
+    999: 61000b00  CapLoad      r0   r11  r0  
+   1000: 127b0c00  Move         r123 r12  r0  
+   1001: 50005400  Jmp          r0   r84  r0   ; -> 1086
+
+; === fn #44 @ 1002 ===
+   1002: 120a7d00  Move         r10  r125 r0  
+   1003: 61000b00  CapLoad      r0   r11  r0  
+   1004: 61010c00  CapLoad      r1   r12  r0  
+   1005: 127d0d00  Move         r125 r13  r0  
+   1006: 50004900  Jmp          r0   r73  r0   ; -> 1080
+
+; === fn #45 @ 1007 ===
+   1007: 120a8000  Move         r10  r128 r0  
+   1008: 61000b00  CapLoad      r0   r11  r0  
+   1009: 61010c00  CapLoad      r1   r12  r0  
+   1010: 61020d00  CapLoad      r2   r13  r0  
+   1011: 12800e00  Move         r128 r14  r0  
+   1012: 120c0f00  Move         r12  r15  r0  
+   1013: 120d1000  Move         r13  r16  r0  
+   1014: 440f1011  ICmpGe       r15  r16  r17 
+   1015: 52110008  JmpF         r17  r0   r8   ; r17 ? -> 1024
+   1016: 12801000  Move         r128 r16  r0  
+   1017: 07000111  ConstU       r0   r1   r17  ; const #1 = Int(65536)
+   1018: 22101112  IMul         r16  r17  r18 
+   1019: 120c1100  Move         r12  r17  r0  
+   1020: 20121112  IAdd         r18  r17  r18 
+   1021: 12121100  Move         r18  r17  r0  
+   1022: 50000100  Jmp          r0   r1   r0   ; -> 1024
+   1023: 120b1100  Move         r11  r17  r0  
+   1024: 12110000  Move         r17  r0   r0  
+   1025: 120c1b00  Move         r12  r27  r0  
+   1026: 121b0100  Move         r27  r1   r0  
+   1027: 90001810  Perform      r0   r24  r16  ; const #24 = String('String.charAt')
+   1028: 1210f800  Move         r16  r248 r0  
+   1029: 12f01100  Move         r240 r17  r0  
+   1030: 1211c800  Move         r17  r200 r0  
+   1031: 12f81200  Move         r248 r18  r0  
+   1032: 12120a00  Move         r18  r10  r0  
+   1033: 64c80111  ClosureCall  r200 r1   r17  ; closure r200 argc=1
+   1034: 03070000  Const0       r7   r0   r0  
+   1035: 40110713  ICmpEq       r17  r7   r19 
+   1036: 49131300  Not          r19  r19  r0  
+   1037: 52130021  JmpF         r19  r0   r33  ; r19 ? -> 1071
+   1038: 04140000  Const1       r20  r0   r0  
+   1039: 40071415  ICmpEq       r7   r20  r21 
+   1040: 40111516  ICmpEq       r17  r21  r22 
+   1041: 49161600  Not          r22  r22  r0  
+   1042: 5216001c  JmpF         r22  r0   r28  ; r22 ? -> 1071
+   1043: 12fa1200  Move         r250 r18  r0  
+   1044: 1212c900  Move         r18  r201 r0  
+   1045: 120b1300  Move         r11  r19  r0  
+   1046: 12130a00  Move         r19  r10  r0  
+   1047: 64c90112  ClosureCall  r201 r1   r18  ; closure r201 argc=1
+   1048: 1212ca00  Move         r18  r202 r0  
+   1049: 120c1400  Move         r12  r20  r0  
+   1050: 04150000  Const1       r21  r0   r0  
+   1051: 20141516  IAdd         r20  r21  r22 
+   1052: 12160a00  Move         r22  r10  r0  
+   1053: 64ca0113  ClosureCall  r202 r1   r19  ; closure r202 argc=1
+   1054: 1213cb00  Move         r19  r203 r0  
+   1055: 120d1500  Move         r13  r21  r0  
+   1056: 12150a00  Move         r21  r10  r0  
+   1057: 64cb0114  ClosureCall  r203 r1   r20  ; closure r203 argc=1
+   1058: 1214cc00  Move         r20  r204 r0  
+   1059: 12801600  Move         r128 r22  r0  
+   1060: 07000517  ConstU       r0   r5   r23  ; const #5 = Int(10)
+   1061: 22161718  IMul         r22  r23  r24 
+   1062: 12f81a00  Move         r248 r26  r0  
+   1063: 0700211b  ConstU       r0   r33  r27  ; const #33 = Int(48)
+   1064: 211a1b1c  ISub         r26  r27  r28 
+   1065: 20181c1b  IAdd         r24  r28  r27 
+   1066: 121b0a00  Move         r27  r10  r0  
+   1067: 64cc0115  ClosureCall  r204 r1   r21  ; closure r204 argc=1
+   1068: 12151300  Move         r21  r19  r0  
+   1069: 50000100  Jmp          r0   r1   r0   ; -> 1071
+   1070: 12801200  Move         r128 r18  r0  
+   1071: 07000113  ConstU       r0   r1   r19  ; const #1 = Int(65536)
+   1072: 22121314  IMul         r18  r19  r20 
+   1073: 120c1300  Move         r12  r19  r0  
+   1074: 20141314  IAdd         r20  r19  r20 
+   1075: 12141300  Move         r20  r19  r0  
+   1076: 12131100  Move         r19  r17  r0  
+   1077: 12110000  Move         r17  r0   r0  
+   1078: 57000000  RetVal       r0   r0   r0  
+   1079: 60002d0e  Closure      r0   r45  r14  ; fn #45 (offset 1007)
+   1080: 620e000b  CapStore     r14  r0   r11 
+   1081: 620e010c  CapStore     r14  r1   r12 
+   1082: 620e020d  CapStore     r14  r2   r13 
+   1083: 120e0000  Move         r14  r0   r0  
+   1084: 57000000  RetVal       r0   r0   r0  
+   1085: 60002c0d  Closure      r0   r44  r13  ; fn #44 (offset 1002)
+   1086: 620d000b  CapStore     r13  r0   r11 
+   1087: 620d010c  CapStore     r13  r1   r12 
+   1088: 120d0000  Move         r13  r0   r0  
+   1089: 57000000  RetVal       r0   r0   r0  
+   1090: 60002b0c  Closure      r0   r43  r12  ; fn #43 (offset 998)
+   1091: 620c000b  CapStore     r12  r0   r11 
+   1092: 120c0000  Move         r12  r0   r0  
+   1093: 57000000  RetVal       r0   r0   r0  
+   1094: 60002a1d  Closure      r0   r42  r29  ; fn #42 (offset 995)
+   1095: 121dfa00  Move         r29  r250 r0  
+   1096: 50006c00  Jmp          r0   r108 r0   ; -> 1205
+
+; === fn #46 @ 1097 ===
+   1097: 120a7b00  Move         r10  r123 r0  
+   1098: 127b0b00  Move         r123 r11  r0  
+   1099: 50006500  Jmp          r0   r101 r0   ; -> 1201
+
+; === fn #47 @ 1100 ===
+   1100: 120a7c00  Move         r10  r124 r0  
+   1101: 61000b00  CapLoad      r0   r11  r0  
+   1102: 127c0c00  Move         r124 r12  r0  
+   1103: 50005c00  Jmp          r0   r92  r0   ; -> 1196
+
+; === fn #48 @ 1104 ===
+   1104: 120a7e00  Move         r10  r126 r0  
+   1105: 61000b00  CapLoad      r0   r11  r0  
+   1106: 61010c00  CapLoad      r1   r12  r0  
+   1107: 127e0d00  Move         r126 r13  r0  
+   1108: 50005100  Jmp          r0   r81  r0   ; -> 1190
+
+; === fn #49 @ 1109 ===
+   1109: 120a8100  Move         r10  r129 r0  
+   1110: 61000b00  CapLoad      r0   r11  r0  
+   1111: 61010c00  CapLoad      r1   r12  r0  
+   1112: 61020d00  CapLoad      r2   r13  r0  
+   1113: 12810e00  Move         r129 r14  r0  
+   1114: 120c0f00  Move         r12  r15  r0  
+   1115: 120d1000  Move         r13  r16  r0  
+   1116: 440f1011  ICmpGe       r15  r16  r17 
+   1117: 5211000c  JmpF         r17  r0   r12  ; r17 ? -> 1130
+   1118: 12d21000  Move         r210 r16  r0  
+   1119: 1210c700  Move         r16  r199 r0  
+   1120: 12811100  Move         r129 r17  r0  
+   1121: 12110a00  Move         r17  r10  r0  
+   1122: 64c70110  ClosureCall  r199 r1   r16  ; closure r199 argc=1
+   1123: 07000111  ConstU       r0   r1   r17  ; const #1 = Int(65536)
+   1124: 22101112  IMul         r16  r17  r18 
+   1125: 120c1100  Move         r12  r17  r0  
+   1126: 20121112  IAdd         r18  r17  r18 
+   1127: 12121100  Move         r18  r17  r0  
+   1128: 50000100  Jmp          r0   r1   r0   ; -> 1130
+   1129: 120b1100  Move         r11  r17  r0  
+   1130: 12110000  Move         r17  r0   r0  
+   1131: 120c1b00  Move         r12  r27  r0  
+   1132: 121b0100  Move         r27  r1   r0  
+   1133: 90001810  Perform      r0   r24  r16  ; const #24 = String('String.charAt')
+   1134: 1210f900  Move         r16  r249 r0  
+   1135: 12f41100  Move         r244 r17  r0  
+   1136: 1211c900  Move         r17  r201 r0  
+   1137: 12f91200  Move         r249 r18  r0  
+   1138: 12120a00  Move         r18  r10  r0  
+   1139: 64c90111  ClosureCall  r201 r1   r17  ; closure r201 argc=1
+   1140: 03070000  Const0       r7   r0   r0  
+   1141: 40110713  ICmpEq       r17  r7   r19 
+   1142: 49131300  Not          r19  r19  r0  
+   1143: 52130021  JmpF         r19  r0   r33  ; r19 ? -> 1177
+   1144: 04140000  Const1       r20  r0   r0  
+   1145: 40071415  ICmpEq       r7   r20  r21 
+   1146: 40111516  ICmpEq       r17  r21  r22 
+   1147: 49161600  Not          r22  r22  r0  
+   1148: 5216001c  JmpF         r22  r0   r28  ; r22 ? -> 1177
+   1149: 12811200  Move         r129 r18  r0  
+   1150: 07002913  ConstU       r0   r41  r19  ; const #41 = Int(5)
+   1151: 22121314  IMul         r18  r19  r20 
+   1152: 12f91600  Move         r249 r22  r0  
+   1153: 20141617  IAdd         r20  r22  r23 
+   1154: 1217fc00  Move         r23  r252 r0  
+   1155: 12fc1300  Move         r252 r19  r0  
+   1156: 1213cc00  Move         r19  r204 r0  
+   1157: 120b1400  Move         r11  r20  r0  
+   1158: 12140a00  Move         r20  r10  r0  
+   1159: 64cc0113  ClosureCall  r204 r1   r19  ; closure r204 argc=1
+   1160: 1213cd00  Move         r19  r205 r0  
+   1161: 120c1500  Move         r12  r21  r0  
+   1162: 04160000  Const1       r22  r0   r0  
+   1163: 20151617  IAdd         r21  r22  r23 
+   1164: 12170a00  Move         r23  r10  r0  
+   1165: 64cd0114  ClosureCall  r205 r1   r20  ; closure r205 argc=1
+   1166: 12145d00  Move         r20  r93  r0  
+   1167: 120d1600  Move         r13  r22  r0  
+   1168: 12160a00  Move         r22  r10  r0  
+   1169: 645d0115  ClosureCall  r93  r1   r21  ; closure r93 argc=1
+   1170: 12155e00  Move         r21  r94  r0  
+   1171: 12fc1700  Move         r252 r23  r0  
+   1172: 12170a00  Move         r23  r10  r0  
+   1173: 645e0116  ClosureCall  r94  r1   r22  ; closure r94 argc=1
+   1174: 12161300  Move         r22  r19  r0  
+   1175: 50000100  Jmp          r0   r1   r0   ; -> 1177
+   1176: 12d21200  Move         r210 r18  r0  
+   1177: 1212ca00  Move         r18  r202 r0  
+   1178: 12811300  Move         r129 r19  r0  
+   1179: 12130a00  Move         r19  r10  r0  
+   1180: 64ca0112  ClosureCall  r202 r1   r18  ; closure r202 argc=1
+   1181: 07000113  ConstU       r0   r1   r19  ; const #1 = Int(65536)
+   1182: 22121314  IMul         r18  r19  r20 
+   1183: 120c1300  Move         r12  r19  r0  
+   1184: 20141314  IAdd         r20  r19  r20 
+   1185: 12141300  Move         r20  r19  r0  
+   1186: 12131100  Move         r19  r17  r0  
+   1187: 12110000  Move         r17  r0   r0  
+   1188: 57000000  RetVal       r0   r0   r0  
+   1189: 6000310e  Closure      r0   r49  r14  ; fn #49 (offset 1109)
+   1190: 620e000b  CapStore     r14  r0   r11 
+   1191: 620e010c  CapStore     r14  r1   r12 
+   1192: 620e020d  CapStore     r14  r2   r13 
+   1193: 120e0000  Move         r14  r0   r0  
+   1194: 57000000  RetVal       r0   r0   r0  
+   1195: 6000300d  Closure      r0   r48  r13  ; fn #48 (offset 1104)
+   1196: 620d000b  CapStore     r13  r0   r11 
+   1197: 620d010c  CapStore     r13  r1   r12 
+   1198: 120d0000  Move         r13  r0   r0  
+   1199: 57000000  RetVal       r0   r0   r0  
+   1200: 60002f0c  Closure      r0   r47  r12  ; fn #47 (offset 1100)
+   1201: 620c000b  CapStore     r12  r0   r11 
+   1202: 120c0000  Move         r12  r0   r0  
+   1203: 57000000  RetVal       r0   r0   r0  
+   1204: 60002e1e  Closure      r0   r46  r30  ; fn #46 (offset 1097)
+   1205: 121efc00  Move         r30  r252 r0  
+   1206: 50005000  Jmp          r0   r80  r0   ; -> 1287
+
+; === fn #50 @ 1207 ===
+   1207: 120a7c00  Move         r10  r124 r0  
+   1208: 127c0b00  Move         r124 r11  r0  
+   1209: 50004900  Jmp          r0   r73  r0   ; -> 1283
+
+; === fn #51 @ 1210 ===
+   1210: 120a7d00  Move         r10  r125 r0  
+   1211: 61000b00  CapLoad      r0   r11  r0  
+   1212: 127d0c00  Move         r125 r12  r0  
+   1213: 50004000  Jmp          r0   r64  r0   ; -> 1278
+
+; === fn #52 @ 1214 ===
+   1214: 120a7f00  Move         r10  r127 r0  
+   1215: 61000b00  CapLoad      r0   r11  r0  
+   1216: 61010c00  CapLoad      r1   r12  r0  
+   1217: 127f0d00  Move         r127 r13  r0  
+   1218: 50003500  Jmp          r0   r53  r0   ; -> 1272
+
+; === fn #53 @ 1219 ===
+   1219: 120a8200  Move         r10  r130 r0  
+   1220: 61000b00  CapLoad      r0   r11  r0  
+   1221: 61010c00  CapLoad      r1   r12  r0  
+   1222: 61020d00  CapLoad      r2   r13  r0  
+   1223: 12820e00  Move         r130 r14  r0  
+   1224: 120c0f00  Move         r12  r15  r0  
+   1225: 120d1000  Move         r13  r16  r0  
+   1226: 440f1011  ICmpGe       r15  r16  r17 
+   1227: 52110004  JmpF         r17  r0   r4   ; r17 ? -> 1232
+   1228: 12821000  Move         r130 r16  r0  
+   1229: 12101100  Move         r16  r17  r0  
+   1230: 50000100  Jmp          r0   r1   r0   ; -> 1232
+   1231: 120b1100  Move         r11  r17  r0  
+   1232: 12110000  Move         r17  r0   r0  
+   1233: 120c1b00  Move         r12  r27  r0  
+   1234: 121b0100  Move         r27  r1   r0  
+   1235: 90001810  Perform      r0   r24  r16  ; const #24 = String('String.charAt')
+   1236: 1210fa00  Move         r16  r250 r0  
+   1237: 12fa1100  Move         r250 r17  r0  
+   1238: 07002a12  ConstU       r0   r42  r18  ; const #42 = Int(34)
+   1239: 40111213  ICmpEq       r17  r18  r19 
+   1240: 52130004  JmpF         r19  r0   r4   ; r19 ? -> 1245
+   1241: 12821200  Move         r130 r18  r0  
+   1242: 12121300  Move         r18  r19  r0  
+   1243: 50000100  Jmp          r0   r1   r0   ; -> 1245
+   1244: 12fe1200  Move         r254 r18  r0  
+   1245: 1212cb00  Move         r18  r203 r0  
+   1246: 120b1300  Move         r11  r19  r0  
+   1247: 12130a00  Move         r19  r10  r0  
+   1248: 64cb0112  ClosureCall  r203 r1   r18  ; closure r203 argc=1
+   1249: 1212cc00  Move         r18  r204 r0  
+   1250: 120c1400  Move         r12  r20  r0  
+   1251: 04150000  Const1       r21  r0   r0  
+   1252: 20141516  IAdd         r20  r21  r22 
+   1253: 12160a00  Move         r22  r10  r0  
+   1254: 64cc0113  ClosureCall  r204 r1   r19  ; closure r204 argc=1
+   1255: 1213cd00  Move         r19  r205 r0  
+   1256: 120d1500  Move         r13  r21  r0  
+   1257: 12150a00  Move         r21  r10  r0  
+   1258: 64cd0114  ClosureCall  r205 r1   r20  ; closure r205 argc=1
+   1259: 12145d00  Move         r20  r93  r0  
+   1260: 12821600  Move         r130 r22  r0  
+   1261: 12fa1800  Move         r250 r24  r0  
+   1262: 12180000  Move         r24  r0   r0  
+   1263: 90002b17  Perform      r0   r43  r23  ; const #43 = String('String.from_char')
+   1264: 20161718  IAdd         r22  r23  r24 
+   1265: 12180a00  Move         r24  r10  r0  
+   1266: 645d0115  ClosureCall  r93  r1   r21  ; closure r93 argc=1
+   1267: 12151300  Move         r21  r19  r0  
+   1268: 12131100  Move         r19  r17  r0  
+   1269: 12110000  Move         r17  r0   r0  
+   1270: 57000000  RetVal       r0   r0   r0  
+   1271: 6000350e  Closure      r0   r53  r14  ; fn #53 (offset 1219)
+   1272: 620e000b  CapStore     r14  r0   r11 
+   1273: 620e010c  CapStore     r14  r1   r12 
+   1274: 620e020d  CapStore     r14  r2   r13 
+   1275: 120e0000  Move         r14  r0   r0  
+   1276: 57000000  RetVal       r0   r0   r0  
+   1277: 6000340d  Closure      r0   r52  r13  ; fn #52 (offset 1214)
+   1278: 620d000b  CapStore     r13  r0   r11 
+   1279: 620d010c  CapStore     r13  r1   r12 
+   1280: 120d0000  Move         r13  r0   r0  
+   1281: 57000000  RetVal       r0   r0   r0  
+   1282: 6000330c  Closure      r0   r51  r12  ; fn #51 (offset 1210)
+   1283: 620c000b  CapStore     r12  r0   r11 
+   1284: 120c0000  Move         r12  r0   r0  
+   1285: 57000000  RetVal       r0   r0   r0  
+   1286: 6000321f  Closure      r0   r50  r31  ; fn #50 (offset 1207)
+   1287: 121ffe00  Move         r31  r254 r0  
+   1288: 50003e00  Jmp          r0   r62  r0   ; -> 1351
+
+; === fn #54 @ 1289 ===
+   1289: 120a7d00  Move         r10  r125 r0  
+   1290: 127d0b00  Move         r125 r11  r0  
+   1291: 50003700  Jmp          r0   r55  r0   ; -> 1347
+
+; === fn #55 @ 1292 ===
+   1292: 120a7e00  Move         r10  r126 r0  
+   1293: 61000b00  CapLoad      r0   r11  r0  
+   1294: 127e0c00  Move         r126 r12  r0  
+   1295: 50002e00  Jmp          r0   r46  r0   ; -> 1342
+
+; === fn #56 @ 1296 ===
+   1296: 120a8000  Move         r10  r128 r0  
+   1297: 61000b00  CapLoad      r0   r11  r0  
+   1298: 61010c00  CapLoad      r1   r12  r0  
+   1299: 12800d00  Move         r128 r13  r0  
+   1300: 120c0e00  Move         r12  r14  r0  
+   1301: 12800f00  Move         r128 r15  r0  
+   1302: 440e0f10  ICmpGe       r14  r15  r16 
+   1303: 52100004  JmpF         r16  r0   r4   ; r16 ? -> 1308
+   1304: 120c0f00  Move         r12  r15  r0  
+   1305: 120f1000  Move         r15  r16  r0  
+   1306: 50000100  Jmp          r0   r1   r0   ; -> 1308
+   1307: 120b1000  Move         r11  r16  r0  
+   1308: 12100000  Move         r16  r0   r0  
+   1309: 120c1a00  Move         r12  r26  r0  
+   1310: 121a0100  Move         r26  r1   r0  
+   1311: 9000180f  Perform      r0   r24  r15  ; const #24 = String('String.charAt')
+   1312: 120ff600  Move         r15  r246 r0  
+   1313: 12f61000  Move         r246 r16  r0  
+   1314: 07002a11  ConstU       r0   r42  r17  ; const #42 = Int(34)
+   1315: 40101112  ICmpEq       r16  r17  r18 
+   1316: 52120006  JmpF         r18  r0   r6   ; r18 ? -> 1323
+   1317: 120c1100  Move         r12  r17  r0  
+   1318: 04120000  Const1       r18  r0   r0  
+   1319: 20111213  IAdd         r17  r18  r19 
+   1320: 12131200  Move         r19  r18  r0  
+   1321: 50000100  Jmp          r0   r1   r0   ; -> 1323
+   1322: 128f1100  Move         r143 r17  r0  
+   1323: 1211c700  Move         r17  r199 r0  
+   1324: 120b1200  Move         r11  r18  r0  
+   1325: 12120a00  Move         r18  r10  r0  
+   1326: 64c70111  ClosureCall  r199 r1   r17  ; closure r199 argc=1
+   1327: 1211c800  Move         r17  r200 r0  
+   1328: 120c1300  Move         r12  r19  r0  
+   1329: 04140000  Const1       r20  r0   r0  
+   1330: 20131415  IAdd         r19  r20  r21 
+   1331: 12150a00  Move         r21  r10  r0  
+   1332: 64c80112  ClosureCall  r200 r1   r18  ; closure r200 argc=1
+   1333: 1212c900  Move         r18  r201 r0  
+   1334: 12801400  Move         r128 r20  r0  
+   1335: 12140a00  Move         r20  r10  r0  
+   1336: 64c90113  ClosureCall  r201 r1   r19  ; closure r201 argc=1
+   1337: 12131200  Move         r19  r18  r0  
+   1338: 12121000  Move         r18  r16  r0  
+   1339: 12100000  Move         r16  r0   r0  
+   1340: 57000000  RetVal       r0   r0   r0  
+   1341: 6000380d  Closure      r0   r56  r13  ; fn #56 (offset 1296)
+   1342: 620d000b  CapStore     r13  r0   r11 
+   1343: 620d010c  CapStore     r13  r1   r12 
+   1344: 120d0000  Move         r13  r0   r0  
+   1345: 57000000  RetVal       r0   r0   r0  
+   1346: 6000370c  Closure      r0   r55  r12  ; fn #55 (offset 1292)
+   1347: 620c000b  CapStore     r12  r0   r11 
+   1348: 120c0000  Move         r12  r0   r0  
+   1349: 57000000  RetVal       r0   r0   r0  
+   1350: 60003620  Closure      r0   r54  r32  ; fn #54 (offset 1289)
+   1351: 12208f00  Move         r32  r143 r0  
+   1352: 50005c00  Jmp          r0   r92  r0   ; -> 1445
+
+; === fn #57 @ 1353 ===
+   1353: 120a7e00  Move         r10  r126 r0  
+   1354: 127e0b00  Move         r126 r11  r0  
+   1355: 50005500  Jmp          r0   r85  r0   ; -> 1441
+
+; === fn #58 @ 1356 ===
+   1356: 120a7f00  Move         r10  r127 r0  
+   1357: 61000b00  CapLoad      r0   r11  r0  
+   1358: 127f0c00  Move         r127 r12  r0  
+   1359: 50004c00  Jmp          r0   r76  r0   ; -> 1436
+
+; === fn #59 @ 1360 ===
+   1360: 120a8100  Move         r10  r129 r0  
+   1361: 61000b00  CapLoad      r0   r11  r0  
+   1362: 61010c00  CapLoad      r1   r12  r0  
+   1363: 12810d00  Move         r129 r13  r0  
+   1364: 12d20e00  Move         r210 r14  r0  
+   1365: 120ec500  Move         r14  r197 r0  
+   1366: 120c0f00  Move         r12  r15  r0  
+   1367: 120f0a00  Move         r15  r10  r0  
+   1368: 64c5010e  ClosureCall  r197 r1   r14  ; closure r197 argc=1
+   1369: 0700020f  ConstU       r0   r2   r15  ; const #2 = Int(256)
+   1370: 220e0f10  IMul         r14  r15  r16 
+   1371: 12d40f00  Move         r212 r15  r0  
+   1372: 120fc600  Move         r15  r198 r0  
+   1373: 12811000  Move         r129 r16  r0  
+   1374: 12100a00  Move         r16  r10  r0  
+   1375: 64c6010f  ClosureCall  r198 r1   r15  ; closure r198 argc=1
+   1376: 20100f10  IAdd         r16  r15  r16 
+   1377: 1210f600  Move         r16  r246 r0  
+   1378: 12d80f00  Move         r216 r15  r0  
+   1379: 120fc700  Move         r15  r199 r0  
+   1380: 12f61000  Move         r246 r16  r0  
+   1381: 07001d11  ConstU       r0   r29  r17  ; const #29 = Int(18)
+   1382: 2b101112  Shr          r16  r17  r18 
+   1383: 12120a00  Move         r18  r10  r0  
+   1384: 64c7010f  ClosureCall  r199 r1   r15  ; closure r199 argc=1
+   1385: 04100000  Const1       r16  r0   r0  
+   1386: 200f1011  IAdd         r15  r16  r17 
+   1387: 1211f800  Move         r17  r248 r0  
+   1388: 12d81000  Move         r216 r16  r0  
+   1389: 1210c900  Move         r16  r201 r0  
+   1390: 12f61100  Move         r246 r17  r0  
+   1391: 07000a12  ConstU       r0   r10  r18  ; const #10 = Int(12)
+   1392: 2b111213  Shr          r17  r18  r19 
+   1393: 12130a00  Move         r19  r10  r0  
+   1394: 64c90110  ClosureCall  r201 r1   r16  ; closure r201 argc=1
+   1395: 04110000  Const1       r17  r0   r0  
+   1396: 20101112  IAdd         r16  r17  r18 
+   1397: 1212fa00  Move         r18  r250 r0  
+   1398: 12d81100  Move         r216 r17  r0  
+   1399: 1211cb00  Move         r17  r203 r0  
+   1400: 12f61200  Move         r246 r18  r0  
+   1401: 07002c13  ConstU       r0   r44  r19  ; const #44 = Int(6)
+   1402: 2b121314  Shr          r18  r19  r20 
+   1403: 12140a00  Move         r20  r10  r0  
+   1404: 64cb0111  ClosureCall  r203 r1   r17  ; closure r203 argc=1
+   1405: 04120000  Const1       r18  r0   r0  
+   1406: 20111213  IAdd         r17  r18  r19 
+   1407: 1213fc00  Move         r19  r252 r0  
+   1408: 12d81200  Move         r216 r18  r0  
+   1409: 1212cd00  Move         r18  r205 r0  
+   1410: 12f61300  Move         r246 r19  r0  
+   1411: 12130a00  Move         r19  r10  r0  
+   1412: 64cd0112  ClosureCall  r205 r1   r18  ; closure r205 argc=1
+   1413: 04130000  Const1       r19  r0   r0  
+   1414: 20121314  IAdd         r18  r19  r20 
+   1415: 1214fe00  Move         r20  r254 r0  
+   1416: 120b1300  Move         r11  r19  r0  
+   1417: 12f81500  Move         r248 r21  r0  
+   1418: 12150000  Move         r21  r0   r0  
+   1419: 90002b14  Perform      r0   r43  r20  ; const #43 = String('String.from_char')
+   1420: 12fa1600  Move         r250 r22  r0  
+   1421: 12160000  Move         r22  r0   r0  
+   1422: 90002b15  Perform      r0   r43  r21  ; const #43 = String('String.from_char')
+   1423: 12fc1700  Move         r252 r23  r0  
+   1424: 12170000  Move         r23  r0   r0  
+   1425: 90002b16  Perform      r0   r43  r22  ; const #43 = String('String.from_char')
+   1426: 12fe1800  Move         r254 r24  r0  
+   1427: 12180000  Move         r24  r0   r0  
+   1428: 90002b17  Perform      r0   r43  r23  ; const #43 = String('String.from_char')
+   1429: 20161718  IAdd         r22  r23  r24 
+   1430: 20151817  IAdd         r21  r24  r23 
+   1431: 20141716  IAdd         r20  r23  r22 
+   1432: 20131615  IAdd         r19  r22  r21 
+   1433: 12150000  Move         r21  r0   r0  
+   1434: 57000000  RetVal       r0   r0   r0  
+   1435: 60003b0d  Closure      r0   r59  r13  ; fn #59 (offset 1360)
+   1436: 620d000b  CapStore     r13  r0   r11 
+   1437: 620d010c  CapStore     r13  r1   r12 
+   1438: 120d0000  Move         r13  r0   r0  
+   1439: 57000000  RetVal       r0   r0   r0  
+   1440: 60003a0c  Closure      r0   r58  r12  ; fn #58 (offset 1356)
+   1441: 620c000b  CapStore     r12  r0   r11 
+   1442: 120c0000  Move         r12  r0   r0  
+   1443: 57000000  RetVal       r0   r0   r0  
+   1444: 60003921  Closure      r0   r57  r33  ; fn #57 (offset 1353)
+   1445: 12219100  Move         r33  r145 r0  
+   1446: 50005400  Jmp          r0   r84  r0   ; -> 1531
+
+; === fn #60 @ 1447 ===
+   1447: 120a7f00  Move         r10  r127 r0  
+   1448: 127f0b00  Move         r127 r11  r0  
+   1449: 50004d00  Jmp          r0   r77  r0   ; -> 1527
+
+; === fn #61 @ 1450 ===
+   1450: 120a8000  Move         r10  r128 r0  
+   1451: 61000b00  CapLoad      r0   r11  r0  
+   1452: 12800c00  Move         r128 r12  r0  
+   1453: 50004500  Jmp          r0   r69  r0   ; -> 1523
+
+; === fn #62 @ 1454 ===
+   1454: 120a8200  Move         r10  r130 r0  
+   1455: 61000b00  CapLoad      r0   r11  r0  
+   1456: 12820c00  Move         r130 r12  r0  
+   1457: 12800d00  Move         r128 r13  r0  
+   1458: 030e0000  Const0       r14  r0   r0  
+   1459: 430d0e0f  ICmpLe       r13  r14  r15 
+   1460: 520f0004  JmpF         r15  r0   r4   ; r15 ? -> 1465
+   1461: 030e0000  Const0       r14  r0   r0  
+   1462: 120e0f00  Move         r14  r15  r0  
+   1463: 50000100  Jmp          r0   r1   r0   ; -> 1465
+   1464: 12e60e00  Move         r230 r14  r0  
+   1465: 120ec500  Move         r14  r197 r0  
+   1466: 120b0f00  Move         r11  r15  r0  
+   1467: 120f0a00  Move         r15  r10  r0  
+   1468: 64c5010e  ClosureCall  r197 r1   r14  ; closure r197 argc=1
+   1469: 120ec600  Move         r14  r198 r0  
+   1470: 12801000  Move         r128 r16  r0  
+   1471: 04110000  Const1       r17  r0   r0  
+   1472: 21101112  ISub         r16  r17  r18 
+   1473: 07001e11  ConstU       r0   r30  r17  ; const #30 = Int(4)
+   1474: 22121112  IMul         r18  r17  r18 
+   1475: 12120a00  Move         r18  r10  r0  
+   1476: 64c6010f  ClosureCall  r198 r1   r15  ; closure r198 argc=1
+   1477: 120ff600  Move         r15  r246 r0  
+   1478: 12d20f00  Move         r210 r15  r0  
+   1479: 120fc700  Move         r15  r199 r0  
+   1480: 12f61000  Move         r246 r16  r0  
+   1481: 07002d11  ConstU       r0   r45  r17  ; const #45 = Int(8)
+   1482: 2b101112  Shr          r16  r17  r18 
+   1483: 12120a00  Move         r18  r10  r0  
+   1484: 64c7010f  ClosureCall  r199 r1   r15  ; closure r199 argc=1
+   1485: 120ff800  Move         r15  r248 r0  
+   1486: 12d41000  Move         r212 r16  r0  
+   1487: 1210c900  Move         r16  r201 r0  
+   1488: 12f61100  Move         r246 r17  r0  
+   1489: 12110a00  Move         r17  r10  r0  
+   1490: 64c90110  ClosureCall  r201 r1   r16  ; closure r201 argc=1
+   1491: 1210fa00  Move         r16  r250 r0  
+   1492: 12f81100  Move         r248 r17  r0  
+   1493: 12d21200  Move         r210 r18  r0  
+   1494: 1212cb00  Move         r18  r203 r0  
+   1495: 12821300  Move         r130 r19  r0  
+   1496: 12130a00  Move         r19  r10  r0  
+   1497: 64cb0112  ClosureCall  r203 r1   r18  ; closure r203 argc=1
+   1498: 40111213  ICmpEq       r17  r18  r19 
+   1499: 52130004  JmpF         r19  r0   r4   ; r19 ? -> 1504
+   1500: 12fa1200  Move         r250 r18  r0  
+   1501: 12121300  Move         r18  r19  r0  
+   1502: 50000100  Jmp          r0   r1   r0   ; -> 1504
+   1503: 12931200  Move         r147 r18  r0  
+   1504: 1212cb00  Move         r18  r203 r0  
+   1505: 120b1300  Move         r11  r19  r0  
+   1506: 12130a00  Move         r19  r10  r0  
+   1507: 64cb0112  ClosureCall  r203 r1   r18  ; closure r203 argc=1
+   1508: 1212cc00  Move         r18  r204 r0  
+   1509: 12801400  Move         r128 r20  r0  
+   1510: 04150000  Const1       r21  r0   r0  
+   1511: 21141516  ISub         r20  r21  r22 
+   1512: 12160a00  Move         r22  r10  r0  
+   1513: 64cc0113  ClosureCall  r204 r1   r19  ; closure r204 argc=1
+   1514: 1213cd00  Move         r19  r205 r0  
+   1515: 12821500  Move         r130 r21  r0  
+   1516: 12150a00  Move         r21  r10  r0  
+   1517: 64cd0114  ClosureCall  r205 r1   r20  ; closure r205 argc=1
+   1518: 12141300  Move         r20  r19  r0  
+   1519: 12130f00  Move         r19  r15  r0  
+   1520: 120f0000  Move         r15  r0   r0  
+   1521: 57000000  RetVal       r0   r0   r0  
+   1522: 60003e0d  Closure      r0   r62  r13  ; fn #62 (offset 1454)
+   1523: 620d000b  CapStore     r13  r0   r11 
+   1524: 120d0000  Move         r13  r0   r0  
+   1525: 57000000  RetVal       r0   r0   r0  
+   1526: 60003d0c  Closure      r0   r61  r12  ; fn #61 (offset 1450)
+   1527: 620c000b  CapStore     r12  r0   r11 
+   1528: 120c0000  Move         r12  r0   r0  
+   1529: 57000000  RetVal       r0   r0   r0  
+   1530: 60003c22  Closure      r0   r60  r34  ; fn #60 (offset 1447)
+   1531: 12229300  Move         r34  r147 r0  
+   1532: 50004c00  Jmp          r0   r76  r0   ; -> 1609
+
+; === fn #63 @ 1533 ===
+   1533: 120a8000  Move         r10  r128 r0  
+   1534: 12800b00  Move         r128 r11  r0  
+   1535: 50004600  Jmp          r0   r70  r0   ; -> 1606
+
+; === fn #64 @ 1536 ===
+   1536: 120a8100  Move         r10  r129 r0  
+   1537: 12810b00  Move         r129 r11  r0  
+   1538: 12810c00  Move         r129 r12  r0  
+   1539: 030d0000  Const0       r13  r0   r0  
+   1540: 430c0d0e  ICmpLe       r12  r13  r14 
+   1541: 520e0004  JmpF         r14  r0   r4   ; r14 ? -> 1546
+   1542: 030d0000  Const0       r13  r0   r0  
+   1543: 120d0e00  Move         r13  r14  r0  
+   1544: 50000100  Jmp          r0   r1   r0   ; -> 1546
+   1545: 12e60d00  Move         r230 r13  r0  
+   1546: 120dc200  Move         r13  r194 r0  
+   1547: 12800e00  Move         r128 r14  r0  
+   1548: 120e0a00  Move         r14  r10  r0  
+   1549: 64c2010d  ClosureCall  r194 r1   r13  ; closure r194 argc=1
+   1550: 120dc300  Move         r13  r195 r0  
+   1551: 12810f00  Move         r129 r15  r0  
+   1552: 04100000  Const1       r16  r0   r0  
+   1553: 210f1011  ISub         r15  r16  r17 
+   1554: 07001e10  ConstU       r0   r30  r16  ; const #30 = Int(4)
+   1555: 22111011  IMul         r17  r16  r17 
+   1556: 12110a00  Move         r17  r10  r0  
+   1557: 64c3010e  ClosureCall  r195 r1   r14  ; closure r195 argc=1
+   1558: 120ef300  Move         r14  r243 r0  
+   1559: 12d40e00  Move         r212 r14  r0  
+   1560: 120ec400  Move         r14  r196 r0  
+   1561: 12f30f00  Move         r243 r15  r0  
+   1562: 120f0a00  Move         r15  r10  r0  
+   1563: 64c4010e  ClosureCall  r196 r1   r14  ; closure r196 argc=1
+   1564: 120ef500  Move         r14  r245 r0  
+   1565: 12f50f00  Move         r245 r15  r0  
+   1566: 07001f10  ConstU       r0   r31  r16  ; const #31 = Int(100)
+   1567: 440f1011  ICmpGe       r15  r16  r17 
+   1568: 52110004  JmpF         r17  r0   r4   ; r17 ? -> 1573
+   1569: 12f51300  Move         r245 r19  r0  
+   1570: 07002014  ConstU       r0   r32  r20  ; const #32 = Int(128)
+   1571: 41131415  ICmpLt       r19  r20  r21 
+   1572: 1215f700  Move         r21  r247 r0  
+   1573: 12951000  Move         r149 r16  r0  
+   1574: 1210c800  Move         r16  r200 r0  
+   1575: 12801100  Move         r128 r17  r0  
+   1576: 12110a00  Move         r17  r10  r0  
+   1577: 64c80110  ClosureCall  r200 r1   r16  ; closure r200 argc=1
+   1578: 1210c900  Move         r16  r201 r0  
+   1579: 12811200  Move         r129 r18  r0  
+   1580: 04130000  Const1       r19  r0   r0  
+   1581: 21121314  ISub         r18  r19  r20 
+   1582: 12140a00  Move         r20  r10  r0  
+   1583: 64c90111  ClosureCall  r201 r1   r17  ; closure r201 argc=1
+   1584: 1211f900  Move         r17  r249 r0  
+   1585: 12f71100  Move         r247 r17  r0  
+   1586: 03070000  Const0       r7   r0   r0  
+   1587: 40110713  ICmpEq       r17  r7   r19 
+   1588: 49131300  Not          r19  r19  r0  
+   1589: 5213000b  JmpF         r19  r0   r11  ; r19 ? -> 1601
+   1590: 04140000  Const1       r20  r0   r0  
+   1591: 40071415  ICmpEq       r7   r20  r21 
+   1592: 40111516  ICmpEq       r17  r21  r22 
+   1593: 49161600  Not          r22  r22  r0  
+   1594: 52160006  JmpF         r22  r0   r6   ; r22 ? -> 1601
+   1595: 04120000  Const1       r18  r0   r0  
+   1596: 12f91300  Move         r249 r19  r0  
+   1597: 20121314  IAdd         r18  r19  r20 
+   1598: 12141300  Move         r20  r19  r0  
+   1599: 50000100  Jmp          r0   r1   r0   ; -> 1601
+   1600: 12f91200  Move         r249 r18  r0  
+   1601: 12121300  Move         r18  r19  r0  
+   1602: 12130e00  Move         r19  r14  r0  
+   1603: 120e0000  Move         r14  r0   r0  
+   1604: 57000000  RetVal       r0   r0   r0  
+   1605: 6000400c  Closure      r0   r64  r12  ; fn #64 (offset 1536)
+   1606: 120c0000  Move         r12  r0   r0  
+   1607: 57000000  RetVal       r0   r0   r0  
+   1608: 60003f23  Closure      r0   r63  r35  ; fn #63 (offset 1533)
+   1609: 12239500  Move         r35  r149 r0  
+   1610: 50008600  Jmp          r0   r134 r0   ; -> 1745
+
+; === fn #65 @ 1611 ===
+   1611: 120a8100  Move         r10  r129 r0  
+   1612: 12810b00  Move         r129 r11  r0  
+   1613: 50008000  Jmp          r0   r128 r0   ; -> 1742
+
+; === fn #66 @ 1614 ===
+   1614: 120a8200  Move         r10  r130 r0  
+   1615: 12820b00  Move         r130 r11  r0  
+   1616: 50007a00  Jmp          r0   r122 r0   ; -> 1739
+
+; === fn #67 @ 1617 ===
+   1617: 120a8300  Move         r10  r131 r0  
+   1618: 12830b00  Move         r131 r11  r0  
+   1619: 50007400  Jmp          r0   r116 r0   ; -> 1736
+
+; === fn #68 @ 1620 ===
+   1620: 120a8400  Move         r10  r132 r0  
+   1621: 12840b00  Move         r132 r11  r0  
+   1622: 12830c00  Move         r131 r12  r0  
+   1623: 12820d00  Move         r130 r13  r0  
+   1624: 440c0d0e  ICmpGe       r12  r13  r14 
+   1625: 520e0004  JmpF         r14  r0   r4   ; r14 ? -> 1630
+   1626: 12810d00  Move         r129 r13  r0  
+   1627: 120d0e00  Move         r13  r14  r0  
+   1628: 50000100  Jmp          r0   r1   r0   ; -> 1630
+   1629: 12e60d00  Move         r230 r13  r0  
+   1630: 120dc500  Move         r13  r197 r0  
+   1631: 12810e00  Move         r129 r14  r0  
+   1632: 120e0a00  Move         r14  r10  r0  
+   1633: 64c5010d  ClosureCall  r197 r1   r13  ; closure r197 argc=1
+   1634: 120dc600  Move         r13  r198 r0  
+   1635: 12830f00  Move         r131 r15  r0  
+   1636: 07001e10  ConstU       r0   r30  r16  ; const #30 = Int(4)
+   1637: 220f1011  IMul         r15  r16  r17 
+   1638: 12110a00  Move         r17  r10  r0  
+   1639: 64c6010e  ClosureCall  r198 r1   r14  ; closure r198 argc=1
+   1640: 120ef600  Move         r14  r246 r0  
+   1641: 12d20e00  Move         r210 r14  r0  
+   1642: 120ec700  Move         r14  r199 r0  
+   1643: 12f60f00  Move         r246 r15  r0  
+   1644: 07002d10  ConstU       r0   r45  r16  ; const #45 = Int(8)
+   1645: 2b0f1011  Shr          r15  r16  r17 
+   1646: 12110a00  Move         r17  r10  r0  
+   1647: 64c7010e  ClosureCall  r199 r1   r14  ; closure r199 argc=1
+   1648: 120ef800  Move         r14  r248 r0  
+   1649: 12d40f00  Move         r212 r15  r0  
+   1650: 120fc900  Move         r15  r201 r0  
+   1651: 12f61000  Move         r246 r16  r0  
+   1652: 12100a00  Move         r16  r10  r0  
+   1653: 64c9010f  ClosureCall  r201 r1   r15  ; closure r201 argc=1
+   1654: 120ffa00  Move         r15  r250 r0  
+   1655: 12fa1000  Move         r250 r16  r0  
+   1656: 07001f11  ConstU       r0   r31  r17  ; const #31 = Int(100)
+   1657: 44101112  ICmpGe       r16  r17  r18 
+   1658: 52120004  JmpF         r18  r0   r4   ; r18 ? -> 1663
+   1659: 12fa1400  Move         r250 r20  r0  
+   1660: 07002015  ConstU       r0   r32  r21  ; const #32 = Int(128)
+   1661: 41141516  ICmpLt       r20  r21  r22 
+   1662: 1216fc00  Move         r22  r252 r0  
+   1663: 12fc1100  Move         r252 r17  r0  
+   1664: 03070000  Const0       r7   r0   r0  
+   1665: 40110713  ICmpEq       r17  r7   r19 
+   1666: 49131300  Not          r19  r19  r0  
+   1667: 5213002d  JmpF         r19  r0   r45  ; r19 ? -> 1713
+   1668: 04140000  Const1       r20  r0   r0  
+   1669: 40071415  ICmpEq       r7   r20  r21 
+   1670: 40111516  ICmpEq       r17  r21  r22 
+   1671: 49161600  Not          r22  r22  r0  
+   1672: 52160028  JmpF         r22  r0   r40  ; r22 ? -> 1713
+   1673: 12971200  Move         r151 r18  r0  
+   1674: 12125d00  Move         r18  r93  r0  
+   1675: 12811300  Move         r129 r19  r0  
+   1676: 12130a00  Move         r19  r10  r0  
+   1677: 645d0112  ClosureCall  r93  r1   r18  ; closure r93 argc=1
+   1678: 12125e00  Move         r18  r94  r0  
+   1679: 12821400  Move         r130 r20  r0  
+   1680: 12140a00  Move         r20  r10  r0  
+   1681: 645e0113  ClosureCall  r94  r1   r19  ; closure r94 argc=1
+   1682: 12135f00  Move         r19  r95  r0  
+   1683: 12831500  Move         r131 r21  r0  
+   1684: 04160000  Const1       r22  r0   r0  
+   1685: 20151617  IAdd         r21  r22  r23 
+   1686: 12170a00  Move         r23  r10  r0  
+   1687: 645f0114  ClosureCall  r95  r1   r20  ; closure r95 argc=1
+   1688: 12146000  Move         r20  r96  r0  
+   1689: 12841600  Move         r132 r22  r0  
+   1690: 04170000  Const1       r23  r0   r0  
+   1691: 20161718  IAdd         r22  r23  r24 
+   1692: 12180a00  Move         r24  r10  r0  
+   1693: 64600115  ClosureCall  r96  r1   r21  ; closure r96 argc=1
+   1694: 1215ff00  Move         r21  r255 r0  
+   1695: 12911300  Move         r145 r19  r0  
+   1696: 12135e00  Move         r19  r94  r0  
+   1697: 12ff1400  Move         r255 r20  r0  
+   1698: 12140a00  Move         r20  r10  r0  
+   1699: 645e0113  ClosureCall  r94  r1   r19  ; closure r94 argc=1
+   1700: 12135f00  Move         r19  r95  r0  
+   1701: 12f81500  Move         r248 r21  r0  
+   1702: 12150a00  Move         r21  r10  r0  
+   1703: 645f0114  ClosureCall  r95  r1   r20  ; closure r95 argc=1
+   1704: 12146000  Move         r20  r96  r0  
+   1705: 07000816  ConstU       r0   r8   r22  ; const #8 = Int(11)
+   1706: 12841700  Move         r132 r23  r0  
+   1707: 20161718  IAdd         r22  r23  r24 
+   1708: 12180a00  Move         r24  r10  r0  
+   1709: 64600115  ClosureCall  r96  r1   r21  ; closure r96 argc=1
+   1710: 12151300  Move         r21  r19  r0  
+   1711: 50000100  Jmp          r0   r1   r0   ; -> 1713
+   1712: 12971200  Move         r151 r18  r0  
+   1713: 1212cd00  Move         r18  r205 r0  
+   1714: 12811300  Move         r129 r19  r0  
+   1715: 12130a00  Move         r19  r10  r0  
+   1716: 64cd0112  ClosureCall  r205 r1   r18  ; closure r205 argc=1
+   1717: 12125d00  Move         r18  r93  r0  
+   1718: 12821400  Move         r130 r20  r0  
+   1719: 12140a00  Move         r20  r10  r0  
+   1720: 645d0113  ClosureCall  r93  r1   r19  ; closure r93 argc=1
+   1721: 12135e00  Move         r19  r94  r0  
+   1722: 12831500  Move         r131 r21  r0  
+   1723: 04160000  Const1       r22  r0   r0  
+   1724: 20151617  IAdd         r21  r22  r23 
+   1725: 12170a00  Move         r23  r10  r0  
+   1726: 645e0114  ClosureCall  r94  r1   r20  ; closure r94 argc=1
+   1727: 12145f00  Move         r20  r95  r0  
+   1728: 12841600  Move         r132 r22  r0  
+   1729: 12160a00  Move         r22  r10  r0  
+   1730: 645f0115  ClosureCall  r95  r1   r21  ; closure r95 argc=1
+   1731: 12151300  Move         r21  r19  r0  
+   1732: 12130e00  Move         r19  r14  r0  
+   1733: 120e0000  Move         r14  r0   r0  
+   1734: 57000000  RetVal       r0   r0   r0  
+   1735: 6000440c  Closure      r0   r68  r12  ; fn #68 (offset 1620)
+   1736: 120c0000  Move         r12  r0   r0  
+   1737: 57000000  RetVal       r0   r0   r0  
+   1738: 6000430c  Closure      r0   r67  r12  ; fn #67 (offset 1617)
+   1739: 120c0000  Move         r12  r0   r0  
+   1740: 57000000  RetVal       r0   r0   r0  
+   1741: 6000420c  Closure      r0   r66  r12  ; fn #66 (offset 1614)
+   1742: 120c0000  Move         r12  r0   r0  
+   1743: 57000000  RetVal       r0   r0   r0  
+   1744: 60004124  Closure      r0   r65  r36  ; fn #65 (offset 1611)
+   1745: 12249700  Move         r36  r151 r0  
+   1746: 50002e00  Jmp          r0   r46  r0   ; -> 1793
+
+; === fn #69 @ 1747 ===
+   1747: 120a8200  Move         r10  r130 r0  
+   1748: 12820b00  Move         r130 r11  r0  
+   1749: 12820c00  Move         r130 r12  r0  
+   1750: 07002e0d  ConstU       r0   r46  r13  ; const #46 = Int(43)
+   1751: 400c0d0e  ICmpEq       r12  r13  r14 
+   1752: 520e0004  JmpF         r14  r0   r4   ; r14 ? -> 1757
+   1753: 050d0000  Const2       r13  r0   r0  
+   1754: 120d0e00  Move         r13  r14  r0  
+   1755: 50000100  Jmp          r0   r1   r0   ; -> 1757
+   1756: 12820d00  Move         r130 r13  r0  
+   1757: 07002f0e  ConstU       r0   r47  r14  ; const #47 = Int(45)
+   1758: 400d0e0f  ICmpEq       r13  r14  r15 
+   1759: 520f0004  JmpF         r15  r0   r4   ; r15 ? -> 1764
+   1760: 050e0000  Const2       r14  r0   r0  
+   1761: 120e0f00  Move         r14  r15  r0  
+   1762: 50000100  Jmp          r0   r1   r0   ; -> 1764
+   1763: 12820e00  Move         r130 r14  r0  
+   1764: 0700300f  ConstU       r0   r48  r15  ; const #48 = Int(42)
+   1765: 400e0f10  ICmpEq       r14  r15  r16 
+   1766: 52100004  JmpF         r16  r0   r4   ; r16 ? -> 1771
+   1767: 0700190f  ConstU       r0   r25  r15  ; const #25 = Int(3)
+   1768: 120f1000  Move         r15  r16  r0  
+   1769: 50000100  Jmp          r0   r1   r0   ; -> 1771
+   1770: 12820f00  Move         r130 r15  r0  
+   1771: 07003110  ConstU       r0   r49  r16  ; const #49 = Int(47)
+   1772: 400f1011  ICmpEq       r15  r16  r17 
+   1773: 52110004  JmpF         r17  r0   r4   ; r17 ? -> 1778
+   1774: 07001910  ConstU       r0   r25  r16  ; const #25 = Int(3)
+   1775: 12101100  Move         r16  r17  r0  
+   1776: 50000100  Jmp          r0   r1   r0   ; -> 1778
+   1777: 12821000  Move         r130 r16  r0  
+   1778: 07003211  ConstU       r0   r50  r17  ; const #50 = Int(38)
+   1779: 40101112  ICmpEq       r16  r17  r18 
+   1780: 52120004  JmpF         r18  r0   r4   ; r18 ? -> 1785
+   1781: 05110000  Const2       r17  r0   r0  
+   1782: 12111200  Move         r17  r18  r0  
+   1783: 50000100  Jmp          r0   r1   r0   ; -> 1785
+   1784: 03110000  Const0       r17  r0   r0  
+   1785: 12111200  Move         r17  r18  r0  
+   1786: 12121100  Move         r18  r17  r0  
+   1787: 12111000  Move         r17  r16  r0  
+   1788: 12100f00  Move         r16  r15  r0  
+   1789: 120f0e00  Move         r15  r14  r0  
+   1790: 120e0000  Move         r14  r0   r0  
+   1791: 57000000  RetVal       r0   r0   r0  
+   1792: 60004525  Closure      r0   r69  r37  ; fn #69 (offset 1747)
+   1793: 12259900  Move         r37  r153 r0  
+   1794: 5000f000  Jmp          r0   r240 r0   ; -> 2035
+
+; === fn #70 @ 1795 ===
+   1795: 120a8300  Move         r10  r131 r0  
+   1796: 12830b00  Move         r131 r11  r0  
+   1797: 5000ea00  Jmp          r0   r234 r0   ; -> 2032
+
+; === fn #71 @ 1798 ===
+   1798: 120a8400  Move         r10  r132 r0  
+   1799: 12840b00  Move         r132 r11  r0  
+   1800: 5000e400  Jmp          r0   r228 r0   ; -> 2029
+
+; === fn #72 @ 1801 ===
+   1801: 120a8500  Move         r10  r133 r0  
+   1802: 12850b00  Move         r133 r11  r0  
+   1803: 12840c00  Move         r132 r12  r0  
+   1804: 12850d00  Move         r133 r13  r0  
+   1805: 440c0d0e  ICmpGe       r12  r13  r14 
+   1806: 520e0004  JmpF         r14  r0   r4   ; r14 ? -> 1811
+   1807: 030d0000  Const0       r13  r0   r0  
+   1808: 120d0e00  Move         r13  r14  r0  
+   1809: 50000100  Jmp          r0   r1   r0   ; -> 1811
+   1810: 12830e00  Move         r131 r14  r0  
+   1811: 120e0000  Move         r14  r0   r0  
+   1812: 12841800  Move         r132 r24  r0  
+   1813: 12180100  Move         r24  r1   r0  
+   1814: 9000180d  Perform      r0   r24  r13  ; const #24 = String('String.charAt')
+   1815: 120df700  Move         r13  r247 r0  
+   1816: 12f70e00  Move         r247 r14  r0  
+   1817: 0700330f  ConstU       r0   r51  r15  ; const #51 = Int(61)
+   1818: 400e0f10  ICmpEq       r14  r15  r16 
+   1819: 52100006  JmpF         r16  r0   r6   ; r16 ? -> 1826
+   1820: 12841200  Move         r132 r18  r0  
+   1821: 04130000  Const1       r19  r0   r0  
+   1822: 20121314  IAdd         r18  r19  r20 
+   1823: 12851600  Move         r133 r22  r0  
+   1824: 41141617  ICmpLt       r20  r22  r23 
+   1825: 03070000  Const0       r7   r0   r0  
+   1826: 40170710  ICmpEq       r23  r7   r16 
+   1827: 49101000  Not          r16  r16  r0  
+   1828: 5210001d  JmpF         r16  r0   r29  ; r16 ? -> 1858
+   1829: 04110000  Const1       r17  r0   r0  
+   1830: 40071112  ICmpEq       r7   r17  r18 
+   1831: 40171213  ICmpEq       r23  r18  r19 
+   1832: 49131300  Not          r19  r19  r0  
+   1833: 52130018  JmpF         r19  r0   r24  ; r19 ? -> 1858
+   1834: 12831000  Move         r131 r16  r0  
+   1835: 12100000  Move         r16  r0   r0  
+   1836: 12841a00  Move         r132 r26  r0  
+   1837: 041b0000  Const1       r27  r0   r0  
+   1838: 201a1b1c  IAdd         r26  r27  r28 
+   1839: 121c0100  Move         r28  r1   r0  
+   1840: 9000180f  Perform      r0   r24  r15  ; const #24 = String('String.charAt')
+   1841: 120ffa00  Move         r15  r250 r0  
+   1842: 12fa1000  Move         r250 r16  r0  
+   1843: 07003311  ConstU       r0   r51  r17  ; const #51 = Int(61)
+   1844: 40101112  ICmpEq       r16  r17  r18 
+   1845: 5212000c  JmpF         r18  r0   r12  ; r18 ? -> 1858
+   1846: 04110000  Const1       r17  r0   r0  
+   1847: 07000112  ConstU       r0   r1   r18  ; const #1 = Int(65536)
+   1848: 22111213  IMul         r17  r18  r19 
+   1849: 07000412  ConstU       r0   r4   r18  ; const #4 = Int(64)
+   1850: 07000213  ConstU       r0   r2   r19  ; const #2 = Int(256)
+   1851: 22121314  IMul         r18  r19  r20 
+   1852: 05130000  Const2       r19  r0   r0  
+   1853: 20141314  IAdd         r20  r19  r20 
+   1854: 20131413  IAdd         r19  r20  r19 
+   1855: 12131200  Move         r19  r18  r0  
+   1856: 50000100  Jmp          r0   r1   r0   ; -> 1858
+   1857: 03110000  Const0       r17  r0   r0  
+   1858: 12111200  Move         r17  r18  r0  
+   1859: 12121000  Move         r18  r16  r0  
+   1860: 50000100  Jmp          r0   r1   r0   ; -> 1862
+   1861: 12f70f00  Move         r247 r15  r0  
+   1862: 07003410  ConstU       r0   r52  r16  ; const #52 = Int(33)
+   1863: 400f1011  ICmpEq       r15  r16  r17 
+   1864: 52110006  JmpF         r17  r0   r6   ; r17 ? -> 1871
+   1865: 12841300  Move         r132 r19  r0  
+   1866: 04140000  Const1       r20  r0   r0  
+   1867: 20131415  IAdd         r19  r20  r21 
+   1868: 12851700  Move         r133 r23  r0  
+   1869: 41151718  ICmpLt       r21  r23  r24 
+   1870: 03070000  Const0       r7   r0   r0  
+   1871: 40180711  ICmpEq       r24  r7   r17 
+   1872: 49111100  Not          r17  r17  r0  
+   1873: 5211001d  JmpF         r17  r0   r29  ; r17 ? -> 1903
+   1874: 04120000  Const1       r18  r0   r0  
+   1875: 40071213  ICmpEq       r7   r18  r19 
+   1876: 40181314  ICmpEq       r24  r19  r20 
+   1877: 49141400  Not          r20  r20  r0  
+   1878: 52140018  JmpF         r20  r0   r24  ; r20 ? -> 1903
+   1879: 12831100  Move         r131 r17  r0  
+   1880: 12110000  Move         r17  r0   r0  
+   1881: 12841b00  Move         r132 r27  r0  
+   1882: 041c0000  Const1       r28  r0   r0  
+   1883: 201b1c1d  IAdd         r27  r28  r29 
+   1884: 121d0100  Move         r29  r1   r0  
+   1885: 90001810  Perform      r0   r24  r16  ; const #24 = String('String.charAt')
+   1886: 1210fb00  Move         r16  r251 r0  
+   1887: 12fb1100  Move         r251 r17  r0  
+   1888: 07003312  ConstU       r0   r51  r18  ; const #51 = Int(61)
+   1889: 40111213  ICmpEq       r17  r18  r19 
+   1890: 5213000c  JmpF         r19  r0   r12  ; r19 ? -> 1903
+   1891: 04120000  Const1       r18  r0   r0  
+   1892: 07000113  ConstU       r0   r1   r19  ; const #1 = Int(65536)
+   1893: 22121314  IMul         r18  r19  r20 
+   1894: 07003513  ConstU       r0   r53  r19  ; const #53 = Int(255)
+   1895: 07000214  ConstU       r0   r2   r20  ; const #2 = Int(256)
+   1896: 22131415  IMul         r19  r20  r21 
+   1897: 05140000  Const2       r20  r0   r0  
+   1898: 20151415  IAdd         r21  r20  r21 
+   1899: 20141514  IAdd         r20  r21  r20 
+   1900: 12141300  Move         r20  r19  r0  
+   1901: 50000100  Jmp          r0   r1   r0   ; -> 1903
+   1902: 03120000  Const0       r18  r0   r0  
+   1903: 12121300  Move         r18  r19  r0  
+   1904: 12131100  Move         r19  r17  r0  
+   1905: 50000100  Jmp          r0   r1   r0   ; -> 1907
+   1906: 12f71000  Move         r247 r16  r0  
+   1907: 07003611  ConstU       r0   r54  r17  ; const #54 = Int(60)
+   1908: 40101112  ICmpEq       r16  r17  r18 
+   1909: 5212001e  JmpF         r18  r0   r30  ; r18 ? -> 1940
+   1910: 12841100  Move         r132 r17  r0  
+   1911: 04120000  Const1       r18  r0   r0  
+   1912: 20111213  IAdd         r17  r18  r19 
+   1913: 12851500  Move         r133 r21  r0  
+   1914: 41131516  ICmpLt       r19  r21  r22 
+   1915: 52160018  JmpF         r22  r0   r24  ; r22 ? -> 1940
+   1916: 12831300  Move         r131 r19  r0  
+   1917: 12130000  Move         r19  r0   r0  
+   1918: 12841d00  Move         r132 r29  r0  
+   1919: 041e0000  Const1       r30  r0   r0  
+   1920: 201d1e1f  IAdd         r29  r30  r31 
+   1921: 121f0100  Move         r31  r1   r0  
+   1922: 90001812  Perform      r0   r24  r18  ; const #24 = String('String.charAt')
+   1923: 1212fd00  Move         r18  r253 r0  
+   1924: 12fd1300  Move         r253 r19  r0  
+   1925: 07003314  ConstU       r0   r51  r20  ; const #51 = Int(61)
+   1926: 40131415  ICmpEq       r19  r20  r21 
+   1927: 5215000c  JmpF         r21  r0   r12  ; r21 ? -> 1940
+   1928: 04140000  Const1       r20  r0   r0  
+   1929: 07000115  ConstU       r0   r1   r21  ; const #1 = Int(65536)
+   1930: 22141516  IMul         r20  r21  r22 
+   1931: 07003715  ConstU       r0   r55  r21  ; const #55 = Int(67)
+   1932: 07000216  ConstU       r0   r2   r22  ; const #2 = Int(256)
+   1933: 22151617  IMul         r21  r22  r23 
+   1934: 05160000  Const2       r22  r0   r0  
+   1935: 20171617  IAdd         r23  r22  r23 
+   1936: 20161716  IAdd         r22  r23  r22 
+   1937: 12161500  Move         r22  r21  r0  
+   1938: 50000100  Jmp          r0   r1   r0   ; -> 1940
+   1939: 04140000  Const1       r20  r0   r0  
+   1940: 07000115  ConstU       r0   r1   r21  ; const #1 = Int(65536)
+   1941: 22141516  IMul         r20  r21  r22 
+   1942: 07002315  ConstU       r0   r35  r21  ; const #35 = Int(65)
+   1943: 07000216  ConstU       r0   r2   r22  ; const #2 = Int(256)
+   1944: 22151617  IMul         r21  r22  r23 
+   1945: 04160000  Const1       r22  r0   r0  
+   1946: 20171617  IAdd         r23  r22  r23 
+   1947: 20161716  IAdd         r22  r23  r22 
+   1948: 12161500  Move         r22  r21  r0  
+   1949: 12151300  Move         r21  r19  r0  
+   1950: 50000100  Jmp          r0   r1   r0   ; -> 1952
+   1951: 04120000  Const1       r18  r0   r0  
+   1952: 07000113  ConstU       r0   r1   r19  ; const #1 = Int(65536)
+   1953: 22121314  IMul         r18  r19  r20 
+   1954: 07002313  ConstU       r0   r35  r19  ; const #35 = Int(65)
+   1955: 07000214  ConstU       r0   r2   r20  ; const #2 = Int(256)
+   1956: 22131415  IMul         r19  r20  r21 
+   1957: 04140000  Const1       r20  r0   r0  
+   1958: 20151415  IAdd         r21  r20  r21 
+   1959: 20141514  IAdd         r20  r21  r20 
+   1960: 12141300  Move         r20  r19  r0  
+   1961: 12131200  Move         r19  r18  r0  
+   1962: 50000100  Jmp          r0   r1   r0   ; -> 1964
+   1963: 12f71100  Move         r247 r17  r0  
+   1964: 07003812  ConstU       r0   r56  r18  ; const #56 = Int(62)
+   1965: 40111213  ICmpEq       r17  r18  r19 
+   1966: 5213001e  JmpF         r19  r0   r30  ; r19 ? -> 1997
+   1967: 12841200  Move         r132 r18  r0  
+   1968: 04130000  Const1       r19  r0   r0  
+   1969: 20121314  IAdd         r18  r19  r20 
+   1970: 12851600  Move         r133 r22  r0  
+   1971: 41141617  ICmpLt       r20  r22  r23 
+   1972: 52170018  JmpF         r23  r0   r24  ; r23 ? -> 1997
+   1973: 12831400  Move         r131 r20  r0  
+   1974: 12140000  Move         r20  r0   r0  
+   1975: 12841e00  Move         r132 r30  r0  
+   1976: 041f0000  Const1       r31  r0   r0  
+   1977: 201e1f20  IAdd         r30  r31  r32 
+   1978: 12200100  Move         r32  r1   r0  
+   1979: 90001813  Perform      r0   r24  r19  ; const #24 = String('String.charAt')
+   1980: 1213fe00  Move         r19  r254 r0  
+   1981: 12fe1400  Move         r254 r20  r0  
+   1982: 07003315  ConstU       r0   r51  r21  ; const #51 = Int(61)
+   1983: 40141516  ICmpEq       r20  r21  r22 
+   1984: 5216000c  JmpF         r22  r0   r12  ; r22 ? -> 1997
+   1985: 04150000  Const1       r21  r0   r0  
+   1986: 07000116  ConstU       r0   r1   r22  ; const #1 = Int(65536)
+   1987: 22151617  IMul         r21  r22  r23 
+   1988: 07003916  ConstU       r0   r57  r22  ; const #57 = Int(68)
+   1989: 07000217  ConstU       r0   r2   r23  ; const #2 = Int(256)
+   1990: 22161718  IMul         r22  r23  r24 
+   1991: 05170000  Const2       r23  r0   r0  
+   1992: 20181718  IAdd         r24  r23  r24 
+   1993: 20171817  IAdd         r23  r24  r23 
+   1994: 12171600  Move         r23  r22  r0  
+   1995: 50000100  Jmp          r0   r1   r0   ; -> 1997
+   1996: 04150000  Const1       r21  r0   r0  
+   1997: 07000116  ConstU       r0   r1   r22  ; const #1 = Int(65536)
+   1998: 22151617  IMul         r21  r22  r23 
+   1999: 07003a16  ConstU       r0   r58  r22  ; const #58 = Int(66)
+   2000: 07000217  ConstU       r0   r2   r23  ; const #2 = Int(256)
+   2001: 22161718  IMul         r22  r23  r24 
+   2002: 04170000  Const1       r23  r0   r0  
+   2003: 20181718  IAdd         r24  r23  r24 
+   2004: 20171817  IAdd         r23  r24  r23 
+   2005: 12171600  Move         r23  r22  r0  
+   2006: 12161400  Move         r22  r20  r0  
+   2007: 50000100  Jmp          r0   r1   r0   ; -> 2009
+   2008: 04130000  Const1       r19  r0   r0  
+   2009: 07000114  ConstU       r0   r1   r20  ; const #1 = Int(65536)
+   2010: 22131415  IMul         r19  r20  r21 
+   2011: 07003a14  ConstU       r0   r58  r20  ; const #58 = Int(66)
+   2012: 07000215  ConstU       r0   r2   r21  ; const #2 = Int(256)
+   2013: 22141516  IMul         r20  r21  r22 
+   2014: 04150000  Const1       r21  r0   r0  
+   2015: 20161516  IAdd         r22  r21  r22 
+   2016: 20151615  IAdd         r21  r22  r21 
+   2017: 12151400  Move         r21  r20  r0  
+   2018: 12141300  Move         r20  r19  r0  
+   2019: 50000100  Jmp          r0   r1   r0   ; -> 2021
+   2020: 03120000  Const0       r18  r0   r0  
+   2021: 12121300  Move         r18  r19  r0  
+   2022: 12131200  Move         r19  r18  r0  
+   2023: 12121100  Move         r18  r17  r0  
+   2024: 12111000  Move         r17  r16  r0  
+   2025: 12100e00  Move         r16  r14  r0  
+   2026: 120e0000  Move         r14  r0   r0  
+   2027: 57000000  RetVal       r0   r0   r0  
+   2028: 6000480c  Closure      r0   r72  r12  ; fn #72 (offset 1801)
+   2029: 120c0000  Move         r12  r0   r0  
+   2030: 57000000  RetVal       r0   r0   r0  
+   2031: 6000470c  Closure      r0   r71  r12  ; fn #71 (offset 1798)
+   2032: 120c0000  Move         r12  r0   r0  
+   2033: 57000000  RetVal       r0   r0   r0  
+   2034: 60004626  Closure      r0   r70  r38  ; fn #70 (offset 1795)
+   2035: 12269b00  Move         r38  r155 r0  
+   2036: 50006200  Jmp          r0   r98  r0   ; -> 2135
+
+; === fn #73 @ 2037 ===
+   2037: 120a8400  Move         r10  r132 r0  
+   2038: 12840b00  Move         r132 r11  r0  
+   2039: 50005c00  Jmp          r0   r92  r0   ; -> 2132
+
+; === fn #74 @ 2040 ===
+   2040: 120a8500  Move         r10  r133 r0  
+   2041: 12850b00  Move         r133 r11  r0  
+   2042: 50005600  Jmp          r0   r86  r0   ; -> 2129
+
+; === fn #75 @ 2043 ===
+   2043: 120a8600  Move         r10  r134 r0  
+   2044: 12860b00  Move         r134 r11  r0  
+   2045: 12850c00  Move         r133 r12  r0  
+   2046: 040d0000  Const1       r13  r0   r0  
+   2047: 200c0d0e  IAdd         r12  r13  r14 
+   2048: 12861000  Move         r134 r16  r0  
+   2049: 410e1011  ICmpLt       r14  r16  r17 
+   2050: 5211002a  JmpF         r17  r0   r42  ; r17 ? -> 2093
+   2051: 12840e00  Move         r132 r14  r0  
+   2052: 120e0000  Move         r14  r0   r0  
+   2053: 12851800  Move         r133 r24  r0  
+   2054: 12180100  Move         r24  r1   r0  
+   2055: 9000180d  Perform      r0   r24  r13  ; const #24 = String('String.charAt')
+   2056: 120df800  Move         r13  r248 r0  
+   2057: 12840f00  Move         r132 r15  r0  
+   2058: 120f0000  Move         r15  r0   r0  
+   2059: 12851900  Move         r133 r25  r0  
+   2060: 041a0000  Const1       r26  r0   r0  
+   2061: 20191a1b  IAdd         r25  r26  r27 
+   2062: 121b0100  Move         r27  r1   r0  
+   2063: 9000180e  Perform      r0   r24  r14  ; const #24 = String('String.charAt')
+   2064: 120efa00  Move         r14  r250 r0  
+   2065: 12f80f00  Move         r248 r15  r0  
+   2066: 07003610  ConstU       r0   r54  r16  ; const #54 = Int(60)
+   2067: 400f1011  ICmpEq       r15  r16  r17 
+   2068: 52110004  JmpF         r17  r0   r4   ; r17 ? -> 2073
+   2069: 12fa1300  Move         r250 r19  r0  
+   2070: 07003614  ConstU       r0   r54  r20  ; const #54 = Int(60)
+   2071: 40131415  ICmpEq       r19  r20  r21 
+   2072: 03070000  Const0       r7   r0   r0  
+   2073: 40150711  ICmpEq       r21  r7   r17 
+   2074: 49111100  Not          r17  r17  r0  
+   2075: 52110011  JmpF         r17  r0   r17  ; r17 ? -> 2093
+   2076: 04120000  Const1       r18  r0   r0  
+   2077: 40071213  ICmpEq       r7   r18  r19 
+   2078: 40151314  ICmpEq       r21  r19  r20 
+   2079: 49141400  Not          r20  r20  r0  
+   2080: 5214000c  JmpF         r20  r0   r12  ; r20 ? -> 2093
+   2081: 07001910  ConstU       r0   r25  r16  ; const #25 = Int(3)
+   2082: 07000111  ConstU       r0   r1   r17  ; const #1 = Int(65536)
+   2083: 22101112  IMul         r16  r17  r18 
+   2084: 07003011  ConstU       r0   r48  r17  ; const #48 = Int(42)
+   2085: 07000212  ConstU       r0   r2   r18  ; const #2 = Int(256)
+   2086: 22111213  IMul         r17  r18  r19 
+   2087: 05120000  Const2       r18  r0   r0  
+   2088: 20131213  IAdd         r19  r18  r19 
+   2089: 20121312  IAdd         r18  r19  r18 
+   2090: 12121100  Move         r18  r17  r0  
+   2091: 50000100  Jmp          r0   r1   r0   ; -> 2093
+   2092: 12f81000  Move         r248 r16  r0  
+   2093: 07003811  ConstU       r0   r56  r17  ; const #56 = Int(62)
+   2094: 40101112  ICmpEq       r16  r17  r18 
+   2095: 52120004  JmpF         r18  r0   r4   ; r18 ? -> 2100
+   2096: 12fa1400  Move         r250 r20  r0  
+   2097: 07003815  ConstU       r0   r56  r21  ; const #56 = Int(62)
+   2098: 40141516  ICmpEq       r20  r21  r22 
+   2099: 03070000  Const0       r7   r0   r0  
+   2100: 40160712  ICmpEq       r22  r7   r18 
+   2101: 49121200  Not          r18  r18  r0  
+   2102: 52120011  JmpF         r18  r0   r17  ; r18 ? -> 2120
+   2103: 04130000  Const1       r19  r0   r0  
+   2104: 40071314  ICmpEq       r7   r19  r20 
+   2105: 40161415  ICmpEq       r22  r20  r21 
+   2106: 49151500  Not          r21  r21  r0  
+   2107: 5215000c  JmpF         r21  r0   r12  ; r21 ? -> 2120
+   2108: 07001911  ConstU       r0   r25  r17  ; const #25 = Int(3)
+   2109: 07000112  ConstU       r0   r1   r18  ; const #1 = Int(65536)
+   2110: 22111213  IMul         r17  r18  r19 
+   2111: 07002e12  ConstU       r0   r46  r18  ; const #46 = Int(43)
+   2112: 07000213  ConstU       r0   r2   r19  ; const #2 = Int(256)
+   2113: 22121314  IMul         r18  r19  r20 
+   2114: 05130000  Const2       r19  r0   r0  
+   2115: 20141314  IAdd         r20  r19  r20 
+   2116: 20131413  IAdd         r19  r20  r19 
+   2117: 12131200  Move         r19  r18  r0  
+   2118: 50000100  Jmp          r0   r1   r0   ; -> 2120
+   2119: 03110000  Const0       r17  r0   r0  
+   2120: 12111200  Move         r17  r18  r0  
+   2121: 12121100  Move         r18  r17  r0  
+   2122: 12110e00  Move         r17  r14  r0  
+   2123: 50000100  Jmp          r0   r1   r0   ; -> 2125
+   2124: 030d0000  Const0       r13  r0   r0  
+   2125: 120d0e00  Move         r13  r14  r0  
+   2126: 120e0000  Move         r14  r0   r0  
+   2127: 57000000  RetVal       r0   r0   r0  
+   2128: 60004b0c  Closure      r0   r75  r12  ; fn #75 (offset 2043)
+   2129: 120c0000  Move         r12  r0   r0  
+   2130: 57000000  RetVal       r0   r0   r0  
+   2131: 60004a0c  Closure      r0   r74  r12  ; fn #74 (offset 2040)
+   2132: 120c0000  Move         r12  r0   r0  
+   2133: 57000000  RetVal       r0   r0   r0  
+   2134: 60004927  Closure      r0   r73  r39  ; fn #73 (offset 2037)
+   2135: 12279d00  Move         r39  r157 r0  
+   2136: 50005c00  Jmp          r0   r92  r0   ; -> 2229
+
+; === fn #76 @ 2137 ===
+   2137: 120a8500  Move         r10  r133 r0  
+   2138: 12850b00  Move         r133 r11  r0  
+   2139: 50005600  Jmp          r0   r86  r0   ; -> 2226
+
+; === fn #77 @ 2140 ===
+   2140: 120a8600  Move         r10  r134 r0  
+   2141: 12860b00  Move         r134 r11  r0  
+   2142: 50005000  Jmp          r0   r80  r0   ; -> 2223
+
+; === fn #78 @ 2143 ===
+   2143: 120a8700  Move         r10  r135 r0  
+   2144: 12870b00  Move         r135 r11  r0  
+   2145: 12f80c00  Move         r248 r12  r0  
+   2146: 120cc700  Move         r12  r199 r0  
+   2147: 12850d00  Move         r133 r13  r0  
+   2148: 120d0a00  Move         r13  r10  r0  
+   2149: 64c7010c  ClosureCall  r199 r1   r12  ; closure r199 argc=1
+   2150: 120cc800  Move         r12  r200 r0  
+   2151: 12860e00  Move         r134 r14  r0  
+   2152: 120e0a00  Move         r14  r10  r0  
+   2153: 64c8010d  ClosureCall  r200 r1   r13  ; closure r200 argc=1
+   2154: 120dc900  Move         r13  r201 r0  
+   2155: 12870f00  Move         r135 r15  r0  
+   2156: 120f0a00  Move         r15  r10  r0  
+   2157: 64c9010e  ClosureCall  r201 r1   r14  ; closure r201 argc=1
+   2158: 120ef800  Move         r14  r248 r0  
+   2159: 12f80d00  Move         r248 r13  r0  
+   2160: 12870e00  Move         r135 r14  r0  
+   2161: 410d0e0f  ICmpLt       r13  r14  r15 
+   2162: 520f0034  JmpF         r15  r0   r52  ; r15 ? -> 2215
+   2163: 12850f00  Move         r133 r15  r0  
+   2164: 120f0000  Move         r15  r0   r0  
+   2165: 12f81900  Move         r248 r25  r0  
+   2166: 12190100  Move         r25  r1   r0  
+   2167: 9000180e  Perform      r0   r24  r14  ; const #24 = String('String.charAt')
+   2168: 120efb00  Move         r14  r251 r0  
+   2169: 12fb0f00  Move         r251 r15  r0  
+   2170: 07003b10  ConstU       r0   r59  r16  ; const #59 = Int(58)
+   2171: 400f1011  ICmpEq       r15  r16  r17 
+   2172: 5211002a  JmpF         r17  r0   r42  ; r17 ? -> 2215
+   2173: 12f81000  Move         r248 r16  r0  
+   2174: 1210cd00  Move         r16  r205 r0  
+   2175: 12851100  Move         r133 r17  r0  
+   2176: 12110a00  Move         r17  r10  r0  
+   2177: 64cd0110  ClosureCall  r205 r1   r16  ; closure r205 argc=1
+   2178: 12105d00  Move         r16  r93  r0  
+   2179: 12f81200  Move         r248 r18  r0  
+   2180: 04130000  Const1       r19  r0   r0  
+   2181: 20121314  IAdd         r18  r19  r20 
+   2182: 12140a00  Move         r20  r10  r0  
+   2183: 645d0111  ClosureCall  r93  r1   r17  ; closure r93 argc=1
+   2184: 12115e00  Move         r17  r94  r0  
+   2185: 12871300  Move         r135 r19  r0  
+   2186: 12130a00  Move         r19  r10  r0  
+   2187: 645e0112  ClosureCall  r94  r1   r18  ; closure r94 argc=1
+   2188: 1212fe00  Move         r18  r254 r0  
+   2189: 12fc1100  Move         r252 r17  r0  
+   2190: 12115e00  Move         r17  r94  r0  
+   2191: 12851200  Move         r133 r18  r0  
+   2192: 12120a00  Move         r18  r10  r0  
+   2193: 645e0111  ClosureCall  r94  r1   r17  ; closure r94 argc=1
+   2194: 12115f00  Move         r17  r95  r0  
+   2195: 12fe1300  Move         r254 r19  r0  
+   2196: 12130a00  Move         r19  r10  r0  
+   2197: 645f0112  ClosureCall  r95  r1   r18  ; closure r95 argc=1
+   2198: 12126000  Move         r18  r96  r0  
+   2199: 12871400  Move         r135 r20  r0  
+   2200: 12140a00  Move         r20  r10  r0  
+   2201: 64600113  ClosureCall  r96  r1   r19  ; closure r96 argc=1
+   2202: 12136100  Move         r19  r97  r0  
+   2203: 03150000  Const0       r21  r0   r0  
+   2204: 12150a00  Move         r21  r10  r0  
+   2205: 64610114  ClosureCall  r97  r1   r20  ; closure r97 argc=1
+   2206: 12148f00  Move         r20  r143 r0  
+   2207: 12d21200  Move         r210 r18  r0  
+   2208: 12125f00  Move         r18  r95  r0  
+   2209: 128f1300  Move         r143 r19  r0  
+   2210: 12130a00  Move         r19  r10  r0  
+   2211: 645f0112  ClosureCall  r95  r1   r18  ; closure r95 argc=1
+   2212: 12121100  Move         r18  r17  r0  
+   2213: 50000100  Jmp          r0   r1   r0   ; -> 2215
+   2214: 12f81000  Move         r248 r16  r0  
+   2215: 12101100  Move         r16  r17  r0  
+   2216: 12110f00  Move         r17  r15  r0  
+   2217: 50000100  Jmp          r0   r1   r0   ; -> 2219
+   2218: 12f80e00  Move         r248 r14  r0  
+   2219: 120e0f00  Move         r14  r15  r0  
+   2220: 120f0000  Move         r15  r0   r0  
+   2221: 57000000  RetVal       r0   r0   r0  
+   2222: 60004e0c  Closure      r0   r78  r12  ; fn #78 (offset 2143)
+   2223: 120c0000  Move         r12  r0   r0  
+   2224: 57000000  RetVal       r0   r0   r0  
+   2225: 60004d0c  Closure      r0   r77  r12  ; fn #77 (offset 2140)
+   2226: 120c0000  Move         r12  r0   r0  
+   2227: 57000000  RetVal       r0   r0   r0  
+   2228: 60004c28  Closure      r0   r76  r40  ; fn #76 (offset 2137)
+   2229: 12289f00  Move         r40  r159 r0  
+   2230: 50019b00  Jmp          r1   r155 r0   ; -> 2642
+
+; === fn #79 @ 2231 ===
+   2231: 120a8600  Move         r10  r134 r0  
+   2232: 12860b00  Move         r134 r11  r0  
+   2233: 50019500  Jmp          r1   r149 r0   ; -> 2639
+
+; === fn #80 @ 2234 ===
+   2234: 120a8700  Move         r10  r135 r0  
+   2235: 12870b00  Move         r135 r11  r0  
+   2236: 50018f00  Jmp          r1   r143 r0   ; -> 2636
+
+; === fn #81 @ 2237 ===
+   2237: 120a8800  Move         r10  r136 r0  
+   2238: 12880b00  Move         r136 r11  r0  
+   2239: 50018900  Jmp          r1   r137 r0   ; -> 2633
+
+; === fn #82 @ 2240 ===
+   2240: 120a8900  Move         r10  r137 r0  
+   2241: 12890b00  Move         r137 r11  r0  
+   2242: 50018300  Jmp          r1   r131 r0   ; -> 2630
+
+; === fn #83 @ 2243 ===
+   2243: 120a8a00  Move         r10  r138 r0  
+   2244: 128a0b00  Move         r138 r11  r0  
+   2245: 50017d00  Jmp          r1   r125 r0   ; -> 2627
+
+; === fn #84 @ 2246 ===
+   2246: 120a8b00  Move         r10  r139 r0  
+   2247: 128b0b00  Move         r139 r11  r0  
+   2248: 50017700  Jmp          r1   r119 r0   ; -> 2624
+
+; === fn #85 @ 2249 ===
+   2249: 120a8c00  Move         r10  r140 r0  
+   2250: 128c0b00  Move         r140 r11  r0  
+   2251: 50017100  Jmp          r1   r113 r0   ; -> 2621
+
+; === fn #86 @ 2252 ===
+   2252: 120a8d00  Move         r10  r141 r0  
+   2253: 128d0b00  Move         r141 r11  r0  
+   2254: 50016b00  Jmp          r1   r107 r0   ; -> 2618
+
+; === fn #87 @ 2255 ===
+   2255: 120a8e00  Move         r10  r142 r0  
+   2256: 128e0b00  Move         r142 r11  r0  
+   2257: 50016500  Jmp          r1   r101 r0   ; -> 2615
+
+; === fn #88 @ 2258 ===
+   2258: 120a8f00  Move         r10  r143 r0  
+   2259: 128f0b00  Move         r143 r11  r0  
+   2260: 12880c00  Move         r136 r12  r0  
+   2261: 040d0000  Const1       r13  r0   r0  
+   2262: 200c0d0e  IAdd         r12  r13  r14 
+   2263: 12891000  Move         r137 r16  r0  
+   2264: 410e1011  ICmpLt       r14  r16  r17 
+   2265: 52110086  JmpF         r17  r0   r134 ; r17 ? -> 2400
+   2266: 12870e00  Move         r135 r14  r0  
+   2267: 120e0000  Move         r14  r0   r0  
+   2268: 12881800  Move         r136 r24  r0  
+   2269: 12180100  Move         r24  r1   r0  
+   2270: 9000180d  Perform      r0   r24  r13  ; const #24 = String('String.charAt')
+   2271: 120d9000  Move         r13  r144 r0  
+   2272: 12870f00  Move         r135 r15  r0  
+   2273: 120f0000  Move         r15  r0   r0  
+   2274: 12881900  Move         r136 r25  r0  
+   2275: 041a0000  Const1       r26  r0   r0  
+   2276: 20191a1b  IAdd         r25  r26  r27 
+   2277: 121b0100  Move         r27  r1   r0  
+   2278: 9000180e  Perform      r0   r24  r14  ; const #24 = String('String.charAt')
+   2279: 120e9200  Move         r14  r146 r0  
+   2280: 12900f00  Move         r144 r15  r0  
+   2281: 07003310  ConstU       r0   r51  r16  ; const #51 = Int(61)
+   2282: 400f1011  ICmpEq       r15  r16  r17 
+   2283: 52110004  JmpF         r17  r0   r4   ; r17 ? -> 2288
+   2284: 12921300  Move         r146 r19  r0  
+   2285: 07003814  ConstU       r0   r56  r20  ; const #56 = Int(62)
+   2286: 40131415  ICmpEq       r19  r20  r21 
+   2287: 03070000  Const0       r7   r0   r0  
+   2288: 40150711  ICmpEq       r21  r7   r17 
+   2289: 49111100  Not          r17  r17  r0  
+   2290: 5211006d  JmpF         r17  r0   r109 ; r17 ? -> 2400
+   2291: 04120000  Const1       r18  r0   r0  
+   2292: 40071213  ICmpEq       r7   r18  r19 
+   2293: 40151314  ICmpEq       r21  r19  r20 
+   2294: 49141400  Not          r20  r20  r0  
+   2295: 52140068  JmpF         r20  r0   r104 ; r20 ? -> 2400
+   2296: 12de1000  Move         r222 r16  r0  
+   2297: 12106400  Move         r16  r100 r0  
+   2298: 07003c11  ConstU       r0   r60  r17  ; const #60 = String('Jmp -> fn_end')
+   2299: 12110a00  Move         r17  r10  r0  
+   2300: 64640110  ClosureCall  r100 r1   r16  ; closure r100 argc=1
+   2301: 12109500  Move         r16  r149 r0  
+   2302: 12e41100  Move         r228 r17  r0  
+   2303: 12116600  Move         r17  r102 r0  
+   2304: 07003d12  ConstU       r0   r61  r18  ; const #61 = Int(80)
+   2305: 12120a00  Move         r18  r10  r0  
+   2306: 64660111  ClosureCall  r102 r1   r17  ; closure r102 argc=1
+   2307: 12116700  Move         r17  r103 r0  
+   2308: 03130000  Const0       r19  r0   r0  
+   2309: 12130a00  Move         r19  r10  r0  
+   2310: 64670112  ClosureCall  r103 r1   r18  ; closure r103 argc=1
+   2311: 12126800  Move         r18  r104 r0  
+   2312: 03140000  Const0       r20  r0   r0  
+   2313: 12140a00  Move         r20  r10  r0  
+   2314: 64680113  ClosureCall  r104 r1   r19  ; closure r104 argc=1
+   2315: 12136900  Move         r19  r105 r0  
+   2316: 03150000  Const0       r21  r0   r0  
+   2317: 12150a00  Move         r21  r10  r0  
+   2318: 64690114  ClosureCall  r105 r1   r20  ; closure r105 argc=1
+   2319: 12149700  Move         r20  r151 r0  
+   2320: 12de1200  Move         r222 r18  r0  
+   2321: 12126800  Move         r18  r104 r0  
+   2322: 07003e13  ConstU       r0   r62  r19  ; const #62 = String('FN_START')
+   2323: 12130a00  Move         r19  r10  r0  
+   2324: 64680112  ClosureCall  r104 r1   r18  ; closure r104 argc=1
+   2325: 12129900  Move         r18  r153 r0  
+   2326: 07001f13  ConstU       r0   r31  r19  ; const #31 = Int(100)
+   2327: 128c1400  Move         r140 r20  r0  
+   2328: 20131415  IAdd         r19  r20  r21 
+   2329: 12159b00  Move         r21  r155 r0  
+   2330: 12e41400  Move         r228 r20  r0  
+   2331: 12146c00  Move         r20  r108 r0  
+   2332: 07001d15  ConstU       r0   r29  r21  ; const #29 = Int(18)
+   2333: 12150a00  Move         r21  r10  r0  
+   2334: 646c0114  ClosureCall  r108 r1   r20  ; closure r108 argc=1
+   2335: 12146d00  Move         r20  r109 r0  
+   2336: 07000516  ConstU       r0   r5   r22  ; const #5 = Int(10)
+   2337: 12160a00  Move         r22  r10  r0  
+   2338: 646d0115  ClosureCall  r109 r1   r21  ; closure r109 argc=1
+   2339: 12156e00  Move         r21  r110 r0  
+   2340: 129b1700  Move         r155 r23  r0  
+   2341: 12170a00  Move         r23  r10  r0  
+   2342: 646e0116  ClosureCall  r110 r1   r22  ; closure r110 argc=1
+   2343: 12166f00  Move         r22  r111 r0  
+   2344: 03180000  Const0       r24  r0   r0  
+   2345: 12180a00  Move         r24  r10  r0  
+   2346: 646f0117  ClosureCall  r111 r1   r23  ; closure r111 argc=1
+   2347: 12179d00  Move         r23  r157 r0  
+   2348: 12971500  Move         r151 r21  r0  
+   2349: 12156e00  Move         r21  r110 r0  
+   2350: 128b1600  Move         r139 r22  r0  
+   2351: 12160a00  Move         r22  r10  r0  
+   2352: 646e0115  ClosureCall  r110 r1   r21  ; closure r110 argc=1
+   2353: 12156f00  Move         r21  r111 r0  
+   2354: 128c1700  Move         r140 r23  r0  
+   2355: 12170a00  Move         r23  r10  r0  
+   2356: 646f0116  ClosureCall  r111 r1   r22  ; closure r111 argc=1
+   2357: 12167000  Move         r22  r112 r0  
+   2358: 03180000  Const0       r24  r0   r0  
+   2359: 12180a00  Move         r24  r10  r0  
+   2360: 64700117  ClosureCall  r112 r1   r23  ; closure r112 argc=1
+   2361: 12177100  Move         r23  r113 r0  
+   2362: 03190000  Const0       r25  r0   r0  
+   2363: 12190a00  Move         r25  r10  r0  
+   2364: 64710118  ClosureCall  r113 r1   r24  ; closure r113 argc=1
+   2365: 12189f00  Move         r24  r159 r0  
+   2366: 129f1700  Move         r159 r23  r0  
+   2367: 12170000  Move         r23  r0   r0  
+   2368: 90003f16  Perform      r0   r63  r22  ; const #63 = String('String.length')
+   2369: 128b1800  Move         r139 r24  r0  
+   2370: 12180000  Move         r24  r0   r0  
+   2371: 90003f17  Perform      r0   r63  r23  ; const #63 = String('String.length')
+   2372: 21161718  ISub         r22  r23  r24 
+   2373: 07001e17  ConstU       r0   r30  r23  ; const #30 = Int(4)
+   2374: 23181718  IDiv         r24  r23  r24 
+   2375: 1218a100  Move         r24  r161 r0  
+   2376: 12a11700  Move         r161 r23  r0  
+   2377: 03180000  Const0       r24  r0   r0  
+   2378: 42171819  ICmpGt       r23  r24  r25 
+   2379: 52190014  JmpF         r25  r0   r20  ; r25 ? -> 2400
+   2380: 12911800  Move         r145 r24  r0  
+   2381: 12187300  Move         r24  r115 r0  
+   2382: 129f1900  Move         r159 r25  r0  
+   2383: 12190a00  Move         r25  r10  r0  
+   2384: 64730118  ClosureCall  r115 r1   r24  ; closure r115 argc=1
+   2385: 12187400  Move         r24  r116 r0  
+   2386: 12d21a00  Move         r210 r26  r0  
+   2387: 121a7500  Move         r26  r117 r0  
+   2388: 128e1b00  Move         r142 r27  r0  
+   2389: 121b0a00  Move         r27  r10  r0  
+   2390: 6475011a  ClosureCall  r117 r1   r26  ; closure r117 argc=1
+   2391: 121a0a00  Move         r26  r10  r0  
+   2392: 64740119  ClosureCall  r116 r1   r25  ; closure r116 argc=1
+   2393: 12197500  Move         r25  r117 r0  
+   2394: 129b1b00  Move         r155 r27  r0  
+   2395: 121b0a00  Move         r27  r10  r0  
+   2396: 6475011a  ClosureCall  r117 r1   r26  ; closure r117 argc=1
+   2397: 121a1900  Move         r26  r25  r0  
+   2398: 50000100  Jmp          r0   r1   r0   ; -> 2400
+   2399: 12911800  Move         r145 r24  r0  
+   2400: 12187300  Move         r24  r115 r0  
+   2401: 128b1900  Move         r139 r25  r0  
+   2402: 12190a00  Move         r25  r10  r0  
+   2403: 64730118  ClosureCall  r115 r1   r24  ; closure r115 argc=1
+   2404: 12187400  Move         r24  r116 r0  
+   2405: 12d21a00  Move         r210 r26  r0  
+   2406: 121a7500  Move         r26  r117 r0  
+   2407: 128e1b00  Move         r142 r27  r0  
+   2408: 121b0a00  Move         r27  r10  r0  
+   2409: 6475011a  ClosureCall  r117 r1   r26  ; closure r117 argc=1
+   2410: 121a0a00  Move         r26  r10  r0  
+   2411: 64740119  ClosureCall  r116 r1   r25  ; closure r116 argc=1
+   2412: 12197500  Move         r25  r117 r0  
+   2413: 129b1b00  Move         r155 r27  r0  
+   2414: 121b0a00  Move         r27  r10  r0  
+   2415: 6475011a  ClosureCall  r117 r1   r26  ; closure r117 argc=1
+   2416: 121a1900  Move         r26  r25  r0  
+   2417: 1219a300  Move         r25  r163 r0  
+   2418: 128c1800  Move         r140 r24  r0  
+   2419: 12a11900  Move         r161 r25  r0  
+   2420: 041a0000  Const1       r26  r0   r0  
+   2421: 20191a1b  IAdd         r25  r26  r27 
+   2422: 20181b1a  IAdd         r24  r27  r26 
+   2423: 121aa500  Move         r26  r165 r0  
+   2424: 12ec1900  Move         r236 r25  r0  
+   2425: 12197600  Move         r25  r118 r0  
+   2426: 031a0000  Const0       r26  r0   r0  
+   2427: 121a0a00  Move         r26  r10  r0  
+   2428: 64760119  ClosureCall  r118 r1   r25  ; closure r118 argc=1
+   2429: 12197700  Move         r25  r119 r0  
+   2430: 12a11b00  Move         r161 r27  r0  
+   2431: 121b0a00  Move         r27  r10  r0  
+   2432: 6477011a  ClosureCall  r119 r1   r26  ; closure r119 argc=1
+   2433: 121a7800  Move         r26  r120 r0  
+   2434: 031c0000  Const0       r28  r0   r0  
+   2435: 121c0a00  Move         r28  r10  r0  
+   2436: 6478011b  ClosureCall  r120 r1   r27  ; closure r120 argc=1
+   2437: 121b7900  Move         r27  r121 r0  
+   2438: 031d0000  Const0       r29  r0   r0  
+   2439: 121d0a00  Move         r29  r10  r0  
+   2440: 6479011c  ClosureCall  r121 r1   r28  ; closure r121 argc=1
+   2441: 121ca700  Move         r28  r167 r0  
+   2442: 12e41a00  Move         r228 r26  r0  
+   2443: 121a7800  Move         r26  r120 r0  
+   2444: 07001d1b  ConstU       r0   r29  r27  ; const #29 = Int(18)
+   2445: 121b0a00  Move         r27  r10  r0  
+   2446: 6478011a  ClosureCall  r120 r1   r26  ; closure r120 argc=1
+   2447: 121a7900  Move         r26  r121 r0  
+   2448: 129b1c00  Move         r155 r28  r0  
+   2449: 121c0a00  Move         r28  r10  r0  
+   2450: 6479011b  ClosureCall  r121 r1   r27  ; closure r121 argc=1
+   2451: 121b7a00  Move         r27  r122 r0  
+   2452: 0700081d  ConstU       r0   r8   r29  ; const #8 = Int(11)
+   2453: 12a11e00  Move         r161 r30  r0  
+   2454: 201d1e1f  IAdd         r29  r30  r31 
+   2455: 121f0a00  Move         r31  r10  r0  
+   2456: 647a011c  ClosureCall  r122 r1   r28  ; closure r122 argc=1
+   2457: 121c7b00  Move         r28  r123 r0  
+   2458: 031e0000  Const0       r30  r0   r0  
+   2459: 121e0a00  Move         r30  r10  r0  
+   2460: 647b011d  ClosureCall  r123 r1   r29  ; closure r123 argc=1
+   2461: 121da900  Move         r29  r169 r0  
+   2462: 12861b00  Move         r134 r27  r0  
+   2463: 121b7a00  Move         r27  r122 r0  
+   2464: 12871c00  Move         r135 r28  r0  
+   2465: 121c0a00  Move         r28  r10  r0  
+   2466: 647a011b  ClosureCall  r122 r1   r27  ; closure r122 argc=1
+   2467: 121b7b00  Move         r27  r123 r0  
+   2468: 12881d00  Move         r136 r29  r0  
+   2469: 051e0000  Const2       r30  r0   r0  
+   2470: 201d1e1f  IAdd         r29  r30  r31 
+   2471: 121f0a00  Move         r31  r10  r0  
+   2472: 647b011c  ClosureCall  r123 r1   r28  ; closure r123 argc=1
+   2473: 121c7c00  Move         r28  r124 r0  
+   2474: 12891e00  Move         r137 r30  r0  
+   2475: 121e0a00  Move         r30  r10  r0  
+   2476: 647c011d  ClosureCall  r124 r1   r29  ; closure r124 argc=1
+   2477: 121d7d00  Move         r29  r125 r0  
+   2478: 128d1f00  Move         r141 r31  r0  
+   2479: 121f0a00  Move         r31  r10  r0  
+   2480: 647d011e  ClosureCall  r125 r1   r30  ; closure r125 argc=1
+   2481: 121e7e00  Move         r30  r126 r0  
+   2482: 04210000  Const1       r33  r0   r0  
+   2483: 21202122  ISub         r32  r33  r34 
+   2484: 12220a00  Move         r34  r10  r0  
+   2485: 647e011f  ClosureCall  r126 r1   r31  ; closure r126 argc=1
+   2486: 121f7f00  Move         r31  r127 r0  
+   2487: 07000a21  ConstU       r0   r10  r33  ; const #10 = Int(12)
+   2488: 12a12200  Move         r161 r34  r0  
+   2489: 20212223  IAdd         r33  r34  r35 
+   2490: 12230a00  Move         r35  r10  r0  
+   2491: 647f0120  ClosureCall  r127 r1   r32  ; closure r127 argc=1
+   2492: 12208000  Move         r32  r128 r0  
+   2493: 12a32200  Move         r163 r34  r0  
+   2494: 12220a00  Move         r34  r10  r0  
+   2495: 64800121  ClosureCall  r128 r1   r33  ; closure r128 argc=1
+   2496: 12218100  Move         r33  r129 r0  
+   2497: 12a52300  Move         r165 r35  r0  
+   2498: 12230a00  Move         r35  r10  r0  
+   2499: 64810122  ClosureCall  r129 r1   r34  ; closure r129 argc=1
+   2500: 1222ab00  Move         r34  r171 r0  
+   2501: 12ab1c00  Move         r171 r28  r0  
+   2502: 07001d1d  ConstU       r0   r29  r29  ; const #29 = Int(18)
+   2503: 2b1c1d1e  Shr          r28  r29  r30 
+   2504: 121ead00  Move         r30  r173 r0  
+   2505: 12d01d00  Move         r208 r29  r0  
+   2506: 121d7e00  Move         r29  r126 r0  
+   2507: 12ab1e00  Move         r171 r30  r0  
+   2508: 121e0a00  Move         r30  r10  r0  
+   2509: 647e011d  ClosureCall  r126 r1   r29  ; closure r126 argc=1
+   2510: 121daf00  Move         r29  r175 r0  
+   2511: 12e41e00  Move         r228 r30  r0  
+   2512: 121e8000  Move         r30  r128 r0  
+   2513: 07001d1f  ConstU       r0   r29  r31  ; const #29 = Int(18)
+   2514: 121f0a00  Move         r31  r10  r0  
+   2515: 6480011e  ClosureCall  r128 r1   r30  ; closure r128 argc=1
+   2516: 121e8100  Move         r30  r129 r0  
+   2517: 12ad2000  Move         r173 r32  r0  
+   2518: 12200a00  Move         r32  r10  r0  
+   2519: 6481011f  ClosureCall  r129 r1   r31  ; closure r129 argc=1
+   2520: 121f8200  Move         r31  r130 r0  
+   2521: 03210000  Const0       r33  r0   r0  
+   2522: 12210a00  Move         r33  r10  r0  
+   2523: 64820120  ClosureCall  r130 r1   r32  ; closure r130 argc=1
+   2524: 12208300  Move         r32  r131 r0  
+   2525: 03220000  Const0       r34  r0   r0  
+   2526: 12220a00  Move         r34  r10  r0  
+   2527: 64830121  ClosureCall  r131 r1   r33  ; closure r131 argc=1
+   2528: 1221b100  Move         r33  r177 r0  
+   2529: 12e41f00  Move         r228 r31  r0  
+   2530: 121f8200  Move         r31  r130 r0  
+   2531: 07004020  ConstU       r0   r64  r32  ; const #64 = Int(87)
+   2532: 12200a00  Move         r32  r10  r0  
+   2533: 6482011f  ClosureCall  r130 r1   r31  ; closure r130 argc=1
+   2534: 121f8300  Move         r31  r131 r0  
+   2535: 03210000  Const0       r33  r0   r0  
+   2536: 12210a00  Move         r33  r10  r0  
+   2537: 64830120  ClosureCall  r131 r1   r32  ; closure r131 argc=1
+   2538: 12208400  Move         r32  r132 r0  
+   2539: 03220000  Const0       r34  r0   r0  
+   2540: 12220a00  Move         r34  r10  r0  
+   2541: 64840121  ClosureCall  r132 r1   r33  ; closure r132 argc=1
+   2542: 12218500  Move         r33  r133 r0  
+   2543: 03230000  Const0       r35  r0   r0  
+   2544: 12230a00  Move         r35  r10  r0  
+   2545: 64850122  ClosureCall  r133 r1   r34  ; closure r133 argc=1
+   2546: 1222b300  Move         r34  r179 r0  
+   2547: 12de2000  Move         r222 r32  r0  
+   2548: 12208400  Move         r32  r132 r0  
+   2549: 07004121  ConstU       r0   r65  r33  ; const #65 = String('fn_end:')
+   2550: 12210a00  Move         r33  r10  r0  
+   2551: 64840120  ClosureCall  r132 r1   r32  ; closure r132 argc=1
+   2552: 1220b500  Move         r32  r181 r0  
+   2553: 128e2100  Move         r142 r33  r0  
+   2554: 1221b700  Move         r33  r183 r0  
+   2555: 12e42200  Move         r228 r34  r0  
+   2556: 12228800  Move         r34  r136 r0  
+   2557: 07004223  ConstU       r0   r66  r35  ; const #66 = Int(96)
+   2558: 12230a00  Move         r35  r10  r0  
+   2559: 64880122  ClosureCall  r136 r1   r34  ; closure r136 argc=1
+   2560: 12228900  Move         r34  r137 r0  
+   2561: 07003524  ConstU       r0   r53  r36  ; const #53 = Int(255)
+   2562: 12240a00  Move         r36  r10  r0  
+   2563: 64890123  ClosureCall  r137 r1   r35  ; closure r137 argc=1
+   2564: 12238a00  Move         r35  r138 r0  
+   2565: 07003525  ConstU       r0   r53  r37  ; const #53 = Int(255)
+   2566: 12250a00  Move         r37  r10  r0  
+   2567: 648a0124  ClosureCall  r138 r1   r36  ; closure r138 argc=1
+   2568: 12248b00  Move         r36  r139 r0  
+   2569: 12b72600  Move         r183 r38  r0  
+   2570: 12260a00  Move         r38  r10  r0  
+   2571: 648b0125  ClosureCall  r139 r1   r37  ; closure r139 argc=1
+   2572: 1225b900  Move         r37  r185 r0  
+   2573: 12ec2300  Move         r236 r35  r0  
+   2574: 12238a00  Move         r35  r138 r0  
+   2575: 12b72400  Move         r183 r36  r0  
+   2576: 12240a00  Move         r36  r10  r0  
+   2577: 648a0123  ClosureCall  r138 r1   r35  ; closure r138 argc=1
+   2578: 12238b00  Move         r35  r139 r0  
+   2579: 12a12500  Move         r161 r37  r0  
+   2580: 12250a00  Move         r37  r10  r0  
+   2581: 648b0124  ClosureCall  r139 r1   r36  ; closure r139 argc=1
+   2582: 12248c00  Move         r36  r140 r0  
+   2583: 03260000  Const0       r38  r0   r0  
+   2584: 12260a00  Move         r38  r10  r0  
+   2585: 648c0125  ClosureCall  r140 r1   r37  ; closure r140 argc=1
+   2586: 12258d00  Move         r37  r141 r0  
+   2587: 04270000  Const1       r39  r0   r0  
+   2588: 12270a00  Move         r39  r10  r0  
+   2589: 648d0126  ClosureCall  r141 r1   r38  ; closure r141 argc=1
+   2590: 1226bb00  Move         r38  r187 r0  
+   2591: 12b72400  Move         r183 r36  r0  
+   2592: 07001a25  ConstU       r0   r26  r37  ; const #26 = Int(262144)
+   2593: 22242526  IMul         r36  r37  r38 
+   2594: 12af2500  Move         r175 r37  r0  
+   2595: 20262526  IAdd         r38  r37  r38 
+   2596: 12261100  Move         r38  r17  r0  
+   2597: 50000100  Jmp          r0   r1   r0   ; -> 2599
+   2598: 128e1000  Move         r142 r16  r0  
+   2599: 07001a11  ConstU       r0   r26  r17  ; const #26 = Int(262144)
+   2600: 22101112  IMul         r16  r17  r18 
+   2601: 128f1100  Move         r143 r17  r0  
+   2602: 20121112  IAdd         r18  r17  r18 
+   2603: 12121100  Move         r18  r17  r0  
+   2604: 12110e00  Move         r17  r14  r0  
+   2605: 50000100  Jmp          r0   r1   r0   ; -> 2607
+   2606: 128e0d00  Move         r142 r13  r0  
+   2607: 07001a0e  ConstU       r0   r26  r14  ; const #26 = Int(262144)
+   2608: 220d0e0f  IMul         r13  r14  r15 
+   2609: 128f0e00  Move         r143 r14  r0  
+   2610: 200f0e0f  IAdd         r15  r14  r15 
+   2611: 120f0e00  Move         r15  r14  r0  
+   2612: 120e0000  Move         r14  r0   r0  
+   2613: 57000000  RetVal       r0   r0   r0  
+   2614: 6000580c  Closure      r0   r88  r12  ; fn #88 (offset 2258)
+   2615: 120c0000  Move         r12  r0   r0  
+   2616: 57000000  RetVal       r0   r0   r0  
+   2617: 6000570c  Closure      r0   r87  r12  ; fn #87 (offset 2255)
+   2618: 120c0000  Move         r12  r0   r0  
+   2619: 57000000  RetVal       r0   r0   r0  
+   2620: 6000560c  Closure      r0   r86  r12  ; fn #86 (offset 2252)
+   2621: 120c0000  Move         r12  r0   r0  
+   2622: 57000000  RetVal       r0   r0   r0  
+   2623: 6000550c  Closure      r0   r85  r12  ; fn #85 (offset 2249)
+   2624: 120c0000  Move         r12  r0   r0  
+   2625: 57000000  RetVal       r0   r0   r0  
+   2626: 6000540c  Closure      r0   r84  r12  ; fn #84 (offset 2246)
+   2627: 120c0000  Move         r12  r0   r0  
+   2628: 57000000  RetVal       r0   r0   r0  
+   2629: 6000530c  Closure      r0   r83  r12  ; fn #83 (offset 2243)
+   2630: 120c0000  Move         r12  r0   r0  
+   2631: 57000000  RetVal       r0   r0   r0  
+   2632: 6000520c  Closure      r0   r82  r12  ; fn #82 (offset 2240)
+   2633: 120c0000  Move         r12  r0   r0  
+   2634: 57000000  RetVal       r0   r0   r0  
+   2635: 6000510c  Closure      r0   r81  r12  ; fn #81 (offset 2237)
+   2636: 120c0000  Move         r12  r0   r0  
+   2637: 57000000  RetVal       r0   r0   r0  
+   2638: 6000500c  Closure      r0   r80  r12  ; fn #80 (offset 2234)
+   2639: 120c0000  Move         r12  r0   r0  
+   2640: 57000000  RetVal       r0   r0   r0  
+   2641: 60004f29  Closure      r0   r79  r41  ; fn #79 (offset 2231)
+   2642: 1229a100  Move         r41  r161 r0  
+   2643: 5000f800  Jmp          r0   r248 r0   ; -> 2892
+
+; === fn #89 @ 2644 ===
+   2644: 120a8700  Move         r10  r135 r0  
+   2645: 12870b00  Move         r135 r11  r0  
+   2646: 5000f200  Jmp          r0   r242 r0   ; -> 2889
+
+; === fn #90 @ 2647 ===
+   2647: 120a8800  Move         r10  r136 r0  
+   2648: 12880b00  Move         r136 r11  r0  
+   2649: 5000ec00  Jmp          r0   r236 r0   ; -> 2886
+
+; === fn #91 @ 2650 ===
+   2650: 120a8900  Move         r10  r137 r0  
+   2651: 12890b00  Move         r137 r11  r0  
+   2652: 5000e600  Jmp          r0   r230 r0   ; -> 2883
+
+; === fn #92 @ 2653 ===
+   2653: 120a8a00  Move         r10  r138 r0  
+   2654: 128a0b00  Move         r138 r11  r0  
+   2655: 5000e000  Jmp          r0   r224 r0   ; -> 2880
+
+; === fn #93 @ 2656 ===
+   2656: 120a8b00  Move         r10  r139 r0  
+   2657: 128b0b00  Move         r139 r11  r0  
+   2658: 5000da00  Jmp          r0   r218 r0   ; -> 2877
+
+; === fn #94 @ 2659 ===
+   2659: 120a8c00  Move         r10  r140 r0  
+   2660: 128c0b00  Move         r140 r11  r0  
+   2661: 5000d400  Jmp          r0   r212 r0   ; -> 2874
+
+; === fn #95 @ 2662 ===
+   2662: 120a8d00  Move         r10  r141 r0  
+   2663: 128d0b00  Move         r141 r11  r0  
+   2664: 5000ce00  Jmp          r0   r206 r0   ; -> 2871
+
+; === fn #96 @ 2665 ===
+   2665: 120a8e00  Move         r10  r142 r0  
+   2666: 128e0b00  Move         r142 r11  r0  
+   2667: 5000c800  Jmp          r0   r200 r0   ; -> 2868
+
+; === fn #97 @ 2668 ===
+   2668: 120a8f00  Move         r10  r143 r0  
+   2669: 128f0b00  Move         r143 r11  r0  
+   2670: 5000c200  Jmp          r0   r194 r0   ; -> 2865
+
+; === fn #98 @ 2671 ===
+   2671: 120a9000  Move         r10  r144 r0  
+   2672: 12900b00  Move         r144 r11  r0  
+   2673: 12f80c00  Move         r248 r12  r0  
+   2674: 120c5f00  Move         r12  r95  r0  
+   2675: 12880d00  Move         r136 r13  r0  
+   2676: 120d0a00  Move         r13  r10  r0  
+   2677: 645f010c  ClosureCall  r95  r1   r12  ; closure r95 argc=1
+   2678: 120c6000  Move         r12  r96  r0  
+   2679: 12900e00  Move         r144 r14  r0  
+   2680: 120e0a00  Move         r14  r10  r0  
+   2681: 6460010d  ClosureCall  r96  r1   r13  ; closure r96 argc=1
+   2682: 120d6100  Move         r13  r97  r0  
+   2683: 128a0f00  Move         r138 r15  r0  
+   2684: 120f0a00  Move         r15  r10  r0  
+   2685: 6461010e  ClosureCall  r97  r1   r14  ; closure r97 argc=1
+   2686: 120e9000  Move         r14  r144 r0  
+   2687: 12900d00  Move         r144 r13  r0  
+   2688: 128a0e00  Move         r138 r14  r0  
+   2689: 410d0e0f  ICmpLt       r13  r14  r15 
+   2690: 520f008e  JmpF         r15  r0   r142 ; r15 ? -> 2833
+   2691: 12880f00  Move         r136 r15  r0  
+   2692: 120f0000  Move         r15  r0   r0  
+   2693: 12901900  Move         r144 r25  r0  
+   2694: 12190100  Move         r25  r1   r0  
+   2695: 9000180e  Perform      r0   r24  r14  ; const #24 = String('String.charAt')
+   2696: 120e9300  Move         r14  r147 r0  
+   2697: 12930f00  Move         r147 r15  r0  
+   2698: 07004310  ConstU       r0   r67  r16  ; const #67 = Int(40)
+   2699: 400f1011  ICmpEq       r15  r16  r17 
+   2700: 52110084  JmpF         r17  r0   r132 ; r17 ? -> 2833
+   2701: 12f81000  Move         r248 r16  r0  
+   2702: 12106500  Move         r16  r101 r0  
+   2703: 12881100  Move         r136 r17  r0  
+   2704: 12110a00  Move         r17  r10  r0  
+   2705: 64650110  ClosureCall  r101 r1   r16  ; closure r101 argc=1
+   2706: 12106600  Move         r16  r102 r0  
+   2707: 12901200  Move         r144 r18  r0  
+   2708: 04130000  Const1       r19  r0   r0  
+   2709: 20121314  IAdd         r18  r19  r20 
+   2710: 12140a00  Move         r20  r10  r0  
+   2711: 64660111  ClosureCall  r102 r1   r17  ; closure r102 argc=1
+   2712: 12116700  Move         r17  r103 r0  
+   2713: 128a1300  Move         r138 r19  r0  
+   2714: 12130a00  Move         r19  r10  r0  
+   2715: 64670112  ClosureCall  r103 r1   r18  ; closure r103 argc=1
+   2716: 12129600  Move         r18  r150 r0  
+   2717: 12fc1100  Move         r252 r17  r0  
+   2718: 12116700  Move         r17  r103 r0  
+   2719: 12881200  Move         r136 r18  r0  
+   2720: 12120a00  Move         r18  r10  r0  
+   2721: 64670111  ClosureCall  r103 r1   r17  ; closure r103 argc=1
+   2722: 12116800  Move         r17  r104 r0  
+   2723: 12961300  Move         r150 r19  r0  
+   2724: 12130a00  Move         r19  r10  r0  
+   2725: 64680112  ClosureCall  r104 r1   r18  ; closure r104 argc=1
+   2726: 12126900  Move         r18  r105 r0  
+   2727: 128a1400  Move         r138 r20  r0  
+   2728: 12140a00  Move         r20  r10  r0  
+   2729: 64690113  ClosureCall  r105 r1   r19  ; closure r105 argc=1
+   2730: 12136a00  Move         r19  r106 r0  
+   2731: 03150000  Const0       r21  r0   r0  
+   2732: 12150a00  Move         r21  r10  r0  
+   2733: 646a0114  ClosureCall  r106 r1   r20  ; closure r106 argc=1
+   2734: 12149800  Move         r20  r152 r0  
+   2735: 12981200  Move         r152 r18  r0  
+   2736: 07000313  ConstU       r0   r3   r19  ; const #3 = Int(16)
+   2737: 2b121314  Shr          r18  r19  r20 
+   2738: 12149a00  Move         r20  r154 r0  
+   2739: 12d21300  Move         r210 r19  r0  
+   2740: 12136b00  Move         r19  r107 r0  
+   2741: 12981400  Move         r152 r20  r0  
+   2742: 12140a00  Move         r20  r10  r0  
+   2743: 646b0113  ClosureCall  r107 r1   r19  ; closure r107 argc=1
+   2744: 12139c00  Move         r19  r156 r0  
+   2745: 129f1400  Move         r159 r20  r0  
+   2746: 12146d00  Move         r20  r109 r0  
+   2747: 12881500  Move         r136 r21  r0  
+   2748: 12150a00  Move         r21  r10  r0  
+   2749: 646d0114  ClosureCall  r109 r1   r20  ; closure r109 argc=1
+   2750: 12146e00  Move         r20  r110 r0  
+   2751: 129c1600  Move         r156 r22  r0  
+   2752: 12160a00  Move         r22  r10  r0  
+   2753: 646e0115  ClosureCall  r110 r1   r21  ; closure r110 argc=1
+   2754: 12156f00  Move         r21  r111 r0  
+   2755: 128a1700  Move         r138 r23  r0  
+   2756: 12170a00  Move         r23  r10  r0  
+   2757: 646f0116  ClosureCall  r111 r1   r22  ; closure r111 argc=1
+   2758: 12169e00  Move         r22  r158 r0  
+   2759: 129e1500  Move         r158 r21  r0  
+   2760: 128a1600  Move         r138 r22  r0  
+   2761: 41151617  ICmpLt       r21  r22  r23 
+   2762: 52170046  JmpF         r23  r0   r70  ; r23 ? -> 2833
+   2763: 12881700  Move         r136 r23  r0  
+   2764: 12170000  Move         r23  r0   r0  
+   2765: 129e2100  Move         r158 r33  r0  
+   2766: 12210100  Move         r33  r1   r0  
+   2767: 90001816  Perform      r0   r24  r22  ; const #24 = String('String.charAt')
+   2768: 1216a100  Move         r22  r161 r0  
+   2769: 12a11700  Move         r161 r23  r0  
+   2770: 07004418  ConstU       r0   r68  r24  ; const #68 = Int(41)
+   2771: 40171819  ICmpEq       r23  r24  r25 
+   2772: 5219003c  JmpF         r25  r0   r60  ; r25 ? -> 2833
+   2773: 12f81800  Move         r248 r24  r0  
+   2774: 12187300  Move         r24  r115 r0  
+   2775: 12881900  Move         r136 r25  r0  
+   2776: 12190a00  Move         r25  r10  r0  
+   2777: 64730118  ClosureCall  r115 r1   r24  ; closure r115 argc=1
+   2778: 12187400  Move         r24  r116 r0  
+   2779: 129e1a00  Move         r158 r26  r0  
+   2780: 041b0000  Const1       r27  r0   r0  
+   2781: 201a1b1c  IAdd         r26  r27  r28 
+   2782: 121c0a00  Move         r28  r10  r0  
+   2783: 64740119  ClosureCall  r116 r1   r25  ; closure r116 argc=1
+   2784: 12197500  Move         r25  r117 r0  
+   2785: 128a1b00  Move         r138 r27  r0  
+   2786: 121b0a00  Move         r27  r10  r0  
+   2787: 6475011a  ClosureCall  r117 r1   r26  ; closure r117 argc=1
+   2788: 121aa400  Move         r26  r164 r0  
+   2789: 12a11900  Move         r161 r25  r0  
+   2790: 12197400  Move         r25  r116 r0  
+   2791: 12871a00  Move         r135 r26  r0  
+   2792: 121a0a00  Move         r26  r10  r0  
+   2793: 64740119  ClosureCall  r116 r1   r25  ; closure r116 argc=1
+   2794: 12197500  Move         r25  r117 r0  
+   2795: 12881b00  Move         r136 r27  r0  
+   2796: 121b0a00  Move         r27  r10  r0  
+   2797: 6475011a  ClosureCall  r117 r1   r26  ; closure r117 argc=1
+   2798: 121a7600  Move         r26  r118 r0  
+   2799: 12a41c00  Move         r164 r28  r0  
+   2800: 121c0a00  Move         r28  r10  r0  
+   2801: 6476011b  ClosureCall  r118 r1   r27  ; closure r118 argc=1
+   2802: 121b7700  Move         r27  r119 r0  
+   2803: 128a1d00  Move         r138 r29  r0  
+   2804: 121d0a00  Move         r29  r10  r0  
+   2805: 6477011c  ClosureCall  r119 r1   r28  ; closure r119 argc=1
+   2806: 121c7800  Move         r28  r120 r0  
+   2807: 129a1e00  Move         r154 r30  r0  
+   2808: 121e0a00  Move         r30  r10  r0  
+   2809: 6478011d  ClosureCall  r120 r1   r29  ; closure r120 argc=1
+   2810: 121d7900  Move         r29  r121 r0  
+   2811: 128c1f00  Move         r140 r31  r0  
+   2812: 121f0a00  Move         r31  r10  r0  
+   2813: 6479011e  ClosureCall  r121 r1   r30  ; closure r121 argc=1
+   2814: 121e7a00  Move         r30  r122 r0  
+   2815: 128d2000  Move         r141 r32  r0  
+   2816: 12200a00  Move         r32  r10  r0  
+   2817: 647a011f  ClosureCall  r122 r1   r31  ; closure r122 argc=1
+   2818: 121f7b00  Move         r31  r123 r0  
+   2819: 128e2100  Move         r142 r33  r0  
+   2820: 12210a00  Move         r33  r10  r0  
+   2821: 647b0120  ClosureCall  r123 r1   r32  ; closure r123 argc=1
+   2822: 12207c00  Move         r32  r124 r0  
+   2823: 129a2200  Move         r154 r34  r0  
+   2824: 12220a00  Move         r34  r10  r0  
+   2825: 647c0121  ClosureCall  r124 r1   r33  ; closure r124 argc=1
+   2826: 12217d00  Move         r33  r125 r0  
+   2827: 128f2300  Move         r143 r35  r0  
+   2828: 12230a00  Move         r35  r10  r0  
+   2829: 647d0122  ClosureCall  r125 r1   r34  ; closure r125 argc=1
+   2830: 12221900  Move         r34  r25  r0  
+   2831: 50000100  Jmp          r0   r1   r0   ; -> 2833
+   2832: 129a1800  Move         r154 r24  r0  
+   2833: 07001a19  ConstU       r0   r26  r25  ; const #26 = Int(262144)
+   2834: 2218191a  IMul         r24  r25  r26 
+   2835: 128f1900  Move         r143 r25  r0  
+   2836: 201a191a  IAdd         r26  r25  r26 
+   2837: 121a1900  Move         r26  r25  r0  
+   2838: 12191700  Move         r25  r23  r0  
+   2839: 50000100  Jmp          r0   r1   r0   ; -> 2841
+   2840: 129a1600  Move         r154 r22  r0  
+   2841: 07001a17  ConstU       r0   r26  r23  ; const #26 = Int(262144)
+   2842: 22161718  IMul         r22  r23  r24 
+   2843: 128f1700  Move         r143 r23  r0  
+   2844: 20181718  IAdd         r24  r23  r24 
+   2845: 12181700  Move         r24  r23  r0  
+   2846: 12171100  Move         r23  r17  r0  
+   2847: 50000100  Jmp          r0   r1   r0   ; -> 2849
+   2848: 128b1000  Move         r139 r16  r0  
+   2849: 07001a11  ConstU       r0   r26  r17  ; const #26 = Int(262144)
+   2850: 22101112  IMul         r16  r17  r18 
+   2851: 128f1100  Move         r143 r17  r0  
+   2852: 20121112  IAdd         r18  r17  r18 
+   2853: 12121100  Move         r18  r17  r0  
+   2854: 12110f00  Move         r17  r15  r0  
+   2855: 50000100  Jmp          r0   r1   r0   ; -> 2857
+   2856: 128b0e00  Move         r139 r14  r0  
+   2857: 07001a0f  ConstU       r0   r26  r15  ; const #26 = Int(262144)
+   2858: 220e0f10  IMul         r14  r15  r16 
+   2859: 128f0f00  Move         r143 r15  r0  
+   2860: 20100f10  IAdd         r16  r15  r16 
+   2861: 12100f00  Move         r16  r15  r0  
+   2862: 120f0000  Move         r15  r0   r0  
+   2863: 57000000  RetVal       r0   r0   r0  
+   2864: 6000620c  Closure      r0   r98  r12  ; fn #98 (offset 2671)
+   2865: 120c0000  Move         r12  r0   r0  
+   2866: 57000000  RetVal       r0   r0   r0  
+   2867: 6000610c  Closure      r0   r97  r12  ; fn #97 (offset 2668)
+   2868: 120c0000  Move         r12  r0   r0  
+   2869: 57000000  RetVal       r0   r0   r0  
+   2870: 6000600c  Closure      r0   r96  r12  ; fn #96 (offset 2665)
+   2871: 120c0000  Move         r12  r0   r0  
+   2872: 57000000  RetVal       r0   r0   r0  
+   2873: 60005f0c  Closure      r0   r95  r12  ; fn #95 (offset 2662)
+   2874: 120c0000  Move         r12  r0   r0  
+   2875: 57000000  RetVal       r0   r0   r0  
+   2876: 60005e0c  Closure      r0   r94  r12  ; fn #94 (offset 2659)
+   2877: 120c0000  Move         r12  r0   r0  
+   2878: 57000000  RetVal       r0   r0   r0  
+   2879: 60005d0c  Closure      r0   r93  r12  ; fn #93 (offset 2656)
+   2880: 120c0000  Move         r12  r0   r0  
+   2881: 57000000  RetVal       r0   r0   r0  
+   2882: 60005c0c  Closure      r0   r92  r12  ; fn #92 (offset 2653)
+   2883: 120c0000  Move         r12  r0   r0  
+   2884: 57000000  RetVal       r0   r0   r0  
+   2885: 60005b0c  Closure      r0   r91  r12  ; fn #91 (offset 2650)
+   2886: 120c0000  Move         r12  r0   r0  
+   2887: 57000000  RetVal       r0   r0   r0  
+   2888: 60005a0c  Closure      r0   r90  r12  ; fn #90 (offset 2647)
+   2889: 120c0000  Move         r12  r0   r0  
+   2890: 57000000  RetVal       r0   r0   r0  
+   2891: 6000592a  Closure      r0   r89  r42  ; fn #89 (offset 2644)
+   2892: 122aa300  Move         r42  r163 r0  
+   2893: 50005600  Jmp          r0   r86  r0   ; -> 2980
+
+; === fn #99 @ 2894 ===
+   2894: 120a8800  Move         r10  r136 r0  
+   2895: 12880b00  Move         r136 r11  r0  
+   2896: 50005000  Jmp          r0   r80  r0   ; -> 2977
+
+; === fn #100 @ 2897 ===
+   2897: 120a8900  Move         r10  r137 r0  
+   2898: 12890b00  Move         r137 r11  r0  
+   2899: 50004a00  Jmp          r0   r74  r0   ; -> 2974
+
+; === fn #101 @ 2900 ===
+   2900: 120a8a00  Move         r10  r138 r0  
+   2901: 128a0b00  Move         r138 r11  r0  
+   2902: 50004400  Jmp          r0   r68  r0   ; -> 2971
+
+; === fn #102 @ 2903 ===
+   2903: 120a8b00  Move         r10  r139 r0  
+   2904: 128b0b00  Move         r139 r11  r0  
+   2905: 50003e00  Jmp          r0   r62  r0   ; -> 2968
+
+; === fn #103 @ 2906 ===
+   2906: 120a8c00  Move         r10  r140 r0  
+   2907: 128c0b00  Move         r140 r11  r0  
+   2908: 12fe0c00  Move         r254 r12  r0  
+   2909: 120ccc00  Move         r12  r204 r0  
+   2910: 12880d00  Move         r136 r13  r0  
+   2911: 120d0a00  Move         r13  r10  r0  
+   2912: 64cc010c  ClosureCall  r204 r1   r12  ; closure r204 argc=1
+   2913: 120ccd00  Move         r12  r205 r0  
+   2914: 12890e00  Move         r137 r14  r0  
+   2915: 120e0a00  Move         r14  r10  r0  
+   2916: 64cd010d  ClosureCall  r205 r1   r13  ; closure r205 argc=1
+   2917: 120d5d00  Move         r13  r93  r0  
+   2918: 128a0f00  Move         r138 r15  r0  
+   2919: 120f0a00  Move         r15  r10  r0  
+   2920: 645d010e  ClosureCall  r93  r1   r14  ; closure r93 argc=1
+   2921: 120e5e00  Move         r14  r94  r0  
+   2922: 07001310  ConstU       r0   r19  r16  ; const #19 = String('')
+   2923: 12100a00  Move         r16  r10  r0  
+   2924: 645e010f  ClosureCall  r94  r1   r15  ; closure r94 argc=1
+   2925: 120ffd00  Move         r15  r253 r0  
+   2926: 07002a0e  ConstU       r0   r42  r14  ; const #42 = Int(34)
+   2927: 120e0000  Move         r14  r0   r0  
+   2928: 90002b0d  Perform      r0   r43  r13  ; const #43 = String('String.from_char')
+   2929: 120dff00  Move         r13  r255 r0  
+   2930: 12de0e00  Move         r222 r14  r0  
+   2931: 120e5f00  Move         r14  r95  r0  
+   2932: 0700450f  ConstU       r0   r69  r15  ; const #69 = String('const ')
+   2933: 12ff1000  Move         r255 r16  r0  
+   2934: 12fd1100  Move         r253 r17  r0  
+   2935: 12ff1200  Move         r255 r18  r0  
+   2936: 20111213  IAdd         r17  r18  r19 
+   2937: 20101312  IAdd         r16  r19  r18 
+   2938: 200f1211  IAdd         r15  r18  r17 
+   2939: 12110a00  Move         r17  r10  r0  
+   2940: 645f010e  ClosureCall  r95  r1   r14  ; closure r95 argc=1
+   2941: 120e9000  Move         r14  r144 r0  
+   2942: 12e40f00  Move         r228 r15  r0  
+   2943: 120f6100  Move         r15  r97  r0  
+   2944: 07004610  ConstU       r0   r70  r16  ; const #70 = Int(144)
+   2945: 12100a00  Move         r16  r10  r0  
+   2946: 6461010f  ClosureCall  r97  r1   r15  ; closure r97 argc=1
+   2947: 120f6200  Move         r15  r98  r0  
+   2948: 03110000  Const0       r17  r0   r0  
+   2949: 12110a00  Move         r17  r10  r0  
+   2950: 64620110  ClosureCall  r98  r1   r16  ; closure r98 argc=1
+   2951: 12106300  Move         r16  r99  r0  
+   2952: 03120000  Const0       r18  r0   r0  
+   2953: 12120a00  Move         r18  r10  r0  
+   2954: 64630111  ClosureCall  r99  r1   r17  ; closure r99 argc=1
+   2955: 12116400  Move         r17  r100 r0  
+   2956: 128b1300  Move         r139 r19  r0  
+   2957: 12130a00  Move         r19  r10  r0  
+   2958: 64640112  ClosureCall  r100 r1   r18  ; closure r100 argc=1
+   2959: 12129200  Move         r18  r146 r0  
+   2960: 128b1000  Move         r139 r16  r0  
+   2961: 07001a11  ConstU       r0   r26  r17  ; const #26 = Int(262144)
+   2962: 22101112  IMul         r16  r17  r18 
+   2963: 128c1100  Move         r140 r17  r0  
+   2964: 20121112  IAdd         r18  r17  r18 
+   2965: 12120000  Move         r18  r0   r0  
+   2966: 57000000  RetVal       r0   r0   r0  
+   2967: 6000670c  Closure      r0   r103 r12  ; fn #103 (offset 2906)
+   2968: 120c0000  Move         r12  r0   r0  
+   2969: 57000000  RetVal       r0   r0   r0  
+   2970: 6000660c  Closure      r0   r102 r12  ; fn #102 (offset 2903)
+   2971: 120c0000  Move         r12  r0   r0  
+   2972: 57000000  RetVal       r0   r0   r0  
+   2973: 6000650c  Closure      r0   r101 r12  ; fn #101 (offset 2900)
+   2974: 120c0000  Move         r12  r0   r0  
+   2975: 57000000  RetVal       r0   r0   r0  
+   2976: 6000640c  Closure      r0   r100 r12  ; fn #100 (offset 2897)
+   2977: 120c0000  Move         r12  r0   r0  
+   2978: 57000000  RetVal       r0   r0   r0  
+   2979: 6000632b  Closure      r0   r99  r43  ; fn #99 (offset 2894)
+   2980: 122ba500  Move         r43  r165 r0  
+   2981: 5001fc00  Jmp          r1   r252 r0   ; -> 3490
+
+; === fn #104 @ 2982 ===
+   2982: 120a8900  Move         r10  r137 r0  
+   2983: 12890b00  Move         r137 r11  r0  
+   2984: 5001f600  Jmp          r1   r246 r0   ; -> 3487
+
+; === fn #105 @ 2985 ===
+   2985: 120a8a00  Move         r10  r138 r0  
+   2986: 128a0b00  Move         r138 r11  r0  
+   2987: 5001f000  Jmp          r1   r240 r0   ; -> 3484
+
+; === fn #106 @ 2988 ===
+   2988: 120a8b00  Move         r10  r139 r0  
+   2989: 128b0b00  Move         r139 r11  r0  
+   2990: 5001ea00  Jmp          r1   r234 r0   ; -> 3481
+
+; === fn #107 @ 2991 ===
+   2991: 120a8c00  Move         r10  r140 r0  
+   2992: 128c0b00  Move         r140 r11  r0  
+   2993: 5001e400  Jmp          r1   r228 r0   ; -> 3478
+
+; === fn #108 @ 2994 ===
+   2994: 120a8d00  Move         r10  r141 r0  
+   2995: 128d0b00  Move         r141 r11  r0  
+   2996: 5001de00  Jmp          r1   r222 r0   ; -> 3475
+
+; === fn #109 @ 2997 ===
+   2997: 120a8e00  Move         r10  r142 r0  
+   2998: 128e0b00  Move         r142 r11  r0  
+   2999: 5001d800  Jmp          r1   r216 r0   ; -> 3472
+
+; === fn #110 @ 3000 ===
+   3000: 120a8f00  Move         r10  r143 r0  
+   3001: 128f0b00  Move         r143 r11  r0  
+   3002: 5001d200  Jmp          r1   r210 r0   ; -> 3469
+
+; === fn #111 @ 3003 ===
+   3003: 120a9000  Move         r10  r144 r0  
+   3004: 12900b00  Move         r144 r11  r0  
+   3005: 5001cc00  Jmp          r1   r204 r0   ; -> 3466
+
+; === fn #112 @ 3006 ===
+   3006: 120a9100  Move         r10  r145 r0  
+   3007: 12910b00  Move         r145 r11  r0  
+   3008: 5001c600  Jmp          r1   r198 r0   ; -> 3463
+
+; === fn #113 @ 3009 ===
+   3009: 120a9200  Move         r10  r146 r0  
+   3010: 12920b00  Move         r146 r11  r0  
+   3011: 128c0c00  Move         r140 r12  r0  
+   3012: 128d0d00  Move         r141 r13  r0  
+   3013: 410c0d0e  ICmpLt       r12  r13  r14 
+   3014: 520e0032  JmpF         r14  r0   r50  ; r14 ? -> 3065
+   3015: 128a0e00  Move         r138 r14  r0  
+   3016: 120e0000  Move         r14  r0   r0  
+   3017: 128c1800  Move         r140 r24  r0  
+   3018: 12180100  Move         r24  r1   r0  
+   3019: 9000180d  Perform      r0   r24  r13  ; const #24 = String('String.charAt')
+   3020: 120d9300  Move         r13  r147 r0  
+   3021: 128e0e00  Move         r142 r14  r0  
+   3022: 120e9500  Move         r14  r149 r0  
+   3023: 12930f00  Move         r147 r15  r0  
+   3024: 07004410  ConstU       r0   r68  r16  ; const #68 = Int(41)
+   3025: 400f1011  ICmpEq       r15  r16  r17 
+   3026: 52110026  JmpF         r17  r0   r38  ; r17 ? -> 3065
+   3027: 12a51000  Move         r165 r16  r0  
+   3028: 12106600  Move         r16  r102 r0  
+   3029: 128a1100  Move         r138 r17  r0  
+   3030: 12110a00  Move         r17  r10  r0  
+   3031: 64660110  ClosureCall  r102 r1   r16  ; closure r102 argc=1
+   3032: 12106700  Move         r16  r103 r0  
+   3033: 128b1200  Move         r139 r18  r0  
+   3034: 12120a00  Move         r18  r10  r0  
+   3035: 64670111  ClosureCall  r103 r1   r17  ; closure r103 argc=1
+   3036: 12116800  Move         r17  r104 r0  
+   3037: 128d1300  Move         r141 r19  r0  
+   3038: 12130a00  Move         r19  r10  r0  
+   3039: 64680112  ClosureCall  r104 r1   r18  ; closure r104 argc=1
+   3040: 12126900  Move         r18  r105 r0  
+   3041: 12951400  Move         r149 r20  r0  
+   3042: 12140a00  Move         r20  r10  r0  
+   3043: 64690113  ClosureCall  r105 r1   r19  ; closure r105 argc=1
+   3044: 12136a00  Move         r19  r106 r0  
+   3045: 12f81500  Move         r248 r21  r0  
+   3046: 12156b00  Move         r21  r107 r0  
+   3047: 128a1600  Move         r138 r22  r0  
+   3048: 12160a00  Move         r22  r10  r0  
+   3049: 646b0115  ClosureCall  r107 r1   r21  ; closure r107 argc=1
+   3050: 12156c00  Move         r21  r108 r0  
+   3051: 128c1700  Move         r140 r23  r0  
+   3052: 04180000  Const1       r24  r0   r0  
+   3053: 20171819  IAdd         r23  r24  r25 
+   3054: 12190a00  Move         r25  r10  r0  
+   3055: 646c0116  ClosureCall  r108 r1   r22  ; closure r108 argc=1
+   3056: 12166d00  Move         r22  r109 r0  
+   3057: 128d1800  Move         r141 r24  r0  
+   3058: 12180a00  Move         r24  r10  r0  
+   3059: 646d0117  ClosureCall  r109 r1   r23  ; closure r109 argc=1
+   3060: 12170a00  Move         r23  r10  r0  
+   3061: 646a0114  ClosureCall  r106 r1   r20  ; closure r106 argc=1
+   3062: 12141100  Move         r20  r17  r0  
+   3063: 50000100  Jmp          r0   r1   r0   ; -> 3065
+   3064: 12931000  Move         r147 r16  r0  
+   3065: 07004711  ConstU       r0   r71  r17  ; const #71 = Int(44)
+   3066: 40101112  ICmpEq       r16  r17  r18 
+   3067: 52120096  JmpF         r18  r0   r150 ; r18 ? -> 3218
+   3068: 07001411  ConstU       r0   r20  r17  ; const #20 = Int(268435456)
+   3069: 07001712  ConstU       r0   r23  r18  ; const #23 = Int(4096)
+   3070: 22111213  IMul         r17  r18  r19 
+   3071: 12139900  Move         r19  r153 r0  
+   3072: 12f81200  Move         r248 r18  r0  
+   3073: 12126a00  Move         r18  r106 r0  
+   3074: 128a1300  Move         r138 r19  r0  
+   3075: 12130a00  Move         r19  r10  r0  
+   3076: 646a0112  ClosureCall  r106 r1   r18  ; closure r106 argc=1
+   3077: 12126b00  Move         r18  r107 r0  
+   3078: 128c1400  Move         r140 r20  r0  
+   3079: 04150000  Const1       r21  r0   r0  
+   3080: 20141516  IAdd         r20  r21  r22 
+   3081: 12160a00  Move         r22  r10  r0  
+   3082: 646b0113  ClosureCall  r107 r1   r19  ; closure r107 argc=1
+   3083: 12136c00  Move         r19  r108 r0  
+   3084: 128d1500  Move         r141 r21  r0  
+   3085: 12150a00  Move         r21  r10  r0  
+   3086: 646c0114  ClosureCall  r108 r1   r20  ; closure r108 argc=1
+   3087: 12149b00  Move         r20  r155 r0  
+   3088: 12891300  Move         r137 r19  r0  
+   3089: 12136c00  Move         r19  r108 r0  
+   3090: 128a1400  Move         r138 r20  r0  
+   3091: 12140a00  Move         r20  r10  r0  
+   3092: 646c0113  ClosureCall  r108 r1   r19  ; closure r108 argc=1
+   3093: 12136d00  Move         r19  r109 r0  
+   3094: 129b1500  Move         r155 r21  r0  
+   3095: 12150a00  Move         r21  r10  r0  
+   3096: 646d0114  ClosureCall  r109 r1   r20  ; closure r109 argc=1
+   3097: 12146e00  Move         r20  r110 r0  
+   3098: 128d1600  Move         r141 r22  r0  
+   3099: 12160a00  Move         r22  r10  r0  
+   3100: 646e0115  ClosureCall  r110 r1   r21  ; closure r110 argc=1
+   3101: 12156f00  Move         r21  r111 r0  
+   3102: 12991700  Move         r153 r23  r0  
+   3103: 12170a00  Move         r23  r10  r0  
+   3104: 646f0116  ClosureCall  r111 r1   r22  ; closure r111 argc=1
+   3105: 12167000  Move         r22  r112 r0  
+   3106: 03180000  Const0       r24  r0   r0  
+   3107: 12180a00  Move         r24  r10  r0  
+   3108: 64700117  ClosureCall  r112 r1   r23  ; closure r112 argc=1
+   3109: 12177100  Move         r23  r113 r0  
+   3110: 128e1900  Move         r142 r25  r0  
+   3111: 041a0000  Const1       r26  r0   r0  
+   3112: 20191a1b  IAdd         r25  r26  r27 
+   3113: 121b0a00  Move         r27  r10  r0  
+   3114: 64710118  ClosureCall  r113 r1   r24  ; closure r113 argc=1
+   3115: 12187200  Move         r24  r114 r0  
+   3116: 128f1a00  Move         r143 r26  r0  
+   3117: 121a0a00  Move         r26  r10  r0  
+   3118: 64720119  ClosureCall  r114 r1   r25  ; closure r114 argc=1
+   3119: 12197300  Move         r25  r115 r0  
+   3120: 12901b00  Move         r144 r27  r0  
+   3121: 121b0a00  Move         r27  r10  r0  
+   3122: 6473011a  ClosureCall  r115 r1   r26  ; closure r115 argc=1
+   3123: 121a9d00  Move         r26  r157 r0  
+   3124: 129d1400  Move         r157 r20  r0  
+   3125: 07001d15  ConstU       r0   r29  r21  ; const #29 = Int(18)
+   3126: 2b141516  Shr          r20  r21  r22 
+   3127: 12169f00  Move         r22  r159 r0  
+   3128: 12d01500  Move         r208 r21  r0  
+   3129: 12157000  Move         r21  r112 r0  
+   3130: 129d1600  Move         r157 r22  r0  
+   3131: 12160a00  Move         r22  r10  r0  
+   3132: 64700115  ClosureCall  r112 r1   r21  ; closure r112 argc=1
+   3133: 1215a100  Move         r21  r161 r0  
+   3134: 12e41600  Move         r228 r22  r0  
+   3135: 12167200  Move         r22  r114 r0  
+   3136: 07001d17  ConstU       r0   r29  r23  ; const #29 = Int(18)
+   3137: 12170a00  Move         r23  r10  r0  
+   3138: 64720116  ClosureCall  r114 r1   r22  ; closure r114 argc=1
+   3139: 12167300  Move         r22  r115 r0  
+   3140: 129f1800  Move         r159 r24  r0  
+   3141: 12180a00  Move         r24  r10  r0  
+   3142: 64730117  ClosureCall  r115 r1   r23  ; closure r115 argc=1
+   3143: 12177400  Move         r23  r116 r0  
+   3144: 03190000  Const0       r25  r0   r0  
+   3145: 12190a00  Move         r25  r10  r0  
+   3146: 64740118  ClosureCall  r116 r1   r24  ; closure r116 argc=1
+   3147: 12187500  Move         r24  r117 r0  
+   3148: 031a0000  Const0       r26  r0   r0  
+   3149: 121a0a00  Move         r26  r10  r0  
+   3150: 64750119  ClosureCall  r117 r1   r25  ; closure r117 argc=1
+   3151: 1219a300  Move         r25  r163 r0  
+   3152: 12f81700  Move         r248 r23  r0  
+   3153: 12177400  Move         r23  r116 r0  
+   3154: 128a1800  Move         r138 r24  r0  
+   3155: 12180a00  Move         r24  r10  r0  
+   3156: 64740117  ClosureCall  r116 r1   r23  ; closure r116 argc=1
+   3157: 12177500  Move         r23  r117 r0  
+   3158: 12a11900  Move         r161 r25  r0  
+   3159: 12190a00  Move         r25  r10  r0  
+   3160: 64750118  ClosureCall  r117 r1   r24  ; closure r117 argc=1
+   3161: 12187600  Move         r24  r118 r0  
+   3162: 128d1a00  Move         r141 r26  r0  
+   3163: 121a0a00  Move         r26  r10  r0  
+   3164: 64760119  ClosureCall  r118 r1   r25  ; closure r118 argc=1
+   3165: 1219a500  Move         r25  r165 r0  
+   3166: 12a51800  Move         r165 r24  r0  
+   3167: 128d1900  Move         r141 r25  r0  
+   3168: 4118191a  ICmpLt       r24  r25  r26 
+   3169: 521a0030  JmpF         r26  r0   r48  ; r26 ? -> 3218
+   3170: 128a1a00  Move         r138 r26  r0  
+   3171: 121a0000  Move         r26  r0   r0  
+   3172: 12a52400  Move         r165 r36  r0  
+   3173: 12240100  Move         r36  r1   r0  
+   3174: 90001819  Perform      r0   r24  r25  ; const #24 = String('String.charAt')
+   3175: 1219a800  Move         r25  r168 r0  
+   3176: 12a81a00  Move         r168 r26  r0  
+   3177: 0700441b  ConstU       r0   r68  r27  ; const #68 = Int(41)
+   3178: 401a1b1c  ICmpEq       r26  r27  r28 
+   3179: 521c0026  JmpF         r28  r0   r38  ; r28 ? -> 3218
+   3180: 12a51b00  Move         r165 r27  r0  
+   3181: 121b7900  Move         r27  r121 r0  
+   3182: 128a1c00  Move         r138 r28  r0  
+   3183: 121c0a00  Move         r28  r10  r0  
+   3184: 6479011b  ClosureCall  r121 r1   r27  ; closure r121 argc=1
+   3185: 121b7a00  Move         r27  r122 r0  
+   3186: 128b1d00  Move         r139 r29  r0  
+   3187: 121d0a00  Move         r29  r10  r0  
+   3188: 647a011c  ClosureCall  r122 r1   r28  ; closure r122 argc=1
+   3189: 121c7b00  Move         r28  r123 r0  
+   3190: 128d1e00  Move         r141 r30  r0  
+   3191: 121e0a00  Move         r30  r10  r0  
+   3192: 647b011d  ClosureCall  r123 r1   r29  ; closure r123 argc=1
+   3193: 121d7c00  Move         r29  r124 r0  
+   3194: 12951f00  Move         r149 r31  r0  
+   3195: 121f0a00  Move         r31  r10  r0  
+   3196: 647c011e  ClosureCall  r124 r1   r30  ; closure r124 argc=1
+   3197: 121e7d00  Move         r30  r125 r0  
+   3198: 12f82000  Move         r248 r32  r0  
+   3199: 12207e00  Move         r32  r126 r0  
+   3200: 128a2100  Move         r138 r33  r0  
+   3201: 12210a00  Move         r33  r10  r0  
+   3202: 647e0120  ClosureCall  r126 r1   r32  ; closure r126 argc=1
+   3203: 12207f00  Move         r32  r127 r0  
+   3204: 12a52200  Move         r165 r34  r0  
+   3205: 04230000  Const1       r35  r0   r0  
+   3206: 20222324  IAdd         r34  r35  r36 
+   3207: 12240a00  Move         r36  r10  r0  
+   3208: 647f0121  ClosureCall  r127 r1   r33  ; closure r127 argc=1
+   3209: 12218000  Move         r33  r128 r0  
+   3210: 128d2300  Move         r141 r35  r0  
+   3211: 12230a00  Move         r35  r10  r0  
+   3212: 64800122  ClosureCall  r128 r1   r34  ; closure r128 argc=1
+   3213: 12220a00  Move         r34  r10  r0  
+   3214: 647d011f  ClosureCall  r125 r1   r31  ; closure r125 argc=1
+   3215: 121f1c00  Move         r31  r28  r0  
+   3216: 50000100  Jmp          r0   r1   r0   ; -> 3218
+   3217: 12a81b00  Move         r168 r27  r0  
+   3218: 0700471c  ConstU       r0   r71  r28  ; const #71 = Int(44)
+   3219: 401b1c1d  ICmpEq       r27  r28  r29 
+   3220: 521d0092  JmpF         r29  r0   r146 ; r29 ? -> 3367
+   3221: 12f81c00  Move         r248 r28  r0  
+   3222: 121c7b00  Move         r28  r123 r0  
+   3223: 128a1d00  Move         r138 r29  r0  
+   3224: 121d0a00  Move         r29  r10  r0  
+   3225: 647b011c  ClosureCall  r123 r1   r28  ; closure r123 argc=1
+   3226: 121c7c00  Move         r28  r124 r0  
+   3227: 12a51e00  Move         r165 r30  r0  
+   3228: 041f0000  Const1       r31  r0   r0  
+   3229: 201e1f20  IAdd         r30  r31  r32 
+   3230: 12200a00  Move         r32  r10  r0  
+   3231: 647c011d  ClosureCall  r124 r1   r29  ; closure r124 argc=1
+   3232: 121d7d00  Move         r29  r125 r0  
+   3233: 128d1f00  Move         r141 r31  r0  
+   3234: 121f0a00  Move         r31  r10  r0  
+   3235: 647d011e  ClosureCall  r125 r1   r30  ; closure r125 argc=1
+   3236: 121eac00  Move         r30  r172 r0  
+   3237: 12891d00  Move         r137 r29  r0  
+   3238: 121d7d00  Move         r29  r125 r0  
+   3239: 128a1e00  Move         r138 r30  r0  
+   3240: 121e0a00  Move         r30  r10  r0  
+   3241: 647d011d  ClosureCall  r125 r1   r29  ; closure r125 argc=1
+   3242: 121d7e00  Move         r29  r126 r0  
+   3243: 12ac1f00  Move         r172 r31  r0  
+   3244: 121f0a00  Move         r31  r10  r0  
+   3245: 647e011e  ClosureCall  r126 r1   r30  ; closure r126 argc=1
+   3246: 121e7f00  Move         r30  r127 r0  
+   3247: 128d2000  Move         r141 r32  r0  
+   3248: 12200a00  Move         r32  r10  r0  
+   3249: 647f011f  ClosureCall  r127 r1   r31  ; closure r127 argc=1
+   3250: 121f8000  Move         r31  r128 r0  
+   3251: 12992100  Move         r153 r33  r0  
+   3252: 12210a00  Move         r33  r10  r0  
+   3253: 64800120  ClosureCall  r128 r1   r32  ; closure r128 argc=1
+   3254: 12208100  Move         r32  r129 r0  
+   3255: 03220000  Const0       r34  r0   r0  
+   3256: 12220a00  Move         r34  r10  r0  
+   3257: 64810121  ClosureCall  r129 r1   r33  ; closure r129 argc=1
+   3258: 12218200  Move         r33  r130 r0  
+   3259: 128e2300  Move         r142 r35  r0  
+   3260: 07000824  ConstU       r0   r8   r36  ; const #8 = Int(11)
+   3261: 20232425  IAdd         r35  r36  r37 
+   3262: 12250a00  Move         r37  r10  r0  
+   3263: 64820122  ClosureCall  r130 r1   r34  ; closure r130 argc=1
+   3264: 12228300  Move         r34  r131 r0  
+   3265: 128f2400  Move         r143 r36  r0  
+   3266: 12240a00  Move         r36  r10  r0  
+   3267: 64830123  ClosureCall  r131 r1   r35  ; closure r131 argc=1
+   3268: 12238400  Move         r35  r132 r0  
+   3269: 12902500  Move         r144 r37  r0  
+   3270: 12250a00  Move         r37  r10  r0  
+   3271: 64840124  ClosureCall  r132 r1   r36  ; closure r132 argc=1
+   3272: 1224ae00  Move         r36  r174 r0  
+   3273: 12ae1e00  Move         r174 r30  r0  
+   3274: 07001d1f  ConstU       r0   r29  r31  ; const #29 = Int(18)
+   3275: 2b1e1f20  Shr          r30  r31  r32 
+   3276: 1220b000  Move         r32  r176 r0  
+   3277: 12d01f00  Move         r208 r31  r0  
+   3278: 121f8100  Move         r31  r129 r0  
+   3279: 12ae2000  Move         r174 r32  r0  
+   3280: 12200a00  Move         r32  r10  r0  
+   3281: 6481011f  ClosureCall  r129 r1   r31  ; closure r129 argc=1
+   3282: 121fb200  Move         r31  r178 r0  
+   3283: 12e42000  Move         r228 r32  r0  
+   3284: 12208300  Move         r32  r131 r0  
+   3285: 07001d21  ConstU       r0   r29  r33  ; const #29 = Int(18)
+   3286: 12210a00  Move         r33  r10  r0  
+   3287: 64830120  ClosureCall  r131 r1   r32  ; closure r131 argc=1
+   3288: 12208400  Move         r32  r132 r0  
+   3289: 12b02200  Move         r176 r34  r0  
+   3290: 12220a00  Move         r34  r10  r0  
+   3291: 64840121  ClosureCall  r132 r1   r33  ; closure r132 argc=1
+   3292: 12218500  Move         r33  r133 r0  
+   3293: 04230000  Const1       r35  r0   r0  
+   3294: 12230a00  Move         r35  r10  r0  
+   3295: 64850122  ClosureCall  r133 r1   r34  ; closure r133 argc=1
+   3296: 12228600  Move         r34  r134 r0  
+   3297: 03240000  Const0       r36  r0   r0  
+   3298: 12240a00  Move         r36  r10  r0  
+   3299: 64860123  ClosureCall  r134 r1   r35  ; closure r134 argc=1
+   3300: 1223b400  Move         r35  r180 r0  
+   3301: 12f82100  Move         r248 r33  r0  
+   3302: 12218500  Move         r33  r133 r0  
+   3303: 128a2200  Move         r138 r34  r0  
+   3304: 12220a00  Move         r34  r10  r0  
+   3305: 64850121  ClosureCall  r133 r1   r33  ; closure r133 argc=1
+   3306: 12218600  Move         r33  r134 r0  
+   3307: 12b22300  Move         r178 r35  r0  
+   3308: 12230a00  Move         r35  r10  r0  
+   3309: 64860122  ClosureCall  r134 r1   r34  ; closure r134 argc=1
+   3310: 12228700  Move         r34  r135 r0  
+   3311: 128d2400  Move         r141 r36  r0  
+   3312: 12240a00  Move         r36  r10  r0  
+   3313: 64870123  ClosureCall  r135 r1   r35  ; closure r135 argc=1
+   3314: 1223b600  Move         r35  r182 r0  
+   3315: 12b62200  Move         r182 r34  r0  
+   3316: 128d2300  Move         r141 r35  r0  
+   3317: 41222324  ICmpLt       r34  r35  r36 
+   3318: 52240030  JmpF         r36  r0   r48  ; r36 ? -> 3367
+   3319: 128a2400  Move         r138 r36  r0  
+   3320: 12240000  Move         r36  r0   r0  
+   3321: 12b62e00  Move         r182 r46  r0  
+   3322: 122e0100  Move         r46  r1   r0  
+   3323: 90001823  Perform      r0   r24  r35  ; const #24 = String('String.charAt')
+   3324: 1223b900  Move         r35  r185 r0  
+   3325: 12b92400  Move         r185 r36  r0  
+   3326: 07004425  ConstU       r0   r68  r37  ; const #68 = Int(41)
+   3327: 40242526  ICmpEq       r36  r37  r38 
+   3328: 52260026  JmpF         r38  r0   r38  ; r38 ? -> 3367
+   3329: 12a52500  Move         r165 r37  r0  
+   3330: 12258a00  Move         r37  r138 r0  
+   3331: 128a2600  Move         r138 r38  r0  
+   3332: 12260a00  Move         r38  r10  r0  
+   3333: 648a0125  ClosureCall  r138 r1   r37  ; closure r138 argc=1
+   3334: 12258b00  Move         r37  r139 r0  
+   3335: 128b2700  Move         r139 r39  r0  
+   3336: 12270a00  Move         r39  r10  r0  
+   3337: 648b0126  ClosureCall  r139 r1   r38  ; closure r139 argc=1
+   3338: 12268c00  Move         r38  r140 r0  
+   3339: 128d2800  Move         r141 r40  r0  
+   3340: 12280a00  Move         r40  r10  r0  
+   3341: 648c0127  ClosureCall  r140 r1   r39  ; closure r140 argc=1
+   3342: 12278d00  Move         r39  r141 r0  
+   3343: 12952900  Move         r149 r41  r0  
+   3344: 12290a00  Move         r41  r10  r0  
+   3345: 648d0128  ClosureCall  r141 r1   r40  ; closure r141 argc=1
+   3346: 12288e00  Move         r40  r142 r0  
+   3347: 12f82a00  Move         r248 r42  r0  
+   3348: 122a8f00  Move         r42  r143 r0  
+   3349: 128a2b00  Move         r138 r43  r0  
+   3350: 122b0a00  Move         r43  r10  r0  
+   3351: 648f012a  ClosureCall  r143 r1   r42  ; closure r143 argc=1
+   3352: 122a9000  Move         r42  r144 r0  
+   3353: 12b62c00  Move         r182 r44  r0  
+   3354: 042d0000  Const1       r45  r0   r0  
+   3355: 202c2d2e  IAdd         r44  r45  r46 
+   3356: 122e0a00  Move         r46  r10  r0  
+   3357: 6490012b  ClosureCall  r144 r1   r43  ; closure r144 argc=1
+   3358: 122b9100  Move         r43  r145 r0  
+   3359: 128d2d00  Move         r141 r45  r0  
+   3360: 122d0a00  Move         r45  r10  r0  
+   3361: 6491012c  ClosureCall  r145 r1   r44  ; closure r145 argc=1
+   3362: 122c0a00  Move         r44  r10  r0  
+   3363: 648e0129  ClosureCall  r142 r1   r41  ; closure r142 argc=1
+   3364: 12292600  Move         r41  r38  r0  
+   3365: 50000100  Jmp          r0   r1   r0   ; -> 3367
+   3366: 12b92500  Move         r185 r37  r0  
+   3367: 07004726  ConstU       r0   r71  r38  ; const #71 = Int(44)
+   3368: 40252627  ICmpEq       r37  r38  r39 
+   3369: 5227004e  JmpF         r39  r0   r78  ; r39 ? -> 3448
+   3370: 12f82600  Move         r248 r38  r0  
+   3371: 12268c00  Move         r38  r140 r0  
+   3372: 128a2700  Move         r138 r39  r0  
+   3373: 12270a00  Move         r39  r10  r0  
+   3374: 648c0126  ClosureCall  r140 r1   r38  ; closure r140 argc=1
+   3375: 12268d00  Move         r38  r141 r0  
+   3376: 12b62800  Move         r182 r40  r0  
+   3377: 04290000  Const1       r41  r0   r0  
+   3378: 2028292a  IAdd         r40  r41  r42 
+   3379: 122a0a00  Move         r42  r10  r0  
+   3380: 648d0127  ClosureCall  r141 r1   r39  ; closure r141 argc=1
+   3381: 12278e00  Move         r39  r142 r0  
+   3382: 128d2900  Move         r141 r41  r0  
+   3383: 12290a00  Move         r41  r10  r0  
+   3384: 648e0128  ClosureCall  r142 r1   r40  ; closure r142 argc=1
+   3385: 1228bd00  Move         r40  r189 r0  
+   3386: 12892700  Move         r137 r39  r0  
+   3387: 12278e00  Move         r39  r142 r0  
+   3388: 128a2800  Move         r138 r40  r0  
+   3389: 12280a00  Move         r40  r10  r0  
+   3390: 648e0127  ClosureCall  r142 r1   r39  ; closure r142 argc=1
+   3391: 12278f00  Move         r39  r143 r0  
+   3392: 12bd2900  Move         r189 r41  r0  
+   3393: 12290a00  Move         r41  r10  r0  
+   3394: 648f0128  ClosureCall  r143 r1   r40  ; closure r143 argc=1
+   3395: 12289000  Move         r40  r144 r0  
+   3396: 128d2a00  Move         r141 r42  r0  
+   3397: 122a0a00  Move         r42  r10  r0  
+   3398: 64900129  ClosureCall  r144 r1   r41  ; closure r144 argc=1
+   3399: 12299100  Move         r41  r145 r0  
+   3400: 12992b00  Move         r153 r43  r0  
+   3401: 122b0a00  Move         r43  r10  r0  
+   3402: 6491012a  ClosureCall  r145 r1   r42  ; closure r145 argc=1
+   3403: 122a9200  Move         r42  r146 r0  
+   3404: 032c0000  Const0       r44  r0   r0  
+   3405: 122c0a00  Move         r44  r10  r0  
+   3406: 6492012b  ClosureCall  r146 r1   r43  ; closure r146 argc=1
+   3407: 122b9300  Move         r43  r147 r0  
+   3408: 128e2d00  Move         r142 r45  r0  
+   3409: 0700482e  ConstU       r0   r72  r46  ; const #72 = Int(21)
+   3410: 202d2e2f  IAdd         r45  r46  r47 
+   3411: 122f0a00  Move         r47  r10  r0  
+   3412: 6493012c  ClosureCall  r147 r1   r44  ; closure r147 argc=1
+   3413: 122c9400  Move         r44  r148 r0  
+   3414: 128f2e00  Move         r143 r46  r0  
+   3415: 122e0a00  Move         r46  r10  r0  
+   3416: 6494012d  ClosureCall  r148 r1   r45  ; closure r148 argc=1
+   3417: 122d9500  Move         r45  r149 r0  
+   3418: 12902f00  Move         r144 r47  r0  
+   3419: 122f0a00  Move         r47  r10  r0  
+   3420: 6495012e  ClosureCall  r149 r1   r46  ; closure r149 argc=1
+   3421: 122ebf00  Move         r46  r191 r0  
+   3422: 12bf2800  Move         r191 r40  r0  
+   3423: 07001d29  ConstU       r0   r29  r41  ; const #29 = Int(18)
+   3424: 2b28292a  Shr          r40  r41  r42 
+   3425: 122ac100  Move         r42  r193 r0  
+   3426: 12d02900  Move         r208 r41  r0  
+   3427: 12299200  Move         r41  r146 r0  
+   3428: 12bf2a00  Move         r191 r42  r0  
+   3429: 122a0a00  Move         r42  r10  r0  
+   3430: 64920129  ClosureCall  r146 r1   r41  ; closure r146 argc=1
+   3431: 1229c300  Move         r41  r195 r0  
+   3432: 12e42a00  Move         r228 r42  r0  
+   3433: 122a9400  Move         r42  r148 r0  
+   3434: 07001d2b  ConstU       r0   r29  r43  ; const #29 = Int(18)
+   3435: 122b0a00  Move         r43  r10  r0  
+   3436: 6494012a  ClosureCall  r148 r1   r42  ; closure r148 argc=1
+   3437: 122a9500  Move         r42  r149 r0  
+   3438: 122ac500  Move         r42  r197 r0  
+   3439: 12c59300  Move         r197 r147 r0  
+   3440: 12c59100  Move         r197 r145 r0  
+   3441: 12c58f00  Move         r197 r143 r0  
+   3442: 12c58d00  Move         r197 r141 r0  
+   3443: 12c58b00  Move         r197 r139 r0  
+   3444: 12c58b00  Move         r197 r139 r0  
+   3445: 12c52700  Move         r197 r39  r0  
+   3446: 50000100  Jmp          r0   r1   r0   ; -> 3448
+   3447: 12252600  Move         r37  r38  r0  
+   3448: 12262400  Move         r38  r36  r0  
+   3449: 50000100  Jmp          r0   r1   r0   ; -> 3451
+   3450: 12221d00  Move         r34  r29  r0  
+   3451: 50000100  Jmp          r0   r1   r0   ; -> 3453
+   3452: 121b1c00  Move         r27  r28  r0  
+   3453: 121c1a00  Move         r28  r26  r0  
+   3454: 50000100  Jmp          r0   r1   r0   ; -> 3456
+   3455: 12181200  Move         r24  r18  r0  
+   3456: 50000100  Jmp          r0   r1   r0   ; -> 3458
+   3457: 12101100  Move         r16  r17  r0  
+   3458: 12110e00  Move         r17  r14  r0  
+   3459: 50000100  Jmp          r0   r1   r0   ; -> 3461
+   3460: 120c0000  Move         r12  r0   r0  
+   3461: 57000000  RetVal       r0   r0   r0  
+   3462: 6000710c  Closure      r0   r113 r12  ; fn #113 (offset 3009)
+   3463: 120c0000  Move         r12  r0   r0  
+   3464: 57000000  RetVal       r0   r0   r0  
+   3465: 6000700c  Closure      r0   r112 r12  ; fn #112 (offset 3006)
+   3466: 120c0000  Move         r12  r0   r0  
+   3467: 57000000  RetVal       r0   r0   r0  
+   3468: 60006f0c  Closure      r0   r111 r12  ; fn #111 (offset 3003)
+   3469: 120c0000  Move         r12  r0   r0  
+   3470: 57000000  RetVal       r0   r0   r0  
+   3471: 60006e0c  Closure      r0   r110 r12  ; fn #110 (offset 3000)
+   3472: 120c0000  Move         r12  r0   r0  
+   3473: 57000000  RetVal       r0   r0   r0  
+   3474: 60006d0c  Closure      r0   r109 r12  ; fn #109 (offset 2997)
+   3475: 120c0000  Move         r12  r0   r0  
+   3476: 57000000  RetVal       r0   r0   r0  
+   3477: 60006c0c  Closure      r0   r108 r12  ; fn #108 (offset 2994)
+   3478: 120c0000  Move         r12  r0   r0  
+   3479: 57000000  RetVal       r0   r0   r0  
+   3480: 60006b0c  Closure      r0   r107 r12  ; fn #107 (offset 2991)
+   3481: 120c0000  Move         r12  r0   r0  
+   3482: 57000000  RetVal       r0   r0   r0  
+   3483: 60006a0c  Closure      r0   r106 r12  ; fn #106 (offset 2988)
+   3484: 120c0000  Move         r12  r0   r0  
+   3485: 57000000  RetVal       r0   r0   r0  
+   3486: 6000690c  Closure      r0   r105 r12  ; fn #105 (offset 2985)
+   3487: 120c0000  Move         r12  r0   r0  
+   3488: 57000000  RetVal       r0   r0   r0  
+   3489: 6000682c  Closure      r0   r104 r44  ; fn #104 (offset 2982)
+   3490: 122ca700  Move         r44  r167 r0  
+   3491: 12a70000  Move         r167 r0   r0  
+   3492: 01000000  Halt         r0   r0   r0  

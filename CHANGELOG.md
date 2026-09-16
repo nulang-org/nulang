@@ -45,6 +45,88 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Added since 1.0.0-frozen — 2026-09-14 (web contract + capacity broker hardening)
+- **Web request decoding fixes** (Experimental, `src/web/request_bindings.rs`,
+  `src/web/bindings.rs`, `src/web/contracts.rs`, `src/web/dispatch.rs`).
+  `percent_decode` no longer maps UTF-8 bytes to Latin-1 code points, so
+  non-ASCII query/form/cookie values survive intact. Route handlers with
+  `using` or typeclass-dictionary parameters, and handler parameters with
+  neither a request binding nor a matching route parameter, are now rejected
+  at contract compile time (serve refuses to start) instead of silently
+  staging the closure value into a parameter register. An attached but
+  incomplete binding plan for a handler that declares parameters now returns
+  a 500-series error instead of falling back to the legacy zero-argument
+  call; zero-parameter ambient-`Web.param` handlers keep the legacy path.
+- **Capacity broker fetch deadline + concurrency** (Experimental,
+  `crates/nulang-capacity/src/broker.rs`). `CapacityBroker::collect_snapshots`
+  awaited each provider's `fetch_offers` sequentially with no deadline, so a
+  hung endpoint stalled `rank`/`rank_at` forever and N provider latencies
+  added instead of overlapping. Provider fetches now fan out concurrently
+  (`futures::join_all`) and each is raced against
+  `BrokerPolicy::fetch_timeout` (default 10s, runtime-agnostic via
+  `futures-timer`); a timed-out provider is recorded as a retryable
+  `ProviderErrorKind::Unavailable` and isolated, preserving the existing
+  failure-isolation guarantee.
+- **Path capture decoding + finite Float params** (Experimental,
+  `src/web/runtime_bindings.rs`, `src/web/request_bindings.rs`). Request
+  path segments are now percent-decoded at match time (split on raw `/`
+  first, so an encoded `%2F` stays inside its segment; `+` stays literal
+  per RFC 3986) and route literals are decoded at pattern-compile time,
+  aligning captures with query/form/cookie decoding. Float-typed params
+  now reject `NaN`/`inf` instead of passing non-finite values to
+  handlers.
+
+### Added since 1.0.0-frozen — 2026-09-13 (mobile runtime boundary)
+- **Interpreter-only mobile runtime profile** (`Cargo.toml`, `src/runtime/`, `src/backends/`, `src/vm.rs`): native Cranelift/AOT code generation is now owned by the optional `native-codegen` feature while remaining enabled in default builds. The `mobile-runtime` profile excludes executable-code-generation and dynamic-loader dependencies, gates native backend wiring and benchmarks, and keeps Wasm support independently selectable. `scripts/check_mobile_runtime_profile.sh` provides the release gate for dependency-graph isolation and interpreter-only correctness.
+
+### Added since 1.0.0-frozen — 2026-09-11 (backend parity + durable determinism)
+- **Canonical behavior content hashing** (`src/types.rs`,
+  `src/mir_codegen.rs`): the BLAKE3 content hash that gates
+  remote-behavior verification (and hot-reload fetch) now covers the
+  *full canonical signature* — every parameter type plus the return
+  type — instead of a parameter count and a `format!("{:?}")` Debug
+  string. The Debug string was non-canonical (record field order
+  changed the hash even though record unification is
+  order-insensitive) and the count-only hashing collided behaviors
+  that differ only in parameter types. The new
+  `types::write_canonical_type` encoding is explicit-tagged,
+  length-prefixed, record-field-sorted, and effect-row-sorted; it
+  deliberately preserves information NTIR erases (type variables,
+  effect rows, Nil/Never distinction) because a content hash has no
+  `mgu` backstop. Hash domain is separated (`NLBH\x02`) from NTIR and
+  wire-frame BLAKE3 uses.
+- **Continuation capture soundness** (`src/effect_checker.rs`): handler
+  arms in `handle ... with` are now capability-analyzed — previously
+  `CapabilityAnalyzer` walked only the handle body, so a linear value used
+  in an arm *and* in the resumed body passed checking (a use-after-move
+  across the dynamic `resume` boundary: the arm consumes before the body
+  continues). Each arm is analyzed as an alternative path from the incoming
+  consumption set (arm params shadow outer bindings as `Ref`), and every
+  arm's consumptions are unioned into the body's continuation set. Arm-only
+  uses now satisfy the exactly-once obligation; multi-arm handlers do not
+  double-count across arms.
+- **Durable-effect determinism gate** (`src/effect_checker.rs`): `workflow`
+  step bodies (including saga compensations), the behavior bodies of
+  `persistent` and `entity` actors, and entity `apply` handlers now reject
+  ambient effects that
+  are unsafe under crash re-drive at compile time: `Time.now*`, `Rand.*`,
+  `Net.*`, `FS.*`, and stdio (`IO.print`/`IO.println`/`IO.read`). Recovery
+  re-runs a suspended step from its start, so these would execute again with
+  different results or duplicate side effects; persistent actors and entity
+  apply handlers replay on recovery under the same rule. `Timer.sleep`
+  (journaled and
+  re-armed), performs intercepted by a user `handle`, and `LLM.ask`
+  (re-run by design) remain allowed. Module-function calls from steps are
+  followed transitively.
+- **Backend parity fixes** (`src/aot/mod.rs`, `src/main.rs`,
+  `src/wasm_runtime.rs`): the AOT perform helpers record `Unhandled effect`
+  on the pending-error channel instead of silently yielding nil; `--backend
+  wasm-run` prints the program result (previously discarded) and runs
+  `IO.print` (the host ignored the guest's null-terminated-string
+  contract); string results no longer print as raw `#Value(...)` after
+  backend memory teardown; `--eval` no longer falls through to piped-stdin
+  script execution after evaluating.
+
 ### Added since 1.0.0-frozen — 2026-08-22 (vscode extension)
 - **AOT backend error parity** (`src/aot/mod.rs`): the native AOT run path
   now surfaces interpreter-parity runtime errors (48-bit overflow, type
