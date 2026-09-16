@@ -1,5 +1,6 @@
 name: Refresh rustls lockfile
 
+# Temporary branch-local helper. Remove after Cargo.lock is refreshed.
 on:
   push:
     branches: [chore/rustfmt-main-baseline]
