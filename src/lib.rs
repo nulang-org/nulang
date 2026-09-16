@@ -26,6 +26,7 @@ pub mod core_vm;
 pub mod cranelift_utils;
 pub mod dap;
 pub mod delivery;
+pub mod delivery_legacy;
 pub mod delivery_runtime;
 pub mod diagnostic;
 #[cfg(feature = "native-codegen")]
