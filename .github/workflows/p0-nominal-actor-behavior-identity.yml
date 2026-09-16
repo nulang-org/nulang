@@ -21,7 +21,9 @@ jobs:
         run: echo "START_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Apply product patch
-        run: python3 scripts/apply_p0_nominal_actor_behavior.py
+        run: |
+          python3 scripts/apply_p0_nominal_actor_behavior.py
+          python3 scripts/apply_p0_actor_provenance.py
 
       - name: Format and focused Rust tests
         run: |
@@ -55,6 +57,7 @@ jobs:
           test "$(git rev-parse origin/fix/nominal-actor-behavior-identity)" = "$START_HEAD"
           rm .github/workflows/p0-nominal-actor-behavior-identity.yml
           rm scripts/apply_p0_nominal_actor_behavior.py
+          rm scripts/apply_p0_actor_provenance.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
