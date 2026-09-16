@@ -59,6 +59,7 @@ pub mod lsp;
 pub mod mir;
 pub mod mir_codegen;
 pub mod mir_inline;
+#[path = "mir_lower_nominal.rs"]
 pub mod mir_lower;
 #[cfg(feature = "wasm-backend")]
 pub mod mir_wasm;
