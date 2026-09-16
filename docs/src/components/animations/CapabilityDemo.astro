@@ -54,19 +54,19 @@
 
 <script>
   function initCapabilityDemo() {
-    const msgPaths = document.querySelectorAll('.cap-msg-path');
-    const particles = document.querySelectorAll('.cap-msg');
+    const msgPaths = document.querySelectorAll<SVGPathElement>('.cap-msg-path');
+    const particles = document.querySelectorAll<SVGCircleElement>('.cap-msg');
     if (msgPaths.length === 0 || particles.length === 0) return;
 
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     if (reducedMotion) return;
 
-    function sendParticle(path, particle, reverse) {
+    function sendParticle(path: SVGPathElement, particle: SVGCircleElement, reverse: boolean) {
       const len = path.getTotalLength();
       const duration = 2000;
       const start = performance.now();
 
-      function animate(now) {
+      function animate(now: number) {
         const elapsed = now - start;
         const progress = Math.min(elapsed / duration, 1);
         const t = reverse ? 1 - progress : progress;
