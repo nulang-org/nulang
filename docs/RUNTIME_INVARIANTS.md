@@ -62,11 +62,18 @@ Required properties:
 
 - entries are replayed in strictly increasing sequence order;
 - duplicate sequence numbers are either idempotently identical or rejected;
-- a gap, malformed interior record, or invalid checksum fails recovery closed;
+- a gap is rejected only for a stream whose sequence contract is contiguous;
+- a malformed interior record or invalid checksum fails recovery closed;
 - a torn terminal append may be discarded only as an invalid suffix;
 - `latest_sequence()` reports the last valid recoverable sequence, not merely
   the last parseable record after corruption;
 - snapshot sequence and replay start sequence must agree.
+
+Nulang has multiple persistence streams that may share/interleave actor-level
+sequence numbers. A stream therefore must explicitly declare whether it is
+merely strictly increasing or truly contiguous. `src/persistence_integrity.rs`
+encodes and tests both policies so backend readers do not invent incompatible
+sequence semantics.
 
 ## 4. Snapshot integrity
 
@@ -194,10 +201,10 @@ release tests with recorded hardware/software configuration:
 ## Immediate implementation order
 
 1. Freeze and version the existing grain-id projection. **Completed in the phase-1 hardening PR.**
-2. Reject compact grain-id collisions at every binding point.
+2. Reject compact grain-id collisions at every binding point. **Typed fail-closed binding primitive implemented; runtime call-site wiring remains (#289).**
 3. Make JSONL recovery consume a valid prefix and stop on corruption instead of
-   skipping malformed records.
-4. Validate journal sequence monotonicity/gaps during recovery.
+   skipping malformed records. **Strict parser and torn-tail policy implemented; backend wiring remains (#290).**
+4. Validate journal sequence monotonicity/gaps during recovery. **Ordering policies and tests implemented; backend wiring remains (#290).**
 5. Add persisted schema/behavior identity to snapshots and migration checks.
 6. Add activation-epoch fencing for durable writer ownership.
 7. Add subprocess kill/restart durability tests to CI.
