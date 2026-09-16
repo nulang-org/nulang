@@ -117,7 +117,7 @@ jobs:
               let Some(module) = actor.bytecode_module.as_ref() else {
                   return false;
               };
-              behavior_ownership::module_behavior_index_for_runtime_id(
+              behavior_ownership::module_behavior_index_for_actor(
                   module,
                   &actor.name,
                   behavior_idx,
@@ -154,8 +154,12 @@ jobs:
                   return u16::try_from(idx).ok();
               }
               let module = actor.bytecode_module.as_ref()?;
-              behavior_ownership::runtime_behavior_id_for_name(module, &actor.name, behavior)
-                  .and_then(|idx| u16::try_from(idx).ok())
+              behavior_ownership::runtime_behavior_id_for_actor_name(
+                  module,
+                  &actor.name,
+                  behavior,
+              )
+              .and_then(|idx| u16::try_from(idx).ok())
           }
 
           '''
@@ -177,12 +181,15 @@ jobs:
                   }
               }
               let module = actor.bytecode_module.as_ref()?;
-              behavior_ownership::behavior_name_for_runtime_id(
+              let module_idx = behavior_ownership::module_behavior_index_for_actor(
                   module,
                   &actor.name,
                   behavior_id as usize,
-              )
-              .map(str::to_owned)
+              )?;
+              module
+                  .behaviors
+                  .get(module_idx)
+                  .map(|behavior| behavior.name.clone())
           }
 
           '''
