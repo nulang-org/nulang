@@ -61,6 +61,12 @@ jobs:
             --features native-codegen \
             --bin nulang
 
+      - name: Verify ELF architecture
+        run: |
+          riscv64-linux-gnu-readelf -h \
+            target/riscv64gc-unknown-linux-gnu/release/nulang \
+            | grep -E 'Machine:[[:space:]]+RISC-V'
+
       - name: Verify heap pointers fit the Value payload under RISC-V
         run: |
           cargo test \
