@@ -679,6 +679,7 @@ impl Middleware {
 
 /// Match a route pattern against a request path, returning captured parameters.
 /// Patterns use `:name` segments, e.g. `/products/:id`.
+#[allow(dead_code)] // exercised by unit tests; production dispatch routes via `web::dispatch::match_route`
 pub fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
     let pattern = pattern.trim_start_matches('/');
     let path = path.trim_start_matches('/');
