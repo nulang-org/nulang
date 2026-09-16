@@ -12,7 +12,8 @@
 //! cargo run --release --example actor_density -- 1000000
 //! ```
 
-use nulang::runtime::Runtime;
+use nulang::runtime::{Actor, ActorHeap, FlightRecorder, Mailbox, OrcaGc, Runtime, TraceEntry};
+use std::mem::size_of;
 use std::time::Instant;
 
 #[cfg(target_os = "linux")]
@@ -37,6 +38,16 @@ fn main() {
         })
         .unwrap_or(10_000);
     assert!(actor_count > 0, "actor count must be greater than zero");
+
+    println!("actor_struct_bytes={}", size_of::<Actor>());
+    println!("mailbox_struct_bytes={}", size_of::<Mailbox>());
+    println!("actor_heap_struct_bytes={}", size_of::<ActorHeap>());
+    println!("orca_gc_struct_bytes={}", size_of::<OrcaGc>());
+    println!(
+        "flight_recorder_struct_bytes={}",
+        size_of::<FlightRecorder>()
+    );
+    println!("trace_entry_struct_bytes={}", size_of::<TraceEntry>());
 
     let mut runtime = Runtime::new();
     let rss_before = resident_bytes();
