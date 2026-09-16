@@ -13,6 +13,8 @@ interface Env {
   CONTACT_TO?: string;
 }
 
+// Fallback account id when the CLOUDFLARE_ACCOUNT_ID env var is unset
+// (set it as a Pages secret or via `wrangler pages secret put`).
 const ACCOUNT_ID = 'ad5ebd496c88731aa7a6b4cfca58e612';
 const MAX_NAME = 120;
 const MAX_EMAIL = 254;
