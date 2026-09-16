@@ -59,7 +59,7 @@ jobs:
           "$BIN" conformance/behavior/actor_20_ambiguous_dynamic_behavior_error.nula > /tmp/ambiguous-out 2> /tmp/ambiguous-err
           CODE=$?
           set -e
-          test "$CODE" -eq 4
+          test "$CODE" -eq 10
           test ! -s /tmp/ambiguous-out
           grep -F "cannot resolve behavior 'ping' unambiguously from dynamic receiver" /tmp/ambiguous-err
 
