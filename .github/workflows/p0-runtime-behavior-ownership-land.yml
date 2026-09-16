@@ -16,7 +16,7 @@ jobs:
   validate-and-land:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           ref: fix/p0-runtime-behavior-ownership
           fetch-depth: 0
@@ -226,6 +226,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --no-default-features --test runtime_actor_behavior_ownership
+          cargo test --no-default-features --test runtime_grain_behavior_ownership
           cargo test --no-default-features --test runtime_actor_schema_identity
           cargo test --no-default-features runtime::tests::p0_unknown_named_send_is_rejected -- --exact
           cargo test --no-default-features runtime::tests::p0_unknown_numeric_ask_is_rejected_without_running_behavior_zero -- --exact
@@ -253,24 +254,30 @@ jobs:
           printf 'working-tree paths:\n%s\n' "$changed"
           test "$changed" = "src/runtime/mod.rs"
 
-      - name: Guard exact head and land validated runtime gate
+      - name: Guard exact head and land cleaned runtime gate
         shell: bash
         run: |
           set -euo pipefail
-          if git diff --quiet -- src/runtime/mod.rs; then
-            echo "runtime ownership gate already landed"
-            exit 0
-          fi
           git fetch origin fix/p0-runtime-behavior-ownership
           remote_head="$(git rev-parse origin/fix/p0-runtime-behavior-ownership)"
           if [ "$remote_head" != "$START_HEAD" ]; then
             echo "branch advanced during validation: $remote_head (expected $START_HEAD)" >&2
             exit 1
           fi
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src/lib.rs")
+          text = path.read_text()
+          shim = '#[path = "runtime/behavior_ownership.rs"]\npub(crate) mod runtime_behavior_ownership;\n'
+          count = text.count(shim)
+          if count != 1:
+              raise SystemExit(f"expected one root ownership shim, found {count}")
+          path.write_text(text.replace(shim, "", 1))
+          PY
+          git rm .github/workflows/p0-runtime-behavior-ownership-land.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/runtime/mod.rs
+          git add src/runtime/mod.rs src/lib.rs
           git diff --cached --check
-          test "$(git diff --cached --name-only)" = "src/runtime/mod.rs"
           git commit -m 'fix(runtime): enforce actor behavior ownership at dispatch'
           git push origin HEAD:fix/p0-runtime-behavior-ownership
