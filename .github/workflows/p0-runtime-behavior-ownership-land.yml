@@ -51,6 +51,47 @@ jobs:
                   "module declaration",
               )
 
+          old_cross_shard = '''        let msg = Message {
+              behavior_id,
+              payload: Arc::new(payload),
+              sender,
+              priority: MessagePriority::Normal,
+              trace_id: trace_id.clone(),
+          };
+          '''
+          new_cross_shard = '''        if self.actors.contains_key(&target_id)
+              && !self.actor_has_behavior_id(target_id, behavior_id)
+          {
+              warn!(
+                  "nulang-runtime: rejecting cross-shard message to actor {}: behavior id {} is not owned by target schema",
+                  target_id, behavior_id
+              );
+              self.route_to_dlq(
+                  &Message {
+                      behavior_id,
+                      payload: Arc::new(Vec::new()),
+                      sender,
+                      priority: MessagePriority::System,
+                      trace_id: trace_id.clone(),
+                  },
+                  "behavior id not owned by target actor schema (cross-shard)",
+              );
+              return;
+          }
+
+          let msg = Message {
+              behavior_id,
+              payload: Arc::new(payload),
+              sender,
+              priority: MessagePriority::Normal,
+              trace_id: trace_id.clone(),
+          };
+          '''
+          if old_cross_shard in text:
+              replace_once(old_cross_shard, new_cross_shard, "cross-shard ownership gate")
+          elif new_cross_shard not in text:
+              raise SystemExit("cross-shard ownership gate: neither legacy nor owned form found")
+
           old_actor_has = '''    fn actor_has_behavior_id(&self, target_id: u64, behavior_id: u16) -> bool {
               let behavior_idx = behavior_id as usize;
               let has_native = self
@@ -189,6 +230,7 @@ jobs:
           cargo test --no-default-features runtime::tests::test_send_carries_current_trace_span -- --exact
           cargo test --no-default-features runtime::tests::test_cross_actor_send_foreign_count_lifecycle -- --exact
           cargo test --no-default-features runtime::tests::test_distributed_remote_address_local_fallback -- --exact
+          cargo test --no-default-features runtime::tests::test_object_ref_cross_shard_copies_bytes -- --exact
 
       - name: Full no-default regression suite
         shell: bash
