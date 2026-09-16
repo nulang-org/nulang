@@ -39,6 +39,7 @@ pub mod format;
 #[cfg(feature = "native-codegen")]
 pub mod fuzz;
 pub mod hir;
+#[path = "hir_lower_nominal.rs"]
 pub mod hir_lower;
 pub mod integration_tests;
 pub mod iso_arena;
