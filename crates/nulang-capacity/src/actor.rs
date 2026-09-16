@@ -180,9 +180,7 @@ impl ActorPlacementPolicy {
         {
             return Err(ActorPlacementError::InvalidAcceleratorVram);
         }
-        if self.resources.accelerator_model.is_some()
-            && self.resources.min_accelerator_count == 0
-        {
+        if self.resources.accelerator_model.is_some() && self.resources.min_accelerator_count == 0 {
             return Err(ActorPlacementError::AcceleratorCountRequired);
         }
         if self.resources.accelerator_model.is_none()
@@ -205,7 +203,11 @@ impl ActorPlacementPolicy {
         if !self.data_egress_gib.is_finite() || self.data_egress_gib < 0.0 {
             return Err(ActorPlacementError::InvalidEgress);
         }
-        if self.allowed_regions.iter().any(|region| region.trim().is_empty()) {
+        if self
+            .allowed_regions
+            .iter()
+            .any(|region| region.trim().is_empty())
+        {
             return Err(ActorPlacementError::EmptyRegion);
         }
         Ok(())
