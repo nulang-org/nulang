@@ -51,9 +51,11 @@ jobs:
       # Keep this profile intentionally independent of Python/SQLite/AI.
       # It validates the portable language runtime plus Cranelift's riscv64
       # JIT/AOT backend without requiring target-architecture Python packages.
-      - name: Cross-build Nulang with native codegen
+      # Release mode catches optimization/LTO-sensitive portability bugs.
+      - name: Cross-build Nulang with native codegen (release)
         run: |
           cargo build \
+            --release \
             --target riscv64gc-unknown-linux-gnu \
             --no-default-features \
             --features native-codegen \
@@ -62,6 +64,7 @@ jobs:
       - name: Verify heap pointers fit the Value payload under RISC-V
         run: |
           cargo test \
+            --release \
             --target riscv64gc-unknown-linux-gnu \
             --no-default-features \
             --features native-codegen \
@@ -70,7 +73,7 @@ jobs:
       - name: Run bytecode VM smoke test under QEMU
         run: |
           qemu-riscv64 -L /usr/riscv64-linux-gnu \
-            target/riscv64gc-unknown-linux-gnu/debug/nulang \
+            target/riscv64gc-unknown-linux-gnu/release/nulang \
             examples/01_hello.nula
 
       # This is the architecture-sensitive check: it forces Cranelift to
@@ -85,10 +88,11 @@ jobs:
             '}' \
             'add(20, 22)' > /tmp/riscv-native.nula
           qemu-riscv64 -L /usr/riscv64-linux-gnu \
-            target/riscv64gc-unknown-linux-gnu/debug/nulang \
+            target/riscv64gc-unknown-linux-gnu/release/nulang \
             --backend native /tmp/riscv-native.nula
 
       - name: Cross-check capacity crate
         run: |
           cargo test -p nulang-capacity \
+            --release \
             --target riscv64gc-unknown-linux-gnu
