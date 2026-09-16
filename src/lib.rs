@@ -70,6 +70,7 @@ pub mod registry;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
+pub mod schema_identity;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;
