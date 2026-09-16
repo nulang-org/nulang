@@ -37,6 +37,8 @@ pub mod format;
 #[allow(dead_code)]
 pub(crate) mod grain_identity;
 #[allow(dead_code)]
+pub(crate) mod grain_identity_durability;
+#[allow(dead_code)]
 pub(crate) mod grain_identity_policy;
 #[allow(dead_code)]
 pub(crate) mod grain_runtime_identity;
