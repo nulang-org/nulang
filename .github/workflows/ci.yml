@@ -5,12 +5,11 @@ on:
     branches: [main]
   pull_request:
 
-# Keep only the newest CI run for a PR/ref. This prevents superseded commits
-# from occupying scarce hosted-runner slots while preserving independent runs
-# for different PRs and branches.
+# Supersede CI only within the same pull request. Main-push runs stay unique so
+# benchmark jobs can preserve the complete per-commit history they record.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
