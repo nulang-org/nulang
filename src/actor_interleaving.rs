@@ -163,7 +163,11 @@ mod tests {
     fn default_policy_preserves_current_serial_semantics() {
         let policy = ActorInterleavingPolicy::default();
         assert_eq!(
-            admission_decision(policy, TurnAdmissionState::default(), BehaviorConcurrency::Exclusive),
+            admission_decision(
+                policy,
+                TurnAdmissionState::default(),
+                BehaviorConcurrency::Exclusive
+            ),
             AdmissionDecision::AdmitExclusive
         );
         assert_eq!(
