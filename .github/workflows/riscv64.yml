@@ -63,11 +63,18 @@ jobs:
 
       # This is the architecture-sensitive check: it forces Cranelift to
       # detect a riscv64 host and execute generated RISC-V machine code.
+      # Keep the program pure so this test isolates code generation from
+      # unrelated effect/IO backend coverage.
       - name: Run native backend smoke test under QEMU
         run: |
+          printf '%s\n' \
+            'fn add(a: Int, b: Int) -> Int {' \
+            '    a + b' \
+            '}' \
+            'add(20, 22)' > /tmp/riscv-native.nula
           qemu-riscv64 -L /usr/riscv64-linux-gnu \
             target/riscv64gc-unknown-linux-gnu/debug/nulang \
-            --backend native examples/02_arithmetic.nula
+            --backend native /tmp/riscv-native.nula
 
       - name: Cross-check capacity crate
         run: |
