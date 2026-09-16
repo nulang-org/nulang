@@ -27,40 +27,68 @@ jobs:
           set -euo pipefail
           echo "START_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Remove only the over-broad numeric send guard
+      - name: Apply narrow runtime and regression fixes
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("src/runtime/mod.rs")
-          text = path.read_text()
+          runtime_path = Path("src/runtime/mod.rs")
+          runtime = runtime_path.read_text()
           start_marker = "        if self.actors.contains_key(&target_id)\n            && !self.actor_has_behavior_id(target_id, behavior_id)\n        {\n"
           end_marker = "        let msg = Message {\n"
+          if start_marker in runtime:
+              start = runtime.index(start_marker)
+              end = runtime.index(end_marker, start)
+              block = runtime[start:end]
+              expected = "".join([
+                  "        if self.actors.contains_key(&target_id)\n",
+                  "            && !self.actor_has_behavior_id(target_id, behavior_id)\n",
+                  "        {\n",
+                  "            warn!(\n",
+                  "                \"nulang-runtime: rejecting message to actor {}: unknown behavior id {}\",\n",
+                  "                target_id, behavior_id\n",
+                  "            );\n",
+                  "            return;\n",
+                  "        }\n",
+              ])
+              if block != expected:
+                  raise SystemExit(f"unexpected send_message_by_id guard shape:\n{block}")
+              runtime_path.write_text(runtime[:start] + runtime[end:])
+          else:
+              print("numeric send guard already absent")
 
-          if start_marker not in text:
-              print("numeric send guard already absent; nothing to patch")
-              raise SystemExit(0)
-
-          start = text.index(start_marker)
-          end = text.index(end_marker, start)
-          block = text[start:end]
-          expected = "".join([
-              "        if self.actors.contains_key(&target_id)\n",
-              "            && !self.actor_has_behavior_id(target_id, behavior_id)\n",
-              "        {\n",
-              "            warn!(\n",
-              "                \"nulang-runtime: rejecting message to actor {}: unknown behavior id {}\",\n",
-              "                target_id, behavior_id\n",
-              "            );\n",
-              "            return;\n",
-              "        }\n",
-          ])
-          if block != expected:
-              raise SystemExit(f"unexpected send_message_by_id guard shape:\n{block}")
-
-          path.write_text(text[:start] + text[end:])
+          tests_path = Path("src/runtime/tests.rs")
+          tests = tests_path.read_text()
+          fn_marker = "fn test_distributed_remote_address_local_fallback() {\n"
+          start = tests.index(fn_marker)
+          next_test = tests.index("\n#[test]\n", start + len(fn_marker))
+          segment = tests[start:next_test]
+          registration = '        .register_behavior("test", local_fallback_behavior);\n'
+          if registration not in segment:
+              actor_line = (
+                  '    let actor_id = rt.spawn_actor(Box::new(|| vec![("val".to_string(), Value::int(0))]));\n'
+              )
+              if actor_line not in segment:
+                  raise SystemExit("unexpected local fallback test shape")
+              segment = segment.replace(
+                  fn_marker,
+                  fn_marker + "    fn local_fallback_behavior(_actor: &mut Actor, _args: &[Value]) {}\n\n",
+                  1,
+              )
+              segment = segment.replace(
+                  actor_line,
+                  actor_line
+                  + "    rt.actors\n"
+                  + "        .get_mut(&actor_id)\n"
+                  + "        .unwrap()\n"
+                  + registration,
+                  1,
+              )
+              tests_path.write_text(tests[:start] + segment + tests[next_test:])
+          else:
+              print("local fallback test already declares behavior")
           PY
           git diff --check
 
@@ -94,16 +122,17 @@ jobs:
           git diff --check
           changed="$(git diff --name-only)"
           printf 'working-tree paths:\n%s\n' "$changed"
+          expected=$'src/runtime/mod.rs\nsrc/runtime/tests.rs'
           if [ -n "$changed" ]; then
-            test "$changed" = 'src/runtime/mod.rs'
+            test "$changed" = "$expected"
           fi
 
-      - name: Guard exact head and land validated product file
+      - name: Guard exact head and land validated product files
         shell: bash
         run: |
           set -euo pipefail
-          if git diff --quiet -- src/runtime/mod.rs; then
-            echo "product guard already absent; no landing commit needed"
+          if git diff --quiet -- src/runtime/mod.rs src/runtime/tests.rs; then
+            echo "validated product fixes already landed; no commit needed"
             exit 0
           fi
           git fetch origin fix/fail-closed-unknown-behavior
@@ -114,8 +143,10 @@ jobs:
           fi
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/runtime/mod.rs
+          git add src/runtime/mod.rs src/runtime/tests.rs
           git diff --cached --check
-          test "$(git diff --cached --name-only)" = 'src/runtime/mod.rs'
-          git commit -m 'fix(runtime): preserve trusted numeric delivery'
+          changed="$(git diff --cached --name-only)"
+          expected=$'src/runtime/mod.rs\nsrc/runtime/tests.rs'
+          test "$changed" = "$expected"
+          git commit -m 'fix(runtime): preserve trusted numeric delivery semantics'
           git push origin HEAD:fix/fail-closed-unknown-behavior
