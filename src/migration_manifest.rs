@@ -157,10 +157,7 @@ impl MigrationManifest {
         if target_version > 1 {
             for from in 1..target_version {
                 if !by_from.contains_key(&from) {
-                    return Err(MigrationManifestError::MissingTransition {
-                        from,
-                        to: from + 1,
-                    });
+                    return Err(MigrationManifestError::MissingTransition { from, to: from + 1 });
                 }
             }
         }
@@ -173,7 +170,8 @@ impl MigrationManifest {
     }
 
     pub fn to_json(&self) -> Result<String, MigrationManifestError> {
-        serde_json::to_string(self).map_err(|error| MigrationManifestError::InvalidJson(error.to_string()))
+        serde_json::to_string(self)
+            .map_err(|error| MigrationManifestError::InvalidJson(error.to_string()))
     }
 
     pub fn from_json(json: &str) -> Result<Self, MigrationManifestError> {
@@ -221,10 +219,7 @@ impl MigrationManifest {
         if self.target_version > 1 {
             for from in 1..self.target_version {
                 if !seen.contains(&from) {
-                    return Err(MigrationManifestError::MissingTransition {
-                        from,
-                        to: from + 1,
-                    });
+                    return Err(MigrationManifestError::MissingTransition { from, to: from + 1 });
                 }
             }
         }
@@ -251,7 +246,9 @@ mod tests {
             .into_iter()
             .find_map(|decl| match decl {
                 crate::ast::Decl::Actor {
-                    version, migrations, ..
+                    version,
+                    migrations,
+                    ..
                 } => Some((version, migrations)),
                 _ => None,
             })

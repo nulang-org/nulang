@@ -39,7 +39,10 @@ fn migration_rejects_direct_extern_call() {
         }
     "#;
     let err = check(source).unwrap_err().to_string();
-    assert!(err.contains("external/FFI call 'sqrt'"), "unexpected error: {err}");
+    assert!(
+        err.contains("external/FFI call 'sqrt'"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
