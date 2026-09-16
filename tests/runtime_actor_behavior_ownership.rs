@@ -114,3 +114,69 @@ fn numeric_send_rejects_behavior_owned_by_another_actor_schema() {
         "owned behavior id remains deliverable"
     );
 }
+
+#[test]
+fn cross_shard_numeric_delivery_rejects_foreign_schema_before_execution() {
+    let module = compile(
+        r#"
+        actor First {
+            state marker: Int = 0
+            behavior hit() { self.marker = 1 }
+        }
+
+        actor Second {
+            state marker: Int = 0
+            behavior hit() { self.marker = 2 }
+        }
+        "#,
+    );
+    let first_hit = *module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == "First")
+        .and_then(|meta| meta.behavior_indices.first())
+        .expect("First.hit index");
+    let second_hit = *module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == "Second")
+        .and_then(|meta| meta.behavior_indices.first())
+        .expect("Second.hit index");
+    assert_ne!(first_hit, second_hit, "fixture requires distinct behavior ids");
+
+    let mut shards = Runtime::new_sharded(2);
+    let actor_id = shards[0]
+        .spawn_from_module(&module, second_hit, vec![])
+        .as_actor_id()
+        .expect("module spawn returns actor ref");
+    let owner = (actor_id % 2) as usize;
+    if owner != 0 {
+        let actor = shards[0]
+            .actors
+            .remove(&actor_id)
+            .expect("spawned actor on construction shard");
+        shards[owner].actors.insert(actor_id, actor);
+    }
+    assert_eq!(shards[owner].actors[&actor_id].name, "Second");
+    let sender = 1 - owner;
+
+    shards[sender].send_message_by_id(actor_id, first_hit as u16, &[]);
+    let _ = shards[owner].run_scheduler_deterministic(7, 8);
+    assert_eq!(
+        shards[owner].actors[&actor_id]
+            .get_state_field("marker")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "cross-shard ingress must reject First.hit before it can execute on Second"
+    );
+
+    shards[sender].send_message_by_id(actor_id, second_hit as u16, &[]);
+    let _ = shards[owner].run_scheduler_deterministic(7, 8);
+    assert_eq!(
+        shards[owner].actors[&actor_id]
+            .get_state_field("marker")
+            .and_then(|value| value.as_int()),
+        Some(2),
+        "owned Second.hit must still execute across shards"
+    );
+}
