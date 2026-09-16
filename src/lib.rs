@@ -46,6 +46,7 @@ pub mod json_diagnostics;
 pub mod lexer;
 #[cfg(feature = "lsp")]
 pub mod lsp;
+pub mod migration_chain;
 pub mod mir;
 pub mod mir_codegen;
 pub mod mir_inline;
