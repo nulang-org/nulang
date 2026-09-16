@@ -200,7 +200,8 @@ impl TraceContext {
         Some(self.tracing_span(actor_id, behavior_idx).entered())
     }
 
-    /// Build a `tracing` span for one effect invocation.
+    /// Build a `tracing` span for one effect invocation as a child of this
+    /// context.
     ///
     /// The effect boundary and delivery semantics are explicit inputs rather
     /// than being guessed from `effect_name`: the same effect can have
@@ -221,9 +222,10 @@ impl TraceContext {
         delivery: DeliverySemantics,
         operation_id: Option<&str>,
     ) -> tracing::Span {
-        let trace = format!("{:032x}", self.trace_id);
-        let span = format!("{:016x}", self.span_id);
-        let parent = format!("{:016x}", self.parent_span_id);
+        let effect_ctx = self.child();
+        let trace = format!("{:032x}", effect_ctx.trace_id);
+        let span = format!("{:016x}", effect_ctx.span_id);
+        let parent = format!("{:016x}", effect_ctx.parent_span_id);
         let boundary_name = boundary.as_str();
         let delivery_name = delivery.as_str();
         let operation_id = operation_id.unwrap_or("");
