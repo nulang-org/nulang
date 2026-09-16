@@ -86,19 +86,45 @@ fn log(msg: String) -> Unit throws {IO} {
 
 ## Built-in Effects
 
-Nulang ships with several built-in effects wired into the VM and runtime:
+Nulang ships with built-in effects wired into the VM and runtime. The canonical
+list lives in the standard library registry (`src/stdlib.rs`); the families
+are:
 
 | Effect | Operations | Description |
 |--------|-----------|-------------|
-| `IO` | `print`, `println`, `read` | Console I/O |
-| `Int` | `to_string` | Integer-to-string conversion |
+| `IO` | `print`, `println`, `read`, `log`, `log_error` | Console I/O and logging |
+| `Int` | `to_string`, `to_float`, `to_hex`, `to_binary` | Integer conversions |
+| `Float` | `to_int`, `to_string`, `sin`, `cos`, `sqrt`, `pow`, … | Float conversions and math |
+| `String` | `length`, `concat`, `substring`, `charAt`, `to_int`, `to_float` | String operations |
+| `Array` | `length`, `new`, `push`, `set`, `slice` | Array operations |
+| `Map` | `new`, `insert`, `get`, `contains`, `remove`, `size` | Hash-map operations |
+| `StrBuilder` | `new`, `push`, `to_string`, `len`, `reset` | Efficient string building |
+| `FS` | `read`, `write`, `append`, `exists` | File-system access |
+| `Env` | `get` | Environment variables |
+| `Process` | `run` | Shell command execution |
+| `Debug` | `inspect` | Labeled value inspection |
+| `Test` | `assert`, `assert_eq`, `assert_true` | Test assertions |
+| `Random` | `int` | Random numbers |
+| `Time` | `now` | Wall-clock time |
 | `Timer` | `sleep` | Durable workflow timers |
 | `Signal` | `wait` | Workflow signal suspension |
 | `Inference` | `ask` | AI language model queries (canonical name) |
-| `LLM` | `ask` | Deprecated alias for `Inference.ask` |
-| `Provider` | `ask` | General provider abstraction |
 | `Actor` | `link`, `unlink`, `monitor`, `demonitor`, `trap_exit`, `exit`, `register`, `unregister`, `whereis`, `set_priority` | Actor lifecycle management |
 | `Otp` | `create_supervisor`, `supervise_child`, `set_template`, `start_child`, `terminate_child`, `child_count` | OTP supervision trees |
+| `Crdt` | `increment`, `decrement`, `add`, `remove`, `set`, `read` | CRDT-backed actor state |
+| `Http` | `get`, `post`, `serve` | HTTP client and server |
+| `Web` | `html`, `text`, `route`, `param`, `header`, `cookie`, … | Web framework primitives |
+| `Python` | `import`, `call`, `get_attr` | Python interop (PyO3) |
+| `System` | `arg` | Command-line arguments |
+| `Realtime` | `broadcast` | Realtime channel broadcast |
 
-`LLM.ask` emits a compiler warning; use `Inference.ask` instead (RFC 0010).
-See the [Standard Library](/stdlib/overview/) for full documentation of each built-in effect.
+`perform LLM.ask(prompt)` remains accepted as a legacy alias for
+`perform Inference.ask(prompt)` — both dispatch identically at runtime.
+
+`Provider.ask(service, prompt)` is not a stdlib-registry effect; it is
+dispatched directly through the runtime's provider callbacks (the longevity
+path for swappable service providers).
+
+See the [Standard Library](/stdlib/overview/) for full documentation of each
+built-in effect, with per-effect pages covering every operation and its
+signature.

@@ -22,6 +22,7 @@ fn double(x) {
 
 // Single-expression functions (block with implicit return)
 fn square(x: Int) -> Int = x * x
+```
 
 ## Let Bindings
 
@@ -115,7 +116,14 @@ let nums = [1, 2, 3, 4, 5]
 let first = nums[0]   // Index access (out-of-bounds returns nil)
 ```
 
-Array length is accessible via `for` loops (which iterate over the full array). A user-facing `Array.length` built-in is planned.
+Array length is available via the built-in `Array.length` effect:
+
+```nulang
+let nums = [1, 2, 3, 4, 5]
+let n = perform Array.length(nums)   // 5
+```
+
+`for` loops also iterate over the full array without an explicit length call.
 
 ## Pipe Operator
 
@@ -222,3 +230,8 @@ See [Algebraic Effects](/language/effects/) for the full effect system.
 
 //! Module-level doc comment
 ```
+
+Use exactly `///` for declaration docs — the lexer recognizes it as a doc
+comment, and consecutive `///` lines attach to the declaration that
+immediately follows them. `//!` lines form the module overview in generated
+docs (`nulang --doc`).
