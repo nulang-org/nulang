@@ -7,6 +7,7 @@
 //! persisted snapshot.
 
 use super::persistence::StateModel;
+use crate::types::{NuError, Span};
 use std::collections::HashMap;
 
 /// Stable identity of a virtual actor.
@@ -63,6 +64,15 @@ impl std::fmt::Display for GrainActorIdCollision {
 }
 
 impl std::error::Error for GrainActorIdCollision {}
+
+impl From<GrainActorIdCollision> for NuError {
+    fn from(error: GrainActorIdCollision) -> Self {
+        NuError::RuntimeError {
+            msg: error.to_string(),
+            span: Span::new(0, 0),
+        }
+    }
+}
 
 /// Establish an `actor_id -> GrainId` reverse binding without permitting a
 /// distinct logical identity to overwrite an existing one.
@@ -304,5 +314,18 @@ mod tests {
         );
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings.get(&7), Some(&original));
+    }
+
+    #[test]
+    fn test_grain_actor_id_collision_converts_to_runtime_error() {
+        let error = GrainActorIdCollision {
+            actor_id: 7,
+            existing: GrainId::new("User", "42"),
+            attempted: GrainId::new("Order", "42"),
+        };
+        let runtime_error: NuError = error.into();
+        assert!(runtime_error
+            .to_string()
+            .contains("grain actor-id collision at 7"));
     }
 }
