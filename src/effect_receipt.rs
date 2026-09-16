@@ -118,7 +118,10 @@ pub struct EffectIdentity {
 }
 
 impl EffectIdentity {
-    pub fn new(effect: impl Into<String>, operation: impl Into<String>) -> Result<Self, EffectReceiptError> {
+    pub fn new(
+        effect: impl Into<String>,
+        operation: impl Into<String>,
+    ) -> Result<Self, EffectReceiptError> {
         let identity = Self {
             effect: effect.into(),
             operation: operation.into(),
@@ -187,7 +190,9 @@ impl EffectIntent {
             return Err(EffectReceiptError::SiteMismatch(self.invocation_id));
         }
         if self.effect_identity != proposed.effect_identity {
-            return Err(EffectReceiptError::EffectIdentityMismatch(self.invocation_id));
+            return Err(EffectReceiptError::EffectIdentityMismatch(
+                self.invocation_id,
+            ));
         }
         if self.request_fingerprint != proposed.request_fingerprint {
             return Err(EffectReceiptError::RequestFingerprintMismatch(
@@ -230,11 +235,7 @@ pub struct EffectReceipt {
 
 impl EffectReceipt {
     pub fn success(intent: &EffectIntent, completed_attempt: u32, payload: Vec<u8>) -> Self {
-        Self::from_outcome(
-            intent,
-            completed_attempt,
-            EffectOutcome::Succeeded(payload),
-        )
+        Self::from_outcome(intent, completed_attempt, EffectOutcome::Succeeded(payload))
     }
 
     pub fn failure(
@@ -333,8 +334,12 @@ impl fmt::Display for EffectReceiptError {
             Self::UnsupportedFormat(version) => {
                 write!(f, "unsupported effect receipt format version {version}")
             }
-            Self::InvalidEffectIdentity => f.write_str("effect and operation names must be non-empty"),
-            Self::InvalidAttempt(attempt) => write!(f, "effect attempt must be positive, got {attempt}"),
+            Self::InvalidEffectIdentity => {
+                f.write_str("effect and operation names must be non-empty")
+            }
+            Self::InvalidAttempt(attempt) => {
+                write!(f, "effect attempt must be positive, got {attempt}")
+            }
             Self::InvocationMismatch => f.write_str("effect invocation ids do not match"),
             Self::SiteMismatch(id) => write!(f, "effect site mismatch for invocation {id}"),
             Self::EffectIdentityMismatch(id) => {
@@ -472,13 +477,7 @@ mod tests {
         let identity = EffectIdentity::new("Payments", "charge").unwrap();
         let fingerprint = RequestFingerprint::from_canonical_bytes(b"order=42&amount=1000");
         let provider_key = Some(invocation.provider_idempotency_key("test-payments-v1"));
-        let intent = EffectIntent::new(
-            invocation,
-            site,
-            identity,
-            fingerprint,
-            provider_key,
-        );
+        let intent = EffectIntent::new(invocation, site, identity, fingerprint, provider_key);
         (site, intent)
     }
 
@@ -496,15 +495,9 @@ mod tests {
     #[test]
     fn provider_idempotency_key_is_stable_and_namespaced() {
         let (_, intent) = fixture();
-        let one = intent
-            .invocation_id
-            .provider_idempotency_key("payments-v1");
-        let two = intent
-            .invocation_id
-            .provider_idempotency_key("payments-v1");
-        let other_adapter = intent
-            .invocation_id
-            .provider_idempotency_key("mail-v1");
+        let one = intent.invocation_id.provider_idempotency_key("payments-v1");
+        let two = intent.invocation_id.provider_idempotency_key("payments-v1");
+        let other_adapter = intent.invocation_id.provider_idempotency_key("mail-v1");
 
         assert_eq!(one, two);
         assert_ne!(one, other_adapter);

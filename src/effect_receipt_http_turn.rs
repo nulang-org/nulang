@@ -11,7 +11,7 @@ use std::fmt;
 use std::io::Read;
 
 use crate::effect_receipt::{
-    EffectIntent, EffectOutcome, EffectReplayDecision, EffectReceipt, RecordedEffectFailure,
+    EffectIntent, EffectOutcome, EffectReceipt, EffectReplayDecision, RecordedEffectFailure,
 };
 use crate::effect_receipt_fence::EffectReceiptFence;
 use crate::effect_receipt_http::http_post_request_fingerprint;
@@ -56,7 +56,10 @@ impl fmt::Display for DurableHttpTurnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongEffectIdentity { effect, operation } => {
-                write!(f, "durable HTTP turn requires Http.post, got {effect}.{operation}")
+                write!(
+                    f,
+                    "durable HTTP turn requires Http.post, got {effect}.{operation}"
+                )
             }
             Self::RequestFingerprintMismatch => {
                 f.write_str("durable HTTP turn request fingerprint mismatch")

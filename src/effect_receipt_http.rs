@@ -10,7 +10,7 @@ use std::fmt;
 use std::io::Read;
 
 use crate::effect_receipt::{
-    EffectIntent, EffectOutcome, EffectReplayDecision, EffectReceipt, RecordedEffectFailure,
+    EffectIntent, EffectOutcome, EffectReceipt, EffectReplayDecision, RecordedEffectFailure,
     RequestFingerprint,
 };
 use crate::effect_receipt_fence::EffectReceiptFence;
@@ -36,7 +36,10 @@ impl fmt::Display for DurableHttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongEffectIdentity { effect, operation } => {
-                write!(f, "durable HTTP POST requires Http.post, got {effect}.{operation}")
+                write!(
+                    f,
+                    "durable HTTP POST requires Http.post, got {effect}.{operation}"
+                )
             }
             Self::RequestFingerprintMismatch => {
                 f.write_str("durable HTTP POST request fingerprint mismatch")
@@ -49,7 +52,11 @@ impl fmt::Display for DurableHttpError {
             Self::ResponseRead(error) => write!(f, "failed reading HTTP response: {error}"),
             Self::HttpStatus { status, .. } => write!(f, "HTTP provider returned status {status}"),
             Self::RecordedFailure(failure) => {
-                write!(f, "recorded HTTP effect failure {}: {}", failure.code, failure.message)
+                write!(
+                    f,
+                    "recorded HTTP effect failure {}: {}",
+                    failure.code, failure.message
+                )
             }
         }
     }
@@ -129,8 +136,7 @@ impl<'a> DurableHttpClient<'a> {
                     format!("http_status_{status}"),
                     failure_message,
                 );
-                self.store
-                    .commit_receipt_fenced(actor_id, fence, receipt)?;
+                self.store.commit_receipt_fenced(actor_id, fence, receipt)?;
                 return Err(DurableHttpError::HttpStatus {
                     status,
                     body: payload,
@@ -149,8 +155,7 @@ impl<'a> DurableHttpClient<'a> {
             durable_intent.first_attempt,
             payload.clone(),
         );
-        self.store
-            .commit_receipt_fenced(actor_id, fence, receipt)?;
+        self.store.commit_receipt_fenced(actor_id, fence, receipt)?;
         Ok(payload)
     }
 }
@@ -353,7 +358,10 @@ mod tests {
             Err(DurableHttpError::RequestFingerprintMismatch)
         ));
         assert_eq!(store.accepted_epoch(actor_id).unwrap(), None);
-        assert!(store.load(actor_id, effect.invocation_id).unwrap().is_none());
+        assert!(store
+            .load(actor_id, effect.invocation_id)
+            .unwrap()
+            .is_none());
     }
 
     fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
@@ -409,6 +417,8 @@ mod tests {
     }
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack.windows(needle.len()).position(|window| window == needle)
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 }
