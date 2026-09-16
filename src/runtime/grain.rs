@@ -79,7 +79,9 @@ impl From<GrainActorIdCollision> for NuError {
 pub enum GrainIdentityBindingError {
     /// A compact actor id is already owned by another logical grain.
     CompactIdCollision(GrainActorIdCollision),
-    /// The same logical grain is already resident under another actor id.
+    /// The same logical grain is already stably bound under another actor id.
+    /// This remains an error even when the old activation is dehydrated and no
+    /// longer appears in the resident index.
     LogicalIdentityConflict {
         grain_id: GrainId,
         existing_actor_id: u64,
@@ -137,6 +139,23 @@ fn validate_grain_actor_id_binding(
     }
 }
 
+fn validate_logical_grain_binding(
+    bindings: &HashMap<u64, GrainId>,
+    actor_id: u64,
+    grain_id: &GrainId,
+) -> Result<(), GrainIdentityBindingError> {
+    for (&existing_actor_id, existing_grain_id) in bindings {
+        if existing_actor_id != actor_id && existing_grain_id == grain_id {
+            return Err(GrainIdentityBindingError::LogicalIdentityConflict {
+                grain_id: grain_id.clone(),
+                existing_actor_id,
+                attempted_actor_id: actor_id,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Establish an `actor_id -> GrainId` reverse binding without permitting a
 /// distinct logical identity to overwrite an existing one.
 ///
@@ -160,6 +179,11 @@ pub fn bind_grain_actor_id(
 /// After activation succeeds, [`bind_resident_grain_indexes`] commits the exact
 /// same validated relation. This two-phase protocol prevents both collision
 /// aliasing and phantom resident mappings after a failed hydration.
+///
+/// The reverse indexes intentionally remain populated across dehydration while
+/// `grain_residents` is removed. Therefore validation checks both directions in
+/// those stable reverse maps: a `GrainId` already bound to a different actor id
+/// is rejected even when no activation is currently resident.
 pub fn validate_resident_grain_indexes(
     grain_residents: &HashMap<GrainId, u64>,
     actor_grain_id: &HashMap<u64, GrainId>,
@@ -169,6 +193,8 @@ pub fn validate_resident_grain_indexes(
 ) -> Result<(), GrainIdentityBindingError> {
     validate_grain_actor_id_binding(actor_grain_id, actor_id, grain_id)?;
     validate_grain_actor_id_binding(grain_actor_ids, actor_id, grain_id)?;
+    validate_logical_grain_binding(actor_grain_id, actor_id, grain_id)?;
+    validate_logical_grain_binding(grain_actor_ids, actor_id, grain_id)?;
 
     if let Some(&existing_actor_id) = grain_residents.get(grain_id) {
         if existing_actor_id != actor_id {
@@ -567,6 +593,63 @@ mod tests {
         assert_eq!(residents.get(&grain), Some(&7));
         assert!(actor_to_grain.is_empty());
         assert!(known_ids.is_empty());
+    }
+
+    #[test]
+    fn test_dehydrated_grain_cannot_rebind_to_new_actor_id() {
+        let grain = GrainId::new("User", "42");
+        // Dehydration removes only the resident relation. Stable reverse
+        // identity mappings remain so the same compact id can be rehydrated.
+        let residents = HashMap::new();
+        let mut actor_to_grain = HashMap::new();
+        let mut known_ids = HashMap::new();
+        actor_to_grain.insert(7, grain.clone());
+        known_ids.insert(7, grain.clone());
+
+        let error = validate_resident_grain_indexes(
+            &residents,
+            &actor_to_grain,
+            &known_ids,
+            8,
+            &grain,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            GrainIdentityBindingError::LogicalIdentityConflict {
+                grain_id: grain,
+                existing_actor_id: 7,
+                attempted_actor_id: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn test_single_stable_reverse_index_prevents_logical_rebind() {
+        let grain = GrainId::new("User", "42");
+        let residents = HashMap::new();
+        let mut actor_to_grain = HashMap::new();
+        let known_ids = HashMap::new();
+        actor_to_grain.insert(7, grain.clone());
+
+        let error = validate_resident_grain_indexes(
+            &residents,
+            &actor_to_grain,
+            &known_ids,
+            8,
+            &grain,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GrainIdentityBindingError::LogicalIdentityConflict {
+                existing_actor_id: 7,
+                attempted_actor_id: 8,
+                ..
+            }
+        ));
     }
 
     #[test]
