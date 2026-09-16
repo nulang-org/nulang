@@ -58,6 +58,7 @@ pub mod mir_wasm_simd;
 pub mod observability;
 pub mod package;
 pub mod parser;
+pub(crate) mod persistence_integrity;
 pub mod prelude_source;
 pub mod primitives;
 #[cfg(feature = "python")]
