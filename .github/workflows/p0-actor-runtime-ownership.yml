@@ -28,6 +28,7 @@ jobs:
         run: |
           python3 scripts/apply_p0_actor_runtime_ownership.py
           python3 scripts/apply_p0_actor_runtime_role_scope.py
+          python3 scripts/apply_p0_actor_snapshot_storage.py
           sed -i 's/behavior hit(): Int/behavior hit()/g' src/runtime/tests.rs
 
       - name: Format and static checks
@@ -53,6 +54,11 @@ jobs:
       - name: Runtime focused suite
         run: cargo test --no-default-features runtime::tests
 
+      - name: SQL persistence feature checks
+        run: |
+          cargo check --no-default-features --features sqlite
+          cargo check --no-default-features --features postgres
+
       - name: Land validated delta
         run: |
           git fetch origin fix/nominal-actor-runtime-ownership
@@ -60,6 +66,7 @@ jobs:
           rm .github/workflows/p0-actor-runtime-ownership.yml
           rm scripts/apply_p0_actor_runtime_ownership.py
           rm scripts/apply_p0_actor_runtime_role_scope.py
+          rm scripts/apply_p0_actor_snapshot_storage.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
