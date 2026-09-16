@@ -25,6 +25,7 @@ pub mod core_vm;
 #[cfg(feature = "native-codegen")]
 pub mod cranelift_utils;
 pub mod dap;
+pub mod delivery;
 pub mod diagnostic;
 #[cfg(feature = "native-codegen")]
 pub mod difffuzz;
