@@ -8,6 +8,7 @@
 #![cfg_attr(test, allow(clippy::approx_constant))]
 
 pub mod agent;
+mod actor_protocol;
 #[cfg(feature = "native-codegen")]
 pub mod aot;
 pub mod ast;
@@ -54,8 +55,6 @@ pub mod mir_lower;
 pub mod mir_wasm;
 #[cfg(feature = "wasm-backend")]
 pub mod mir_wasm_simd;
-#[cfg(feature = "otel")]
-pub mod observability;
 pub mod package;
 pub mod parser;
 pub mod prelude_source;
@@ -72,6 +71,9 @@ pub mod stress_tests;
 pub mod tool_schema;
 pub mod type_ir;
 pub mod type_metadata;
+#[path = "typechecker.rs"]
+pub(crate) mod typechecker_base;
+#[path = "typechecker_facade.rs"]
 pub mod typechecker;
 pub mod types;
 pub mod value_layout;
