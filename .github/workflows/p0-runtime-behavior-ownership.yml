@@ -1,0 +1,231 @@
+name: P0 Runtime Behavior Ownership
+
+on:
+  push:
+    branches:
+      - fix/p0-runtime-behavior-ownership
+
+concurrency:
+  group: p0-runtime-behavior-ownership
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/p0-runtime-behavior-ownership
+          fetch-depth: 0
+
+      - name: Pin branch head
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "START_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Apply narrow ownership gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/runtime/mod.rs")
+          text = path.read_text()
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one exact match, found {count}")
+              text = text.replace(old, new, 1)
+
+          # Compile the ownership helper into the runtime module tree.
+          if "mod behavior_ownership;\n" not in text:
+              replace_once(
+                  "mod actor;\nmod gc;\n",
+                  "mod actor;\nmod behavior_ownership;\nmod gc;\n",
+                  "module declaration",
+              )
+
+          old_actor_has = '''    fn actor_has_behavior_id(&self, target_id: u64, behavior_id: u16) -> bool {
+              let behavior_idx = behavior_id as usize;
+              let has_native = self
+                  .actors
+                  .get(&target_id)
+                  .and_then(|actor| actor.behavior_table.get(behavior_idx))
+                  .is_some_and(|entry| !entry.name.is_empty());
+              has_native || self.has_bytecode_handler(target_id, behavior_idx)
+          }
+          '''
+          new_actor_has = '''    fn actor_has_behavior_id(&self, target_id: u64, behavior_id: u16) -> bool {
+              let behavior_idx = behavior_id as usize;
+              let Some(actor) = self.actors.get(&target_id) else {
+                  return false;
+              };
+              let has_native = actor
+                  .behavior_table
+                  .get(behavior_idx)
+                  .is_some_and(|entry| !entry.name.is_empty());
+              if has_native {
+                  return true;
+              }
+              let Some(module) = actor.bytecode_module.as_ref() else {
+                  return false;
+              };
+              behavior_ownership::module_behavior_index_for_runtime_id(
+                  module,
+                  &actor.name,
+                  behavior_idx,
+              )
+              .is_some()
+                  && self.has_bytecode_handler(target_id, behavior_idx)
+          }
+          '''
+          if old_actor_has in text:
+              replace_once(old_actor_has, new_actor_has, "actor_has_behavior_id")
+          elif new_actor_has not in text:
+              raise SystemExit("actor_has_behavior_id: neither legacy nor owned form found")
+
+          behavior_start = text.index(
+              "    pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {\n"
+          )
+          behavior_end = text.index(
+              "    /// Resolve a behavior name to a numeric id using the registered grain\n",
+              behavior_start,
+          )
+          old_behavior = text[behavior_start:behavior_end]
+          new_behavior = '''    pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {
+              let actor = self.actors.get(&target_id)?;
+              let matches = |name: &str| {
+                  name == behavior
+                      || name
+                          .strip_suffix(behavior)
+                          .is_some_and(|prefix| prefix.ends_with('.'))
+              };
+              if let Some(idx) = actor
+                  .behavior_table
+                  .iter()
+                  .position(|entry| matches(&entry.name))
+              {
+                  return u16::try_from(idx).ok();
+              }
+              let module = actor.bytecode_module.as_ref()?;
+              behavior_ownership::runtime_behavior_id_for_name(module, &actor.name, behavior)
+                  .and_then(|idx| u16::try_from(idx).ok())
+          }
+
+          '''
+          if old_behavior != new_behavior:
+              text = text[:behavior_start] + new_behavior + text[behavior_end:]
+
+          wire_start = text.index(
+              "    fn behavior_wire_name_for(&self, actor: Option<u64>, behavior_id: u16) -> Option<String> {\n"
+          )
+          wire_end = text.index(
+              "    /// Synchronously run a single behavior on an actor and return its result.\n",
+              wire_start,
+          )
+          old_wire = text[wire_start:wire_end]
+          new_wire = '''    fn behavior_wire_name_for(&self, actor: Option<u64>, behavior_id: u16) -> Option<String> {
+              let actor = self.actors.get(&actor?)?;
+              if let Some(entry) = actor.behavior_table.get(behavior_id as usize) {
+                  if !entry.name.is_empty() {
+                      return Some(entry.name.clone());
+                  }
+              }
+              let module = actor.bytecode_module.as_ref()?;
+              behavior_ownership::behavior_name_for_runtime_id(
+                  module,
+                  &actor.name,
+                  behavior_id as usize,
+              )
+              .map(str::to_owned)
+          }
+
+          '''
+          if old_wire != new_wire:
+              text = text[:wire_start] + new_wire + text[wire_end:]
+
+          grain_start = text.index(
+              "    fn resolve_grain_behavior_id(&self, grain_id: &GrainId, behavior_name: &str) -> Option<u16> {\n"
+          )
+          grain_end = text.index(
+              "    /// Send a message to an actor owned by another shard.",
+              grain_start,
+          )
+          old_grain = text[grain_start:grain_end]
+          new_grain = '''    fn resolve_grain_behavior_id(&self, grain_id: &GrainId, behavior_name: &str) -> Option<u16> {
+              let grain_type = self.grain_registry.get(&grain_id.grain_type)?;
+              behavior_ownership::runtime_behavior_id_for_name(
+                  &grain_type.module,
+                  &grain_id.grain_type,
+                  behavior_name,
+              )
+              .and_then(|idx| u16::try_from(idx).ok())
+          }
+
+          '''
+          if old_grain != new_grain:
+              text = text[:grain_start] + new_grain + text[grain_end:]
+
+          path.write_text(text)
+          PY
+          git diff --check
+
+      - name: Validate focused ownership regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features --test runtime_behavior_ownership
+          cargo test --no-default-features --test runtime_actor_schema_identity
+          cargo test --no-default-features runtime::tests::p0_unknown_named_send_is_rejected -- --exact
+          cargo test --no-default-features runtime::tests::p0_unknown_numeric_ask_is_rejected_without_running_behavior_zero -- --exact
+
+      - name: Revalidate actor delivery paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features runtime::tests::test_send_carries_current_trace_span -- --exact
+          cargo test --no-default-features runtime::tests::test_cross_actor_send_foreign_count_lifecycle -- --exact
+          cargo test --no-default-features runtime::tests::test_distributed_remote_address_local_fallback -- --exact
+
+      - name: Full no-default regression suite
+        shell: bash
+        run: cargo test --no-default-features
+
+      - name: Format and diff gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          git diff --check
+          changed="$(git diff --name-only)"
+          printf 'working-tree paths:\n%s\n' "$changed"
+          test "$changed" = "src/runtime/mod.rs"
+
+      - name: Guard exact head and land validated runtime gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/runtime/mod.rs; then
+            echo "runtime ownership gate already landed"
+            exit 0
+          fi
+          git fetch origin fix/p0-runtime-behavior-ownership
+          remote_head="$(git rev-parse origin/fix/p0-runtime-behavior-ownership)"
+          if [ "$remote_head" != "$START_HEAD" ]; then
+            echo "branch advanced during validation: $remote_head (expected $START_HEAD)" >&2
+            exit 1
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime/mod.rs
+          git diff --cached --check
+          test "$(git diff --cached --name-only)" = "src/runtime/mod.rs"
+          git commit -m 'fix(runtime): enforce actor behavior ownership at dispatch'
+          git push origin HEAD:fix/p0-runtime-behavior-ownership
