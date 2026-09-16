@@ -1,0 +1,16 @@
+actor IntPinger {
+    behavior ping(x: Int) { x + 1 }
+}
+
+actor StringPinger {
+    behavior ping(x: String) { x }
+}
+
+fn main() {
+    let ints = spawn IntPinger {}
+    let strings = spawn StringPinger {}
+    let int_result = ask ints ping(41)
+    let string_result = ask strings ping("ok")
+    perform IO.print(int_result)
+    perform IO.print(string_result)
+}
