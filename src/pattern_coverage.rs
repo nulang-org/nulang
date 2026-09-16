@@ -64,7 +64,7 @@ pub fn analyze_variant_match(
             continue;
         }
 
-        if is_irrefutable(pattern) {
+        if is_unconditional_catch_all(pattern) {
             catch_all = true;
             covered.extend(declared.iter().map(|name| (*name).to_string()));
             continue;
@@ -117,7 +117,12 @@ fn covered_constructor<'a>(
 
     match (declared_payload, payload_pattern) {
         (None, None) => Some(name.as_str()),
-        (Some(_), Some(inner)) if is_irrefutable(inner) => Some(name.as_str()),
+        // For the first coverage slice, only wildcard/variable (possibly
+        // aliased) payloads prove full-constructor coverage. Structured tuple
+        // and record payloads remain on the runtime fallback until the
+        // typechecker validates their exact shape as part of the future
+        // Maranget-style pattern-matrix pass.
+        (Some(_), Some(inner)) if is_unconditional_catch_all(inner) => Some(name.as_str()),
         _ => None,
     }
 }
@@ -129,18 +134,15 @@ fn strip_alias(mut pattern: &Pattern) -> &Pattern {
     pattern
 }
 
-/// Whether the pattern accepts every value of its already-known input type.
-///
-/// Tuple and record patterns are included when all children are irrefutable;
-/// their outer shape is guaranteed by the typechecker before this analysis is
-/// consumed. Literals and variant constructors are refutable by definition.
-fn is_irrefutable(pattern: &Pattern) -> bool {
+/// Whether this pattern is an unconditional catch-all independent of input
+/// shape. We intentionally do not classify tuple/record patterns here: the
+/// current binder is permissive about structured shapes, so doing so could
+/// turn an invalid structured pattern into a false exhaustiveness proof.
+fn is_unconditional_catch_all(pattern: &Pattern) -> bool {
     match pattern {
         Pattern::Wild | Pattern::Var(_) => true,
-        Pattern::Alias(_, inner) => is_irrefutable(inner),
-        Pattern::Tuple(items) => items.iter().all(is_irrefutable),
-        Pattern::Record(fields) => fields.iter().all(|(_, pat)| is_irrefutable(pat)),
-        Pattern::Lit(_) | Pattern::Variant(_, _) => false,
+        Pattern::Alias(_, inner) => is_unconditional_catch_all(inner),
+        Pattern::Lit(_) | Pattern::Tuple(_) | Pattern::Record(_) | Pattern::Variant(_, _) => false,
     }
 }
 
@@ -234,6 +236,23 @@ mod tests {
         ];
         let report = analyze_variant_match(&option, &arms).unwrap();
         assert_eq!(report.missing, vec!["Some(_)"]);
+    }
+
+    #[test]
+    fn structured_payload_is_not_yet_used_as_a_proof() {
+        let wrapped = Type::Variant(vec![(
+            "Pair".into(),
+            Some(Type::Tuple(vec![Type::int(), Type::int()])),
+        )]);
+        let arms = vec![(
+            Pattern::Variant(
+                "Pair".into(),
+                Some(Box::new(Pattern::Tuple(vec![Pattern::Wild, Pattern::Wild]))),
+            ),
+            false,
+        )];
+        let report = analyze_variant_match(&wrapped, &arms).unwrap();
+        assert_eq!(report.missing, vec!["Pair(_)"]);
     }
 
     #[test]
