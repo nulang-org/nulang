@@ -80,7 +80,10 @@ fn main() {
     println!("actor_count={actor_count}");
     println!("spawn_seconds={:.6}", spawn_elapsed.as_secs_f64());
     println!("actors_per_second={actors_per_second:.0}");
-    println!("scheduler_settle_seconds={:.6}", settle_elapsed.as_secs_f64());
+    println!(
+        "scheduler_settle_seconds={:.6}",
+        settle_elapsed.as_secs_f64()
+    );
     println!("initial_actor_heap_capacity_bytes={actor_heap_capacity_bytes}");
     println!(
         "initial_actor_heap_capacity_bytes_per_actor={:.1}",
