@@ -1,4 +1,4 @@
-name: Apply fail-closed actor dispatch
+name: Superseded fail-closed actor dispatch branch
 
 on:
   push:
@@ -11,38 +11,8 @@ concurrency:
   group: apply-fail-closed-actor-dispatch
   cancel-in-progress: true
 
-permissions:
-  contents: write
-
 jobs:
-  apply-and-verify:
-    runs-on: macos-latest
+  superseded:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: fix/fail-closed-actor-dispatch
-          fetch-depth: 0
-
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Apply audited P0 fix
-        run: |
-          git cherry-pick 2b12918847833612516d9a9d37aab9dae16378c3
-
-      - name: Verify focused regressions
-        run: |
-          cargo test --lib p0_unknown
-
-      - name: Verify runtime library suite
-        run: |
-          cargo test --lib
-
-      - name: Remove one-shot workflow and push
-        run: |
-          rm .github/workflows/apply-fail-closed-actor-dispatch.yml
-          git add -A
-          git commit -m "chore: remove one-shot actor dispatch applicator"
-          git push origin HEAD:fix/fail-closed-actor-dispatch
+      - run: echo "Superseded by the existing stacked implementation in PR #269; no product changes will be applied from this branch."
