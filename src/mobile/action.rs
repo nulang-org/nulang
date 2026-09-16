@@ -37,7 +37,10 @@ impl fmt::Display for ClientActionProtocolError {
                 write!(f, "invalid runtime action message: {error}")
             }
             Self::ServerPlacement => {
-                write!(f, "server-placed actions cannot execute in the local native runtime")
+                write!(
+                    f,
+                    "server-placed actions cannot execute in the local native runtime"
+                )
             }
             Self::EmptyIdentity(field) => write!(f, "{field} must not be empty"),
         }

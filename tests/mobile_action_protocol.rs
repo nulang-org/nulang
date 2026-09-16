@@ -1,11 +1,10 @@
 use nulang::mobile::action::{
-    decode_client_action_invocation, decode_client_action_output,
-    encode_client_action_invocation, encode_client_action_output, stable_client_action_id,
-    ClientActionProtocolError,
+    decode_client_action_invocation, decode_client_action_output, encode_client_action_invocation,
+    encode_client_action_output, stable_client_action_id, ClientActionProtocolError,
 };
 use nulang_ui_protocol::{
-    ActionId, ActionPlacement, ActionRequest, CorrelationId, DocumentId, IdempotencyKey,
-    Revision, RuntimeToHostMessage, UiPatch, WireValue,
+    ActionId, ActionPlacement, ActionRequest, CorrelationId, DocumentId, IdempotencyKey, Revision,
+    RuntimeToHostMessage, UiPatch, WireValue,
 };
 
 fn request(placement: ActionPlacement) -> ActionRequest {

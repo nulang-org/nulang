@@ -17,7 +17,10 @@ fn public_mobile_manifest_contract_is_stable_and_verifiable() {
         MOBILE_MESSAGE_PROTOCOL,
         nulang_ui_protocol::UI_MESSAGE_PROTOCOL_VERSION
     );
-    assert_eq!(manifest.ui_protocol, nulang_ui_protocol::UI_PROTOCOL_VERSION);
+    assert_eq!(
+        manifest.ui_protocol,
+        nulang_ui_protocol::UI_PROTOCOL_VERSION
+    );
     assert_eq!(
         manifest.message_protocol,
         nulang_ui_protocol::UI_MESSAGE_PROTOCOL_VERSION

@@ -1,9 +1,8 @@
 use std::ffi::{CStr, CString};
 
 use nulang::ffi::c_api::{
-    nulang_call_function, nulang_compile, nulang_last_error, nulang_load_nbc,
-    nulang_runtime_free, nulang_runtime_new_interpreter, nulang_value_int,
-    nulang_value_int_new,
+    nulang_call_function, nulang_compile, nulang_last_error, nulang_load_nbc, nulang_runtime_free,
+    nulang_runtime_new_interpreter, nulang_value_int, nulang_value_int_new,
 };
 
 #[test]
