@@ -78,6 +78,13 @@ jobs:
           test ! -s /tmp/out
           grep -F "Type mismatch: expected Int, found String" /tmp/err
 
+      - name: Canonical WASM agrees on nominal dispatch
+        run: |
+          cargo build --quiet --no-default-features --features wasm-backend
+          BIN="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"] + "/debug/nulang")')"
+          test "$($BIN --backend wasm-run conformance/behavior/actor_18_nominal_behavior_owner.nula)" = "42ok"
+          test "$($BIN --backend wasm-run conformance/behavior/lifecycle_05_behavior_name_first_declaration_wins.nula)" = "1"
+
       - name: Land validated delta
         run: |
           git fetch origin fix/nominal-actor-behavior-identity
