@@ -54,13 +54,7 @@ fn fixture(actor_id: u64) -> EffectIntent {
     let fingerprint = RequestFingerprint::from_canonical_bytes(b"order=42&amount=1000");
     let provider_key = Some(invocation.provider_idempotency_key("fake-payments-v1"));
 
-    EffectIntent::new(
-        invocation,
-        site,
-        identity,
-        fingerprint,
-        provider_key,
-    )
+    EffectIntent::new(invocation, site, identity, fingerprint, provider_key)
 }
 
 fn provider_key(intent: &EffectIntent) -> &str {
