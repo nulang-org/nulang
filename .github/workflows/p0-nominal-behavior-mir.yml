@@ -1,0 +1,151 @@
+name: P0 Nominal Behavior MIR Guard
+
+on:
+  push:
+    branches:
+      - codex/nominal-actor-dispatch
+
+concurrency:
+  group: p0-nominal-behavior-mir
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: codex/nominal-actor-dispatch
+          fetch-depth: 0
+
+      - name: Pin branch head
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "START_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Replace first-suffix MIR dispatch with fail-closed identity resolution
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/mir_lower.rs")
+          text = path.read_text()
+
+          old_fn = '''    /// Resolve `send`/`ask actor behavior(...)` to a behavior-table index by
+    /// name. Mirrors the stable compiler's `behavior_table_index`: an exact
+    /// "ActorName.behavior" match first, falling back to any behavior with a
+    /// matching suffix if the receiver expression isn't a bare actor-typed
+    /// variable name (a known ambiguity inherited from the stable compiler,
+    /// not introduced here).
+    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> usize {
+        let full_name = format!("{}.{}", actor_name_hint, behavior);
+        if let Some(idx) = self.behavior_names.iter().position(|n| *n == full_name) {
+            return idx;
+        }
+        let suffix = format!(".{}", behavior);
+        self.behavior_names
+            .iter()
+            .position(|n| n.ends_with(&suffix))
+            .unwrap_or(self.behaviors.len())
+    }
+'''
+
+          new_fn = '''    /// Resolve `send`/`ask actor behavior(...)` without ever choosing an
+    /// arbitrary first suffix match. The current HIR still carries only a
+    /// lexical receiver-name hint, so an exact actor-name hit remains valid;
+    /// otherwise the short behavior name must be globally unique. Duplicate
+    /// short names fail closed until typed HIR carries nominal actor identity.
+    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> NuResult<usize> {
+        crate::behavior_identity::resolve_behavior_index_from_hint(
+            actor_name_hint,
+            behavior,
+            &self.behavior_names,
+        )
+        .map_err(|error| compile_err(error.to_string(), Span::default()))
+    }
+'''
+
+          if new_fn in text:
+              print("MIR resolver already migrated")
+          elif old_fn in text:
+              text = text.replace(old_fn, new_fn, 1)
+          else:
+              raise SystemExit("unexpected send_behavior_idx implementation; refusing broad rewrite")
+
+          old_call = "                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior);\n"
+          new_call = "                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior)?;\n"
+          count = text.count(old_call)
+          if count == 2:
+              text = text.replace(old_call, new_call)
+          elif count == 0 and text.count(new_call) == 2:
+              print("send/ask call sites already migrated")
+          else:
+              raise SystemExit(
+                  f"unexpected send_behavior_idx call-site shape: old={count}, new={text.count(new_call)}"
+              )
+
+          path.write_text(text)
+          PY
+
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate identity primitives
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features --lib behavior_identity
+
+      - name: Validate typed actor protocol regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features --test actor_protocol_nominal
+
+      - name: Validate minimal compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --no-default-features
+
+      - name: Verify isolated product diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          git diff --check
+          changed="$(git diff --name-only)"
+          printf 'working-tree paths:\n%s\n' "$changed"
+          if [ -n "$changed" ]; then
+            test "$changed" = 'src/mir_lower.rs'
+          fi
+
+      - name: Guard exact head and land validated MIR change
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/mir_lower.rs; then
+            echo "MIR fail-closed resolver already landed; no product commit needed"
+            exit 0
+          fi
+
+          git fetch origin codex/nominal-actor-dispatch
+          remote_head="$(git rev-parse origin/codex/nominal-actor-dispatch)"
+          if [ "$remote_head" != "$START_HEAD" ]; then
+            echo "branch advanced during validation: $remote_head (expected $START_HEAD)" >&2
+            exit 1
+          fi
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/mir_lower.rs
+          git diff --cached --check
+          test "$(git diff --cached --name-only)" = 'src/mir_lower.rs'
+          git commit -m 'fix(compiler): reject ambiguous actor behavior lowering'
+          git push origin HEAD:codex/nominal-actor-dispatch
