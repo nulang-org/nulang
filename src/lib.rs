@@ -79,6 +79,8 @@ pub mod registry;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
+#[path = "runtime/behavior_ownership.rs"]
+pub(crate) mod runtime_behavior_ownership;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;
