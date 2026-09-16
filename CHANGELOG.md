@@ -45,47 +45,7 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
-### Runtime soundness & actor authority — 2026-09-14 (P0 stabilization gate, issues #181, #186, #165, #143)
-- **Raw `Value` provenance boundaries** (`src/vm.rs`, `src/wasm_runtime.rs`,
-  `src/wasmfx_runtime.rs`, `src/aot/`, `src/ffi/`, `src/runtime/`,
-  `tests/raw_value_provenance.rs`; issues #181, #186): the unchecked raw-bit
-  constructors are now `pub unsafe fn from_raw_unchecked` /
-  `pub unsafe fn from_bits_unchecked` with a boundary-specific `SAFETY:`
-  justification audited at every call site, and `Value::ptr` is an `unsafe fn`
-  whose contract requires a live, in-layout pointer (with a `compile_fail`
-  doctest against safe reintroduction). Externally supplied bits must enter
-  through the fail-closed `try_from_untrusted_bits` decoder, which rejects
-  pointer-tagged values before they can reach heap/GC dereference paths. The
-  VM allocation API exposes `ActorVmCallbacks::alloc_value` so normal heap
-  allocation constructs the pointer `Value` in one safe, provenance-preserving
-  operation. `docs/UNSAFE_AUDIT.md` F1/F1b are closed.
-- **Exact spawn-site authority** (`src/parser.rs`, `src/mir_codegen.rs`,
-  `src/vm.rs`, `src/runtime/callbacks.rs`, `src/authority_runtime.rs`,
-  `src/runtime/spawn.rs`, `src/runtime/persistence.rs`,
-  `tests/spawn_authority_provenance.rs`; issue #165): source-level spawn
-  capability grants now flow source → typed parse → MIR → bytecode metadata
-  keyed by exact Spawn PC → VM callback spawn-PC provenance → monotonic parent
-  delegation → child manifest install. Malformed, missing, ambiguous,
-  over-privileged, or legacy-durable-restart links fail closed before the
-  privileged child becomes observable; authority manifests survive durable
-  snapshots, SQLite persistence, and migration packets; the native/AOT backend
-  conforms to the same exact-site provenance as the VM (the behavior-index
-  compatibility bridge is removed); and externally observable host boundaries
-  (FS, env, secrets, network egress, FFI, process/system, DB, provider) are
-  grant-checked at the runtime callback layer. Remote `spawn @node` with
-  non-empty grants fails compilation as unsupported rather than dropping
-  authority.
-- **Transactional selective receive** (`src/runtime/mailbox.rs`,
-  `src/runtime/callbacks.rs`, `src/aot/codegen.rs`; issue #143): selective
-  receive and ORCA ownership now form one transactional lifecycle —
-  `ReceiveMatch`/`ReceiveWait` stage candidates in per-lane skip buffers
-  without taking ownership, `ReceiveCommit` establishes receiver-side ORCA
-  ownership exactly once, and abort/reset releases the staged state, so
-  guard-rejected messages can no longer accumulate ownership holds. The AOT
-  backend rejects selective-receive transactions at compile time (fail closed)
-  until native parity lands.
-
-### Added since 1.0.0-frozen — 2026-09-14 (web contract dispatch hardening)
+### Added since 1.0.0-frozen — 2026-09-14 (web contract + capacity broker hardening)
 - **Web request decoding fixes** (Experimental, `src/web/request_bindings.rs`,
   `src/web/bindings.rs`, `src/web/contracts.rs`, `src/web/dispatch.rs`).
   `percent_decode` no longer maps UTF-8 bytes to Latin-1 code points, so
@@ -97,6 +57,24 @@ two major versions.*
   incomplete binding plan for a handler that declares parameters now returns
   a 500-series error instead of falling back to the legacy zero-argument
   call; zero-parameter ambient-`Web.param` handlers keep the legacy path.
+- **Capacity broker fetch deadline + concurrency** (Experimental,
+  `crates/nulang-capacity/src/broker.rs`). `CapacityBroker::collect_snapshots`
+  awaited each provider's `fetch_offers` sequentially with no deadline, so a
+  hung endpoint stalled `rank`/`rank_at` forever and N provider latencies
+  added instead of overlapping. Provider fetches now fan out concurrently
+  (`futures::join_all`) and each is raced against
+  `BrokerPolicy::fetch_timeout` (default 10s, runtime-agnostic via
+  `futures-timer`); a timed-out provider is recorded as a retryable
+  `ProviderErrorKind::Unavailable` and isolated, preserving the existing
+  failure-isolation guarantee.
+- **Path capture decoding + finite Float params** (Experimental,
+  `src/web/runtime_bindings.rs`, `src/web/request_bindings.rs`). Request
+  path segments are now percent-decoded at match time (split on raw `/`
+  first, so an encoded `%2F` stays inside its segment; `+` stays literal
+  per RFC 3986) and route literals are decoded at pattern-compile time,
+  aligning captures with query/form/cookie decoding. Float-typed params
+  now reject `NaN`/`inf` instead of passing non-finite values to
+  handlers.
 
 ### Added since 1.0.0-frozen — 2026-09-13 (mobile runtime boundary)
 - **Interpreter-only mobile runtime profile** (`Cargo.toml`, `src/runtime/`, `src/backends/`, `src/vm.rs`): native Cranelift/AOT code generation is now owned by the optional `native-codegen` feature while remaining enabled in default builds. The `mobile-runtime` profile excludes executable-code-generation and dynamic-loader dependencies, gates native backend wiring and benchmarks, and keeps Wasm support independently selectable. `scripts/check_mobile_runtime_profile.sh` provides the release gate for dependency-graph isolation and interpreter-only correctness.
