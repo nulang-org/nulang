@@ -17,5 +17,29 @@ jobs:
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
-      - name: Validate helper runner
-        run: echo ready
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Apply exact source transformations
+        run: python3 scripts/apply_runtime_authority_spawn_pipeline.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Focused tests
+        run: cargo test --test runtime_authority_spawn_pipeline
+
+      - name: Remove temporary patch helpers
+        run: rm .github/workflows/apply-runtime-authority-spawn-pipeline.yml scripts/apply_runtime_authority_spawn_pipeline.py
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(compiler): preserve spawn authority grants"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
