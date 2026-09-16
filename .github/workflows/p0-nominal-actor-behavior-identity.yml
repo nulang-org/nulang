@@ -5,6 +5,10 @@ on:
     branches:
       - fix/nominal-actor-behavior-identity
 
+concurrency:
+  group: p0-nominal-actor-behavior-identity
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
