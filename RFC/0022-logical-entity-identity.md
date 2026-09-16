@@ -1,4 +1,4 @@
-# RFC 0018: Logical Entity Identity and Activation Handles
+# RFC 0022: Logical Entity Identity and Activation Handles
 
 - **Status:** Draft — Phase 1 groundwork implemented
 - **Tier:** Experimental
