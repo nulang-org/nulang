@@ -69,6 +69,39 @@ pub fn resolve_behavior_index(
             });
     }
 
+    resolve_unique_short_behavior(behavior, behavior_names)
+}
+
+/// Transitional resolver for compiler layers that still carry only a lexical
+/// receiver-name hint rather than a proven actor schema identity.
+///
+/// The hint is allowed to win only when it happens to name an exact actor
+/// schema (`Second.hit`). Otherwise we deliberately discard the untrusted hint
+/// and fall back to globally-unique short-name resolution. This preserves old
+/// dynamic behavior where it is unambiguous while eliminating the dangerous
+/// "first suffix match" rule.
+///
+/// Once typed HIR carries a proven actor schema, callers should use
+/// [`resolve_behavior_index`] directly with `Some(actor_schema)` instead.
+pub fn resolve_behavior_index_from_hint(
+    actor_name_hint: &str,
+    behavior: &str,
+    behavior_names: &[String],
+) -> Result<usize, BehaviorIdentityError> {
+    if !actor_name_hint.is_empty() {
+        let exact = format!("{actor_name_hint}.{behavior}");
+        if let Some(idx) = behavior_names.iter().position(|name| name == &exact) {
+            return Ok(idx);
+        }
+    }
+
+    resolve_unique_short_behavior(behavior, behavior_names)
+}
+
+fn resolve_unique_short_behavior(
+    behavior: &str,
+    behavior_names: &[String],
+) -> Result<usize, BehaviorIdentityError> {
     let mut matches = behavior_names
         .iter()
         .enumerate()
@@ -114,11 +147,11 @@ pub fn behavior_index_belongs_to_actor(
         return false;
     }
 
-    behavior_names
-        .get(behavior_idx)
-        .and_then(|name| name.split_once('.'))
-        .map(|(owner, _)| owner == actor_name)
-        .unwrap_or(false)
+    behavior_names.get(behavior_idx).is_some_and(|name| {
+        name.strip_prefix(actor_name)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|behavior| !behavior.is_empty())
+    })
 }
 
 fn short_behavior_name(full_name: &str) -> &str {
@@ -182,6 +215,33 @@ mod tests {
     }
 
     #[test]
+    fn lexical_hint_falls_back_only_when_short_name_is_unique() {
+        let names = names();
+        assert_eq!(
+            resolve_behavior_index_from_hint("target", "only_second", &names),
+            Ok(3)
+        );
+
+        let error = resolve_behavior_index_from_hint("target", "hit", &names).unwrap_err();
+        assert_eq!(
+            error,
+            BehaviorIdentityError::Ambiguous {
+                behavior: "hit".to_string(),
+                candidates: vec!["First.hit".to_string(), "Second.hit".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn lexical_hint_uses_exact_actor_name_when_available() {
+        let names = names();
+        assert_eq!(
+            resolve_behavior_index_from_hint("Second", "hit", &names),
+            Ok(2)
+        );
+    }
+
+    #[test]
     fn unknown_dynamic_behavior_fails_closed() {
         let error = resolve_behavior_index(None, "missing", &names()).unwrap_err();
         assert_eq!(
@@ -221,6 +281,27 @@ mod tests {
             "First",
             2,
             &first_indices,
+            &names
+        ));
+    }
+
+    #[test]
+    fn runtime_ownership_handles_qualified_actor_names() {
+        let names = vec![
+            "billing.Counter.hit".to_string(),
+            "other.Counter.hit".to_string(),
+        ];
+
+        assert!(behavior_index_belongs_to_actor(
+            "billing.Counter",
+            0,
+            &[0],
+            &names
+        ));
+        assert!(!behavior_index_belongs_to_actor(
+            "billing.Counter",
+            1,
+            &[0],
             &names
         ));
     }
