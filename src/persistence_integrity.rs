@@ -33,6 +33,27 @@ pub enum TornTailPolicy {
     AllowUnterminatedFinalRecord,
 }
 
+/// Successfully decoded recovery prefix plus the physical repair boundary.
+///
+/// When `discarded_torn_tail` is true, a writable file backend must truncate
+/// the JSONL file to `valid_bytes` (and durably persist that repair) before any
+/// later append. Merely ignoring the torn suffix in memory is unsafe: a future
+/// append would concatenate onto the partial JSON fragment and turn a
+/// recoverable terminal tear into permanent interior corruption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryPrefix<T> {
+    pub records: Vec<T>,
+    /// Exclusive byte offset of the last recoverable byte in the input.
+    pub valid_bytes: usize,
+    pub discarded_torn_tail: bool,
+}
+
+impl<T> RecoveryPrefix<T> {
+    pub fn requires_truncation(&self, original_len: usize) -> bool {
+        self.valid_bytes < original_len
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryIntegrityError {
     MalformedRecord {
@@ -96,32 +117,45 @@ impl std::error::Error for RecoveryIntegrityError {}
 ///
 /// With [`TornTailPolicy::AllowUnterminatedFinalRecord`], only a malformed last
 /// line in a file that does *not* end in `\n` is treated as a torn append and
-/// discarded. This distinguishes a plausible crash during append from a fully
-/// written but corrupt record.
+/// discarded. The returned [`RecoveryPrefix::valid_bytes`] identifies the exact
+/// truncation boundary a writable backend must repair before appending again.
 pub fn decode_jsonl_recovery_prefix<T, F>(
     data: &str,
     sequence_policy: SequencePolicy,
     torn_tail_policy: TornTailPolicy,
     mut sequence_of: F,
-) -> Result<Vec<T>, RecoveryIntegrityError>
+) -> Result<RecoveryPrefix<T>, RecoveryIntegrityError>
 where
     T: DeserializeOwned,
     F: FnMut(&T) -> u64,
 {
-    let final_line_unterminated = !data.is_empty() && !data.ends_with('\n');
-    let line_count = data.lines().count();
     let mut records = Vec::new();
     let mut previous_sequence = None;
+    let mut valid_bytes = 0;
+    let mut discarded_torn_tail = false;
+    let mut line_number = 0;
+    let mut offset = 0;
 
-    for (index, line) in data.lines().enumerate() {
-        let line_number = index + 1;
+    for segment in data.split_inclusive('\n') {
+        line_number += 1;
+        let segment_start = offset;
+        let segment_end = segment_start + segment.len();
+        offset = segment_end;
+        let newline_terminated = segment.ends_with('\n');
+        let is_final_segment = segment_end == data.len();
+
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+
         let record: T = match serde_json::from_str(line) {
             Ok(record) => record,
             Err(_error)
                 if torn_tail_policy == TornTailPolicy::AllowUnterminatedFinalRecord
-                    && final_line_unterminated
-                    && line_number == line_count =>
+                    && is_final_segment
+                    && !newline_terminated =>
             {
+                valid_bytes = segment_start;
+                discarded_torn_tail = true;
                 break;
             }
             Err(error) => {
@@ -134,6 +168,13 @@ where
 
         let sequence = sequence_of(&record);
         if let Some(previous) = previous_sequence {
+            if sequence_policy == SequencePolicy::Contiguous && previous == u64::MAX {
+                return Err(RecoveryIntegrityError::SequenceOverflow {
+                    line: line_number,
+                    previous,
+                });
+            }
+
             if sequence <= previous {
                 return Err(RecoveryIntegrityError::DuplicateOrRegressingSequence {
                     line: line_number,
@@ -143,12 +184,7 @@ where
             }
 
             if sequence_policy == SequencePolicy::Contiguous {
-                let expected = previous.checked_add(1).ok_or(
-                    RecoveryIntegrityError::SequenceOverflow {
-                        line: line_number,
-                        previous,
-                    },
-                )?;
+                let expected = previous + 1;
                 if sequence != expected {
                     return Err(RecoveryIntegrityError::SequenceGap {
                         line: line_number,
@@ -161,9 +197,14 @@ where
 
         previous_sequence = Some(sequence);
         records.push(record);
+        valid_bytes = segment_end;
     }
 
-    Ok(records)
+    Ok(RecoveryPrefix {
+        records,
+        valid_bytes,
+        discarded_torn_tail,
+    })
 }
 
 #[cfg(test)]
@@ -181,7 +222,7 @@ mod tests {
         data: &str,
         sequence_policy: SequencePolicy,
         tail_policy: TornTailPolicy,
-    ) -> Result<Vec<Record>, RecoveryIntegrityError> {
+    ) -> Result<RecoveryPrefix<Record>, RecoveryIntegrityError> {
         decode_jsonl_recovery_prefix(data, sequence_policy, tail_policy, |record: &Record| {
             record.sequence
         })
@@ -189,15 +230,24 @@ mod tests {
 
     #[test]
     fn valid_stream_replays_every_record() {
-        let records = decode(
-            "{\"sequence\":1,\"value\":\"a\"}\n{\"sequence\":2,\"value\":\"b\"}\n{\"sequence\":3,\"value\":\"c\"}\n",
-            SequencePolicy::Contiguous,
-            TornTailPolicy::Reject,
-        )
-        .unwrap();
+        let data = "{\"sequence\":1,\"value\":\"a\"}\n{\"sequence\":2,\"value\":\"b\"}\n{\"sequence\":3,\"value\":\"c\"}\n";
+        let recovery = decode(data, SequencePolicy::Contiguous, TornTailPolicy::Reject).unwrap();
 
-        assert_eq!(records.len(), 3);
-        assert_eq!(records[2].sequence, 3);
+        assert_eq!(recovery.records.len(), 3);
+        assert_eq!(recovery.records[2].sequence, 3);
+        assert_eq!(recovery.valid_bytes, data.len());
+        assert!(!recovery.discarded_torn_tail);
+        assert!(!recovery.requires_truncation(data.len()));
+    }
+
+    #[test]
+    fn valid_unterminated_final_record_needs_no_repair() {
+        let data = "{\"sequence\":1,\"value\":\"a\"}";
+        let recovery = decode(data, SequencePolicy::Contiguous, TornTailPolicy::Reject).unwrap();
+
+        assert_eq!(recovery.records.len(), 1);
+        assert_eq!(recovery.valid_bytes, data.len());
+        assert!(!recovery.discarded_torn_tail);
     }
 
     #[test]
@@ -216,16 +266,47 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_malformed_final_record_can_be_discarded_as_torn_suffix() {
-        let records = decode(
-            "{\"sequence\":1,\"value\":\"a\"}\n{\"sequence\":2,\"value\":\"b\"}\n{\"sequence\":3",
+    fn unterminated_malformed_final_record_returns_repair_boundary() {
+        let good_prefix =
+            "{\"sequence\":1,\"value\":\"a\"}\n{\"sequence\":2,\"value\":\"b\"}\n";
+        let data = format!("{good_prefix}{{\"sequence\":3");
+        let recovery = decode(
+            &data,
             SequencePolicy::Contiguous,
             TornTailPolicy::AllowUnterminatedFinalRecord,
         )
         .unwrap();
 
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[1].sequence, 2);
+        assert_eq!(recovery.records.len(), 2);
+        assert_eq!(recovery.records[1].sequence, 2);
+        assert_eq!(recovery.valid_bytes, good_prefix.len());
+        assert!(recovery.discarded_torn_tail);
+        assert!(recovery.requires_truncation(data.len()));
+        assert_eq!(&data[..recovery.valid_bytes], good_prefix);
+    }
+
+    #[test]
+    fn repair_boundary_makes_future_append_valid() {
+        let good_prefix = "{\"sequence\":1,\"value\":\"a\"}\n";
+        let damaged = format!("{good_prefix}{{\"sequence\":2");
+        let recovery = decode(
+            &damaged,
+            SequencePolicy::Contiguous,
+            TornTailPolicy::AllowUnterminatedFinalRecord,
+        )
+        .unwrap();
+
+        let mut repaired = damaged[..recovery.valid_bytes].to_string();
+        repaired.push_str("{\"sequence\":2,\"value\":\"b\"}\n");
+        let replay = decode(
+            &repaired,
+            SequencePolicy::Contiguous,
+            TornTailPolicy::Reject,
+        )
+        .unwrap();
+
+        assert_eq!(replay.records.len(), 2);
+        assert_eq!(replay.records[1].sequence, 2);
     }
 
     #[test]
@@ -283,15 +364,15 @@ mod tests {
 
     #[test]
     fn gaps_are_allowed_for_interleaved_sequence_spaces() {
-        let records = decode(
+        let recovery = decode(
             "{\"sequence\":1,\"value\":\"a\"}\n{\"sequence\":3,\"value\":\"c\"}\n",
             SequencePolicy::StrictlyIncreasing,
             TornTailPolicy::Reject,
         )
         .unwrap();
 
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[1].sequence, 3);
+        assert_eq!(recovery.records.len(), 2);
+        assert_eq!(recovery.records[1].sequence, 3);
     }
 
     #[test]
@@ -309,6 +390,27 @@ mod tests {
                 line: 2,
                 expected: 2,
                 found: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn contiguous_sequence_reports_overflow() {
+        let error = decode(
+            &format!(
+                "{{\"sequence\":{},\"value\":\"a\"}}\n{{\"sequence\":0,\"value\":\"b\"}}\n",
+                u64::MAX
+            ),
+            SequencePolicy::Contiguous,
+            TornTailPolicy::Reject,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            RecoveryIntegrityError::SequenceOverflow {
+                line: 2,
+                previous: u64::MAX,
             }
         );
     }
