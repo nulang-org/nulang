@@ -6,7 +6,7 @@
 //! source of truth for unification. Dynamic/opaque actor references retain the
 //! previous permissive behavior until an explicit protocol type is available.
 
-use crate::ast::{self, AstModule, Behavior, Decl, Expr, Literal, Param, StateMachineEvent};
+use crate::ast::{self, AstModule, Behavior, Decl, Expr, Literal, Param, Pattern, StateMachineEvent};
 use crate::types::{NuError, NuResult, PrimitiveType, Span, Type};
 use rustc_hash::FxHashMap;
 
@@ -187,6 +187,57 @@ fn infer_simple_return_type(
     }
 }
 
+fn set_actor_binding(
+    env: &mut Env,
+    name: &str,
+    actor_name: Option<String>,
+    protocols: &FxHashMap<String, ActorProtocol>,
+) {
+    // Every lexical binder shadows the outer name, even when the new value is
+    // not a statically known actor. Keeping a stale actor entry here would make
+    // the protocol pass validate a new binding against an unrelated outer
+    // actor's protocol.
+    env.actors.remove(name);
+    if let Some(actor_name) = actor_name.filter(|name| protocols.contains_key(name)) {
+        env.actors.insert(name.to_string(), actor_name);
+    }
+}
+
+fn shadow_params(env: &mut Env, params: &[Param]) {
+    for param in params {
+        env.actors.remove(&param.name);
+    }
+}
+
+fn shadow_pattern(env: &mut Env, pattern: &Pattern) {
+    match pattern {
+        Pattern::Var(name) => {
+            env.actors.remove(name);
+        }
+        Pattern::Tuple(items) | Pattern::Record(items) => {
+            match pattern {
+                Pattern::Tuple(items) => {
+                    for item in items {
+                        shadow_pattern(env, item);
+                    }
+                }
+                Pattern::Record(fields) => {
+                    for (_, item) in fields {
+                        shadow_pattern(env, item);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        Pattern::Variant(_, Some(inner)) => shadow_pattern(env, inner),
+        Pattern::Alias(name, inner) => {
+            env.actors.remove(name);
+            shadow_pattern(env, inner);
+        }
+        Pattern::Wild | Pattern::Lit(_) | Pattern::Variant(_, None) => {}
+    }
+}
+
 fn annotate_decls(
     decls: &mut [Decl],
     env: &mut Env,
@@ -196,18 +247,12 @@ fn annotate_decls(
         annotate_decl(decl, env, protocols)?;
         match decl {
             Decl::LetBinding { name, value, .. } => {
-                if let Some(actor_name) = actor_name_for_expr(value, env) {
-                    if protocols.contains_key(&actor_name) {
-                        env.actors.insert(name.clone(), actor_name);
-                    }
-                }
+                let actor_name = actor_name_for_expr(value, env);
+                set_actor_binding(env, name, actor_name, protocols);
             }
             Decl::Signal { name, init, .. } => {
-                if let Some(actor_name) = actor_name_for_expr(init, env) {
-                    if protocols.contains_key(&actor_name) {
-                        env.actors.insert(name.clone(), actor_name);
-                    }
-                }
+                let actor_name = actor_name_for_expr(init, env);
+                set_actor_binding(env, name, actor_name, protocols);
             }
             _ => {}
         }
@@ -221,7 +266,31 @@ fn annotate_decl(
     protocols: &FxHashMap<String, ActorProtocol>,
 ) -> NuResult<()> {
     match decl {
-        Decl::Function { body, .. } => annotate_expr(body, env, protocols),
+        Decl::Function {
+            name,
+            params,
+            default_values,
+            using_params,
+            requires,
+            ensures,
+            body,
+            ..
+        } => {
+            for default in default_values.iter_mut().flatten() {
+                annotate_expr(default, env, protocols)?;
+            }
+            let mut fn_env = env.clone();
+            fn_env.actors.remove(name);
+            shadow_params(&mut fn_env, params);
+            shadow_params(&mut fn_env, using_params);
+            for requirement in requires {
+                annotate_expr(requirement, &fn_env, protocols)?;
+            }
+            for guarantee in ensures {
+                annotate_expr(guarantee, &fn_env, protocols)?;
+            }
+            annotate_expr(body, &fn_env, protocols)
+        }
         Decl::Actor {
             name,
             state_fields,
@@ -238,11 +307,15 @@ fn annotate_decl(
             for (_, value) in init {
                 annotate_expr(value, &actor_env, protocols)?;
             }
-            if let Some((_, _, body)) = initializer {
-                annotate_expr(body, &actor_env, protocols)?;
+            if let Some((_, params, body)) = initializer {
+                let mut initializer_env = actor_env.clone();
+                shadow_params(&mut initializer_env, params);
+                annotate_expr(body, &initializer_env, protocols)?;
             }
             for behavior in behaviors {
-                annotate_expr(&mut behavior.body, &actor_env, protocols)?;
+                let mut behavior_env = actor_env.clone();
+                shadow_params(&mut behavior_env, &behavior.params);
+                annotate_expr(&mut behavior.body, &behavior_env, protocols)?;
             }
             Ok(())
         }
@@ -268,24 +341,31 @@ fn annotate_decl(
             let mut module_env = env.clone();
             annotate_decls(decls, &mut module_env, protocols)
         }
-        Decl::Workflow { items, .. } => {
+        Decl::Workflow { input, items, compensate, .. } => {
+            let mut workflow_env = env.clone();
+            if let Some((name, _)) = input {
+                workflow_env.actors.remove(name);
+            }
             for item in items {
                 match item {
                     ast::WorkflowItem::Step(step) => {
-                        annotate_expr(&mut step.body, env, protocols)?;
+                        annotate_expr(&mut step.body, &workflow_env, protocols)?;
                         if let Some(compensate) = &mut step.compensate {
-                            annotate_expr(compensate, env, protocols)?;
+                            annotate_expr(compensate, &workflow_env, protocols)?;
                         }
                     }
                     ast::WorkflowItem::Parallel(steps) => {
                         for step in steps {
-                            annotate_expr(&mut step.body, env, protocols)?;
+                            annotate_expr(&mut step.body, &workflow_env, protocols)?;
                             if let Some(compensate) = &mut step.compensate {
-                                annotate_expr(compensate, env, protocols)?;
+                                annotate_expr(compensate, &workflow_env, protocols)?;
                             }
                         }
                     }
                 }
+            }
+            if let Some(compensate) = compensate {
+                annotate_expr(compensate, &workflow_env, protocols)?;
             }
             Ok(())
         }
@@ -390,7 +470,11 @@ fn annotate_expr(
             }
             Ok(())
         }
-        Expr::Lambda { body, .. } => annotate_expr(body, env, protocols),
+        Expr::Lambda { params, body, .. } => {
+            let mut lambda_env = env.clone();
+            shadow_params(&mut lambda_env, params);
+            annotate_expr(body, &lambda_env, protocols)
+        }
         Expr::App { func, args, .. } => {
             annotate_expr(func, env, protocols)?;
             for arg in args {
@@ -406,16 +490,22 @@ fn annotate_expr(
         } => {
             annotate_expr(value, env, protocols)?;
             let mut body_env = env.clone();
-            if let Some(actor_name) = actor_name_for_expr(value, env) {
-                if protocols.contains_key(&actor_name) {
-                    body_env.actors.insert(name.clone(), actor_name);
-                }
-            }
+            let actor_name = actor_name_for_expr(value, env);
+            set_actor_binding(&mut body_env, name, actor_name, protocols);
             annotate_expr(body, &body_env, protocols)
         }
-        Expr::LetRec { value, body, .. } => {
-            annotate_expr(value, env, protocols)?;
-            annotate_expr(body, env, protocols)
+        Expr::LetRec {
+            name,
+            params,
+            value,
+            body,
+            ..
+        } => {
+            let mut rec_env = env.clone();
+            rec_env.actors.remove(name);
+            shadow_params(&mut rec_env, params);
+            annotate_expr(value, &rec_env, protocols)?;
+            annotate_expr(body, &rec_env, protocols)
         }
         Expr::If {
             cond,
@@ -434,11 +524,13 @@ fn annotate_expr(
             scrutinee, arms, ..
         } => {
             annotate_expr(scrutinee, env, protocols)?;
-            for (_, guard, body) in arms {
+            for (pattern, guard, body) in arms {
+                let mut arm_env = env.clone();
+                shadow_pattern(&mut arm_env, pattern);
                 if let Some(guard) = guard {
-                    annotate_expr(guard, env, protocols)?;
+                    annotate_expr(guard, &arm_env, protocols)?;
                 }
-                annotate_expr(body, env, protocols)?;
+                annotate_expr(body, &arm_env, protocols)?;
             }
             Ok(())
         }
@@ -475,9 +567,19 @@ fn annotate_expr(
         | Expr::TypeAnnotate { expr, .. }
         | Expr::Consume { expr, .. }
         | Expr::Recover { body: expr, .. }
-        | Expr::Defer { expr, .. }
-        | Expr::Hide { body: expr, .. }
-        | Expr::Seal { body: expr, .. } => annotate_expr(expr, env, protocols),
+        | Expr::Defer { expr, .. } => annotate_expr(expr, env, protocols),
+        Expr::Hide { names, body, .. } => {
+            let mut hidden_env = env.clone();
+            for name in names {
+                hidden_env.actors.remove(name);
+            }
+            annotate_expr(body, &hidden_env, protocols)
+        }
+        Expr::Seal { names, body, .. } => {
+            let mut sealed_env = env.clone();
+            sealed_env.actors.retain(|name, _| names.contains(name));
+            annotate_expr(body, &sealed_env, protocols)
+        }
         Expr::Assign { target, value, .. } => {
             annotate_expr(target, env, protocols)?;
             annotate_expr(value, env, protocols)
@@ -542,11 +644,15 @@ fn annotate_expr(
             Ok(())
         }
         Expr::Receive { arms, after, .. } => {
-            for (_, _, guard, body) in arms {
-                if let Some(guard) = guard {
-                    annotate_expr(guard, env, protocols)?;
+            for (_, patterns, guard, body) in arms {
+                let mut arm_env = env.clone();
+                for pattern in patterns {
+                    shadow_pattern(&mut arm_env, pattern);
                 }
-                annotate_expr(body, env, protocols)?;
+                if let Some(guard) = guard {
+                    annotate_expr(guard, &arm_env, protocols)?;
+                }
+                annotate_expr(body, &arm_env, protocols)?;
             }
             if let Some((timeout, body)) = after {
                 annotate_expr(timeout, env, protocols)?;
@@ -565,7 +671,11 @@ fn annotate_expr(
         Expr::Handle { body, handlers, .. } => {
             annotate_expr(body, env, protocols)?;
             for handler in handlers {
-                annotate_expr(&mut handler.body, env, protocols)?;
+                let mut handler_env = env.clone();
+                for param in &handler.params {
+                    handler_env.actors.remove(param);
+                }
+                annotate_expr(&mut handler.body, &handler_env, protocols)?;
             }
             Ok(())
         }
@@ -577,9 +687,16 @@ fn annotate_expr(
             annotate_expr(left, env, protocols)?;
             annotate_expr(right, env, protocols)
         }
-        Expr::For { iterable, body, .. } => {
+        Expr::For {
+            var,
+            iterable,
+            body,
+            ..
+        } => {
             annotate_expr(iterable, env, protocols)?;
-            annotate_expr(body, env, protocols)
+            let mut body_env = env.clone();
+            body_env.actors.remove(var);
+            annotate_expr(body, &body_env, protocols)
         }
         Expr::While { cond, body, .. } => {
             annotate_expr(cond, env, protocols)?;
@@ -682,5 +799,29 @@ mod tests {
     fn opaque_dynamic_actor_keeps_compatibility_fallback() {
         let result = check("fn relay(a) { send a whatever(1) }");
         assert!(result.is_ok(), "dynamic actors remain permissive: {:?}", result.err());
+    }
+
+    #[test]
+    fn let_shadow_clears_outer_actor_identity() {
+        let result = check(
+            r#"
+            actor Counter { behavior inc() { nil } }
+            let c = spawn Counter {} in
+                let c = other in send c whatever(1)
+            "#,
+        );
+        assert!(result.is_ok(), "shadowed dynamic actor should stay permissive: {:?}", result.err());
+    }
+
+    #[test]
+    fn function_param_shadows_module_actor_binding() {
+        let result = check(
+            r#"
+            actor Counter { behavior inc() { nil } }
+            let target = spawn Counter {}
+            fn relay(target) { send target whatever(1) }
+            "#,
+        );
+        assert!(result.is_ok(), "function parameter must shadow outer actor identity: {:?}", result.err());
     }
 }
