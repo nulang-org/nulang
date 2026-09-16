@@ -1,0 +1,19 @@
+#!/usr/bin/env dagger
+
+# Portable equivalent of the no-default-features CI job.
+# Deliberately does not install python3-dev or other optional-feature system deps.
+# Run locally with: dagger .dagger/ci/minimal-build.dag
+
+src=$(host | directory . --exclude .git --exclude target --exclude test-pkg)
+
+container |
+  from rust:bookworm |
+  with-mounted-cache /usr/local/cargo/registry nulang-cargo-registry |
+  with-mounted-cache /usr/local/cargo/git nulang-cargo-git |
+  with-directory /src $src |
+  with-workdir /src |
+  with-mounted-cache /tmp/cargo-target nulang-cargo-target-minimal |
+  with-exec -- cargo build --all-targets --no-default-features |
+  with-exec -- cargo test --no-default-features |
+  with-exec -- cargo check --tests --no-default-features |
+  sync
