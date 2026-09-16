@@ -204,6 +204,19 @@ pub enum EffectBoundary {
     External,
 }
 
+impl EffectBoundary {
+    /// Canonical low-cardinality label for tracing, metrics, and replay
+    /// inspection. This is observability metadata, not a serialized language
+    /// or wire-format tag.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeOwned => "runtime_owned",
+            Self::BackendOwned => "backend_owned",
+            Self::External => "external",
+        }
+    }
+}
+
 /// Delivery/replay semantics that may be advertised by Nulang components.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeliverySemantics {
@@ -215,6 +228,19 @@ pub enum DeliverySemantics {
     /// The guarantee is delegated to a configured backend and must not be
     /// strengthened by the language/runtime documentation.
     BackendDefined,
+}
+
+impl DeliverySemantics {
+    /// Canonical low-cardinality label for tracing, metrics, and replay
+    /// inspection. Callers must select the semantics they can actually
+    /// enforce rather than inferring stronger guarantees from an effect name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AtLeastOnce => "at_least_once",
+            Self::EffectivelyOnceWithDeduplication => "effectively_once_with_deduplication",
+            Self::BackendDefined => "backend_defined",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,5 +317,22 @@ mod tests {
             .time_operation(),
             TimeOperation::ScheduledDelivery
         );
+    }
+
+    #[test]
+    fn effect_boundary_labels_are_explicit() {
+        assert_eq!(EffectBoundary::RuntimeOwned.as_str(), "runtime_owned");
+        assert_eq!(EffectBoundary::BackendOwned.as_str(), "backend_owned");
+        assert_eq!(EffectBoundary::External.as_str(), "external");
+    }
+
+    #[test]
+    fn delivery_semantics_labels_are_explicit() {
+        assert_eq!(DeliverySemantics::AtLeastOnce.as_str(), "at_least_once");
+        assert_eq!(
+            DeliverySemantics::EffectivelyOnceWithDeduplication.as_str(),
+            "effectively_once_with_deduplication"
+        );
+        assert_eq!(DeliverySemantics::BackendDefined.as_str(), "backend_defined");
     }
 }
