@@ -24,13 +24,16 @@ fn bench_spawn_idle_actors(c: &mut Criterion) {
     for count in [1_000usize, 10_000] {
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
-            b.iter(|| {
-                let mut rt = Runtime::new();
-                for _ in 0..count {
-                    black_box(rt.spawn_actor(Box::new(|| vec![])));
-                }
-                black_box(rt.actors.len());
-            });
+            b.iter_batched(
+                Runtime::new,
+                |mut rt| {
+                    for _ in 0..count {
+                        black_box(rt.spawn_actor(Box::new(|| vec![])));
+                    }
+                    black_box(rt.actors.len());
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
 
@@ -48,6 +51,9 @@ fn bench_single_mailbox_flood(c: &mut Criterion) {
                 || {
                     let mut rt = Runtime::new();
                     let actor = rt.spawn_actor(Box::new(|| vec![]));
+                    // Settle the actor outside the timed section so this
+                    // isolates mailbox enqueue + dispatch rather than spawn.
+                    rt.run_scheduler();
                     (rt, actor)
                 },
                 |(mut rt, actor)| {
