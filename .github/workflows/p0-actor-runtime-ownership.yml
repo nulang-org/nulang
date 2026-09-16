@@ -25,7 +25,9 @@ jobs:
         run: echo "START_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Apply runtime ownership patch
-        run: python3 scripts/apply_p0_actor_runtime_ownership.py
+        run: |
+          python3 scripts/apply_p0_actor_runtime_ownership.py
+          sed -i 's/behavior hit(): Int/behavior hit()/g' src/runtime/tests.rs
 
       - name: Format and static checks
         run: |
