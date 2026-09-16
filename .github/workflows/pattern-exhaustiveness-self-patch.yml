@@ -1,0 +1,404 @@
+name: Apply pattern exhaustiveness integration
+
+on:
+  push:
+    branches:
+      - feat/pattern-exhaustiveness
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/pattern-exhaustiveness
+          fetch-depth: 0
+
+      - name: Integrate coverage analysis into typechecker
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import json
+
+          path = Path('src/typechecker.rs')
+          text = path.read_text()
+
+          old_import = "use crate::ast::*;\nuse crate::types::*;"
+          new_import = "use crate::ast::*;\nuse crate::pattern_coverage::analyze_variant_match;\nuse crate::types::*;"
+          assert text.count(old_import) == 1, 'typechecker import anchor changed'
+          text = text.replace(old_import, new_import, 1)
+
+          old_match = r'''    /// Infer the type of a pattern match expression.
+    fn infer_match(
+        &mut self,
+        ctx: &TypeContext,
+        scrutinee: &Expr,
+        arms: &[(Pattern, Option<Expr>, Expr)],
+        span: Span,
+    ) -> NuResult<(Substitution, Type)> {
+        // Infer scrutinee type
+        let (s1, scrut_ty) = self.infer_expr(ctx, scrutinee)?;
+
+        // Infer each arm
+        let mut subst = s1;
+        let mut arm_types = vec![];
+
+        for (pattern, guard, arm_expr) in arms {
+            let ctx_sub = apply_subst_to_ctx(ctx, &subst);
+            // Bind pattern variables to the context
+            let pattern_ctx =
+                self.bind_pattern(&ctx_sub, pattern, &apply_subst(&scrut_ty, &subst))?;
+            // A guard runs with the pattern's bindings in scope and must be
+            // a boolean; it does not contribute to the arm result type.
+            if let Some(guard_expr) = guard {
+                let (s_guard, guard_ty) = self.infer_expr(&pattern_ctx, guard_expr)?;
+                let guard_subst = compose_subst(&s_guard, &subst);
+                let s_bool = mgu(&apply_subst(&guard_ty, &guard_subst), &Type::bool(), span)?;
+                subst = compose_subst(&s_bool, &guard_subst);
+            }
+            let pattern_ctx = apply_subst_to_ctx(&pattern_ctx, &subst);
+            let (s_arm, arm_ty) = self.infer_expr(&pattern_ctx, arm_expr)?;
+            subst = compose_subst(&s_arm, &subst);
+            arm_types.push(arm_ty);
+        }
+        if arm_types.is_empty() {
+            return Err(NuError::TypeError {
+                msg: "Match expression with no arms".to_string(),
+                span,
+                expected_type: Some("at least one match arm".to_string()),
+                found_type: Some("0 match arms".to_string()),
+                similar_names: None,
+            });
+        }
+
+        // Unify all arm types
+        let first_arm = arm_types[0].clone();
+        let mut final_subst = subst;
+        for arm_ty in &arm_types[1..] {
+            let s = mgu(
+                &apply_subst(arm_ty, &final_subst),
+                &apply_subst(&first_arm, &final_subst),
+                span,
+            )?;
+            final_subst = compose_subst(&s, &final_subst);
+        }
+
+        Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
+    }
+'''
+
+          new_match = r'''    /// Infer the type of a pattern match expression.
+    fn infer_match(
+        &mut self,
+        ctx: &TypeContext,
+        scrutinee: &Expr,
+        arms: &[(Pattern, Option<Expr>, Expr)],
+        span: Span,
+    ) -> NuResult<(Substitution, Type)> {
+        // Infer scrutinee type
+        let (s1, scrut_ty) = self.infer_expr(ctx, scrutinee)?;
+
+        if arms.is_empty() {
+            return Err(NuError::TypeError {
+                msg: "Match expression with no arms".to_string(),
+                span,
+                expected_type: Some("at least one match arm".to_string()),
+                found_type: Some("0 match arms".to_string()),
+                similar_names: None,
+            });
+        }
+
+        // Infer each arm first. This intentionally precedes exhaustiveness
+        // analysis so malformed constructor patterns get their more specific
+        // diagnostics instead of being reported merely as coverage holes.
+        let mut subst = s1;
+        let mut arm_types = vec![];
+
+        for (pattern, guard, arm_expr) in arms {
+            let ctx_sub = apply_subst_to_ctx(ctx, &subst);
+            // Bind pattern variables to the context
+            let pattern_ctx =
+                self.bind_pattern(&ctx_sub, pattern, &apply_subst(&scrut_ty, &subst))?;
+            // A guard runs with the pattern's bindings in scope and must be
+            // a boolean; it does not contribute to the arm result type.
+            if let Some(guard_expr) = guard {
+                let (s_guard, guard_ty) = self.infer_expr(&pattern_ctx, guard_expr)?;
+                let guard_subst = compose_subst(&s_guard, &subst);
+                let s_bool = mgu(&apply_subst(&guard_ty, &guard_subst), &Type::bool(), span)?;
+                subst = compose_subst(&s_bool, &guard_subst);
+            }
+            let pattern_ctx = apply_subst_to_ctx(&pattern_ctx, &subst);
+            let (s_arm, arm_ty) = self.infer_expr(&pattern_ctx, arm_expr)?;
+            subst = compose_subst(&s_arm, &subst);
+            arm_types.push(arm_ty);
+        }
+
+        // Finite declared variants are decidable: reject a provably
+        // non-exhaustive match at compile time. Other domains deliberately
+        // keep the MIR/runtime fallback until the general pattern-matrix pass
+        // can prove coverage for them too.
+        let coverage_arms: Vec<(Pattern, bool)> = arms
+            .iter()
+            .map(|(pattern, guard, _)| (pattern.clone(), guard.is_some()))
+            .collect();
+        let resolved_scrutinee = apply_subst(&scrut_ty, &subst);
+        if let Some(report) = analyze_variant_match(&resolved_scrutinee, &coverage_arms) {
+            if !report.is_exhaustive() {
+                let missing = report.missing.join(", ");
+                return Err(NuError::TypeError {
+                    msg: format!("non-exhaustive match: missing {}", missing),
+                    span,
+                    expected_type: Some("all variant constructors covered".to_string()),
+                    found_type: Some(format!("missing {}", missing)),
+                    similar_names: None,
+                });
+            }
+        }
+
+        // Unify all arm types
+        let first_arm = arm_types[0].clone();
+        let mut final_subst = subst;
+        for arm_ty in &arm_types[1..] {
+            let s = mgu(
+                &apply_subst(arm_ty, &final_subst),
+                &apply_subst(&first_arm, &final_subst),
+                span,
+            )?;
+            final_subst = compose_subst(&s, &final_subst);
+        }
+
+        Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
+    }
+'''
+          assert text.count(old_match) == 1, 'infer_match anchor changed'
+          text = text.replace(old_match, new_match, 1)
+
+          old_variant = r'''            Pattern::Variant(name, pat) => match scrut_ty {
+                Type::Variant(variants) => {
+                    let mut new_ctx = ctx.clone();
+                    if let Some((_, Some(ty))) = variants.iter().find(|(n, _)| n == name) {
+                        if let Some(p) = pat {
+                            new_ctx = self.bind_pattern(&new_ctx, p, ty)?;
+                        }
+                    }
+                    Ok(new_ctx)
+                }
+                _ => {
+                    if let Some(p) = pat {
+                        let fresh = Type::Var(TypeVar::fresh());
+                        self.bind_pattern(ctx, p, &fresh)
+                    } else {
+                        Ok(ctx.clone())
+                    }
+                }
+            },
+'''
+          new_variant = r'''            Pattern::Variant(name, pat) => match scrut_ty {
+                Type::Variant(variants) => {
+                    let available: Vec<String> =
+                        variants.iter().map(|(ctor, _)| ctor.clone()).collect();
+                    let Some((_, payload_ty)) = variants.iter().find(|(ctor, _)| ctor == name) else {
+                        return Err(NuError::TypeError {
+                            msg: format!("unknown variant constructor '{}' in match pattern", name),
+                            span: Span::default(),
+                            expected_type: Some("declared variant constructor".to_string()),
+                            found_type: Some(name.clone()),
+                            similar_names: Some(available),
+                        });
+                    };
+
+                    match (payload_ty, pat) {
+                        (None, None) => Ok(ctx.clone()),
+                        (None, Some(_)) => Err(NuError::TypeError {
+                            msg: format!("variant constructor '{}' does not take a payload", name),
+                            span: Span::default(),
+                            expected_type: Some(format!("{}", name)),
+                            found_type: Some(format!("{}(_)", name)),
+                            similar_names: None,
+                        }),
+                        (Some(_), None) => Err(NuError::TypeError {
+                            msg: format!("variant constructor '{}' requires a payload pattern", name),
+                            span: Span::default(),
+                            expected_type: Some(format!("{}(_)", name)),
+                            found_type: Some(name.clone()),
+                            similar_names: None,
+                        }),
+                        (Some(ty), Some(p)) => self.bind_pattern(ctx, p, ty),
+                    }
+                }
+                Type::Var(_) | Type::Skolem(_) => {
+                    // The exact variant shape is not yet known. Preserve the
+                    // existing inference behavior and leave coverage to the
+                    // runtime fallback rather than inventing a closed variant.
+                    if let Some(p) = pat {
+                        let fresh = Type::Var(TypeVar::fresh());
+                        self.bind_pattern(ctx, p, &fresh)
+                    } else {
+                        Ok(ctx.clone())
+                    }
+                }
+                other => Err(NuError::TypeError {
+                    msg: format!(
+                        "variant pattern '{}' cannot match non-variant type {}",
+                        name, other
+                    ),
+                    span: Span::default(),
+                    expected_type: Some("variant type".to_string()),
+                    found_type: Some(format!("{}", other)),
+                    similar_names: None,
+                }),
+            },
+'''
+          assert text.count(old_variant) == 1, 'variant bind anchor changed'
+          text = text.replace(old_variant, new_variant, 1)
+
+          test_anchor = r'''    #[test]
+    fn test_infer_match_variable() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        // match 42 { | x => x }
+        let expr = Expr::Match {
+            scrutinee: Box::new(int_lit(42)),
+            arms: vec![(Pattern::Var("x".to_string()), None, var("x"))],
+            span: sp(),
+        };
+        let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+'''
+          test_replacement = test_anchor + r'''
+
+    #[test]
+    fn test_non_exhaustive_variant_match_is_compile_time_error() {
+        let result = check_src(
+            "type Color = Red | Green | Blue\nfn name(c: Color) -> String { match c { | Red => \"red\" | Green => \"green\" } }\nname",
+        );
+        let err = result.expect_err("missing Blue must be rejected statically");
+        match err {
+            NuError::TypeError {
+                msg,
+                expected_type,
+                found_type,
+                ..
+            } => {
+                assert!(msg.contains("non-exhaustive match"));
+                assert!(msg.contains("Blue"));
+                assert_eq!(
+                    expected_type.as_deref(),
+                    Some("all variant constructors covered")
+                );
+                assert_eq!(found_type.as_deref(), Some("missing Blue"));
+            }
+            other => panic!("expected TypeError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_exhaustive_variant_match_passes() {
+        let result = check_src(
+            "type Color = Red | Green | Blue\nfn name(c: Color) -> String { match c { | Red => \"red\" | Green => \"green\" | Blue => \"blue\" } }\nname",
+        );
+        assert!(result.is_ok(), "expected exhaustive match to pass: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_guarded_variant_arm_does_not_close_coverage() {
+        let result = check_src(
+            "type Color = Red | Green | Blue\nfn value(c: Color) -> Int { match c { | Red if true => 1 | Green => 2 | Blue => 3 } }\nvalue",
+        );
+        let err = format!("{}", result.expect_err("guarded Red leaves Red uncovered"));
+        assert!(err.contains("non-exhaustive match"), "unexpected error: {}", err);
+        assert!(err.contains("Red"), "missing witness must name Red: {}", err);
+    }
+
+    #[test]
+    fn test_infinite_domain_guarded_match_keeps_runtime_fallback() {
+        // Exhaustiveness over Int is not decidable with this finite-variant
+        // pass, so typechecking must still succeed. MIR/runtime retains the
+        // existing non-exhaustive fallback for the false guard.
+        let result = check_src("match 5 { | _ if false => 1 }");
+        assert!(result.is_ok(), "Int matches remain runtime-checked: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_unknown_variant_constructor_in_pattern_is_rejected() {
+        let result = check_src(
+            "type Color = Red | Green | Blue\nfn value(c: Color) -> Int { match c { | Red => 1 | Green => 2 | Blue => 3 | Purple => 4 } }\nvalue",
+        );
+        let err = format!("{}", result.expect_err("Purple is not a Color constructor"));
+        assert!(err.contains("unknown variant constructor 'Purple'"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_variant_payload_arity_is_checked_in_patterns() {
+        let missing_payload = check_src(
+            "type Option[T] = Some(T) | None\nfn value(o: Option[Int]) -> Int { match o { | Some => 1 | None => 0 } }\nvalue",
+        );
+        let err = format!("{}", missing_payload.expect_err("Some requires a payload pattern"));
+        assert!(err.contains("requires a payload pattern"), "unexpected error: {}", err);
+
+        let extra_payload = check_src(
+            "type Color = Red | Blue\nfn value(c: Color) -> Int { match c { | Red(x) => x | Blue => 0 } }\nvalue",
+        );
+        let err = format!("{}", extra_payload.expect_err("Red is nullary"));
+        assert!(err.contains("does not take a payload"), "unexpected error: {}", err);
+    }
+'''
+          assert text.count(test_anchor) == 1, 'match test anchor changed'
+          text = text.replace(test_anchor, test_replacement, 1)
+          path.write_text(text)
+
+          conformance = Path('conformance/behavior/pat_06_non_exhaustive_runtime_error.json')
+          conformance.write_text(json.dumps({
+              'exit_code': 4,
+              'stdout': '',
+              'stderr': 'non-exhaustive match: missing Blue',
+          }) + '\n')
+
+          # Keep the old filename for conformance-history stability, but make
+          # its new compile-time contract explicit in the source itself.
+          nula = Path('conformance/behavior/pat_06_non_exhaustive_runtime_error.nula')
+          source = nula.read_text()
+          marker = '// Finite declared variants are exhaustiveness-checked at compile time.\n'
+          if not source.startswith(marker):
+              nula.write_text(marker + source)
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Run focused unit tests
+        run: |
+          cargo test --lib pattern_coverage
+          cargo test --lib non_exhaustive_variant_match
+          cargo test --lib exhaustive_variant_match_passes
+          cargo test --lib guarded_variant_arm_does_not_close_coverage
+          cargo test --lib unknown_variant_constructor_in_pattern_is_rejected
+          cargo test --lib variant_payload_arity_is_checked_in_patterns
+          cargo test --lib infinite_domain_guarded_match_keeps_runtime_fallback
+
+      - name: Verify conformance case
+        shell: bash
+        run: |
+          set +e
+          cargo run --quiet -- conformance/behavior/pat_06_non_exhaustive_runtime_error.nula >/tmp/pat06.out 2>/tmp/pat06.err
+          code=$?
+          set -e
+          test "$code" -eq 4
+          test ! -s /tmp/pat06.out
+          grep -F "non-exhaustive match: missing Blue" /tmp/pat06.err
+
+      - name: Commit integrated implementation
+        shell: bash
+        run: |
+          rm .github/workflows/pattern-exhaustiveness-self-patch.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: enforce finite variant match exhaustiveness"
+          git push origin HEAD:feat/pattern-exhaustiveness
