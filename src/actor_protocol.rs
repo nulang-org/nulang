@@ -159,7 +159,9 @@ fn infer_simple_return_type(
                 None
             }
         }
-        Expr::Binary { op, left, right, .. } => {
+        Expr::Binary {
+            op, left, right, ..
+        } => {
             use ast::BinOp::*;
             match op {
                 Eq | Ne | Lt | Le | Gt | Ge | And | Or => Some(Type::bool()),
@@ -336,7 +338,12 @@ fn annotate_decl(
             let mut module_env = env.clone();
             annotate_decls(decls, &mut module_env, protocols)
         }
-        Decl::Workflow { input, items, compensate, .. } => {
+        Decl::Workflow {
+            input,
+            items,
+            compensate,
+            ..
+        } => {
             let mut workflow_env = env.clone();
             if let Some((name, _)) = input {
                 workflow_env.actors.remove(name);
@@ -477,12 +484,7 @@ fn annotate_expr(
             }
             Ok(())
         }
-        Expr::Let {
-            name,
-            value,
-            body,
-            ..
-        } => {
+        Expr::Let { name, value, body, .. } => {
             annotate_expr(value, env, protocols)?;
             let mut body_env = env.clone();
             let actor_name = actor_name_for_expr(value, env);
@@ -787,13 +789,21 @@ mod tests {
             }
             "#,
         );
-        assert!(result.is_ok(), "expected typed ask to return Int: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "expected typed ask to return Int: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn opaque_dynamic_actor_keeps_compatibility_fallback() {
         let result = check("fn relay(a) { send a whatever(1) }");
-        assert!(result.is_ok(), "dynamic actors remain permissive: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "dynamic actors remain permissive: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -807,7 +817,11 @@ mod tests {
             }
             "#,
         );
-        assert!(result.is_ok(), "shadowed dynamic actor should stay permissive: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "shadowed dynamic actor should stay permissive: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -819,6 +833,10 @@ mod tests {
             fn relay(target) { send target whatever(1) }
             "#,
         );
-        assert!(result.is_ok(), "function parameter must shadow outer actor identity: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "function parameter must shadow outer actor identity: {:?}",
+            result.err()
+        );
     }
 }
