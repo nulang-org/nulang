@@ -19,6 +19,7 @@ use crate::ast::Pattern;
 use crate::hir::{self, Body, Decl, Operand, Place, RValue, Stmt, Terminator};
 use crate::types::Span;
 use rustc_hash::FxHashMap;
+use std::collections::HashSet;
 
 #[derive(Default)]
 struct Bridge {
@@ -35,18 +36,11 @@ impl Bridge {
         for decl in decls {
             match decl {
                 Decl::Function(function) => {
-                    let mut env = FxHashMap::default();
-                    for (name, _) in function.params.iter().chain(function.dict_params.iter()) {
-                        env.remove(name);
-                    }
-                    self.transform_body(&mut function.body, env, None);
+                    self.transform_body(&mut function.body, FxHashMap::default(), None);
                 }
                 Decl::Actor(actor) => {
                     for behavior in &mut actor.behaviors {
                         let mut env = FxHashMap::default();
-                        for (name, _) in &behavior.params {
-                            env.remove(name);
-                        }
                         env.insert("self".to_string(), actor.name.clone());
                         self.transform_body(
                             &mut behavior.body,
@@ -85,7 +79,15 @@ impl Bridge {
                     span,
                     ..
                 } => {
+                    // A nested block/branch/loop may assign an actor binding
+                    // from the enclosing scope. Such a write makes the old
+                    // nominal identity no longer provable after the expression.
+                    let invalidated = invalidated_actor_bindings(value, &env);
                     self.transform_rvalue(value, &env, current_actor, *span);
+                    for binding in invalidated {
+                        env.remove(&binding);
+                    }
+
                     let identity = actor_identity_of_rvalue(value, &env, current_actor);
                     env.remove(name);
                     if let Some(identity) = identity {
@@ -97,7 +99,12 @@ impl Bridge {
                     value,
                     span,
                 } => {
+                    let invalidated = invalidated_actor_bindings(value, &env);
                     self.transform_rvalue(value, &env, current_actor, *span);
+                    for binding in invalidated {
+                        env.remove(&binding);
+                    }
+
                     if let Place::Var(name, _) = target {
                         let identity = actor_identity_of_rvalue(value, &env, current_actor);
                         env.remove(name);
@@ -291,6 +298,119 @@ fn actor_identity_of_rvalue(
     }
 }
 
+/// Return tracked outer actor bindings that may be rebound while evaluating
+/// `value`. A conditional/loop/block write invalidates the old identity after
+/// that expression unless a later direct assignment establishes a new one.
+///
+/// This analysis is deliberately lexical: an inner `let target = ...` or
+/// pattern binding named `target` shadows the outer binding, so writes to that
+/// inner name do not invalidate the outer actor identity.
+fn invalidated_actor_bindings(
+    value: &RValue,
+    env: &FxHashMap<String, String>,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    collect_rvalue_assignments(value, env, &HashSet::new(), &mut out);
+    out
+}
+
+fn collect_body_assignments(
+    body: &Body,
+    env: &FxHashMap<String, String>,
+    inherited_shadowed: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    let mut shadowed = inherited_shadowed.clone();
+    for stmt in &body.stmts {
+        match stmt {
+            Stmt::Let { name, value, .. } => {
+                collect_rvalue_assignments(value, env, &shadowed, out);
+                shadowed.insert(name.clone());
+            }
+            Stmt::Assign { target, value, .. } => {
+                collect_rvalue_assignments(value, env, &shadowed, out);
+                if let Place::Var(name, _) = target {
+                    if env.contains_key(name) && !shadowed.contains(name) {
+                        out.insert(name.clone());
+                    }
+                }
+            }
+            Stmt::StateSet { .. } | Stmt::Emit { .. } => {}
+        }
+    }
+}
+
+fn collect_rvalue_assignments(
+    value: &RValue,
+    env: &FxHashMap<String, String>,
+    shadowed: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    match value {
+        // Closures capture locals by value in MIR. Merely constructing one does
+        // not rebind the surrounding function's local, so do not invalidate
+        // outer identities for assignments in a closure body.
+        RValue::Closure { .. } | RValue::RecClosure { .. } => {}
+        RValue::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_body_assignments(then_body, env, shadowed, out);
+            if let Some(else_body) = else_body {
+                collect_body_assignments(else_body, env, shadowed, out);
+            }
+        }
+        RValue::Match { arms, .. } => {
+            for (pattern, guard, arm) in arms {
+                let mut nested = shadowed.clone();
+                shadow_pattern_names(&mut nested, pattern);
+                if let Some(guard) = guard {
+                    collect_body_assignments(guard, env, &nested, out);
+                }
+                collect_body_assignments(arm, env, &nested, out);
+            }
+        }
+        RValue::For { var, body, .. } => {
+            let mut nested = shadowed.clone();
+            nested.insert(var.clone());
+            collect_body_assignments(body, env, &nested, out);
+        }
+        RValue::While { cond, body, .. } => {
+            collect_body_assignments(cond, env, shadowed, out);
+            collect_body_assignments(body, env, shadowed, out);
+        }
+        RValue::Block(body) => collect_body_assignments(body, env, shadowed, out),
+        RValue::Handle { body, handlers, .. } => {
+            collect_body_assignments(body, env, shadowed, out);
+            for handler in handlers {
+                let mut nested = shadowed.clone();
+                for (name, _) in &handler.params {
+                    nested.insert(name.clone());
+                }
+                collect_body_assignments(&handler.body, env, &nested, out);
+            }
+        }
+        RValue::Receive { arms, after, .. } => {
+            for (_, patterns, guard, arm) in arms {
+                let mut nested = shadowed.clone();
+                for pattern in patterns {
+                    shadow_pattern_names(&mut nested, pattern);
+                }
+                if let Some(guard) = guard {
+                    collect_body_assignments(guard, env, &nested, out);
+                }
+                collect_body_assignments(arm, env, &nested, out);
+            }
+            if let Some((timeout, after_body)) = after {
+                collect_body_assignments(timeout, env, shadowed, out);
+                collect_body_assignments(after_body, env, shadowed, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn shadow_pattern(env: &mut FxHashMap<String, String>, pattern: &Pattern) {
     match pattern {
         Pattern::Var(name) => {
@@ -310,6 +430,30 @@ fn shadow_pattern(env: &mut FxHashMap<String, String>, pattern: &Pattern) {
         Pattern::Alias(name, inner) => {
             env.remove(name);
             shadow_pattern(env, inner);
+        }
+        Pattern::Wild | Pattern::Lit(_) | Pattern::Variant(_, None) => {}
+    }
+}
+
+fn shadow_pattern_names(names: &mut HashSet<String>, pattern: &Pattern) {
+    match pattern {
+        Pattern::Var(name) => {
+            names.insert(name.clone());
+        }
+        Pattern::Tuple(items) => {
+            for item in items {
+                shadow_pattern_names(names, item);
+            }
+        }
+        Pattern::Record(fields) => {
+            for (_, item) in fields {
+                shadow_pattern_names(names, item);
+            }
+        }
+        Pattern::Variant(_, Some(inner)) => shadow_pattern_names(names, inner),
+        Pattern::Alias(name, inner) => {
+            names.insert(name.clone());
+            shadow_pattern_names(names, inner);
         }
         Pattern::Wild | Pattern::Lit(_) | Pattern::Variant(_, None) => {}
     }
