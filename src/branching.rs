@@ -125,9 +125,7 @@ impl BranchManifest {
 
     /// BLAKE3 content identity for the manifest itself.
     pub fn digest(&self) -> Result<String, BranchManifestError> {
-        Ok(blake3::hash(&self.canonical_bytes()?)
-            .to_hex()
-            .to_string())
+        Ok(blake3::hash(&self.canonical_bytes()?).to_hex().to_string())
     }
 
     /// Check whether a runtime/artifact tuple exactly matches this manifest.
@@ -159,7 +157,9 @@ impl std::fmt::Display for BranchManifestError {
             Self::UnsupportedManifestVersion(v) => {
                 write!(f, "unsupported branch manifest version {v}")
             }
-            Self::Missing(field) => write!(f, "branch manifest is missing required field '{field}'"),
+            Self::Missing(field) => {
+                write!(f, "branch manifest is missing required field '{field}'")
+            }
             Self::Serialization(msg) => write!(f, "branch manifest serialization failed: {msg}"),
         }
     }
