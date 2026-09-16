@@ -57,12 +57,15 @@ impl ProtocolSupport {
         }
         let accepts = accepts.into_iter().collect::<BTreeSet<_>>();
         if !accepts.contains(&emits) {
-            return Err(ProtocolCompatibilityError::DoesNotAcceptOwnEmittedRevision {
-                protocol,
-                emits,
-            });
+            return Err(
+                ProtocolCompatibilityError::DoesNotAcceptOwnEmittedRevision { protocol, emits },
+            );
         }
-        Ok(Self { protocol, emits, accepts })
+        Ok(Self {
+            protocol,
+            emits,
+            accepts,
+        })
     }
 
     pub fn accepts_revision(&self, revision: ProtocolRevision) -> bool {
@@ -76,10 +79,12 @@ impl ProtocolSupport {
         emits: ProtocolRevision,
     ) -> Result<Self, ProtocolCompatibilityError> {
         if !self.accepts.contains(&emits) {
-            return Err(ProtocolCompatibilityError::DoesNotAcceptOwnEmittedRevision {
-                protocol: self.protocol,
-                emits,
-            });
+            return Err(
+                ProtocolCompatibilityError::DoesNotAcceptOwnEmittedRevision {
+                    protocol: self.protocol,
+                    emits,
+                },
+            );
         }
         self.emits = emits;
         Ok(self)
@@ -96,10 +101,7 @@ impl ActivationProtocols {
         Self::default()
     }
 
-    pub fn insert(
-        &mut self,
-        support: ProtocolSupport,
-    ) -> Result<(), ProtocolCompatibilityError> {
+    pub fn insert(&mut self, support: ProtocolSupport) -> Result<(), ProtocolCompatibilityError> {
         let name = support.protocol.clone();
         if self.protocols.contains_key(&name) {
             return Err(ProtocolCompatibilityError::DuplicateProtocol { protocol: name });
@@ -122,8 +124,12 @@ impl ActivationProtocols {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageCompatibility {
     Compatible,
-    SenderMissingProtocol { protocol: String },
-    ReceiverMissingProtocol { protocol: String },
+    SenderMissingProtocol {
+        protocol: String,
+    },
+    ReceiverMissingProtocol {
+        protocol: String,
+    },
     ReceiverRejectsRevision {
         protocol: String,
         emitted: ProtocolRevision,
@@ -190,7 +196,9 @@ pub enum ProtocolCompatibilityError {
         protocol: String,
         emits: ProtocolRevision,
     },
-    DuplicateProtocol { protocol: String },
+    DuplicateProtocol {
+        protocol: String,
+    },
 }
 
 impl fmt::Display for ProtocolCompatibilityError {
