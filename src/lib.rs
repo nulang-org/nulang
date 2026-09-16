@@ -36,6 +36,8 @@ pub mod fmt;
 pub mod format;
 #[allow(dead_code)]
 pub(crate) mod grain_identity;
+#[allow(dead_code)]
+pub(crate) mod grain_runtime_identity;
 #[cfg(feature = "native-codegen")]
 pub mod fuzz;
 pub mod hir;
