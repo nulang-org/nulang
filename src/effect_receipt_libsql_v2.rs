@@ -117,7 +117,10 @@ impl fmt::Display for LibsqlDurableEffectError {
             Self::ContextMismatch {
                 invocation_id,
                 detail,
-            } => write!(f, "durable effect context mismatch for {invocation_id}: {detail}"),
+            } => write!(
+                f,
+                "durable effect context mismatch for {invocation_id}: {detail}"
+            ),
             Self::MissingContext(id) => {
                 write!(f, "missing durable effect context for invocation {id}")
             }
@@ -228,12 +231,10 @@ impl LibsqlDurableEffectStore {
         })
     }
 
-    pub fn accepted_epoch(
-        &self,
-        actor_id: u64,
-    ) -> Result<Option<u64>, LibsqlDurableEffectError> {
+    pub fn accepted_epoch(&self, actor_id: u64) -> Result<Option<u64>, LibsqlDurableEffectError> {
         let conn = self.conn();
-        self.rt.block_on(async { load_epoch(&conn, actor_id).await })
+        self.rt
+            .block_on(async { load_epoch(&conn, actor_id).await })
     }
 
     pub fn load(
@@ -296,25 +297,20 @@ impl LibsqlDurableEffectStore {
 
                 if matches!(replay, EffectReplayDecision::ExecuteNew) {
                     reference.create_intent(proposed.clone())?;
-                    let next = reference
-                        .load(proposed.invocation_id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            LibsqlDurableEffectError::CorruptState(format!(
-                                "preparing invocation {} produced no receipt state",
-                                proposed.invocation_id
-                            ))
-                        })?;
+                    let next =
+                        reference
+                            .load(proposed.invocation_id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                LibsqlDurableEffectError::CorruptState(format!(
+                                    "preparing invocation {} produced no receipt state",
+                                    proposed.invocation_id
+                                ))
+                            })?;
                     write_state(&tx, namespace_actor_id, proposed.invocation_id, &next).await?;
                 }
 
-                ensure_context(
-                    &tx,
-                    namespace_actor_id,
-                    proposed.invocation_id,
-                    context,
-                )
-                .await?;
+                ensure_context(&tx, namespace_actor_id, proposed.invocation_id, context).await?;
                 write_epoch(&tx, namespace_actor_id, presented_epoch).await?;
                 Ok::<_, LibsqlDurableEffectError>(replay)
             }
@@ -363,10 +359,7 @@ impl LibsqlDurableEffectStore {
                 let existing = load_state(&tx, namespace_actor_id, receipt.invocation_id)
                     .await?
                     .ok_or(EffectReceiptError::MissingIntent(receipt.invocation_id))?;
-                let mut reference = restore_reference_store(
-                    Some(existing),
-                    receipt.invocation_id,
-                )?;
+                let mut reference = restore_reference_store(Some(existing), receipt.invocation_id)?;
                 reference.commit_receipt(receipt.clone())?;
                 let next = reference
                     .load(receipt.invocation_id)
@@ -641,7 +634,11 @@ mod tests {
         }
     }
 
-    fn fixture(actor_id: u64, sequence: u64, occurrence: u32) -> (EffectIntent, DurableEffectContext) {
+    fn fixture(
+        actor_id: u64,
+        sequence: u64,
+        occurrence: u32,
+    ) -> (EffectIntent, DurableEffectContext) {
         let site = EffectSiteId::from_semantic_bytes(b"orders.Charge.capture#0");
         let owner = format!("actor:{actor_id}");
         let invocation = EffectInvocationId::derive(owner.as_bytes(), sequence, site, occurrence);
@@ -672,7 +669,10 @@ mod tests {
             EffectReplayDecision::ExecuteNew
         );
         assert_eq!(store.accepted_epoch(actor_id).unwrap(), Some(1));
-        assert_eq!(store.load_context(actor_id, intent.invocation_id).unwrap(), Some(context));
+        assert_eq!(
+            store.load_context(actor_id, intent.invocation_id).unwrap(),
+            Some(context)
+        );
         assert!(matches!(
             store.load(actor_id, intent.invocation_id).unwrap(),
             Some(PersistedEffectState::Intent(_))
@@ -690,7 +690,9 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            store.prepare_fenced(actor_id, &fence, &intent, context).unwrap(),
+            store
+                .prepare_fenced(actor_id, &fence, &intent, context)
+                .unwrap(),
             EffectReplayDecision::RecoverIndeterminate(_)
         ));
     }
@@ -710,7 +712,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.prepare_fenced(actor_id, &fence, &intent, context).unwrap(),
+            store
+                .prepare_fenced(actor_id, &fence, &intent, context)
+                .unwrap(),
             EffectReplayDecision::ReturnReceipt(receipt)
         );
     }

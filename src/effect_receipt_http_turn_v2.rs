@@ -11,7 +11,7 @@ use std::fmt;
 use std::io::Read;
 
 use crate::effect_receipt::{
-    EffectIntent, EffectOutcome, EffectReplayDecision, EffectReceipt, RecordedEffectFailure,
+    EffectIntent, EffectOutcome, EffectReceipt, EffectReplayDecision, RecordedEffectFailure,
 };
 use crate::effect_receipt_fence::EffectReceiptFence;
 use crate::effect_receipt_http::http_post_request_fingerprint;
@@ -66,7 +66,10 @@ impl fmt::Display for DurableHttpTurnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongEffectIdentity { effect, operation } => {
-                write!(f, "durable HTTP turn requires Http.post, got {effect}.{operation}")
+                write!(
+                    f,
+                    "durable HTTP turn requires Http.post, got {effect}.{operation}"
+                )
             }
             Self::RequestFingerprintMismatch => {
                 f.write_str("durable HTTP turn request fingerprint mismatch")
@@ -347,12 +350,8 @@ mod tests {
             Some(crate::effect_receipt::PersistedEffectState::Intent(_))
         ));
 
-        let turn = DurableTurnRecord::new(
-            actor_id,
-            bundle(sequence),
-            vec![effect.invocation_id],
-        )
-        .unwrap();
+        let turn =
+            DurableTurnRecord::new(actor_id, bundle(sequence), vec![effect.invocation_id]).unwrap();
         LibsqlDurableTurnStore::new(&path)
             .unwrap()
             .commit_turn(actor_id, &fence, turn, vec![prepared.receipt.clone()])
@@ -419,18 +418,15 @@ mod tests {
         let client = DurableHttpTurnClient::new(&effects);
 
         let prepared = client
-            .prepare_post_with_policy(
-                actor_id,
-                &fence,
-                context,
-                &effect,
-                &url,
-                b"payload",
-                |_| HttpStatusDisposition::Terminal,
-            )
+            .prepare_post_with_policy(actor_id, &fence, context, &effect, &url, b"payload", |_| {
+                HttpStatusDisposition::Terminal
+            })
             .unwrap();
         server.join().unwrap();
-        assert!(matches!(prepared.observation, HttpTurnObservation::Failed(_)));
+        assert!(matches!(
+            prepared.observation,
+            HttpTurnObservation::Failed(_)
+        ));
         cleanup(&path);
     }
 

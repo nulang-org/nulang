@@ -337,7 +337,9 @@ impl LibsqlDurableTurnStore {
                         .ok_or(LibsqlDurableTurnError::MissingIntent(receipt.invocation_id))?;
                     let context = load_context(&tx, namespace_actor_id, receipt.invocation_id)
                         .await?
-                        .ok_or(LibsqlDurableTurnError::MissingContext(receipt.invocation_id))?;
+                        .ok_or(LibsqlDurableTurnError::MissingContext(
+                            receipt.invocation_id,
+                        ))?;
                     validate_effect_context(&record, receipt.invocation_id, context)?;
                     completed.push((
                         receipt.invocation_id,
@@ -534,9 +536,7 @@ fn storage_error(error: impl fmt::Display) -> LibsqlDurableTurnError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect_receipt::{
-        EffectIdentity, EffectIntent, EffectSiteId, RequestFingerprint,
-    };
+    use crate::effect_receipt::{EffectIdentity, EffectIntent, EffectSiteId, RequestFingerprint};
     use crate::effect_receipt_libsql_v2::LibsqlDurableEffectStore;
 
     #[derive(Clone, Copy, Debug)]
@@ -662,8 +662,8 @@ mod tests {
             .prepare_fenced(actor_id, &fence, &intent, context)
             .unwrap();
         let receipt = EffectReceipt::success(&intent, 1, b"ok".to_vec());
-        let record = DurableTurnRecord::new(actor_id, bundle(8, 1), vec![intent.invocation_id])
-            .unwrap();
+        let record =
+            DurableTurnRecord::new(actor_id, bundle(8, 1), vec![intent.invocation_id]).unwrap();
         let turns = LibsqlDurableTurnStore::new(&path).unwrap();
 
         assert!(matches!(
