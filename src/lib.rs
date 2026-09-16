@@ -30,6 +30,8 @@ pub mod diagnostic;
 pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
+#[cfg(feature = "sqlite")]
+pub mod durable_turn_libsql;
 pub mod effect_checker;
 pub mod effect_receipt;
 pub mod effect_receipt_fence;
