@@ -162,7 +162,7 @@ borsh = { version = "1.5", optional = true, features = ["derive"] }
 wasmtime = { version = "46", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
 wat = { version = "1.254", optional = true }
 blake3 = "1.8"
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "ring", "logging"] }
 rustls-pemfile = { version = "2" }
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 hex = "0.4.3"
