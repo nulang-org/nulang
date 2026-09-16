@@ -578,7 +578,7 @@ def patch_call_sites() -> None:
         r"(?P<tc>[A-Za-z_][A-Za-z0-9_]*)\.inferred_decl_types\s*\)"
     )
     total = 0
-    for root in (Path("src"), Path("crates"), Path("benches")):
+    for root in (Path("src"), Path("crates"), Path("benches"), Path("tests")):
         if not root.exists():
             continue
         for path in root.rglob("*.rs"):
