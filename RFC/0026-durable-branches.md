@@ -1,4 +1,4 @@
-# RFC 0019: Durable Branches
+# RFC 0026: Durable Branches
 
 - **Status:** Draft
 - **Tier:** Experimental
