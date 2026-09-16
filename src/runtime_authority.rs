@@ -32,7 +32,7 @@ impl AuthorityToken {
         let (namespace, operation) = raw
             .split_once("::")
             .ok_or_else(|| AuthorityTokenError::Malformed(raw.clone()))?;
-        if namespace.is_empty() || operation.is_empty() || namespace.contains(char::is_whitespace) {
+        if !valid_identifier(namespace) || operation.is_empty() || operation.contains("::") {
             return Err(AuthorityTokenError::Malformed(raw));
         }
 
@@ -42,8 +42,9 @@ impl AuthorityToken {
             }
             let action = &operation[..open];
             let resource = &operation[open + 1..operation.len() - 1];
-            if resource.is_empty()
-                || action.contains(char::is_whitespace)
+            if !valid_identifier(action)
+                || resource.is_empty()
+                || resource.trim() != resource
                 || resource.contains('(')
                 || resource.contains(')')
             {
@@ -51,7 +52,7 @@ impl AuthorityToken {
             }
             (action.to_string(), Some(resource.to_string()))
         } else {
-            if operation.contains(')') || operation.contains(char::is_whitespace) {
+            if !valid_identifier(operation) || operation.contains(')') {
                 return Err(AuthorityTokenError::Malformed(raw));
             }
             (operation.to_string(), None)
@@ -85,6 +86,17 @@ impl AuthorityToken {
     pub fn resource(&self) -> Option<&str> {
         self.resource.as_deref()
     }
+}
+
+fn valid_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,13 +282,16 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_and_nested_resource_syntax_are_rejected() {
+    fn malformed_names_whitespace_and_nested_resource_syntax_are_rejected() {
         for malformed in [
             " Net::TcpOut(api:443)",
             "Net ::TcpOut(api:443)",
             "Net::TcpOut()",
             "Net::TcpOut(a(b))",
             "Net::Tcp Out(api:443)",
+            "Net::Tcp::Out(api:443)",
+            "Net-Admin::Read",
+            "9Net::Read",
         ] {
             assert!(AuthorityToken::parse(malformed).is_err(), "{malformed}");
         }
