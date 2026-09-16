@@ -117,7 +117,7 @@ where
         let line_number = index + 1;
         let record: T = match serde_json::from_str(line) {
             Ok(record) => record,
-            Err(error)
+            Err(_error)
                 if torn_tail_policy == TornTailPolicy::AllowUnterminatedFinalRecord
                     && final_line_unterminated
                     && line_number == line_count =>
