@@ -64,7 +64,20 @@ Candidate implementation order:
 ## Manual density ladder
 
 Density tests should not run on every shared CI push. Run them deliberately on
-a fixed host and record both elapsed time and resident memory:
+a fixed host and record both elapsed time and resident memory. The manual probe
+is `examples/actor_density.rs`:
+
+```bash
+cargo run --release --example actor_density -- 10000
+cargo run --release --example actor_density -- 100000
+cargo run --release --example actor_density -- 500000
+cargo run --release --example actor_density -- 1000000
+```
+
+On Linux it reports RSS before spawning, RSS after spawning, RSS after the
+scheduler settles, spawn throughput, scheduler-settle time, and initial actor
+heap capacity. On other platforms the runtime metrics still work but RSS is
+reported as unavailable.
 
 | Stage | Resident actors | Purpose |
 |---|---:|---|
