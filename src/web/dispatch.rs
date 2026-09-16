@@ -14,8 +14,8 @@ use crate::web::request_bindings::{
     bind_request_arguments, RequestBindingValues, RequestDecodeError,
 };
 use crate::web::runtime_bindings::{
-    attach_runtime_route_plans, match_attached_route, render_bound_route_handler,
-    RuntimeRoutePlan, RuntimeRouteSegment, RuntimeWebRoute,
+    attach_runtime_route_plans, match_attached_route, render_bound_route_handler, RuntimeRoutePlan,
+    RuntimeRouteSegment, RuntimeWebRoute,
 };
 use crate::web::validation::compile_validated_contracts_from_tree;
 use std::collections::HashMap;
@@ -186,8 +186,7 @@ fn has_complete_request_binding_plan(plan: &RuntimeRoutePlan) -> bool {
 
     let mut handler_slots = vec![false; plan.handler_param_count];
     for binding in &plan.bindings {
-        if binding.handler_index >= plan.handler_param_count
-            || handler_slots[binding.handler_index]
+        if binding.handler_index >= plan.handler_param_count || handler_slots[binding.handler_index]
         {
             return false;
         }
@@ -328,10 +327,7 @@ fn show() -> String { "ok" }
                 handler_module: crate::bytecode::CodeModule::new("gate_test"),
                 handler_func_idx: 0,
             },
-            plan: Some(plan(
-                vec![binding(RouteBindingSource::Query, "id", 0)],
-                1,
-            )),
+            plan: Some(plan(vec![binding(RouteBindingSource::Query, "id", 0)], 1)),
         };
         let err = render_direct_route(&route, &HashMap::new()).unwrap_err();
         assert!(err.contains("incomplete"), "{err}");
@@ -348,7 +344,9 @@ fn show() -> String { "ok" }
             },
             plan: Some(plan(vec![], 0)),
         };
-        assert!(render_direct_route(&route, &HashMap::new()).unwrap().is_none());
+        assert!(render_direct_route(&route, &HashMap::new())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -15,9 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// monotonically increasing within that origin. Distributed runtimes should
 /// use their stable `NodeId` as the origin; standalone runtimes may use zero
 /// when identity only needs to be unique within one process/runtime boundary.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MessageId {
     pub origin: u64,
     pub sequence: u64,
@@ -180,10 +178,7 @@ mod tests {
     fn message_id_wire_round_trip() {
         let id = MessageId::new(0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00);
         assert_eq!(MessageId::from_bytes(id.to_bytes()), id);
-        assert_eq!(
-            id.as_u128(),
-            0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00u128
-        );
+        assert_eq!(id.as_u128(), 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00u128);
     }
 
     #[test]
