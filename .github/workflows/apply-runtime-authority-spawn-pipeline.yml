@@ -27,6 +27,9 @@ jobs:
       - name: Apply runtime authority transformations
         run: python3 scripts/apply_runtime_authority_runtime_pipeline.py
 
+      - name: Keep the existing RFC 0022
+        run: rm RFC/0022-runtime-authority-spawn-grants.md
+
       - name: Format
         run: cargo fmt --all
 
@@ -42,7 +45,7 @@ jobs:
           set -euo pipefail
           git diff --check
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+dporkka@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "feat(runtime): enforce spawn authority attenuation"
           git push origin "HEAD:${GITHUB_REF_NAME}"
