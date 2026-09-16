@@ -27,6 +27,7 @@ jobs:
       - name: Apply runtime ownership patch
         run: |
           python3 scripts/apply_p0_actor_runtime_ownership.py
+          python3 scripts/apply_p0_actor_runtime_role_scope.py
           sed -i 's/behavior hit(): Int/behavior hit()/g' src/runtime/tests.rs
 
       - name: Format and static checks
@@ -58,6 +59,7 @@ jobs:
           test "$(git rev-parse origin/fix/nominal-actor-runtime-ownership)" = "$START_HEAD"
           rm .github/workflows/p0-actor-runtime-ownership.yml
           rm scripts/apply_p0_actor_runtime_ownership.py
+          rm scripts/apply_p0_actor_runtime_role_scope.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
