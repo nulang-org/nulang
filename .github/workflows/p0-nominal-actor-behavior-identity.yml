@@ -23,22 +23,28 @@ jobs:
       - name: Apply product patch
         run: |
           python3 scripts/apply_p0_nominal_actor_behavior.py
-          python3 scripts/apply_p0_actor_provenance.py
+          python3 scripts/apply_p0_behavior_key.py
 
       - name: Format and focused Rust tests
         run: |
           cargo fmt --all
           git diff --check
           cargo test --no-default-features typechecker::tests
+          cargo test --no-default-features hir_lower
           cargo test --no-default-features mir_lower
 
       - name: Build minimal compiler
         run: cargo build --quiet --no-default-features
 
-      - name: Nominal owner passes
+      - name: Duplicate-name ask dispatches by nominal owner
         run: |
           BIN="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"] + "/debug/nulang")')"
           test "$($BIN conformance/behavior/actor_18_nominal_behavior_owner.nula)" = "42ok"
+
+      - name: Duplicate-name send dispatches by nominal owner
+        run: |
+          BIN="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"] + "/debug/nulang")')"
+          test "$($BIN conformance/behavior/lifecycle_05_behavior_name_first_declaration_wins.nula)" = "1"
 
       - name: Unique dynamic receiver remains compatible
         run: |
@@ -74,6 +80,7 @@ jobs:
           rm .github/workflows/p0-nominal-actor-behavior-identity.yml
           rm scripts/apply_p0_nominal_actor_behavior.py
           rm scripts/apply_p0_actor_provenance.py
+          rm scripts/apply_p0_behavior_key.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
