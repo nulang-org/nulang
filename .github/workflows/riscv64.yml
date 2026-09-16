@@ -50,8 +50,8 @@ jobs:
 
       # Keep this profile intentionally independent of Python/SQLite/AI.
       # It validates the portable language runtime plus Cranelift's riscv64
-      # JIT/AOT backend without requiring target-architecture Python packages.
-      # Release mode catches optimization/LTO-sensitive portability bugs.
+      # tiered-JIT/AOT code generation without requiring target-architecture
+      # Python packages. Release mode catches optimization/LTO-sensitive bugs.
       - name: Cross-build Nulang with native codegen (release)
         run: |
           cargo build \
@@ -82,20 +82,35 @@ jobs:
             target/riscv64gc-unknown-linux-gnu/release/nulang \
             examples/01_hello.nula
 
-      # This is the architecture-sensitive check: it forces Cranelift to
-      # detect a riscv64 host and execute generated RISC-V machine code.
-      # Keep the program pure so this test isolates code generation from
-      # unrelated effect/IO backend coverage.
-      - name: Run native backend smoke test under QEMU
+      # Force the VM hot counter past HOT_THRESHOLD and assert that the JIT
+      # actually compiled a loop region. The Cargo target runner executes the
+      # RISC-V test binary through qemu-riscv64, so this verifies tiered JIT
+      # generation and execution on the target ISA rather than only AOT.
+      - name: Exercise tiered JIT under QEMU
+        run: |
+          cargo test \
+            --release \
+            --target riscv64gc-unknown-linux-gnu \
+            --no-default-features \
+            --features native-codegen \
+            --lib 'jit::tests::test_jit_direct_call_loop_tiers_up' \
+            -- --exact
+
+      # This separately exercises the AOT/native backend. The CLI prints the
+      # pure program result, so require the generated RISC-V code to compute
+      # the expected value instead of treating a zero exit status as enough.
+      - name: Run AOT native backend smoke test under QEMU
         run: |
           printf '%s\n' \
             'fn add(a: Int, b: Int) -> Int {' \
             '    a + b' \
             '}' \
             'add(20, 22)' > /tmp/riscv-native.nula
-          qemu-riscv64 -L /usr/riscv64-linux-gnu \
+          output="$(qemu-riscv64 -L /usr/riscv64-linux-gnu \
             target/riscv64gc-unknown-linux-gnu/release/nulang \
-            --backend native /tmp/riscv-native.nula
+            --backend native /tmp/riscv-native.nula)"
+          printf 'AOT result: %s\n' "$output"
+          test "$output" = "42"
 
       - name: Cross-check capacity crate
         run: |
