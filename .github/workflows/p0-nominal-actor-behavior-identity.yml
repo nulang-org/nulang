@@ -40,6 +40,22 @@ jobs:
           BIN="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"] + "/debug/nulang")')"
           test "$($BIN conformance/behavior/actor_18_nominal_behavior_owner.nula)" = "42ok"
 
+      - name: Unique dynamic receiver remains compatible
+        run: |
+          BIN="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"] + "/debug/nulang")')"
+          test "$($BIN conformance/behavior/cap_02_default_spawn_iso.nula)" = "pong"
+
+      - name: Ambiguous dynamic receiver fails closed
+        run: |
+          BIN="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"] + "/debug/nulang")')"
+          set +e
+          "$BIN" conformance/behavior/actor_20_ambiguous_dynamic_behavior_error.nula > /tmp/ambiguous-out 2> /tmp/ambiguous-err
+          CODE=$?
+          set -e
+          test "$CODE" -eq 4
+          test ! -s /tmp/ambiguous-out
+          grep -F "cannot resolve behavior 'ping' unambiguously from dynamic receiver" /tmp/ambiguous-err
+
       - name: Foreign payload fails closed
         run: |
           BIN="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"] + "/debug/nulang")')"
