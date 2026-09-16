@@ -55,6 +55,8 @@ pub mod mir_lower;
 pub mod mir_wasm;
 #[cfg(feature = "wasm-backend")]
 pub mod mir_wasm_simd;
+#[cfg(feature = "otel")]
+pub mod observability;
 pub mod package;
 pub mod parser;
 pub mod prelude_source;
