@@ -1,0 +1,581 @@
+name: P0 Nominal Actor Behavior Identity
+
+on:
+  push:
+    branches:
+      - fix/nominal-actor-behavior-identity
+
+concurrency:
+  group: p0-nominal-actor-behavior-identity
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  patch-validate-land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/nominal-actor-behavior-identity
+          fetch-depth: 0
+
+      - name: Pin branch head
+        shell: bash
+        run: echo "START_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install receiver-specific actor behavior typing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/typechecker.rs")
+          text = path.read_text()
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              text = text.replace(old, new, 1)
+
+          def replace_between(start: str, end: str, replacement: str, label: str) -> None:
+              global text
+              start_pos = text.find(start)
+              if start_pos < 0:
+                  raise SystemExit(f"{label}: start marker not found")
+              end_pos = text.find(end, start_pos)
+              if end_pos < 0:
+                  raise SystemExit(f"{label}: end marker not found")
+              text = text[:start_pos] + replacement + text[end_pos:]
+
+          replace_once(
+          '''            Expr::Ask {
+                          actor,
+                          behavior: _,
+                          args: _,
+                          span,
+                          ..
+                      } => self.infer_ask(ctx, actor, *span),''',
+          '''            Expr::Ask {
+                          actor,
+                          behavior,
+                          args,
+                          span,
+                          ..
+                      } => self.infer_ask(ctx, actor, behavior, args, *span),''',
+          "ask inference dispatch",
+          )
+
+          helper_marker = "    fn infer_actor_decl(\n"
+          helper = r'''    fn pack_behavior_params(mut params: Vec<Type>) -> Type {
+              match params.len() {
+                  0 => Type::Tuple(Vec::new()),
+                  1 => params.remove(0),
+                  _ => Type::Tuple(params),
+              }
+          }
+
+          /// Resolve a statically-known actor behavior contract from the
+          /// receiver's nominal behavior schema. `None` means the receiver is
+          /// intentionally opaque/dynamic and cannot be checked further here.
+          fn actor_behavior_signature(
+              &self,
+              actor_ty: &Type,
+              behavior_name: &str,
+              span: Span,
+          ) -> NuResult<Option<(Type, Type)>> {
+              let Type::Actor { behavior, .. } = actor_ty else {
+                  return Err(NuError::type_error(
+                      format!("message receiver is not an actor: {}", actor_ty),
+                      span,
+                  ));
+              };
+
+              let (owner, schema) = match behavior.as_ref() {
+                  Type::Nominal { name, underlying } => (Some(name.as_str()), underlying.as_ref()),
+                  Type::Var(_) => return Ok(None),
+                  other => (None, other),
+              };
+
+              let Type::Record(fields) = schema else {
+                  return Ok(None);
+              };
+              let Some((_, signature)) = fields.iter().find(|(name, _)| name == behavior_name)
+              else {
+                  let owner = owner
+                      .and_then(|name| name.strip_prefix("actor::"))
+                      .and_then(|name| name.strip_suffix("::behaviors"))
+                      .unwrap_or("actor");
+                  return Err(NuError::type_error(
+                      format!("Actor '{}' does not declare behavior '{}'", owner, behavior_name),
+                      span,
+                  ));
+              };
+
+              match signature {
+                  Type::Function { param, ret, .. } => {
+                      Ok(Some(((**param).clone(), (**ret).clone())))
+                  }
+                  other => Err(NuError::type_error(
+                      format!(
+                          "internal: behavior '{}' has non-function signature {}",
+                          behavior_name, other
+                      ),
+                      span,
+                  )),
+              }
+          }
+
+'''
+          if helper_marker not in text:
+              raise SystemExit("infer_actor_decl marker not found")
+          text = text.replace(helper_marker, helper + helper_marker, 1)
+
+          self_start = "        // The actor's own name must be in scope inside its behaviors so an\n"
+          self_end = "        // Type-check state field defaults and CRDT type compatibility.\n"
+          self_replacement = r'''        // Materialize one receiver-specific behavior contract before checking
+          // behavior bodies. The existing Actor.behavior slot is the semantic
+          // home for this identity; the nominal owner prevents same-short-name
+          // handlers on different actors from unifying accidentally.
+          let behavior_signatures: Vec<(String, Vec<Type>, Type, EffectRow, Capability)> = behaviors
+              .iter()
+              .map(|behavior| {
+                  let params = behavior
+                      .params
+                      .iter()
+                      .map(|param| {
+                          param
+                              .ty
+                              .clone()
+                              .unwrap_or_else(|| Type::Var(TypeVar::fresh()))
+                      })
+                      .collect::<Vec<_>>();
+                  let ret = behavior
+                      .ret_type
+                      .clone()
+                      .unwrap_or_else(|| Type::Var(TypeVar::fresh()));
+                  (
+                      behavior.name.clone(),
+                      params,
+                      ret,
+                      behavior.effect.clone().unwrap_or_else(EffectRow::empty),
+                      behavior.cap,
+                  )
+              })
+              .collect();
+          let behavior_record = Type::Record(
+              behavior_signatures
+                  .iter()
+                  .map(|(name, params, ret, effect, cap)| {
+                      (
+                          name.clone(),
+                          Type::Function {
+                              param: Box::new(Self::pack_behavior_params(params.clone())),
+                              ret: Box::new(ret.clone()),
+                              effect: effect.clone(),
+                              cap: *cap,
+                          },
+                      )
+                  })
+                  .collect(),
+          );
+          let behavior_identity = Type::Nominal {
+              name: format!("actor::{}::behaviors", name),
+              underlying: Box::new(behavior_record),
+          };
+          let self_ty = Type::Actor {
+              state: Box::new(Type::Var(TypeVar::fresh())),
+              behavior: Box::new(behavior_identity.clone()),
+          };
+
+'''
+          replace_between(self_start, self_end, self_replacement, "actor behavior schema")
+
+          behavior_start = "        // Check each behavior, with event declarations in scope for emit checking\n"
+          behavior_end = "        // Typecheck migration contracts: state_body and event_migration handlers\n"
+          behavior_replacement = r'''        // Check each behavior against the same signature variables embedded
+          // in the actor type. This lets an unannotated return type be inferred
+          // once and then flow to every `ask` site for this actor.
+          let mut behavior_subst = Substitution::new();
+          for (behavior_index, behavior) in behaviors.iter().enumerate() {
+              let mut behavior_ctx = apply_subst_to_ctx(ctx, &behavior_subst);
+              behavior_ctx.bind(
+                  name.to_string(),
+                  apply_subst(&self_ty, &behavior_subst),
+                  Capability::Ref,
+                  false,
+              );
+              let (_, param_types, ret_type, _, _) = &behavior_signatures[behavior_index];
+              for (param, param_ty) in behavior.params.iter().zip(param_types.iter()) {
+                  behavior_ctx.bind(
+                      param.name.clone(),
+                      apply_subst(param_ty, &behavior_subst),
+                      param.cap.unwrap_or(Capability::Ref),
+                      false,
+                  );
+              }
+              if !events.is_empty() {
+                  let ctx_events: Vec<(String, Vec<(String, Type)>)> = events
+                      .iter()
+                      .map(|e| (e.name.clone(), e.params.clone()))
+                      .collect();
+                  behavior_ctx.set_entity_events(ctx_events);
+              }
+              let (s_body, body_ty) = self.infer_expr(&behavior_ctx, &behavior.body)?;
+              let s_body = compose_subst(&s_body, &behavior_subst);
+              let inferred_ret = apply_subst(&body_ty, &s_body);
+              let expected_ret = apply_subst(ret_type, &s_body);
+              let s_ret = mgu(&expected_ret, &inferred_ret, behavior.span)?;
+              behavior_subst = compose_subst(&s_ret, &s_body);
+          }
+
+'''
+          replace_between(behavior_start, behavior_end, behavior_replacement, "behavior body typing")
+
+          replace_once(
+          '''        let actor_ty = Type::Actor {
+                      state: Box::new(Type::Var(TypeVar::fresh())),
+                      behavior: Box::new(Type::Var(TypeVar::fresh())),
+                  };
+                  Ok((vec![], actor_ty))
+              }
+
+              /// Infer spawn expression.''',
+          '''        let actor_ty = Type::Actor {
+                      state: Box::new(Type::Var(TypeVar::fresh())),
+                      behavior: Box::new(apply_subst(&behavior_identity, &behavior_subst)),
+                  };
+                  Ok((behavior_subst, actor_ty))
+              }
+
+              /// Infer spawn expression.''',
+          "final actor type",
+          )
+
+          send_start = "    /// Infer send expression.\n"
+          send_end = "    /// Infer perform expression.\n"
+          send_replacement = r'''    /// Infer send expression.
+          fn infer_send(
+              &mut self,
+              ctx: &TypeContext,
+              actor: &Expr,
+              behavior: &str,
+              args: &[Expr],
+              span: Span,
+          ) -> NuResult<(Substitution, Type)> {
+              let (s1, actor_ty) = self.infer_expr(ctx, actor)?;
+              let fresh_actor = Type::Actor {
+                  state: Box::new(Type::Var(TypeVar::fresh())),
+                  behavior: Box::new(Type::Var(TypeVar::fresh())),
+              };
+              let s2 = mgu(&apply_subst(&actor_ty, &s1), &fresh_actor, span)?;
+              let mut subst = compose_subst(&s2, &s1);
+              let resolved_actor = apply_subst(&actor_ty, &subst);
+              let signature = self.actor_behavior_signature(&resolved_actor, behavior, span)?;
+
+              let mut arg_types = Vec::with_capacity(args.len());
+              for arg in args {
+                  let ctx_sub = apply_subst_to_ctx(ctx, &subst);
+                  let (s_arg, arg_ty) = self.infer_expr(&ctx_sub, arg)?;
+                  subst = compose_subst(&s_arg, &subst);
+                  arg_types.push(arg_ty);
+              }
+
+              if let Some((expected_param, _)) = signature {
+                  let actual_param = Self::pack_behavior_params(
+                      arg_types
+                          .iter()
+                          .map(|ty| apply_subst(ty, &subst))
+                          .collect(),
+                  );
+                  let s_args = mgu(
+                      &apply_subst(&expected_param, &subst),
+                      &actual_param,
+                      span,
+                  )?;
+                  subst = compose_subst(&s_args, &subst);
+              }
+
+              Ok((subst, Type::unit()))
+          }
+
+          /// Infer ask expression.
+          fn infer_ask(
+              &mut self,
+              ctx: &TypeContext,
+              actor: &Expr,
+              behavior: &str,
+              args: &[Expr],
+              span: Span,
+          ) -> NuResult<(Substitution, Type)> {
+              let (s1, actor_ty) = self.infer_expr(ctx, actor)?;
+              let fresh_actor = Type::Actor {
+                  state: Box::new(Type::Var(TypeVar::fresh())),
+                  behavior: Box::new(Type::Var(TypeVar::fresh())),
+              };
+              let s2 = mgu(&apply_subst(&actor_ty, &s1), &fresh_actor, span)?;
+              let mut subst = compose_subst(&s2, &s1);
+              let resolved_actor = apply_subst(&actor_ty, &subst);
+              let signature = self.actor_behavior_signature(&resolved_actor, behavior, span)?;
+
+              let mut arg_types = Vec::with_capacity(args.len());
+              for arg in args {
+                  let ctx_sub = apply_subst_to_ctx(ctx, &subst);
+                  let (s_arg, arg_ty) = self.infer_expr(&ctx_sub, arg)?;
+                  subst = compose_subst(&s_arg, &subst);
+                  arg_types.push(arg_ty);
+              }
+
+              if let Some((expected_param, ret_type)) = signature {
+                  let actual_param = Self::pack_behavior_params(
+                      arg_types
+                          .iter()
+                          .map(|ty| apply_subst(ty, &subst))
+                          .collect(),
+                  );
+                  let s_args = mgu(
+                      &apply_subst(&expected_param, &subst),
+                      &actual_param,
+                      span,
+                  )?;
+                  subst = compose_subst(&s_args, &subst);
+                  return Ok((subst.clone(), apply_subst(&ret_type, &subst)));
+              }
+
+              Ok((subst, Type::Var(TypeVar::fresh())))
+          }
+
+'''
+          replace_between(send_start, send_end, send_replacement, "send/ask typing")
+
+          nominal_marker = "/// Compute the most general unifier of two types.\n"
+          contains_nominal = r'''fn contains_nominal(ty: &Type) -> bool {
+              match ty {
+                  Type::Nominal { .. } => true,
+                  Type::Tuple(types) => types.iter().any(contains_nominal),
+                  Type::Record(fields) => fields.iter().any(|(_, ty)| contains_nominal(ty)),
+                  Type::Variant(cases) => cases
+                      .iter()
+                      .any(|(_, payload)| payload.as_ref().is_some_and(contains_nominal)),
+                  Type::Array(inner) => contains_nominal(inner),
+                  Type::Function { param, ret, .. } => {
+                      contains_nominal(param) || contains_nominal(ret)
+                  }
+                  Type::Actor { state, behavior } => {
+                      contains_nominal(state) || contains_nominal(behavior)
+                  }
+                  Type::App { constructor, args } => {
+                      contains_nominal(constructor) || args.iter().any(contains_nominal)
+                  }
+                  Type::Reference { inner, .. } => contains_nominal(inner),
+                  Type::Scheme { body, .. } => contains_nominal(body),
+                  _ => false,
+              }
+          }
+
+'''
+          if nominal_marker not in text:
+              raise SystemExit("mgu marker not found")
+          text = text.replace(nominal_marker, contains_nominal + nominal_marker, 1)
+
+          replace_once(
+          '''    if !matches!(t1, Type::Nominal { .. })
+                  && !matches!(t2, Type::Nominal { .. })
+                  && t1.is_ground()
+                  && t2.is_ground()''',
+          '''    if !matches!(t1, Type::Nominal { .. })
+                  && !matches!(t2, Type::Nominal { .. })
+                  && !contains_nominal(t1)
+                  && !contains_nominal(t2)
+                  && t1.is_ground()
+                  && t2.is_ground()''',
+          "nested nominal unification guard",
+          )
+
+          path.write_text(text)
+          PY
+
+      - name: Make MIR behavior selection receiver-specific
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/mir_lower.rs")
+          text = path.read_text()
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              text = text.replace(old, new, 1)
+
+          def replace_between(start: str, end: str, replacement: str, label: str) -> None:
+              global text
+              start_pos = text.find(start)
+              if start_pos < 0:
+                  raise SystemExit(f"{label}: start marker not found")
+              end_pos = text.find(end, start_pos)
+              if end_pos < 0:
+                  raise SystemExit(f"{label}: end marker not found")
+              text = text[:start_pos] + replacement + text[end_pos:]
+
+          resolver_start = "    /// Resolve `send`/`ask actor behavior(...)` to a behavior-table index by\n"
+          resolver_end = "    fn fresh_lambda_name(&mut self) -> String {\n"
+          resolver = r'''    /// Resolve a send/ask only when the receiver contributes a nominal
+          /// actor owner. Global suffix fallback is deliberately forbidden: two
+          /// actors may legally expose the same short behavior name.
+          fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> Option<usize> {
+              if actor_name_hint.is_empty() {
+                  return None;
+              }
+              let full_name = format!("{}.{}", actor_name_hint, behavior);
+              self.behavior_names.iter().position(|name| *name == full_name)
+          }
+
+          /// Receive arms are local to the currently-running actor but HIR does
+          /// not yet carry that owner explicitly. Keep the legacy suffix lookup
+          /// isolated here instead of sharing it with outbound send/ask.
+          fn receive_behavior_idx(&self, behavior: &str) -> usize {
+              let suffix = format!(".{}", behavior);
+              self.behavior_names
+                  .iter()
+                  .position(|name| name.ends_with(&suffix))
+                  .unwrap_or(self.behaviors.len())
+          }
+
+'''
+          replace_between(resolver_start, resolver_end, resolver, "behavior index resolver")
+
+          send_lookup = '''                let actor_hint = operand_name_hint(actor);
+                          let idx = self.ctx.send_behavior_idx(&actor_hint, behavior);'''
+          send_replacement = '''                let actor_hint = operand_name_hint(actor);
+                          let idx = self
+                              .ctx
+                              .send_behavior_idx(&actor_hint, behavior)
+                              .ok_or_else(|| {
+                                  compile_err(
+                                      format!(
+                                          "cannot resolve behavior '{}.{}' from receiver type",
+                                          actor_hint, behavior
+                                      ),
+                                      Span::default(),
+                                  )
+                              })?;'''
+          if text.count(send_lookup) != 2:
+              raise SystemExit(
+                  f"send/ask MIR lookup: expected two matches, found {text.count(send_lookup)}"
+              )
+          text = text.replace(send_lookup, send_replacement)
+
+          replace_once(
+          '''            .map(|(name, _, _, _)| self.ctx.send_behavior_idx("", name) as u16)''',
+          '''            .map(|(name, _, _, _)| self.ctx.receive_behavior_idx(name) as u16)''',
+          "receive behavior lookup",
+          )
+
+          hint_start = "/// Best-effort actor-type-name hint for `send`/`ask` behavior resolution,\n"
+          hint_end = "\nfn literal_to_constant("
+          hint_replacement = r'''/// Recover the actor declaration owner from the nominal behavior schema
+          /// installed by the typechecker. Variable spelling is not semantic identity.
+          fn nominal_actor_name_from_type(ty: &Type) -> Option<String> {
+              match ty {
+                  Type::Actor { behavior, .. } => match behavior.as_ref() {
+                      Type::Nominal { name, .. } => name
+                          .strip_prefix("actor::")
+                          .and_then(|name| name.strip_suffix("::behaviors"))
+                          .map(str::to_owned),
+                      _ => None,
+                  },
+                  Type::Scheme { body, .. } => nominal_actor_name_from_type(body),
+                  _ => None,
+              }
+          }
+
+          fn operand_name_hint(op: &hir::Operand) -> String {
+              let ty = match op {
+                  hir::Operand::Var(_, ty) | hir::Operand::Literal(_, ty) => Some(ty),
+                  hir::Operand::Unit => None,
+              };
+              if let Some(actor_name) = ty.and_then(nominal_actor_name_from_type) {
+                  return actor_name;
+              }
+              match op {
+                  hir::Operand::Var(name, _) => name.clone(),
+                  _ => String::new(),
+              }
+          }
+          '''
+          replace_between(hint_start, hint_end, hint_replacement, "typed actor owner hint")
+
+          path.write_text(text)
+          PY
+
+      - name: Format and compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          git diff --check
+          cargo test --no-default-features typechecker::tests
+          cargo test --no-default-features mir_lower
+
+      - name: Run nominal actor conformance regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --quiet
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          target_dir = json.loads(
+              subprocess.check_output(
+                  ["cargo", "metadata", "--format-version", "1", "--no-deps"], text=True
+              )
+          )["target_directory"]
+          binary = os.path.join(target_dir, "debug", "nulang")
+          for base in (
+              "actor_18_nominal_behavior_owner",
+              "actor_19_nominal_behavior_payload_error",
+          ):
+              with open(f"conformance/behavior/{base}.json") as f:
+                  expected = json.load(f)
+              result = subprocess.run(
+                  [binary, f"conformance/behavior/{base}.nula"],
+                  capture_output=True,
+                  text=True,
+              )
+              out = result.stdout.strip()
+              err = result.stderr.strip()
+              assert result.returncode == expected.get("exit_code", 0), (base, result.returncode, err)
+              assert out == expected.get("stdout", ""), (base, out, err)
+              needle = expected.get("stderr", "")
+              assert not needle or needle in err, (base, needle, err)
+              print(f"PASS: {base}")
+          PY
+
+      - name: Land validated product delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin fix/nominal-actor-behavior-identity
+          remote_head="$(git rev-parse origin/fix/nominal-actor-behavior-identity)"
+          if [ "$remote_head" != "$START_HEAD" ]; then
+            echo "branch advanced during validation: $remote_head (expected $START_HEAD)" >&2
+            exit 1
+          fi
+          rm .github/workflows/p0-nominal-actor-behavior-identity.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/typechecker.rs src/mir_lower.rs .github/workflows/p0-nominal-actor-behavior-identity.yml
+          git diff --cached --check
+          git commit -m 'fix(actor): make behavior identity receiver-specific'
+          git push origin HEAD:fix/nominal-actor-behavior-identity
