@@ -34,13 +34,13 @@ jobs:
           cargo check --no-default-features --tests
 
       - name: Reject cross-schema bytecode slot
-        run: cargo test --no-default-features bytecode_dispatch_rejects_other_actor_schema_slot -- --exact
+        run: cargo test --no-default-features bytecode_dispatch_rejects_other_actor_schema_slot
 
       - name: Preserve schema through migration
-        run: cargo test --no-default-features actor_schema_identity_survives_snapshot_json_and_migration -- --exact
+        run: cargo test --no-default-features actor_schema_identity_survives_snapshot_json_and_migration
 
       - name: Ambiguous legacy actor fails closed
-        run: cargo test --no-default-features ambiguous_legacy_snapshot_has_no_cross_schema_bytecode_dispatch -- --exact
+        run: cargo test --no-default-features ambiguous_legacy_snapshot_has_no_cross_schema_bytecode_dispatch
 
       - name: Existing unknown-behavior regressions remain green
         run: |
