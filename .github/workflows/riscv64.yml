@@ -1,0 +1,75 @@
+name: RISC-V 64
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
+  CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+  CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
+  AR_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-ar
+  TARGET_CC: riscv64-linux-gnu-gcc
+  TARGET_AR: riscv64-linux-gnu-ar
+  CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUNNER: qemu-riscv64 -L /usr/riscv64-linux-gnu
+
+jobs:
+  riscv64:
+    name: Build & smoke test (riscv64gc Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install RISC-V toolchain and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-riscv64-linux-gnu \
+            binutils-riscv64-linux-gnu \
+            libc6-dev-riscv64-cross \
+            qemu-user
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: riscv64gc-unknown-linux-gnu
+
+      # Keep this profile intentionally independent of Python/SQLite/AI.
+      # It validates the portable language runtime plus Cranelift's riscv64
+      # JIT/AOT backend without requiring target-architecture Python packages.
+      - name: Cross-build Nulang with native codegen
+        run: |
+          cargo build \
+            --target riscv64gc-unknown-linux-gnu \
+            --no-default-features \
+            --features native-codegen \
+            --bin nulang
+
+      - name: Run bytecode VM smoke test under QEMU
+        run: |
+          qemu-riscv64 -L /usr/riscv64-linux-gnu \
+            target/riscv64gc-unknown-linux-gnu/debug/nulang \
+            examples/01_hello.nula
+
+      # This is the architecture-sensitive check: it forces Cranelift to
+      # detect a riscv64 host and execute generated RISC-V machine code.
+      - name: Run native backend smoke test under QEMU
+        run: |
+          qemu-riscv64 -L /usr/riscv64-linux-gnu \
+            target/riscv64gc-unknown-linux-gnu/debug/nulang \
+            --backend native examples/02_arithmetic.nula
+
+      - name: Cross-check capacity crate
+        run: |
+          cargo test -p nulang-capacity \
+            --target riscv64gc-unknown-linux-gnu
