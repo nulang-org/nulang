@@ -1,19 +1,18 @@
 //! Conservative static coverage analysis for `match` expressions.
 //!
 //! The runtime already retains a non-exhaustive-match fallback for cases the
-//! compiler cannot prove. This module handles the decidable finite-variant
-//! subset: declared variants, constructor arms, guards, and irrefutable
-//! catch-alls. It deliberately prefers false negatives (leave the runtime
-//! fallback in place) over false positives (claim an arm is exhaustive when it
-//! is not).
+//! compiler cannot prove. This module handles decidable finite domains first:
+//! declared variants and booleans. It deliberately prefers false negatives
+//! (leave the runtime fallback in place) over false positives (claim an arm is
+//! exhaustive when it is not).
 //!
 //! Nulang Core freezes the validity and runtime behavior of existing `match`
 //! programs (RFC 0002), so coverage findings are warnings rather than new hard
 //! type errors. Projects that want strict matching can opt into the existing
 //! `--deny-warnings` policy once these diagnostics are surfaced by the frontend.
 
-use crate::ast::Pattern;
-use crate::types::{NuWarning, Span, Type};
+use crate::ast::{Literal, Pattern};
+use crate::types::{NuWarning, PrimitiveType, Span, Type};
 use std::collections::HashSet;
 
 /// Result of statically analysing a finite match.
@@ -22,7 +21,7 @@ pub struct CoverageReport {
     /// Human-readable witnesses for values not covered by any unguarded arm.
     pub missing: Vec<String>,
     /// Zero-based arm indexes that can never be reached because an earlier
-    /// unguarded arm already covers the same constructor (or all values).
+    /// unguarded arm already covers the same value/constructor (or all values).
     pub redundant_arms: Vec<usize>,
 }
 
@@ -32,12 +31,26 @@ impl CoverageReport {
     }
 }
 
-/// Analyse a match when its scrutinee has a statically finite variant type.
+/// Analyse a match when its scrutinee belongs to a finite domain currently
+/// understood by the compiler coverage engine.
+///
+/// Supported today:
+/// - declared variant types;
+/// - `Bool`.
 ///
 /// `arms` stores the pattern and whether that arm has a guard. Guarded arms do
 /// not contribute to exhaustiveness because the guard may evaluate to false.
-/// Returns `None` for non-variant scrutinees; those continue to rely on the
-/// existing runtime non-exhaustive fallback.
+/// Returns `None` for domains the analyzer cannot prove finite/complete; those
+/// continue to rely on the existing runtime non-exhaustive fallback.
+pub fn analyze_match(scrutinee_ty: &Type, arms: &[(Pattern, bool)]) -> Option<CoverageReport> {
+    match peel_reference(scrutinee_ty) {
+        Type::Variant(_) => analyze_variant_match(scrutinee_ty, arms),
+        Type::Primitive(PrimitiveType::Bool) => Some(analyze_bool_match(arms)),
+        _ => None,
+    }
+}
+
+/// Analyse a match when its scrutinee has a statically finite variant type.
 pub fn analyze_variant_match(
     scrutinee_ty: &Type,
     arms: &[(Pattern, bool)],
@@ -99,11 +112,88 @@ pub fn analyze_variant_match(
     })
 }
 
-/// Convert finite-variant coverage findings into non-fatal compiler warnings.
+/// Analyse the two-value boolean domain.
+fn analyze_bool_match(arms: &[(Pattern, bool)]) -> CoverageReport {
+    let mut covered_true = false;
+    let mut covered_false = false;
+    let mut catch_all = false;
+    let mut redundant_arms = Vec::new();
+
+    for (index, (pattern, guarded)) in arms.iter().enumerate() {
+        if catch_all {
+            redundant_arms.push(index);
+            continue;
+        }
+
+        let pattern = strip_alias(pattern);
+
+        if *guarded {
+            match pattern {
+                Pattern::Lit(Literal::Bool(true)) if covered_true => redundant_arms.push(index),
+                Pattern::Lit(Literal::Bool(false)) if covered_false => redundant_arms.push(index),
+                _ => {}
+            }
+            continue;
+        }
+
+        if is_unconditional_catch_all(pattern) {
+            catch_all = true;
+            covered_true = true;
+            covered_false = true;
+            continue;
+        }
+
+        match pattern {
+            Pattern::Lit(Literal::Bool(true)) => {
+                if covered_true {
+                    redundant_arms.push(index);
+                } else {
+                    covered_true = true;
+                }
+            }
+            Pattern::Lit(Literal::Bool(false)) => {
+                if covered_false {
+                    redundant_arms.push(index);
+                } else {
+                    covered_false = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut missing = Vec::with_capacity(2);
+    if !covered_true {
+        missing.push("true".to_string());
+    }
+    if !covered_false {
+        missing.push("false".to_string());
+    }
+
+    CoverageReport {
+        missing,
+        redundant_arms,
+    }
+}
+
+/// Convert finite-domain coverage findings into non-fatal compiler warnings.
 ///
-/// This is intentionally separate from [`analyze_variant_match`] so IDEs,
-/// formatters, tests, and future strict-mode frontends can consume the raw
-/// report without committing to a presentation policy.
+/// This is intentionally separate from [`analyze_match`] so IDEs, formatters,
+/// tests, and future strict-mode frontends can consume the raw report without
+/// committing to a presentation policy.
+pub fn warnings_for_match(
+    scrutinee_ty: &Type,
+    arms: &[(Pattern, bool)],
+    span: Span,
+) -> Vec<NuWarning> {
+    let Some(report) = analyze_match(scrutinee_ty, arms) else {
+        return Vec::new();
+    };
+
+    warnings_from_report(report, span)
+}
+
+/// Backward-compatible variant-specific warning helper.
 pub fn warnings_for_variant_match(
     scrutinee_ty: &Type,
     arms: &[(Pattern, bool)],
@@ -113,6 +203,10 @@ pub fn warnings_for_variant_match(
         return Vec::new();
     };
 
+    warnings_from_report(report, span)
+}
+
+fn warnings_from_report(report: CoverageReport, span: Span) -> Vec<NuWarning> {
     let mut warnings = Vec::with_capacity(2);
 
     if !report.missing.is_empty() {
@@ -277,7 +371,6 @@ mod tests {
 
     #[test]
     fn refutable_payload_does_not_cover_whole_constructor() {
-        use crate::ast::Literal;
         let option = Type::Variant(vec![
             ("Some".into(), Some(Type::int())),
             ("None".into(), None),
@@ -327,18 +420,79 @@ mod tests {
     }
 
     #[test]
+    fn boolean_match_requires_both_values() {
+        let arms = vec![(Pattern::Lit(Literal::Bool(true)), false)];
+        let report = analyze_match(&Type::bool(), &arms).unwrap();
+        assert_eq!(report.missing, vec!["false"]);
+        assert!(!report.is_exhaustive());
+    }
+
+    #[test]
+    fn boolean_true_false_is_exhaustive() {
+        let arms = vec![
+            (Pattern::Lit(Literal::Bool(true)), false),
+            (Pattern::Lit(Literal::Bool(false)), false),
+        ];
+        let report = analyze_match(&Type::bool(), &arms).unwrap();
+        assert!(report.is_exhaustive());
+        assert!(report.redundant_arms.is_empty());
+    }
+
+    #[test]
+    fn guarded_boolean_arm_does_not_close_coverage() {
+        let arms = vec![
+            (Pattern::Lit(Literal::Bool(true)), true),
+            (Pattern::Lit(Literal::Bool(false)), false),
+        ];
+        let report = analyze_match(&Type::bool(), &arms).unwrap();
+        assert_eq!(report.missing, vec!["true"]);
+    }
+
+    #[test]
+    fn wildcard_closes_boolean_coverage_and_makes_later_arm_redundant() {
+        let arms = vec![
+            (Pattern::Wild, false),
+            (Pattern::Lit(Literal::Bool(false)), false),
+        ];
+        let report = analyze_match(&Type::bool(), &arms).unwrap();
+        assert!(report.is_exhaustive());
+        assert_eq!(report.redundant_arms, vec![1]);
+    }
+
+    #[test]
+    fn duplicate_boolean_literal_is_redundant() {
+        let arms = vec![
+            (Pattern::Lit(Literal::Bool(true)), false),
+            (Pattern::Lit(Literal::Bool(true)), true),
+            (Pattern::Lit(Literal::Bool(false)), false),
+        ];
+        let report = analyze_match(&Type::bool(), &arms).unwrap();
+        assert!(report.is_exhaustive());
+        assert_eq!(report.redundant_arms, vec![1]);
+    }
+
+    #[test]
     fn leaves_infinite_domains_to_runtime_fallback() {
         let arms = vec![(Pattern::Wild, true)];
-        assert!(analyze_variant_match(&Type::int(), &arms).is_none());
+        assert!(analyze_match(&Type::int(), &arms).is_none());
     }
 
     #[test]
     fn emits_non_exhaustive_warning_without_changing_validity() {
         let arms = vec![(variant("Red"), false), (variant("Green"), false)];
-        let warnings = warnings_for_variant_match(&color_type(), &arms, Span::new(10, 20));
+        let warnings = warnings_for_match(&color_type(), &arms, Span::new(10, 20));
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, "W0201");
         assert!(warnings[0].msg.contains("Blue"));
+    }
+
+    #[test]
+    fn emits_boolean_non_exhaustive_warning() {
+        let arms = vec![(Pattern::Lit(Literal::Bool(true)), false)];
+        let warnings = warnings_for_match(&Type::bool(), &arms, Span::default());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "W0201");
+        assert!(warnings[0].msg.contains("false"));
     }
 
     #[test]
@@ -349,7 +503,7 @@ mod tests {
             (Pattern::Wild, false),
             (variant("Blue"), false),
         ];
-        let warnings = warnings_for_variant_match(&color_type(), &arms, Span::default());
+        let warnings = warnings_for_match(&color_type(), &arms, Span::default());
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, "W0202");
         assert!(warnings[0].msg.contains("2, 4"));
@@ -362,7 +516,7 @@ mod tests {
             (variant("Red"), false),
             (variant("Green"), false),
         ];
-        let warnings = warnings_for_variant_match(&color_type(), &arms, Span::default());
+        let warnings = warnings_for_match(&color_type(), &arms, Span::default());
         assert_eq!(warnings.len(), 2);
         assert_eq!(warnings[0].code, "W0201");
         assert_eq!(warnings[1].code, "W0202");
