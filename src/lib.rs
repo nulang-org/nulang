@@ -13,6 +13,7 @@ pub mod agent;
 pub mod aot;
 pub mod ast;
 pub mod backends;
+pub mod behavior_identity;
 #[cfg(test)]
 pub mod benchmarks;
 pub mod bytecode;
