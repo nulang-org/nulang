@@ -93,12 +93,8 @@ mod tests {
     #[test]
     fn manifest_pins_protocols_formats_and_interpreter_runtime() {
         let capabilities = vec!["os".to_string(), "net".to_string()];
-        let manifest = MobileBuildManifest::new(
-            "mobile-app",
-            "app.nbc",
-            b"artifact-bytes",
-            &capabilities,
-        );
+        let manifest =
+            MobileBuildManifest::new("mobile-app", "app.nbc", b"artifact-bytes", &capabilities);
 
         assert_eq!(manifest.version, MOBILE_MANIFEST_VERSION);
         assert_eq!(manifest.artifact, "app.nbc");
@@ -111,7 +107,10 @@ mod tests {
             MOBILE_MESSAGE_PROTOCOL,
             nulang_ui_protocol::UI_MESSAGE_PROTOCOL_VERSION
         );
-        assert_eq!(manifest.ui_protocol, nulang_ui_protocol::UI_PROTOCOL_VERSION);
+        assert_eq!(
+            manifest.ui_protocol,
+            nulang_ui_protocol::UI_PROTOCOL_VERSION
+        );
         assert_eq!(
             manifest.message_protocol,
             nulang_ui_protocol::UI_MESSAGE_PROTOCOL_VERSION

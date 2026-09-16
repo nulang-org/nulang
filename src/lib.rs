@@ -50,11 +50,11 @@ pub mod mir;
 pub mod mir_codegen;
 pub mod mir_inline;
 pub mod mir_lower;
-pub mod mobile;
 #[cfg(feature = "wasm-backend")]
 pub mod mir_wasm;
 #[cfg(feature = "wasm-backend")]
 pub mod mir_wasm_simd;
+pub mod mobile;
 #[cfg(feature = "otel")]
 pub mod observability;
 pub mod package;
