@@ -204,7 +204,10 @@ pub struct ActorFleetInspection {
 
 /// Inspect one activation by its current runtime actor id.
 pub fn inspect_actor(runtime: &Runtime, actor_id: u64) -> Option<ActorInspection> {
-    runtime.actors.get(&actor_id).map(ActorInspection::from_actor)
+    runtime
+        .actors
+        .get(&actor_id)
+        .map(ActorInspection::from_actor)
 }
 
 /// Inspect every activation in stable actor-id order.
@@ -245,7 +248,10 @@ mod tests {
     fn inspection_projects_existing_actor_state_without_mutation() {
         let mut runtime = Runtime::new();
         let id = runtime.spawn_actor(Box::new(|| {
-            vec![("count".into(), Value::int(7)), ("ready".into(), Value::bool(true))]
+            vec![
+                ("count".into(), Value::int(7)),
+                ("ready".into(), Value::bool(true)),
+            ]
         }));
 
         {
@@ -256,7 +262,9 @@ mod tests {
             actor.children = vec![9, 3];
             actor.links = vec![8, 2];
             actor.monitors = vec![7, 1];
-            actor.capabilities.insert("Net::TcpOut(api.example:443)".into());
+            actor
+                .capabilities
+                .insert("Net::TcpOut(api.example:443)".into());
             actor.idle_ms = 1234;
             actor.pinned = true;
         }
