@@ -21,27 +21,46 @@ jobs:
           ref: fix/p0-runtime-durable-schema-identity
           fetch-depth: 0
 
-      - name: Pin branch head
+      - name: Pin child and cleaned parent heads
         shell: bash
         run: |
           set -euo pipefail
           echo "START_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          git fetch origin fix/p0-runtime-behavior-ownership
+          parent_head="$(git rev-parse origin/fix/p0-runtime-behavior-ownership)"
+          echo "PARENT_HEAD=$parent_head" >> "$GITHUB_ENV"
+          if git cat-file -e "$parent_head:.github/workflows/p0-runtime-behavior-ownership-land.yml" 2>/dev/null; then
+            echo "#316 has not completed its self-cleaning runtime landing yet" >&2
+            exit 1
+          fi
+          git show "$parent_head:src/runtime/mod.rs" | grep -q '^mod behavior_ownership;$'
+
+      - name: Synchronize final parent runtime shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout "$PARENT_HEAD" -- src/runtime/mod.rs src/lib.rs
+          rm -f .github/workflows/p0-runtime-behavior-ownership-land.yml
+          git diff --cached --check
 
       - name: Apply durable schema identity integration
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/p0_durable_schema_identity_land.py
+          python3 scripts/p0_durable_schema_identity_finalize.py
           git diff --check
+          git diff --cached --check
 
-      - name: Validate durable schema regressions
+      - name: Validate focused ownership and recovery regressions
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --no-default-features runtime_schema_identity::tests --lib
+          cargo test --no-default-features runtime::schema_identity::tests --lib
           cargo test --no-default-features --test runtime_snapshot_schema_identity
           cargo test --no-default-features --test runtime_actor_behavior_ownership
           cargo test --no-default-features --test runtime_grain_behavior_ownership
+          cargo test --no-default-features --test runtime_actor_schema_identity
 
       - name: Full no-default regression suite
         shell: bash
@@ -53,20 +72,27 @@ jobs:
           set -euo pipefail
           cargo fmt --all -- --check
           git diff --check
-          git diff --name-only
+          git diff --cached --check
+          git status --short
 
-      - name: Guard exact head and land validated durable identity
+      - name: Guard exact heads and land cleaned durable identity
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin fix/p0-runtime-durable-schema-identity
-          remote_head="$(git rev-parse origin/fix/p0-runtime-durable-schema-identity)"
-          if [ "$remote_head" != "$START_HEAD" ]; then
-            echo "branch advanced during validation: $remote_head (expected $START_HEAD)" >&2
+          git fetch origin fix/p0-runtime-durable-schema-identity fix/p0-runtime-behavior-ownership
+          child_remote="$(git rev-parse origin/fix/p0-runtime-durable-schema-identity)"
+          parent_remote="$(git rev-parse origin/fix/p0-runtime-behavior-ownership)"
+          if [ "$child_remote" != "$START_HEAD" ]; then
+            echo "child branch advanced during validation: $child_remote (expected $START_HEAD)" >&2
+            exit 1
+          fi
+          if [ "$parent_remote" != "$PARENT_HEAD" ]; then
+            echo "parent branch advanced during validation: $parent_remote (expected $PARENT_HEAD)" >&2
             exit 1
           fi
           git rm .github/workflows/p0-runtime-durable-schema-identity-land.yml
           git rm scripts/p0_durable_schema_identity_land.py
+          git rm scripts/p0_durable_schema_identity_finalize.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
