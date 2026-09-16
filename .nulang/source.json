@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "project": "nulang",
+  "source": {
+    "repository": {
+      "provider": "github",
+      "namespace": "nulang-org",
+      "name": "nulang",
+      "external_id": "1278594551",
+      "default_branch": "main",
+      "transport": "https"
+    },
+    "development": {
+      "enabled": true,
+      "source_engine": "change_graph",
+      "workspace_engine": "jujutsu",
+      "max_agent_concurrency": 250,
+      "isolation": "firecracker",
+      "validation": {
+        "profile": "rust-ci-v1",
+        "required": ["fmt", "check", "test"]
+      },
+      "integration": "change_dag",
+      "auto_rebase": true,
+      "auto_merge": false,
+      "export": "pull_request"
+    }
+  }
+}
