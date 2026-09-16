@@ -308,16 +308,9 @@ mod tests {
         let owner = format!("actor:{actor_id}");
         let invocation = EffectInvocationId::derive(owner.as_bytes(), 7, site, 0);
         let identity = EffectIdentity::new("Payments", "charge").unwrap();
-        let fingerprint =
-            RequestFingerprint::from_canonical_bytes(b"order=42&amount=1000");
+        let fingerprint = RequestFingerprint::from_canonical_bytes(b"order=42&amount=1000");
         let provider_key = Some(invocation.provider_idempotency_key("test-payments-v1"));
-        EffectIntent::new(
-            invocation,
-            site,
-            identity,
-            fingerprint,
-            provider_key,
-        )
+        EffectIntent::new(invocation, site, identity, fingerprint, provider_key)
     }
 
     #[test]
