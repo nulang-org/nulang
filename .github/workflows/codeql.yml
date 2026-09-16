@@ -17,6 +17,12 @@ on:
   schedule:
     - cron: "0 12 * * 1" # Weekly on Monday at 12:00 UTC
 
+# Cancel superseded executions for the same event/ref or pull request without
+# letting a main push cancel the independent scheduled security scan.
+concurrency:
+  group: codeql-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   security-events: write
   actions: read
