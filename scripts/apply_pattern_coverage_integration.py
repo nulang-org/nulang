@@ -30,7 +30,7 @@ replace_once(
 replace_once(
     "src/typechecker.rs",
     """        Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))\n    }\n\n    /// Bind pattern variables into a new context.\n""",
-    """        // Coverage is a semantic diagnostic, not a validity rule in Nulang\n        // 1.x: RFC 0002 freezes existing Core `match` program validity. Run\n        // the conservative finite-variant analysis only after all ordinary\n        // pattern/guard/arm type inference has succeeded, using the fully\n        // substituted scrutinee type as the source of truth.\n        let coverage_ty = apply_subst(&scrut_ty, &final_subst);\n        let coverage_arms: Vec<(Pattern, bool)> = arms\n            .iter()\n            .map(|(pattern, guard, _)| (pattern.clone(), guard.is_some()))\n            .collect();\n        self.warnings.extend(\n            crate::pattern_coverage::warnings_for_variant_match(\n                &coverage_ty,\n                &coverage_arms,\n                span,\n            ),\n        );\n\n        Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))\n    }\n\n    /// Bind pattern variables into a new context.\n""",
+    """        // Coverage is a semantic diagnostic, not a validity rule in Nulang\n        // 1.x: RFC 0002 freezes existing Core `match` program validity. Run\n        // the conservative finite-domain analysis only after all ordinary\n        // pattern/guard/arm type inference has succeeded, using the fully\n        // substituted scrutinee type as the source of truth.\n        let coverage_ty = apply_subst(&scrut_ty, &final_subst);\n        let coverage_arms: Vec<(Pattern, bool)> = arms\n            .iter()\n            .map(|(pattern, guard, _)| (pattern.clone(), guard.is_some()))\n            .collect();\n        self.warnings.extend(crate::pattern_coverage::warnings_for_match(\n            &coverage_ty,\n            &coverage_arms,\n            span,\n        ));\n\n        Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))\n    }\n\n    /// Bind pattern variables into a new context.\n""",
 )
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ replace_once(
 replace_once(
     "src/main.rs",
     """    // 3. Type check\n    let mut type_checker = TypeChecker::new();\n    let module_type = type_checker.check_module(&ast)?;\n\n    if verbose {\n""",
-    """    // 3. Type check\n    let mut type_checker = TypeChecker::new();\n    let module_type = type_checker.check_module(&ast)?;\n\n    // Semantic warnings are emitted only after successful type inference so\n    // they can use resolved variant types. They follow the same compatibility\n    // contract as parser warnings: warning-by-default, strict under\n    // --deny-warnings.\n    let type_warnings = type_checker.take_warnings();\n    if !type_warnings.is_empty() {\n        let use_color = std::io::stderr().is_terminal();\n        for w in &type_warnings {\n            eprintln!(\"{}\", nulang::diagnostic::format_warning(w, use_color));\n        }\n        if deny_warnings {\n            return Err(nulang::types::NuError::parse_error(\n                format!(\n                    \"aborting due to {} warning{} (--deny-warnings)\",\n                    type_warnings.len(),\n                    if type_warnings.len() == 1 { \"\" } else { \"s\" }\n                ),\n                type_warnings[0].span,\n            ));\n        }\n    }\n\n    if verbose {\n""",
+    """    // 3. Type check\n    let mut type_checker = TypeChecker::new();\n    let module_type = type_checker.check_module(&ast)?;\n\n    // Semantic warnings are emitted only after successful type inference so\n    // they can use resolved finite-domain types. They follow the same\n    // compatibility contract as parser warnings: warning-by-default, strict\n    // under --deny-warnings.\n    let type_warnings = type_checker.take_warnings();\n    if !type_warnings.is_empty() {\n        let use_color = std::io::stderr().is_terminal();\n        for w in &type_warnings {\n            eprintln!(\"{}\", nulang::diagnostic::format_warning(w, use_color));\n        }\n        if deny_warnings {\n            return Err(nulang::types::NuError::parse_error(\n                format!(\n                    \"aborting due to {} warning{} (--deny-warnings)\",\n                    type_warnings.len(),\n                    if type_warnings.len() == 1 { \"\" } else { \"s\" }\n                ),\n                type_warnings[0].span,\n            ));\n        }\n    }\n\n    if verbose {\n""",
 )
 
 # ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ replace_once(
 replace_once(
     "CHANGELOG.md",
     """### Added since 1.0.0-frozen — 2026-09-14 (web contract + capacity broker hardening)\n""",
-    """### Added since 1.0.0-frozen — 2026-09-16 (pattern coverage diagnostics)\n- **Finite variant match coverage diagnostics** (Experimental, RFC 0020,\n  `src/pattern_coverage.rs`, `src/typechecker.rs`). After successful ordinary\n  type inference, matches over statically finite variant types emit `W0201`\n  for missing constructors and `W0202` for redundant arms. Guarded arms do\n  not prove exhaustiveness. Existing Nulang Core program validity and the\n  runtime non-exhaustive-match fallback remain unchanged;\n  `--deny-warnings` provides opt-in strictness. The LSP preserves the same\n  warning codes and source ranges.\n\n### Added since 1.0.0-frozen — 2026-09-14 (web contract + capacity broker hardening)\n""",
+    """### Added since 1.0.0-frozen — 2026-09-16 (pattern coverage diagnostics)\n- **Finite-domain match coverage diagnostics** (Experimental, RFC 0020,\n  `src/pattern_coverage.rs`, `src/typechecker.rs`). After successful ordinary\n  type inference, matches over closed variant types and `Bool` emit `W0201`\n  for missing constructors/values and `W0202` for redundant arms. Guarded\n  arms do not prove exhaustiveness. Existing Nulang Core program validity and\n  the runtime non-exhaustive-match fallback remain unchanged;\n  `--deny-warnings` provides opt-in strictness. The LSP preserves the same\n  warning codes and source ranges.\n\n### Added since 1.0.0-frozen — 2026-09-14 (web contract + capacity broker hardening)\n""",
 )
 
 # ---------------------------------------------------------------------------
@@ -142,6 +142,39 @@ fn redundant_variant_arm_emits_w0202() {
     );
 
     assert!(warnings.iter().any(|w| w.code == "W0202"));
+}
+
+#[test]
+fn non_exhaustive_bool_match_emits_w0201() {
+    let warnings = warnings_for(
+        r#"
+        fn choose(flag: Bool) -> Int {
+            match flag {
+                | true => 1
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].code, "W0201");
+    assert!(warnings[0].msg.contains("false"));
+}
+
+#[test]
+fn exhaustive_bool_match_has_no_coverage_warning() {
+    let warnings = warnings_for(
+        r#"
+        fn choose(flag: Bool) -> Int {
+            match flag {
+                | true => 1
+                | false => 0
+            }
+        }
+        "#,
+    );
+
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 }
 ''')
 
