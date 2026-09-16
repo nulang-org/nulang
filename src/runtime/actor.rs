@@ -430,7 +430,7 @@ impl Actor {
         self.hibernation_state = Some(HibernationState {
             continuation_bytes: bytes.clone(),
             module_hash: *module_hash,
-            hibernated_at_ms: std::time::SystemTime::now()
+            hibernated_at_ms: std::time::SystemTimeTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
@@ -477,7 +477,7 @@ impl Actor {
     }
 
     /// Pin the actor so the scheduler-driven dehydration scanner never
-    /// hibernates this actor. Used to keep a grain resident while it is actively needed.
+    /// hibernates it.
     pub fn pin(&mut self) {
         self.pinned = true;
     }
@@ -487,7 +487,7 @@ impl Actor {
         self.pinned = false;
     }
 
-    /// True if this actor currently has in-flight execution that must not be
+    /// True if the actor currently has in-flight execution that must not be
     /// interrupted by dehydration (a suspended behavior, an armed receive-wait,
     /// a JIT-yield suspension, or an in-flight LLM call).
     pub fn is_mid_execution(&self) -> bool {
