@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# Keep only the newest CI run for a PR/ref. This prevents superseded commits
+# from occupying scarce hosted-runner slots while preserving independent runs
+# for different PRs and branches.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
