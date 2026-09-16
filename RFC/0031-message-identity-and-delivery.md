@@ -1,4 +1,4 @@
-# RFC 0020: Message Identity and Delivery Invariants
+# RFC 0031: Message Identity and Delivery Invariants
 
 - **Status:** Draft — identity primitives implemented in Phase 1
 - **Tier:** Experimental
