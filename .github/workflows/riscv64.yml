@@ -82,10 +82,10 @@ jobs:
             target/riscv64gc-unknown-linux-gnu/release/nulang \
             examples/01_hello.nula
 
-      # Force the VM hot counter past HOT_THRESHOLD and assert that the JIT
-      # actually compiled a loop region. The Cargo target runner executes the
-      # RISC-V test binary through qemu-riscv64, so this verifies tiered JIT
-      # generation and execution on the target ISA rather than only AOT.
+      # The focused integration test forces a hot loop past HOT_THRESHOLD and
+      # asserts jit_compiled_count() > 0. Cargo's target runner executes the
+      # RISC-V test binary through qemu-riscv64, proving target-ISA JIT code
+      # generation and execution without compiling unrelated unit-test code.
       - name: Exercise tiered JIT under QEMU
         run: |
           cargo test \
@@ -93,8 +93,7 @@ jobs:
             --target riscv64gc-unknown-linux-gnu \
             --no-default-features \
             --features native-codegen \
-            --lib 'jit::tests::test_jit_direct_call_loop_tiers_up' \
-            -- --exact
+            --test riscv_jit
 
       # This separately exercises the AOT/native backend. The CLI prints the
       # pure program result, so require the generated RISC-V code to compute
