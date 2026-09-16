@@ -53,26 +53,36 @@ impl From<ActivationFence> for PersistedActivationFence {
 
 /// Decision a persistence backend must enforce atomically with the durable
 /// mutation associated with the presented fence.
+///
+/// Every variant carries the actor namespace validated by the evaluator. This
+/// prevents callers from accidentally applying a valid epoch decision to a
+/// different actor when persisting the resulting fence state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationFenceDecision {
     /// No fence exists yet: establish the presented epoch and commit the write.
-    Initialize { epoch: u64 },
+    Initialize { actor_id: u64, epoch: u64 },
     /// The activation still owns the current epoch: commit normally.
-    Current { epoch: u64 },
+    Current { actor_id: u64, epoch: u64 },
     /// A newly-authoritative activation presents a higher epoch: atomically
     /// advance the stored fence and commit its first write.
-    Advance { previous_epoch: u64, epoch: u64 },
+    Advance {
+        actor_id: u64,
+        previous_epoch: u64,
+        epoch: u64,
+    },
 }
 
 impl ActivationFenceDecision {
     /// Fence state that must exist after the corresponding durable write commits.
-    pub fn resulting_state(self, actor_id: u64) -> PersistedActivationFence {
-        let epoch = match self {
-            Self::Initialize { epoch } | Self::Current { epoch } | Self::Advance { epoch, .. } => {
-                epoch
+    pub fn resulting_state(self) -> PersistedActivationFence {
+        match self {
+            Self::Initialize { actor_id, epoch } | Self::Current { actor_id, epoch } => {
+                PersistedActivationFence { actor_id, epoch }
             }
-        };
-        PersistedActivationFence { actor_id, epoch }
+            Self::Advance {
+                actor_id, epoch, ..
+            } => PersistedActivationFence { actor_id, epoch },
+        }
     }
 }
 
@@ -155,6 +165,7 @@ pub fn evaluate_activation_fence(
             });
         }
         return Ok(ActivationFenceDecision::Initialize {
+            actor_id: namespace_actor_id,
             epoch: presented.epoch,
         });
     };
@@ -183,11 +194,13 @@ pub fn evaluate_activation_fence(
 
     if presented.epoch == stored.epoch {
         return Ok(ActivationFenceDecision::Current {
+            actor_id: namespace_actor_id,
             epoch: stored.epoch,
         });
     }
 
     Ok(ActivationFenceDecision::Advance {
+        actor_id: namespace_actor_id,
         previous_epoch: stored.epoch,
         epoch: presented.epoch,
     })
@@ -199,7 +212,13 @@ mod tests {
 
     #[test]
     fn initial_epoch_is_one() {
-        assert_eq!(ActivationFence::initial(42), ActivationFence { actor_id: 42, epoch: 1 });
+        assert_eq!(
+            ActivationFence::initial(42),
+            ActivationFence {
+                actor_id: 42,
+                epoch: 1,
+            }
+        );
     }
 
     #[test]
@@ -214,27 +233,40 @@ mod tests {
     fn first_write_initializes_fence() {
         assert_eq!(
             evaluate_activation_fence(42, None, ActivationFence::initial(42)).unwrap(),
-            ActivationFenceDecision::Initialize { epoch: 1 }
+            ActivationFenceDecision::Initialize {
+                actor_id: 42,
+                epoch: 1,
+            }
         );
     }
 
     #[test]
     fn same_epoch_can_continue_writing() {
-        let stored = PersistedActivationFence { actor_id: 42, epoch: 3 };
+        let stored = PersistedActivationFence {
+            actor_id: 42,
+            epoch: 3,
+        };
         let presented = ActivationFence::new(42, 3).unwrap();
         assert_eq!(
             evaluate_activation_fence(42, Some(stored), presented).unwrap(),
-            ActivationFenceDecision::Current { epoch: 3 }
+            ActivationFenceDecision::Current {
+                actor_id: 42,
+                epoch: 3,
+            }
         );
     }
 
     #[test]
     fn higher_epoch_advances_authority() {
-        let stored = PersistedActivationFence { actor_id: 42, epoch: 3 };
+        let stored = PersistedActivationFence {
+            actor_id: 42,
+            epoch: 3,
+        };
         let presented = ActivationFence::new(42, 4).unwrap();
         assert_eq!(
             evaluate_activation_fence(42, Some(stored), presented).unwrap(),
             ActivationFenceDecision::Advance {
+                actor_id: 42,
                 previous_epoch: 3,
                 epoch: 4,
             }
@@ -243,7 +275,10 @@ mod tests {
 
     #[test]
     fn stale_writer_is_rejected_after_epoch_advance() {
-        let stored = PersistedActivationFence { actor_id: 42, epoch: 4 };
+        let stored = PersistedActivationFence {
+            actor_id: 42,
+            epoch: 4,
+        };
         let stale = ActivationFence::new(42, 3).unwrap();
         assert_eq!(
             evaluate_activation_fence(42, Some(stored), stale).unwrap_err(),
@@ -257,7 +292,10 @@ mod tests {
 
     #[test]
     fn actor_namespace_mismatch_fails_closed() {
-        let stored = PersistedActivationFence { actor_id: 42, epoch: 2 };
+        let stored = PersistedActivationFence {
+            actor_id: 42,
+            epoch: 2,
+        };
         let presented = ActivationFence::new(99, 2).unwrap();
         assert!(matches!(
             evaluate_activation_fence(42, Some(stored), presented),
@@ -267,7 +305,10 @@ mod tests {
 
     #[test]
     fn corrupt_stored_zero_epoch_fails_closed() {
-        let stored = PersistedActivationFence { actor_id: 42, epoch: 0 };
+        let stored = PersistedActivationFence {
+            actor_id: 42,
+            epoch: 0,
+        };
         assert_eq!(
             evaluate_activation_fence(42, Some(stored), ActivationFence::initial(42)).unwrap_err(),
             ActivationFenceError::CorruptStoredZeroEpoch { actor_id: 42 }
@@ -275,14 +316,18 @@ mod tests {
     }
 
     #[test]
-    fn decision_resulting_state_matches_committed_authority() {
+    fn decision_resulting_state_cannot_change_actor_namespace() {
         let decision = ActivationFenceDecision::Advance {
+            actor_id: 42,
             previous_epoch: 7,
             epoch: 8,
         };
         assert_eq!(
-            decision.resulting_state(42),
-            PersistedActivationFence { actor_id: 42, epoch: 8 }
+            decision.resulting_state(),
+            PersistedActivationFence {
+                actor_id: 42,
+                epoch: 8,
+            }
         );
     }
 }
