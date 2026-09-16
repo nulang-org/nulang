@@ -90,7 +90,7 @@ pub enum GrainIdentityBindingError {
 impl std::fmt::Display for GrainIdentityBindingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CompactIdCollision(error) => error.fmt(f),
+            Self::CompactIdCollision(error) => write!(f, "{error}"),
             Self::LogicalIdentityConflict {
                 grain_id,
                 existing_actor_id,
@@ -153,12 +153,44 @@ pub fn bind_grain_actor_id(
     Ok(())
 }
 
+/// Validate the complete set of grain identity indexes without mutating them.
+///
+/// Runtime activation should call this *before* recovery-module registration,
+/// snapshot hydration, persistence access with side effects, or actor insertion.
+/// After activation succeeds, [`bind_resident_grain_indexes`] commits the exact
+/// same validated relation. This two-phase protocol prevents both collision
+/// aliasing and phantom resident mappings after a failed hydration.
+pub fn validate_resident_grain_indexes(
+    grain_residents: &HashMap<GrainId, u64>,
+    actor_grain_id: &HashMap<u64, GrainId>,
+    grain_actor_ids: &HashMap<u64, GrainId>,
+    actor_id: u64,
+    grain_id: &GrainId,
+) -> Result<(), GrainIdentityBindingError> {
+    validate_grain_actor_id_binding(actor_grain_id, actor_id, grain_id)?;
+    validate_grain_actor_id_binding(grain_actor_ids, actor_id, grain_id)?;
+
+    if let Some(&existing_actor_id) = grain_residents.get(grain_id) {
+        if existing_actor_id != actor_id {
+            return Err(GrainIdentityBindingError::LogicalIdentityConflict {
+                grain_id: grain_id.clone(),
+                existing_actor_id,
+                attempted_actor_id: actor_id,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Atomically validate and establish the three indexes used by a resident
 /// grain activation.
 ///
 /// Validation is completed against every index before any map is mutated. A
 /// collision or logical rebinding therefore cannot leave the runtime with a
-/// partially-updated set of indexes.
+/// partially-updated set of indexes. For activation paths that can fail after
+/// identity validation, call [`validate_resident_grain_indexes`] first, perform
+/// activation, and call this function only after activation succeeds.
 pub fn bind_resident_grain_indexes(
     grain_residents: &mut HashMap<GrainId, u64>,
     actor_grain_id: &mut HashMap<u64, GrainId>,
@@ -166,18 +198,13 @@ pub fn bind_resident_grain_indexes(
     actor_id: u64,
     grain_id: GrainId,
 ) -> Result<(), GrainIdentityBindingError> {
-    validate_grain_actor_id_binding(actor_grain_id, actor_id, &grain_id)?;
-    validate_grain_actor_id_binding(grain_actor_ids, actor_id, &grain_id)?;
-
-    if let Some(&existing_actor_id) = grain_residents.get(&grain_id) {
-        if existing_actor_id != actor_id {
-            return Err(GrainIdentityBindingError::LogicalIdentityConflict {
-                grain_id,
-                existing_actor_id,
-                attempted_actor_id: actor_id,
-            });
-        }
-    }
+    validate_resident_grain_indexes(
+        grain_residents,
+        actor_grain_id,
+        grain_actor_ids,
+        actor_id,
+        &grain_id,
+    )?;
 
     grain_residents.entry(grain_id.clone()).or_insert(actor_id);
     actor_grain_id
@@ -402,6 +429,33 @@ mod tests {
         );
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings.get(&7), Some(&original));
+    }
+
+    #[test]
+    fn test_validate_resident_grain_indexes_is_pure() {
+        let original = GrainId::new("User", "42");
+        let attempted = GrainId::new("Order", "42");
+        let residents = HashMap::new();
+        let actor_to_grain = HashMap::new();
+        let mut known_ids = HashMap::new();
+        known_ids.insert(7, original.clone());
+
+        let error = validate_resident_grain_indexes(
+            &residents,
+            &actor_to_grain,
+            &known_ids,
+            7,
+            &attempted,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GrainIdentityBindingError::CompactIdCollision(_)
+        ));
+        assert!(residents.is_empty());
+        assert!(actor_to_grain.is_empty());
+        assert_eq!(known_ids.get(&7), Some(&original));
     }
 
     #[test]
