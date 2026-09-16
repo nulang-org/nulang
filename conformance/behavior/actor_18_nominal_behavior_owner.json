@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"42ok","stderr":"","proves":"send/ask behavior resolution is scoped to the receiver actor even when multiple actors declare the same short behavior name"}
