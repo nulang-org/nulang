@@ -193,7 +193,7 @@ release tests with recorded hardware/software configuration:
 
 ## Immediate implementation order
 
-1. Freeze and version the existing grain-id projection. **Started.**
+1. Freeze and version the existing grain-id projection. **Completed in the phase-1 hardening PR.**
 2. Reject compact grain-id collisions at every binding point.
 3. Make JSONL recovery consume a valid prefix and stop on corruption instead of
    skipping malformed records.
