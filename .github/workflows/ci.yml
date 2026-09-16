@@ -2,13 +2,164 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, codex/nominal-actor-dispatch]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # -----------------------------------------------------------------------
+  # Temporary P0 nominal-behavior migration bootstrap.
+  # This job runs only on the feature-branch push event. After executable
+  # validation it restores this workflow from the exact PR base and removes
+  # all migration helpers in the same product landing commit.
+  # -----------------------------------------------------------------------
+  nominal-behavior-migration:
+    name: P0 Nominal Behavior Migration
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/nominal-actor-dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: codex/nominal-actor-dispatch
+          fetch-depth: 0
+
+      - name: Pin exact head
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "START_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply nominal identity migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/p0_nominal_behavior_migrate.py
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate focused identity and protocol regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features --lib behavior_identity
+          cargo test --no-default-features --test actor_protocol_nominal
+
+      - name: Validate receiver identity reaches HIR and MIR
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > tests/nominal_actor_dispatch_p0.rs <<'RS'
+          use nulang::hir::{Decl, RValue, Stmt};
+          use nulang::lexer::Lexer;
+          use nulang::parser::Parser;
+          use nulang::typechecker::TypeChecker;
+
+          fn find_behavior(body: &nulang::hir::Body, expected: &str) -> bool {
+              for stmt in &body.stmts {
+                  if let Stmt::Let { value, .. } = stmt {
+                      match value {
+                          RValue::Send { behavior, .. } | RValue::Ask { behavior, .. }
+                              if behavior == expected =>
+                          {
+                              return true;
+                          }
+                          RValue::Block(inner) if find_behavior(inner, expected) => return true,
+                          _ => {}
+                      }
+                  }
+              }
+              false
+          }
+
+          #[test]
+          fn duplicate_short_name_preserves_second_actor_identity() {
+              let source = r#"
+                  actor First { behavior hit(value: Int) { nil } }
+                  actor Second { behavior hit(value: String) { nil } }
+                  fn main() {
+                      let target = spawn Second {}
+                      send target hit("ok")
+                  }
+              "#;
+
+              let tokens = Lexer::new(source).lex().unwrap();
+              let ast = Parser::new(tokens).parse_module().unwrap();
+              let mut tc = TypeChecker::new();
+              tc.check_module(&ast).unwrap();
+              let hir = nulang::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+
+              assert!(hir.decls.iter().any(|decl| match decl {
+                  Decl::Function(function) => find_behavior(&function.body, "Second.hit"),
+                  _ => false,
+              }));
+
+              nulang::mir_lower::lower_module(&hir).unwrap();
+          }
+          RS
+          cargo test --no-default-features --test nominal_actor_dispatch_p0
+          rm tests/nominal_actor_dispatch_p0.rs
+
+      - name: Validate minimal compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --no-default-features
+          cargo fmt --all -- --check
+          git diff --check
+
+      - name: Verify isolated product transform
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only)"
+          expected="$(printf '%s\n' \
+            src/actor_protocol.rs \
+            src/behavior_identity.rs \
+            src/hir_lower.rs \
+            src/mir_lower.rs)"
+          printf 'product working-tree paths:\n%s\n' "$changed"
+          test "$changed" = "$expected"
+
+      - name: Guard exact head and land product-only PR state
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin codex/nominal-actor-dispatch
+          remote_head="$(git rev-parse origin/codex/nominal-actor-dispatch)"
+          if [ "$remote_head" != "$START_HEAD" ]; then
+            echo "branch advanced during validation: $remote_head (expected $START_HEAD)" >&2
+            exit 1
+          fi
+
+          # Restore the registered CI workflow from the exact stacked-PR base,
+          # then remove both temporary migration helpers. The landing commit
+          # leaves only product/compiler changes in the PR diff.
+          git show 44159e34580a0820e298e466d6619c03b4aa11d4:.github/workflows/ci.yml > .github/workflows/ci.yml
+          git rm .github/workflows/p0-nominal-behavior-mir.yml
+          git rm scripts/p0_nominal_behavior_migrate.py
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add \
+            .github/workflows/ci.yml \
+            src/actor_protocol.rs \
+            src/behavior_identity.rs \
+            src/hir_lower.rs \
+            src/mir_lower.rs
+          git diff --cached --check
+
+          git commit -m 'fix(compiler): preserve nominal actor behavior identity'
+          git push origin HEAD:codex/nominal-actor-dispatch
+
   # -----------------------------------------------------------------------
   # Primary build & test (default features)
   # -----------------------------------------------------------------------
@@ -78,7 +229,6 @@ jobs:
       - name: Test (release)
         run: cargo test --release
 
-
   # -----------------------------------------------------------------------
   # Nula package-manager smoke test — scaffold a package and run `nula test`
   # -----------------------------------------------------------------------
@@ -118,6 +268,7 @@ jobs:
 
       - name: Verify documentation examples
         run: NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
+
   # -----------------------------------------------------------------------
   # No-default-features build — proves zero PyO3/SQLite/LSP dependencies
   # -----------------------------------------------------------------------
