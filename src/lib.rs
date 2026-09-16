@@ -28,6 +28,7 @@ pub mod dap;
 pub mod delivery;
 pub mod delivery_legacy;
 pub mod delivery_runtime;
+pub mod delivery_wire;
 pub mod diagnostic;
 #[cfg(feature = "native-codegen")]
 pub mod difffuzz;
@@ -67,6 +68,7 @@ pub mod primitives;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod registry;
+pub mod remote_delivery;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
