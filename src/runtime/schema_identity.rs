@@ -14,6 +14,10 @@ pub(crate) enum SnapshotSchemaError {
         schema_name: String,
         candidates: Vec<String>,
     },
+    UnexpectedPersistedSchema {
+        expected_schema_name: String,
+        actual_schema_name: String,
+    },
     AmbiguousLegacySnapshot {
         candidates: Vec<String>,
     },
@@ -30,6 +34,13 @@ impl fmt::Display for SnapshotSchemaError {
                 f,
                 "persisted actor schema '{schema_name}' is not declared by the loaded module (declared: {})",
                 candidates.join(", ")
+            ),
+            SnapshotSchemaError::UnexpectedPersistedSchema {
+                expected_schema_name,
+                actual_schema_name,
+            } => write!(
+                f,
+                "persisted actor schema '{actual_schema_name}' does not match expected schema '{expected_schema_name}'"
             ),
             SnapshotSchemaError::AmbiguousLegacySnapshot { candidates } => write!(
                 f,
@@ -91,6 +102,27 @@ pub(crate) fn resolve_snapshot_actor_meta<'a>(
     Ok(first)
 }
 
+/// Resolve a durable snapshot for a caller that already knows which schema it
+/// must represent, such as `resolve_or_hydrate_grain(Type@key)`.
+///
+/// This closes a subtle multi-schema hole: an exact persisted schema can be
+/// valid for the module while still being the wrong schema for the requested
+/// virtual actor type.
+pub(crate) fn resolve_expected_snapshot_actor_meta<'a>(
+    module: &'a CodeModule,
+    persisted_schema_name: Option<&str>,
+    expected_schema_name: &str,
+) -> Result<&'a ActorMeta, SnapshotSchemaError> {
+    let meta = resolve_snapshot_actor_meta(module, persisted_schema_name)?;
+    if meta.name != expected_schema_name {
+        return Err(SnapshotSchemaError::UnexpectedPersistedSchema {
+            expected_schema_name: expected_schema_name.to_string(),
+            actual_schema_name: meta.name.clone(),
+        });
+    }
+    Ok(meta)
+}
+
 fn sorted_schema_names(module: &CodeModule) -> Vec<String> {
     let mut names: Vec<String> = module
         .actor_metadata
@@ -144,6 +176,23 @@ mod tests {
             SnapshotSchemaError::UnknownPersistedSchema {
                 schema_name: "Missing".to_string(),
                 candidates: vec!["First".to_string(), "Second".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn expected_schema_rejects_another_valid_module_schema() {
+        let module = compile(
+            r#"
+            virtual entity Counter(key: String) { behavior hit() { nil } }
+            actor Other { behavior hit() { nil } }
+            "#,
+        );
+        assert_eq!(
+            resolve_expected_snapshot_actor_meta(&module, Some("Other"), "Counter").unwrap_err(),
+            SnapshotSchemaError::UnexpectedPersistedSchema {
+                expected_schema_name: "Counter".to_string(),
+                actual_schema_name: "Other".to_string(),
             }
         );
     }
