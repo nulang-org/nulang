@@ -81,6 +81,8 @@ pub mod resolver;
 pub mod runtime;
 #[path = "runtime/behavior_ownership.rs"]
 pub(crate) mod runtime_behavior_ownership;
+#[path = "runtime/schema_identity.rs"]
+pub(crate) mod runtime_schema_identity;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;
