@@ -139,9 +139,7 @@ impl MigrationRegistry {
     ) -> Result<(), EvolutionError> {
         let schema = schema.into();
         if target == SchemaVersion::LEGACY {
-            return Err(EvolutionError::LegacyCannotBeWriteTarget {
-                schema,
-            });
+            return Err(EvolutionError::LegacyCannotBeWriteTarget { schema });
         }
         self.targets.insert(schema, target);
         Ok(())
@@ -254,12 +252,12 @@ impl MigrationRegistry {
         Ok((version, value))
     }
 
-    pub fn upcast_event(&self, mut event: VersionedEvent) -> Result<VersionedEvent, EvolutionError> {
-        let (version, payload) = self.upcast(
-            &event.event_type,
-            event.schema_version,
-            event.payload,
-        )?;
+    pub fn upcast_event(
+        &self,
+        mut event: VersionedEvent,
+    ) -> Result<VersionedEvent, EvolutionError> {
+        let (version, payload) =
+            self.upcast(&event.event_type, event.schema_version, event.payload)?;
         event.schema_version = version;
         event.payload = payload;
         Ok(event)
@@ -269,11 +267,8 @@ impl MigrationRegistry {
         &self,
         mut snapshot: VersionedSnapshot,
     ) -> Result<VersionedSnapshot, EvolutionError> {
-        let (version, state) = self.upcast(
-            &snapshot.schema,
-            snapshot.schema_version,
-            snapshot.state,
-        )?;
+        let (version, state) =
+            self.upcast(&snapshot.schema, snapshot.schema_version, snapshot.state)?;
         snapshot.schema_version = version;
         snapshot.state = state;
         Ok(snapshot)
@@ -319,7 +314,10 @@ impl fmt::Display for EvolutionError {
                 write!(f, "unknown durable schema '{schema}'")
             }
             EvolutionError::LegacyCannotBeWriteTarget { schema } => {
-                write!(f, "schema '{schema}' cannot use legacy version 0 as a write target")
+                write!(
+                    f,
+                    "schema '{schema}' cannot use legacy version 0 as a write target"
+                )
             }
             EvolutionError::FutureVersion {
                 schema,
