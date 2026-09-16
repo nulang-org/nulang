@@ -46,6 +46,7 @@ pub mod json_diagnostics;
 pub mod lexer;
 #[cfg(feature = "lsp")]
 pub mod lsp;
+pub mod migration_chain;
 pub mod mir;
 pub mod mir_codegen;
 pub mod mir_inline;
@@ -69,6 +70,7 @@ pub mod registry;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
+pub mod schema_identity;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;
