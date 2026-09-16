@@ -11,7 +11,7 @@ The supported baseline covers:
 - the Nulang frontend and bytecode VM;
 - actor/runtime code that is included in a no-default-features build;
 - Cranelift-backed native code generation and JIT execution;
-- the `nulang-capacity` crate;
+- the `nulang-capacity` crate, including `Architecture::Riscv64` placement constraints;
 - execution under a real riscv64 Linux userspace or QEMU user-mode emulation.
 
 The repository's RISC-V workflow cross-compiles this configuration on every pull request and runs both bytecode and native-codegen smoke tests under QEMU.
@@ -60,6 +60,16 @@ qemu-riscv64 -L /usr/riscv64-linux-gnu \
 `cranelift-codegen` is compiled with its `riscv64` backend enabled in `Cargo.toml`. Nulang's JIT/AOT implementation asks `cranelift-native` for the host ISA, so a Nulang process running on riscv64 generates riscv64 code rather than assuming x86-64 or AArch64.
 
 Nulang's hand-selected SIMD fast path is currently enabled only where its architecture-specific capability check succeeds. On riscv64 it falls back to scalar codegen; RISC-V Vector Extension (RVV) optimization is not part of the compatibility baseline.
+
+## Capacity placement
+
+`nulang-capacity::Architecture` includes `Riscv64`, serialized as `riscv64`. Jobs can therefore require RISC-V explicitly and the broker treats architecture as a hard eligibility constraint rather than a ranking preference. A RISC-V workload cannot be silently placed on an x86-64 or Arm64 offer.
+
+## Portability notes
+
+The native smoke test deliberately runs generated machine code, rather than only cross-compiling the Rust binary. This catches target-ISA regressions that a compile-only check would miss.
+
+The JIT callback bridge still stores a Rust trait-object pointer across a short thread-local execution boundary. That code is exercised by the native RISC-V smoke path, but Rust does not specify trait-object representation as a stable ABI. Removing that representation assumption is tracked as portability hardening rather than as a prerequisite for the RV64 Linux baseline.
 
 ## Scope and non-goals
 
