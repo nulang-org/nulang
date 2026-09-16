@@ -6,9 +6,14 @@
 //! catch-alls. It deliberately prefers false negatives (leave the runtime
 //! fallback in place) over false positives (claim an arm is exhaustive when it
 //! is not).
+//!
+//! Nulang Core freezes the validity and runtime behavior of existing `match`
+//! programs (RFC 0002), so coverage findings are warnings rather than new hard
+//! type errors. Projects that want strict matching can opt into the existing
+//! `--deny-warnings` policy once these diagnostics are surfaced by the frontend.
 
 use crate::ast::Pattern;
-use crate::types::Type;
+use crate::types::{NuWarning, Span, Type};
 use std::collections::HashSet;
 
 /// Result of statically analysing a finite match.
@@ -92,6 +97,59 @@ pub fn analyze_variant_match(
         missing,
         redundant_arms,
     })
+}
+
+/// Convert finite-variant coverage findings into non-fatal compiler warnings.
+///
+/// This is intentionally separate from [`analyze_variant_match`] so IDEs,
+/// formatters, tests, and future strict-mode frontends can consume the raw
+/// report without committing to a presentation policy.
+pub fn warnings_for_variant_match(
+    scrutinee_ty: &Type,
+    arms: &[(Pattern, bool)],
+    span: Span,
+) -> Vec<NuWarning> {
+    let Some(report) = analyze_variant_match(scrutinee_ty, arms) else {
+        return Vec::new();
+    };
+
+    let mut warnings = Vec::with_capacity(2);
+
+    if !report.missing.is_empty() {
+        let missing = report.missing.join(", ");
+        warnings.push(NuWarning {
+            code: "W0201",
+            msg: format!("non-exhaustive match: missing {missing}"),
+            span,
+            help: Some(format!(
+                "add arm{} for {missing}; without one, an uncovered value keeps the frozen runtime non-exhaustive-match behavior",
+                if report.missing.len() == 1 { "" } else { "s" }
+            )),
+        });
+    }
+
+    if !report.redundant_arms.is_empty() {
+        let one_based: Vec<String> = report
+            .redundant_arms
+            .iter()
+            .map(|index| (index + 1).to_string())
+            .collect();
+        let label = if one_based.len() == 1 { "arm" } else { "arms" };
+        warnings.push(NuWarning {
+            code: "W0202",
+            msg: format!(
+                "redundant match {label}: {} cannot be reached",
+                one_based.join(", ")
+            ),
+            span,
+            help: Some(
+                "remove the redundant arm or move/refine it before the pattern that already covers the same values"
+                    .to_string(),
+            ),
+        });
+    }
+
+    warnings
 }
 
 /// Peel compile-time reference wrappers. Pattern matching observes the value
@@ -272,5 +330,41 @@ mod tests {
     fn leaves_infinite_domains_to_runtime_fallback() {
         let arms = vec![(Pattern::Wild, true)];
         assert!(analyze_variant_match(&Type::int(), &arms).is_none());
+    }
+
+    #[test]
+    fn emits_non_exhaustive_warning_without_changing_validity() {
+        let arms = vec![(variant("Red"), false), (variant("Green"), false)];
+        let warnings = warnings_for_variant_match(&color_type(), &arms, Span::new(10, 20));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "W0201");
+        assert!(warnings[0].msg.contains("Blue"));
+    }
+
+    #[test]
+    fn emits_redundant_arm_warning_with_one_based_arm_numbers() {
+        let arms = vec![
+            (variant("Red"), false),
+            (variant("Red"), false),
+            (Pattern::Wild, false),
+            (variant("Blue"), false),
+        ];
+        let warnings = warnings_for_variant_match(&color_type(), &arms, Span::default());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "W0202");
+        assert!(warnings[0].msg.contains("2, 4"));
+    }
+
+    #[test]
+    fn can_emit_coverage_and_redundancy_warnings_together() {
+        let arms = vec![
+            (variant("Red"), false),
+            (variant("Red"), false),
+            (variant("Green"), false),
+        ];
+        let warnings = warnings_for_variant_match(&color_type(), &arms, Span::default());
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].code, "W0201");
+        assert_eq!(warnings[1].code, "W0202");
     }
 }
