@@ -30,8 +30,8 @@ jobs:
           cargo test --no-default-features typechecker::tests
           cargo test --no-default-features mir_lower
 
-      - name: Build compiler
-        run: cargo build --quiet
+      - name: Build minimal compiler
+        run: cargo build --quiet --no-default-features
 
       - name: Nominal owner passes
         run: |
