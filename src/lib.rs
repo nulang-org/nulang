@@ -17,6 +17,7 @@ pub mod authority_host;
 mod authority_runtime;
 pub use authority_runtime::RuntimeAuthorityError;
 pub mod backends;
+pub mod behavior_identity;
 #[cfg(test)]
 pub mod benchmarks;
 pub mod bytecode;
@@ -45,6 +46,7 @@ pub mod format;
 #[cfg(feature = "native-codegen")]
 pub mod fuzz;
 pub mod hir;
+#[path = "hir_lower_nominal.rs"]
 pub mod hir_lower;
 pub mod integration_tests;
 pub mod iso_arena;
