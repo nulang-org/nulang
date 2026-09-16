@@ -750,9 +750,8 @@ mod tests {
 
         let args = [nulang_value_int_new(20), nulang_value_int_new(22)];
         let name = CString::new("add").unwrap();
-        let result = unsafe {
-            nulang_call_function(rt, handle, name.as_ptr(), args.as_ptr(), args.len())
-        };
+        let result =
+            unsafe { nulang_call_function(rt, handle, name.as_ptr(), args.as_ptr(), args.len()) };
         assert_eq!(nulang_value_int(result), 42);
 
         unsafe { nulang_runtime_free(rt) };
@@ -828,10 +827,9 @@ mod tests {
         let rt = nulang_runtime_new();
         assert!(!rt.is_null());
 
-        let source = CString::new(
-            "fn len(s: String) -> Int { perform String.length(s) } len(\"\")",
-        )
-        .unwrap();
+        let source =
+            CString::new("fn len(s: String) -> Int { perform String.length(s) } len(\"\")")
+                .unwrap();
         let first = unsafe { nulang_compile(rt, source.as_ptr()) };
         let cached = unsafe { nulang_compile(rt, source.as_ptr()) };
         assert!(first >= 0 && cached >= 0);
@@ -845,9 +843,8 @@ mod tests {
         let args = [arg];
         let name = CString::new("len").unwrap();
         // SAFETY: rt and cached are valid, name is a valid C string, and args is live.
-        let result = unsafe {
-            nulang_call_function(rt, cached, name.as_ptr(), args.as_ptr(), args.len())
-        };
+        let result =
+            unsafe { nulang_call_function(rt, cached, name.as_ptr(), args.as_ptr(), args.len()) };
         assert_eq!(nulang_value_int(result), 6);
 
         unsafe { nulang_runtime_free(rt) };

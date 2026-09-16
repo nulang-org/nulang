@@ -54,6 +54,7 @@ pub mod mir_lower;
 pub mod mir_wasm;
 #[cfg(feature = "wasm-backend")]
 pub mod mir_wasm_simd;
+pub mod mobile;
 #[cfg(feature = "otel")]
 pub mod observability;
 pub mod package;

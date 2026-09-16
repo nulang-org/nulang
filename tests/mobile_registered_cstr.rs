@@ -15,7 +15,11 @@ extern "C" fn capture_mobile_json(value: *const c_char) {
     } else {
         // SAFETY: the VM's CStr marshalling path provides a valid temporary
         // null-terminated string for the duration of this callback.
-        Some(unsafe { CStr::from_ptr(value) }.to_string_lossy().into_owned())
+        Some(
+            unsafe { CStr::from_ptr(value) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     };
     *CAPTURED.get_or_init(|| Mutex::new(None)).lock().unwrap() = text;
 }
@@ -61,7 +65,9 @@ fn interpreter_mobile_profile_delivers_nulang_strings_to_registered_cstr_callbac
             "unknown compile error".to_string()
         } else {
             // SAFETY: non-null error is a runtime-owned C string.
-            unsafe { CStr::from_ptr(error) }.to_string_lossy().into_owned()
+            unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned()
         };
         // SAFETY: runtime was created above and is freed exactly once.
         unsafe { nulang_runtime_free(runtime) };
