@@ -350,6 +350,13 @@ fn spawn_from_module_with_initial_authority(
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
         if let Some(meta) = meta {
+            // Preserve canonical actor schema identity at runtime. Plain
+            // module-spawned actors previously retained only `actor_<id>`,
+            // which discarded the ownership information needed to validate
+            // numeric and name-based behavior dispatch. Workflows already use
+            // the schema name, so this unifies both paths without changing
+            // manually spawned/native actors.
+            actor.name = meta.name.clone();
             if matches!(role, ActorRole::Agent) {
                 // Legacy storage flag retained until the serialized role enum
                 // replaces the compatibility booleans.
