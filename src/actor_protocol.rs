@@ -6,7 +6,7 @@
 //! source of truth for unification. Dynamic/opaque actor references retain the
 //! previous permissive behavior until an explicit protocol type is available.
 
-use crate::ast::{self, AstModule, Behavior, Decl, Expr, Literal, Param, Pattern, StateMachineEvent};
+use crate::ast::{self, AstModule, Behavior, Decl, Expr, Literal, Param, Pattern};
 use crate::types::{NuError, NuResult, PrimitiveType, Span, Type};
 use rustc_hash::FxHashMap;
 
@@ -214,19 +214,14 @@ fn shadow_pattern(env: &mut Env, pattern: &Pattern) {
         Pattern::Var(name) => {
             env.actors.remove(name);
         }
-        Pattern::Tuple(items) | Pattern::Record(items) => {
-            match pattern {
-                Pattern::Tuple(items) => {
-                    for item in items {
-                        shadow_pattern(env, item);
-                    }
-                }
-                Pattern::Record(fields) => {
-                    for (_, item) in fields {
-                        shadow_pattern(env, item);
-                    }
-                }
-                _ => unreachable!(),
+        Pattern::Tuple(items) => {
+            for item in items {
+                shadow_pattern(env, item);
+            }
+        }
+        Pattern::Record(fields) => {
+            for (_, item) in fields {
+                shadow_pattern(env, item);
             }
         }
         Pattern::Variant(_, Some(inner)) => shadow_pattern(env, inner),
@@ -806,8 +801,10 @@ mod tests {
         let result = check(
             r#"
             actor Counter { behavior inc() { nil } }
-            let c = spawn Counter {} in
-                let c = other in send c whatever(1)
+            fn relay(other) {
+                let c = spawn Counter {} in
+                    let c = other in send c whatever(1)
+            }
             "#,
         );
         assert!(result.is_ok(), "shadowed dynamic actor should stay permissive: {:?}", result.err());
