@@ -62,6 +62,7 @@ fn mir_send_indices(module: &nulang::mir::Module) -> Vec<usize> {
     module
         .functions
         .iter()
+        .chain(module.behaviors.iter())
         .flat_map(|function| function.blocks.iter())
         .flat_map(|block| block.stmts.iter())
         .filter_map(|stmt| match stmt {
@@ -78,6 +79,7 @@ fn mir_ask_indices(module: &nulang::mir::Module) -> Vec<usize> {
     module
         .functions
         .iter()
+        .chain(module.behaviors.iter())
         .flat_map(|function| function.blocks.iter())
         .flat_map(|block| block.stmts.iter())
         .filter_map(|stmt| match stmt {
@@ -88,6 +90,14 @@ fn mir_ask_indices(module: &nulang::mir::Module) -> Vec<usize> {
             _ => None,
         })
         .collect()
+}
+
+fn behavior_index(module: &nulang::mir::Module, name: &str) -> usize {
+    module
+        .behaviors
+        .iter()
+        .position(|behavior| behavior.name == name)
+        .unwrap_or_else(|| panic!("missing MIR behavior {name}"))
 }
 
 #[test]
@@ -116,16 +126,8 @@ fn duplicate_short_behavior_name_lowers_send_to_receiver_schema() {
         _ => false,
     }));
 
-    let first_hit = mir
-        .behaviors
-        .iter()
-        .position(|behavior| behavior.name == "First.hit")
-        .expect("First.hit MIR behavior");
-    let second_hit = mir
-        .behaviors
-        .iter()
-        .position(|behavior| behavior.name == "Second.hit")
-        .expect("Second.hit MIR behavior");
+    let first_hit = behavior_index(&mir, "First.hit");
+    let second_hit = behavior_index(&mir, "Second.hit");
     let send_indices = mir_send_indices(&mir);
 
     assert!(
@@ -164,20 +166,78 @@ fn duplicate_short_behavior_name_lowers_ask_to_receiver_schema() {
         _ => false,
     }));
 
-    let first_read = mir
-        .behaviors
-        .iter()
-        .position(|behavior| behavior.name == "First.read")
-        .expect("First.read MIR behavior");
-    let second_read = mir
-        .behaviors
-        .iter()
-        .position(|behavior| behavior.name == "Second.read")
-        .expect("Second.read MIR behavior");
+    let first_read = behavior_index(&mir, "First.read");
+    let second_read = behavior_index(&mir, "Second.read");
     let ask_indices = mir_ask_indices(&mir);
 
     assert!(ask_indices.contains(&second_read));
     assert!(!ask_indices.contains(&first_read));
+}
+
+#[test]
+fn copied_actor_reference_preserves_nominal_schema() {
+    let (hir, mir) = lower(
+        r#"
+        actor First {
+            behavior hit(value: Int) { nil }
+        }
+
+        actor Second {
+            behavior hit(value: String) { nil }
+        }
+
+        fn main() {
+            let original = spawn Second {}
+            let copy = original
+            send copy hit("second")
+        }
+        "#,
+    );
+
+    assert!(hir.decls.iter().any(|decl| match decl {
+        Decl::Function(function) => {
+            hir_contains_nominal_dispatch(&function.body, "Second", "hit")
+        }
+        _ => false,
+    }));
+
+    let first_hit = behavior_index(&mir, "First.hit");
+    let second_hit = behavior_index(&mir, "Second.hit");
+    let send_indices = mir_send_indices(&mir);
+    assert!(send_indices.contains(&second_hit));
+    assert!(!send_indices.contains(&first_hit));
+}
+
+#[test]
+fn self_dispatch_preserves_enclosing_actor_schema() {
+    let (hir, mir) = lower(
+        r#"
+        actor First {
+            behavior hit() { nil }
+        }
+
+        actor Second {
+            behavior hit() { nil }
+            behavior relay() {
+                send self hit()
+            }
+        }
+        "#,
+    );
+
+    assert!(hir.decls.iter().any(|decl| match decl {
+        Decl::Actor(actor) if actor.name == "Second" => actor.behaviors.iter().any(|behavior| {
+            behavior.name == "relay"
+                && hir_contains_nominal_dispatch(&behavior.body, "Second", "hit")
+        }),
+        _ => false,
+    }));
+
+    let first_hit = behavior_index(&mir, "First.hit");
+    let second_hit = behavior_index(&mir, "Second.hit");
+    let send_indices = mir_send_indices(&mir);
+    assert!(send_indices.contains(&second_hit));
+    assert!(!send_indices.contains(&first_hit));
 }
 
 #[test]
@@ -194,10 +254,6 @@ fn unique_dynamic_short_behavior_remains_lowerable() {
         "#,
     );
 
-    let work = mir
-        .behaviors
-        .iter()
-        .position(|behavior| behavior.name == "Worker.work")
-        .expect("Worker.work MIR behavior");
+    let work = behavior_index(&mir, "Worker.work");
     assert!(mir_send_indices(&mir).contains(&work));
 }
