@@ -31,6 +31,7 @@ pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
 pub mod effect_checker;
+pub mod effect_receipt;
 pub mod ffi;
 pub mod fmt;
 pub mod format;
