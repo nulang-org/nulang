@@ -1,8 +1,0 @@
-actor Counter {
-    behavior inc() { nil }
-}
-
-fn main() {
-    let c = spawn Counter {} in
-    send c typo()
-}
