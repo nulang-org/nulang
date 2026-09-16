@@ -60,6 +60,7 @@ pub mod package;
 pub mod parser;
 pub mod prelude_source;
 pub mod primitives;
+pub mod protocol_compat;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod registry;
