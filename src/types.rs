@@ -2494,14 +2494,8 @@ mod tests {
             canonical_type_bytes(&fn_type(EffectRow::Closed(vec![Effect::Send])))
         );
         // Tuple order is significant.
-        let t1 = Type::Tuple(vec![
-            prim(PrimitiveType::Int),
-            prim(PrimitiveType::String),
-        ]);
-        let t2 = Type::Tuple(vec![
-            prim(PrimitiveType::String),
-            prim(PrimitiveType::Int),
-        ]);
+        let t1 = Type::Tuple(vec![prim(PrimitiveType::Int), prim(PrimitiveType::String)]);
+        let t2 = Type::Tuple(vec![prim(PrimitiveType::String), prim(PrimitiveType::Int)]);
         assert_ne!(canonical_type_bytes(&t1), canonical_type_bytes(&t2));
     }
 
