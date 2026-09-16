@@ -123,7 +123,11 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
     // route parameter is unbound: direct dispatch would stage nothing for its
     // slot and the legacy zero-argument fallback would feed it the closure
     // value or stale registers (ClosureCall copies the whole register bank).
-    let bound_slots: HashSet<usize> = out.bindings.iter().map(|binding| binding.handler_index).collect();
+    let bound_slots: HashSet<usize> = out
+        .bindings
+        .iter()
+        .map(|binding| binding.handler_index)
+        .collect();
     for (handler_index, handler_param) in contract.handler_params.iter().enumerate() {
         if handler_param.request.is_none() && !bound_slots.contains(&handler_index) {
             out.diagnostics.push(format!(
