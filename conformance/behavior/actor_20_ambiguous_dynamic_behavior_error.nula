@@ -1,0 +1,16 @@
+actor LeftPinger {
+    behavior ping() { 1 }
+}
+
+actor RightPinger {
+    behavior ping() { 2 }
+}
+
+fn relay(target) {
+    ask target ping()
+}
+
+fn main() {
+    let target = spawn LeftPinger {}
+    perform IO.print(relay(target))
+}
