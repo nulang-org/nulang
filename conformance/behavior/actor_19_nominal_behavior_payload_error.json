@@ -1,0 +1,1 @@
+{"exit_code":4,"stdout":"","stderr":"Type mismatch: expected Int, found String","proves":"the receiver actor's own behavior signature controls payload typing even when another actor declares the same behavior name"}
