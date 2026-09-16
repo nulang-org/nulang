@@ -1,0 +1,39 @@
+name: Compiler API
+
+on:
+  pull_request:
+    paths:
+      - "src/compiler_api.rs"
+      - "src/lib.rs"
+      - ".github/workflows/compiler-api.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/compiler_api.rs"
+      - "src/lib.rs"
+      - ".github/workflows/compiler-api.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  compiler-api:
+    name: Hermetic WASM compiler API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Build the library only. The repository's broad --all-targets jobs also
+      # compile benchmarks; this boundary should remain independently testable
+      # when unrelated bench targets are temporarily broken.
+      - name: Check library with only wasm-backend
+        run: cargo check --lib --no-default-features --features wasm-backend
+
+      - name: Test compiler API
+        run: cargo test --lib --no-default-features --features wasm-backend compiler_api::tests
