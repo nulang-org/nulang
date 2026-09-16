@@ -6,8 +6,7 @@
 //! It performs no mutation and deliberately summarizes sensitive capability
 //! manifests by count rather than returning raw authority tokens.
 
-use crate::runtime::actor::{Actor, ActorBackend, ActorPriority, ActorState};
-use crate::runtime::Runtime;
+use crate::runtime::{Actor, ActorBackend, ActorPriority, ActorState, Runtime};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
