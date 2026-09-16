@@ -15,7 +15,7 @@
 //! Dynamic/opaque actor refs are deliberately left untouched. Runtime actor
 //! ownership remains the defense-in-depth boundary for those calls.
 
-use crate::ast::Pattern;
+use crate::ast::{Literal, Pattern};
 use crate::hir::{self, Body, Decl, Operand, Place, RValue, Stmt, Terminator};
 use crate::types::Span;
 use rustc_hash::FxHashMap;
@@ -42,6 +42,9 @@ impl Bridge {
                     for behavior in &mut actor.behaviors {
                         let mut env = FxHashMap::default();
                         env.insert("self".to_string(), actor.name.clone());
+                        for (name, _) in &behavior.params {
+                            env.remove(name);
+                        }
                         self.transform_body(
                             &mut behavior.body,
                             env.clone(),
@@ -294,6 +297,16 @@ fn actor_identity_of_rvalue(
         RValue::Spawn { actor_type, .. } => Some(actor_type.clone()),
         RValue::Use(operand) => actor_identity_of_operand(operand, env),
         RValue::SelfRef(_) => current_actor.map(str::to_string),
+        // `Grain("Type", key)` is lowered to `perform Grain.ref("Type", key)`.
+        // Preserve the virtual actor's nominal schema from that compiler-owned
+        // literal so cross-shard/grain sends get the same exact MIR identity as
+        // ordinary spawned actors.
+        RValue::Perform {
+            effect, op, args, ..
+        } if effect == "Grain" && op == "ref" => args.first().and_then(|arg| match arg {
+            Operand::Literal(Literal::String(actor_type), _) => Some(actor_type.clone()),
+            _ => None,
+        }),
         _ => None,
     }
 }
