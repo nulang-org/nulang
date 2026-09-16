@@ -31,16 +31,18 @@ pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
 #[cfg(feature = "sqlite")]
-pub mod durable_turn_libsql;
+pub mod durable_turn_libsql_v2;
 pub mod effect_checker;
 pub mod effect_receipt;
 pub mod effect_receipt_fence;
 #[cfg(all(feature = "sqlite", feature = "ureq"))]
 pub mod effect_receipt_http;
 #[cfg(all(feature = "sqlite", feature = "ureq"))]
-pub mod effect_receipt_http_turn;
+pub mod effect_receipt_http_turn_v2;
 #[cfg(feature = "sqlite")]
 pub mod effect_receipt_libsql;
+#[cfg(feature = "sqlite")]
+pub mod effect_receipt_libsql_v2;
 pub mod ffi;
 pub mod fmt;
 pub mod format;
