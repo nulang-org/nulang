@@ -73,7 +73,11 @@ fn duplicate_short_behavior_names_preserve_each_nominal_protocol() {
             send target hit(42)
         "#,
     );
-    assert!(first.is_ok(), "First.hit(Int) should typecheck: {:?}", first.err());
+    assert!(
+        first.is_ok(),
+        "First.hit(Int) should typecheck: {:?}",
+        first.err()
+    );
 
     let second = check(
         r#"

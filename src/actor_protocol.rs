@@ -484,7 +484,9 @@ fn annotate_expr(
             }
             Ok(())
         }
-        Expr::Let { name, value, body, .. } => {
+        Expr::Let {
+            name, value, body, ..
+        } => {
             annotate_expr(value, env, protocols)?;
             let mut body_env = env.clone();
             let actor_name = actor_name_for_expr(value, env);
