@@ -30,7 +30,12 @@ pub mod diagnostic;
 pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
+#[path = "effect_checker.rs"]
+#[doc(hidden)]
+pub mod effect_checker_impl;
+#[path = "effect_checker_wrapper.rs"]
 pub mod effect_checker;
+pub mod migration_purity;
 pub mod ffi;
 pub mod fmt;
 pub mod format;
