@@ -315,8 +315,8 @@ mod tests {
 
     use crate::provider::{CapacityProvider, ProviderFuture};
     use futures_timer::Delay;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     enum MockBehavior {
@@ -405,10 +405,7 @@ mod tests {
         assert_eq!(result.provider_errors.len(), 1);
         let error = &result.provider_errors[0];
         assert_eq!(error.provider, "hung");
-        assert_eq!(
-            error.kind,
-            crate::provider::ProviderErrorKind::Unavailable
-        );
+        assert_eq!(error.kind, crate::provider::ProviderErrorKind::Unavailable);
         assert!(error.retryable);
         assert!(error.message.contains("timed out"));
     }
@@ -450,14 +447,11 @@ mod tests {
             inner: releasing,
         };
 
-        let broker = CapacityBroker::new(
-            vec![&waiting, &releasing],
-            ScoreWeights::default(),
-        )
-        .with_policy(BrokerPolicy {
-            max_snapshot_age_ms: None,
-            fetch_timeout: Some(Duration::from_secs(5)),
-        });
+        let broker = CapacityBroker::new(vec![&waiting, &releasing], ScoreWeights::default())
+            .with_policy(BrokerPolicy {
+                max_snapshot_age_ms: None,
+                fetch_timeout: Some(Duration::from_secs(5)),
+            });
 
         let result = futures::executor::block_on(broker.rank(&query(false))).unwrap();
         // The waiting provider was released, errored by design, and the
