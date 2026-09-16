@@ -39,6 +39,56 @@ impl GrainId {
     }
 }
 
+/// Error returned when two distinct logical grains attempt to claim the same
+/// compact actor id.
+///
+/// The 48-bit actor-ref projection is intentionally compact, not unique. This
+/// error is therefore part of the runtime's correctness boundary: callers must
+/// fail closed rather than overwriting the existing reverse mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrainActorIdCollision {
+    pub actor_id: u64,
+    pub existing: GrainId,
+    pub attempted: GrainId,
+}
+
+impl std::fmt::Display for GrainActorIdCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "grain actor-id collision at {}: existing {:?}, attempted {:?}",
+            self.actor_id, self.existing, self.attempted
+        )
+    }
+}
+
+impl std::error::Error for GrainActorIdCollision {}
+
+/// Establish an `actor_id -> GrainId` reverse binding without permitting a
+/// distinct logical identity to overwrite an existing one.
+///
+/// This is the only safe primitive for populating compact grain-id reverse
+/// indexes. It is deliberately idempotent for an identical binding so repeated
+/// hydration/registration does not fail.
+pub fn bind_grain_actor_id(
+    bindings: &mut HashMap<u64, GrainId>,
+    actor_id: u64,
+    grain_id: GrainId,
+) -> Result<(), GrainActorIdCollision> {
+    match bindings.get(&actor_id) {
+        None => {
+            bindings.insert(actor_id, grain_id);
+            Ok(())
+        }
+        Some(existing) if existing == &grain_id => Ok(()),
+        Some(existing) => Err(GrainActorIdCollision {
+            actor_id,
+            existing: existing.clone(),
+            attempted: grain_id,
+        }),
+    }
+}
+
 /// Policy controlling when a grain may be dehydrated / evicted.
 #[derive(Debug, Clone, Copy)]
 pub struct DehydratePolicy {
@@ -214,5 +264,45 @@ mod tests {
         assert_eq!(a.actor_name(), b.actor_name());
         assert_ne!(a, b);
         assert_ne!(grain_actor_id(&a), grain_actor_id(&b));
+    }
+
+    #[test]
+    fn test_bind_grain_actor_id_allows_first_binding() {
+        let mut bindings = HashMap::new();
+        let grain = GrainId::new("User", "42");
+
+        assert_eq!(bind_grain_actor_id(&mut bindings, 7, grain.clone()), Ok(()));
+        assert_eq!(bindings.get(&7), Some(&grain));
+    }
+
+    #[test]
+    fn test_bind_grain_actor_id_is_idempotent_for_same_identity() {
+        let mut bindings = HashMap::new();
+        let grain = GrainId::new("User", "42");
+        bind_grain_actor_id(&mut bindings, 7, grain.clone()).unwrap();
+
+        assert_eq!(bind_grain_actor_id(&mut bindings, 7, grain.clone()), Ok(()));
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings.get(&7), Some(&grain));
+    }
+
+    #[test]
+    fn test_bind_grain_actor_id_rejects_collision_without_overwrite() {
+        let mut bindings = HashMap::new();
+        let original = GrainId::new("User", "42");
+        let colliding = GrainId::new("Order", "42");
+        bind_grain_actor_id(&mut bindings, 7, original.clone()).unwrap();
+
+        let err = bind_grain_actor_id(&mut bindings, 7, colliding.clone()).unwrap_err();
+        assert_eq!(
+            err,
+            GrainActorIdCollision {
+                actor_id: 7,
+                existing: original.clone(),
+                attempted: colliding,
+            }
+        );
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings.get(&7), Some(&original));
     }
 }
