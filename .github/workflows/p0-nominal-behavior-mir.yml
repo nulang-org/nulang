@@ -1,0 +1,377 @@
+name: P0 Nominal Behavior MIR Guard
+
+on:
+  push:
+    branches:
+      - codex/nominal-actor-dispatch
+
+concurrency:
+  group: p0-nominal-behavior-mir
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: codex/nominal-actor-dispatch
+          fetch-depth: 0
+
+      - name: Pin branch head
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "START_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Preserve receiver identity through protocol HIR and MIR
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str, label: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              if new in text:
+                  print(f"{label}: already migrated")
+                  return
+              if old not in text:
+                  raise SystemExit(f"{label}: unexpected source shape")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "src/behavior_identity.rs",
+              '''pub fn resolve_behavior_index_from_hint(
+    actor_name_hint: &str,
+    behavior: &str,
+    behavior_names: &[String],
+) -> Result<usize, BehaviorIdentityError> {
+    if !actor_name_hint.is_empty() {
+''',
+              '''pub fn resolve_behavior_index_from_hint(
+    actor_name_hint: &str,
+    behavior: &str,
+    behavior_names: &[String],
+) -> Result<usize, BehaviorIdentityError> {
+    // Semantic passes may already have qualified a known call as
+    // `Actor.behavior`. That compiler-owned identity takes precedence over
+    // the legacy lexical receiver-name hint.
+    if let Some(idx) = behavior_names.iter().position(|name| name == behavior) {
+        return Ok(idx);
+    }
+
+    if !actor_name_hint.is_empty() {
+''',
+              "qualified behavior fast path",
+          )
+
+          replace_once(
+              "src/actor_protocol.rs",
+              '''        Expr::Send {
+            actor,
+            behavior,
+            args,
+            span,
+            ..
+        } => {
+            annotate_expr(actor, env, protocols)?;
+            for arg in args.iter_mut() {
+                annotate_expr(arg, env, protocols)?;
+            }
+            let _ = validate_call(actor, behavior, args, env, protocols, *span)?;
+            Ok(())
+        }
+''',
+              '''        Expr::Send {
+            actor,
+            behavior,
+            args,
+            span,
+            ..
+        } => {
+            annotate_expr(actor, env, protocols)?;
+            for arg in args.iter_mut() {
+                annotate_expr(arg, env, protocols)?;
+            }
+            let actor_name = actor_name_for_expr(actor, env);
+            let short_behavior = if let Some(actor_name) = actor_name.as_deref() {
+                let prefix = format!("{actor_name}.");
+                behavior
+                    .strip_prefix(&prefix)
+                    .unwrap_or(behavior.as_str())
+                    .to_string()
+            } else {
+                behavior.clone()
+            };
+            let _ = validate_call(actor, &short_behavior, args, env, protocols, *span)?;
+            if let Some(actor_name) = actor_name {
+                *behavior = format!("{actor_name}.{short_behavior}");
+            }
+            Ok(())
+        }
+''',
+              "send qualification",
+          )
+
+          replace_once(
+              "src/actor_protocol.rs",
+              '''        Expr::Ask {
+            actor,
+            behavior,
+            args,
+            span,
+            ..
+        } => {
+            annotate_expr(actor, env, protocols)?;
+            for arg in args.iter_mut() {
+                annotate_expr(arg, env, protocols)?;
+            }
+            let ask_span = *span;
+            let ret = validate_call(actor, behavior, args, env, protocols, ask_span)?;
+            if let Some(ret) = ret {
+                let placeholder = Expr::Literal(Literal::Unit, ask_span);
+                let inner = std::mem::replace(expr, placeholder);
+                *expr = Expr::TypeAnnotate {
+                    expr: Box::new(inner),
+                    ty: ret,
+                    span: ask_span,
+                };
+            }
+            Ok(())
+        }
+''',
+              '''        Expr::Ask {
+            actor,
+            behavior,
+            args,
+            span,
+            ..
+        } => {
+            annotate_expr(actor, env, protocols)?;
+            for arg in args.iter_mut() {
+                annotate_expr(arg, env, protocols)?;
+            }
+            let actor_name = actor_name_for_expr(actor, env);
+            let short_behavior = if let Some(actor_name) = actor_name.as_deref() {
+                let prefix = format!("{actor_name}.");
+                behavior
+                    .strip_prefix(&prefix)
+                    .unwrap_or(behavior.as_str())
+                    .to_string()
+            } else {
+                behavior.clone()
+            };
+            let ask_span = *span;
+            let ret = validate_call(actor, &short_behavior, args, env, protocols, ask_span)?;
+            if let Some(actor_name) = actor_name {
+                *behavior = format!("{actor_name}.{short_behavior}");
+            }
+            if let Some(ret) = ret {
+                let placeholder = Expr::Literal(Literal::Unit, ask_span);
+                let inner = std::mem::replace(expr, placeholder);
+                *expr = Expr::TypeAnnotate {
+                    expr: Box::new(inner),
+                    ty: ret,
+                    span: ask_span,
+                };
+            }
+            Ok(())
+        }
+''',
+              "ask qualification",
+          )
+
+          replace_once(
+              "src/hir_lower.rs",
+              '''pub fn lower_module(
+    ast: &ast::AstModule,
+    inferred_decl_types: &FxHashMap<String, Type>,
+) -> hir::Module {
+    let mut module = hir::Module::new(&ast.name);
+''',
+              '''pub fn lower_module(
+    ast: &ast::AstModule,
+    inferred_decl_types: &FxHashMap<String, Type>,
+) -> hir::Module {
+    let annotated_ast = crate::actor_protocol::annotate_module(ast)
+        .expect("HIR lowering requires an actor-protocol-valid AST");
+    let ast = &annotated_ast;
+    let mut module = hir::Module::new(&ast.name);
+''',
+              "HIR protocol enrichment",
+          )
+
+          replace_once(
+              "src/mir_lower.rs",
+              '''    /// Resolve `send`/`ask actor behavior(...)` to a behavior-table index by
+    /// name. Mirrors the stable compiler's `behavior_table_index`: an exact
+    /// "ActorName.behavior" match first, falling back to any behavior with a
+    /// matching suffix if the receiver expression isn't a bare actor-typed
+    /// variable name (a known ambiguity inherited from the stable compiler,
+    /// not introduced here).
+    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> usize {
+        let full_name = format!("{}.{}", actor_name_hint, behavior);
+        if let Some(idx) = self.behavior_names.iter().position(|n| *n == full_name) {
+            return idx;
+        }
+        let suffix = format!(".{}", behavior);
+        self.behavior_names
+            .iter()
+            .position(|n| n.ends_with(&suffix))
+            .unwrap_or(self.behaviors.len())
+    }
+''',
+              '''    /// Resolve `send`/`ask actor behavior(...)` without ever choosing an
+    /// arbitrary first suffix match. Known calls arrive from HIR with a
+    /// compiler-qualified `Actor.behavior` identity. Dynamic calls retain
+    /// compatibility only when the short behavior name is globally unique.
+    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> NuResult<usize> {
+        crate::behavior_identity::resolve_behavior_index_from_hint(
+            actor_name_hint,
+            behavior,
+            &self.behavior_names,
+        )
+        .map_err(|error| compile_err(error.to_string(), Span::default()))
+    }
+''',
+              "MIR behavior resolver",
+          )
+
+          mir = Path("src/mir_lower.rs")
+          text = mir.read_text()
+          old_call = "                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior);\n"
+          new_call = "                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior)?;\n"
+          old_count = text.count(old_call)
+          new_count = text.count(new_call)
+          if old_count == 2:
+              text = text.replace(old_call, new_call)
+              mir.write_text(text)
+          elif old_count == 0 and new_count == 2:
+              print("MIR send/ask call sites: already migrated")
+          else:
+              raise SystemExit(
+                  f"MIR call sites: unexpected shape old={old_count} new={new_count}"
+              )
+          PY
+
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate focused protocol and identity tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features --lib behavior_identity
+          cargo test --no-default-features --test actor_protocol_nominal
+
+      - name: Validate receiver identity reaches HIR and MIR
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > tests/nominal_actor_dispatch_p0.rs <<'RS'
+          use nulang::hir::{Decl, RValue, Stmt};
+          use nulang::lexer::Lexer;
+          use nulang::parser::Parser;
+          use nulang::typechecker::TypeChecker;
+
+          fn find_behavior(body: &nulang::hir::Body, expected: &str) -> bool {
+              for stmt in &body.stmts {
+                  if let Stmt::Let { value, .. } = stmt {
+                      match value {
+                          RValue::Send { behavior, .. } | RValue::Ask { behavior, .. }
+                              if behavior == expected =>
+                          {
+                              return true;
+                          }
+                          RValue::Block(inner) if find_behavior(inner, expected) => return true,
+                          _ => {}
+                      }
+                  }
+              }
+              false
+          }
+
+          #[test]
+          fn duplicate_short_name_preserves_second_actor_identity() {
+              let source = r#"
+                  actor First { behavior hit(value: Int) { nil } }
+                  actor Second { behavior hit(value: String) { nil } }
+                  fn main() {
+                      let target = spawn Second {}
+                      send target hit("ok")
+                  }
+              "#;
+
+              let tokens = Lexer::new(source).lex().unwrap();
+              let ast = Parser::new(tokens).parse_module().unwrap();
+              let mut tc = TypeChecker::new();
+              tc.check_module(&ast).unwrap();
+              let hir = nulang::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+
+              assert!(hir.decls.iter().any(|decl| match decl {
+                  Decl::Function(function) => find_behavior(&function.body, "Second.hit"),
+                  _ => false,
+              }));
+
+              // Before this fix the MIR suffix heuristic chose First.hit.
+              // A compiler-qualified Second.hit must now lower successfully
+              // through the exact-identity path.
+              nulang::mir_lower::lower_module(&hir).unwrap();
+          }
+          RS
+
+          cargo test --no-default-features --test nominal_actor_dispatch_p0
+          rm tests/nominal_actor_dispatch_p0.rs
+
+      - name: Validate minimal compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --no-default-features
+
+      - name: Verify isolated product diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          git diff --check
+          changed="$(git diff --name-only)"
+          expected="$(printf '%s\n' \
+            src/actor_protocol.rs \
+            src/behavior_identity.rs \
+            src/hir_lower.rs \
+            src/mir_lower.rs)"
+          printf 'working-tree paths:\n%s\n' "$changed"
+          test "$changed" = "$expected"
+
+      - name: Guard exact head and land validated nominal identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin codex/nominal-actor-dispatch
+          remote_head="$(git rev-parse origin/codex/nominal-actor-dispatch)"
+          if [ "$remote_head" != "$START_HEAD" ]; then
+            echo "branch advanced during validation: $remote_head (expected $START_HEAD)" >&2
+            exit 1
+          fi
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add \
+            src/actor_protocol.rs \
+            src/behavior_identity.rs \
+            src/hir_lower.rs \
+            src/mir_lower.rs
+          git diff --cached --check
+          test "$(git diff --cached --name-only)" = "$(printf '%s\n' \
+            src/actor_protocol.rs \
+            src/behavior_identity.rs \
+            src/hir_lower.rs \
+            src/mir_lower.rs)"
+          git commit -m 'fix(compiler): preserve nominal actor behavior identity'
+          git push origin HEAD:codex/nominal-actor-dispatch
