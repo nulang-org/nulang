@@ -8,6 +8,31 @@
 use crate::bytecode::{ActorMeta, CodeModule};
 use crate::primitives::ActorRole;
 
+/// Resolve the canonical actor metadata represented by a runtime actor name.
+///
+/// Module-spawned actors preserve `ActorMeta.name` directly. Virtual actors
+/// use the human-readable instance name `Type@key`; only the `Type` prefix is
+/// schema identity. Synthetic/manual names such as `actor_42` deliberately do
+/// not guess an owner from an unrelated module.
+pub(crate) fn actor_meta_for_runtime_name<'a>(
+    module: &'a CodeModule,
+    runtime_name: &str,
+) -> Option<&'a ActorMeta> {
+    if let Some(meta) = module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == runtime_name)
+    {
+        return Some(meta);
+    }
+
+    let (grain_type, _) = runtime_name.split_once('@')?;
+    module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.is_virtual && meta.name == grain_type)
+}
+
 pub(crate) fn actor_meta_for_schema<'a>(
     module: &'a CodeModule,
     schema_name: &str,
@@ -30,6 +55,24 @@ pub(crate) fn module_behavior_index_for_runtime_id(
     runtime_behavior_idx: usize,
 ) -> Option<usize> {
     let meta = actor_meta_for_schema(module, schema_name)?;
+    module_behavior_index_for_meta(meta, runtime_behavior_idx)
+}
+
+/// Runtime-name variant used by the actor runtime. This understands virtual
+/// actor instance names while preserving the same fail-closed ownership rule.
+pub(crate) fn module_behavior_index_for_actor(
+    module: &CodeModule,
+    runtime_name: &str,
+    runtime_behavior_idx: usize,
+) -> Option<usize> {
+    let meta = actor_meta_for_runtime_name(module, runtime_name)?;
+    module_behavior_index_for_meta(meta, runtime_behavior_idx)
+}
+
+fn module_behavior_index_for_meta(
+    meta: &ActorMeta,
+    runtime_behavior_idx: usize,
+) -> Option<usize> {
     match meta.role().ok()? {
         ActorRole::Workflow => meta.behavior_indices.get(runtime_behavior_idx).copied(),
         _ => meta
@@ -48,12 +91,30 @@ pub(crate) fn runtime_behavior_id_for_name(
     behavior: &str,
 ) -> Option<usize> {
     let meta = actor_meta_for_schema(module, schema_name)?;
+    runtime_behavior_id_for_meta(module, meta, behavior)
+}
+
+/// Runtime-name variant used by live actors/grains.
+pub(crate) fn runtime_behavior_id_for_actor_name(
+    module: &CodeModule,
+    runtime_name: &str,
+    behavior: &str,
+) -> Option<usize> {
+    let meta = actor_meta_for_runtime_name(module, runtime_name)?;
+    runtime_behavior_id_for_meta(module, meta, behavior)
+}
+
+fn runtime_behavior_id_for_meta(
+    module: &CodeModule,
+    meta: &ActorMeta,
+    behavior: &str,
+) -> Option<usize> {
     let role = meta.role().ok()?;
 
     for (local_idx, &module_idx) in meta.behavior_indices.iter().enumerate() {
         let full_name = module.behaviors.get(module_idx)?.name.as_str();
         let short_name = full_name
-            .strip_prefix(schema_name)
+            .strip_prefix(meta.name.as_str())
             .and_then(|rest| rest.strip_prefix('.'));
         if full_name == behavior || short_name == Some(behavior) {
             return Some(match role {
@@ -152,7 +213,10 @@ mod tests {
             "#,
         );
         let flow = actor_meta_for_schema(&module, "Flow").expect("Flow metadata");
-        assert!(flow.behavior_indices[0] > 0, "Prefix must occupy an earlier module slot");
+        assert!(
+            flow.behavior_indices[0] > 0,
+            "Prefix must occupy an earlier module slot"
+        );
 
         assert_eq!(
             module_behavior_index_for_runtime_id(&module, "Flow", 0),
@@ -167,6 +231,47 @@ mod tests {
         assert_eq!(
             behavior_name_for_runtime_id(&module, "Flow", 0),
             Some("Flow.first")
+        );
+    }
+
+    #[test]
+    fn virtual_actor_instance_name_resolves_only_its_virtual_schema() {
+        let module = compile(
+            r#"
+            virtual entity User(key: String) {
+                behavior hit() { nil }
+            }
+
+            actor Other {
+                behavior hit() { nil }
+            }
+            "#,
+        );
+        let user = actor_meta_for_schema(&module, "User").expect("User metadata");
+        let other = actor_meta_for_schema(&module, "Other").expect("Other metadata");
+        let user_hit = user.behavior_indices[0];
+        let other_hit = other.behavior_indices[0];
+
+        assert_eq!(
+            actor_meta_for_runtime_name(&module, "User@u-42").map(|meta| meta.name.as_str()),
+            Some("User")
+        );
+        assert_eq!(
+            module_behavior_index_for_actor(&module, "User@u-42", user_hit),
+            Some(user_hit)
+        );
+        assert_eq!(
+            module_behavior_index_for_actor(&module, "User@u-42", other_hit),
+            None
+        );
+        assert_eq!(
+            runtime_behavior_id_for_actor_name(&module, "User@u-42", "hit"),
+            Some(user_hit)
+        );
+        assert_eq!(
+            actor_meta_for_runtime_name(&module, "actor_42"),
+            None,
+            "synthetic instance names must not guess an actor schema"
         );
     }
 }
