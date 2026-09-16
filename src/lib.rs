@@ -25,11 +25,16 @@ pub mod core_vm;
 #[cfg(feature = "native-codegen")]
 pub mod cranelift_utils;
 pub mod dap;
+pub mod delivery;
+pub mod delivery_legacy;
+pub mod delivery_runtime;
+pub mod delivery_wire;
 pub mod diagnostic;
 #[cfg(feature = "native-codegen")]
 pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
+pub mod durable_inbox;
 pub mod effect_checker;
 pub mod ffi;
 pub mod fmt;
@@ -64,6 +69,7 @@ pub mod primitives;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod registry;
+pub mod remote_delivery;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
