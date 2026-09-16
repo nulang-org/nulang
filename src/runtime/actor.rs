@@ -430,7 +430,7 @@ impl Actor {
         self.hibernation_state = Some(HibernationState {
             continuation_bytes: bytes.clone(),
             module_hash: *module_hash,
-            hibernated_at_ms: std::time::SystemTimeTime::now()
+            hibernated_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
