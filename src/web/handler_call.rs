@@ -99,7 +99,9 @@ fn validate_argument_bank(
     }
 
     if let Some(index) = occupied.iter().position(|occupied| !occupied) {
-        return Err(format!("handler parameter slot {index} has no bound argument"));
+        return Err(format!(
+            "handler parameter slot {index} has no bound argument"
+        ));
     }
     Ok(())
 }
