@@ -267,12 +267,22 @@ impl GrainRegistry {
 /// therefore must not be treated as the durable logical identity of a virtual
 /// actor. It is retained while the runtime/persistence wire formats migrate to
 /// `GrainId` + `ActivationDirectory` semantics.
+///
+/// Do not change this encoding: existing virtual-actor persistence and tests
+/// depend on it during the compatibility window.
 pub fn grain_actor_id(grain: &GrainId) -> u64 {
     let mut hash: u64 = 0xCBF29CE484222325; // FNV offset basis
     const PRIME: u64 = 0x00000100000001B3;
 
-    for b in grain.canonical_bytes() {
-        hash ^= b as u64;
+    for b in grain.grain_type.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    // Historical separator used by the existing persistence identity.
+    hash ^= 0xFF;
+    hash = hash.wrapping_mul(PRIME);
+    for b in grain.key.as_bytes() {
+        hash ^= *b as u64;
         hash = hash.wrapping_mul(PRIME);
     }
 
@@ -329,6 +339,12 @@ mod tests {
         assert_eq!(directory.grain_for(handle), None);
         assert!(directory.is_empty());
         assert_eq!(grain, GrainId::new("Cart", "customer-42"));
+    }
+
+    #[test]
+    fn legacy_grain_actor_id_fixture_is_stable() {
+        let g = GrainId::new("User", "user:42");
+        assert_eq!(grain_actor_id(&g), 0x10B0_DD6B_B828);
     }
 
     #[test]
