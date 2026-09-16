@@ -80,7 +80,10 @@ pub enum LibsqlDurableTurnError {
     CorruptState(String),
     UnsupportedFormat(u16),
     InvalidSequence(u64),
-    InvalidJson { field: &'static str, error: String },
+    InvalidJson {
+        field: &'static str,
+        error: String,
+    },
     MissingIntent(EffectInvocationId),
     ConflictingReceipt(EffectInvocationId),
     StaleSequence {
@@ -294,15 +297,10 @@ impl LibsqlDurableTurnStore {
                 let current_turn = load_turn(&tx, namespace_actor_id).await?;
                 validate_turn_sequence(current_turn.as_ref(), &record)?;
 
-                let existing_effect = load_effect_state(
-                    &tx,
-                    namespace_actor_id,
-                    receipt.invocation_id,
-                )
-                .await?
-                .ok_or(LibsqlDurableTurnError::MissingIntent(
-                    receipt.invocation_id,
-                ))?;
+                let existing_effect =
+                    load_effect_state(&tx, namespace_actor_id, receipt.invocation_id)
+                        .await?
+                        .ok_or(LibsqlDurableTurnError::MissingIntent(receipt.invocation_id))?;
 
                 let next_effect = complete_effect_state(existing_effect, &receipt)?;
                 let effect_json = serde_json::to_string(&next_effect)
@@ -565,9 +563,7 @@ fn storage_error(error: impl fmt::Display) -> LibsqlDurableTurnError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect_receipt::{
-        EffectIdentity, EffectIntent, EffectSiteId, RequestFingerprint,
-    };
+    use crate::effect_receipt::{EffectIdentity, EffectIntent, EffectSiteId, RequestFingerprint};
     use crate::effect_receipt_libsql::LibsqlEffectReceiptStore;
 
     #[derive(Clone, Copy, Debug)]
@@ -698,8 +694,14 @@ mod tests {
                     EffectReceipt::success(&second, 1, b"second".to_vec()),
                 )
                 .unwrap_err();
-            assert!(matches!(error, LibsqlDurableTurnError::StaleSequence { .. }));
-            assert_eq!(turns.load_turn(actor_id).unwrap().unwrap().actor_sequence, 20);
+            assert!(matches!(
+                error,
+                LibsqlDurableTurnError::StaleSequence { .. }
+            ));
+            assert_eq!(
+                turns.load_turn(actor_id).unwrap().unwrap().actor_sequence,
+                20
+            );
         }
         {
             let effects = LibsqlEffectReceiptStore::new(&path).unwrap();
@@ -792,9 +794,7 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(
                 error,
-                LibsqlDurableTurnError::Fence(
-                    FencedEffectReceiptError::StaleActivation { .. }
-                )
+                LibsqlDurableTurnError::Fence(FencedEffectReceiptError::StaleActivation { .. })
             ));
             assert!(turns.load_turn(actor_id).unwrap().is_none());
         }
@@ -806,14 +806,8 @@ mod tests {
     fn malformed_inbox_bundle_fails_before_storage() {
         let actor_id = 42;
         let invocation = fixture(actor_id, 0).invocation_id;
-        let error = DurableTurnRecord::new(
-            actor_id,
-            1,
-            r#"{"count":1}"#,
-            "not-json",
-            invocation,
-        )
-        .unwrap_err();
+        let error = DurableTurnRecord::new(actor_id, 1, r#"{"count":1}"#, "not-json", invocation)
+            .unwrap_err();
         assert!(matches!(
             error,
             LibsqlDurableTurnError::InvalidJson {
