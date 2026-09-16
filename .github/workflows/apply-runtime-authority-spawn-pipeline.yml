@@ -1,0 +1,293 @@
+name: Apply runtime authority spawn pipeline
+
+on:
+  push:
+    branches: [codex/runtime-capability-spawn-pipeline]
+    paths:
+      - .github/workflows/apply-runtime-authority-spawn-pipeline.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Apply exact source transformations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          parser = Path("src/parser.rs")
+          text = parser.read_text()
+          marker = "    fn parse_spawn(&mut self) -> NuResult<Expr> {\n"
+          if text.count(marker) != 1:
+              raise SystemExit("src/parser.rs: parse_spawn marker mismatch")
+          helper = r'''    /// Parse explicit runtime-authority grants attached to a spawn.
+    ///
+    /// Source syntax intentionally accepts only a narrow, auditable form:
+    /// `Namespace::Action` or `Namespace::Action("resource")`.  The latter is
+    /// canonicalized to `Namespace::Action(resource)` so every later compiler
+    /// and runtime layer compares the same token bytes.
+    fn parse_spawn_authority_grants(&mut self) -> NuResult<Vec<String>> {
+        if !self.consume_if(&TokenKind::With) {
+            return Ok(Vec::new());
+        }
+
+        self.expect(TokenKind::LBracket)?;
+        self.skip_newlines();
+        let mut grants = Vec::new();
+
+        while !self.match_token(&TokenKind::RBracket) && !self.is_at_end() {
+            let grant_span = self.current_span();
+            let namespace = self.expect_ident("runtime authority namespace")?;
+            self.expect(TokenKind::DoubleColon)?;
+            let action = self.expect_ident("runtime authority action")?;
+            let resource = if self.consume_if(&TokenKind::LParen) {
+                let resource = self.expect_string("runtime authority resource string")?;
+                self.expect(TokenKind::RParen)?;
+                Some(resource)
+            } else {
+                None
+            };
+
+            let raw = match resource {
+                Some(resource) => format!("{}::{}({})", namespace, action, resource),
+                None => format!("{}::{}", namespace, action),
+            };
+            crate::runtime_authority::AuthorityToken::parse(raw.clone()).map_err(|err| {
+                NuError::parse_error(
+                    format!("Invalid runtime authority grant: {}", err),
+                    grant_span,
+                )
+            })?;
+            grants.push(raw);
+
+            self.skip_newlines();
+            if self.consume_if(&TokenKind::Comma) {
+                self.skip_newlines();
+            } else {
+                break;
+            }
+        }
+
+        self.expect(TokenKind::RBracket)?;
+        Ok(grants)
+    }
+
+'''
+          parser.write_text(text.replace(marker, helper + marker, 1))
+
+          replace_once(
+              "src/parser.rs",
+              '''        // Optional named registration: `spawn Foo() as "name"`
+        let register_as = if self.consume_if(&TokenKind::As) {
+            Some(self.expect_string("actor name")?)
+        } else {
+            None
+        };
+''',
+              '''        // Optional runtime-authority grants: `spawn Foo() with [Net::TcpOut("host:443")]`.
+        // Parse these before named registration so `spawn Foo() with [...] as "name"`
+        // has one deterministic grammar.
+        let capabilities = self.parse_spawn_authority_grants()?;
+
+        // Optional named registration: `spawn Foo() as "name"`
+        let register_as = if self.consume_if(&TokenKind::As) {
+            Some(self.expect_string("actor name")?)
+        } else {
+            None
+        };
+'''
+          )
+          replace_once(
+              "src/parser.rs",
+              '''            // Spawn-time capability-grant syntax (`with [Net::TcpOut(...)]`) is
+            // not parsed yet; the field is plumbed through as empty.
+            capabilities: Vec::new(),
+''',
+              '''            capabilities,
+'''
+          )
+
+          replace_once(
+              "src/hir_lower.rs",
+              '''        Expr::Spawn {
+            actor_type,
+            init,
+            target_node,
+            span,
+            ..
+        } => {
+''',
+              '''        Expr::Spawn {
+            actor_type,
+            init,
+            target_node,
+            capabilities,
+            span,
+            ..
+        } => {
+'''
+          )
+          replace_once(
+              "src/hir_lower.rs",
+              '''                    target_node: target_operand,
+                    capabilities: vec![],
+                    ty: ty.clone(),
+''',
+              '''                    target_node: target_operand,
+                    capabilities: capabilities.clone(),
+                    ty: ty.clone(),
+'''
+          )
+
+          replace_once(
+              "src/mir_codegen.rs",
+              '''                target_node,
+                capabilities: _,
+            } => {
+                if let Some(node) = target_node {
+''',
+              '''                target_node,
+                capabilities,
+            } => {
+                if let Some(node) = target_node {
+                    if !capabilities.is_empty() {
+                        return Err(compile_err(
+                            "remote spawn with runtime authority grants is unsupported until authenticated grant propagation is versioned",
+                            Span::default(),
+                        ));
+                    }
+'''
+          )
+          replace_once(
+              "src/mir_codegen.rs",
+              '''                    self.emit(Instruction::new3(
+                        OpCode::Spawn,
+                        ((*behavior_idx >> 8) & 0xFF) as u8,
+                        (*behavior_idx & 0xFF) as u8,
+                        dst,
+                    ));
+                    if !init.is_empty() {
+''',
+              '''                    self.emit(Instruction::new3(
+                        OpCode::Spawn,
+                        ((*behavior_idx >> 8) & 0xFF) as u8,
+                        (*behavior_idx & 0xFF) as u8,
+                        dst,
+                    ));
+                    if !capabilities.is_empty() {
+                        self.module
+                            .spawn_capability_grants
+                            .push((pc, capabilities.clone()));
+                    }
+                    if !init.is_empty() {
+'''
+          )
+
+          Path("tests/runtime_authority_spawn_pipeline.rs").write_text(r'''use nulang::bytecode::CodeModule;
+use nulang::lexer::Lexer;
+use nulang::parser::Parser;
+use nulang::typechecker::TypeChecker;
+use nulang::types::NuResult;
+
+fn compile(source: &str) -> NuResult<CodeModule> {
+    let tokens = Lexer::new(source).lex()?;
+    let ast = Parser::new(tokens).parse_module()?;
+    let mut type_checker = TypeChecker::new();
+    type_checker.check_module(&ast)?;
+    let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+    let mut mir = nulang::mir_lower::lower_module(&hir)?;
+    nulang::mir_codegen::compile_mir(&mut mir, "runtime-authority-test")
+}
+
+const ACTOR: &str = r#"
+actor Worker {
+    state count: Int = 0
+    behavior ping() { self.count }
+}
+"#;
+
+#[test]
+fn local_spawn_grants_reach_bytecode_side_table() {
+    let source = format!(
+        "{}\nfn main() {{ spawn Worker() with [Net::TcpOut(\"api.example.com:443\"), Fs::Read(\"/data/models\")] }}",
+        ACTOR
+    );
+    let module = compile(&source).expect("compile local spawn with grants");
+    assert_eq!(module.spawn_capability_grants.len(), 1);
+    assert_eq!(
+        module.spawn_capability_grants[0].1,
+        vec![
+            "Net::TcpOut(api.example.com:443)".to_string(),
+            "Fs::Read(/data/models)".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn remote_spawn_with_grants_fails_closed() {
+    let source = format!(
+        "{}\nfn main() {{ spawn@1 Worker() with [Net::TcpOut(\"api.example.com:443\")] }}",
+        ACTOR
+    );
+    let err = compile(&source).expect_err("remote grants must not be silently erased");
+    assert!(
+        err.to_string().contains("remote spawn with runtime authority grants is unsupported"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn grant_resource_must_be_a_string_literal() {
+    let source = format!(
+        "{}\nfn main() {{ spawn Worker() with [Net::TcpOut(443)] }}",
+        ACTOR
+    );
+    let tokens = Lexer::new(&source).lex().expect("lex");
+    let err = Parser::new(tokens)
+        .parse_module()
+        .expect_err("non-string authority resources must be rejected by the parser");
+    assert!(err.to_string().contains("runtime authority resource string"));
+}
+''')
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Focused tests
+        run: cargo test --test runtime_authority_spawn_pipeline
+
+      - name: Remove temporary patch workflow
+        run: rm .github/workflows/apply-runtime-authority-spawn-pipeline.yml
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/parser.rs src/hir_lower.rs src/mir_codegen.rs tests/runtime_authority_spawn_pipeline.rs .github/workflows/apply-runtime-authority-spawn-pipeline.yml
+          git commit -m "feat(compiler): preserve spawn authority grants"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
