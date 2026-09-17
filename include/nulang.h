@@ -30,7 +30,7 @@ typedef struct {
     uint64_t raw;
 } NulangValue;
 
-/** ABI-stable C type token used with `nulang_register_native_function`. */
+/** ABI-stable C type token used with native function registration. */
 typedef enum {
     NULANG_CTYPE_I64 = 0,
     NULANG_CTYPE_F64 = 1,
@@ -45,42 +45,15 @@ typedef enum {
 /* Runtime lifecycle                                                           */
 /* -------------------------------------------------------------------------- */
 
-/** Create a new Nulang runtime. */
 NulangRuntime *nulang_runtime_new(void);
-
-/** Free a runtime created by `nulang_runtime_new`. */
 void nulang_runtime_free(NulangRuntime *runtime);
 
 /* -------------------------------------------------------------------------- */
 /* Compilation and execution                                                   */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Compile Nulang source code.
- *
- * Returns a non-negative module handle on success, or -1 on error. On error,
- * the message is available through `nulang_last_error`.
- */
 int64_t nulang_compile(NulangRuntime *runtime, const char *source);
-
-/**
- * Run the top-level expression of a compiled module.
- *
- * On error the result is nil and `nulang_last_error` contains the message.
- */
 NulangValue nulang_run(NulangRuntime *runtime, int64_t module_handle);
-
-/**
- * Call an exported Nulang function by name.
- *
- * `args` is an array of `NulangValue` of length `arg_count`; arguments are
- * passed in r0, r1, etc. The function's return value (register 0) is
- * returned. On error the result is nil.
- *
- * String-valued arguments are module-scoped and must belong to
- * `module_handle`. Use `nulang_module_string` separately for each target
- * module.
- */
 NulangValue nulang_call_function(NulangRuntime *runtime,
                                  int64_t module_handle,
                                  const char *name,
@@ -91,10 +64,7 @@ NulangValue nulang_call_function(NulangRuntime *runtime,
 /* Error handling                                                              */
 /* -------------------------------------------------------------------------- */
 
-/** Return the last error message, or NULL if there is none. */
 const char *nulang_last_error(NulangRuntime *runtime);
-
-/** Clear the runtime's last error state. */
 void nulang_clear_error(NulangRuntime *runtime);
 
 /* -------------------------------------------------------------------------- */
@@ -106,11 +76,6 @@ NulangValue nulang_value_float_new(double value);
 NulangValue nulang_value_bool_new(bool value);
 NulangValue nulang_value_nil(void);
 NulangValue nulang_value_unit(void);
-
-/**
- * Create a module-scoped Nulang string value by interning `s` into
- * `module_handle`'s constant pool. Returns nil on error.
- */
 NulangValue nulang_module_string(NulangRuntime *runtime,
                                  int64_t module_handle,
                                  const char *s);
@@ -124,36 +89,10 @@ double nulang_value_float(NulangValue value);
 bool nulang_value_bool(NulangValue value);
 bool nulang_value_is_nil(NulangValue value);
 bool nulang_value_is_unit(NulangValue value);
-
-/**
- * Return a C string representation of a module-independent Nulang value.
- *
- * Interned string values are rejected because their numeric payload is only a
- * module-local string-pool index. Use `nulang_module_value_to_string` when a
- * value may be a string.
- *
- * The returned pointer is owned by the runtime and normally valid until the
- * runtime is freed. Call `nulang_free_string` to release it earlier.
- */
 const char *nulang_value_to_string(NulangRuntime *runtime, NulangValue value);
-
-/**
- * Return a C string representation of `value`, resolving interned strings
- * against `module_handle`.
- *
- * Use this for values returned by `nulang_run` or `nulang_call_function` when
- * they may be strings. Returns NULL and sets `nulang_last_error` if the module
- * handle is invalid or the value's string ID does not belong to that module.
- */
 const char *nulang_module_value_to_string(NulangRuntime *runtime,
                                           int64_t module_handle,
                                           NulangValue value);
-
-/**
- * Free a C string previously returned by either value-to-string helper.
- *
- * Returns true if the pointer was recognized and freed.
- */
 bool nulang_free_string(NulangRuntime *runtime, const char *ptr);
 
 /* -------------------------------------------------------------------------- */
@@ -161,11 +100,22 @@ bool nulang_free_string(NulangRuntime *runtime, const char *ptr);
 /* -------------------------------------------------------------------------- */
 
 /**
- * Register a native C function so it can be called from Nulang.
+ * Register a native callback for one NulangRuntime.
  *
- * Use `"__nulang_registered__"` as the library name in the Nulang `extern`
- * block when the function was registered this way. Returns 0 on success,
- * -1 on error.
+ * Library-less `extern { ... }` declarations compiled by this runtime use the
+ * private binding first. A same-named callback registered through the legacy
+ * process-global API remains only a fallback.
+ */
+int nulang_runtime_register_native_function(NulangRuntime *runtime,
+                                            const char *name,
+                                            const void *ptr,
+                                            const NulangCType *params,
+                                            size_t param_count,
+                                            NulangCType ret);
+
+/**
+ * Legacy process-global registration. Prefer
+ * `nulang_runtime_register_native_function` for embedded applications.
  */
 int nulang_register_native_function(const char *name,
                                     const void *ptr,
