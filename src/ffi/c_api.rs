@@ -19,24 +19,16 @@ use crate::types::NuError;
 use crate::value_layout::{TAG_MASK, TAG_PTR};
 use crate::vm::{Value, VM};
 
-// ---------------------------------------------------------------------------
-// Opaque runtime handle
-// ---------------------------------------------------------------------------
+const REGISTERED_LIBRARY_SENTINEL: &str = "__nulang_registered__";
 
 /// An opaque runtime context that owns compiled modules and error state.
 #[repr(C)]
 pub struct NulangRuntime {
-    /// Unique compiled modules. Repeated source is stored only once.
     modules: Vec<crate::bytecode::CodeModule>,
-    /// Public C handle -> unique module index. This preserves fresh-handle
-    /// semantics without deep-cloning a CodeModule for each repeated compile.
     module_handles: Vec<usize>,
-    /// Source-hash -> unique compiled module index.
     compile_cache: HashMap<[u8; 32], usize>,
     last_error: Option<String>,
-    /// Holds the CString backing `nulang_last_error`.
     error_cstring: Option<CString>,
-    /// Holds CStrings returned by the value-to-string helpers.
     string_cache: Vec<CString>,
 }
 
@@ -50,6 +42,13 @@ impl NulangRuntime {
             error_cstring: None,
             string_cache: Vec::new(),
         }
+    }
+
+    /// Private resolver namespace for library-less `extern { ... }` functions.
+    /// The runtime lives in a Box for its entire public lifetime, so its address
+    /// is stable until `nulang_runtime_free` drops it.
+    fn ffi_namespace(&self) -> String {
+        format!("__nulang_runtime_{:x}", self as *const Self as usize)
     }
 
     fn set_error(&mut self, err: NuError) {
@@ -67,11 +66,6 @@ impl NulangRuntime {
         handle
     }
 
-    /// Resolve a public C module handle to the deduplicated module storage index.
-    ///
-    /// Public handles intentionally remain fresh for every compile call, while
-    /// `modules` stores identical source only once. Every operation that touches
-    /// a compiled module must cross this indirection boundary.
     fn module_index_for_handle(&self, module_handle: usize) -> Option<usize> {
         self.module_handles.get(module_handle).copied()
     }
@@ -88,7 +82,17 @@ impl NulangRuntime {
         }
 
         match compile_source(source) {
-            Ok(module) => {
+            Ok(mut module) => {
+                // Library-less externs are represented by a parser sentinel.
+                // Replace only that sentinel with this runtime's private namespace.
+                // Explicit dynamic-library externs keep their original library path.
+                let namespace = self.ffi_namespace();
+                for foreign in &mut module.foreign_functions {
+                    if foreign.library == REGISTERED_LIBRARY_SENTINEL {
+                        foreign.library = namespace.clone();
+                    }
+                }
+
                 let module_index = self.modules.len();
                 self.modules.push(module);
                 self.compile_cache.insert(source_hash, module_index);
@@ -243,6 +247,13 @@ impl NulangRuntime {
     }
 }
 
+impl Drop for NulangRuntime {
+    fn drop(&mut self) {
+        let namespace = self.ffi_namespace();
+        let _ = super::native::unregister_native_namespace(&namespace);
+    }
+}
+
 fn compile_source(source: &str) -> Result<crate::bytecode::CodeModule, NuError> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.lex()?;
@@ -302,6 +313,23 @@ fn value_from_c(value: NulangValue) -> Result<Value, &'static str> {
         return Err(INVALID_C_VALUE);
     }
     Value::try_from_untrusted_bits(value.raw)
+}
+
+fn signature_from_abi(
+    params: *const super::marshal::CType,
+    param_count: usize,
+    ret: super::marshal::CType,
+) -> Option<super::marshal::Signature> {
+    let params_slice = if param_count == 0 {
+        &[]
+    } else if params.is_null() {
+        return None;
+    } else {
+        // SAFETY: callers of the exported registration functions guarantee the
+        // pointer names `param_count` initialized CType values.
+        unsafe { std::slice::from_raw_parts(params, param_count) }
+    };
+    Some(super::marshal::Signature::new(params_slice.to_vec(), ret))
 }
 
 #[no_mangle]
@@ -541,6 +569,50 @@ pub unsafe extern "C" fn nulang_module_value_to_string(
     }
 }
 
+/// Register a native callback for this embedding runtime only.
+///
+/// Library-less `extern { ... }` declarations compiled by this runtime are
+/// rewritten to a private namespace. The existing resolver prefers that exact
+/// namespaced registration, then falls back to legacy process-global
+/// registrations.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_runtime_register_native_function(
+    runtime: *mut NulangRuntime,
+    name: *const c_char,
+    ptr: *const c_void,
+    params: *const super::marshal::CType,
+    param_count: usize,
+    ret: super::marshal::CType,
+) -> i32 {
+    if runtime.is_null() || name.is_null() || ptr.is_null() {
+        return -1;
+    }
+    let rt = unsafe { &mut *runtime };
+    let name_str = match unsafe { CStr::from_ptr(name).to_str() } {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let Some(signature) = signature_from_abi(params, param_count, ret) else {
+        return -1;
+    };
+    let namespace = rt.ffi_namespace();
+    match unsafe {
+        super::native::register_native_function_in_namespace(
+            &namespace,
+            name_str,
+            ptr,
+            signature,
+        )
+    } {
+        Ok(()) => 0,
+        Err(message) => {
+            rt.last_error = Some(message);
+            -1
+        }
+    }
+}
+
+/// Register a legacy process-global native callback.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_register_native_function(
     name: *const c_char,
@@ -558,28 +630,75 @@ pub unsafe extern "C" fn nulang_register_native_function(
             Err(_) => return -1,
         }
     };
-
-    let params_slice = if param_count == 0 {
-        &[]
-    } else if params.is_null() {
+    let Some(signature) = signature_from_abi(params, param_count, ret) else {
         return -1;
-    } else {
-        unsafe { std::slice::from_raw_parts(params, param_count) }
     };
-    let signature = super::marshal::Signature::new(params_slice.to_vec(), ret);
 
-    unsafe {
-        match super::native::register_native_function(name_str, ptr, signature) {
-            Ok(()) => 0,
-            Err(_) => -1,
-        }
+    match unsafe { super::native::register_native_function(name_str, ptr, signature) } {
+        Ok(()) => 0,
+        Err(_) => -1,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffi::marshal::CType;
     use std::ffi::CString;
+
+    extern "C" fn runtime_a_value() -> i64 {
+        11
+    }
+
+    extern "C" fn runtime_b_value() -> i64 {
+        22
+    }
+
+    #[test]
+    fn test_runtime_scoped_native_registration_isolated() {
+        let rt_a = nulang_runtime_new();
+        let rt_b = nulang_runtime_new();
+        let name = CString::new("scoped_value").unwrap();
+
+        assert_eq!(
+            unsafe {
+                nulang_runtime_register_native_function(
+                    rt_a,
+                    name.as_ptr(),
+                    runtime_a_value as *const c_void,
+                    std::ptr::null(),
+                    0,
+                    CType::I64,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                nulang_runtime_register_native_function(
+                    rt_b,
+                    name.as_ptr(),
+                    runtime_b_value as *const c_void,
+                    std::ptr::null(),
+                    0,
+                    CType::I64,
+                )
+            },
+            0
+        );
+
+        let source = CString::new("extern { fn scoped_value() -> Int } scoped_value()").unwrap();
+        let handle_a = unsafe { nulang_compile(rt_a, source.as_ptr()) };
+        let handle_b = unsafe { nulang_compile(rt_b, source.as_ptr()) };
+        assert!(handle_a >= 0 && handle_b >= 0);
+        assert_eq!(nulang_value_int(unsafe { nulang_run(rt_a, handle_a) }), 11);
+        assert_eq!(nulang_value_int(unsafe { nulang_run(rt_b, handle_b) }), 22);
+
+        unsafe { nulang_runtime_free(rt_a) };
+        // Runtime B remains independently usable after A removes its namespace.
+        assert_eq!(nulang_value_int(unsafe { nulang_run(rt_b, handle_b) }), 22);
+        unsafe { nulang_runtime_free(rt_b) };
+    }
 
     #[test]
     fn test_c_api_compile_and_run() {
