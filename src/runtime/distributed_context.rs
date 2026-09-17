@@ -409,9 +409,7 @@ mod tests {
             .unwrap()
             .register_behavior("handle", noop);
 
-        assert!(rt
-            .fabric_subscribe("events.>", actor_id, "handle")
-            .unwrap());
+        assert!(rt.fabric_subscribe("events.>", actor_id, "handle").unwrap());
         assert_eq!(rt.fabric_subscription_count(), 1);
 
         rt.exit_actor(actor_id, crate::types::ExitReason::Normal);
