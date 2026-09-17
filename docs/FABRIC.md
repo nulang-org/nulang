@@ -7,15 +7,22 @@ and persistence rather than as a second broker embedded beside them.
 
 ## Current implementation
 
-The first implementation slice is ephemeral, shard-local topic routing.
+The first implementation slice provides ephemeral topic routing across a
+Fabric-enabled Runtime shard set.
 
 Runtime APIs:
 
+- `Runtime::new_fabric_sharded(num_shards)` — create normal runtime shards plus
+  Fabric's subscription-metadata control plane.
+- `Runtime::wire_fabric_shards(shards)` — attach Fabric metadata replication to
+  an existing ordered shard set before subscriptions are registered.
+- `Runtime::fabric_sync()` — apply pending cross-shard subscription metadata.
 - `Runtime::fabric_subscribe(pattern, actor_id, behavior)` — fan-out subscription.
 - `Runtime::fabric_subscribe_group(pattern, group, actor_id, behavior)` — competing
   consumer subscription.
 - `Runtime::fabric_unsubscribe_actor(actor_id)` — remove an actor's subscriptions.
-- `Runtime::fabric_subscription_count()` — shard-local subscription gauge.
+- `Runtime::fabric_subscription_count()` — subscription gauge for the local
+  routing view.
 - `Runtime::fabric_publish(topic, args)` — publish to matching subscribers.
 
 Subject patterns use NATS-style token matching:
@@ -25,15 +32,22 @@ Subject patterns use NATS-style token matching:
 - `orders.>` matches one-or-more tokens after `orders` and `>` must be terminal.
 
 Non-group subscriptions fan out to every matching actor. For each matching
-consumer group, Fabric selects one member using deterministic round-robin
-routing. Identical subscriptions are deduplicated.
+consumer group, Fabric selects one member using deterministic per-publisher-
+shard round-robin routing. Identical subscriptions are deduplicated.
 
 Subscriptions are lifecycle-bound to their actors: normal exit, faults, linked
 exit cascades, and supervisor shutdown remove the actor's ephemeral routing
-entries. Subscription registration also verifies that the requested behavior
-exists. Publication resolves the behavior again and uses numeric delivery,
-explicitly avoiding the legacy actor-send fallback where an unknown behavior
-name can map to behavior 0.
+entries. Subscription registration verifies that the requested behavior exists
+and captures its numeric behavior id. That metadata is replicated to the other
+Fabric-enabled shards. A publisher therefore selects targets once from its
+local routing view and then calls the normal `send_message_by_id` path; payloads
+use the existing local/cross-shard actor transport rather than a second message
+transport.
+
+The Fabric control plane is explicit and runtime-owned. It uses small in-process
+channels only for subscription lifecycle metadata. There is no process-global
+subscription registry, so separate Runtime groups and deterministic tests remain
+isolated.
 
 This layer has deliberately **no durability guarantee yet**. It defines routing
 semantics that later cluster and stream layers can reuse.
@@ -55,9 +69,9 @@ semantics that later cluster and stream layers can reuse.
 6. **Prefer typed language primitives over stringly broker APIs.** String subjects
    are a runtime/interoperability layer; future `topic` and `stream` declarations
    should provide compile-time payload types and capabilities.
-7. **Do not hide shard coordination in process-global state.** Cross-shard Fabric
-   control messages should extend the existing shard transport explicitly so
-   independent runtimes and deterministic tests remain isolated.
+7. **Do not hide shard coordination in process-global state.** Fabric shard
+   metadata channels are owned by the Runtime shard set and payload delivery
+   continues to use the existing actor transport.
 
 ## Roadmap
 
@@ -70,8 +84,9 @@ semantics that later cluster and stream layers can reuse.
 - [x] Explicit actor cleanup.
 - [x] Automatic cleanup during actor exit.
 - [x] Behavior existence validation and safe numeric delivery.
-- [ ] Cross-shard subscription routing.
-- [ ] Mailbox capacity and explicit backpressure policies.
+- [x] Cross-shard subscription replication and payload routing.
+- [ ] Publish/backpressure result accounting on top of bounded actor mailboxes.
+- [ ] Placement-aware queue-group selection across publishing shards.
 
 ### Phase 2 — cluster-wide topics
 
