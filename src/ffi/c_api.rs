@@ -67,6 +67,15 @@ impl NulangRuntime {
         handle
     }
 
+    /// Resolve a public C module handle to the deduplicated module storage index.
+    ///
+    /// Public handles intentionally remain fresh for every compile call, while
+    /// `modules` stores identical source only once. Every operation that touches
+    /// a compiled module must cross this indirection boundary.
+    fn module_index_for_handle(&self, module_handle: usize) -> Option<usize> {
+        self.module_handles.get(module_handle).copied()
+    }
+
     fn compile(&mut self, source: &str) -> Option<usize> {
         self.clear_error();
 
@@ -97,7 +106,7 @@ impl NulangRuntime {
 
     fn run(&mut self, module_handle: usize) -> Option<Value> {
         self.clear_error();
-        let module_index = *self.module_handles.get(module_handle)?;
+        let module_index = self.module_index_for_handle(module_handle)?;
         let module = self.modules.get(module_index)?.clone();
         let mut vm = VM::new();
         vm.load_module(module);
@@ -117,7 +126,8 @@ impl NulangRuntime {
         args: &[NulangValue],
     ) -> Option<Value> {
         self.clear_error();
-        let module = self.modules.get(module_handle)?.clone();
+        let module_index = self.module_index_for_handle(module_handle)?;
+        let module = self.modules.get(module_index)?.clone();
         let offset = module.function_offset_by_name(name)?;
         let mut vm = VM::new();
         vm.load_module(module);
@@ -141,7 +151,8 @@ impl NulangRuntime {
     }
 
     fn add_module_string(&mut self, module_handle: usize, s: &str) -> Option<Value> {
-        let module = self.modules.get_mut(module_handle)?;
+        let module_index = self.module_index_for_handle(module_handle)?;
+        let module = self.modules.get_mut(module_index)?;
         let idx = module.add_string_constant(s);
         Some(Value::string(idx as u32))
     }
@@ -155,10 +166,13 @@ impl NulangRuntime {
             return value;
         }
         if let Some(bytes) = vm.string_bytes(value) {
-            if let Some(module) = self.modules.get_mut(module_handle) {
-                let id =
-                    module.add_string_constant(String::from_utf8_lossy(&bytes).into_owned()) as u32;
-                return Value::string(id);
+            if let Some(module_index) = self.module_index_for_handle(module_handle) {
+                if let Some(module) = self.modules.get_mut(module_index) {
+                    let id = module
+                        .add_string_constant(String::from_utf8_lossy(&bytes).into_owned())
+                        as u32;
+                    return Value::string(id);
+                }
             }
         }
         value
@@ -705,6 +719,52 @@ mod tests {
         let second_value = unsafe { nulang_run(rt, second) };
         assert_eq!(nulang_value_int(first_value), 42);
         assert_eq!(nulang_value_int(second_value), 42);
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_fresh_cached_handle_supports_call_function() {
+        let rt = nulang_runtime_new();
+        let source = CString::new("fn add(a: Int, b: Int) -> Int { a + b } add(0, 0)").unwrap();
+        let first = unsafe { nulang_compile(rt, source.as_ptr()) };
+        let second = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(first >= 0 && second >= 0 && first != second);
+
+        let args = [nulang_value_int_new(20), nulang_value_int_new(22)];
+        let name = CString::new("add").unwrap();
+        let result = unsafe {
+            nulang_call_function(rt, second, name.as_ptr(), args.as_ptr(), args.len())
+        };
+        assert_eq!(nulang_value_int(result), 42);
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_fresh_cached_handle_supports_module_strings_and_string_returns() {
+        let rt = nulang_runtime_new();
+        let source = CString::new(
+            "fn greet(name: String) -> String { perform String.concat(\"hello \", name) } greet(\"world\")",
+        )
+        .unwrap();
+        let first = unsafe { nulang_compile(rt, source.as_ptr()) };
+        let second = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(first >= 0 && second >= 0 && first != second);
+
+        let name = CString::new("world").unwrap();
+        let name_val = unsafe { nulang_module_string(rt, second, name.as_ptr()) };
+        assert!(!nulang_value_is_nil(name_val));
+
+        let args = [name_val];
+        let func_name = CString::new("greet").unwrap();
+        let result = unsafe {
+            nulang_call_function(rt, second, func_name.as_ptr(), args.as_ptr(), args.len())
+        };
+        let repr = unsafe { nulang_value_to_string(rt, result) };
+        assert!(!repr.is_null());
+        let s = unsafe { CStr::from_ptr(repr).to_str().unwrap() };
+        assert_eq!(s, "hello world");
 
         unsafe { nulang_runtime_free(rt) };
     }
