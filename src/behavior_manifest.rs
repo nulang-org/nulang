@@ -528,7 +528,7 @@ fn classify_effect(effect: &Effect) -> EffectDecl {
 fn authority_requirements(effects: &[Effect]) -> Vec<AuthorityDecl> {
     use Effect::*;
 
-    let mut required: BTreeMap<String, AuthorityDecl> = BTreeMap::new();
+    let mut required: BTreeMap<std::string::String, AuthorityDecl> = BTreeMap::new();
     for effect in effects {
         let decl = match effect {
             FS => Some(AuthorityDecl {
