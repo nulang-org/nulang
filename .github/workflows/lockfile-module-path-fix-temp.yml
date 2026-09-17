@@ -1,0 +1,59 @@
+name: Stage lockfile-only module resolution fix
+
+on:
+  push:
+    branches:
+      - automation/package-behavior-manifest-build
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: automation/package-behavior-manifest-build
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Bind package module resolution to lockfile
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('src/package/commands.rs')
+          text = p.read_text()
+          old = '''    let mut module_path = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
+    if let Some(computed) = build_module_path() {
+        if !module_path.is_empty() {
+            module_path.push(';');
+        }
+        module_path.push_str(&computed);
+    }
+    let module_path = (!module_path.is_empty()).then_some(module_path);
+'''
+          new = '''    // Package dependency resolution is derived exclusively from the lockfile
+    // written by prepare_package(). Ambient module mappings must not change the
+    // semantic input while provenance still claims the locked dependency graph.
+    let module_path = build_module_path();
+'''
+          if new not in text:
+              if old not in text:
+                  raise SystemExit('module-path patch anchor missing')
+              p.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --all
+      - name: Commit fix
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No diff"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/package/commands.rs
+          git commit -m "fix: bind package imports to resolved lockfile"
+          git push origin HEAD:automation/package-behavior-manifest-build
