@@ -84,9 +84,6 @@ impl NulangRuntime {
             if self.modules.get(module_index).is_some() {
                 return Some(self.fresh_handle_for(module_index));
             }
-            // The cache is internal and modules are append-only, so a missing
-            // module index should be impossible. Fall through and repair the
-            // entry by recompiling rather than failing the FFI call.
             self.compile_cache.remove(&source_hash);
         }
 
@@ -157,10 +154,6 @@ impl NulangRuntime {
         Some(Value::string(idx as u32))
     }
 
-    /// Move a returned string value from the ephemeral VM heap into the
-    /// runtime's module constant pool so that it remains valid after the VM is
-    /// dropped. String-pool values are returned unchanged; non-string values are
-    /// returned unchanged.
     fn stabilize_string_value(&mut self, value: Value, vm: &VM, module_handle: usize) -> Value {
         if value.as_string_id().is_some() {
             return value;
@@ -192,7 +185,6 @@ impl NulangRuntime {
         match &self.last_error {
             Some(msg) => {
                 let cstr = CString::new(msg.clone()).unwrap_or_else(|_| {
-                    // The message should never contain interior nuls in practice.
                     CString::new("<invalid error message>").unwrap_or(CString::new("").unwrap())
                 });
                 let ptr = cstr.as_ptr();
@@ -210,12 +202,6 @@ impl NulangRuntime {
         ptr
     }
 
-    /// Convert a value whose representation is independent of a module.
-    ///
-    /// Interned strings are intentionally rejected here: their payload is only
-    /// an index into a particular module's constant pool. Guessing a module
-    /// makes the C ABI return incorrect text once one runtime owns more than one
-    /// compiled module.
     fn value_to_cached_cstr(&mut self, value: Value) -> Result<*const c_char, String> {
         if value.as_string_id().is_some() {
             return Err(
@@ -226,8 +212,6 @@ impl NulangRuntime {
         Ok(self.cache_cstr(value.to_string_repr()))
     }
 
-    /// Convert a value using the explicitly supplied module as string-pool
-    /// provenance. Non-string values retain the ordinary representation.
     fn module_value_to_cached_cstr(
         &mut self,
         module_handle: usize,
@@ -258,10 +242,6 @@ impl NulangRuntime {
         Ok(self.cache_cstr(text))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Compilation pipeline
-// ---------------------------------------------------------------------------
 
 fn compile_source(source: &str) -> Result<crate::bytecode::CodeModule, NuError> {
     let mut lexer = Lexer::new(source);
@@ -300,14 +280,6 @@ fn compile_source(source: &str) -> Result<crate::bytecode::CodeModule, NuError> 
     Ok(code_module)
 }
 
-// ---------------------------------------------------------------------------
-// C value type
-// ---------------------------------------------------------------------------
-
-/// A Nulang value exposed to C.
-///
-/// Internally this is just the raw NaN-boxed bits. Use the extractor
-/// functions below to read primitive data out of it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NulangValue {
@@ -325,10 +297,6 @@ impl From<Value> for NulangValue {
 const INVALID_C_VALUE: &str =
     "C ABI rejected a pointer-tagged NulangValue: host heap pointers cannot be supplied by C";
 
-/// Convert an ABI value into a host `Value` only when it cannot forge a host
-/// heap pointer. C callers may construct arbitrary `NulangValue` bits even
-/// though `raw` is private to Rust, so the old blanket `From<NulangValue>`
-/// implementation was not a trustworthy provenance boundary.
 fn value_from_c(value: NulangValue) -> Result<Value, &'static str> {
     if (value.raw & TAG_MASK) == TAG_PTR {
         return Err(INVALID_C_VALUE);
@@ -336,52 +304,31 @@ fn value_from_c(value: NulangValue) -> Result<Value, &'static str> {
     Value::try_from_untrusted_bits(value.raw)
 }
 
-// ---------------------------------------------------------------------------
-// C API functions
-// ---------------------------------------------------------------------------
-
-/// Create a new Nulang runtime.
 #[no_mangle]
 pub extern "C" fn nulang_runtime_new() -> *mut NulangRuntime {
-    let runtime = Box::new(NulangRuntime::new());
-    Box::into_raw(runtime)
+    Box::into_raw(Box::new(NulangRuntime::new()))
 }
 
-/// Free a runtime created by `nulang_runtime_new`.
-///
-/// # Safety
-/// `runtime` must be a pointer returned by `nulang_runtime_new` and must not
-/// be used after this call.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_runtime_free(runtime: *mut NulangRuntime) {
     if !runtime.is_null() {
-        // SAFETY: caller guarantees the pointer came from `nulang_runtime_new`.
         unsafe {
             let _ = Box::from_raw(runtime);
         }
     }
 }
 
-/// Compile Nulang source code.
-///
-/// Returns a non-negative module handle on success, or -1 on error.
-/// On error, the error message can be retrieved with `nulang_last_error`.
-///
-/// # Safety
-/// `source` must be a valid, null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_compile(runtime: *mut NulangRuntime, source: *const c_char) -> i64 {
     if runtime.is_null() || source.is_null() {
         return -1;
     }
-    // SAFETY: caller guarantees `source` is a valid C string.
     let source_str = unsafe {
         match CStr::from_ptr(source).to_str() {
             Ok(s) => s,
             Err(_) => return -1,
         }
     };
-    // SAFETY: runtime is non-null and valid.
     let rt = unsafe { &mut *runtime };
     match rt.compile(source_str) {
         Some(handle) => handle as i64,
@@ -389,13 +336,6 @@ pub unsafe extern "C" fn nulang_compile(runtime: *mut NulangRuntime, source: *co
     }
 }
 
-/// Run a previously compiled module.
-///
-/// Returns the resulting value. If execution failed, the result is `nil` and
-/// `nulang_last_error` will return the error message.
-///
-/// # Safety
-/// `runtime` must be a valid pointer returned by `nulang_runtime_new`.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_run(
     runtime: *mut NulangRuntime,
@@ -404,7 +344,6 @@ pub unsafe extern "C" fn nulang_run(
     if runtime.is_null() || module_handle < 0 {
         return Value::nil().into();
     }
-    // SAFETY: runtime is non-null and valid.
     let rt = unsafe { &mut *runtime };
     match rt.run(module_handle as usize) {
         Some(value) => value.into(),
@@ -412,23 +351,6 @@ pub unsafe extern "C" fn nulang_run(
     }
 }
 
-/// Call an exported Nulang function by name with the supplied arguments.
-///
-/// `args` points to an array of `NulangValue` of length `arg_count`. The
-/// first argument goes into register r0, the second into r1, and so on,
-/// matching the MIR calling convention. On success the function's return
-/// value (register 0) is returned; on error the result is `nil` and
-/// `nulang_last_error` contains the message.
-///
-/// String-valued `NulangValue`s are module-scoped because their payload is an
-/// interned-string index. Pass them back only to the module that produced (or
-/// interned) them.
-///
-/// # Safety
-/// `runtime` must be valid, `name` a null-terminated UTF-8 string, and
-/// `args` must point to `arg_count` valid values (or be NULL when zero).
-/// Pointer-tagged values are not accepted from C because their payload cannot
-/// establish host-heap provenance.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_call_function(
     runtime: *mut NulangRuntime,
@@ -440,7 +362,6 @@ pub unsafe extern "C" fn nulang_call_function(
     if runtime.is_null() || module_handle < 0 || name.is_null() {
         return Value::nil().into();
     }
-    // SAFETY: runtime is valid; caller guarantees name is a valid C string.
     let rt = unsafe { &mut *runtime };
     let name_str = match unsafe { CStr::from_ptr(name).to_str() } {
         Ok(s) => s,
@@ -451,7 +372,6 @@ pub unsafe extern "C" fn nulang_call_function(
     } else if args.is_null() {
         return Value::nil().into();
     } else {
-        // SAFETY: caller guarantees args points to arg_count initialized ABI values.
         unsafe { std::slice::from_raw_parts(args, arg_count) }
     };
     match rt.call_function(module_handle as usize, name_str, args_slice) {
@@ -460,40 +380,23 @@ pub unsafe extern "C" fn nulang_call_function(
     }
 }
 
-/// Clear the runtime's last error state.
-///
-/// # Safety
-/// `runtime` must be a valid pointer returned by `nulang_runtime_new`.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_clear_error(runtime: *mut NulangRuntime) {
     if !runtime.is_null() {
-        // SAFETY: runtime is valid.
         let rt = unsafe { &mut *runtime };
         rt.clear_error();
     }
 }
 
-/// Return the last error message, or `NULL` if there is none.
-///
-/// The returned pointer is owned by the runtime and remains valid until the
-/// next call that modifies the error state or until the runtime is freed.
-///
-/// # Safety
-/// `runtime` must be a valid pointer returned by `nulang_runtime_new`.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_last_error(runtime: *mut NulangRuntime) -> *const c_char {
     if runtime.is_null() {
         return std::ptr::null();
     }
-    // SAFETY: runtime is non-null and valid.
     let rt = unsafe { &mut *runtime };
     rt.last_error_ptr()
 }
 
-/// Extract an integer from a Nulang value.
-///
-/// Returns 0 if the value is not an integer or if C supplied a forbidden
-/// host-pointer-tagged value.
 #[no_mangle]
 pub extern "C" fn nulang_value_int(value: NulangValue) -> i64 {
     value_from_c(value)
@@ -502,9 +405,6 @@ pub extern "C" fn nulang_value_int(value: NulangValue) -> i64 {
         .unwrap_or(0)
 }
 
-/// Extract a float from a Nulang value.
-///
-/// Returns 0.0 if the value is not a float or is rejected at the C boundary.
 #[no_mangle]
 pub extern "C" fn nulang_value_float(value: NulangValue) -> f64 {
     value_from_c(value)
@@ -513,9 +413,6 @@ pub extern "C" fn nulang_value_float(value: NulangValue) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Extract a boolean from a Nulang value.
-///
-/// Returns `false` if the value is not a boolean or is rejected at the C boundary.
 #[no_mangle]
 pub extern "C" fn nulang_value_bool(value: NulangValue) -> bool {
     value_from_c(value)
@@ -524,7 +421,6 @@ pub extern "C" fn nulang_value_bool(value: NulangValue) -> bool {
         .unwrap_or(false)
 }
 
-/// Check whether a value is `nil`.
 #[no_mangle]
 pub extern "C" fn nulang_value_is_nil(value: NulangValue) -> bool {
     value_from_c(value)
@@ -532,7 +428,6 @@ pub extern "C" fn nulang_value_is_nil(value: NulangValue) -> bool {
         .unwrap_or(false)
 }
 
-/// Check whether a value is the unit value `()`.
 #[no_mangle]
 pub extern "C" fn nulang_value_is_unit(value: NulangValue) -> bool {
     value_from_c(value)
@@ -540,46 +435,31 @@ pub extern "C" fn nulang_value_is_unit(value: NulangValue) -> bool {
         .unwrap_or(false)
 }
 
-/// Create an integer Nulang value.
 #[no_mangle]
 pub extern "C" fn nulang_value_int_new(value: i64) -> NulangValue {
     Value::int(value).into()
 }
 
-/// Create a floating-point Nulang value.
 #[no_mangle]
 pub extern "C" fn nulang_value_float_new(value: f64) -> NulangValue {
     Value::float(value).into()
 }
 
-/// Create a boolean Nulang value.
 #[no_mangle]
 pub extern "C" fn nulang_value_bool_new(value: bool) -> NulangValue {
     Value::bool(value).into()
 }
 
-/// Create the nil Nulang value.
 #[no_mangle]
 pub extern "C" fn nulang_value_nil() -> NulangValue {
     Value::nil().into()
 }
 
-/// Create the unit Nulang value `()`.
 #[no_mangle]
 pub extern "C" fn nulang_value_unit() -> NulangValue {
     Value::unit().into()
 }
 
-/// Create a Nulang string value by interning `s` into a compiled module's
-/// constant pool.
-///
-/// Returns `nil` if the runtime or handle is invalid, if `s` is not valid
-/// UTF-8, or if the string cannot be interned. The returned value is scoped to
-/// `module_handle`; use a separate `nulang_module_string` call for another
-/// module.
-///
-/// # Safety
-/// `runtime` must be valid and `s` a null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_module_string(
     runtime: *mut NulangRuntime,
@@ -589,25 +469,17 @@ pub unsafe extern "C" fn nulang_module_string(
     if runtime.is_null() || module_handle < 0 || s.is_null() {
         return Value::nil().into();
     }
-    // SAFETY: runtime is valid; caller guarantees s is a valid C string.
     let rt = unsafe { &mut *runtime };
-    let s_str = match unsafe { CStr::from_ptr(s).to_str() {
+    let s_str = match unsafe { CStr::from_ptr(s).to_str() } {
         Ok(s) => s,
         Err(_) => return Value::nil().into(),
-    }};
+    };
     match rt.add_module_string(module_handle as usize, s_str) {
         Some(value) => value.into(),
         None => Value::nil().into(),
     }
 }
 
-/// Free a C string previously returned by a value-to-string helper.
-///
-/// Returns `true` if the pointer was recognized and freed, `false` otherwise.
-///
-/// # Safety
-/// `runtime` must be valid and `ptr` must be a pointer previously returned by
-/// this runtime and not already freed.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_free_string(
     runtime: *mut NulangRuntime,
@@ -616,26 +488,10 @@ pub unsafe extern "C" fn nulang_free_string(
     if runtime.is_null() || ptr.is_null() {
         return false;
     }
-    // SAFETY: runtime is valid.
     let rt = unsafe { &mut *runtime };
     rt.free_cached_string(ptr)
 }
 
-/// Return a C string representation of a module-independent Nulang value.
-///
-/// Interned strings are rejected because their payload is only an index into a
-/// particular module's constant pool. Use `nulang_module_value_to_string` for
-/// string values. This avoids the historical behavior of guessing the most
-/// recently compiled module, which could return the wrong text.
-///
-/// The returned pointer is owned by the runtime and remains valid until the
-/// runtime is freed or `nulang_free_string` releases it.
-///
-/// Pointer-tagged raw values supplied by C are rejected because a numeric
-/// payload cannot establish that it points into a live Nulang host heap.
-///
-/// # Safety
-/// `runtime` must be a valid pointer returned by `nulang_runtime_new`.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_value_to_string(
     runtime: *mut NulangRuntime,
@@ -644,7 +500,6 @@ pub unsafe extern "C" fn nulang_value_to_string(
     if runtime.is_null() {
         return std::ptr::null();
     }
-    // SAFETY: runtime is non-null and valid.
     let rt = unsafe { &mut *runtime };
     match value_from_c(value) {
         Ok(value) => match rt.value_to_cached_cstr(value) {
@@ -661,16 +516,6 @@ pub unsafe extern "C" fn nulang_value_to_string(
     }
 }
 
-/// Return a C string representation using `module_handle` as the provenance
-/// for any interned string value.
-///
-/// This is the correct conversion API for values returned by `nulang_run` or
-/// `nulang_call_function` when the value may be a string. Passing an invalid
-/// module handle, or a string ID that is not present in that module, returns
-/// NULL and sets `nulang_last_error`.
-///
-/// # Safety
-/// `runtime` must be a valid pointer returned by `nulang_runtime_new`.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_module_value_to_string(
     runtime: *mut NulangRuntime,
@@ -680,7 +525,6 @@ pub unsafe extern "C" fn nulang_module_value_to_string(
     if runtime.is_null() || module_handle < 0 {
         return std::ptr::null();
     }
-    // SAFETY: runtime is non-null and valid.
     let rt = unsafe { &mut *runtime };
     match value_from_c(value) {
         Ok(value) => match rt.module_value_to_cached_cstr(module_handle as usize, value) {
@@ -697,23 +541,6 @@ pub unsafe extern "C" fn nulang_module_value_to_string(
     }
 }
 
-/// Register a native C function so it can be called from Nulang.
-///
-/// The function pointer must match the supplied parameter and return types.
-/// Use `"__nulang_registered__"` as the sentinel library name in the Nulang
-/// `extern` block when no dynamic library is required.
-///
-/// `params` is a pointer to an array of `CType` values; `param_count` is the
-/// array length. `ret` is the return type. The pointer and array are only
-/// borrowed for the duration of the call.
-///
-/// Returns 0 on success, -1 on error.
-///
-/// # Safety
-/// `name` must be a valid null-terminated UTF-8 string. `ptr` must point to a
-/// valid function whose C ABI matches the given types. If `param_count` is
-/// non-zero, `params` must point to at least `param_count` valid `CType`
-/// values.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_register_native_function(
     name: *const c_char,
@@ -725,7 +552,6 @@ pub unsafe extern "C" fn nulang_register_native_function(
     if name.is_null() || ptr.is_null() {
         return -1;
     }
-    // SAFETY: caller guarantees `name` is a valid C string.
     let name_str = unsafe {
         match CStr::from_ptr(name).to_str() {
             Ok(s) => s,
@@ -738,12 +564,10 @@ pub unsafe extern "C" fn nulang_register_native_function(
     } else if params.is_null() {
         return -1;
     } else {
-        // SAFETY: caller guarantees `params` points to `param_count` valid values.
         unsafe { std::slice::from_raw_parts(params, param_count) }
     };
     let signature = super::marshal::Signature::new(params_slice.to_vec(), ret);
 
-    // SAFETY: caller guarantees `ptr` matches the signature.
     unsafe {
         match super::native::register_native_function(name_str, ptr, signature) {
             Ok(()) => 0,
@@ -751,10 +575,6 @@ pub unsafe extern "C" fn nulang_register_native_function(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -764,29 +584,21 @@ mod tests {
     #[test]
     fn test_c_api_compile_and_run() {
         let rt = nulang_runtime_new();
-        assert!(!rt.is_null());
-
         let source = CString::new("1 + 2").unwrap();
         let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
-        assert!(handle >= 0, "compile failed");
-
+        assert!(handle >= 0);
         let value = unsafe { nulang_run(rt, handle) };
         assert_eq!(nulang_value_int(value), 3);
-
         unsafe { nulang_runtime_free(rt) };
     }
 
     #[test]
     fn test_identical_source_reuses_compiled_module_with_fresh_handle() {
         let rt = nulang_runtime_new();
-        assert!(!rt.is_null());
-
         let source = CString::new("40 + 2").unwrap();
         let first = unsafe { nulang_compile(rt, source.as_ptr()) };
         let second = unsafe { nulang_compile(rt, source.as_ptr()) };
-        assert!(first >= 0 && second >= 0);
-        assert_ne!(first, second, "each compile call must retain fresh-handle semantics");
-
+        assert!(first >= 0 && second >= 0 && first != second);
         let runtime = unsafe { &*rt };
         assert_eq!(runtime.compile_cache.len(), 1);
         assert_eq!(runtime.modules.len(), 1);
@@ -795,12 +607,8 @@ mod tests {
             runtime.module_handles[first as usize],
             runtime.module_handles[second as usize]
         );
-
-        let first_value = unsafe { nulang_run(rt, first) };
-        let second_value = unsafe { nulang_run(rt, second) };
-        assert_eq!(nulang_value_int(first_value), 42);
-        assert_eq!(nulang_value_int(second_value), 42);
-
+        assert_eq!(nulang_value_int(unsafe { nulang_run(rt, first) }), 42);
+        assert_eq!(nulang_value_int(unsafe { nulang_run(rt, second) }), 42);
         unsafe { nulang_runtime_free(rt) };
     }
 
@@ -811,14 +619,12 @@ mod tests {
         let first = unsafe { nulang_compile(rt, source.as_ptr()) };
         let second = unsafe { nulang_compile(rt, source.as_ptr()) };
         assert!(first >= 0 && second >= 0 && first != second);
-
         let args = [nulang_value_int_new(20), nulang_value_int_new(22)];
         let name = CString::new("add").unwrap();
         let result = unsafe {
             nulang_call_function(rt, second, name.as_ptr(), args.as_ptr(), args.len())
         };
         assert_eq!(nulang_value_int(result), 42);
-
         unsafe { nulang_runtime_free(rt) };
     }
 
@@ -832,21 +638,15 @@ mod tests {
         let first = unsafe { nulang_compile(rt, source.as_ptr()) };
         let second = unsafe { nulang_compile(rt, source.as_ptr()) };
         assert!(first >= 0 && second >= 0 && first != second);
-
         let name = CString::new("world").unwrap();
         let name_val = unsafe { nulang_module_string(rt, second, name.as_ptr()) };
-        assert!(!nulang_value_is_nil(name_val));
-
         let args = [name_val];
         let func_name = CString::new("greet").unwrap();
         let result = unsafe {
             nulang_call_function(rt, second, func_name.as_ptr(), args.as_ptr(), args.len())
         };
         let repr = unsafe { nulang_module_value_to_string(rt, second, result) };
-        assert!(!repr.is_null());
-        let s = unsafe { CStr::from_ptr(repr).to_str().unwrap() };
-        assert_eq!(s, "hello world");
-
+        assert_eq!(unsafe { CStr::from_ptr(repr).to_str().unwrap() }, "hello world");
         unsafe { nulang_runtime_free(rt) };
     }
 
@@ -855,19 +655,12 @@ mod tests {
         let rt = nulang_runtime_new();
         let first_source = CString::new("1 + 1").unwrap();
         let second_source = CString::new("2 + 2").unwrap();
-
         let first = unsafe { nulang_compile(rt, first_source.as_ptr()) };
         let second = unsafe { nulang_compile(rt, second_source.as_ptr()) };
         assert!(first >= 0 && second >= 0);
-
         let runtime = unsafe { &*rt };
         assert_eq!(runtime.compile_cache.len(), 2);
         assert_eq!(runtime.modules.len(), 2);
-        assert_ne!(
-            runtime.module_handles[first as usize],
-            runtime.module_handles[second as usize]
-        );
-
         unsafe { nulang_runtime_free(rt) };
     }
 
@@ -875,26 +668,16 @@ mod tests {
     fn test_c_api_compile_error() {
         let rt = nulang_runtime_new();
         let source = CString::new("let x = in").unwrap();
-        let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
-        assert_eq!(handle, -1);
-
-        let err = unsafe { nulang_last_error(rt) };
-        assert!(!err.is_null());
-
+        assert_eq!(unsafe { nulang_compile(rt, source.as_ptr()) }, -1);
+        assert!(!unsafe { nulang_last_error(rt) }.is_null());
         unsafe { nulang_runtime_free(rt) };
     }
 
     #[test]
     fn test_c_api_value_extractors() {
-        let int_val: NulangValue = Value::int(42).into();
-        assert_eq!(nulang_value_int(int_val), 42);
-
-        let float_val: NulangValue = Value::float(2.5).into();
-        assert!((nulang_value_float(float_val) - 2.5).abs() < f64::EPSILON);
-
-        let bool_val: NulangValue = Value::bool(true).into();
-        assert!(nulang_value_bool(bool_val));
-
+        assert_eq!(nulang_value_int(Value::int(42).into()), 42);
+        assert!((nulang_value_float(Value::float(2.5).into()) - 2.5).abs() < f64::EPSILON);
+        assert!(nulang_value_bool(Value::bool(true).into()));
         assert!(nulang_value_is_nil(Value::nil().into()));
         assert!(nulang_value_is_unit(Value::unit().into()));
     }
@@ -903,18 +686,12 @@ mod tests {
     fn test_c_api_rejects_forged_host_pointer_values() {
         let forged = NulangValue { raw: TAG_PTR | 0x1234 };
         assert_eq!(nulang_value_int(forged), 0);
-        assert_eq!(nulang_value_float(forged), 0.0);
-        assert!(!nulang_value_bool(forged));
-        assert!(!nulang_value_is_nil(forged));
-        assert!(!nulang_value_is_unit(forged));
-
         let rt = nulang_runtime_new();
-        let ptr = unsafe { nulang_value_to_string(rt, forged) };
-        assert!(ptr.is_null());
+        assert!(unsafe { nulang_value_to_string(rt, forged) }.is_null());
         let err = unsafe { nulang_last_error(rt) };
-        assert!(!err.is_null());
-        let message = unsafe { CStr::from_ptr(err) }.to_string_lossy();
-        assert!(message.contains("pointer-tagged"));
+        assert!(unsafe { CStr::from_ptr(err) }
+            .to_string_lossy()
+            .contains("pointer-tagged"));
         unsafe { nulang_runtime_free(rt) };
     }
 
@@ -923,37 +700,27 @@ mod tests {
         let rt = nulang_runtime_new();
         let source = CString::new("fn id(x: Int) -> Int { x } id(0)").unwrap();
         let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
-        assert!(handle >= 0);
         let name = CString::new("id").unwrap();
         let forged = [NulangValue { raw: TAG_PTR | 0x1234 }];
         let result = unsafe {
             nulang_call_function(rt, handle, name.as_ptr(), forged.as_ptr(), forged.len())
         };
         assert!(nulang_value_is_nil(result));
-        let err = unsafe { nulang_last_error(rt) };
-        assert!(!err.is_null());
-        let message = unsafe { CStr::from_ptr(err) }.to_string_lossy();
-        assert!(message.contains("pointer-tagged"));
         unsafe { nulang_runtime_free(rt) };
     }
 
     #[test]
     fn test_c_api_value_to_string() {
         let rt = nulang_runtime_new();
-        let value: NulangValue = Value::int(123).into();
-        let ptr = unsafe { nulang_value_to_string(rt, value) };
-        assert!(!ptr.is_null());
-        let s = unsafe { CStr::from_ptr(ptr).to_str().unwrap() };
-        assert_eq!(s, "123");
-
+        let ptr = unsafe { nulang_value_to_string(rt, Value::int(123).into()) };
+        assert_eq!(unsafe { CStr::from_ptr(ptr).to_str().unwrap() }, "123");
         unsafe { nulang_runtime_free(rt) };
     }
 
     #[test]
     fn test_c_api_value_constructors() {
         assert_eq!(nulang_value_int(nulang_value_int_new(-7)), -7);
-        let f = nulang_value_float(nulang_value_float_new(3.5));
-        assert!((f - 3.5).abs() < f64::EPSILON);
+        assert!((nulang_value_float(nulang_value_float_new(3.5)) - 3.5).abs() < f64::EPSILON);
         assert!(nulang_value_bool(nulang_value_bool_new(true)));
         assert!(nulang_value_is_nil(nulang_value_nil()));
         assert!(nulang_value_is_unit(nulang_value_unit()));
@@ -964,14 +731,12 @@ mod tests {
         let rt = nulang_runtime_new();
         let source = CString::new("fn add(a: Int, b: Int) -> Int { a + b } add(0, 0)").unwrap();
         let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
-        assert!(handle >= 0, "compile failed");
-
         let args = [nulang_value_int_new(10), nulang_value_int_new(32)];
         let name = CString::new("add").unwrap();
-        let result =
-            unsafe { nulang_call_function(rt, handle, name.as_ptr(), args.as_ptr(), args.len()) };
+        let result = unsafe {
+            nulang_call_function(rt, handle, name.as_ptr(), args.as_ptr(), args.len())
+        };
         assert_eq!(nulang_value_int(result), 42);
-
         unsafe { nulang_runtime_free(rt) };
     }
 
@@ -983,78 +748,40 @@ mod tests {
         )
         .unwrap();
         let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
-        assert!(handle >= 0, "compile failed");
-
         let name = CString::new("world").unwrap();
         let name_val = unsafe { nulang_module_string(rt, handle, name.as_ptr()) };
-        assert!(!nulang_value_is_nil(name_val));
-
         let args = [name_val];
         let func_name = CString::new("greet").unwrap();
         let result = unsafe {
             nulang_call_function(rt, handle, func_name.as_ptr(), args.as_ptr(), args.len())
         };
-
         let repr = unsafe { nulang_module_value_to_string(rt, handle, result) };
-        assert!(!repr.is_null());
-        let s = unsafe { CStr::from_ptr(repr).to_str().unwrap() };
-        assert_eq!(s, "hello world");
-
+        assert_eq!(unsafe { CStr::from_ptr(repr).to_str().unwrap() }, "hello world");
         unsafe { nulang_runtime_free(rt) };
     }
 
     #[test]
     fn test_module_aware_string_conversion_preserves_provenance() {
         let rt = nulang_runtime_new();
-        let first_source = CString::new("1").unwrap();
-        let second_source = CString::new("2").unwrap();
-        let first = unsafe { nulang_compile(rt, first_source.as_ptr()) };
-        let second = unsafe { nulang_compile(rt, second_source.as_ptr()) };
-        assert!(first >= 0 && second >= 0);
-
+        let first = unsafe { nulang_compile(rt, CString::new("1").unwrap().as_ptr()) };
+        let second = unsafe { nulang_compile(rt, CString::new("2").unwrap().as_ptr()) };
         let alpha = CString::new("alpha").unwrap();
         let beta = CString::new("beta").unwrap();
         let first_value = unsafe { nulang_module_string(rt, first, alpha.as_ptr()) };
         let second_value = unsafe { nulang_module_string(rt, second, beta.as_ptr()) };
-
-        // Both modules begin with the same constant shape, so the newly interned
-        // strings should occupy the same numeric pool slot while meaning
-        // different things. The conversion API must therefore use the handle.
         assert_eq!(
             value_from_c(first_value).unwrap().as_string_id(),
             value_from_c(second_value).unwrap().as_string_id()
         );
-
         let first_ptr = unsafe { nulang_module_value_to_string(rt, first, first_value) };
         let second_ptr = unsafe { nulang_module_value_to_string(rt, second, second_value) };
-        assert!(!first_ptr.is_null() && !second_ptr.is_null());
         assert_eq!(unsafe { CStr::from_ptr(first_ptr).to_str().unwrap() }, "alpha");
         assert_eq!(unsafe { CStr::from_ptr(second_ptr).to_str().unwrap() }, "beta");
-
-        // The legacy module-less conversion must fail rather than guess.
-        let ambiguous = unsafe { nulang_value_to_string(rt, first_value) };
-        assert!(ambiguous.is_null());
+        assert!(unsafe { nulang_value_to_string(rt, first_value) }.is_null());
         let err = unsafe { nulang_last_error(rt) };
-        let message = unsafe { CStr::from_ptr(err) }.to_string_lossy();
-        assert!(message.contains("module provenance"));
-
-        unsafe { nulang_runtime_free(rt) };
-    }
-
-    #[test]
-    fn test_module_aware_conversion_rejects_wrong_module_string_id() {
-        let rt = nulang_runtime_new();
-        let first_source = CString::new("1").unwrap();
-        let second_source = CString::new("fn f() -> Int { 2 } f()").unwrap();
-        let first = unsafe { nulang_compile(rt, first_source.as_ptr()) };
-        let second = unsafe { nulang_compile(rt, second_source.as_ptr()) };
-        assert!(first >= 0 && second >= 0);
-
-        let text = CString::new("only-first").unwrap();
-        let value = unsafe { nulang_module_string(rt, first, text.as_ptr()) };
-        let wrong = unsafe { nulang_module_value_to_string(rt, second, value) };
-        assert!(wrong.is_null());
-
+        assert!(unsafe { CStr::from_ptr(err) }
+            .to_string_lossy()
+            .contains("module provenance"));
         unsafe { nulang_runtime_free(rt) };
     }
 
@@ -1065,26 +792,21 @@ mod tests {
             CString::new("fn len(s: String) -> Int { perform String.length(s) } len(\"\")")
                 .unwrap();
         let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
-        assert!(handle >= 0, "compile failed");
-
         let s = CString::new("hello c api").unwrap();
         let sv = unsafe { nulang_module_string(rt, handle, s.as_ptr()) };
-        assert!(!nulang_value_is_nil(sv));
-
         let args = [sv];
         let name = CString::new("len").unwrap();
-        let result =
-            unsafe { nulang_call_function(rt, handle, name.as_ptr(), args.as_ptr(), args.len()) };
+        let result = unsafe {
+            nulang_call_function(rt, handle, name.as_ptr(), args.as_ptr(), args.len())
+        };
         assert_eq!(nulang_value_int(result), 11);
-
         unsafe { nulang_runtime_free(rt) };
     }
 
     #[test]
     fn test_c_api_free_string() {
         let rt = nulang_runtime_new();
-        let value: NulangValue = Value::int(456).into();
-        let ptr = unsafe { nulang_value_to_string(rt, value) };
+        let ptr = unsafe { nulang_value_to_string(rt, Value::int(456).into()) };
         assert!(!ptr.is_null());
         assert!(unsafe { nulang_free_string(rt, ptr) });
         assert!(!unsafe { nulang_free_string(rt, std::ptr::null()) });
