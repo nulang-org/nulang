@@ -45,6 +45,15 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Runtime backend parity — 2026-09-17
+- **WASM guest-heap negation error parity** (`src/wasm_runtime.rs`,
+  `src/mir_wasm.rs`): unary negation of a guest heap value now reports the
+  same Nulang arithmetic type error as the interpreter instead of surfacing a
+  generic Wasmtime trap. The fix preserves pointer-provenance hardening: a
+  guest `TAG_PTR` remains a linear-memory offset and is never reconstructed as
+  a process-local host pointer. A focused WASM regression test covers tuple
+  negation, and the deterministic differential fuzzer exercises the same path.
+
 ### Added since 1.0.0-frozen — 2026-09-14 (web contract + capacity broker hardening)
 - **Web request decoding fixes** (Experimental, `src/web/request_bindings.rs`,
   `src/web/bindings.rs`, `src/web/contracts.rs`, `src/web/dispatch.rs`).
