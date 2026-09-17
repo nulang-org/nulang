@@ -5,17 +5,18 @@ const { title = data.title, tagline, actions = [] } = data.hero || {};
 const PAGE_TITLE_ID = '_top';
 
 const codeHtml = [
-	'<span class="tok-comment">// counter.nulang — a durable stateful actor</span>',
-	'<span class="tok-kw">state</span> {',
-	'  <span class="tok-id">count</span>: <span class="tok-type">Int</span> = <span class="tok-num">0</span>,',
+	'<span class="tok-comment">// counter.nula — a stateful actor</span>',
+	'<span class="tok-kw">actor</span> <span class="tok-type">Counter</span> {',
+	'  <span class="tok-kw">state</span> <span class="tok-id">count</span>: <span class="tok-type">Int</span> = <span class="tok-num">0</span>',
+	'',
+	'  <span class="tok-kw">behavior</span> <span class="tok-fn">inc</span>() {',
+	'    <span class="tok-kw">self</span>.<span class="tok-id">count</span> = <span class="tok-kw">self</span>.<span class="tok-id">count</span> + <span class="tok-num">1</span>',
+	'  }',
 	'}',
 	'',
-	'<span class="tok-kw">effect</span> <span class="tok-fn">increment</span>() {',
-	'  <span class="tok-kw">self</span>.<span class="tok-id">count</span> = <span class="tok-kw">self</span>.<span class="tok-id">count</span> + <span class="tok-num">1</span>',
-	'}',
-	'',
-	'<span class="tok-kw">effect</span> <span class="tok-fn">value</span>() {',
-	'  <span class="tok-kw">self</span>.<span class="tok-id">count</span>',
+	'<span class="tok-kw">fn</span> <span class="tok-fn">main</span>() {',
+	'  <span class="tok-kw">let</span> <span class="tok-id">c</span> = <span class="tok-kw">spawn</span> <span class="tok-type">Counter</span> {}',
+	'  <span class="tok-id">c</span> ! <span class="tok-fn">inc</span>()',
 	'}',
 ].join('\n');
 ---
@@ -30,13 +31,13 @@ const codeHtml = [
 					{actions.map(({ text, link, icon, variant }) => (
 						<a href={link} class:list={['hero-action', variant]}>
 							{text}
-							{icon === 'right-arrow' && (
+							{icon?.type === 'icon' && icon.name === 'right-arrow' && (
 								<svg aria-hidden="true" class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 									<path d="M5 12h14" />
 									<path d="m12 5 7 7-7 7" />
 								</svg>
 							)}
-							{icon === 'external' && (
+							{icon?.type === 'icon' && icon.name === 'external' && (
 								<svg aria-hidden="true" class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 									<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
 									<polyline points="15 3 21 3 21 9" />
@@ -55,7 +56,7 @@ const codeHtml = [
 			<span class="t-dot t-red"></span>
 			<span class="t-dot t-yellow"></span>
 			<span class="t-dot t-green"></span>
-			<span class="t-title">counter.nulang</span>
+			<span class="t-title">counter.nula</span>
 		</div>
 		<pre class="hero-terminal-code"><code set:html={codeHtml}></code></pre>
 	</div>

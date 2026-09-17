@@ -47,7 +47,7 @@ let a = spawn Assistant {} in
 ask a ask("What is an actor model?")
 ```
 
-`spawn Assistant {} in ...` creates a running agent instance and returns its reference. The `ask a ask("prompt")` form is a synchronous request/reply — it blocks the caller until the agent responds. Inside a scheduler-driven actor or workflow, `LLM.ask` suspends non-blockingly instead (see [Signals, Timers & Queries](/workflows/signals-timers/)).
+`spawn Assistant {} in ...` creates a running agent instance and returns its reference. The `ask a ask("prompt")` form is a synchronous request/reply — it blocks the caller until the agent responds. Inside a scheduler-driven actor or workflow, `perform Inference.ask(prompt)` suspends non-blockingly instead (see [Signals, Timers & Queries](/workflows/signals-timers/)).
 
 ## Tools
 
