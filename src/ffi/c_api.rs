@@ -78,7 +78,6 @@ impl NulangRuntime {
 
     fn compile(&mut self, source: &str) -> Option<usize> {
         self.clear_error();
-
         let source_hash = *blake3::hash(source.as_bytes()).as_bytes();
         if let Some(&module_index) = self.compile_cache.get(&source_hash) {
             if self.modules.get(module_index).is_some() {
@@ -86,7 +85,6 @@ impl NulangRuntime {
             }
             self.compile_cache.remove(&source_hash);
         }
-
         match compile_source(source) {
             Ok(mut module) => {
                 let namespace = self.ffi_namespace();
@@ -95,7 +93,6 @@ impl NulangRuntime {
                         foreign.library = namespace.clone();
                     }
                 }
-
                 let module_index = self.modules.len();
                 self.modules.push(module);
                 self.compile_cache.insert(source_hash, module_index);
@@ -227,7 +224,6 @@ impl NulangRuntime {
         let module_index = self
             .module_index_for_handle(module_handle)
             .ok_or_else(|| "invalid module handle".to_string())?;
-
         let text = if let Some(id) = value.as_string_id() {
             self.modules
                 .get(module_index)
@@ -245,7 +241,6 @@ impl NulangRuntime {
         } else {
             value.to_string_repr()
         };
-
         Ok(self.cache_cstr(text))
     }
 }
@@ -260,16 +255,12 @@ impl Drop for NulangRuntime {
 fn compile_source(source: &str) -> Result<crate::bytecode::CodeModule, NuError> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.lex()?;
-
     let mut parser = Parser::new(tokens);
     let ast = parser.parse_module()?;
-
     let mut type_checker = TypeChecker::new();
     let _module_type = type_checker.check_module(&ast)?;
-
     let mut effect_checker = EffectChecker::new();
     effect_checker.check_module(&ast.decls)?;
-
     let mut cap_analyzer = CapabilityAnalyzer::new();
     let cap_ctx = CapContext::new();
     for decl in crate::effect_checker::flatten_decls(&ast.decls) {
@@ -287,7 +278,6 @@ fn compile_source(source: &str) -> Result<crate::bytecode::CodeModule, NuError> 
             _ => {}
         }
     }
-
     let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
     let mut mir = crate::mir_lower::lower_module(&hir)?;
     let code_module = crate::mir_codegen::compile_mir(&mut mir, "main")?;
@@ -724,7 +714,6 @@ pub unsafe extern "C" fn nulang_register_native_function(
     let Some(signature) = signature_from_abi(params, param_count, ret) else {
         return -1;
     };
-
     match unsafe { super::native::register_native_function(name_str, ptr, signature) } {
         Ok(()) => 0,
         Err(_) => -1,
@@ -779,7 +768,10 @@ mod tests {
     #[test]
     fn test_protected_run_reports_runtime_error() {
         let rt = nulang_runtime_new();
-        let source = CString::new("1 / 0").unwrap();
+        let source = CString::new(
+            "extern \"libnulang_definitely_missing_protected_test.so\" { fn missing() -> Int } missing()",
+        )
+        .unwrap();
         let mut handle = -1;
         assert_eq!(
             unsafe { nulang_compile_protected(rt, source.as_ptr(), &mut handle) },
@@ -810,7 +802,6 @@ mod tests {
         let rt_a = nulang_runtime_new();
         let rt_b = nulang_runtime_new();
         let name = CString::new("scoped_value").unwrap();
-
         assert_eq!(
             unsafe {
                 nulang_runtime_register_native_function(
@@ -837,14 +828,12 @@ mod tests {
             },
             0
         );
-
         let source = CString::new("extern { fn scoped_value() -> Int } scoped_value()").unwrap();
         let handle_a = unsafe { nulang_compile(rt_a, source.as_ptr()) };
         let handle_b = unsafe { nulang_compile(rt_b, source.as_ptr()) };
         assert!(handle_a >= 0 && handle_b >= 0);
         assert_eq!(nulang_value_int(unsafe { nulang_run(rt_a, handle_a) }), 11);
         assert_eq!(nulang_value_int(unsafe { nulang_run(rt_b, handle_b) }), 22);
-
         unsafe { nulang_runtime_free(rt_a) };
         assert_eq!(nulang_value_int(unsafe { nulang_run(rt_b, handle_b) }), 22);
         unsafe { nulang_runtime_free(rt_b) };
