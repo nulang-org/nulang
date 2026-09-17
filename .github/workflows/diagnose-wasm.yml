@@ -1,4 +1,4 @@
-name: Diagnose WASM backend
+name: Apply WASM pointer negation fix
 
 on:
   push:
@@ -6,32 +6,140 @@ on:
       - debug/wasm-ci-provenance
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose:
+  fix:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: debug/wasm-ci-provenance
+          fetch-depth: 0
+
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-      - name: Run WASM differential fuzz test and capture output
+
+      - name: Patch guest pointer negation boundary
         shell: bash
         run: |
-          set +e
-          cargo test --features wasm-backend fuzz_differential_quick -- --nocapture > wasm-test.log 2>&1
-          status=$?
-          echo "$status" > wasm-test.status
-          exit 0
-      - name: Upload diagnostic output
-        uses: actions/upload-artifact@v6
-        with:
-          name: wasm-test-diagnostic
-          path: |
-            wasm-test.log
-            wasm-test.status
-          if-no-files-found: error
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/wasm_runtime.rs')
+          s = p.read_text()
+          old = '''fn host_neg(_caller: Caller<'_, HostState>, a: i64) -> Result<i64, Error> {
+              let a = a as u64;
+              if value_layout::is_float_raw(a) {
+                  // Flip the IEEE-754 sign bit (bit 63), NOT `SIGN_BIT` (bit 47, the
+                  // 48-bit payload sign used for ints) — XORing the mantissa would
+                  // corrupt the float. Negating the canonical NaN flips it into the
+                  // tag range, so canonicalize the result.
+                  Ok(value_layout::float_bits(-f64::from_bits(a)) as i64)
+              } else {
+                  // Match the interpreter's INeg (and the JIT helper `nulang_ineg`):
+                  // ints negate with a 48-bit overflow check at INT48_MIN; anything
+                  // else is a type error. A guest pointer remains valid guest-local
+                  // state, but it cannot be reconstructed as a host pointer Value.
+                  let v = guest_non_pointer_value(a).map_err(Error::msg)?;
+                  match v.as_int() {
+                      Some(x) if x != crate::value_layout::INT48_MIN => Ok(value_layout::tag_int(-x) as i64),
+                      Some(x) => Err(Error::msg(error_message(crate::vm::int_overflow_error(
+                          "neg", x, 0,
+                      )))),
+                      None => Err(Error::msg(error_message(crate::vm::arith_type_error(
+                          "neg", v, v,
+                      )))),
+                  }
+              }
+          }
+          '''
+          new = '''fn host_neg(_caller: Caller<'_, HostState>, a: i64) -> Result<i64, Error> {
+              let a = a as u64;
+              if value_layout::is_float_raw(a) {
+                  // Flip the IEEE-754 sign bit (bit 63), NOT `SIGN_BIT` (bit 47, the
+                  // 48-bit payload sign used for ints) — XORing the mantissa would
+                  // corrupt the float. Negating the canonical NaN flips it into the
+                  // tag range, so canonicalize the result.
+                  Ok(value_layout::float_bits(-f64::from_bits(a)) as i64)
+              } else {
+                  // Match the interpreter's INeg (and the JIT helper `nulang_ineg`):
+                  // ints negate with a 48-bit overflow check at INT48_MIN; anything
+                  // else is a type error. A guest TAG_PTR is a linear-memory offset,
+                  // not a process-local host pointer, so format that type error from
+                  // the raw guest bits instead of reconstructing a host `Value`.
+                  if value_layout::is_ptr_raw(a) {
+                      let repr = format!("#Value({a:x})");
+                      return Err(Error::msg(format!(
+                          "type error: arithmetic `neg` requires numeric operands, got {repr} and {repr}"
+                      )));
+                  }
+
+                  let v = guest_non_pointer_value(a).map_err(Error::msg)?;
+                  match v.as_int() {
+                      Some(x) if x != crate::value_layout::INT48_MIN => Ok(value_layout::tag_int(-x) as i64),
+                      Some(x) => Err(Error::msg(error_message(crate::vm::int_overflow_error(
+                          "neg", x, 0,
+                      )))),
+                      None => Err(Error::msg(error_message(crate::vm::arith_type_error(
+                          "neg", v, v,
+                      )))),
+                  }
+              }
+          }
+          '''
+          if s.count(old) != 1:
+              raise SystemExit(f'host_neg anchor count changed: {s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('src/mir_wasm.rs')
+          s = p.read_text()
+          anchor = '''    #[test]
+              #[cfg(all(test, feature = "wasm-backend"))]
+              fn test_wasm_array_index() {
+          '''
+          test = '''    #[test]
+              #[cfg(all(test, feature = "wasm-backend"))]
+              fn test_wasm_neg_heap_value_reports_type_error() {
+                  let err = run_source("-(1 + 2,)").expect_err("heap tuple negation must fail");
+                  assert!(
+                      err.to_string()
+                          .contains("type error: arithmetic `neg` requires numeric operands"),
+                      "WASM must report the language type error instead of a provenance/trap error: {err}"
+                  );
+              }
+
+          '''
+          if s.count(anchor) != 1:
+              raise SystemExit(f'WASM test anchor count changed: {s.count(anchor)}')
+          p.write_text(s.replace(anchor, test + anchor, 1))
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Validate focused regression
+        run: cargo test --features wasm-backend test_wasm_neg_heap_value_reports_type_error -- --nocapture
+
+      - name: Validate deterministic differential fuzz regression
+        run: cargo test --features wasm-backend fuzz_differential_quick -- --nocapture
+
+      - name: Commit source fix and remove temporary workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/diagnose-wasm.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/wasm_runtime.rs src/mir_wasm.rs .github/workflows/diagnose-wasm.yml
+          git diff --cached --check
+          git commit -m "fix(wasm): preserve type errors for guest heap negation"
+          git push origin HEAD:debug/wasm-ci-provenance
