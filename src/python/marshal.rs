@@ -181,34 +181,34 @@ pub fn python_to_nulang(obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Value, Str
         // Future optimization: intern the string and use TAG_STRING.
         let py_obj: Py<PyAny> = obj.clone().unbind().into_any();
         let id = register_object(py_obj);
-        return Ok(Value::from_raw(TAG_PYTHON | id.0));
+        return Ok(unsafe { Value::from_raw(TAG_PYTHON | id.0) });
     }
 
     // Check for list
     if let Ok(_lst) = obj.cast::<PyList>() {
         let py_obj: Py<PyAny> = obj.clone().unbind().into_any();
         let id = register_object(py_obj);
-        return Ok(Value::from_raw(TAG_PYTHON | id.0));
+        return Ok(unsafe { Value::from_raw(TAG_PYTHON | id.0) });
     }
 
     // Check for tuple
     if let Ok(_tup) = obj.cast::<PyTuple>() {
         let py_obj: Py<PyAny> = obj.clone().unbind().into_any();
         let id = register_object(py_obj);
-        return Ok(Value::from_raw(TAG_PYTHON | id.0));
+        return Ok(unsafe { Value::from_raw(TAG_PYTHON | id.0) });
     }
 
     // Check for dict
     if let Ok(_d) = obj.cast::<PyDict>() {
         let py_obj: Py<PyAny> = obj.clone().unbind().into_any();
         let id = register_object(py_obj);
-        return Ok(Value::from_raw(TAG_PYTHON | id.0));
+        return Ok(unsafe { Value::from_raw(TAG_PYTHON | id.0) });
     }
 
     // Any other Python type — store as opaque Python object
     let py_obj: Py<PyAny> = obj.clone().unbind().into_any();
     let id = register_object(py_obj);
-    Ok(Value::from_raw(TAG_PYTHON | id.0))
+    Ok(unsafe { Value::from_raw(TAG_PYTHON | id.0) })
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +415,7 @@ mod tests {
         });
 
         // Create a Nulang Value referencing it
-        let val = Value::from_raw(TAG_PYTHON | py_id.0);
+        let val = unsafe { Value::from_raw(TAG_PYTHON | py_id.0) };
 
         // Convert to Python
         let py_obj = nulang_to_python(val).expect("nulang_to_python failed");
@@ -617,7 +617,7 @@ mod tests {
             let obj: Py<PyAny> = "opaque".into_pyobject(py).unwrap().unbind().into_any();
             register_object(obj)
         });
-        let val = Value::from_raw(TAG_PYTHON | py_id.0);
+        let val = unsafe { Value::from_raw(TAG_PYTHON | py_id.0) };
         assert_eq!(
             val.as_raw() & TAG_MASK,
             TAG_PYTHON,
