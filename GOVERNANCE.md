@@ -95,8 +95,10 @@ The following rules govern keyword introduction, reservation, and removal:
    - Free the identifier in the following major version.
    - Migration tooling (`nulang migrate`) rewrites affected source files.
 
-The canonical keyword inventory lives in `src/lexer.rs` §keyword_map and
-is audited in `SPEC2.md` §Implementation Status.
+The canonical keyword inventory lives in
+`crates/nulang-lexer/src/lexer_impl.rs` §keyword and is audited in `SPEC2.md`
+§Implementation Status. `src/lexer.rs` is the root compiler compatibility
+facade for the extracted lexer crate.
 
 ## 3. Roles
 
