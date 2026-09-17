@@ -10,15 +10,17 @@
     "build": "astro build",
     "prebuild": "pnpm run generate-og",
     "generate-og": "node scripts/generate-og-image.mjs",
-    "preview": "astro preview"
+    "preview": "astro preview",
+    "check": "astro check"
   },
   "dependencies": {
-    "@astrojs/sitemap": "^3.7.3",
-    "@astrojs/starlight": "^0.41.3",
-    "@astrojs/tailwind": "^6.0.2",
-    "@tailwindcss/typography": "^0.5.20",
-    "astro": "^7.1.2",
-    "sharp": "^0.35.3",
-    "tailwindcss": "^3.4.17"
+    "@astrojs/sitemap": "^3.7.4",
+    "@astrojs/starlight": "^0.42.1",
+    "astro": "^7.3.2"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.4",
+    "sharp": "^0.35.4",
+    "typescript": "^5.9.3"
   }
 }
