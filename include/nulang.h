@@ -20,7 +20,12 @@ extern "C" {
 /** Opaque handle to a Nulang runtime context. */
 typedef struct NulangRuntime NulangRuntime;
 
-/** A Nulang value passed by value (raw NaN-boxed bits). */
+/**
+ * A Nulang value passed by value.
+ *
+ * String-valued instances are module-scoped: their payload is an interned
+ * string index in the module that produced or created them.
+ */
 typedef struct {
     uint64_t raw;
 } NulangValue;
@@ -71,6 +76,10 @@ NulangValue nulang_run(NulangRuntime *runtime, int64_t module_handle);
  * `args` is an array of `NulangValue` of length `arg_count`; arguments are
  * passed in r0, r1, etc. The function's return value (register 0) is
  * returned. On error the result is nil.
+ *
+ * String-valued arguments are module-scoped and must belong to
+ * `module_handle`. Use `nulang_module_string` separately for each target
+ * module.
  */
 NulangValue nulang_call_function(NulangRuntime *runtime,
                                  int64_t module_handle,
@@ -99,8 +108,8 @@ NulangValue nulang_value_nil(void);
 NulangValue nulang_value_unit(void);
 
 /**
- * Create a Nulang string value by interning `s` into `module_handle`'s
- * constant pool. Returns nil on error.
+ * Create a module-scoped Nulang string value by interning `s` into
+ * `module_handle`'s constant pool. Returns nil on error.
  */
 NulangValue nulang_module_string(NulangRuntime *runtime,
                                  int64_t module_handle,
@@ -117,7 +126,11 @@ bool nulang_value_is_nil(NulangValue value);
 bool nulang_value_is_unit(NulangValue value);
 
 /**
- * Return a C string representation of a Nulang value.
+ * Return a C string representation of a module-independent Nulang value.
+ *
+ * Interned string values are rejected because their numeric payload is only a
+ * module-local string-pool index. Use `nulang_module_value_to_string` when a
+ * value may be a string.
  *
  * The returned pointer is owned by the runtime and normally valid until the
  * runtime is freed. Call `nulang_free_string` to release it earlier.
@@ -125,7 +138,19 @@ bool nulang_value_is_unit(NulangValue value);
 const char *nulang_value_to_string(NulangRuntime *runtime, NulangValue value);
 
 /**
- * Free a C string previously returned by `nulang_value_to_string`.
+ * Return a C string representation of `value`, resolving interned strings
+ * against `module_handle`.
+ *
+ * Use this for values returned by `nulang_run` or `nulang_call_function` when
+ * they may be strings. Returns NULL and sets `nulang_last_error` if the module
+ * handle is invalid or the value's string ID does not belong to that module.
+ */
+const char *nulang_module_value_to_string(NulangRuntime *runtime,
+                                          int64_t module_handle,
+                                          NulangValue value);
+
+/**
+ * Free a C string previously returned by either value-to-string helper.
  *
  * Returns true if the pointer was recognized and freed.
  */
