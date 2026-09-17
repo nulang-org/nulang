@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Added since 1.0.0-frozen — 2026-09-16 (universal app vertical-slice + benchmark gates)
+- **Universal app vertical-slice definition and benchmark gates** (docs, PR #147). Documented the universal-app vertical-slice scope and its benchmark-gate criteria.
+
 ### Added since 1.0.0-frozen — 2026-09-14 (web contract + capacity broker hardening)
 - **Web request decoding fixes** (Experimental, `src/web/request_bindings.rs`,
   `src/web/bindings.rs`, `src/web/contracts.rs`, `src/web/dispatch.rs`).
