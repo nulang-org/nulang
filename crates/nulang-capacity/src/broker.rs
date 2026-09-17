@@ -1,10 +1,26 @@
-use crate::provider::{CapacityProvider, CapacityQuery, ProviderError, ProviderSnapshot};
+use crate::provider::{
+    CapacityProvider, CapacityQuery, ProviderError, ProviderErrorKind, ProviderSnapshot,
+};
 use crate::{rank_offers, CapacityError, CapacityOffer, ScoreWeights};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrokerPolicy {
     /// Reject capacity snapshots older than this age. `None` disables expiry.
     pub max_snapshot_age_ms: Option<u64>,
+    /// Per-provider fetch deadline. A provider that does not answer within
+    /// this window is recorded as a retryable `ProviderErrorKind::Unavailable`
+    /// and contributes no offers; healthy providers are unaffected.
+    /// Defaults to 10s so a hung endpoint can never stall ranking.
+    pub fetch_timeout: Option<std::time::Duration>,
+}
+
+impl Default for BrokerPolicy {
+    fn default() -> Self {
+        Self {
+            max_snapshot_age_ms: None,
+            fetch_timeout: Some(std::time::Duration::from_secs(10)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,16 +112,45 @@ impl<'a> CapacityBroker<'a> {
         &self,
         query: &CapacityQuery,
     ) -> (Vec<ProviderSnapshot>, Vec<ProviderError>) {
-        let mut snapshots = Vec::with_capacity(self.providers.len());
-        let mut provider_errors = Vec::new();
+        use futures::future::{self, Either, FutureExt};
+        use futures_timer::Delay;
 
-        for provider in &self.providers {
-            match provider.fetch_offers(query).await {
+        // Fan out across providers so N endpoint latencies overlap instead of
+        // adding, and race each fetch against the policy deadline so a hung
+        // provider is isolated as a retryable error instead of stalling
+        // ranking forever.
+        let fetches = self
+            .providers
+            .iter()
+            .map(|provider| {
+                let fetch = provider.fetch_offers(query);
+                async move {
+                    match self.policy.fetch_timeout {
+                        Some(timeout) => match future::select(fetch, Delay::new(timeout)).await {
+                            Either::Left((result, _delay)) => result,
+                            Either::Right(((), _fetch)) => Err(ProviderError {
+                                provider: provider.provider_id().to_string(),
+                                kind: ProviderErrorKind::Unavailable,
+                                message: format!("fetch timed out after {timeout:?}"),
+                                retryable: true,
+                            }),
+                        },
+                        None => fetch.await,
+                    }
+                }
+                .boxed()
+            })
+            .collect::<Vec<_>>();
+
+        let results = future::join_all(fetches).await;
+        let mut snapshots = Vec::with_capacity(results.len());
+        let mut provider_errors = Vec::new();
+        for result in results {
+            match result {
                 Ok(snapshot) => snapshots.push(snapshot),
                 Err(error) => provider_errors.push(error),
             }
         }
-
         (snapshots, provider_errors)
     }
 }
@@ -261,9 +306,159 @@ mod tests {
         };
         let policy = BrokerPolicy {
             max_snapshot_age_ms: Some(5_000),
+            fetch_timeout: None,
         };
 
         assert!(snapshot_is_fresh(&snapshot, 6_000, policy));
         assert!(!snapshot_is_fresh(&snapshot, 6_001, policy));
+    }
+
+    use crate::provider::{CapacityProvider, ProviderFuture};
+    use futures_timer::Delay;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    enum MockBehavior {
+        Ready,
+        Sleep(Duration),
+        /// Completes only once the shared flag is set (by another provider's
+        /// fetch). Under sequential collection this never runs the peer, so
+        /// the fetch would spin forever; under concurrent fan-out it completes.
+        WaitsFor(Arc<AtomicBool>),
+    }
+
+    struct MockProvider {
+        id: &'static str,
+        behavior: MockBehavior,
+        snapshot: ProviderSnapshot,
+    }
+
+    impl CapacityProvider for MockProvider {
+        fn provider_id(&self) -> &str {
+            self.id
+        }
+
+        fn fetch_offers<'a>(&'a self, _query: &'a CapacityQuery) -> ProviderFuture<'a> {
+            match &self.behavior {
+                MockBehavior::Ready => {
+                    let snapshot = self.snapshot.clone();
+                    Box::pin(async move { Ok(snapshot) })
+                }
+                MockBehavior::Sleep(duration) => {
+                    let snapshot = self.snapshot.clone();
+                    let duration = *duration;
+                    Box::pin(async move {
+                        Delay::new(duration).await;
+                        Ok(snapshot)
+                    })
+                }
+                MockBehavior::WaitsFor(flag) => {
+                    let flag = flag.clone();
+                    Box::pin(async move {
+                        while !flag.load(Ordering::SeqCst) {
+                            // Zero-delay timer as a portable yield.
+                            Delay::new(Duration::from_millis(0)).await;
+                        }
+                        Err(ProviderError {
+                            provider: "released".into(),
+                            kind: crate::provider::ProviderErrorKind::Unavailable,
+                            message: "released".into(),
+                            retryable: true,
+                        })
+                    })
+                }
+            }
+        }
+    }
+
+    fn snapshot(provider: &str, offer_id: &str) -> ProviderSnapshot {
+        ProviderSnapshot {
+            provider: provider.into(),
+            observed_at_unix_ms: 1,
+            offers: vec![offer(provider, offer_id, Lifecycle::OnDemand, 0.50)],
+        }
+    }
+
+    #[test]
+    fn timed_out_provider_is_isolated_as_retryable_error() {
+        let fast = MockProvider {
+            id: "fast",
+            behavior: MockBehavior::Ready,
+            snapshot: snapshot("fast", "fast-1"),
+        };
+        let hung = MockProvider {
+            id: "hung",
+            behavior: MockBehavior::Sleep(Duration::from_secs(60)),
+            snapshot: snapshot("hung", "hung-1"),
+        };
+        let broker = CapacityBroker::new(vec![&fast, &hung], ScoreWeights::default()).with_policy(
+            BrokerPolicy {
+                max_snapshot_age_ms: None,
+                fetch_timeout: Some(Duration::from_millis(50)),
+            },
+        );
+
+        let result = futures::executor::block_on(broker.rank(&query(false))).unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].offer.offer_id, "fast-1");
+        assert_eq!(result.provider_errors.len(), 1);
+        let error = &result.provider_errors[0];
+        assert_eq!(error.provider, "hung");
+        assert_eq!(error.kind, crate::provider::ProviderErrorKind::Unavailable);
+        assert!(error.retryable);
+        assert!(error.message.contains("timed out"));
+    }
+
+    #[test]
+    fn provider_fetches_run_concurrently() {
+        // Provider A only completes after provider B's fetch sets the flag.
+        // Sequential collection would never poll B, so A would spin forever;
+        // concurrent fan-out completes.
+        let flag = Arc::new(AtomicBool::new(false));
+        let waiting = MockProvider {
+            id: "waiting",
+            behavior: MockBehavior::WaitsFor(flag.clone()),
+            snapshot: snapshot("waiting", "waiting-1"),
+        };
+        let releasing = MockProvider {
+            id: "releasing",
+            behavior: MockBehavior::Ready,
+            snapshot: snapshot("releasing", "releasing-1"),
+        };
+        // Set the flag from the releasing provider via a wrapper: polling
+        // order is not guaranteed, so the flag must be set by whichever
+        // provider's fetch actually runs.
+        struct ReleasingProvider {
+            flag: Arc<AtomicBool>,
+            inner: MockProvider,
+        }
+        impl CapacityProvider for ReleasingProvider {
+            fn provider_id(&self) -> &str {
+                self.inner.id
+            }
+            fn fetch_offers<'a>(&'a self, query: &'a CapacityQuery) -> ProviderFuture<'a> {
+                self.flag.store(true, Ordering::SeqCst);
+                self.inner.fetch_offers(query)
+            }
+        }
+        let releasing = ReleasingProvider {
+            flag,
+            inner: releasing,
+        };
+
+        let broker = CapacityBroker::new(vec![&waiting, &releasing], ScoreWeights::default())
+            .with_policy(BrokerPolicy {
+                max_snapshot_age_ms: None,
+                fetch_timeout: Some(Duration::from_secs(5)),
+            });
+
+        let result = futures::executor::block_on(broker.rank(&query(false))).unwrap();
+        // The waiting provider was released, errored by design, and the
+        // releasing provider's offer is ranked.
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].offer.offer_id, "releasing-1");
+        assert_eq!(result.provider_errors.len(), 1);
+        assert_eq!(result.provider_errors[0].provider, "released");
     }
 }

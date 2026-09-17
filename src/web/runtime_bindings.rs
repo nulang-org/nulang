@@ -151,10 +151,16 @@ fn match_segments(
     request_path: &str,
 ) -> Option<HashMap<String, String>> {
     let request_path = request_path.trim_start_matches('/');
-    let request_segments: Vec<&str> = if request_path.is_empty() {
-        vec![""]
+    let request_segments: Vec<String> = if request_path.is_empty() {
+        vec![String::new()]
     } else {
-        request_path.split('/').collect()
+        // Split on the raw '/' first: an encoded %2F must stay inside its
+        // segment. Each segment is then percent-decoded so captures (and
+        // literal comparisons) see the same text the client sent.
+        request_path
+            .split('/')
+            .map(crate::web::request_bindings::percent_decode_path)
+            .collect()
     };
     if segments.len() != request_segments.len() {
         return None;
@@ -163,10 +169,10 @@ fn match_segments(
     let mut params = HashMap::new();
     for (pattern, value) in segments.iter().zip(request_segments) {
         match pattern {
-            RuntimeRouteSegment::Literal(expected) if expected != value => return None,
+            RuntimeRouteSegment::Literal(expected) if *expected != value => return None,
             RuntimeRouteSegment::Literal(_) => {}
             RuntimeRouteSegment::PathParam(name) => {
-                params.insert(name.clone(), value.to_string());
+                params.insert(name.clone(), value);
             }
         }
     }
@@ -216,7 +222,12 @@ fn compile_segments(
                 return Ok(RuntimeRouteSegment::PathParam(name.to_string()));
             }
 
-            Ok(RuntimeRouteSegment::Literal(segment.to_string()))
+            // Decode literal segments so a percent-encoded pattern matches
+            // the decoded request segment (captures are decoded at match
+            // time in `match_segments`).
+            Ok(RuntimeRouteSegment::Literal(
+                crate::web::request_bindings::percent_decode_path(segment),
+            ))
         })
         .collect()
 }
@@ -363,8 +374,10 @@ fn decode_path_constant(raw: &str, ty: Option<&str>) -> Result<Constant, String>
             .map_err(|_| format!("expected Int, got '{raw}'")),
         Some("Float") => raw
             .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
             .map(Constant::Float)
-            .map_err(|_| format!("expected Float, got '{raw}'")),
+            .ok_or_else(|| format!("expected finite Float, got '{raw}'")),
         Some("Bool") => match raw {
             "true" => Ok(Constant::Bool(true)),
             "false" => Ok(Constant::Bool(false)),
@@ -405,6 +418,7 @@ mod tests {
                 name: "id".to_string(),
                 ty: Some("Int".to_string()),
                 capability: None,
+                request: None,
             }],
             response_type: Some("String".to_string()),
             error_type: None,
@@ -435,6 +449,51 @@ mod tests {
         let plan = compile_runtime_route_plan(&contract("/users/:id")).unwrap();
         let params = match_runtime_route(&plan, "/users/9").unwrap();
         assert_eq!(params.get("id"), Some(&"9".to_string()));
+    }
+
+    #[test]
+    fn path_captures_are_percent_decoded() {
+        let mut contract = contract("/files/{name}");
+        contract.params = vec![RouteParamContract {
+            name: "name".to_string(),
+            ty: Some("String".to_string()),
+        }];
+        contract.handler_params[0].name = "name".to_string();
+        contract.handler_params[0].ty = Some("String".to_string());
+        let plan = compile_runtime_route_plan(&contract).unwrap();
+
+        // Encoded space and UTF-8 arrive decoded.
+        let params = match_runtime_route(&plan, "/files/hello%20world").unwrap();
+        assert_eq!(params.get("name"), Some(&"hello world".to_string()));
+        let params = match_runtime_route(&plan, "/files/caf%C3%A9").unwrap();
+        assert_eq!(params.get("name"), Some(&"café".to_string()));
+        // An encoded slash stays inside the segment instead of splitting.
+        let params = match_runtime_route(&plan, "/files/a%2Fb").unwrap();
+        assert_eq!(params.get("name"), Some(&"a/b".to_string()));
+        // `+` is a literal plus in paths, not a space.
+        let params = match_runtime_route(&plan, "/files/a+b").unwrap();
+        assert_eq!(params.get("name"), Some(&"a+b".to_string()));
+    }
+
+    #[test]
+    fn percent_encoded_literal_matches_decoded_request() {
+        let plan = compile_runtime_route_plan(&contract("/caf%C3%A9/{id}")).unwrap();
+        let params = match_runtime_route(&plan, "/caf%C3%A9/7").unwrap();
+        assert_eq!(params.get("id"), Some(&"7".to_string()));
+        // A raw (unencoded) UTF-8 request matches the same decoded literal.
+        let params = match_runtime_route(&plan, "/café/7").unwrap();
+        assert_eq!(params.get("id"), Some(&"7".to_string()));
+    }
+
+    #[test]
+    fn non_finite_float_path_value_is_rejected() {
+        assert!(decode_path_constant("NaN", Some("Float")).is_err());
+        assert!(decode_path_constant("inf", Some("Float")).is_err());
+        assert!(decode_path_constant("-inf", Some("Float")).is_err());
+        assert_eq!(
+            decode_path_constant("1.5", Some("Float")).unwrap(),
+            crate::bytecode::Constant::Float(1.5)
+        );
     }
 
     #[test]

@@ -17,7 +17,11 @@ use std::time::Duration;
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
 use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
+use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
+use crate::web::http_problem::request_decode_problem_response;
+use crate::web::http_request::HttpRequestBindingInputs;
 use crate::web::reactivity::inject_client_runtime_script;
+use crate::web::runtime_bindings::RuntimeWebRoute;
 
 /// HTTP method — must match the Nulang-level variant type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -675,6 +679,7 @@ impl Middleware {
 
 /// Match a route pattern against a request path, returning captured parameters.
 /// Patterns use `:name` segments, e.g. `/products/:id`.
+#[allow(dead_code)] // exercised by unit tests; production dispatch routes via `web::dispatch::match_route`
 pub fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
     let pattern = pattern.trim_start_matches('/');
     let path = path.trim_start_matches('/');
@@ -762,6 +767,24 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<WebRoute>,
     ) -> std::io::Result<Self> {
+        let routes = routes
+            .into_iter()
+            .map(|route| RuntimeWebRoute { route, plan: None })
+            .collect();
+        Self::bind_runtime(port, static_dir, output_dir, routes)
+    }
+
+    /// Bind a dev server using compiler-validated, precompiled route plans.
+    ///
+    /// `nula dev` uses this entry point after Web Contract IR validation.
+    /// Legacy callers can continue using [`Self::bind`], which wraps raw
+    /// registrations without opting them into direct typed invocation.
+    pub fn bind_runtime(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -793,7 +816,7 @@ impl WebDevServer {
         listener: TcpListener,
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
-        routes: Vec<WebRoute>,
+        routes: Vec<RuntimeWebRoute>,
         shutdown: Arc<AtomicBool>,
     ) {
         listener.set_nonblocking(true).ok();
@@ -824,7 +847,7 @@ impl WebDevServer {
         mut stream: TcpStream,
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
-        routes: Vec<WebRoute>,
+        routes: Vec<RuntimeWebRoute>,
         shutdown: Arc<AtomicBool>,
     ) {
         let mut buf = [0u8; 8192];
@@ -895,19 +918,35 @@ impl WebDevServer {
                                 break;
                             } else if let Some((route, params)) = routes
                                 .iter()
-                                .filter(|r| r.method == request.method)
-                                .find_map(|r| match_route(&r.path, &request.path).map(|p| (r, p)))
+                                .filter(|r| r.route.method == request.method)
+                                .find_map(|r| {
+                                    crate::web::dispatch::match_route(r, &request.path)
+                                        .map(|params| (r, params))
+                                })
                             {
+                                let captured = HttpRequestBindingInputs::capture(
+                                    &request.path,
+                                    &request.headers,
+                                    &request.body,
+                                );
+                                let values = captured.values(&params, &request.headers);
                                 let ctx = RequestContext {
                                     request: request.clone(),
-                                    params,
+                                    params: params.clone(),
                                 };
-                                match render_route_handler(
-                                    &route.handler_module,
-                                    route.handler_func_idx,
-                                    Some(ctx),
-                                ) {
-                                    Some(html) => HttpResponse {
+                                let rendered = with_request_context(ctx, || {
+                                    match render_direct_request(route, &values) {
+                                        Ok(Some(rendered)) => Ok(Some(rendered)),
+                                        Ok(None) => Ok(render_route_handler(
+                                            &route.route.handler_module,
+                                            route.route.handler_func_idx,
+                                            None,
+                                        )),
+                                        Err(error) => Err(error),
+                                    }
+                                });
+                                match rendered {
+                                    Ok(Some(html)) => HttpResponse {
                                         status: 200,
                                         headers: vec![(
                                             "Content-Type".into(),
@@ -915,11 +954,30 @@ impl WebDevServer {
                                         )],
                                         body: inject_client_runtime_script(&html).into_bytes(),
                                     },
-                                    None => HttpResponse {
+                                    Ok(None) => HttpResponse {
                                         status: 500,
                                         headers: vec![("Content-Type".into(), "text/plain".into())],
                                         body: b"Internal server error".to_vec(),
                                     },
+                                    Err(DirectRequestRenderError::Decode(error)) => {
+                                        let problem = request_decode_problem_response(&error);
+                                        HttpResponse {
+                                            status: problem.status,
+                                            headers: problem.headers,
+                                            body: problem.body,
+                                        }
+                                    }
+                                    Err(DirectRequestRenderError::Execution(error)) => {
+                                        eprintln!("typed route dispatch error: {error}");
+                                        HttpResponse {
+                                            status: 500,
+                                            headers: vec![(
+                                                "Content-Type".into(),
+                                                "text/plain".into(),
+                                            )],
+                                            body: b"Internal server error".to_vec(),
+                                        }
+                                    }
                                 }
                             } else {
                                 Self::serve_static(

@@ -11,11 +11,45 @@ use crate::web::package_contracts::compile_contracts_from_tree;
 use std::collections::HashSet;
 use std::path::Path;
 
+/// Compile and validate every statically extractable route contract in a
+/// package source tree.
+///
+/// This is the preferred build/dev-server entry point. Returning the validated
+/// compilation on success lets downstream consumers (runtime dispatch, IR,
+/// OpenAPI/client generation) share the exact same compiler-owned contract set
+/// instead of independently reparsing source and potentially disagreeing about
+/// diagnostics.
+pub fn compile_validated_contracts_from_tree(
+    src_root: &Path,
+) -> Result<ContractCompilation, Vec<String>> {
+    validate_compilation(compile_contracts_from_tree(src_root))
+}
+
 /// Validate every statically extractable route contract in a package source
 /// tree. The returned strings are deterministic and deduplicated.
 pub fn validate_contracts_from_tree(src_root: &Path) -> Vec<String> {
-    let compilation = compile_contracts_from_tree(src_root);
-    validation_diagnostics(&compilation)
+    match compile_validated_contracts_from_tree(src_root) {
+        Ok(_) => Vec::new(),
+        Err(diagnostics) => diagnostics,
+    }
+}
+
+/// Turn a best-effort contract compilation into a hard validation boundary.
+///
+/// Contract extraction deliberately retains diagnostics instead of panicking so
+/// IDEs and tooling can inspect partial metadata. Build and runtime entry points,
+/// however, should not serve or emit artifacts from an invalid contract-first
+/// route. This helper makes that policy explicit while preserving the successful
+/// compilation for all downstream consumers.
+pub fn validate_compilation(
+    compilation: ContractCompilation,
+) -> Result<ContractCompilation, Vec<String>> {
+    let diagnostics = validation_diagnostics(&compilation);
+    if diagnostics.is_empty() {
+        Ok(compilation)
+    } else {
+        Err(diagnostics)
+    }
 }
 
 /// Aggregate extraction diagnostics and route-binding diagnostics.
@@ -94,6 +128,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: Some("UserId".to_string()),
                     capability: None,
+                    request: None,
                 }],
             )],
             diagnostics: Vec::new(),
@@ -115,5 +150,36 @@ mod tests {
             validation_diagnostics(&compilation),
             vec!["a diagnostic".to_string(), "z diagnostic".to_string()]
         );
+    }
+
+    #[test]
+    fn validate_compilation_preserves_valid_contracts() {
+        let compilation = ContractCompilation {
+            routes: vec![contract(
+                "/users/{id: UserId}",
+                vec![HandlerParamContract {
+                    name: "id".to_string(),
+                    ty: Some("UserId".to_string()),
+                    capability: None,
+                    request: None,
+                }],
+            )],
+            diagnostics: Vec::new(),
+        };
+
+        let validated = validate_compilation(compilation.clone()).unwrap();
+        assert_eq!(validated, compilation);
+    }
+
+    #[test]
+    fn validate_compilation_rejects_invalid_contracts() {
+        let compilation = ContractCompilation {
+            routes: vec![contract("/users/{id: UserId}", Vec::new())],
+            diagnostics: Vec::new(),
+        };
+
+        let diagnostics = validate_compilation(compilation).unwrap_err();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("has no same-named parameter"));
     }
 }

@@ -19,6 +19,8 @@ pub enum CType {
     Unit,
     /// A raw Nulang value passed as an opaque i64-tagged value. This is only
     /// usable via the C registration API; it has no language-level syntax.
+    /// Raw host-pointer tags returned by C are rejected because the ABI cannot
+    /// establish that they point into a live Nulang heap.
     Value,
 }
 
@@ -93,6 +95,20 @@ pub unsafe fn value_to_voidptr(v: &Value) -> Result<*mut c_void, String> {
 // Conversion helpers: C return value -> Value
 // ---------------------------------------------------------------------------
 
+/// Extract an opaque tagged value returned by C without allowing C to mint a
+/// host heap pointer. `CType::Value` is a raw integer ABI, so a `TAG_PTR`
+/// payload has no host-heap provenance and must fail closed.
+#[cfg(feature = "ffi")]
+fn opaque_c_value_to_value(raw: u64) -> Result<Value, String> {
+    if crate::value_layout::is_ptr_raw(raw) {
+        return Err(
+            "CType::Value returned a pointer-tagged value without Nulang heap provenance"
+                .to_string(),
+        );
+    }
+    Value::try_from_untrusted_bits(raw).map_err(str::to_string)
+}
+
 /// Marshal a C `i64` return value into a Nulang value.
 pub fn i64_to_value(n: i64) -> Value {
     Value::int(n)
@@ -115,7 +131,10 @@ pub fn bool_to_value(b: bool) -> Value {
 /// closed here is strictly safer than the legacy masking behavior.
 fn ptr_to_value_checked(p: *mut u8) -> Value {
     if crate::value_layout::ptr_fits_payload(p as u64) {
-        Value::ptr(p)
+        unsafe {
+            /* SAFETY: FFI/native boundary contract establishes the pointer lifetime and validity for this conversion. */
+            Value::ptr(p)
+        }
     } else {
         Value::nil()
     }
@@ -324,7 +343,7 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
         }
         CType::Value => {
             let r: u64 = unsafe { cif.call(code, &ffi_args) };
-            Ok(Value::from_bits(r))
+            opaque_c_value_to_value(r)
         }
     }
 }
@@ -628,7 +647,10 @@ mod tests {
     fn test_marshal_cstr_roundtrip() {
         let original = CString::new("hello ffi").unwrap();
         let ptr = original.as_ptr() as *mut u8;
-        let v = Value::ptr(ptr);
+        let v = unsafe {
+            /* SAFETY: FFI/native boundary contract establishes the pointer lifetime and validity for this conversion. */
+            Value::ptr(ptr)
+        };
         // SAFETY: pointer is a valid C string for the borrow.
         let borrowed = unsafe { value_to_cstr(&v).unwrap() };
         // SAFETY: borrowed pointer is valid.
@@ -666,6 +688,11 @@ mod tests {
     #[cfg(feature = "ffi")]
     extern "C" fn identity_value(v: u64) -> u64 {
         v
+    }
+
+    #[cfg(feature = "ffi")]
+    extern "C" fn forged_pointer_value() -> u64 {
+        crate::value_layout::TAG_PTR | 0x1234
     }
 
     #[cfg(feature = "ffi")]
@@ -722,6 +749,17 @@ mod tests {
 
     #[test]
     #[cfg(feature = "ffi")]
+    fn test_call_native_value_rejects_forged_pointer_return() {
+        let func = make_func(
+            forged_pointer_value as *const c_void,
+            Signature::new(vec![], CType::Value),
+        );
+        let err = unsafe { call_native(&func, &[]) }.unwrap_err();
+        assert!(err.contains("pointer-tagged"));
+    }
+
+    #[test]
+    #[cfg(feature = "ffi")]
     fn test_call_native_cstr_return_cleanup() {
         let func = make_func(
             make_greeting as *const c_void,
@@ -765,7 +803,10 @@ mod tests {
             Signature::new(vec![CType::CStr], CType::I64),
         );
         let s = CString::new("nulang").unwrap();
-        let v = Value::ptr(s.as_ptr() as *mut u8);
+        let v = unsafe {
+            /* SAFETY: FFI/native boundary contract establishes the pointer lifetime and validity for this conversion. */
+            Value::ptr(s.as_ptr() as *mut u8)
+        };
         // SAFETY: pointer matches signature and is a valid C string.
         let result = unsafe { call_native(&func, &[v]).unwrap() };
         assert_eq!(result.as_int(), Some(6));

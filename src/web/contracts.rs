@@ -9,7 +9,9 @@
 //! IR format is ready for typed route syntax without forcing a runtime migration
 //! in the same change.
 
-use crate::ast::{AstModule, Decl, Expr, FunctionAnnotation, Literal, Param, WorkflowItem};
+use crate::ast::{
+    AstModule, Decl, Expr, FunctionAnnotation, Literal, Param, WebRequestParamSource, WorkflowItem,
+};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::types::EffectRow;
@@ -25,11 +27,30 @@ pub struct RouteParamContract {
     pub ty: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestParamSource {
+    Path,
+    Query,
+    Header,
+    Cookie,
+    Body,
+    Form,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestParamBindingContract {
+    pub source: RequestParamSource,
+    pub source_name: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandlerParamContract {
     pub name: String,
     pub ty: Option<String>,
     pub capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<RequestParamBindingContract>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +83,15 @@ pub struct ContractCompilation {
 #[derive(Clone)]
 struct FunctionMeta {
     params: Vec<Param>,
+    /// `using` parameters: appended to the compiled function's parameter list
+    /// by HIR lowering, so the VM function's arity exceeds `params.len()`.
+    /// Request bindings can never supply them.
+    using_params: Vec<Param>,
+    /// Typeclass dictionary parameters appended by HIR lowering (one per
+    /// constraint class). Like `using_params`, they extend the VM arity
+    /// beyond what a route binding plan can stage.
+    dict_param_count: usize,
+    request_bindings: HashMap<String, RequestParamBindingContract>,
     response_type: Option<String>,
     error_type: Option<String>,
     effects: Vec<String>,
@@ -74,6 +104,8 @@ impl FunctionMeta {
         let Decl::Function {
             name,
             params,
+            type_param_constraints,
+            using_params,
             ret_type,
             error_type,
             effect,
@@ -85,15 +117,40 @@ impl FunctionMeta {
             return None;
         };
 
+        let dict_param_count = type_param_constraints
+            .iter()
+            .map(|(_, _, classes)| classes.len())
+            .sum();
+
         let placement = annotations.iter().find_map(|annotation| match annotation {
             FunctionAnnotation::Placement(p) => Some(p.to_string()),
             _ => None,
         });
+        let request_bindings = annotations
+            .iter()
+            .filter_map(|annotation| match annotation {
+                FunctionAnnotation::RequestBinding {
+                    param,
+                    source,
+                    source_name,
+                } => Some((
+                    param.clone(),
+                    RequestParamBindingContract {
+                        source: request_source_contract(*source),
+                        source_name: source_name.clone(),
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
 
         Some((
             name.clone(),
             Self {
                 params: params.clone(),
+                using_params: using_params.clone(),
+                dict_param_count,
+                request_bindings,
                 response_type: ret_type.as_ref().map(ToString::to_string),
                 error_type: error_type.as_ref().map(ToString::to_string),
                 effects: effect_names(effect.as_ref()),
@@ -215,12 +272,36 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
         };
 
         if let Some(meta) = meta {
+            if !meta.using_params.is_empty() || meta.dict_param_count > 0 {
+                // HIR lowering appends `using` and typeclass-dictionary
+                // parameters to the compiled function, so the VM arity exceeds
+                // the request-bound parameter list. A binding plan built from
+                // `params` alone would stage the closure into a parameter slot
+                // (ClosureCall copies the whole register bank). Reject the
+                // route instead of emitting a wrong-arity plan.
+                let extra = [
+                    (!meta.using_params.is_empty())
+                        .then(|| format!("{} using", meta.using_params.len())),
+                    (meta.dict_param_count > 0)
+                        .then(|| format!("{} typeclass dictionary", meta.dict_param_count)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" and ");
+                out.diagnostics.push(format!(
+                    "{method} {path}: handler '{}' has {extra} parameters that request bindings cannot supply",
+                    handler_name.as_deref().unwrap_or("<handler>"),
+                ));
+                continue;
+            }
             validate_and_infer_param_types(
                 &method,
                 &path,
                 handler_name.as_deref().unwrap_or("<handler>"),
                 &mut params,
                 &meta.params,
+                &meta.request_bindings,
                 &transparent_aliases,
                 &mut out.diagnostics,
             );
@@ -232,7 +313,14 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
             handler: handler_name,
             params,
             handler_params: meta
-                .map(|m| m.params.iter().map(handler_param_contract).collect())
+                .map(|m| {
+                    m.params
+                        .iter()
+                        .map(|param| {
+                            handler_param_contract(param, m.request_bindings.get(&param.name))
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
             response_type: meta.and_then(|m| m.response_type.clone()),
             error_type: meta.and_then(|m| m.error_type.clone()),
@@ -256,13 +344,21 @@ fn validate_and_infer_param_types(
     handler_name: &str,
     route_params: &mut [RouteParamContract],
     handler_params: &[Param],
+    request_bindings: &HashMap<String, RequestParamBindingContract>,
     transparent_aliases: &HashMap<String, String>,
     diagnostics: &mut Vec<String>,
 ) {
     for route_param in route_params {
-        let handler_param = handler_params
-            .iter()
-            .find(|param| param.name == route_param.name);
+        let handler_param =
+            handler_params
+                .iter()
+                .find(|param| match request_bindings.get(&param.name) {
+                    Some(binding) => {
+                        binding.source == RequestParamSource::Path
+                            && binding.source_name == route_param.name
+                    }
+                    None => param.name == route_param.name,
+                });
         let handler_ty = handler_param
             .and_then(|param| param.ty.as_ref())
             .map(ToString::to_string);
@@ -304,11 +400,26 @@ fn canonical_type_name(name: &str, aliases: &HashMap<String, String>) -> String 
     current
 }
 
-fn handler_param_contract(param: &Param) -> HandlerParamContract {
+fn request_source_contract(source: WebRequestParamSource) -> RequestParamSource {
+    match source {
+        WebRequestParamSource::Path => RequestParamSource::Path,
+        WebRequestParamSource::Query => RequestParamSource::Query,
+        WebRequestParamSource::Header => RequestParamSource::Header,
+        WebRequestParamSource::Cookie => RequestParamSource::Cookie,
+        WebRequestParamSource::Body => RequestParamSource::Body,
+        WebRequestParamSource::Form => RequestParamSource::Form,
+    }
+}
+
+fn handler_param_contract(
+    param: &Param,
+    request: Option<&RequestParamBindingContract>,
+) -> HandlerParamContract {
     HandlerParamContract {
         name: param.name.clone(),
         ty: param.ty.as_ref().map(ToString::to_string),
         capability: param.cap.map(|cap| cap.to_string()),
+        request: request.cloned(),
     }
 }
 
@@ -663,5 +774,48 @@ fn web_main() {
         assert_eq!(compiled.diagnostics.len(), 1);
         assert!(compiled.diagnostics[0].contains("typed as ExternalId"));
         assert!(compiled.diagnostics[0].contains("declares String"));
+    }
+
+    #[test]
+    fn using_params_on_route_handler_is_diagnostic() {
+        // HIR lowering appends using/typeclass-dictionary parameters to the
+        // compiled function; a binding plan built from `params` alone would
+        // stage the closure into a parameter slot.
+        let module = parse(
+            r#"
+fn show(id: Int) using (log: Int) -> String {
+    "ok"
+}
+
+fn web_main() {
+    perform Web.route("GET", "/users/{id: Int}", show)
+}
+"#,
+        );
+
+        let compiled = compile_module_contracts(&module);
+        assert_eq!(compiled.diagnostics.len(), 1);
+        assert!(compiled.diagnostics[0].contains("using"));
+        assert!(compiled.routes.is_empty());
+    }
+
+    #[test]
+    fn typeclass_constraints_on_route_handler_is_diagnostic() {
+        let module = parse(
+            r#"
+fn show[T: Show](x: T) -> String {
+    "ok"
+}
+
+fn web_main() {
+    perform Web.route("GET", "/users/{x: Int}", show)
+}
+"#,
+        );
+
+        let compiled = compile_module_contracts(&module);
+        assert_eq!(compiled.diagnostics.len(), 1);
+        assert!(compiled.diagnostics[0].contains("typeclass dictionary"));
+        assert!(compiled.routes.is_empty());
     }
 }

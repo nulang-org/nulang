@@ -4,6 +4,7 @@
 //! Entry point: `Parser::parse_module()`.
 
 use crate::ast::*;
+use crate::authority::AuthorityGrant;
 use crate::lexer::{Token, TokenKind};
 use crate::types::{
     Capability, Effect, EffectRow, NuError, NuResult, NuWarning, PrimitiveType, Region, Span, Type,
@@ -912,7 +913,7 @@ impl Parser {
     fn parse_function(
         &mut self,
         public: bool,
-        annotations: Vec<FunctionAnnotation>,
+        mut annotations: Vec<FunctionAnnotation>,
     ) -> NuResult<Decl> {
         let span = self.current_span();
         self.advance(); // consume 'fn'
@@ -922,14 +923,21 @@ impl Parser {
         let (type_params, type_param_constraints) = self.parse_type_params_with_constraints()?;
 
         self.expect(TokenKind::LParen)?;
-        let (params, default_values) = self.parse_params_with_defaults()?;
+        let (params, default_values, request_bindings) = self.parse_params_with_defaults()?;
         self.expect(TokenKind::RParen)?;
+        annotations.extend(request_bindings);
 
         // Optional `using` clause: `fn foo(x) using (log: Logger) -> T`
         let using_params = if self.consume_if(&TokenKind::Using) {
             self.expect(TokenKind::LParen)?;
-            let (up, _) = self.parse_params_with_defaults()?;
+            let (up, _, request_bindings) = self.parse_params_with_defaults()?;
             self.expect(TokenKind::RParen)?;
+            if !request_bindings.is_empty() {
+                return Err(NuError::parse_error(
+                    "request-source bindings are not allowed on `using` parameters".to_string(),
+                    self.current_span(),
+                ));
+            }
             up
         } else {
             vec![]
@@ -4087,7 +4095,53 @@ impl Parser {
             Vec::new()
         };
 
-        // Optional named registration: `spawn Foo() as "name"`
+        // Optional external-authority attenuation for the child. Grants are
+        // intentionally structural and literal-only: authority must be known at
+        // compile time, never computed from ambient runtime data.
+        //
+        //   spawn Worker() with [
+        //       Net::TcpOut("api.example.com:443"),
+        //       Secret::Read("stripe_key"),
+        //   ]
+        let capabilities = if self.consume_if(&TokenKind::With) {
+            self.expect(TokenKind::LBracket)?;
+            self.skip_newlines();
+            let mut grants = Vec::new();
+            while !self.match_token(&TokenKind::RBracket) && !self.is_at_end() {
+                let grant_span = self.current_span();
+                let namespace = self.expect_ident("authority namespace")?;
+                self.expect(TokenKind::DoubleColon)?;
+                let operation = self.expect_ident("authority operation")?;
+                let argument = if self.consume_if(&TokenKind::LParen) {
+                    let argument = self.expect_string("authority argument")?;
+                    self.expect(TokenKind::RParen)?;
+                    Some(argument)
+                } else {
+                    None
+                };
+
+                let grant = AuthorityGrant::from_parts(&namespace, &operation, argument.as_deref())
+                    .map_err(|err| NuError::parse_error(err.to_string(), grant_span))?;
+                grants.push(grant.to_string());
+
+                self.skip_newlines();
+                if !self.consume_if(&TokenKind::Comma) {
+                    break;
+                }
+                self.skip_newlines();
+            }
+            self.expect(TokenKind::RBracket)?;
+            // Canonical metadata makes equivalent source produce identical
+            // artifact identity regardless of grant order or duplication.
+            grants.sort_unstable();
+            grants.dedup();
+            grants
+        } else {
+            Vec::new()
+        };
+
+        // Optional named registration: `spawn Foo() as "name"`.
+        // Canonical order is `spawn Foo() with [...] as "name"`.
         let register_as = if self.consume_if(&TokenKind::As) {
             Some(self.expect_string("actor name")?)
         } else {
@@ -4099,9 +4153,7 @@ impl Parser {
             positional_args,
             register_as,
             target_node,
-            // Spawn-time capability-grant syntax (`with [Net::TcpOut(...)]`) is
-            // not parsed yet; the field is plumbed through as empty.
-            capabilities: Vec::new(),
+            capabilities,
             span,
         };
         Ok(match link_op {
@@ -6672,13 +6724,69 @@ impl Parser {
         Ok(params)
     }
 
-    /// Parse function parameters with optional default values.
-    /// Returns params and a parallel vec of default expressions (None = required).
+    fn parse_request_param_binding(
+        &mut self,
+        param_name: &str,
+    ) -> NuResult<Option<FunctionAnnotation>> {
+        let is_from = matches!(self.peek_kind(), TokenKind::Ident(name) if name == "from");
+        if !is_from {
+            return Ok(None);
+        }
+        self.advance(); // contextual `from`
+        let source_name = self.expect_ident("request source after 'from'")?;
+        let source = match source_name.as_str() {
+            "path" => WebRequestParamSource::Path,
+            "query" => WebRequestParamSource::Query,
+            "header" => WebRequestParamSource::Header,
+            "cookie" => WebRequestParamSource::Cookie,
+            "body" => WebRequestParamSource::Body,
+            "form" => WebRequestParamSource::Form,
+            other => {
+                return Err(NuError::parse_error(
+                    format!(
+                        "unknown request source '{other}'; expected path, query, header, cookie, body, or form"
+                    ),
+                    self.current_span(),
+                ));
+            }
+        };
+
+        let explicit_name = if self.consume_if(&TokenKind::LParen) {
+            let name = self.expect_string("request source name")?;
+            self.expect(TokenKind::RParen)?;
+            Some(name)
+        } else {
+            None
+        };
+        if source == WebRequestParamSource::Body && explicit_name.is_some() {
+            return Err(NuError::parse_error(
+                "body bindings do not accept a source name".to_string(),
+                self.current_span(),
+            ));
+        }
+        let source_name = match source {
+            WebRequestParamSource::Body => "body".to_string(),
+            _ => explicit_name.unwrap_or_else(|| param_name.to_string()),
+        };
+        Ok(Some(FunctionAnnotation::RequestBinding {
+            param: param_name.to_string(),
+            source,
+            source_name,
+        }))
+    }
+
+    /// Parse function parameters with optional default values and contextual
+    /// request-source metadata (`name: Type from query`).
     fn parse_params_with_defaults(
         &mut self,
-    ) -> NuResult<(Vec<crate::ast::Param>, Vec<Option<Expr>>)> {
+    ) -> NuResult<(
+        Vec<crate::ast::Param>,
+        Vec<Option<Expr>>,
+        Vec<FunctionAnnotation>,
+    )> {
         let mut params = Vec::new();
         let mut defaults = Vec::new();
+        let mut request_bindings = Vec::new();
         self.skip_newlines();
         while self.peek_kind() != &TokenKind::RParen && !self.is_at_end() {
             let cap = self.try_parse_param_capability().unwrap_or(None);
@@ -6688,6 +6796,9 @@ impl Parser {
             } else {
                 None
             };
+            if let Some(binding) = self.parse_request_param_binding(&name)? {
+                request_bindings.push(binding);
+            }
             let default = if self.consume_if(&TokenKind::Assign) {
                 Some(self.parse_expr()?)
             } else {
@@ -6701,7 +6812,7 @@ impl Parser {
             }
             self.skip_newlines();
         }
-        Ok((params, defaults))
+        Ok((params, defaults, request_bindings))
     }
 
     /// Parse method parameters for class/impl methods. Accepts `self` keyword
