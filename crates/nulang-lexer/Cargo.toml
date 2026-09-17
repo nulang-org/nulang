@@ -1,0 +1,15 @@
+[package]
+name = "nulang-lexer"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Dependency-light lexer for the Nulang language"
+repository = "https://github.com/nulang-org/nulang"
+publish = false
+
+[dependencies]
+nulang-source = { path = "../nulang-source" }
+
+[lib]
+name = "nulang_lexer"
+path = "src/lib.rs"
