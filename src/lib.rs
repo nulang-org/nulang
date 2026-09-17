@@ -10,7 +10,12 @@
 pub mod agent;
 #[cfg(feature = "native-codegen")]
 pub mod aot;
+pub mod artifact_identity;
 pub mod ast;
+pub mod authority;
+pub mod authority_host;
+mod authority_runtime;
+pub use authority_runtime::RuntimeAuthorityError;
 pub mod backends;
 #[cfg(test)]
 pub mod benchmarks;
@@ -21,6 +26,7 @@ pub mod cir;
 pub mod cir_analysis;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir_lower;
+pub mod content_identity;
 pub mod core_vm;
 #[cfg(feature = "native-codegen")]
 pub mod cranelift_utils;
@@ -30,6 +36,8 @@ pub mod diagnostic;
 pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
+pub mod durable_effect;
+pub mod durable_effect_persistence;
 pub mod effect_checker;
 pub mod ffi;
 pub mod fmt;
@@ -60,6 +68,8 @@ pub mod package;
 pub mod parser;
 pub mod prelude_source;
 pub mod primitives;
+pub mod protocol;
+pub mod protocol_wire;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod registry;

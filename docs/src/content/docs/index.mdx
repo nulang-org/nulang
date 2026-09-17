@@ -10,7 +10,7 @@ hero:
       link: /getting-started/installation/
       icon: right-arrow
       variant: primary
-    - text: Try the Playground
+    - text: Read the Quick Start
       link: /getting-started/quick-start/
       icon: right-arrow
       variant: secondary
@@ -26,7 +26,9 @@ import Steps from '../../components/Steps.astro';
 import TerminalCard from '../../components/TerminalCard.astro';
 import MetricsBand from '../../components/MetricsBand.astro';
 
-<MetricsBand />
+<MetricsBand>
+  <GcDemo />
+</MetricsBand>
 
 <div class="nu-section">
   <div class="nu-container">
@@ -44,6 +46,9 @@ import MetricsBand from '../../components/MetricsBand.astro';
         </div>
         <h3>Durable actors</h3>
         <p>Failures are isolated and restarted automatically. Supervision trees, durable workflows, and saga compensation keep your program running through crashes and restarts.</p>
+        <div class="pillar-demo">
+          <SupervisionTree />
+        </div>
       </div>
       <div class="pillar-card">
         <div class="feature-icon-chip">
@@ -53,6 +58,9 @@ import MetricsBand from '../../components/MetricsBand.astro';
         </div>
         <h3>Built-in AI primitives</h3>
         <p>Perform LLM calls as algebraic effects, wire up agent pipelines, debates, and supervisor teams with episodic, semantic, and procedural memory.</p>
+        <div class="pillar-demo">
+          <AIPipeline />
+        </div>
       </div>
       <div class="pillar-card">
         <div class="feature-icon-chip">
@@ -62,6 +70,9 @@ import MetricsBand from '../../components/MetricsBand.astro';
         </div>
         <h3>Location-transparent distribution</h3>
         <p>Move a service from one node to many without rewriting code. Actors communicate through messages, with automatic clustering and CRDT state replication.</p>
+        <div class="pillar-demo">
+          <DistributionDemo />
+        </div>
       </div>
     </div>
   </div>
@@ -82,12 +93,12 @@ import MetricsBand from '../../components/MetricsBand.astro';
   <div class="nu-container">
     <div class="durable-row">
       <div class="benefit-text">
-        <h2>Durable by default</h2>
-        <p>Every external operation — messages, effects, timers — is part of the actor's execution log. If an actor crashes mid-flight, it replays from the last checkpoint and picks up exactly where it left off.</p>
+        <h2>Durable when you ask for it</h2>
+        <p>Ordinary actors are fast and in-memory. Mark an actor <code>persistent</code> — as in <code>persistent actor Counter</code> — and every external operation (messages, effects, timers) is journaled as part of its execution log. If a persistent actor crashes mid-flight, it replays from the last checkpoint and picks up exactly where it left off.</p>
         <ul class="durable-checklist">
           <li>
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            Automatic state checkpointing on effect boundaries
+            Journaling and checkpointing for persistent actors
           </li>
           <li>
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
@@ -95,7 +106,7 @@ import MetricsBand from '../../components/MetricsBand.astro';
           </li>
           <li>
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            Survives VM crashes, host failures, and restarts
+            Persistent actors survive crashes and restarts
           </li>
           <li>
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
@@ -104,18 +115,18 @@ import MetricsBand from '../../components/MetricsBand.astro';
         </ul>
       </div>
       <div class="benefit-demo">
-        <TerminalCard title="nulang deploy" code={`$ nulang deploy counter.nula
+        <TerminalCard title="nulang nula deploy" code={`$ nulang nula build-wasm
 
-Building actor...
-Compiling to WASM...  ✓
-Optimizing with PGO...  ✓
-Provisioning runtime...  ✓
+Building counter (WASM AOT)...
+  Compiling src/main.nula to WASM...
+WASM AOT build succeeded.
 
-Deployed!
-https://my-app.nulang.cloud
+$ nulang nula deploy --wasm
 
-Cold start: 42ms
-Status: healthy`} />
+Compiling counter to .nbc...
+Compiling counter to .wasm + .cwasm...
+Deploying counter to https://deploy.nulang.cloud ...
+Deployed! -> https://counter-7f3a9c.nulang.cloud (healthy)`} />
       </div>
     </div>
   </div>
@@ -164,17 +175,7 @@ Status: healthy`} />
       <h2>Support Nulang</h2>
       <p class="nu-section-subhead">The language is free and open source. Help us keep building the future of durable software.</p>
     </div>
-    <div class="support-grid">
-      <a href="https://github.com/nulang-org/nulang" class="support-card" target="_blank" rel="noopener noreferrer">
-        <div class="support-icon">
-          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"/>
-            <path d="M9 18c-4.51 2-5-2-7-2"/>
-          </svg>
-        </div>
-        <h3>Contribute on GitHub</h3>
-        <p>Issues, discussions, and pull requests are welcome. Star the repo to show your support.</p>
-      </a>
+    <div class="support-grid support-grid-single">
       <a href="https://buy.stripe.com/cNidR932O6du6nK6eX1RC02" class="support-card support-card-accent" target="_blank" rel="noopener noreferrer">
         <div class="support-icon">
           <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -184,26 +185,15 @@ Status: healthy`} />
         <h3>Sponsor development</h3>
         <p>Back the project financially and get priority support, roadmap input, and recognition.</p>
       </a>
-      <a href="https://www.nulang.cloud" class="support-card" target="_blank" rel="noopener noreferrer">
-        <div class="support-icon">
-          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="10"/>
-            <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/>
-            <path d="M2 12h20"/>
-          </svg>
-        </div>
-        <h3>Deploy on Nulang Cloud</h3>
-        <p>Production hosting for durable actors, AI agents, and global edge deployment.</p>
-      </a>
     </div>
   </div>
 </div>
 
 <div class="cta-panel bottom-cta">
   <h2 class="cta-panel-title">Ready to ship?</h2>
-  <p class="cta-panel-copy">
+  <div class="cta-panel-copy">
     Nulang is open source under the Apache 2.0 license. Get started, contribute on GitHub, or support its ongoing development.
-  </p>
+  </div>
   <div class="cta-panel-actions">
     <a href="/getting-started/installation/" class="cta-btn cta-btn-primary">Get Started</a>
     <a href="https://github.com/nulang-org/nulang" class="cta-btn cta-btn-ghost" target="_blank" rel="noopener noreferrer">
