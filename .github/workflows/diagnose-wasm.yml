@@ -19,11 +19,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-      - name: Run WASM feature tests and capture output
+      - name: Run WASM differential fuzz test and capture output
         shell: bash
         run: |
           set +e
-          cargo test --features wasm-backend -- --nocapture > wasm-test.log 2>&1
+          cargo test --features wasm-backend fuzz_differential_quick -- --nocapture > wasm-test.log 2>&1
           status=$?
           echo "$status" > wasm-test.status
           exit 0
