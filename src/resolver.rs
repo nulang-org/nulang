@@ -11,6 +11,26 @@ thread_local! {
     /// Cleared at the start of every top-level `resolve_imports` call so that
     /// repeated compilations in the same process do not reuse stale ASTs.
     static IMPORT_CACHE: RefCell<BTreeMap<PathBuf, Vec<Decl>>> = const { RefCell::new(BTreeMap::new()) };
+    /// Exact source bytes consumed while resolving the current top-level
+    /// compilation unit. Kept beside the AST cache so provenance consumers can
+    /// bind to the same bytes that were parsed rather than re-reading files.
+    static IMPORT_SOURCES: RefCell<BTreeMap<PathBuf, Vec<u8>>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Resolve imports and return the exact imported source bytes consumed by this
+/// resolution. The root module's bytes are supplied by its caller and are not
+/// included here.
+///
+/// This is intentionally a thin wrapper around `resolve_imports`: compilation
+/// and provenance share one resolver read, eliminating a filesystem TOCTOU
+/// window between semantic analysis and source identity calculation.
+pub fn resolve_imports_with_sources(
+    module: &mut AstModule,
+    current_file: &Path,
+    stack: &mut HashSet<PathBuf>,
+) -> NuResult<Vec<Vec<u8>>> {
+    resolve_imports(module, current_file, stack)?;
+    Ok(IMPORT_SOURCES.with(|sources| sources.borrow().values().cloned().collect()))
 }
 
 pub fn resolve_imports(
@@ -20,6 +40,7 @@ pub fn resolve_imports(
 ) -> NuResult<()> {
     if stack.is_empty() {
         IMPORT_CACHE.with(|c| c.borrow_mut().clear());
+        IMPORT_SOURCES.with(|sources| sources.borrow_mut().clear());
     }
 
     let canonical_file = current_file
@@ -69,6 +90,11 @@ pub fn resolve_imports(
             msg: format!("cannot read '{}': {}", import_path, e),
             span: Span::default(),
         })?;
+        IMPORT_SOURCES.with(|sources| {
+            sources
+                .borrow_mut()
+                .insert(resolved_canonical.clone(), source.as_bytes().to_vec());
+        });
         let tokens = Lexer::new(&source)
             .lex()
             .map_err(|e| NuError::RuntimeError {
