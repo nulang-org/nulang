@@ -64,9 +64,10 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("type check failed: {e}"))?;
 
     let mut effect_checker = EffectChecker::new();
-    if !options.grants.is_empty() {
-        effect_checker.set_resource_grants(&options.grants);
-    }
+    // Mirror the normal compiler frontend exactly: even an empty grant list
+    // enables the resource-capability gate, causing FS/Net/OS effects to fail
+    // closed unless explicitly authorized with --with.
+    effect_checker.set_resource_grants(&options.grants);
     effect_checker
         .check_module(&ast.decls)
         .map_err(|e| format!("effect/authority check failed: {e}"))?;
