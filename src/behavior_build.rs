@@ -129,10 +129,7 @@ fn checked_module(
     if !warnings.is_empty() {
         let use_color = std::io::stderr().is_terminal();
         for warning in &warnings {
-            eprintln!(
-                "{}",
-                crate::diagnostic::format_warning(warning, use_color)
-            );
+            eprintln!("{}", crate::diagnostic::format_warning(warning, use_color));
         }
         if deny_warnings {
             return Err(NuError::parse_error(
@@ -199,9 +196,7 @@ fn checked_module(
     let seed_from_params = |context: &mut CapContext, params: &[crate::ast::Param]| {
         for parameter in params {
             if let Some(capability) = parameter.cap {
-                *context = context
-                    .clone()
-                    .with_binding(&parameter.name, capability);
+                *context = context.clone().with_binding(&parameter.name, capability);
             }
         }
     };
@@ -343,9 +338,7 @@ fn resolve_source_path(base: &Path, import: &str) -> PathBuf {
         }
         if let Ok(exe) = std::env::current_exe() {
             if let Some(exe_dir) = exe.parent() {
-                let candidate = exe_dir
-                    .join("stdlib")
-                    .join(format!("{module_path}.nula"));
+                let candidate = exe_dir.join("stdlib").join(format!("{module_path}.nula"));
                 if candidate.exists() {
                     return candidate;
                 }
@@ -405,7 +398,11 @@ fn resolve_source_path(base: &Path, import: &str) -> PathBuf {
 
 fn resolve_nulang_module_path(module: &str) -> PathBuf {
     let entries = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
-    for entry in entries.split(';').map(str::trim).filter(|entry| !entry.is_empty()) {
+    for entry in entries
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
         let Some((name, directory)) = entry.split_once('=') else {
             continue;
         };
@@ -513,7 +510,10 @@ mod tests {
         })
         .unwrap();
 
-        assert_ne!(first_source_digest, second.manifest.provenance.source_digest);
+        assert_ne!(
+            first_source_digest,
+            second.manifest.provenance.source_digest
+        );
         let _ = std::fs::remove_dir_all(directory);
     }
 }
