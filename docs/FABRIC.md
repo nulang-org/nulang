@@ -7,8 +7,9 @@ and persistence rather than as a second broker embedded beside them.
 
 ## Current implementation
 
-The first implementation slice provides ephemeral topic routing across a
-Fabric-enabled Runtime shard set.
+The current implementation provides ephemeral topic routing across a
+Fabric-enabled Runtime shard set and the node-aware directory primitives needed
+for cluster-wide topics.
 
 Runtime APIs:
 
@@ -20,10 +21,19 @@ Runtime APIs:
 - `Runtime::fabric_subscribe(pattern, actor_id, behavior)` — fan-out subscription.
 - `Runtime::fabric_subscribe_group(pattern, group, actor_id, behavior)` — competing
   consumer subscription.
-- `Runtime::fabric_unsubscribe_actor(actor_id)` — remove an actor's subscriptions.
+- `Runtime::fabric_unsubscribe_actor(actor_id)` — remove a local actor's
+  subscriptions without touching numerically-colliding actors on remote nodes.
+- `Runtime::fabric_advertisements(limit)` — export a bounded snapshot of this
+  node's local subscriptions for the cluster control plane.
+- `Runtime::fabric_replace_remote_advertisements(node_id, advertisements)` —
+  atomically replace the known remote subscription snapshot for one node.
+- `Runtime::fabric_remove_remote_node(node_id)` — purge routes learned from a
+  failed or removed cluster node.
 - `Runtime::fabric_subscription_count()` — subscription gauge for the local
   routing view.
-- `Runtime::fabric_publish(topic, args)` — publish to matching subscribers.
+- `Runtime::fabric_remote_subscription_count()` — remote-subscription gauge.
+- `Runtime::fabric_publish(topic, args)` — publish to matching local, cross-shard,
+  or already-known remote subscribers.
 
 Subject patterns use NATS-style token matching:
 
@@ -32,8 +42,10 @@ Subject patterns use NATS-style token matching:
 - `orders.>` matches one-or-more tokens after `orders` and `>` must be terminal.
 
 Non-group subscriptions fan out to every matching actor. For each matching
-consumer group, Fabric selects one member using deterministic per-publisher-
-shard round-robin routing. Identical subscriptions are deduplicated.
+consumer group, Fabric selects one member using deterministic round-robin
+routing. Queue-group cursors are scoped by concrete topic plus group name, so
+unrelated subjects using the same group label cannot perturb each other's
+selection order. Identical subscriptions are deduplicated.
 
 Subscriptions are lifecycle-bound to their actors: normal exit, faults, linked
 exit cascades, and supervisor shutdown remove the actor's ephemeral routing
@@ -43,6 +55,21 @@ Fabric-enabled shards. A publisher therefore selects targets once from its
 local routing view and then calls the normal `send_message_by_id` path; payloads
 use the existing local/cross-shard actor transport rather than a second message
 transport.
+
+Fabric now distinguishes local and remote routing identities explicitly. Local
+subscriptions retain numeric behavior ids for fast same-process delivery.
+Remote subscriptions retain `(node_id, actor_id, behavior_name)` because numeric
+behavior-table ids are node-local. Remote publication therefore reuses
+`Runtime::send_distributed` and the ordinary distributed actor message path.
+Actor ids are not assumed to be globally unique: removing local actor `42`
+never removes a remote node's actor `42`.
+
+The cluster-directory API uses complete per-node snapshots. Replacing a node's
+snapshot removes stale routes for that node before inserting the new set, and
+node-loss cleanup can delete the node's routing state immediately. The remaining
+Phase 2 wire step is to carry these snapshots as a backward-compatible additive
+tail on existing cluster gossip; Fabric does not need a new payload transport or
+new broker connection.
 
 The Fabric control plane is explicit and runtime-owned. It uses small in-process
 channels only for subscription lifecycle metadata. There is no process-global
@@ -72,6 +99,11 @@ semantics that later cluster and stream layers can reuse.
 7. **Do not hide shard coordination in process-global state.** Fabric shard
    metadata channels are owned by the Runtime shard set and payload delivery
    continues to use the existing actor transport.
+8. **Do not fork the NUL0 payload path.** Cluster-wide Fabric metadata may extend
+   the existing compatible gossip envelope, while actual remote publications
+   remain ordinary distributed actor messages.
+9. **Scope lifecycle by node identity.** Bare actor ids are insufficient for
+   remote subscription deletion or failure cleanup.
 
 ## Roadmap
 
@@ -85,14 +117,19 @@ semantics that later cluster and stream layers can reuse.
 - [x] Automatic cleanup during actor exit.
 - [x] Behavior existence validation and safe numeric delivery.
 - [x] Cross-shard subscription replication and payload routing.
+- [x] Queue-group cursors scoped by topic and group.
 - [ ] Publish/backpressure result accounting on top of bounded actor mailboxes.
 - [ ] Placement-aware queue-group selection across publishing shards.
 
 ### Phase 2 — cluster-wide topics
 
-- [ ] Subscription advertisement through cluster membership/distribution.
-- [ ] Remote topic delivery over NUL0.
-- [ ] Node-loss cleanup and subscription convergence.
+- [x] Node-aware local/remote subscription representation.
+- [x] Per-node advertisement snapshot export/replacement APIs.
+- [x] Node-scoped remote route cleanup primitive.
+- [x] Remote routing path reuses `Runtime::send_distributed`.
+- [ ] Carry subscription snapshots as an additive NUL0 gossip tail.
+- [ ] Invoke node cleanup from cluster failure/removal handling.
+- [ ] Multi-node subscription convergence.
 - [ ] Placement-aware consumer selection using mailbox pressure and locality.
 - [ ] Deterministic multi-node simulation coverage.
 
