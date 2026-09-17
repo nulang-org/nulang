@@ -21,7 +21,6 @@ use crate::vm::{Value, VM};
 
 const REGISTERED_LIBRARY_SENTINEL: &str = "__nulang_registered__";
 
-/// An opaque runtime context that owns compiled modules and error state.
 #[repr(C)]
 pub struct NulangRuntime {
     modules: Vec<crate::bytecode::CodeModule>,
@@ -44,15 +43,22 @@ impl NulangRuntime {
         }
     }
 
-    /// Private resolver namespace for library-less `extern { ... }` functions.
-    /// The runtime lives in a Box for its entire public lifetime, so its address
-    /// is stable until `nulang_runtime_free` drops it.
     fn ffi_namespace(&self) -> String {
         format!("__nulang_runtime_{:x}", self as *const Self as usize)
     }
 
     fn set_error(&mut self, err: NuError) {
         self.last_error = Some(err.to_string());
+    }
+
+    fn set_error_message(&mut self, message: impl Into<String>) {
+        self.last_error = Some(message.into());
+    }
+
+    fn ensure_error_message(&mut self, fallback: &str) {
+        if self.last_error.is_none() {
+            self.last_error = Some(fallback.to_string());
+        }
     }
 
     fn clear_error(&mut self) {
@@ -83,9 +89,6 @@ impl NulangRuntime {
 
         match compile_source(source) {
             Ok(mut module) => {
-                // Library-less externs are represented by a parser sentinel.
-                // Replace only that sentinel with this runtime's private namespace.
-                // Explicit dynamic-library externs keep their original library path.
                 let namespace = self.ffi_namespace();
                 for foreign in &mut module.foreign_functions {
                     if foreign.library == REGISTERED_LIBRARY_SENTINEL {
@@ -305,6 +308,15 @@ impl From<Value> for NulangValue {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NulangStatus {
+    Ok = 0,
+    InvalidArgument = 1,
+    CompileError = 2,
+    RuntimeError = 3,
+}
+
 const INVALID_C_VALUE: &str =
     "C ABI rejected a pointer-tagged NulangValue: host heap pointers cannot be supplied by C";
 
@@ -325,8 +337,6 @@ fn signature_from_abi(
     } else if params.is_null() {
         return None;
     } else {
-        // SAFETY: callers of the exported registration functions guarantee the
-        // pointer names `param_count` initialized CType values.
         unsafe { std::slice::from_raw_parts(params, param_count) }
     };
     Some(super::marshal::Signature::new(params_slice.to_vec(), ret))
@@ -342,6 +352,94 @@ pub unsafe extern "C" fn nulang_runtime_free(runtime: *mut NulangRuntime) {
     if !runtime.is_null() {
         unsafe {
             let _ = Box::from_raw(runtime);
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nulang_compile_protected(
+    runtime: *mut NulangRuntime,
+    source: *const c_char,
+    out_handle: *mut i64,
+) -> NulangStatus {
+    if runtime.is_null() || source.is_null() || out_handle.is_null() {
+        return NulangStatus::InvalidArgument;
+    }
+    let rt = unsafe { &mut *runtime };
+    let source_str = match unsafe { CStr::from_ptr(source).to_str() } {
+        Ok(s) => s,
+        Err(_) => {
+            rt.set_error_message("source is not valid UTF-8");
+            return NulangStatus::InvalidArgument;
+        }
+    };
+    match rt.compile(source_str) {
+        Some(handle) => {
+            unsafe { *out_handle = handle as i64 };
+            NulangStatus::Ok
+        }
+        None => NulangStatus::CompileError,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nulang_run_protected(
+    runtime: *mut NulangRuntime,
+    module_handle: i64,
+    out_value: *mut NulangValue,
+) -> NulangStatus {
+    if runtime.is_null() || module_handle < 0 || out_value.is_null() {
+        return NulangStatus::InvalidArgument;
+    }
+    let rt = unsafe { &mut *runtime };
+    match rt.run(module_handle as usize) {
+        Some(value) => {
+            unsafe { *out_value = value.into() };
+            NulangStatus::Ok
+        }
+        None => {
+            rt.ensure_error_message("invalid module handle or runtime execution failed");
+            NulangStatus::RuntimeError
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nulang_call_function_protected(
+    runtime: *mut NulangRuntime,
+    module_handle: i64,
+    name: *const c_char,
+    args: *const NulangValue,
+    arg_count: usize,
+    out_value: *mut NulangValue,
+) -> NulangStatus {
+    if runtime.is_null() || module_handle < 0 || name.is_null() || out_value.is_null() {
+        return NulangStatus::InvalidArgument;
+    }
+    let rt = unsafe { &mut *runtime };
+    let name_str = match unsafe { CStr::from_ptr(name).to_str() } {
+        Ok(s) => s,
+        Err(_) => {
+            rt.set_error_message("function name is not valid UTF-8");
+            return NulangStatus::InvalidArgument;
+        }
+    };
+    let args_slice = if arg_count == 0 {
+        &[]
+    } else if args.is_null() {
+        rt.set_error_message("args is NULL with non-zero arg_count");
+        return NulangStatus::InvalidArgument;
+    } else {
+        unsafe { std::slice::from_raw_parts(args, arg_count) }
+    };
+    match rt.call_function(module_handle as usize, name_str, args_slice) {
+        Some(value) => {
+            unsafe { *out_value = value.into() };
+            NulangStatus::Ok
+        }
+        None => {
+            rt.ensure_error_message("function lookup or runtime execution failed");
+            NulangStatus::RuntimeError
         }
     }
 }
@@ -569,12 +667,6 @@ pub unsafe extern "C" fn nulang_module_value_to_string(
     }
 }
 
-/// Register a native callback for this embedding runtime only.
-///
-/// Library-less `extern { ... }` declarations compiled by this runtime are
-/// rewritten to a private namespace. The existing resolver prefers that exact
-/// namespaced registration, then falls back to legacy process-global
-/// registrations.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_runtime_register_native_function(
     runtime: *mut NulangRuntime,
@@ -612,7 +704,6 @@ pub unsafe extern "C" fn nulang_runtime_register_native_function(
     }
 }
 
-/// Register a legacy process-global native callback.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_register_native_function(
     name: *const c_char,
@@ -652,6 +743,66 @@ mod tests {
 
     extern "C" fn runtime_b_value() -> i64 {
         22
+    }
+
+    #[test]
+    fn test_protected_run_distinguishes_successful_nil() {
+        let rt = nulang_runtime_new();
+        let source = CString::new("nil").unwrap();
+        let mut handle = -1;
+        assert_eq!(
+            unsafe { nulang_compile_protected(rt, source.as_ptr(), &mut handle) },
+            NulangStatus::Ok
+        );
+        let mut value = nulang_value_unit();
+        assert_eq!(
+            unsafe { nulang_run_protected(rt, handle, &mut value) },
+            NulangStatus::Ok
+        );
+        assert!(nulang_value_is_nil(value));
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_protected_compile_reports_compile_error() {
+        let rt = nulang_runtime_new();
+        let source = CString::new("let x = in").unwrap();
+        let mut handle = -1;
+        assert_eq!(
+            unsafe { nulang_compile_protected(rt, source.as_ptr(), &mut handle) },
+            NulangStatus::CompileError
+        );
+        assert!(!unsafe { nulang_last_error(rt) }.is_null());
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_protected_run_reports_runtime_error() {
+        let rt = nulang_runtime_new();
+        let source = CString::new("1 / 0").unwrap();
+        let mut handle = -1;
+        assert_eq!(
+            unsafe { nulang_compile_protected(rt, source.as_ptr(), &mut handle) },
+            NulangStatus::Ok
+        );
+        let mut value = nulang_value_unit();
+        assert_eq!(
+            unsafe { nulang_run_protected(rt, handle, &mut value) },
+            NulangStatus::RuntimeError
+        );
+        assert!(!unsafe { nulang_last_error(rt) }.is_null());
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_protected_calls_reject_null_outputs() {
+        let rt = nulang_runtime_new();
+        let source = CString::new("1").unwrap();
+        assert_eq!(
+            unsafe { nulang_compile_protected(rt, source.as_ptr(), std::ptr::null_mut()) },
+            NulangStatus::InvalidArgument
+        );
+        unsafe { nulang_runtime_free(rt) };
     }
 
     #[test]
@@ -695,7 +846,6 @@ mod tests {
         assert_eq!(nulang_value_int(unsafe { nulang_run(rt_b, handle_b) }), 22);
 
         unsafe { nulang_runtime_free(rt_a) };
-        // Runtime B remains independently usable after A removes its namespace.
         assert_eq!(nulang_value_int(unsafe { nulang_run(rt_b, handle_b) }), 22);
         unsafe { nulang_runtime_free(rt_b) };
     }
