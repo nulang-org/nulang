@@ -291,18 +291,12 @@ mod tests {
 
     #[test]
     fn source_closure_is_content_bound_and_order_independent() {
-        let first = canonical_source_closure(
-            b"root",
-            &[b"import-a".to_vec(), b"import-b".to_vec()],
-        );
-        let reordered = canonical_source_closure(
-            b"root",
-            &[b"import-b".to_vec(), b"import-a".to_vec()],
-        );
-        let changed = canonical_source_closure(
-            b"root",
-            &[b"import-a".to_vec(), b"import-c".to_vec()],
-        );
+        let first =
+            canonical_source_closure(b"root", &[b"import-a".to_vec(), b"import-b".to_vec()]);
+        let reordered =
+            canonical_source_closure(b"root", &[b"import-b".to_vec(), b"import-a".to_vec()]);
+        let changed =
+            canonical_source_closure(b"root", &[b"import-a".to_vec(), b"import-c".to_vec()]);
 
         assert_eq!(first, reordered);
         assert_ne!(first, changed);
