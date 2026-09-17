@@ -1,3 +1,3 @@
 User-agent: *
 Allow: /
-Sitemap: https://nulang.org/sitemap.xml
+Sitemap: https://nulang.org/sitemap-index.xml

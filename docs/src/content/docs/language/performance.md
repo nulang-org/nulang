@@ -25,6 +25,10 @@ The `--backend native` flag compiles Nulang directly to native code:
 - **Unboxed operations**: Compile-time type metadata (`src/type_metadata.rs`) enables unboxed integer and float arithmetic — no NaN-tagging overhead in compiled code.
 - **Zero VM overhead**: AOT-compiled functions run natively without interpreter dispatch or frame management.
 
+:::caution[Limitation]
+`--backend native` compiles a **pure-functional subset only** — no effects, no actors, and no FFI (the compiler errors name the unsupported construct). Use the default bytecode backend for full-language programs.
+:::
+
 ## WASM Backend
 
 The WASM backend (`--backend wasm`, requires `--features wasm-backend`) compiles MIR to WebAssembly:
@@ -34,13 +38,17 @@ The WASM backend (`--backend wasm`, requires `--features wasm-backend`) compiles
 - **AOT compilation**: `wasmtime compile` produces `.cwasm` files for instant startup — no JIT warm-up on the client side.
 - **SIMD lowering**: MIR array operations lower to WASM SIMD instructions via raw byte emission.
 
+:::caution[Limitation]
+The WASM backend supports **IO.print/read only** — no user-defined effect handlers and no actor mailbox. (The experimental `wasmfx-backend` feature adds WasmFX stack-switching for suspending effects such as `LLM.ask`, `Signal.wait`, and `ReceiveWait`.)
+:::
+
 ## Register VM
 
 The bytecode VM is designed for compact code and fast dispatch:
 
 - **32-bit instructions**: `{opcode: u8, op1: u8, op2: u8, op3: u8}` — fixed-width, cache-friendly.
 - **256 registers per frame**: Flat `Vec<u64>` with 48-bit payload + 16-bit type tag.
-- **133 opcodes**: spanning the ranges above (arithmetic, control flow, closures, actors, effects, FFI, etc.).
+- **135 opcodes**: spanning the ranges above (arithmetic, control flow, closures, actors, effects, FFI, etc.).
 - **i64-tagged values**: integers, floats, booleans, nil, and unit are all represented inline — no boxing, no heap allocation for primitives.
 
 ## Memory Model
