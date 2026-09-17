@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::ast::{AstModule, Decl};
 use crate::backends::WasmBackend;
@@ -41,12 +41,11 @@ pub struct BehaviorBuildOutput {
 
 /// Compile one import-resolved Nulang unit to Wasm and its Behavior Manifest.
 ///
-/// The root source is parsed exactly once for compilation, imports are merged
-/// by the ordinary resolver, and the same checked AST/effect checker feeds
-/// both MIR/Wasm lowering and manifest construction. A separate provenance
-/// walk reads the exact source closure and converts it into a location-neutral
-/// content bundle so imported-source changes necessarily change
-/// `provenance.source_digest`.
+/// The root source is read once. The ordinary resolver returns the exact bytes
+/// it consumed for every reachable import, so source provenance is calculated
+/// from the same filesystem reads that produced the merged AST. The successful
+/// effect checker is then reused for manifest semantics while the same checked
+/// AST is lowered to MIR/Wasm.
 pub fn compile_wasm_behavior(input: BehaviorBuildInput<'_>) -> NuResult<BehaviorBuildOutput> {
     let source_bytes = std::fs::read(input.source_path).map_err(|error| NuError::RuntimeError {
         msg: format!(
@@ -63,17 +62,13 @@ pub fn compile_wasm_behavior(input: BehaviorBuildInput<'_>) -> NuResult<Behavior
         span: Span::default(),
     })?;
 
-    // Provenance is collected before import declarations are erased by the
-    // resolver. The bundle contains sorted content digests, not absolute
-    // paths, so identical source closures hash identically on different hosts.
-    let source_closure = canonical_source_closure(input.source_path, &source_bytes)?;
-
-    let (ast, type_checker, mut effect_checker) = checked_module(
+    let (ast, type_checker, mut effect_checker, imported_sources) = checked_module(
         source,
         input.source_path,
         input.with_capabilities,
         input.deny_warnings,
     )?;
+    let source_closure = canonical_source_closure(&source_bytes, &imported_sources);
 
     let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
     let mir = crate::mir_lower::lower_module(&hir)?;
@@ -104,14 +99,15 @@ pub fn compile_wasm_behavior(input: BehaviorBuildInput<'_>) -> NuResult<Behavior
 }
 
 /// Compiler frontend equivalent to the CLI's `run_frontend`, but returns the
-/// successful effect checker as part of the checked compilation unit so
-/// manifest emission cannot drift into a source-text or bytecode re-analysis.
+/// successful effect checker and the exact imported source bytes as part of the
+/// checked compilation unit. Manifest emission therefore never performs a
+/// second filesystem/source/bytecode semantic analysis.
 fn checked_module(
     source: &str,
     source_path: &Path,
     with_capabilities: &[String],
     deny_warnings: bool,
-) -> NuResult<(AstModule, TypeChecker, EffectChecker)> {
+) -> NuResult<(AstModule, TypeChecker, EffectChecker, Vec<Vec<u8>>)> {
     let prelude_source = crate::prelude_source::PRELUDE_SOURCE;
     let mut prelude_lexer = Lexer::new(prelude_source);
     crate::types::set_source_map_with_file(prelude_source, Some("<prelude>"));
@@ -150,7 +146,8 @@ fn checked_module(
         .collect();
 
     let mut stack = HashSet::new();
-    crate::resolver::resolve_imports(&mut ast, source_path, &mut stack)?;
+    let imported_sources =
+        crate::resolver::resolve_imports_with_sources(&mut ast, source_path, &mut stack)?;
 
     // Keep the same ordering invariant as the canonical CLI frontend: imported
     // declarations are resolved first, then prelude variants are placed ahead
@@ -253,191 +250,31 @@ fn checked_module(
         }
     }
 
-    Ok((ast, type_checker, effect_checker))
+    Ok((ast, type_checker, effect_checker, imported_sources))
 }
 
-/// Produce a deterministic, location-neutral representation of every source
-/// file reachable from the root module. Each file contributes its exact byte
-/// digest. The sorted digest set is then hashed by BehaviorManifest, avoiding
-/// absolute-path differences between build machines while preserving exact
-/// source-content identity.
-fn canonical_source_closure(root_path: &Path, root_bytes: &[u8]) -> NuResult<Vec<u8>> {
-    let mut visited = BTreeSet::new();
+/// Produce a deterministic, location-neutral representation of the exact root
+/// and imported source bytes consumed by the compiler. The imported sources
+/// come directly from the resolver's parse reads; no file is opened again.
+fn canonical_source_closure(root_bytes: &[u8], imported_sources: &[Vec<u8>]) -> Vec<u8> {
     let mut content_digests = BTreeSet::new();
-    collect_source_file(
-        root_path,
-        Some(root_bytes),
-        &mut visited,
-        &mut content_digests,
-    )?;
+    content_digests.insert(crate::behavior_manifest::digest(root_bytes));
+    for source in imported_sources {
+        content_digests.insert(crate::behavior_manifest::digest(source));
+    }
 
     let mut bundle = b"nulang-source-closure/v1\n".to_vec();
     for digest in content_digests {
         bundle.extend_from_slice(digest.as_bytes());
         bundle.push(b'\n');
     }
-    Ok(bundle)
-}
-
-fn collect_source_file(
-    path: &Path,
-    supplied_bytes: Option<&[u8]>,
-    visited: &mut BTreeSet<PathBuf>,
-    content_digests: &mut BTreeSet<String>,
-) -> NuResult<()> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(canonical.clone()) {
-        return Ok(());
-    }
-
-    let owned;
-    let bytes = if let Some(bytes) = supplied_bytes {
-        bytes
-    } else {
-        owned = std::fs::read(&canonical).map_err(|error| NuError::RuntimeError {
-            msg: format!(
-                "cannot read imported source '{}': {error}",
-                canonical.display()
-            ),
-            span: Span::default(),
-        })?;
-        &owned
-    };
-
-    content_digests.insert(crate::behavior_manifest::digest(bytes));
-    let source = std::str::from_utf8(bytes).map_err(|error| NuError::RuntimeError {
-        msg: format!(
-            "imported source '{}' is not UTF-8: {error}",
-            canonical.display()
-        ),
-        span: Span::default(),
-    })?;
-    let tokens = Lexer::new(source).lex()?;
-    let imported_ast = Parser::new(tokens).parse_module()?;
-    let base = canonical.parent().unwrap_or(&canonical);
-
-    for import in imported_ast.decls.iter().filter_map(|decl| match decl {
-        Decl::Import { path, .. } => Some(path.as_str()),
-        _ => None,
-    }) {
-        let resolved = resolve_source_path(base, import);
-        collect_source_file(&resolved, None, visited, content_digests)?;
-    }
-
-    Ok(())
-}
-
-/// Mirrors `resolver::resolve_path` for provenance collection. Compilation
-/// still uses the real resolver; this helper only finds the same source bytes
-/// before import declarations are erased from the AST.
-fn resolve_source_path(base: &Path, import: &str) -> PathBuf {
-    if let Some(module) = import.strip_prefix("stdlib::") {
-        let module_path = module.replace("::", std::path::MAIN_SEPARATOR_STR);
-        if let Ok(dir) = std::env::var("NULANG_STDLIB") {
-            return PathBuf::from(dir).join(format!("{module_path}.nula"));
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                let candidate = exe_dir.join("stdlib").join(format!("{module_path}.nula"));
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
-        }
-        if let Ok(cwd) = std::env::current_dir() {
-            let candidate = cwd
-                .join("src")
-                .join("stdlib")
-                .join(format!("{module_path}.nula"));
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-        return PathBuf::from(format!("src/stdlib/{module_path}.nula"));
-    }
-
-    if let Some(module) = import.strip_prefix("@nulang/") {
-        return resolve_nulang_module_path(module);
-    }
-
-    let import_path = Path::new(import);
-    let resolved = if import_path.is_absolute() {
-        import_path.to_path_buf()
-    } else {
-        base.join(import_path)
-    };
-    let resolved = if resolved.extension().is_none() {
-        resolved.with_extension("nula")
-    } else {
-        resolved
-    };
-    if resolved.exists() || import_path.is_absolute() {
-        return resolved;
-    }
-
-    let mut directory = base;
-    loop {
-        if directory.join("Nulang.toml").is_file() {
-            let candidate = directory.join("src").join(import_path);
-            let candidate = if candidate.extension().is_none() {
-                candidate.with_extension("nula")
-            } else {
-                candidate
-            };
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-        match directory.parent() {
-            Some(parent) => directory = parent,
-            None => break,
-        }
-    }
-    resolved
-}
-
-fn resolve_nulang_module_path(module: &str) -> PathBuf {
-    let entries = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
-    for entry in entries
-        .split(';')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-    {
-        let Some((name, directory)) = entry.split_once('=') else {
-            continue;
-        };
-        let name = name.trim();
-        let directory = directory.trim();
-        if name.is_empty() || directory.is_empty() {
-            continue;
-        }
-        let name = name.strip_prefix("@nulang/").unwrap_or(name);
-        if module == name || module.starts_with(&format!("{name}/")) {
-            let rest = module
-                .strip_prefix(name)
-                .unwrap_or(module)
-                .trim_start_matches('/');
-            let subpath = if rest.is_empty() {
-                PathBuf::from("lib.nula")
-            } else {
-                PathBuf::from(format!(
-                    "{}.nula",
-                    rest.replace('/', std::path::MAIN_SEPARATOR_STR)
-                ))
-            };
-            return PathBuf::from(directory).join(subpath);
-        }
-    }
-
-    PathBuf::from(format!(
-        "src/{}.nula",
-        module.replace('/', std::path::MAIN_SEPARATOR_STR)
-    ))
+    bundle
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_dir(label: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -453,20 +290,22 @@ mod tests {
     }
 
     #[test]
-    fn source_closure_digest_changes_when_import_changes() {
-        let directory = temp_dir("provenance");
-        let main_path = directory.join("main.nula");
-        let lib_path = directory.join("lib.nula");
-        let root = b"import lib\nfn main() { helper() }\n";
-        std::fs::write(&main_path, root).unwrap();
-        std::fs::write(&lib_path, "fn helper() { 1 }\n").unwrap();
+    fn source_closure_is_content_bound_and_order_independent() {
+        let first = canonical_source_closure(
+            b"root",
+            &[b"import-a".to_vec(), b"import-b".to_vec()],
+        );
+        let reordered = canonical_source_closure(
+            b"root",
+            &[b"import-b".to_vec(), b"import-a".to_vec()],
+        );
+        let changed = canonical_source_closure(
+            b"root",
+            &[b"import-a".to_vec(), b"import-c".to_vec()],
+        );
 
-        let first = canonical_source_closure(&main_path, root).unwrap();
-        std::fs::write(&lib_path, "fn helper() { 2 }\n").unwrap();
-        let second = canonical_source_closure(&main_path, root).unwrap();
-
-        assert_ne!(first, second);
-        let _ = std::fs::remove_dir_all(directory);
+        assert_eq!(first, reordered);
+        assert_ne!(first, changed);
     }
 
     #[test]
