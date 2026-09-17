@@ -6,6 +6,7 @@
 //! to keep the god-object at a manageable size.
 
 use crate::bytecode::Constant;
+use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
@@ -22,7 +23,7 @@ pub(crate) fn next_sequence(rt: &Runtime, actor_id: u64) -> u64 {
 pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
     rt.actors
         .get(&actor_id)
-        .map(|a| a.is_workflow)
+        .map(|a| matches!(a.role(), Ok(ActorRole::Workflow)))
         .unwrap_or(false)
 }
 
@@ -60,11 +61,29 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
             state.insert(name.clone(), persisted);
         }
     }
+    let authority_tokens = match actor.authority_manifest() {
+        Ok(manifest) => manifest.canonical_token_set(),
+        Err(err) => {
+            tracing::warn!(
+                "nulang-persist: refusing to checkpoint actor {} with invalid authority: {}",
+                actor_id,
+                err
+            );
+            return;
+        }
+    };
     // Snapshot the global CRDT state alongside durable actor fields.
     let crdt_snapshot = rt.crdt_manager.as_ref().map(|m| {
         m.snapshot()
             .into_iter()
             .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
+            .collect()
+    });
+    let crdt_field_map = rt.crdt_manager.as_ref().map(|m| {
+        m.field_map
+            .iter()
+            .filter(|((aid, _), _)| *aid == actor_id)
+            .map(|((_, name), id)| (name.clone(), id.0))
             .collect()
     });
     let snapshot = crate::runtime::persistence::ActorSnapshot {
@@ -73,6 +92,8 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
         state,
         waiting_signal: actor.waiting_signal.clone(),
         crdt_snapshot,
+        crdt_field_map,
+        authority_tokens,
     };
     // RFC 0014 §3: re-spawn-opted actors replicate the snapshot to their
     // deterministic shadow node before the local save, so the replica is a
@@ -109,11 +130,7 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
 /// event-sourced (non-workflow) actors the event is persisted to the event
 /// journal and a checkpoint is forced.
 pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
-    let is_workflow = rt
-        .actors
-        .get(&actor_id)
-        .map(|a| a.is_workflow)
-        .unwrap_or(false);
+    let is_workflow = actor_is_workflow(rt, actor_id);
     let seq = next_sequence(rt, actor_id);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.event_log.push((event.to_string(), args.to_vec()));
@@ -287,7 +304,7 @@ pub(crate) fn signal_workflow(
 /// Register a read-only query handler on a workflow actor.
 pub(crate) fn register_workflow_query(rt: &mut Runtime, actor_id: u64, name: &str, handler: Value) {
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        if actor.is_workflow {
+        if matches!(actor.role(), Ok(ActorRole::Workflow)) {
             actor.query_handlers.insert(name.to_string(), handler);
         }
     }
@@ -297,7 +314,7 @@ pub(crate) fn register_workflow_query(rt: &mut Runtime, actor_id: u64, name: &st
 pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Option<Value> {
     let (handler, module) = {
         let actor = rt.actors.get(&actor_id)?;
-        if !actor.is_workflow {
+        if !matches!(actor.role(), Ok(ActorRole::Workflow)) {
             return None;
         }
         let handler = *actor.query_handlers.get(name)?;

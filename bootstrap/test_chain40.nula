@@ -1,0 +1,43 @@
+fn main() -> Int {
+    let a0 = 0 in
+    let a1 = 1 in
+    let a2 = 2 in
+    let a3 = 3 in
+    let a4 = 4 in
+    let a5 = 5 in
+    let a6 = 6 in
+    let a7 = 7 in
+    let a8 = 8 in
+    let a9 = 9 in
+    let a10 = 10 in
+    let a11 = 11 in
+    let a12 = 12 in
+    let a13 = 13 in
+    let a14 = 14 in
+    let a15 = 15 in
+    let a16 = 16 in
+    let a17 = 17 in
+    let a18 = 18 in
+    let a19 = 19 in
+    let a20 = 20 in
+    let a21 = 21 in
+    let a22 = 22 in
+    let a23 = 23 in
+    let a24 = 24 in
+    let a25 = 25 in
+    let a26 = 26 in
+    let a27 = 27 in
+    let a28 = 28 in
+    let a29 = 29 in
+    let a30 = 30 in
+    let a31 = 31 in
+    let a32 = 32 in
+    let a33 = 33 in
+    let a34 = 34 in
+    let a35 = 35 in
+    let a36 = 36 in
+    let a37 = 37 in
+    let a38 = 38 in
+    let a39 = 39 in
+    a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15 + a16 + a17 + a18 + a19 + a20 + a21 + a22 + a23 + a24 + a25 + a26 + a27 + a28 + a29 + a30 + a31 + a32 + a33 + a34 + a35 + a36 + a37 + a38 + a39
+}

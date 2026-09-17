@@ -1,0 +1,2 @@
+fn low17(x: Int) -> Int { x }
+let f = fn(a) => fn(b) => fn(c) => fn(d) => (if a == 1 then (nr * 262144) + p else if a == 2 then ((if b == 1 then (nr * 262144) + p else if b == 2 then ((if c == 1 then (nr * 262144) + p else if c == 2 then ((nr * 262144) + p) else (nr * 262144) + p)) else (nr * 262144) + p)) else (nr * 262144) + p) in 123

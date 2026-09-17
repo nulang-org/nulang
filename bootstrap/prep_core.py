@@ -14,6 +14,9 @@ Transforms applied:
 import sys
 import re
 
+from prep_selfhost import transform_fns_for_self_host, rewrite_emit_word_calls
+from split_comp_for_self_host import split_comp_for_self_host, split_comp_deep_kws, thunk_wrap_let
+
 
 def strip_comments(src: str) -> str:
     lines = []
@@ -42,15 +45,6 @@ def balanced_split_args(args_str: str) -> list[str]:
         args.append(curr.strip())
     return args
 
-
-def curry_call(name: str, args_str: str) -> str | None:
-    args = balanced_split_args(args_str)
-    if len(args) <= 1:
-        return None
-    result = name + '(' + args[0] + ')'
-    for a in args[1:]:
-        result += '(' + a + ')'
-    return result
 
 
 def transform_perform(source: str) -> str:
@@ -110,41 +104,69 @@ def transform_perform(source: str) -> str:
     return out
 
 
+def _curry_call_match(source: str, name: str, args_str: str, start: int, end: int) -> str:
+    """Curry one call site if appropriate; otherwise return the original text."""
+    KEYWORDS = {'then', 'else', 'if', 'let', 'in', 'fn', 'and', 'or', 'not'}
+    before = source[max(0, start - 10):start]
+    after = source[end:end + 20]
+    args = balanced_split_args(args_str)
+    curried_args = [curry_call_sites(a) for a in args]
+    if name in KEYWORDS:
+        return name + '(' + ', '.join(curried_args) + ')'
+    if name == 'nperform':
+        return 'nperform(' + ', '.join(curried_args) + ')'
+    if start > 0 and source[start - 1] == '.':
+        return source[start:end]
+    if re.search(r'\bfn\s+$', before) and re.match(r'\s*(?:=>|->|\{)', after):
+        return source[start:end]
+    if len(args) <= 1:
+        return source[start:end]
+    c = name + '(' + curried_args[0] + ')'
+    for a in curried_args[1:]:
+        c += '(' + a + ')'
+    return c
+
+
 def curry_call_sites(source: str) -> str:
     """Curry function calls with multiple arguments, but not `fn` definitions or nperform."""
-    KEYWORDS = {'then', 'else', 'if', 'let', 'in', 'fn', 'and', 'or', 'not'}
-    def repl(match: re.Match) -> str:
-        name = match.group(1)
-        args_str = match.group(2)
-        full = match.group(0)
-        before = source[max(0, match.start() - 10):match.start()]
-        after = source[match.end():match.end() + 20]
-        # Recursively curry all arguments so inner multi-arg calls
-        # (e.g. inside `then(...)`) are also curried.
-        args = balanced_split_args(args_str)
-        curried_args = [curry_call_sites(a) for a in args]
-        # Skip keywords.
-        if name in KEYWORDS:
-            return name + '(' + ', '.join(curried_args) + ')'
-        # nperform effect calls are parsed specially by compile_hex, but their
-        # arguments may still contain multi-arg function calls that need currying.
-        if name == 'nperform':
-            return 'nperform(' + ', '.join(curried_args) + ')'
-        # Skip qualified names (String.charAt) and function definitions.
-        if match.start() > 0 and source[match.start() - 1] == '.':
-            return full
-        if re.search(r'\bfn\s+$', before) and re.match(r'\s*(?:=>|->|\{)', after):
-            return full
-        if len(args) <= 1:
-            return full
-        c = curry_call(name, args_str)
-        return c if c else full
+    result = []
+    i = 0
+    n = len(source)
+    while i < n:
+        m = re.match(r'\w+', source[i:])
+        if m and i + m.end() < n and source[i + m.end()] == '(':
+            name = m.group(0)
+            j = i + m.end() + 1
+            depth = 1
+            in_str = False
+            while j < n and depth > 0:
+                ch = source[j]
+                if ch == '"':
+                    in_str = not in_str
+                elif not in_str:
+                    if ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth -= 1
+                j += 1
+            if depth == 0:
+                args_str = source[i + m.end() + 1:j - 1]
+                result.append(_curry_call_match(source, name, args_str, i, j))
+                i = j
+                continue
+        result.append(source[i])
+        i += 1
+    return ''.join(result)
 
-    return re.sub(
-        r'(\w+)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)',
-        repl,
-        source
-    )
+
+def curry_call_sites_to_fixpoint(source: str) -> str:
+    """Apply curry_call_sites until a fixed point."""
+    prev = None
+    cur = source
+    while cur != prev:
+        prev = cur
+        cur = curry_call_sites(cur)
+    return cur
 
 
 def strip_type_annotations(params_str: str) -> str:
@@ -169,7 +191,7 @@ def curry_fn_definition(name: str, params: list[str], body: str) -> str:
     if not params:
         return f'{name} = fn() => {body}'
     result = body
-    for p in params[1:]:
+    for p in reversed(params[1:]):
         result = f'fn({p}) => {result}'
     result = f'{name} = fn({params[0]}) => {result}'
     return result
@@ -243,7 +265,9 @@ def _flatten_block_body(body: str) -> str:
     # Merge `else` continuations.
     merged = []
     for part in parts:
-        if merged and re.match(r'else\b', part):
+        if merged and merged[-1].rstrip().endswith('+'):
+            merged[-1] = merged[-1] + ' ' + part
+        elif merged and re.match(r'else\b', part):
             merged[-1] = merged[-1] + ' ' + part
         else:
             merged.append(part)
@@ -316,22 +340,31 @@ def parse_top_level_fns(source: str) -> tuple[list[tuple[str, list[str], str]], 
     return fns, rest
 
 
-def convert_to_let_chain(fns: list[tuple[str, list[str], str]], main_expr: str) -> str:
+def convert_to_let_chain(
+    fns: list[tuple[str, list[str], str]],
+    main_expr: str,
+    *,
+    transform_effects: bool = True,
+) -> str:
     """Wrap functions in nested let/in and curry definitions.
 
     If the final main expression is empty, invoke the `main` function.
     """
+    if main_expr is None:
+        main_expr = ""
     main_expr = main_expr.strip()
     if not main_expr and fns:
-        main_expr = f'{fns[-1][0]}()'
-    expr = transform_perform(main_expr)
-    expr = curry_call_sites(expr)
+        main_expr = f'let _ = {fns[-1][0]}() in 0'
+    expr = curry_call_sites_to_fixpoint(
+        transform_perform(main_expr) if transform_effects else main_expr
+    )
     for name, params, body in reversed(fns):
         body = flatten_blocks(body)
         body = _flatten_block_body(body)
         body = convert_operators(body)
-        body = transform_perform(body)
-        body = curry_call_sites(body)
+        body = curry_call_sites_to_fixpoint(
+            transform_perform(body) if transform_effects else body
+        )
         defn = curry_fn_definition(name, params, body)
         expr = f'let {defn} in {expr}'
     return expr
@@ -339,9 +372,40 @@ def convert_to_let_chain(fns: list[tuple[str, list[str], str]], main_expr: str) 
 
 def main():
     source = sys.stdin.read()
+    # Extract only the `not` keyword branch (smallest failing codegen). A
+    # 3-way let/if/not split fixed not/if-true but killed infix via layout
+    # churn; try the single smallest helper.
+    source = split_comp_deep_kws(source)
+    source = thunk_wrap_let(source)
     source = strip_comments(source)
     fns, main_expr = parse_top_level_fns(source)
-    result = convert_to_let_chain(fns, main_expr)
+    fns, _ = transform_fns_for_self_host(fns)
+    # Stage-2 self-host: keep the top-level frame tiny by moving all helper
+    # definitions inside the driver function.  The host compiler's register
+    # allocator otherwise runs out of frame registers on the long top-level
+    # let-chain and silently drops the trailing main() call.
+    if not main_expr:
+        kept: list[tuple[str, list[str], str]] = []
+        for name, params, body in fns:
+            if name == 'main':
+                main_expr = body
+            else:
+                kept.append((name, params, body))
+        fns = kept
+    # main's body is a semicolon-separated block like fn bodies; flatten it the
+    # same way before wrapping, or the `;` survives into the self-hosted source
+    # where compile_hex.nula's comp() cannot parse it (it stops at the `;`).
+    if main_expr:
+        main_expr = flatten_blocks(main_expr)
+        main_expr = _flatten_block_body(main_expr)
+        main_expr = convert_operators(main_expr)
+    if main_expr:
+        inner = convert_to_let_chain(fns, main_expr, transform_effects=True)
+        inner = rewrite_emit_word_calls(inner)
+        fns = [('main', [], inner)]
+        main_expr = 'main()'
+    result = convert_to_let_chain(fns, main_expr or 'main()', transform_effects=True)
+    result = rewrite_emit_word_calls(result)
     # Collapse whitespace to a single line (preserve necessary spaces around identifiers).
     result = re.sub(r'\s+', ' ', result).strip()
     print(result)

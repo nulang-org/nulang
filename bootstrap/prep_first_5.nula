@@ -1,0 +1,1 @@
+let low17 = fn(x) => (let q = x / 131072 in x - q * 131072) in let low16 = fn(x) => (let q = x / 65536 in x - q * 65536) in let low8 = fn(x) => (let q = x / 256 in x - q * 256) in let low4 = fn(x) => (let q = x / 16 in x - q * 16) in let low6 = fn(x) => (let q = x / 64 in x - q * 64) in let main = fn() => 123 in main()

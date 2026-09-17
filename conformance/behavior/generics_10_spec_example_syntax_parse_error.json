@@ -1,1 +1,1 @@
-{"exit_code":3,"stdout":"","stderr":"Error: Parse error at 5:20: Unknown type name: 'List'"}
+{"exit_code": 3, "stdout": "", "stderr": "Unknown type name: 'List'"}

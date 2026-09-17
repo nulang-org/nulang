@@ -1,1 +1,1 @@
-{"exit_code":4,"stdout":"","stderr":"Error: Type error at 6:54: Unbound variable: 'Math'"}
+{"exit_code": 4, "stdout": "", "stderr": "Unbound variable: 'Math'"}

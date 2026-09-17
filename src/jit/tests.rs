@@ -820,13 +820,13 @@ fn test_jit_execute_bitwise_ops() {
 
     func(regs.as_mut_ptr(), consts.as_ptr());
 
-    assert_eq!(Value::from_bits(regs[2]).as_int(), Some(0b0110));
-    assert_eq!(Value::from_bits(regs[3]).as_int(), Some(0b1000));
-    assert_eq!(Value::from_bits(regs[4]).as_int(), Some(0b1110));
-    assert_eq!(Value::from_bits(regs[7]).as_int(), Some(48));
-    assert_eq!(Value::from_bits(regs[10]).as_int(), Some(-4));
-    assert_eq!(Value::from_bits(regs[13]).as_int(), Some(2));
-    assert_eq!(Value::from_bits(regs[16]).as_int(), Some(7));
+    assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_int(), Some(0b0110));
+    assert_eq!(unsafe { Value::from_bits(regs[3]) }.as_int(), Some(0b1000));
+    assert_eq!(unsafe { Value::from_bits(regs[4]) }.as_int(), Some(0b1110));
+    assert_eq!(unsafe { Value::from_bits(regs[7]) }.as_int(), Some(48));
+    assert_eq!(unsafe { Value::from_bits(regs[10]) }.as_int(), Some(-4));
+    assert_eq!(unsafe { Value::from_bits(regs[13]) }.as_int(), Some(2));
+    assert_eq!(unsafe { Value::from_bits(regs[16]) }.as_int(), Some(7));
 }
 
 /// FNeg must negate real floats and map any tagged (NaN-pattern) value to
@@ -850,7 +850,7 @@ fn test_jit_execute_fneg() {
 
     func(regs.as_mut_ptr(), consts.as_ptr());
 
-    assert_eq!(Value::from_bits(regs[1]).as_float(), Some(-2.5));
+    assert_eq!(unsafe { Value::from_bits(regs[1]) }.as_float(), Some(-2.5));
     assert_eq!(regs[3], (-0.0f64).to_bits());
 }
 
@@ -873,8 +873,8 @@ fn test_jit_execute_load_store() {
 
     func(regs.as_mut_ptr(), consts.as_ptr());
 
-    assert_eq!(Value::from_bits(regs[1]).as_int(), Some(42));
-    assert_eq!(Value::from_bits(regs[2]).as_int(), Some(42));
+    assert_eq!(unsafe { Value::from_bits(regs[1]) }.as_int(), Some(42));
+    assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_int(), Some(42));
 }
 
 /// End-to-end equivalence: run a hot loop (2000 iterations, crossing
@@ -967,13 +967,13 @@ fn test_jit_bitwise_loop_matches_interpreter() {
     regs[7] = Value::int(1).as_raw();
     loop {
         func(regs.as_mut_ptr(), consts.as_ptr());
-        if Value::from_bits(regs[5]).as_bool() != Some(true) {
+        if unsafe { Value::from_bits(regs[5]) }.as_bool() != Some(true) {
             break;
         }
     }
 
     assert_eq!(
-        Value::from_bits(regs[0]).as_int(),
+        unsafe { Value::from_bits(regs[0]) }.as_int(),
         Some(expected),
         "JIT-compiled loop body must match the interpreter"
     );
@@ -1296,7 +1296,7 @@ fn test_typed_path_matches_scalar_path() {
         regs[8] = Value::int(2).as_raw();
         loop {
             func(regs.as_mut_ptr(), consts.as_ptr());
-            if Value::from_bits(regs[5]).as_bool() != Some(true) {
+            if unsafe { Value::from_bits(regs[5]) }.as_bool() != Some(true) {
                 break;
             }
         }
@@ -1386,12 +1386,12 @@ fn test_absent_metadata_uses_scalar_path() {
     regs[8] = Value::int(2).as_raw();
     loop {
         func(regs.as_mut_ptr(), consts.as_ptr());
-        if Value::from_bits(regs[5]).as_bool() != Some(true) {
+        if unsafe { Value::from_bits(regs[5]) }.as_bool() != Some(true) {
             break;
         }
     }
     assert_eq!(
-        Value::from_bits(regs[0]).as_int(),
+        unsafe { Value::from_bits(regs[0]) }.as_int(),
         Some(int_loop_expected(LIMIT))
     );
 

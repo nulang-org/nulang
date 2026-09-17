@@ -1,0 +1,10 @@
+fn shard(comp_rec) => fn(src) => fn(pos) => fn(n) => (
+    let c = perform String.charAt(src, pos) in
+    if pos < n then comp_rec(src)(pos + 1)(n) else c
+)
+
+fn comp(src) => fn(pos) => fn(n) => shard(comp)(src)(pos)(n)
+
+fn main() {
+    perform IO.print(comp("abc")(0)(2))
+}
