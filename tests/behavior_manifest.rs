@@ -82,18 +82,12 @@ fn artifact_identity_is_content_bound_not_filename_bound() {
         dependency_bytes: b"",
     };
 
-    let first = BehaviorManifest::from_checked_module(
-        build(b"artifact-a"),
-        &mut checker_a,
-        &ast.decls,
-    )
-    .unwrap();
-    let second = BehaviorManifest::from_checked_module(
-        build(b"artifact-b"),
-        &mut checker_b,
-        &ast.decls,
-    )
-    .unwrap();
+    let first =
+        BehaviorManifest::from_checked_module(build(b"artifact-a"), &mut checker_a, &ast.decls)
+            .unwrap();
+    let second =
+        BehaviorManifest::from_checked_module(build(b"artifact-b"), &mut checker_b, &ast.decls)
+            .unwrap();
 
     assert_ne!(first.artifact.digest, second.artifact.digest);
 }
