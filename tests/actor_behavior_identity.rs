@@ -209,6 +209,45 @@ fn copied_actor_reference_preserves_nominal_schema() {
 }
 
 #[test]
+fn conditional_actor_reference_preserves_nominal_schema_when_all_paths_agree() {
+    let (hir, mir) = lower(
+        r#"
+        actor First {
+            behavior hit(value: Int) { nil }
+        }
+
+        actor Second {
+            behavior hit(value: String) { nil }
+        }
+
+        fn main() {
+            let target = if true then {
+                let candidate = spawn Second {}
+                candidate
+            } else {
+                let candidate = spawn Second {}
+                candidate
+            }
+            send target hit("second")
+        }
+        "#,
+    );
+
+    assert!(hir.decls.iter().any(|decl| match decl {
+        Decl::Function(function) => {
+            hir_contains_nominal_dispatch(&function.body, "Second", "hit")
+        }
+        _ => false,
+    }));
+
+    let first_hit = behavior_index(&mir, "First.hit");
+    let second_hit = behavior_index(&mir, "Second.hit");
+    let send_indices = mir_send_indices(&mir);
+    assert!(send_indices.contains(&second_hit));
+    assert!(!send_indices.contains(&first_hit));
+}
+
+#[test]
 fn self_dispatch_preserves_enclosing_actor_schema() {
     let (hir, mir) = lower(
         r#"
