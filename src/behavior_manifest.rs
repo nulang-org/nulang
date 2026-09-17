@@ -492,17 +492,16 @@ fn classify_effect(effect: &Effect) -> EffectDecl {
             | UserDefined(_)
     );
 
-    let replay = match effect {
-        String | Array | Spawn | Send | Receive | Migrate | STM | Async | Cost | Event | Render => {
-            EffectReplay::Safe
-        }
-        Inference | Time | Rand => EffectReplay::RequiresJournal,
-        Net | FS | DB | FFI | Python | Process | System | Respond | Realtime | UserDefined(_) => {
-            EffectReplay::RequiresIdempotencyKey
-        }
-        IO | Env | Request | Client | Web => EffectReplay::Nonreplayable,
-        Test => EffectReplay::Safe,
-    };
+    let replay =
+        match effect {
+            String | Array | Spawn | Send | Receive | Migrate | STM | Async | Cost | Event
+            | Render => EffectReplay::Safe,
+            Inference | Time | Rand => EffectReplay::RequiresJournal,
+            Net | FS | DB | FFI | Python | Process | System | Respond | Realtime
+            | UserDefined(_) => EffectReplay::RequiresIdempotencyKey,
+            IO | Env | Request | Client | Web => EffectReplay::Nonreplayable,
+            Test => EffectReplay::Safe,
+        };
 
     EffectDecl {
         effect: effect.to_string(),
