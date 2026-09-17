@@ -15,6 +15,7 @@ Runtime APIs:
 - `Runtime::fabric_subscribe_group(pattern, group, actor_id, behavior)` — competing
   consumer subscription.
 - `Runtime::fabric_unsubscribe_actor(actor_id)` — remove an actor's subscriptions.
+- `Runtime::fabric_subscription_count()` — shard-local subscription gauge.
 - `Runtime::fabric_publish(topic, args)` — publish to matching subscribers.
 
 Subject patterns use NATS-style token matching:
@@ -26,6 +27,13 @@ Subject patterns use NATS-style token matching:
 Non-group subscriptions fan out to every matching actor. For each matching
 consumer group, Fabric selects one member using deterministic round-robin
 routing. Identical subscriptions are deduplicated.
+
+Subscriptions are lifecycle-bound to their actors: normal exit, faults, linked
+exit cascades, and supervisor shutdown remove the actor's ephemeral routing
+entries. Subscription registration also verifies that the requested behavior
+exists. Publication resolves the behavior again and uses numeric delivery,
+explicitly avoiding the legacy actor-send fallback where an unknown behavior
+name can map to behavior 0.
 
 This layer has deliberately **no durability guarantee yet**. It defines routing
 semantics that later cluster and stream layers can reuse.
@@ -47,6 +55,9 @@ semantics that later cluster and stream layers can reuse.
 6. **Prefer typed language primitives over stringly broker APIs.** String subjects
    are a runtime/interoperability layer; future `topic` and `stream` declarations
    should provide compile-time payload types and capabilities.
+7. **Do not hide shard coordination in process-global state.** Cross-shard Fabric
+   control messages should extend the existing shard transport explicitly so
+   independent runtimes and deterministic tests remain isolated.
 
 ## Roadmap
 
@@ -57,7 +68,8 @@ semantics that later cluster and stream layers can reuse.
 - [x] Consumer groups.
 - [x] Duplicate suppression.
 - [x] Explicit actor cleanup.
-- [ ] Automatic cleanup during actor exit.
+- [x] Automatic cleanup during actor exit.
+- [x] Behavior existence validation and safe numeric delivery.
 - [ ] Cross-shard subscription routing.
 - [ ] Mailbox capacity and explicit backpressure policies.
 
