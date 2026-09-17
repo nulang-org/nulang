@@ -69,25 +69,40 @@ fn artifact_identity_is_content_bound_not_filename_bound() {
     let (ast, mut checker_a) = checked(source);
     let (_, mut checker_b) = checked(source);
 
-    let build = |artifact: &[u8]| ManifestBuildInput {
-        package_name: "content-test",
-        package_version: "0.1.0",
-        language_version: "1.0.0-frozen",
-        artifact_kind: ArtifactKind::WasmModule,
-        artifact_bytes: artifact,
-        compiler_implementation: "nulang-rust",
-        compiler_version: "test",
-        compiler_bytes: b"compiler",
-        source_bytes: source.as_bytes(),
-        dependency_bytes: b"",
-    };
-
-    let first =
-        BehaviorManifest::from_checked_module(build(b"artifact-a"), &mut checker_a, &ast.decls)
-            .unwrap();
-    let second =
-        BehaviorManifest::from_checked_module(build(b"artifact-b"), &mut checker_b, &ast.decls)
-            .unwrap();
+    let first = BehaviorManifest::from_checked_module(
+        ManifestBuildInput {
+            package_name: "content-test",
+            package_version: "0.1.0",
+            language_version: "1.0.0-frozen",
+            artifact_kind: ArtifactKind::WasmModule,
+            artifact_bytes: b"artifact-a",
+            compiler_implementation: "nulang-rust",
+            compiler_version: "test",
+            compiler_bytes: b"compiler",
+            source_bytes: source.as_bytes(),
+            dependency_bytes: b"",
+        },
+        &mut checker_a,
+        &ast.decls,
+    )
+    .unwrap();
+    let second = BehaviorManifest::from_checked_module(
+        ManifestBuildInput {
+            package_name: "content-test",
+            package_version: "0.1.0",
+            language_version: "1.0.0-frozen",
+            artifact_kind: ArtifactKind::WasmModule,
+            artifact_bytes: b"artifact-b",
+            compiler_implementation: "nulang-rust",
+            compiler_version: "test",
+            compiler_bytes: b"compiler",
+            source_bytes: source.as_bytes(),
+            dependency_bytes: b"",
+        },
+        &mut checker_b,
+        &ast.decls,
+    )
+    .unwrap();
 
     assert_ne!(first.artifact.digest, second.artifact.digest);
 }
