@@ -1,5 +1,18 @@
 [workspace]
-members = ["crates/nulang-ai", "crates/nulang-ai-core", "crates/nulang-ai-protocol", "crates/nulang-ai-local", "crates/nulang-ai-director", "crates/nulang-ai-manager", "crates/nulang-ai-worker", "crates/nulang-ai-mcp", "crates/nulang-capacity", "crates/nulang-ui-protocol"]
+members = [
+    "crates/nulang-ai",
+    "crates/nulang-ai-core",
+    "crates/nulang-ai-protocol",
+    "crates/nulang-ai-local",
+    "crates/nulang-ai-director",
+    "crates/nulang-ai-manager",
+    "crates/nulang-ai-worker",
+    "crates/nulang-ai-mcp",
+    "crates/nulang-capacity",
+    "crates/nulang-ui-protocol",
+    "crates/nulang-source",
+    "crates/nulang-lexer",
+]
 # The browser-playground crate re-uses compiler sources via #[path] includes
 # and builds only for wasm32-unknown-unknown; it is intentionally standalone
 # (its own lockfile, minimal pure-Rust dep set) and excluded from workspace
@@ -84,6 +97,9 @@ postgres = ["dep:postgres"]
 difffuzz = ["native-codegen"]
 
 [dependencies]
+# Extracted frontend stages
+nulang-lexer = { path = "crates/nulang-lexer" }
+
 # Memory & concurrency
 mimalloc = "0.1"
 crossbeam = "0.8"

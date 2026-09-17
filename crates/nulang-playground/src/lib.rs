@@ -25,7 +25,7 @@ pub mod types;
 pub mod type_ir;
 #[path = "../../../src/diagnostic.rs"]
 pub mod diagnostic;
-#[path = "../../../src/lexer.rs"]
+#[path = "../../nulang-lexer/src/lexer_impl.rs"]
 pub mod lexer;
 #[path = "../../../src/ast.rs"]
 pub mod ast;

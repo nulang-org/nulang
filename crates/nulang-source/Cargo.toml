@@ -1,0 +1,12 @@
+[package]
+name = "nulang-source"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Source locations and source maps for the Nulang compiler"
+repository = "https://github.com/nulang-org/nulang"
+publish = false
+
+[lib]
+name = "nulang_source"
+path = "src/lib.rs"
