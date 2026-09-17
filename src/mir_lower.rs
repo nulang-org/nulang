@@ -22,10 +22,8 @@ use crate::ast::Pattern;
 use crate::hir;
 use crate::mir;
 use crate::types::{NuError, NuResult, Span, Type};
+use rustc_hash::FxHashMap;
 use std::collections::HashSet;
-
-type FxHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 fn compile_err(msg: impl Into<String>, span: Span) -> NuError {
     NuError::VMError {

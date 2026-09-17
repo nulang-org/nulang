@@ -29,10 +29,9 @@ use crate::bytecode::{
 };
 use crate::mir;
 use crate::types::{NuError, NuResult, PrimitiveType, Span, Type};
+use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
-type FxHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 const FUNC_VALUE_REG: u8 = 254;
 /// First general-purpose local register. r0..(LOCAL_BASE-1) is the call/effect staging zone,
 /// r12..r14 are spill scratch registers, and rLOCAL_BASE..253 hold MIR locals that are not spilled.
@@ -242,20 +241,24 @@ impl MirCodegen {
             let params = ff
                 .params
                 .iter()
-                .map(crate::ffi::marshal::nulang_type_to_ffi_type)
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    compile_err(
-                        format!(
-                            "unsupported parameter type in extern function {}",
-                            ff.symbol
-                        ),
-                        Span::default(),
-                    )
-                })?;
+                .map(|ty| {
+                    crate::ffi::marshal::nulang_type_to_ffi_type(ty).ok_or_else(|| {
+                        compile_err(
+                            format!(
+                                "extern function '{}' parameter has unsupported FFI type {:?}",
+                                ff.symbol, ty
+                            ),
+                            Span::default(),
+                        )
+                    })
+                })
+                .collect::<NuResult<Vec<_>>>()?;
             let ret = crate::ffi::marshal::nulang_type_to_ffi_type(&ff.ret).ok_or_else(|| {
                 compile_err(
-                    format!("unsupported return type in extern function {}", ff.symbol),
+                    format!(
+                        "extern function '{}' has unsupported FFI return type {:?}",
+                        ff.symbol, ff.ret
+                    ),
                     Span::default(),
                 )
             })?;
@@ -303,19 +306,35 @@ impl MirCodegen {
             let end = self.module.instructions.len();
 
             // Compute BLAKE3 content hash from the compiled bytecode slice +
-            // param types + return type.
+            // the full canonical signature (parameter types + return type).
+            // Parameter types matter for content identity: two behaviors
+            // with identical bytecode but different parameter types are NOT
+            // interchangeable, and the hash is the receiver-side gate that
+            // rejects mismatched behavior code on the wire. The canonical
+            // encoding (types::write_canonical_type) is field-order
+            // insensitive for records and free of compiler-internal state,
+            // unlike format!("{:?}").
             let bytecode_slice = &self.module.instructions[offset..end];
             let mut hasher = blake3::Hasher::new();
+            // Domain separation from other BLAKE3 uses (NTIR, wire frames).
+            hasher.update(b"NLBH\x02");
             for instr in bytecode_slice {
                 hasher.update(&[instr.opcode as u8, instr.op1, instr.op2, instr.op3]);
             }
-            let param_count_bytes = (func.params.len() as u32).to_be_bytes();
-            hasher.update(&param_count_bytes);
-            // Hash return type if present
-            if let Some(ref ret_ty) = func.ret {
-                let ty_str = format!("{:?}", ret_ty);
-                hasher.update(ty_str.as_bytes());
+            let mut ty_buf = Vec::new();
+            for param in &func.params {
+                if let Some(local) = func.locals.iter().find(|l| l.id == *param) {
+                    ty_buf.clear();
+                    crate::types::write_canonical_type(&local.ty, &mut ty_buf);
+                    hasher.update(&ty_buf);
+                }
             }
+            ty_buf.clear();
+            match &func.ret {
+                Some(ret_ty) => crate::types::write_canonical_type(ret_ty, &mut ty_buf),
+                None => ty_buf.push(0xFF), // no declared return type
+            }
+            hasher.update(&ty_buf);
             let hash_bytes = *hasher.finalize().as_bytes();
 
             self.module
@@ -1071,9 +1090,15 @@ impl MirCodegen {
                 behavior_idx,
                 init,
                 target_node,
-                capabilities: _,
+                capabilities,
             } => {
                 if let Some(node) = target_node {
+                    if !capabilities.is_empty() {
+                        return Err(compile_err(
+                            "spawn@node authority grants are unsupported until the distributed spawn protocol carries typed authority",
+                            Span::default(),
+                        ));
+                    }
                     let node_reg = self.local_reg(*node);
                     if init.len() > MAX_STAGED_ARGS {
                         return Err(compile_err(
@@ -1101,6 +1126,15 @@ impl MirCodegen {
                     ));
                     self.emit(Instruction::new2(OpCode::Move, node_reg, dst));
                 } else {
+                    let authority_manifest = crate::authority::AuthorityManifest::from_tokens(
+                        capabilities.iter().map(String::as_str),
+                    )
+                    .map_err(|err| {
+                        compile_err(
+                            format!("invalid spawn authority grant: {err}"),
+                            Span::default(),
+                        )
+                    })?;
                     let pc = self.current_offset();
                     self.emit(Instruction::new3(
                         OpCode::Spawn,
@@ -1108,6 +1142,11 @@ impl MirCodegen {
                         (*behavior_idx & 0xFF) as u8,
                         dst,
                     ));
+                    if !authority_manifest.is_empty() {
+                        self.module
+                            .spawn_capability_grants
+                            .push((pc, authority_manifest.canonical_tokens()));
+                    }
                     if !init.is_empty() {
                         let overrides: Vec<(String, crate::bytecode::Constant)> = init
                             .iter()
@@ -3409,5 +3448,51 @@ mod optimize_tests {
                 op: mir::RValue::Load(a)
             }
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Behavior content hashing: canonical full-signature identity
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_behavior_content_hash_distinguishes_param_types() {
+        // Identical bodies and arity, different parameter types: these
+        // behaviors are NOT interchangeable, and the content hash is the
+        // receiver-side gate that rejects mismatched behavior code.
+        let a = compile_source("actor A { behavior poke(x: Int) { 1 } }").unwrap();
+        let b = compile_source("actor A { behavior poke(x: String) { 1 } }").unwrap();
+        let ha = a.behaviors[0].content_hash.expect("hash present");
+        let hb = b.behaviors[0].content_hash.expect("hash present");
+        assert_ne!(
+            ha, hb,
+            "different param types must produce different content hashes"
+        );
+    }
+
+    #[test]
+    fn test_behavior_content_hash_record_field_order_invariant() {
+        // Records unify field-order-insensitively; re-declaring the same
+        // record fields in a different order must not change the hash.
+        let a = compile_source("actor A { behavior poke(p: {x: Int, y: Int}) { 1 } }").unwrap();
+        let b = compile_source("actor A { behavior poke(p: {y: Int, x: Int}) { 1 } }").unwrap();
+        assert_eq!(
+            a.behaviors[0].content_hash, b.behaviors[0].content_hash,
+            "record field order must not change the content hash"
+        );
+    }
+
+    #[test]
+    fn test_behavior_content_hash_deterministic() {
+        let source = "actor A { behavior poke(x: Int) { x + 1 } behavior other(s: String) { 1 } }";
+        let a = compile_source(source).unwrap();
+        let b = compile_source(source).unwrap();
+        assert_eq!(a.behaviors.len(), b.behaviors.len());
+        for (ba, bb) in a.behaviors.iter().zip(b.behaviors.iter()) {
+            assert_eq!(ba.name, bb.name);
+            assert_eq!(
+                ba.content_hash, bb.content_hash,
+                "same source must produce identical content hashes"
+            );
+        }
     }
 }

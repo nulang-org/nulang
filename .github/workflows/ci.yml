@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push to the same PR/branch supersedes the previous run. Without
+# this, every push queues a full ~6h run set (including Release Build) and
+# the shared runner pool gridlocks behind stale runs.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 

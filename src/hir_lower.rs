@@ -16,9 +16,7 @@ use crate::ast::{BinOp, Decl, Expr, FunctionAnnotation, Literal};
 use crate::hir;
 use crate::tool_schema::{function_to_tool_schema, ToolSchema};
 use crate::types::{Capability, EffectRow, Span, Type, TypeVar};
-
-type FxHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+use rustc_hash::FxHashMap;
 
 pub fn lower_module(
     ast: &ast::AstModule,
@@ -153,7 +151,9 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             fields: _,
             span,
         } => {
-            // In a full implementation, this would create a CRDT actor
+            // CRDT declarations are compile-time schemas. The typechecker binds
+            // the name to a record type describing the fields; at runtime they
+            // have no representation and lower to a unit constant.
             hir::Decl::Constant {
                 name: name.clone(),
                 body: hir::Body {
@@ -1803,6 +1803,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             actor_type,
             init,
             target_node,
+            capabilities,
             span,
             ..
         } => {
@@ -1821,7 +1822,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                     actor_type: name,
                     init: init_ops,
                     target_node: target_operand,
-                    capabilities: vec![],
+                    capabilities: capabilities.clone(),
                     ty: ty.clone(),
                 },
                 span: *span,
@@ -2782,6 +2783,7 @@ mod tests {
             positional_args: None,
             register_as: None,
             target_node: None,
+            capabilities: vec![],
             span,
         };
         assert!(used(&spawn).contains("k"), "spawn init must be free");
