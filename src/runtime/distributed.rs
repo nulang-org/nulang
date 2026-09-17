@@ -1543,6 +1543,7 @@ pub fn process_network_packets(
                             msg.sender,
                             "string intern failed on receiver",
                         );
+                        continue;
                     }
                     if !intern_wire_objects(runtime, &mut payload_vec, &object_table) {
                         warn!(
@@ -1554,6 +1555,7 @@ pub fn process_network_packets(
                             msg.sender,
                             "object intern failed on receiver",
                         );
+                        continue;
                     }
                     msg.payload = Arc::new(payload_vec);
                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
@@ -2766,6 +2768,99 @@ mod tests {
             content,
             Some("hello-cross-node".to_string()),
             "string payload must arrive by CONTENT, not by the sender's pool id"
+        );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    #[cfg(feature = "tcp")]
+    /// Regression: a string payload addressed to an actor with NO module
+    /// pool (native handlers only) must be DROPPED, not delivered with
+    /// dangling pool ids. `intern_wire_strings` fails for such actors; the
+    /// receipt path must not fall through and deliver the un-interned
+    /// payload (which would resolve to the wrong string, or worse, read
+    /// out of bounds).
+    #[test]
+    fn test_remote_string_payload_dropped_without_module_pool() {
+        use crate::bytecode::{CodeModule, Constant};
+        use std::time::{Duration, Instant};
+
+        // --- Node A (sender): pool id 0 = "hello-cross-node". ---
+        let mut runtime_a = Runtime::new();
+        let mut module_a = CodeModule::new("sender");
+        module_a.add_constant(Constant::String("hello-cross-node".to_string()));
+        runtime_a.vm = Some(crate::vm::VM::new());
+        runtime_a.vm.as_mut().unwrap().load_module(module_a);
+        let actor_a = runtime_a.spawn_actor(Box::new(|| vec![]));
+        {
+            let actor = runtime_a.actors.get_mut(&actor_a).unwrap();
+            actor.bytecode_module_idx = Some(0);
+        }
+        runtime_a.current_actor = Some(actor_a);
+
+        // --- Node B (receiver): native handler, NO bytecode module. ---
+        let mut runtime_b = Runtime::new();
+        let actor_b =
+            runtime_b.spawn_actor(Box::new(|| vec![("received".to_string(), Value::nil())]));
+        {
+            let actor = runtime_b.actors.get_mut(&actor_b).unwrap();
+            // Deliberately NO bytecode_module: intern_wire_strings must fail.
+            actor.register_behavior("store", |actor, args| {
+                let v = args.get(0).copied().unwrap_or(Value::nil());
+                actor.set_state_field("received", v);
+            });
+        }
+
+        let mut transport_a = crate::runtime::network::TcpTransport::bind(
+            addr(0),
+            crate::runtime::network::TlsConfig::PlaintextInsecure,
+        )
+        .unwrap();
+        let mut transport_b = crate::runtime::network::TcpTransport::bind(
+            addr(0),
+            crate::runtime::network::TlsConfig::PlaintextInsecure,
+        )
+        .unwrap();
+        let node_b = transport_b.node_id();
+        let addr_b = transport_b.listen_addr();
+
+        let mut cluster_a = ClusterState::new(transport_a.node_id(), transport_a.listen_addr());
+        cluster_a.handle_heartbeat(node_b, addr_b);
+        let mut resolver_a = AddressResolver::new(transport_a.node_id());
+
+        let mut cluster_b = ClusterState::new(node_b, addr_b);
+        let mut resolver_b = AddressResolver::new(node_b);
+
+        let target = ActorAddress::remote(node_b, actor_b);
+        send_distributed(
+            &mut runtime_a,
+            &mut transport_a,
+            &mut cluster_a,
+            &mut resolver_a,
+            target,
+            "store",
+            &[Value::string(0)],
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            process_network_packets(
+                &mut runtime_b,
+                &mut transport_b,
+                &mut cluster_b,
+                &mut resolver_b,
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            runtime_b
+                .actors
+                .get(&actor_b)
+                .map(|a| a.mailbox.len())
+                .unwrap_or(0)
+                == 0,
+            "string payload to an actor without a module pool must be dropped, not delivered with dangling pool ids"
         );
 
         transport_a.shutdown();

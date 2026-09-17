@@ -1,0 +1,217 @@
+---
+title: Running a Cluster
+description: Start Nulang nodes with the node CLI, join them into a cluster with seeds and quorum, spawn actors on remote nodes, and recover from node loss.
+---
+import CopyMarkdown from '../../../components/CopyMarkdown.astro';
+
+## From Wire Protocol to Running Nodes
+
+The [Distribution & Clustering](/actors/distribution/) page describes the wire protocol, gossip, and CRDTs. This page is the operator's view: how to start nodes, form a cluster, place actors on specific nodes, and survive node failures.
+
+## Starting a Node
+
+The `nulang node` command starts a network-enabled node (shard 0, TCP transport) that runs until SIGINT/SIGTERM:
+
+```bash
+nulang node --listen 127.0.0.1:9000
+```
+
+On startup the node prints its bind address and its **node id** — an 8-byte random identifier assigned when distribution is enabled. You will need this id to target the node from `spawn@` expressions:
+
+```
+Nulang node listening on 127.0.0.1:9000 (node_id: Some(NodeId(4936869174725254492)))
+```
+
+Full flag list (from `nulang node --help`):
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--listen <ADDR>` | `127.0.0.1:9000` | Bind address for the TCP transport |
+| `--seed <ADDR>` | — | Address of a seed node to join |
+| `--expected-nodes <N>` | — | Expected cluster size; enables the static-quorum split-brain resolver |
+| `--tls-cert <PATH>` | — | Server certificate (PEM) for mutual TLS |
+| `--tls-key <PATH>` | — | Server private key (PEM) |
+| `--tls-ca <PATH>` | — | CA certificate for mutual TLS |
+| `--plaintext` | — | Disable TLS (insecure, dev only) |
+
+:::caution
+If no TLS material is provided, the node logs a warning and uses the **plaintext** transport. Without `--plaintext`, supplying `--tls-cert`/`--tls-key`/`--tls-ca` enables mutual TLS (see [RFC 0013](https://github.com/nulang/nulang/blob/main/RFC/0013-authenticated-transport.md)). Treat plaintext as development-only.
+:::
+
+## Joining a Cluster with `--seed`
+
+A **seed** is simply a node you already trust to be reachable: a joiner dials the seed address, and the seed learns about the joiner through **heartbeat-based discovery** — the joiner begins heartbeating, and the seed records the sender's node id from its connection table. Membership then propagates transitively via gossip (`Packet::Gossip`), so a chain of pairwise seed links converges without a full mesh. Only one `--seed` is accepted per node; for multiple seeds, point joiners at any one healthy member.
+
+```bash
+# Terminal 1 — the seed (first node)
+nulang node --listen 127.0.0.1:9000
+
+# Terminal 2 — join through the seed
+nulang node --listen 127.0.0.1:9001 --seed 127.0.0.1:9000
+```
+
+TCP links are fully duplex — a joiner that only dials out still receives gossip and messages inbound, so NAT-style outbound-only setups work.
+
+## Cluster Formation and Split-Brain Protection
+
+Membership states and timings (from `src/runtime/cluster.rs`):
+
+| Parameter | Value |
+|-----------|-------|
+| Heartbeat interval | 500 ms |
+| Heartbeat timeout (→ `Suspicious`) | 2 s |
+| Suspicion duration (→ `Failed`) | 5 s |
+| Failed-node retention | 60 s |
+| Gossip fanout | 2 peers per tick |
+| Active view size | 4 (bounds heartbeat traffic) |
+
+By default there is **no quorum logic**: a partition leaves both sides running independently, and a healed partition re-merges by incarnation number. Passing `--expected-nodes N` opts into the **static-quorum split-brain resolver** ([RFC 0011](https://github.com/nulang/nulang/blob/main/RFC/0011-split-brain-resolver.md)): each side of a partition counts the reachable members against the expected size, and the side that cannot muster a quorum **downs itself** (its actors checkpoint and it sends a `NodeGoodbye` before shutting its transport). The resolver is consulted on a 5-second probe interval.
+
+```bash
+# Both nodes agree on the expected cluster size
+nulang node --listen 127.0.0.1:9000 --expected-nodes 2
+nulang node --listen 127.0.0.1:9001 --seed 127.0.0.1:9000 --expected-nodes 2
+```
+
+:::note
+Static quorum uses the *configured* expected size, not a live member count — it is a partition tie-breaker, not a leader election. Clusters that cannot pin an expected size should omit the flag.
+:::
+
+## Registering Spawnable Behaviors
+
+A node never runs code a peer sends it. Remote spawn is **opt-in per behavior**: the receiving node must have registered the behavior name beforehand with `Runtime::register_spawnable_behavior`. An unregistered name is answered with `SpawnResponse { success: false }` and no actor is created — the crash-free counterpart of local send's unknown-behavior fallback.
+
+```rust
+// Embedding the runtime (Rust API — there is no CLI/module declaration yet)
+use nulang::runtime::{Runtime, Actor, TlsConfig};
+use nulang::vm::Value;
+
+fn store_handler(actor: &mut Actor, args: &[Value]) {
+    if let Some(n) = args.get(0).and_then(|v| v.as_int()) {
+        actor.set_state_field("received", Value::int(n));
+    }
+}
+
+let mut rt = Runtime::new();
+rt.enable_distribution("0.0.0.0:9000".parse().unwrap(), TlsConfig::PlaintextInsecure)?;
+rt.register_spawnable_behavior("store", store_handler);
+rt.run_distributed_node();
+```
+
+:::caution
+Two current limitations, verified against `src/runtime/distributed.rs`:
+- Registration is a **Rust embedder API only** — the `nulang node` CLI accepts no program file and no `--register` flag, and there is no module-level declaration. The `Packet::SpawnRequest` `bytecode` field exists on the wire but is currently unused; remotely spawnable behaviors are **native handlers**, not `.nula` bytecode actors.
+- The plain `nulang program.nula` run path never calls `enable_distribution`, so a CLI-run program has no transport; `send remote` falls back to local delivery and `ask remote` returns `nil` in that mode.
+:::
+
+## Spawning Actors on Remote Nodes
+
+The language-level remote-spawn expression is `spawn@<node_expr> Actor { ... }`, where `node_expr` evaluates to the target node's id as an `Int` (the id printed at node startup). The result is an ordinary actor ref: sends to it are location-transparent.
+
+```nulang
+actor Counter {
+    state count: Int = 0
+    behavior inc() { self.count = self.count + 1 }
+    behavior get() { self.count }
+}
+
+// Requires a distributed runtime on both nodes; in a standalone run the
+// spawn falls back to local, so this file still checks and runs as-is.
+fn place_counter(node_id: Int) {
+    let c = spawn@node_id Counter { count = 0 }
+    send c inc()
+    c
+}
+```
+
+Mechanics worth knowing (from `src/runtime/distributed.rs`):
+
+- **Placeholder addresses**: `spawn@` returns immediately with a placeholder whose actor id is the spawn *request id*. The real actor id arrives with `SpawnResponse`; messages sent to the placeholder in the meantime queue and flush once the response lands.
+- **Local fallback**: with no distributed runtime (or when the target id is the local node), `spawn@` spawns locally — the same program runs unchanged in single-node development.
+- **Explicit remote send/ask**: `send remote a beh(args)` and `ask remote a beh(args) timeout ms` force the wire path. A bare actor ref that came from `spawn@` or an inbound message routes remotely automatically via the runtime's id→node reverse index.
+- **Behavior names on the wire**: remote messages carry the behavior **name**, not an index. The receiver resolves it against the target actor's behavior table (suffix match), falling back to behavior id 0 for unknown names — mirroring local `send`.
+- **Payload rules**: strings travel by content (per-packet string table interned on receipt); heap pointers, closures, actor refs, and `nil` are rejected at send time.
+
+## Surviving Node Loss
+
+When a node is confirmed gone, its durable actors must come back somewhere — but never as two live copies. [RFC 0014](https://github.com/nulang/nulang/blob/main/RFC/0014-node-failure-respawn.md) defines the protocol:
+
+1. **Confirmed-gone only**: re-spawn triggers on the `Removed` membership state — either a graceful `NodeGoodbye` (immediate) or a `Failed` node promoted after a 60-second confirmation timeout while the survivor holds quorum. A merely partitioned node re-joins via the probe path and is never re-spawned over.
+2. **Location directory**: each re-spawn-opted durable actor is announced in a gossip-replicated directory `(actor_id, node_id, epoch)`, merged highest-epoch-wins.
+3. **Shadow replica**: every checkpoint of an opted-in actor is replicated to a deterministic shadow node (the healthy member with the smallest node id other than the home node). Re-spawn restores the actor on the shadow from its last acknowledged snapshot, so no write is lost.
+4. **Epoch self-demote**: a node that re-joins after being declared `Removed` finds a higher epoch in the directory for its own actor and self-demotes — forwarding in-flight sends to the replacement — so exactly one live copy ever exists.
+
+The opt-in is a per-child supervisor policy. Policy `3` = `respawn_on_node_loss` (durable children only; it implies `permanent` for the local exit protocol):
+
+```nulang
+persistent actor DurableCounter {
+    state durable count: Int = 0
+
+    behavior inc() { self.count = self.count + 1 }
+    behavior get() { self.count }
+}
+
+fn main() {
+    let sup = perform Otp.create_supervisor("counters", 0)
+    let c = spawn DurableCounter {}
+    // Policy 3: opt the durable child into the directory + shadow replication,
+    // so it is re-spawned on the shadow node if this node is lost.
+    perform Otp.supervise_child(sup, c, 3)
+    send c inc()
+    ask c get()
+}
+```
+
+If the home node dies before any checkpoint replica is acknowledged, the child degrades to a `DOWN` notification instead of a stale partial re-spawn.
+
+## End-to-End: Two Nodes and a Counter
+
+Bringing it together — two terminals, one cluster:
+
+```bash
+# Terminal 1 — seed node (note the node_id it prints)
+nulang node --listen 127.0.0.1:9000 --expected-nodes 2 --plaintext
+
+# Terminal 2 — joins via the seed
+nulang node --listen 127.0.0.1:9001 --seed 127.0.0.1:9000 --expected-nodes 2 --plaintext
+```
+
+The program that places and drives the counter (save as `counter.nula`):
+
+```nulang
+actor Counter {
+    state count: Int = 0
+    behavior inc() { self.count = self.count + 1 }
+    behavior get() { self.count }
+}
+
+fn main() {
+    // In a distributed runtime, pass the peer's node id (from its startup
+    // line). Without distribution this spawns locally, so the same file
+    // works for single-node development and tests.
+    let node_b = 4936869174725254492
+    let c = spawn@node_b Counter { count = 0 }
+    send c inc()
+    send c inc()
+    ask c get()
+}
+```
+
+:::note
+Node ids are random `u64`s, but `spawn@` takes the id as a Nulang `Int` (i64) — ids above `i64::MAX` cannot be written as integer literals. Passing the id in from outside the program (an argument, environment, or config value produced by your embedder) avoids the lottery.
+:::
+
+Today the CLI piece of this story is intentionally narrow: `nulang node` runs an **empty** network-enabled runtime (membership, gossip, CRDT sync, remote-spawn hosting), and embedding the `Runtime` in Rust is how spawnable behaviors and program logic get onto a node. A CLI flag for loading a module into a node, and bytecode-level remote spawn, are the known gaps.
+
+## Current Limitations
+
+- `nulang node` loads no program; remote spawn targets only Rust-registered native behaviors.
+- One `--seed` per node; multi-seed join is via any single member.
+- No language-level cluster introspection (listing members, resolving a node id by name) — node ids come from the startup line.
+- Remote spawn of `.nula` bytecode actors over the wire is planned; the `bytecode` field in `Packet::SpawnRequest` is reserved for it.
+
+## Next
+
+- [Distribution & Clustering](/actors/distribution/) — wire protocol, gossip, and CRDT internals
+- [Supervision Trees](/actors/supervision/) — supervisor strategies and child policies, including `respawn_on_node_loss`
+- [RFC 0014: Node-Failure Re-Spawn](https://github.com/nulang/nulang/blob/main/RFC/0014-node-failure-respawn.md) — the full durability-on-failure design

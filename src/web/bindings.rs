@@ -11,27 +11,10 @@
 //! require a same-named handler parameter and produce a diagnostic when one is
 //! missing.
 
+pub use crate::web::contracts::RequestParamSource as RouteBindingSource;
 use crate::web::contracts::RouteContract;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-
-/// Transport-neutral request source used to populate a handler argument.
-///
-/// Path bindings are the first source emitted by the compiler. The remaining
-/// variants reserve the stable Contract IR vocabulary for typed query, header,
-/// cookie, body, and form extractors so transports and generators can converge
-/// on one schema without another IR-version split. Until the compiler emits a
-/// source, runtimes must not synthesize it implicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RouteBindingSource {
-    Path,
-    Query,
-    Header,
-    Cookie,
-    Body,
-    Form,
-}
 
 /// One deterministic handler-argument binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,13 +42,61 @@ pub struct BindingCompilation {
 pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
     let contract_params = contract_syntax_params(&contract.path);
     let mut out = BindingCompilation::default();
+    let mut explicit_path_inputs = HashSet::new();
+    let mut body_binding: Option<&str> = None;
+
+    for (handler_index, handler_param) in contract.handler_params.iter().enumerate() {
+        let Some(request) = &handler_param.request else {
+            continue;
+        };
+
+        if request.source == RouteBindingSource::Body {
+            if let Some(first_param) = body_binding {
+                out.diagnostics.push(format!(
+                    "{} {}: handler parameters '{}' and '{}' both bind the whole request body",
+                    contract.method, contract.path, first_param, handler_param.name
+                ));
+                continue;
+            }
+            body_binding = Some(handler_param.name.as_str());
+        }
+
+        let ty = if request.source == RouteBindingSource::Path {
+            let Some(route_param) = contract
+                .params
+                .iter()
+                .find(|param| param.name == request.source_name)
+            else {
+                out.diagnostics.push(format!(
+                    "{} {}: handler parameter '{}' binds unknown path input '{}'",
+                    contract.method, contract.path, handler_param.name, request.source_name
+                ));
+                continue;
+            };
+            explicit_path_inputs.insert(request.source_name.clone());
+            route_param.ty.clone().or_else(|| handler_param.ty.clone())
+        } else {
+            handler_param.ty.clone()
+        };
+
+        out.bindings.push(RouteBindingContract {
+            source: request.source,
+            source_name: request.source_name.clone(),
+            handler_param: handler_param.name.clone(),
+            handler_index,
+            ty,
+        });
+    }
 
     for route_param in &contract.params {
+        if explicit_path_inputs.contains(&route_param.name) {
+            continue;
+        }
         let Some((handler_index, handler_param)) = contract
             .handler_params
             .iter()
             .enumerate()
-            .find(|(_, param)| param.name == route_param.name)
+            .find(|(_, param)| param.name == route_param.name && param.request.is_none())
         else {
             if contract_params.contains(route_param.name.as_str()) {
                 out.diagnostics.push(format!(
@@ -88,6 +119,24 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
         });
     }
 
+    // A handler parameter with neither a request binding nor a same-named
+    // route parameter is unbound: direct dispatch would stage nothing for its
+    // slot and the legacy zero-argument fallback would feed it the closure
+    // value or stale registers (ClosureCall copies the whole register bank).
+    let bound_slots: HashSet<usize> = out
+        .bindings
+        .iter()
+        .map(|binding| binding.handler_index)
+        .collect();
+    for (handler_index, handler_param) in contract.handler_params.iter().enumerate() {
+        if handler_param.request.is_none() && !bound_slots.contains(&handler_index) {
+            out.diagnostics.push(format!(
+                "{} {}: handler parameter '{}' has no request binding and no matching route parameter",
+                contract.method, contract.path, handler_param.name
+            ));
+        }
+    }
+
     out.bindings.sort_by_key(|binding| binding.handler_index);
     out
 }
@@ -106,7 +155,9 @@ fn contract_syntax_params(path: &str) -> HashSet<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::web::contracts::{HandlerParamContract, RouteParamContract};
+    use crate::web::contracts::{
+        HandlerParamContract, RequestParamBindingContract, RouteParamContract,
+    };
 
     fn route(path: &str) -> RouteContract {
         RouteContract {
@@ -121,12 +172,20 @@ mod tests {
                 name: "id".to_string(),
                 ty: Some("UserId".to_string()),
                 capability: None,
+                request: None,
             }],
             response_type: Some("String".to_string()),
             error_type: None,
             effects: Vec::new(),
             reference_capability: None,
             placement: Some("server".to_string()),
+        }
+    }
+
+    fn request(source: RouteBindingSource, source_name: &str) -> RequestParamBindingContract {
+        RequestParamBindingContract {
+            source,
+            source_name: source_name.to_string(),
         }
     }
 
@@ -188,6 +247,70 @@ mod tests {
     }
 
     #[test]
+    fn unbound_handler_param_is_diagnostic() {
+        // A declared handler parameter with neither a request binding nor a
+        // same-named route capture would be fed the closure value by the
+        // legacy fallback (ClosureCall copies the whole register bank), so it
+        // must fail the plan instead.
+        let mut contract = route("/users/{id: UserId}");
+        contract.handler_params.push(HandlerParamContract {
+            name: "page".to_string(),
+            ty: Some("Int".to_string()),
+            capability: None,
+            request: None,
+        });
+        let compiled = compile_route_bindings(&contract);
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("'page' has no request binding")));
+    }
+
+    #[test]
+    fn explicit_path_binding_must_reference_a_route_capture() {
+        let mut contract = route("/users/{id: UserId}");
+        contract.handler_params[0].request = Some(request(RouteBindingSource::Path, "missing"));
+        let compiled = compile_route_bindings(&contract);
+        assert!(compiled.bindings.is_empty());
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("binds unknown path input 'missing'")));
+    }
+
+    #[test]
+    fn whole_request_body_can_only_bind_once() {
+        let mut contract = route("/users/{id: UserId}");
+        contract.handler_params = vec![
+            HandlerParamContract {
+                name: "first".to_string(),
+                ty: Some("String".to_string()),
+                capability: None,
+                request: Some(request(RouteBindingSource::Body, "body")),
+            },
+            HandlerParamContract {
+                name: "second".to_string(),
+                ty: Some("String".to_string()),
+                capability: None,
+                request: Some(request(RouteBindingSource::Body, "body")),
+            },
+        ];
+        let compiled = compile_route_bindings(&contract);
+        assert_eq!(
+            compiled
+                .bindings
+                .iter()
+                .filter(|binding| binding.source == RouteBindingSource::Body)
+                .count(),
+            1
+        );
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("both bind the whole request body")));
+    }
+
+    #[test]
     fn bindings_are_ordered_by_handler_slot() {
         let contract = RouteContract {
             method: "GET".to_string(),
@@ -208,11 +331,13 @@ mod tests {
                     name: "user".to_string(),
                     ty: Some("UserId".to_string()),
                     capability: None,
+                    request: None,
                 },
                 HandlerParamContract {
                     name: "org".to_string(),
                     ty: Some("OrgId".to_string()),
                     capability: None,
+                    request: None,
                 },
             ],
             response_type: None,

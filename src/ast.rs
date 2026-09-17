@@ -541,6 +541,20 @@ pub enum ActorBackendKind {
 // Function annotations
 // ---------------------------------------------------------------------------
 
+/// Request source for compiler-bound web handler parameters.
+///
+/// This metadata does not wrap or alter the parameter's Nulang type: an
+/// `Int from query` parameter remains an `Int` to the typechecker and body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebRequestParamSource {
+    Path,
+    Query,
+    Header,
+    Cookie,
+    Body,
+    Form,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FunctionAnnotation {
     /// `@tool(description: "...")` marks a function as an LLM-callable tool.
@@ -552,6 +566,12 @@ pub enum FunctionAnnotation {
     /// `@placement(static|server|edge|client|actor|workflow)` marks a web
     /// framework function's compile-time execution target.
     Placement(crate::types::Placement),
+    /// Contextual parameter syntax such as `limit: Int from query`.
+    RequestBinding {
+        param: String,
+        source: WebRequestParamSource,
+        source_name: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

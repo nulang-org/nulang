@@ -122,7 +122,7 @@ mod tests {
             "native" => {
                 let aot_module = crate::aot::AotModule::compile(&mir)?;
                 let result_raw = aot_module.run()?;
-                let value = Value::from_raw(result_raw);
+                let value = unsafe { Value::from_raw(result_raw) };
                 Ok((value, module_type))
             }
             #[cfg(not(feature = "native-codegen"))]
