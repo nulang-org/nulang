@@ -15,7 +15,10 @@ pub mod types {
     /// byte-for-byte identical to the former root module.
     #[derive(Debug, Clone)]
     pub enum NuError {
-        LexError { msg: String, span: Span },
+        LexError {
+            msg: String,
+            span: Span,
+        },
         #[doc(hidden)]
         __NonExhaustive,
     }
@@ -43,5 +46,5 @@ pub mod types {
 mod lexer_impl;
 
 pub use lexer_impl::{Lexer, Token, TokenKind};
-pub use types::{NuError as LexError, NuResult as LexResult};
 pub use nulang_source::Span;
+pub use types::{NuError as LexError, NuResult as LexResult};
