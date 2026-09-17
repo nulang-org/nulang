@@ -12,12 +12,15 @@ compatibility_date = "2026-07-19"
 #   TURNSTILE_SECRET — Turnstile widget secret for /api/contact
 #   CLOUDFLARE_API_TOKEN — API token with Account Email Sending Edit
 #   CONTACT_TO (optional) — defaults to davidporkka@gmail.com
+#   CLOUDFLARE_ACCOUNT_ID (optional) — defaults to the account id
+#     documented as the fallback in docs/functions/api/contact.ts
 
 
-# Cloudflare Pages build configuration:
+# Cloudflare Pages build configuration (wrangler.toml-driven project:
+# the toml lives in docs/, so the Pages project root IS docs/):
 #   Framework preset: Astro
-#   Build command:     cd docs && pnpm install && pnpm run build
-#   Output directory:  docs/dist
+#   Build command:     pnpm install && pnpm run build
+#   Output directory:  dist
 #   Build watch paths: docs/**
 #   Custom domain:     nulang.org
 #
