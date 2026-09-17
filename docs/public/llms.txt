@@ -32,12 +32,21 @@ cargo run -- --repl
 actor Counter {
     state count: Int = 0
     behavior inc() { self.count = self.count + 1 }
-    behavior get(sender: Actor) { send sender reply(self.count) }
+    behavior get(sender) { send sender reply(self.count :cap val) }
 }
-let counter = spawn Counter {} in {
-    send counter inc()
-    counter
+actor Client {
+    behavior reply(v: Int) { v }
+    behavior run(counter) {
+        send counter get(self :cap val)
+        receive {
+            | reply(v) => perform IO.print("Count: " + perform Int.to_string(v))
+        } after 5000 => perform IO.print("timeout")
+    }
 }
+let counter = spawn Counter {}
+send counter inc()
+let client = spawn Client {}
+send client run(counter)
 ```
 
 ## Documentation
