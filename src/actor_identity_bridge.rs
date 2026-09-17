@@ -291,7 +291,73 @@ fn actor_identity_of_rvalue(
         RValue::Spawn { actor_type, .. } => Some(actor_type.clone()),
         RValue::Use(operand) => actor_identity_of_operand(operand, env),
         RValue::SelfRef(_) => current_actor.map(str::to_string),
+        RValue::Block(body) => actor_identity_of_body(body, env, current_actor),
+        RValue::If {
+            then_body,
+            else_body: Some(else_body),
+            ..
+        } => {
+            let then_identity = actor_identity_of_body(then_body, env, current_actor)?;
+            let else_identity = actor_identity_of_body(else_body, env, current_actor)?;
+            (then_identity == else_identity).then_some(then_identity)
+        }
+        RValue::Match { arms, .. } => {
+            let mut identities = arms.iter().map(|(pattern, _, arm)| {
+                let mut nested = env.clone();
+                shadow_pattern(&mut nested, pattern);
+                actor_identity_of_body(arm, &nested, current_actor)
+            });
+            let first = identities.next()??;
+            identities
+                .all(|identity| identity.as_deref() == Some(first.as_str()))
+                .then_some(first)
+        }
         _ => None,
+    }
+}
+
+fn actor_identity_of_body(
+    body: &Body,
+    env: &FxHashMap<String, String>,
+    current_actor: Option<&str>,
+) -> Option<String> {
+    let mut nested = env.clone();
+
+    for stmt in &body.stmts {
+        match stmt {
+            Stmt::Let { name, value, .. } => {
+                let invalidated = invalidated_actor_bindings(value, &nested);
+                for binding in invalidated {
+                    nested.remove(&binding);
+                }
+
+                let identity = actor_identity_of_rvalue(value, &nested, current_actor);
+                nested.remove(name);
+                if let Some(identity) = identity {
+                    nested.insert(name.clone(), identity);
+                }
+            }
+            Stmt::Assign { target, value, .. } => {
+                let invalidated = invalidated_actor_bindings(value, &nested);
+                for binding in invalidated {
+                    nested.remove(&binding);
+                }
+
+                if let Place::Var(name, _) = target {
+                    let identity = actor_identity_of_rvalue(value, &nested, current_actor);
+                    nested.remove(name);
+                    if let Some(identity) = identity {
+                        nested.insert(name.clone(), identity);
+                    }
+                }
+            }
+            Stmt::StateSet { .. } | Stmt::Emit { .. } => {}
+        }
+    }
+
+    match &body.terminator {
+        Terminator::Yield(operand) => actor_identity_of_operand(operand, &nested),
+        Terminator::FnReturn(_) | Terminator::Break(_) => None,
     }
 }
 
