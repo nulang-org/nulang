@@ -5,7 +5,8 @@
 //! messaging primitives.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 
 use crate::runtime::cluster::{ClusterState, NodeId};
 use crate::runtime::network::NetworkTransport;
@@ -23,6 +24,20 @@ pub struct FabricAdvertisement {
     pub actor_id: u64,
     pub behavior: String,
     pub group: Option<String>,
+}
+
+/// A complete, versioned subscription snapshot owned by one cluster node.
+///
+/// `generation` is monotonically increasing for the lifetime of the node.
+/// Receivers ignore snapshots whose generation is not newer than the latest
+/// snapshot already applied for that node. This makes duplicate/reordered
+/// gossip idempotent and prevents an older subscription set from resurrecting
+/// routes that a newer unsubscribe already removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricAdvertisementSnapshot {
+    pub node_id: NodeId,
+    pub generation: u64,
+    pub subscriptions: Vec<FabricAdvertisement>,
 }
 
 /// One ephemeral Fabric subscription.
@@ -134,6 +149,7 @@ enum FabricControl {
     UnsubscribeLocalActor(u64),
     ReplaceRemoteNode {
         node_id: NodeId,
+        generation: u64,
         subscriptions: Vec<FabricSubscription>,
     },
     RemoveRemoteNode(NodeId),
@@ -152,6 +168,10 @@ struct FabricRegistry {
     // unrelated subjects using the same queue-group label must not perturb
     // one another's deterministic round-robin order.
     group_cursors: HashMap<(String, String), usize>,
+    // Highest complete snapshot applied for each remote node. Removing a node
+    // clears this entry so a restarted node with the same stable NodeId can
+    // start a fresh generation sequence after failure cleanup.
+    remote_generations: HashMap<NodeId, u64>,
 }
 
 impl FabricRegistry {
@@ -181,19 +201,36 @@ impl FabricRegistry {
         before - self.subscriptions.len()
     }
 
-    fn remove_remote_node(&mut self, node_id: NodeId) -> usize {
+    fn remove_remote_subscriptions(&mut self, node_id: NodeId) -> usize {
         let before = self.subscriptions.len();
         self.subscriptions
             .retain(|sub| sub.node_id != Some(node_id));
         before - self.subscriptions.len()
     }
 
+    fn remove_remote_node(&mut self, node_id: NodeId) -> usize {
+        let removed = self.remove_remote_subscriptions(node_id);
+        self.remote_generations.remove(&node_id);
+        removed
+    }
+
+    /// Apply a complete remote snapshot if and only if its generation is
+    /// newer than the latest snapshot already known for the node.
     fn replace_remote_node(
         &mut self,
         node_id: NodeId,
+        generation: u64,
         subscriptions: Vec<FabricSubscription>,
     ) -> usize {
-        let removed = self.remove_remote_node(node_id);
+        if self
+            .remote_generations
+            .get(&node_id)
+            .is_some_and(|current| generation <= *current)
+        {
+            return 0;
+        }
+
+        let removed = self.remove_remote_subscriptions(node_id);
         let mut inserted = 0;
         for subscription in subscriptions {
             debug_assert_eq!(subscription.node_id, Some(node_id));
@@ -201,14 +238,34 @@ impl FabricRegistry {
                 inserted += 1;
             }
         }
+        self.remote_generations.insert(node_id, generation);
         removed + inserted
     }
 
-    fn local_advertisements(&self, node_id: NodeId, limit: usize) -> Vec<FabricAdvertisement> {
+    fn local_subscription_count(&self) -> usize {
         self.subscriptions
             .iter()
             .filter(|sub| sub.node_id.is_none())
-            .take(limit)
+            .count()
+    }
+
+    fn local_snapshot(
+        &self,
+        node_id: NodeId,
+        generation: u64,
+        limit: usize,
+    ) -> Result<FabricAdvertisementSnapshot, String> {
+        let count = self.local_subscription_count();
+        if count > limit {
+            return Err(format!(
+                "Fabric snapshot has {count} local subscriptions, exceeding limit {limit}; refusing partial advertisement"
+            ));
+        }
+
+        let subscriptions = self
+            .subscriptions
+            .iter()
+            .filter(|sub| sub.node_id.is_none())
             .map(|sub| FabricAdvertisement {
                 node_id,
                 pattern: sub.pattern.clone(),
@@ -216,7 +273,13 @@ impl FabricRegistry {
                 behavior: sub.behavior.clone(),
                 group: sub.group.clone(),
             })
-            .collect()
+            .collect();
+
+        Ok(FabricAdvertisementSnapshot {
+            node_id,
+            generation,
+            subscriptions,
+        })
     }
 
     fn len(&self) -> usize {
@@ -375,6 +438,10 @@ pub struct DistributedContext {
     fabric: FabricRegistry,
     fabric_control_tx: Option<Vec<mpsc::Sender<FabricControl>>>,
     fabric_control_rx: Option<mpsc::Receiver<FabricControl>>,
+    // Shared by every shard in one runtime process. A single monotonic source
+    // avoids divergent generations when subscriptions are registered from
+    // different shards.
+    fabric_generation: Option<Arc<AtomicU64>>,
 }
 
 impl DistributedContext {
@@ -405,11 +472,30 @@ impl Runtime {
         }
         let channels: Vec<_> = (0..shards.len()).map(|_| mpsc::channel()).collect();
         let senders: Vec<_> = channels.iter().map(|(tx, _)| tx.clone()).collect();
+        let generation = Arc::new(AtomicU64::new(0));
 
         for (runtime, (_, rx)) in shards.iter_mut().zip(channels.into_iter()) {
             runtime.distributed.fabric_control_tx = Some(senders.clone());
             runtime.distributed.fabric_control_rx = Some(rx);
+            runtime.distributed.fabric_generation = Some(generation.clone());
         }
+    }
+
+    fn fabric_generation_counter(&mut self) -> Arc<AtomicU64> {
+        self.distributed
+            .fabric_generation
+            .get_or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone()
+    }
+
+    fn fabric_current_generation(&mut self) -> u64 {
+        self.fabric_generation_counter().load(Ordering::Acquire)
+    }
+
+    fn fabric_bump_generation(&mut self) -> u64 {
+        self.fabric_generation_counter()
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
     }
 
     fn fabric_broadcast_control(&self, control: FabricControl) {
@@ -450,11 +536,12 @@ impl Runtime {
                 }
                 Ok(FabricControl::ReplaceRemoteNode {
                     node_id,
+                    generation,
                     subscriptions,
                 }) => {
                     self.distributed
                         .fabric
-                        .replace_remote_node(node_id, subscriptions);
+                        .replace_remote_node(node_id, generation, subscriptions);
                     applied += 1;
                 }
                 Ok(FabricControl::RemoveRemoteNode(node_id)) => {
@@ -494,6 +581,7 @@ impl Runtime {
             FabricSubscription::local(pattern, actor_id, behavior, behavior_id, None)?;
         let inserted = self.distributed.fabric.insert(subscription.clone());
         if inserted {
+            self.fabric_bump_generation();
             self.fabric_broadcast_control(FabricControl::Subscribe(subscription));
         }
         Ok(inserted)
@@ -522,6 +610,7 @@ impl Runtime {
             FabricSubscription::local(pattern, actor_id, behavior, behavior_id, Some(group))?;
         let inserted = self.distributed.fabric.insert(subscription.clone());
         if inserted {
+            self.fabric_bump_generation();
             self.fabric_broadcast_control(FabricControl::Subscribe(subscription));
         }
         Ok(inserted)
@@ -536,49 +625,60 @@ impl Runtime {
         self.fabric_sync();
         let removed = self.distributed.fabric.unsubscribe_local_actor(actor_id);
         if removed > 0 {
+            self.fabric_bump_generation();
             self.fabric_broadcast_control(FabricControl::UnsubscribeLocalActor(actor_id));
         }
         removed
     }
 
-    /// Return a bounded snapshot of this node's local subscriptions suitable
-    /// for cluster advertisement. Remote subscriptions learned from other
-    /// nodes are never re-advertised by this method.
+    /// Return a bounded, complete snapshot of this node's local subscriptions
+    /// suitable for cluster advertisement. Remote subscriptions learned from
+    /// other nodes are never re-advertised by this method.
+    ///
+    /// If the local subscription count exceeds `limit`, this returns an error
+    /// instead of silently truncating the snapshot. A receiver must never use
+    /// an incomplete snapshot with replace semantics because doing so would
+    /// incorrectly delete the omitted live routes.
     ///
     /// An undistributed runtime has no cluster node identity and therefore
-    /// returns an empty advertisement set.
-    pub fn fabric_advertisements(&mut self, limit: usize) -> Vec<FabricAdvertisement> {
+    /// returns an error rather than manufacturing a routing identity.
+    pub fn fabric_advertisements(
+        &mut self,
+        limit: usize,
+    ) -> Result<FabricAdvertisementSnapshot, String> {
         self.fabric_sync();
-        let Some(node_id) = self.distributed.node_id else {
-            return Vec::new();
-        };
+        let node_id = self
+            .distributed
+            .node_id
+            .ok_or_else(|| "Fabric advertisements require distribution to be enabled".to_string())?;
+        let generation = self.fabric_current_generation();
         self.distributed
             .fabric
-            .local_advertisements(node_id, limit)
+            .local_snapshot(node_id, generation, limit)
     }
 
-    /// Replace the complete remote subscription snapshot for one cluster node.
+    /// Apply a complete remote subscription snapshot for one cluster node.
     ///
-    /// The caller is expected to invoke this with a complete snapshot from a
-    /// trusted cluster transport (for example a Fabric tail on NUL0 gossip).
-    /// Every advertisement must claim the same `node_id`; mismatches are
-    /// rejected so a peer cannot smuggle another node's routing identity into
-    /// a direct snapshot.
+    /// Older or duplicate generations are ignored. Every advertisement must
+    /// claim the same node as the snapshot owner; mismatches are rejected so
+    /// a peer cannot smuggle another node's routing identity into a direct
+    /// snapshot.
     pub fn fabric_replace_remote_advertisements(
         &mut self,
-        node_id: NodeId,
-        advertisements: Vec<FabricAdvertisement>,
+        snapshot: FabricAdvertisementSnapshot,
     ) -> Result<usize, String> {
         self.fabric_sync();
         if !self.distributed.enabled || self.distributed.node_id.is_none() {
             return Err("Fabric remote advertisements require distribution to be enabled".into());
         }
-        if self.distributed.node_id == Some(node_id) {
+        if self.distributed.node_id == Some(snapshot.node_id) {
             return Ok(0);
         }
 
-        let mut subscriptions = Vec::with_capacity(advertisements.len());
-        for advertisement in advertisements {
+        let node_id = snapshot.node_id;
+        let generation = snapshot.generation;
+        let mut subscriptions = Vec::with_capacity(snapshot.subscriptions.len());
+        for advertisement in snapshot.subscriptions {
             if advertisement.node_id != node_id {
                 return Err(format!(
                     "Fabric advertisement node mismatch: snapshot owner {:?}, entry claims {:?}",
@@ -588,15 +688,17 @@ impl Runtime {
             subscriptions.push(FabricSubscription::remote(advertisement)?);
         }
 
-        let changed = self
-            .distributed
-            .fabric
-            .replace_remote_node(node_id, subscriptions.clone());
-        // Broadcast even if this shard already had the same logical snapshot:
-        // another shard may have joined the control plane later and need the
-        // authoritative replacement to converge.
+        let changed = self.distributed.fabric.replace_remote_node(
+            node_id,
+            generation,
+            subscriptions.clone(),
+        );
+        // Broadcast the authoritative snapshot even when this shard already
+        // had the same logical generation: another shard may have joined the
+        // control plane later and still need to converge.
         self.fabric_broadcast_control(FabricControl::ReplaceRemoteNode {
             node_id,
+            generation,
             subscriptions,
         });
         Ok(changed)
@@ -605,7 +707,9 @@ impl Runtime {
     /// Remove all subscriptions learned from `node_id`.
     ///
     /// Cluster failure/removal handling should call this as soon as a node is
-    /// no longer routable so Fabric cannot select dead remote consumers.
+    /// no longer routable so Fabric cannot select dead remote consumers. The
+    /// remembered snapshot generation is also removed, allowing a restarted
+    /// node with the same NodeId to begin a fresh sequence.
     pub fn fabric_remove_remote_node(&mut self, node_id: NodeId) -> usize {
         self.fabric_sync();
         let removed = self.distributed.fabric.remove_remote_node(node_id);
@@ -631,9 +735,10 @@ impl Runtime {
     /// Publish an ephemeral Fabric message to a concrete topic.
     ///
     /// The returned count is the number of actor deliveries selected by
-    /// routing. Local and same-process cross-shard targets use numeric actor
-    /// delivery; remote targets use the existing location-transparent actor
-    /// transport and resolve behavior by name on the destination node.
+    /// routing, not a transport acknowledgement count. Local and same-process
+    /// cross-shard targets use numeric actor delivery; remote targets use the
+    /// existing location-transparent actor transport and resolve behavior by
+    /// name on the destination node.
     pub fn fabric_publish(&mut self, topic: &str, args: &[Value]) -> Result<usize, String> {
         self.fabric_sync();
         let targets = self.distributed.fabric.route(topic)?;
@@ -645,7 +750,7 @@ impl Runtime {
             return Err("Fabric remote publication requires distribution to be enabled".into());
         }
 
-        let delivered = targets.len();
+        let selected = targets.len();
         for target in targets {
             match target {
                 FabricTarget::Local {
@@ -663,7 +768,7 @@ impl Runtime {
                 ),
             }
         }
-        Ok(delivered)
+        Ok(selected)
     }
 }
 
@@ -817,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn fabric_exports_local_subscriptions_and_replaces_remote_snapshots() {
+    fn fabric_exports_complete_local_snapshot_and_replaces_remote_snapshot() {
         let mut source = Runtime::new();
         source.distributed.enabled = true;
         source.distributed.node_id = Some(NodeId(10));
@@ -831,18 +936,22 @@ mod tests {
             .fabric_subscribe_group("jobs.*", "workers", actor_id, "handle")
             .unwrap();
 
-        let advertisements = source.fabric_advertisements(16);
-        assert_eq!(advertisements.len(), 1);
-        assert_eq!(advertisements[0].node_id, NodeId(10));
-        assert_eq!(advertisements[0].pattern, "jobs.*");
-        assert_eq!(advertisements[0].group.as_deref(), Some("workers"));
+        let snapshot = source.fabric_advertisements(16).unwrap();
+        assert_eq!(snapshot.node_id, NodeId(10));
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(snapshot.subscriptions.len(), 1);
+        assert_eq!(snapshot.subscriptions[0].pattern, "jobs.*");
+        assert_eq!(
+            snapshot.subscriptions[0].group.as_deref(),
+            Some("workers")
+        );
 
         let mut target = Runtime::new();
         target.distributed.enabled = true;
         target.distributed.node_id = Some(NodeId(20));
         assert_eq!(
             target
-                .fabric_replace_remote_advertisements(NodeId(10), advertisements)
+                .fabric_replace_remote_advertisements(snapshot)
                 .unwrap(),
             1
         );
@@ -857,9 +966,88 @@ mod tests {
         );
 
         target
-            .fabric_replace_remote_advertisements(NodeId(10), Vec::new())
+            .fabric_replace_remote_advertisements(FabricAdvertisementSnapshot {
+                node_id: NodeId(10),
+                generation: 2,
+                subscriptions: Vec::new(),
+            })
             .unwrap();
         assert_eq!(target.fabric_remote_subscription_count(), 0);
+    }
+
+    #[test]
+    fn fabric_rejects_partial_local_snapshots() {
+        let mut source = Runtime::new();
+        source.distributed.enabled = true;
+        source.distributed.node_id = Some(NodeId(10));
+        let actor_id = source.spawn_actor(Box::new(|| Vec::new()));
+        source
+            .actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .register_behavior("handle", noop);
+        source
+            .fabric_subscribe("events.one", actor_id, "handle")
+            .unwrap();
+        source
+            .fabric_subscribe("events.two", actor_id, "handle")
+            .unwrap();
+
+        let err = source.fabric_advertisements(1).unwrap_err();
+        assert!(err.contains("refusing partial advertisement"));
+        assert_eq!(source.fabric_advertisements(2).unwrap().generation, 2);
+    }
+
+    #[test]
+    fn fabric_ignores_stale_remote_snapshot_generation() {
+        let mut target = Runtime::new();
+        target.distributed.enabled = true;
+        target.distributed.node_id = Some(NodeId(20));
+
+        let current = FabricAdvertisementSnapshot {
+            node_id: NodeId(10),
+            generation: 2,
+            subscriptions: vec![FabricAdvertisement {
+                node_id: NodeId(10),
+                pattern: "events.new".into(),
+                actor_id: 7,
+                behavior: "handle".into(),
+                group: None,
+            }],
+        };
+        assert_eq!(
+            target
+                .fabric_replace_remote_advertisements(current)
+                .unwrap(),
+            1
+        );
+
+        let stale = FabricAdvertisementSnapshot {
+            node_id: NodeId(10),
+            generation: 1,
+            subscriptions: vec![FabricAdvertisement {
+                node_id: NodeId(10),
+                pattern: "events.old".into(),
+                actor_id: 7,
+                behavior: "handle".into(),
+                group: None,
+            }],
+        };
+        assert_eq!(
+            target.fabric_replace_remote_advertisements(stale).unwrap(),
+            0
+        );
+        assert_eq!(target.fabric_remote_subscription_count(), 1);
+        assert_eq!(
+            target.distributed.fabric.route("events.new").unwrap().len(),
+            1
+        );
+        assert!(target
+            .distributed
+            .fabric
+            .route("events.old")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -876,15 +1064,18 @@ mod tests {
         rt.fabric_subscribe("events.*", actor_id, "handle")
             .unwrap();
 
-        let advertisement = FabricAdvertisement {
+        let snapshot = FabricAdvertisementSnapshot {
             node_id: NodeId(10),
-            pattern: "events.*".into(),
-            actor_id,
-            behavior: "handle".into(),
-            group: None,
+            generation: 1,
+            subscriptions: vec![FabricAdvertisement {
+                node_id: NodeId(10),
+                pattern: "events.*".into(),
+                actor_id,
+                behavior: "handle".into(),
+                group: None,
+            }],
         };
-        rt.fabric_replace_remote_advertisements(NodeId(10), vec![advertisement])
-            .unwrap();
+        rt.fabric_replace_remote_advertisements(snapshot).unwrap();
         assert_eq!(rt.fabric_subscription_count(), 2);
 
         assert_eq!(rt.fabric_remove_remote_node(NodeId(10)), 1);
