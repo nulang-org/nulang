@@ -16,7 +16,7 @@ const { title = 'terminal', class: className = '', code } = Astro.props;
 		{title && <span class="t-title">{title}</span>}
 	</div>
 	<div class="terminal-card-body">
-		{code ? <pre><code set:html={code}></code></pre> : <slot />}
+		{code ? <pre><code>{code}</code></pre> : <slot />}
 	</div>
 </div>
 
