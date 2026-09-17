@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nulang.org/spec/behavior/v0alpha1.schema.json",
+  "title": "Nulang Behavior Manifest v0alpha1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "package",
+    "artifact",
+    "compiler",
+    "interfaces",
+    "actors",
+    "effects",
+    "authority",
+    "durability",
+    "replay",
+    "resources",
+    "provenance"
+  ],
+  "properties": {
+    "schema": {
+      "const": "nulang.behavior/v0alpha1"
+    },
+    "package": {
+      "$ref": "#/$defs/package"
+    },
+    "artifact": {
+      "$ref": "#/$defs/artifact"
+    },
+    "compiler": {
+      "$ref": "#/$defs/compiler"
+    },
+    "interfaces": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/interface" }
+    },
+    "actors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/actor" }
+    },
+    "effects": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/effect" }
+    },
+    "authority": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/authority" }
+    },
+    "durability": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/durability" }
+    },
+    "replay": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/replay" }
+    },
+    "resources": {
+      "$ref": "#/$defs/resources"
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Advisory namespaced extension data. Consumers MUST NOT use unknown extensions to widen authority or make security-critical admission decisions.",
+      "propertyNames": {
+        "pattern": "^[a-z0-9][a-z0-9.-]*/[A-Za-z0-9._-]+$"
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^(blake3|sha256):[0-9a-f]{32,128}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "language_version"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "language_version": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "digest"],
+      "properties": {
+        "kind": {
+          "enum": ["bytecode", "native", "wasm-module", "wasm-component"]
+        },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "compiler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implementation", "version", "digest"],
+      "properties": {
+        "implementation": { "$ref": "#/$defs/name" },
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "interface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "input", "output"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "input": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "output": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "contract_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "durability"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "protocol": { "type": "string", "maxLength": 512 },
+        "durability": { "enum": ["transient", "durable"] },
+        "state_schema": { "type": "string", "maxLength": 512 }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effect", "class", "determinism", "replay"],
+      "properties": {
+        "effect": { "$ref": "#/$defs/name" },
+        "class": { "enum": ["pure", "local", "external"] },
+        "determinism": { "enum": ["deterministic", "nondeterministic"] },
+        "replay": {
+          "enum": [
+            "none",
+            "safe",
+            "requires-journal",
+            "requires-idempotency-key",
+            "nonreplayable"
+          ]
+        },
+        "cost_class": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "filesystem",
+            "network",
+            "secret",
+            "inference",
+            "payment",
+            "state",
+            "actor-delegation",
+            "custom"
+          ]
+        },
+        "resource": { "type": "string", "maxLength": 2048 },
+        "operations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        },
+        "required": { "type": "boolean", "default": true }
+      }
+    },
+    "durability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "persistence"],
+      "properties": {
+        "owner": { "$ref": "#/$defs/name" },
+        "persistence": { "enum": ["transient", "durable"] },
+        "schema": { "type": "string", "maxLength": 512 },
+        "migration_contract": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "replay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effect", "class"],
+      "properties": {
+        "effect": { "$ref": "#/$defs/name" },
+        "class": {
+          "enum": [
+            "pure",
+            "local-replay-safe",
+            "journal-result",
+            "external-idempotent",
+            "external-requires-idempotency-key",
+            "external-nonreplayable"
+          ]
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "memory_min_bytes": { "type": "integer", "minimum": 0 },
+        "memory_max_bytes": { "type": "integer", "minimum": 0 },
+        "cpu_weight": { "type": "integer", "minimum": 1 },
+        "accelerator_class": { "type": "string", "maxLength": 128 },
+        "inference_budget_microusd": { "type": "integer", "minimum": 0 },
+        "deadline_ms": { "type": "integer", "minimum": 0 },
+        "residency": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 2, "maxLength": 64 }
+        },
+        "network_egress_class": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_digest", "dependency_digest"],
+      "properties": {
+        "source_digest": { "$ref": "#/$defs/digest" },
+        "dependency_digest": { "$ref": "#/$defs/digest" },
+        "interface_digests": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/digest" }
+        },
+        "state_schema_digests": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/digest" }
+        }
+      }
+    }
+  }
+}
