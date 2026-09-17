@@ -82,7 +82,18 @@ Nulang supports 8 Conflict-free Replicated Data Types for eventually-consistent 
 
 CRDTs use **delta-state replication**: only changed state (deltas) is shipped over the wire, with periodic full syncs (every 16 rounds) as a repair mechanism.
 
-CRDT types (`GCounter`, `PNCounter`, `GSet`, `ORSet`, `AWORSet`, `LWWRegister`, `MVRegister`, `RGA`) are Rust-level APIs on `CrdtManager` with delta-state replication and periodic full syncs (every 16 rounds). There are currently no language-level `Crdt.*` built-in effects.
+CRDT types (`GCounter`, `PNCounter`, `GSet`, `ORSet`, `AWORSet`, `LWWRegister`, `MVRegister`, `RGA`) are Rust-level APIs on `CrdtManager`. Actor state fields can also be declared CRDT-backed (`state crdt gcounter hits: Int = 0` — the `crdt` state model takes an optional CRDT type keyword: `gcounter`, `pncounter`, `gset`, `orset`, `aworset`, `lwwregister`, `mvregister`, `rga`), and the runtime wires a language-level `Crdt.*` built-in effect for operating on them:
+
+| Effect op | Signature | Description |
+|-----------|-----------|-------------|
+| `Crdt.increment` | `increment(field: String) -> Unit` | Increment a `gcounter`/`pncounter` field |
+| `Crdt.decrement` | `decrement(field: String) -> Unit` | Decrement a `pncounter` field |
+| `Crdt.add` | `add(field: String, item: String) -> Unit` | Add an element to a `gset`/`orset`/`aworset` field |
+| `Crdt.remove` | `remove(field: String, item: String) -> Unit` | Remove an element from an `orset`/`aworset` field |
+| `Crdt.set` | `set(field: String, value: String) -> Unit` | Write a `lwwregister`/`mvregister` field |
+| `Crdt.read` | `read(field: String) -> Int \| String` | Read the materialized value (count for counters, element count for sets/RGA, stored string for registers) |
+
+Each op is rejected (returns `nil`) when the field's CRDT type doesn't match, and also returns `nil` outside an actor context. See [CRDT Stdlib Reference](/stdlib/crdt/) for details.
 
 ## Persistence
 
