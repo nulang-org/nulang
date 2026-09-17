@@ -63,9 +63,8 @@ mod enabled {
         .map_err(|error| format!("integrated build failed: {error}"))?;
 
         ensure_parent(&options.out)?;
-        std::fs::write(&options.out, &output.wasm_bytes).map_err(|error| {
-            format!("cannot write Wasm '{}': {error}", options.out.display())
-        })?;
+        std::fs::write(&options.out, &output.wasm_bytes)
+            .map_err(|error| format!("cannot write Wasm '{}': {error}", options.out.display()))?;
 
         let manifest_json = output
             .manifest
@@ -156,8 +155,8 @@ mod enabled {
             package_name.ok_or_else(|| "missing required --package-name".to_string())?;
         let package_version =
             package_version.ok_or_else(|| "missing required --package-version".to_string())?;
-        let dependency_lock = dependency_lock
-            .ok_or_else(|| "missing required --dependency-lock".to_string())?;
+        let dependency_lock =
+            dependency_lock.ok_or_else(|| "missing required --dependency-lock".to_string())?;
         let out = out.ok_or_else(|| "missing required --out".to_string())?;
         let manifest_out = manifest_out.unwrap_or_else(|| default_manifest_path(&out));
 
