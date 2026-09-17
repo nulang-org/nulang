@@ -57,9 +57,15 @@ fn fabric_remote_publish_reuses_distributed_actor_transport() {
             .unwrap()
             .handle_heartbeat(node_a, addr_a);
     }
-    assert!(a.distributed.cluster.as_ref().unwrap().get_node(node_b).is_some());
+    assert!(a
+        .distributed
+        .cluster
+        .as_ref()
+        .unwrap()
+        .get_node(node_b)
+        .is_some());
 
-    let target = b.spawn_actor(Box::new(Vec::new));
+    let target = b.spawn_actor(Box::new(|| Vec::new()));
     b.actors
         .get_mut(&target)
         .unwrap()
@@ -69,10 +75,11 @@ fn fabric_remote_publish_reuses_distributed_actor_transport() {
     // This manually performs the control-plane exchange that the next Fabric
     // slice will piggyback on cluster gossip. The data plane is already the
     // production distributed actor path.
-    let advertisements = b.fabric_advertisements(16);
-    assert_eq!(advertisements.len(), 1);
-    a.fabric_replace_remote_advertisements(node_b, advertisements)
-        .unwrap();
+    let snapshot = b.fabric_advertisements(16).unwrap();
+    assert_eq!(snapshot.node_id, node_b);
+    assert_eq!(snapshot.generation, 1);
+    assert_eq!(snapshot.subscriptions.len(), 1);
+    a.fabric_replace_remote_advertisements(snapshot).unwrap();
 
     assert_eq!(
         a.fabric_publish("events.created", &[Value::int(42)])
