@@ -30,6 +30,12 @@ pub struct BehaviorBuildInput<'a> {
     pub compiler_implementation: &'a str,
     pub compiler_version: &'a str,
     pub compiler_bytes: &'a [u8],
+    /// Optional package dependency mapping in NULANG_MODULE_PATH format.
+    /// Supplying it here keeps package compilation independent of process-wide
+    /// environment mutation.
+    pub module_path: Option<&'a str>,
+    /// Optional stdlib directory for deterministic package builds.
+    pub stdlib_dir: Option<&'a Path>,
     pub with_capabilities: &'a [String],
     pub deny_warnings: bool,
 }
@@ -65,6 +71,8 @@ pub fn compile_wasm_behavior(input: BehaviorBuildInput<'_>) -> NuResult<Behavior
     let (ast, type_checker, mut effect_checker, imported_sources) = checked_module(
         source,
         input.source_path,
+        input.module_path,
+        input.stdlib_dir,
         input.with_capabilities,
         input.deny_warnings,
     )?;
@@ -105,6 +113,8 @@ pub fn compile_wasm_behavior(input: BehaviorBuildInput<'_>) -> NuResult<Behavior
 fn checked_module(
     source: &str,
     source_path: &Path,
+    module_path: Option<&str>,
+    stdlib_dir: Option<&Path>,
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<(AstModule, TypeChecker, EffectChecker, Vec<Vec<u8>>)> {
@@ -147,7 +157,9 @@ fn checked_module(
 
     let mut stack = HashSet::new();
     let imported_sources =
-        crate::resolver::resolve_imports_with_sources(&mut ast, source_path, &mut stack)?;
+        crate::resolver::with_resolution_context(module_path, stdlib_dir, || {
+            crate::resolver::resolve_imports_with_sources(&mut ast, source_path, &mut stack)
+        })?;
 
     // Keep the same ordering invariant as the canonical CLI frontend: imported
     // declarations are resolved first, then prelude variants are placed ahead
@@ -318,6 +330,8 @@ mod tests {
             compiler_implementation: "nulang-rust-test",
             compiler_version: "test",
             compiler_bytes: b"compiler",
+            module_path: None,
+            stdlib_dir: None,
             with_capabilities: &[],
             deny_warnings: false,
         })
@@ -338,6 +352,8 @@ mod tests {
             compiler_implementation: "nulang-rust-test",
             compiler_version: "test",
             compiler_bytes: b"compiler",
+            module_path: None,
+            stdlib_dir: None,
             with_capabilities: &[],
             deny_warnings: false,
         })

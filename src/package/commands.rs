@@ -1209,8 +1209,33 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
     })
 }
 
-/// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
-/// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
+/// Locate the stdlib used by this compiler invocation so an in-process
+/// package build resolves `stdlib::*` exactly as the child CLI path did.
+#[cfg(feature = "wasm-backend")]
+fn behavior_build_stdlib_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("NULANG_STDLIB").map(PathBuf::from) {
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let candidate = exe_dir.join("stdlib");
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+    }
+    let development = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("stdlib");
+    development.is_dir().then_some(development)
+}
+
+/// `nula build-wasm`: resolve the package once, then emit `.wasm`,
+/// `.behavior.json`, and machine-local `.cwasm` artifacts. The Wasm and
+/// Behavior Manifest are produced from the same checked compilation unit.
+#[cfg(feature = "wasm-backend")]
 fn cmd_build_wasm() -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
@@ -1219,24 +1244,111 @@ fn cmd_build_wasm() -> NuResult<()> {
         span: Span::default(),
     })?;
     let name = manifest.package.name.clone();
+    let version = manifest.package.version.clone();
+    let capabilities = manifest.package.capabilities.clone();
 
+    // Resolution writes the canonical lockfile. Read it only afterwards so
+    // provenance is bound to the exact dependency graph used by this build.
     let entry = prepare_package()?;
-    let entry_str = entry.to_string_lossy().into_owned();
+    let lock_path = root.join(LOCKFILE_FILE);
+    let dependency_bytes = std::fs::read(&lock_path).map_err(|e| NuError::PackageError {
+        msg: format!("cannot read {}: {}", lock_path.display(), e),
+        span: Span::default(),
+    })?;
+
+    let compiler_path = std::env::current_exe().map_err(|e| NuError::PackageError {
+        msg: format!("cannot locate current compiler executable: {}", e),
+        span: Span::default(),
+    })?;
+    let compiler_bytes = std::fs::read(&compiler_path).map_err(|e| NuError::PackageError {
+        msg: format!("cannot read compiler {}: {}", compiler_path.display(), e),
+        span: Span::default(),
+    })?;
+
+    let mut module_path = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
+    if let Some(computed) = build_module_path() {
+        if !module_path.is_empty() {
+            module_path.push(';');
+        }
+        module_path.push_str(&computed);
+    }
+    let module_path = (!module_path.is_empty()).then_some(module_path);
+    let stdlib_dir = behavior_build_stdlib_dir();
 
     let dist_dir = root.join(".nula").join("dist");
     std::fs::create_dir_all(&dist_dir).map_err(|e| NuError::PackageError {
         msg: format!("cannot create {}: {}", dist_dir.display(), e),
         span: Span::default(),
     })?;
-
     let wasm_path = dist_dir.join(format!("{}.wasm", name));
-    let wasm_path_str = wasm_path.to_string_lossy().into_owned();
+    let behavior_path = dist_dir.join(format!("{}.behavior.json", name));
+    let cwasm_path = dist_dir.join(format!("{}.cwasm", name));
 
     eprintln!("Building {} (WASM AOT)...", name);
-    eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+    eprintln!(
+        "  Compiling {} to WASM + Behavior Manifest...",
+        entry.display()
+    );
+    let output =
+        crate::behavior_build::compile_wasm_behavior(crate::behavior_build::BehaviorBuildInput {
+            source_path: &entry,
+            package_name: &name,
+            package_version: &version,
+            dependency_bytes: &dependency_bytes,
+            compiler_implementation: "nulang-rust",
+            compiler_version: env!("CARGO_PKG_VERSION"),
+            compiler_bytes: &compiler_bytes,
+            module_path: module_path.as_deref(),
+            stdlib_dir: stdlib_dir.as_deref(),
+            with_capabilities: &capabilities,
+            deny_warnings: false,
+        })
+        .map_err(|e| NuError::PackageError {
+            msg: format!("WASM behavior build failed: {}", e),
+            span: Span::default(),
+        })?;
+
+    std::fs::write(&wasm_path, &output.wasm_bytes).map_err(|e| NuError::PackageError {
+        msg: format!("cannot write {}: {}", wasm_path.display(), e),
+        span: Span::default(),
+    })?;
+    let behavior_json = output
+        .manifest
+        .to_canonical_json()
+        .map_err(|e| NuError::PackageError {
+            msg: format!("cannot serialize Behavior Manifest: {}", e),
+            span: Span::default(),
+        })?;
+    std::fs::write(&behavior_path, behavior_json).map_err(|e| NuError::PackageError {
+        msg: format!("cannot write {}: {}", behavior_path.display(), e),
+        span: Span::default(),
+    })?;
+
+    let wasm_path_string = wasm_path.to_string_lossy().into_owned();
+    let cwasm_path_string = cwasm_path.to_string_lossy().into_owned();
+    crate::wasm_runtime::aot_compile(&wasm_path_string, &cwasm_path_string).map_err(|e| {
+        NuError::PackageError {
+            msg: format!("AOT compilation failed: {}", e),
+            span: Span::default(),
+        }
+    })?;
+
     println!("WASM AOT build succeeded.");
+    println!("  {}", wasm_path.display());
+    println!("  {}", behavior_path.display());
+    println!("  {}", cwasm_path.display());
     Ok(())
+}
+
+/// A build without the Wasm backend cannot uphold the command contract:
+/// emitting legacy Wasm without its checked Behavior Manifest would be a
+/// fail-open downgrade.
+#[cfg(not(feature = "wasm-backend"))]
+fn cmd_build_wasm() -> NuResult<()> {
+    Err(NuError::PackageError {
+        msg: "nula build-wasm requires the 'wasm-backend' feature so Wasm and its Behavior Manifest are emitted atomically".to_string(),
+        span: Span::default(),
+    })
 }
 
 /// `nula run`: build, then execute the entry point.

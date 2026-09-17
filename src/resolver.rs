@@ -15,6 +15,43 @@ thread_local! {
     /// compilation unit. Kept beside the AST cache so provenance consumers can
     /// bind to the same bytes that were parsed rather than re-reading files.
     static IMPORT_SOURCES: RefCell<BTreeMap<PathBuf, Vec<u8>>> = const { RefCell::new(BTreeMap::new()) };
+    static MODULE_PATH_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+    static STDLIB_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+struct ResolutionContextGuard {
+    previous_module_path: Option<String>,
+    previous_stdlib_dir: Option<PathBuf>,
+}
+
+impl Drop for ResolutionContextGuard {
+    fn drop(&mut self) {
+        MODULE_PATH_OVERRIDE.with(|slot| {
+            slot.replace(self.previous_module_path.take());
+        });
+        STDLIB_DIR_OVERRIDE.with(|slot| {
+            slot.replace(self.previous_stdlib_dir.take());
+        });
+    }
+}
+
+/// Run resolver work with package-specific import locations without mutating
+/// process-global environment variables. Overrides are scoped to this thread
+/// and restored on success, error, or unwinding.
+pub fn with_resolution_context<T>(
+    module_path: Option<&str>,
+    stdlib_dir: Option<&Path>,
+    f: impl FnOnce() -> NuResult<T>,
+) -> NuResult<T> {
+    let previous_module_path =
+        MODULE_PATH_OVERRIDE.with(|slot| slot.replace(module_path.map(str::to_owned)));
+    let previous_stdlib_dir =
+        STDLIB_DIR_OVERRIDE.with(|slot| slot.replace(stdlib_dir.map(Path::to_path_buf)));
+    let _guard = ResolutionContextGuard {
+        previous_module_path,
+        previous_stdlib_dir,
+    };
+    f()
 }
 
 /// Resolve imports and return the exact imported source bytes consumed by this
@@ -204,6 +241,9 @@ fn resolve_path(base: &Path, import: &str) -> PathBuf {
     // stdlib::web::types → STDLIB_DIR/web/types.nula.
     if let Some(module) = import.strip_prefix("stdlib::") {
         let module_path = module.replace("::", std::path::MAIN_SEPARATOR_STR);
+        if let Some(dir) = STDLIB_DIR_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return dir.join(format!("{}.nula", module_path));
+        }
         // Try NULANG_STDLIB env var first
         if let Ok(dir) = std::env::var("NULANG_STDLIB") {
             return PathBuf::from(dir).join(format!("{}.nula", module_path));
@@ -319,7 +359,9 @@ fn filter_decls(decls: Vec<Decl>, items: &[String]) -> Vec<Decl> {
 /// files; the bare import maps to `<dir>/lib.nula`, and subpaths map to
 /// `<dir>/<subpath>.nula`.
 fn resolve_module_path(module: &str) -> PathBuf {
-    let entries = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
+    let entries = MODULE_PATH_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(|| std::env::var("NULANG_MODULE_PATH").unwrap_or_default());
     let mut chosen_dir: Option<PathBuf> = None;
     let mut chosen_prefix = String::new();
     for entry in entries.split(';') {

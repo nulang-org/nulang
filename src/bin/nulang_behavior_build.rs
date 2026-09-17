@@ -57,6 +57,8 @@ mod enabled {
             compiler_implementation: "nulang-rust",
             compiler_version: env!("CARGO_PKG_VERSION"),
             compiler_bytes: &compiler_bytes,
+            module_path: None,
+            stdlib_dir: None,
             with_capabilities: &options.grants,
             deny_warnings: options.deny_warnings,
         })
