@@ -353,10 +353,22 @@ impl AotModule {
         behavior_idx: usize,
         init: Vec<(u64, crate::vm::Value)>,
     ) -> Option<u64> {
+        let authority = crate::authority::AuthorityManifest::new();
+        self.spawn_actor_with_authority(behavior_idx, init, &authority)
+    }
+
+    /// Standalone native spawn with one already-validated exact-site manifest.
+    pub fn spawn_actor_with_authority(
+        &self,
+        behavior_idx: usize,
+        init: Vec<(u64, crate::vm::Value)>,
+        authority: &crate::authority::AuthorityManifest,
+    ) -> Option<u64> {
         let full = self.behavior_names.get(behavior_idx)?;
         let actor_name = full.split('.').next()?.to_string();
         let id = AOT_FRESH_ACTOR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut actor = Box::new(crate::runtime::Actor::new(id, actor_name.clone(), 64));
+        actor.install_authority_manifest(authority);
 
         let prefix = format!("{}.", actor_name);
         for name in &self.behavior_names {
@@ -526,12 +538,18 @@ impl AotModule {
         let mut callbacks = AotTopLevelCallbacks { runtime: rt };
         unsafe {
             crate::jit::runtime::set_jit_callbacks(&mut callbacks);
+            set_aot_dispatch(Some(AotDispatchTarget {
+                fn_ptr: ptr,
+                module: module_ptr,
+                runtime: rt,
+            }));
         }
         let func: extern "C" fn() -> u64 = unsafe { std::mem::transmute(ptr) };
         let result = func();
 
         // Clear helper context before running the scheduler.
         crate::jit::runtime::clear_jit_callbacks();
+        clear_aot_dispatch();
         if let Some(msg) = crate::jit::runtime::aot_take_pending_error() {
             crate::jit::runtime::aot_clear_constants();
             clear_aot_module_ctx();
@@ -737,6 +755,31 @@ pub fn clear_aot_spawn_ctx() {
     AOT_SPAWN_CTX.with(|c| *c.borrow_mut() = std::ptr::null());
 }
 
+thread_local! {
+    /// Canonical authority tokens for the next native Spawn instruction.
+    /// The queue is site-local in generated code: tokens are pushed only after
+    /// all init expressions have evaluated, then drained atomically by spawn.
+    static AOT_SPAWN_AUTHORITY: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// A token that could not be resolved from the armed constant pool marks
+    /// the whole pending manifest invalid; partial manifests must never grant.
+    static AOT_SPAWN_AUTHORITY_INVALID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nulang_aot_spawn_grant_push(token_raw: u64) {
+    match crate::jit::runtime::resolve_string_coerce(token_raw) {
+        Some(token) => AOT_SPAWN_AUTHORITY.with(|tokens| tokens.borrow_mut().push(token)),
+        None => AOT_SPAWN_AUTHORITY_INVALID.with(|invalid| invalid.set(true)),
+    }
+}
+
+fn take_aot_spawn_authority() -> Option<Vec<String>> {
+    let invalid = AOT_SPAWN_AUTHORITY_INVALID.with(|flag| flag.replace(false));
+    let tokens = AOT_SPAWN_AUTHORITY.with(|tokens| std::mem::take(&mut *tokens.borrow_mut()));
+    (!invalid).then_some(tokens)
+}
+
 /// Native-code entry point for `RValue::Spawn`: creates an actor of the type
 /// whose first behavior is at module index `behavior_idx`, applying any queued
 /// init pairs. When dispatched inside the real actor `Runtime` (the armed
@@ -749,6 +792,15 @@ pub fn clear_aot_spawn_ctx() {
 #[no_mangle]
 pub unsafe extern "C" fn nulang_aot_spawn(behavior_idx: u64) -> u64 {
     let init = crate::jit::runtime::take_aot_spawn_init();
+    let Some(authority_tokens) = take_aot_spawn_authority() else {
+        return crate::vm::Value::nil().as_raw();
+    };
+    let requested = match crate::authority::AuthorityManifest::from_tokens(
+        authority_tokens.iter().map(String::as_str),
+    ) {
+        Ok(manifest) => manifest,
+        Err(_) => return crate::vm::Value::nil().as_raw(),
+    };
     let dispatch = AOT_DISPATCH.with(|c| *c.borrow());
     if let Some(t) = dispatch {
         let module = unsafe { &*t.module };
@@ -770,14 +822,21 @@ pub unsafe extern "C" fn nulang_aot_spawn(behavior_idx: u64) -> u64 {
                         (name, *v)
                     })
                     .collect();
-                let val =
-                    unsafe { (*t.runtime).spawn_from_module(code, behavior_idx as usize, init) };
-                return val.as_raw();
+                let val = unsafe {
+                    crate::runtime::spawn_from_module_with_authority(
+                        &mut *t.runtime,
+                        code,
+                        behavior_idx as usize,
+                        init,
+                        &requested,
+                    )
+                };
+                return val.unwrap_or_else(|_| crate::vm::Value::nil()).as_raw();
             }
             return crate::vm::Value::nil().as_raw();
         }
         // Standalone path: spawn a boxed standalone actor.
-        return match module.spawn_actor(behavior_idx as usize, init) {
+        return match module.spawn_actor_with_authority(behavior_idx as usize, init, &requested) {
             Some(id) => crate::vm::Value::actor_ref(id).as_raw(),
             None => crate::vm::Value::nil().as_raw(),
         };
@@ -787,7 +846,7 @@ pub unsafe extern "C" fn nulang_aot_spawn(behavior_idx: u64) -> u64 {
     if module.is_null() {
         return crate::vm::Value::nil().as_raw();
     }
-    match (*module).spawn_actor(behavior_idx as usize, init) {
+    match (*module).spawn_actor_with_authority(behavior_idx as usize, init, &requested) {
         Some(id) => crate::vm::Value::actor_ref(id).as_raw(),
         None => crate::vm::Value::nil().as_raw(),
     }
@@ -820,7 +879,7 @@ macro_rules! define_aot_perform {
         pub unsafe extern "C" fn $name(eff_raw: u64, op_raw: u64 $(, $arg: u64)*) -> u64 {
             let effect = crate::jit::runtime::resolve_string_coerce(eff_raw).unwrap_or_default();
             let op = crate::jit::runtime::resolve_string_coerce(op_raw).unwrap_or_default();
-            let regs = [$(crate::vm::Value::from_bits($arg)),*];
+            let regs = [$(unsafe { crate::vm::Value::from_bits($arg) }),*];
             // The module is only needed by `perform_builtin_effect_in_module`
             // for a few effects (Otp/Http resolve against it); the common
             // IO/Actor/Timer path ignores it.
@@ -1104,6 +1163,7 @@ impl crate::vm::ActorVmCallbacks for AotActorCallbacks {
     fn spawn_actor(
         &mut self,
         _module: &crate::bytecode::CodeModule,
+        _spawn_pc: usize,
         _behavior_idx: usize,
         _init: Vec<(String, crate::vm::Value)>,
     ) -> crate::vm::Value {
@@ -1181,6 +1241,18 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
         Some(self.actor_id)
     }
 
+    fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
+        unsafe {
+            crate::runtime::callbacks::authorize_actor_ffi(
+                &*self.runtime,
+                Some(self.actor_id),
+                library,
+                symbol,
+            )
+            .is_ok()
+        }
+    }
+
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
         // SAFETY: the scheduler holds `&mut Runtime`; re-borrow through the
         // raw pointer, mirroring `BytecodeRuntimeCallbacks`.
@@ -1227,12 +1299,21 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
     fn spawn_actor(
         &mut self,
         module: &crate::bytecode::CodeModule,
+        spawn_pc: usize,
         behavior_idx: usize,
         init: Vec<(String, crate::vm::Value)>,
     ) -> crate::vm::Value {
         // SAFETY: as above; spawning mutates runtime state but never re-enters
         // the VM.
-        unsafe { (*self.runtime).spawn_from_module(module, behavior_idx, init) }
+        unsafe {
+            crate::runtime::callbacks::spawn_with_site_authority(
+                &mut *self.runtime,
+                module,
+                spawn_pc,
+                behavior_idx,
+                init,
+            )
+        }
     }
 
     fn send_message(
@@ -1364,6 +1445,14 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
         self.current_actor_id()
     }
 
+    fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
+        unsafe {
+            let rt = &*self.runtime;
+            crate::runtime::callbacks::authorize_actor_ffi(rt, rt.current_actor, library, symbol)
+                .is_ok()
+        }
+    }
+
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
         // SAFETY: as in `AotRuntimeCallbacks`.
         unsafe {
@@ -1460,10 +1549,19 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
     fn spawn_actor(
         &mut self,
         module: &crate::bytecode::CodeModule,
+        spawn_pc: usize,
         behavior_idx: usize,
         init: Vec<(String, crate::vm::Value)>,
     ) -> crate::vm::Value {
-        unsafe { (*self.runtime).spawn_from_module(module, behavior_idx, init) }
+        unsafe {
+            crate::runtime::callbacks::spawn_with_site_authority(
+                &mut *self.runtime,
+                module,
+                spawn_pc,
+                behavior_idx,
+                init,
+            )
+        }
     }
 
     fn send_message(
@@ -1725,7 +1823,19 @@ fn collect_rvalue_field_and_consts(
                 id
             });
         }
-        mir::RValue::Spawn { init, .. } => {
+        mir::RValue::Spawn {
+            init, capabilities, ..
+        } => {
+            if let Ok(manifest) = crate::authority::AuthorityManifest::from_tokens(
+                capabilities.iter().map(String::as_str),
+            ) {
+                for token in manifest.canonical_tokens() {
+                    let c = crate::bytecode::Constant::String(token);
+                    if !constants.contains(&c) {
+                        constants.push(c);
+                    }
+                }
+            }
             for (name, rv) in init {
                 field_map.entry(name.clone()).or_insert_with(|| {
                     let id = *next_field_id;

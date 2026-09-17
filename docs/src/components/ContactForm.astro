@@ -12,22 +12,26 @@ const turnstileSiteKey = '0x4AAAAAAEYgutYVrXLZ2ywd';
   <form id="contact-form" class="contact-form" novalidate>
     <div class="contact-field">
       <label for="contact-name">Name</label>
-      <input id="contact-name" name="name" type="text" autocomplete="name" required maxlength="120" />
+      <input id="contact-name" name="name" type="text" autocomplete="name" required maxlength="120" aria-describedby="contact-name-error" />
+      <p id="contact-name-error" class="contact-error"></p>
     </div>
 
     <div class="contact-field">
       <label for="contact-email">Email</label>
-      <input id="contact-email" name="email" type="email" autocomplete="email" required maxlength="254" />
+      <input id="contact-email" name="email" type="email" autocomplete="email" required maxlength="254" aria-describedby="contact-email-error" />
+      <p id="contact-email-error" class="contact-error"></p>
     </div>
 
     <div class="contact-field">
       <label for="contact-subject">Subject</label>
-      <input id="contact-subject" name="subject" type="text" required maxlength="200" />
+      <input id="contact-subject" name="subject" type="text" required maxlength="200" aria-describedby="contact-subject-error" />
+      <p id="contact-subject-error" class="contact-error"></p>
     </div>
 
     <div class="contact-field">
       <label for="contact-message">Message</label>
-      <textarea id="contact-message" name="message" rows="6" required maxlength="5000"></textarea>
+      <textarea id="contact-message" name="message" rows="6" required maxlength="5000" aria-describedby="contact-message-error"></textarea>
+      <p id="contact-message-error" class="contact-error"></p>
     </div>
 
     <div
@@ -46,18 +50,104 @@ const turnstileSiteKey = '0x4AAAAAAEYgutYVrXLZ2ywd';
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 
 <script>
+  declare global {
+    interface Window {
+      turnstile?: { reset: () => void };
+    }
+  }
+
   const form = document.getElementById('contact-form');
   const statusEl = document.getElementById('contact-status');
   const submitBtn = document.getElementById('contact-submit');
 
   if (form instanceof HTMLFormElement && statusEl instanceof HTMLElement && submitBtn instanceof HTMLButtonElement) {
+    const turnstileBox = form.querySelector('.cf-turnstile');
+
+    // If the Turnstile CDN script never loads (blocked/offline), swap the widget
+    // area for a mailto fallback instead of dead-ending on the bot-check message.
+    let turnstileUnavailable = false;
+    window.setTimeout(() => {
+      if (window.turnstile || !turnstileBox) return;
+      turnstileUnavailable = true;
+      turnstileBox.innerHTML =
+        'The bot check could not load (the verification script is unavailable). ' +
+        'You can still reach us at <a href="mailto:support@nulang.org">support@nulang.org</a>.';
+      turnstileBox.classList.add('is-fallback');
+    }, 8000);
+
+    const fields: Array<{ id: string; errorId: string; validate: (value: string) => string | null }> = [
+      {
+        id: 'contact-name',
+        errorId: 'contact-name-error',
+        validate: (value) => (value.trim() ? null : 'Please enter your name.'),
+      },
+      {
+        id: 'contact-email',
+        errorId: 'contact-email-error',
+        validate: (value) =>
+          /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim()) ? null : 'Please enter a valid email address.',
+      },
+      {
+        id: 'contact-subject',
+        errorId: 'contact-subject-error',
+        validate: (value) => (value.trim() ? null : 'Please enter a subject.'),
+      },
+      {
+        id: 'contact-message',
+        errorId: 'contact-message-error',
+        validate: (value) => (value.trim() ? null : 'Please enter a message.'),
+      },
+    ];
+
+    const setFieldError = (field: (typeof fields)[number], message: string | null) => {
+      const input = document.getElementById(field.id);
+      const errorEl = document.getElementById(field.errorId);
+      if (!(input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement)) return;
+      if (errorEl instanceof HTMLElement) errorEl.textContent = message ?? '';
+      if (message) {
+        input.setAttribute('aria-invalid', 'true');
+      } else {
+        input.removeAttribute('aria-invalid');
+      }
+    };
+
+    // Clear an error as soon as the user starts fixing the field.
+    fields.forEach((field) => {
+      const input = document.getElementById(field.id);
+      if (input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement) {
+        input.addEventListener('input', () => setFieldError(field, null));
+      }
+    });
+
+    const validateForm = (): boolean => {
+      let firstInvalid: HTMLElement | null = null;
+      fields.forEach((field) => {
+        const input = document.getElementById(field.id);
+        if (!(input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement)) return;
+        const message = field.validate(input.value);
+        setFieldError(field, message);
+        if (message && !firstInvalid) firstInvalid = input;
+      });
+      (firstInvalid as HTMLElement | null)?.focus();
+      return firstInvalid === null;
+    };
+
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       statusEl.textContent = '';
       statusEl.className = 'contact-status';
 
+      if (!validateForm()) return;
+
       const formData = new FormData(form);
       const turnstileToken = formData.get('cf-turnstile-response');
+      if (turnstileUnavailable) {
+        statusEl.innerHTML =
+          'The bot check is unavailable, so the form cannot be sent right now. ' +
+          'Please email us at <a href="mailto:support@nulang.org">support@nulang.org</a> instead.';
+        statusEl.classList.add('is-error');
+        return;
+      }
       if (typeof turnstileToken !== 'string' || !turnstileToken) {
         statusEl.textContent = 'Please complete the bot check.';
         statusEl.classList.add('is-error');
@@ -86,6 +176,7 @@ const turnstileSiteKey = '0x4AAAAAAEYgutYVrXLZ2ywd';
         }
 
         form.reset();
+        fields.forEach((field) => setFieldError(field, null));
         if (window.turnstile) {
           window.turnstile.reset();
         }
@@ -109,3 +200,20 @@ const turnstileSiteKey = '0x4AAAAAAEYgutYVrXLZ2ywd';
 <script is:inline>
   window.turnstile = window.turnstile || undefined;
 </script>
+
+<style>
+  .contact-error {
+    margin: 0.25rem 0 0;
+    font-size: 0.8125rem;
+    color: var(--sl-color-red, #dc2626);
+  }
+
+  .cf-turnstile.is-fallback {
+    font-size: 0.875rem;
+    color: var(--sl-color-gray-2);
+  }
+
+  .cf-turnstile.is-fallback a {
+    color: var(--sl-color-accent);
+  }
+</style>
