@@ -23,17 +23,20 @@ Runtime APIs:
   consumer subscription.
 - `Runtime::fabric_unsubscribe_actor(actor_id)` — remove a local actor's
   subscriptions without touching numerically-colliding actors on remote nodes.
-- `Runtime::fabric_advertisements(limit)` — export a bounded snapshot of this
-  node's local subscriptions for the cluster control plane.
-- `Runtime::fabric_replace_remote_advertisements(node_id, advertisements)` —
-  atomically replace the known remote subscription snapshot for one node.
-- `Runtime::fabric_remove_remote_node(node_id)` — purge routes learned from a
-  failed or removed cluster node.
+- `Runtime::fabric_advertisements(limit)` — export a **complete**, generation-
+  tagged snapshot of this node's local subscriptions. It fails rather than
+  truncating when the local set exceeds `limit`.
+- `Runtime::fabric_replace_remote_advertisements(snapshot)` — atomically replace
+  the known remote subscription snapshot for one node when the incoming
+  generation is newer.
+- `Runtime::fabric_remove_remote_node(node_id)` — purge routes and remembered
+  generation learned from a failed or removed cluster node.
 - `Runtime::fabric_subscription_count()` — subscription gauge for the local
   routing view.
 - `Runtime::fabric_remote_subscription_count()` — remote-subscription gauge.
 - `Runtime::fabric_publish(topic, args)` — publish to matching local, cross-shard,
-  or already-known remote subscribers.
+  or already-known remote subscribers. The return value is the number of routes
+  selected, not transport acknowledgements.
 
 Subject patterns use NATS-style token matching:
 
@@ -64,12 +67,31 @@ behavior-table ids are node-local. Remote publication therefore reuses
 Actor ids are not assumed to be globally unique: removing local actor `42`
 never removes a remote node's actor `42`.
 
-The cluster-directory API uses complete per-node snapshots. Replacing a node's
-snapshot removes stale routes for that node before inserting the new set, and
-node-loss cleanup can delete the node's routing state immediately. The remaining
-Phase 2 wire step is to carry these snapshots as a backward-compatible additive
-tail on existing cluster gossip; Fabric does not need a new payload transport or
-new broker connection.
+The cluster-directory API uses complete per-node snapshots. Local subscription
+changes advance a monotonic generation shared by every Runtime shard in the
+process. Receivers remember the newest generation applied for each remote node
+and ignore duplicate or stale snapshots. This makes reordered control traffic
+idempotent and prevents an older snapshot from resurrecting a route removed by
+a newer unsubscribe.
+
+Snapshot export is fail-closed: if the configured advertisement limit is lower
+than the number of local subscriptions, `fabric_advertisements` returns an error
+instead of a truncated set. That distinction is required because replace
+semantics make a partial snapshot destructive. A future gossip sender should
+therefore encode either a complete generation-tagged snapshot or **no Fabric
+update** for that round; an omitted update must never be interpreted as an empty
+snapshot.
+
+Node-loss cleanup removes both the node's routes and its remembered generation,
+which permits a restarted node with the same stable NodeId to start a fresh
+snapshot sequence. The remaining Phase 2 wire step is to carry complete
+snapshots as a backward-compatible additive tail on existing cluster gossip;
+Fabric does not need a new payload transport or new broker connection.
+
+`tests/fabric_cluster.rs` already exercises the intended split directly: it
+exchanges a complete Fabric snapshot between two deterministic distributed
+runtimes, publishes from one node, then verifies that the message arrives at the
+remote actor through the existing distributed actor transport.
 
 The Fabric control plane is explicit and runtime-owned. It uses small in-process
 channels only for subscription lifecycle metadata. There is no process-global
@@ -104,6 +126,10 @@ semantics that later cluster and stream layers can reuse.
    remain ordinary distributed actor messages.
 9. **Scope lifecycle by node identity.** Bare actor ids are insufficient for
    remote subscription deletion or failure cleanup.
+10. **Never replace from a partial snapshot.** A generation-tagged snapshot is
+    authoritative for the node only when the sender could encode the full set.
+11. **Reject stale convergence state.** Per-node generations make duplicate or
+    reordered Fabric advertisements harmless.
 
 ## Roadmap
 
@@ -124,14 +150,17 @@ semantics that later cluster and stream layers can reuse.
 ### Phase 2 — cluster-wide topics
 
 - [x] Node-aware local/remote subscription representation.
-- [x] Per-node advertisement snapshot export/replacement APIs.
-- [x] Node-scoped remote route cleanup primitive.
+- [x] Complete per-node advertisement snapshot export/replacement APIs.
+- [x] Monotonic snapshot generations with stale-update rejection.
+- [x] Refuse partial snapshots when the advertisement cap is exceeded.
+- [x] Node-scoped remote route + generation cleanup primitive.
 - [x] Remote routing path reuses `Runtime::send_distributed`.
-- [ ] Carry subscription snapshots as an additive NUL0 gossip tail.
+- [x] Deterministic two-node remote-publish coverage with manual snapshot exchange.
+- [ ] Carry complete subscription snapshots as an additive NUL0 gossip tail.
 - [ ] Invoke node cleanup from cluster failure/removal handling.
-- [ ] Multi-node subscription convergence.
+- [ ] Multi-node automatic subscription convergence.
 - [ ] Placement-aware consumer selection using mailbox pressure and locality.
-- [ ] Deterministic multi-node simulation coverage.
+- [ ] Deterministic partition/reorder/rejoin coverage for automatic gossip.
 
 ### Phase 3 — durable streams
 
