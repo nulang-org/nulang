@@ -25,24 +25,15 @@ jobs:
           from pathlib import Path
           p = Path('src/package/commands.rs')
           text = p.read_text()
-          old = '''    let mut module_path = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
-    if let Some(computed) = build_module_path() {
-        if !module_path.is_empty() {
-            module_path.push(';');
-        }
-        module_path.push_str(&computed);
-    }
-    let module_path = (!module_path.is_empty()).then_some(module_path);
-'''
-          new = '''    // Package dependency resolution is derived exclusively from the lockfile
-    // written by prepare_package(). Ambient module mappings must not change the
-    // semantic input while provenance still claims the locked dependency graph.
-    let module_path = build_module_path();
-'''
-          if new not in text:
-              if old not in text:
+          marker = '    let mut module_path = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();'
+          replacement = "    // Package dependency resolution is derived exclusively from the lockfile\n    // written by prepare_package(). Ambient module mappings must not change the\n    // semantic input while provenance still claims the locked dependency graph.\n    let module_path = build_module_path();\n"
+          if replacement not in text:
+              start = text.find(marker)
+              end_marker = '    let stdlib_dir = behavior_build_stdlib_dir();'
+              end = text.find(end_marker, start)
+              if start < 0 or end < 0:
                   raise SystemExit('module-path patch anchor missing')
-              p.write_text(text.replace(old, new, 1))
+              p.write_text(text[:start] + replacement + text[end:])
           PY
           cargo fmt --all
       - name: Commit fix
