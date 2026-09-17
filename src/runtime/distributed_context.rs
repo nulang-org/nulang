@@ -81,6 +81,10 @@ impl FabricRegistry {
         before - self.subscriptions.len()
     }
 
+    fn len(&self) -> usize {
+        self.subscriptions.len()
+    }
+
     fn route(&mut self, topic: &str) -> Result<Vec<FabricTarget>, String> {
         validate_topic(topic)?;
 
@@ -238,6 +242,11 @@ impl Runtime {
         if !self.actors.contains_key(&actor_id) {
             return Err(format!("Fabric subscriber actor {actor_id} does not exist"));
         }
+        if self.behavior_id_for(actor_id, behavior).is_none() {
+            return Err(format!(
+                "Fabric subscriber actor {actor_id} has no behavior `{behavior}`"
+            ));
+        }
         self.distributed
             .fabric
             .subscribe(pattern, actor_id, behavior, None)
@@ -257,18 +266,26 @@ impl Runtime {
         if !self.actors.contains_key(&actor_id) {
             return Err(format!("Fabric subscriber actor {actor_id} does not exist"));
         }
+        if self.behavior_id_for(actor_id, behavior).is_none() {
+            return Err(format!(
+                "Fabric subscriber actor {actor_id} has no behavior `{behavior}`"
+            ));
+        }
         self.distributed
             .fabric
             .subscribe(pattern, actor_id, behavior, Some(group))
     }
 
     /// Remove every Fabric subscription owned by `actor_id`.
-    ///
-    /// Actor-exit integration will call this automatically in a subsequent
-    /// change; exposing the operation now also lets embedders clean up
-    /// explicitly.
     pub fn fabric_unsubscribe_actor(&mut self, actor_id: u64) -> usize {
         self.distributed.fabric.unsubscribe_actor(actor_id)
+    }
+
+    /// Number of ephemeral subscriptions registered on this runtime shard.
+    ///
+    /// Exposed primarily for runtime metrics, tests, and leak detection.
+    pub fn fabric_subscription_count(&self) -> usize {
+        self.distributed.fabric.len()
     }
 
     /// Publish an ephemeral Fabric message to a concrete topic.
@@ -281,13 +298,17 @@ impl Runtime {
         let targets = self.distributed.fabric.route(topic)?;
         let mut delivered = 0;
         for target in targets {
-            // A subscriber can exit between subscription and publication.
-            // Skip stale entries rather than sending into the DLQ; explicit
-            // cleanup below keeps the routing table bounded.
-            if self.actors.contains_key(&target.actor_id) {
-                self.send_message(target.actor_id, &target.behavior, args);
+            // Resolve by name again at delivery time. This deliberately avoids
+            // `send_message`'s legacy unknown-name -> behavior-0 fallback: a
+            // stale/hot-reloaded subscription must never invoke the wrong
+            // behavior silently.
+            let behavior_id = self.behavior_id_for(target.actor_id, &target.behavior);
+            if let Some(behavior_id) = behavior_id {
+                self.send_message_by_id(target.actor_id, behavior_id, args);
                 delivered += 1;
             } else {
+                // The actor exited or its behavior table changed after
+                // subscription. Remove all of its stale routing entries.
                 self.distributed.fabric.unsubscribe_actor(target.actor_id);
             }
         }
@@ -298,6 +319,8 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn noop(_actor: &mut crate::runtime::Actor, _args: &[Value]) {}
 
     #[test]
     fn fabric_subject_wildcards_match_expected_tokens() {
@@ -366,5 +389,32 @@ mod tests {
             .unwrap());
         assert_eq!(fabric.unsubscribe_actor(7), 2);
         assert!(fabric.route("events.created").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fabric_rejects_unknown_behavior_names() {
+        let mut rt = Runtime::new();
+        let actor_id = rt.spawn_actor(Box::new(|| Vec::new()));
+        assert!(rt
+            .fabric_subscribe("events.created", actor_id, "missing")
+            .is_err());
+    }
+
+    #[test]
+    fn fabric_actor_exit_removes_subscriptions() {
+        let mut rt = Runtime::new();
+        let actor_id = rt.spawn_actor(Box::new(|| Vec::new()));
+        rt.actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .register_behavior("handle", noop);
+
+        assert!(rt
+            .fabric_subscribe("events.>", actor_id, "handle")
+            .unwrap());
+        assert_eq!(rt.fabric_subscription_count(), 1);
+
+        rt.exit_actor(actor_id, crate::types::ExitReason::Normal);
+        assert_eq!(rt.fabric_subscription_count(), 0);
     }
 }
