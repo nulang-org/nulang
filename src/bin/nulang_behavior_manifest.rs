@@ -23,8 +23,8 @@ struct Options {
     artifact_kind: ArtifactKind,
     package_name: String,
     package_version: String,
-    dependency_lock: Option<PathBuf>,
-    compiler: Option<PathBuf>,
+    dependency_lock: PathBuf,
+    compiler: PathBuf,
     out: PathBuf,
     grants: Vec<String>,
 }
@@ -73,22 +73,16 @@ fn run() -> Result<(), String> {
 
     let artifact_bytes = std::fs::read(&options.artifact)
         .map_err(|e| format!("cannot read artifact '{}': {e}", options.artifact.display()))?;
-
-    let dependency_bytes = match &options.dependency_lock {
-        Some(path) => std::fs::read(path)
-            .map_err(|e| format!("cannot read dependency lock '{}': {e}", path.display()))?,
-        None => Vec::new(),
-    };
-
-    let compiler_path = match &options.compiler {
-        Some(path) => path.clone(),
-        None => std::env::current_exe()
-            .map_err(|e| format!("cannot identify current compiler executable: {e}"))?,
-    };
-    let compiler_bytes = std::fs::read(&compiler_path).map_err(|e| {
+    let dependency_bytes = std::fs::read(&options.dependency_lock).map_err(|e| {
+        format!(
+            "cannot read dependency lock '{}': {e}",
+            options.dependency_lock.display()
+        )
+    })?;
+    let compiler_bytes = std::fs::read(&options.compiler).map_err(|e| {
         format!(
             "cannot read compiler artifact '{}': {e}",
-            compiler_path.display()
+            options.compiler.display()
         )
     })?;
 
@@ -186,6 +180,9 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
     let package_name = package_name.ok_or_else(|| "missing required --package-name".to_string())?;
     let package_version =
         package_version.ok_or_else(|| "missing required --package-version".to_string())?;
+    let dependency_lock =
+        dependency_lock.ok_or_else(|| "missing required --dependency-lock".to_string())?;
+    let compiler = compiler.ok_or_else(|| "missing required --compiler".to_string())?;
     let out = out.unwrap_or_else(|| default_output_path(&artifact));
 
     Ok(Options {
@@ -235,12 +232,13 @@ fn print_help() {
         "nulang_behavior_manifest (experimental RFC 0020 v0alpha1)\n\
          \n\
          Usage:\n\
-           nulang_behavior_manifest \\\n             --source <file.nula> \\\n             --artifact <artifact> \\\n             --artifact-kind <bytecode|native|wasm-module|wasm-component> \\\n             --package-name <name> \\\n             --package-version <version> \\\n             [--dependency-lock <Nulang.lock>] \\\n             [--compiler <compiler-binary>] \\\n             [--with <fs,net,os>] \\\n             [--out <manifest.json>]\n\
+           nulang_behavior_manifest \\\n             --source <file.nula> \\\n             --artifact <artifact> \\\n             --artifact-kind <bytecode|native|wasm-module|wasm-component> \\\n             --package-name <name> \\\n             --package-version <version> \\\n             --dependency-lock <Nulang.lock> \\\n             --compiler <compiler-binary> \\\n             [--with <fs,net,os>] \\\n             [--out <manifest.json>]\n\
          \n\
          Security boundary:\n\
-           This standalone v0alpha1 emitter refuses source imports rather than\n\
-           emitting an incomplete manifest. It emits requirements only and\n\
-           never grants runtime authority."
+           This standalone v0alpha1 emitter refuses source imports and refuses\n\
+           missing compiler/dependency provenance rather than emitting an\n\
+           incomplete manifest. It emits requirements only and never grants\n\
+           runtime authority."
     );
 }
 
@@ -264,6 +262,24 @@ mod tests {
             ArtifactKind::WasmModule
         );
         assert!(parse_artifact_kind("wasm").is_err());
+    }
+
+    #[test]
+    fn required_provenance_inputs_fail_closed() {
+        let error = parse_args(vec![
+            "--source".into(),
+            "main.nula".into(),
+            "--artifact".into(),
+            "main.wasm".into(),
+            "--artifact-kind".into(),
+            "wasm-module".into(),
+            "--package-name".into(),
+            "demo".into(),
+            "--package-version".into(),
+            "0.1.0".into(),
+        ])
+        .unwrap_err();
+        assert!(error.contains("--dependency-lock"));
     }
 
     #[test]
