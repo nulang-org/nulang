@@ -29,7 +29,7 @@ The release build uses `opt-level=3`, LTO, and single codegen-unit for maximum p
 Nulang supports optional features for leaner builds:
 
 ```bash
-# Minimal build (no Python, SQLite, or LSP)
+# Minimal build (no Python, SQLite, LSP, AI runtime, or networking)
 cargo build --release --no-default-features
 
 # With WASM backend
@@ -41,11 +41,22 @@ cargo build --release --all-features
 
 | Feature | Default | Description |
 |---------|---------|-------------|
+| `native-codegen` | On | Cranelift-backed tiered JIT and the native/AOT backend |
 | `python` | On | PyO3 Python interop |
 | `sqlite` | On | libsql/Turso persistence |
 | `lsp` | On | tower-lsp language server |
 | `ai-runtime` | On | AI runtime — LLM providers, pipelines, debates, supervisor teams |
-| `wasm-backend` | Off | WASM compiler + Wasmtime runtime |
+| `tls` | On | TLS support for the TCP transport |
+| `ffi` | On | Dynamic native library loading (`extern` FFI) via libloading/libffi |
+| `tcp` | On | Raw TCP networking — distributed-actor transport, HTTP server, metrics/registry/DAP servers |
+| `ureq` | On | Synchronous HTTP client for `Http.get`/`Http.post`, the registry client, and `nula deploy` |
+| `wasm-backend` | Off | WASM compiler + Wasmtime runtime (enables `--backend wasm\|wasm-run\|wasm-aot`) |
+| `wasmfx-backend` | Off | WasmFX stack-switching backend for suspending effects (requires `wasm-backend`) |
+| `http-client` | Off | Async HTTP client (reqwest) |
+| `rocksdb` | Off | RocksDB persistence backend |
+| `postgres` | Off | PostgreSQL persistence backend |
+| `otel` | Off | OpenTelemetry observability |
+| `difffuzz` | Off | Differential fuzzing driver binary |
 
 ## Verifying the Build
 
