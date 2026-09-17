@@ -357,10 +357,7 @@ mod tests {
         ]);
         let arms = vec![
             (
-                Pattern::Variant(
-                    "Some".into(),
-                    Some(Box::new(Pattern::Var("value".into()))),
-                ),
+                Pattern::Variant("Some".into(), Some(Box::new(Pattern::Var("value".into())))),
                 false,
             ),
             (Pattern::Variant("None".into(), None), false),
@@ -377,10 +374,7 @@ mod tests {
         ]);
         let arms = vec![
             (
-                Pattern::Variant(
-                    "Some".into(),
-                    Some(Box::new(Pattern::Lit(Literal::Int(1)))),
-                ),
+                Pattern::Variant("Some".into(), Some(Box::new(Pattern::Lit(Literal::Int(1))))),
                 false,
             ),
             (Pattern::Variant("None".into(), None), false),
