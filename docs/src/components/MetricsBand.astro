@@ -7,9 +7,9 @@ interface Metric {
 }
 
 const metrics: Metric[] = [
-  { value: '1558+', label: 'Tests passing', detail: 'Core language suite' },
-  { value: '4', label: 'Backends', detail: 'VM · JIT · AOT · WASM' },
-  { value: '0', label: 'GC pauses', detail: 'Per-actor collection' },
+  { value: '1,500+', label: 'Tests passing', detail: 'Core language suite' },
+  { value: '3', label: 'Backends', detail: 'Bytecode · Native · WASM' },
+  { value: 'Per-actor', label: 'Garbage collection', detail: 'No stop-the-world pauses' },
   { value: 'Apache 2.0', label: 'Open source', detail: 'Contribute on GitHub', href: 'https://github.com/nulang-org/nulang' },
 ];
 ---
@@ -33,5 +33,8 @@ const metrics: Metric[] = [
         )}
       </div>
     ))}
+  </div>
+  <div class="metrics-demo">
+    <slot />
   </div>
 </section>
