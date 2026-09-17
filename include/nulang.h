@@ -17,20 +17,19 @@
 extern "C" {
 #endif
 
-/** Opaque handle to a Nulang runtime context. */
 typedef struct NulangRuntime NulangRuntime;
 
-/**
- * A Nulang value passed by value.
- *
- * String-valued instances are module-scoped: their payload is an interned
- * string index in the module that produced or created them.
- */
 typedef struct {
     uint64_t raw;
 } NulangValue;
 
-/** ABI-stable C type token used with native function registration. */
+typedef enum {
+    NULANG_STATUS_OK = 0,
+    NULANG_STATUS_INVALID_ARGUMENT = 1,
+    NULANG_STATUS_COMPILE_ERROR = 2,
+    NULANG_STATUS_RUNTIME_ERROR = 3,
+} NulangStatus;
+
 typedef enum {
     NULANG_CTYPE_I64 = 0,
     NULANG_CTYPE_F64 = 1,
@@ -41,17 +40,28 @@ typedef enum {
     NULANG_CTYPE_VALUE = 6,
 } NulangCType;
 
-/* -------------------------------------------------------------------------- */
-/* Runtime lifecycle                                                           */
-/* -------------------------------------------------------------------------- */
-
 NulangRuntime *nulang_runtime_new(void);
 void nulang_runtime_free(NulangRuntime *runtime);
 
-/* -------------------------------------------------------------------------- */
-/* Compilation and execution                                                   */
-/* -------------------------------------------------------------------------- */
+/**
+ * Protected APIs return an explicit status and write results through an
+ * out-parameter. A successful Nulang `nil` therefore remains distinguishable
+ * from failure.
+ */
+NulangStatus nulang_compile_protected(NulangRuntime *runtime,
+                                      const char *source,
+                                      int64_t *out_handle);
+NulangStatus nulang_run_protected(NulangRuntime *runtime,
+                                  int64_t module_handle,
+                                  NulangValue *out_value);
+NulangStatus nulang_call_function_protected(NulangRuntime *runtime,
+                                            int64_t module_handle,
+                                            const char *name,
+                                            const NulangValue *args,
+                                            size_t arg_count,
+                                            NulangValue *out_value);
 
+/** Legacy sentinel-return APIs retained for compatibility. */
 int64_t nulang_compile(NulangRuntime *runtime, const char *source);
 NulangValue nulang_run(NulangRuntime *runtime, int64_t module_handle);
 NulangValue nulang_call_function(NulangRuntime *runtime,
@@ -60,16 +70,8 @@ NulangValue nulang_call_function(NulangRuntime *runtime,
                                  const NulangValue *args,
                                  size_t arg_count);
 
-/* -------------------------------------------------------------------------- */
-/* Error handling                                                              */
-/* -------------------------------------------------------------------------- */
-
 const char *nulang_last_error(NulangRuntime *runtime);
 void nulang_clear_error(NulangRuntime *runtime);
-
-/* -------------------------------------------------------------------------- */
-/* Value constructors                                                          */
-/* -------------------------------------------------------------------------- */
 
 NulangValue nulang_value_int_new(int64_t value);
 NulangValue nulang_value_float_new(double value);
@@ -79,10 +81,6 @@ NulangValue nulang_value_unit(void);
 NulangValue nulang_module_string(NulangRuntime *runtime,
                                  int64_t module_handle,
                                  const char *s);
-
-/* -------------------------------------------------------------------------- */
-/* Value extractors                                                            */
-/* -------------------------------------------------------------------------- */
 
 int64_t nulang_value_int(NulangValue value);
 double nulang_value_float(NulangValue value);
@@ -95,28 +93,12 @@ const char *nulang_module_value_to_string(NulangRuntime *runtime,
                                           NulangValue value);
 bool nulang_free_string(NulangRuntime *runtime, const char *ptr);
 
-/* -------------------------------------------------------------------------- */
-/* Native function registration                                                */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Register a native callback for one NulangRuntime.
- *
- * Library-less `extern { ... }` declarations compiled by this runtime use the
- * private binding first. A same-named callback registered through the legacy
- * process-global API remains only a fallback.
- */
 int nulang_runtime_register_native_function(NulangRuntime *runtime,
                                             const char *name,
                                             const void *ptr,
                                             const NulangCType *params,
                                             size_t param_count,
                                             NulangCType ret);
-
-/**
- * Legacy process-global registration. Prefer
- * `nulang_runtime_register_native_function` for embedded applications.
- */
 int nulang_register_native_function(const char *name,
                                     const void *ptr,
                                     const NulangCType *params,
