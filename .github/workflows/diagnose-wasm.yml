@@ -1,0 +1,35 @@
+name: Diagnose WASM backend
+
+on:
+  push:
+    branches:
+      - debug/wasm-ci-provenance
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run WASM feature tests and capture output
+        shell: bash
+        run: |
+          set +e
+          cargo test --features wasm-backend -- --nocapture > wasm-test.log 2>&1
+          status=$?
+          echo "$status" > wasm-test.status
+          exit 0
+      - name: Upload diagnostic output
+        uses: actions/upload-artifact@v6
+        with:
+          name: wasm-test-diagnostic
+          path: |
+            wasm-test.log
+            wasm-test.status
+          if-no-files-found: error
