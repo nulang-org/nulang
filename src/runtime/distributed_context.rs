@@ -9,31 +9,50 @@ use std::sync::mpsc;
 
 use crate::runtime::cluster::{ClusterState, NodeId};
 use crate::runtime::network::NetworkTransport;
-use crate::runtime::{AddressResolver, Runtime};
+use crate::runtime::{ActorAddress, AddressResolver, Runtime};
 use crate::vm::Value;
 
+/// Cluster advertisement for one ephemeral Fabric subscription.
+///
+/// This is deliberately transport-agnostic. The NUL0/gossip layer can carry
+/// these records without making Fabric depend on a second payload protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricAdvertisement {
+    pub node_id: NodeId,
+    pub pattern: String,
+    pub actor_id: u64,
+    pub behavior: String,
+    pub group: Option<String>,
+}
+
 /// One ephemeral Fabric subscription.
+///
+/// `node_id == None` denotes a subscription owned by this runtime process.
+/// Those entries retain the numeric behavior id needed for fast local and
+/// cross-shard delivery. `node_id == Some(node)` denotes a remote actor and
+/// intentionally stores no numeric behavior id because behavior-table indices
+/// are node-local; remote delivery resolves by behavior name.
 ///
 /// `group == None` is a fan-out subscriber: every matching publication is
 /// delivered to it. `group == Some(name)` is a competing consumer: exactly
 /// one matching member of each group receives a publication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FabricSubscription {
+    node_id: Option<NodeId>,
     pattern: String,
     actor_id: u64,
     behavior: String,
-    behavior_id: u16,
+    behavior_id: Option<u16>,
     group: Option<String>,
 }
 
 impl FabricSubscription {
-    fn validated(
+    fn validate_fields(
         pattern: &str,
         actor_id: u64,
         behavior: &str,
-        behavior_id: u16,
         group: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<(), String> {
         validate_pattern(pattern)?;
         if behavior.is_empty() {
             return Err("Fabric behavior name cannot be empty".to_string());
@@ -44,21 +63,65 @@ impl FabricSubscription {
         if matches!(group, Some("")) {
             return Err("Fabric consumer group cannot be empty".to_string());
         }
+        Ok(())
+    }
+
+    fn local(
+        pattern: &str,
+        actor_id: u64,
+        behavior: &str,
+        behavior_id: u16,
+        group: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::validate_fields(pattern, actor_id, behavior, group)?;
         Ok(Self {
+            node_id: None,
             pattern: pattern.to_string(),
             actor_id,
             behavior: behavior.to_string(),
-            behavior_id,
+            behavior_id: Some(behavior_id),
             group: group.map(str::to_string),
         })
+    }
+
+    fn remote(advertisement: FabricAdvertisement) -> Result<Self, String> {
+        Self::validate_fields(
+            &advertisement.pattern,
+            advertisement.actor_id,
+            &advertisement.behavior,
+            advertisement.group.as_deref(),
+        )?;
+        Ok(Self {
+            node_id: Some(advertisement.node_id),
+            pattern: advertisement.pattern,
+            actor_id: advertisement.actor_id,
+            behavior: advertisement.behavior,
+            behavior_id: None,
+            group: advertisement.group,
+        })
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        self.node_id == other.node_id
+            && self.pattern == other.pattern
+            && self.actor_id == other.actor_id
+            && self.behavior == other.behavior
+            && self.group == other.group
     }
 }
 
 /// A concrete actor delivery selected by Fabric routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FabricTarget {
-    actor_id: u64,
-    behavior_id: u16,
+enum FabricTarget {
+    Local {
+        actor_id: u64,
+        behavior_id: u16,
+    },
+    Remote {
+        node_id: NodeId,
+        actor_id: u64,
+        behavior: String,
+    },
 }
 
 /// Cross-shard Fabric control traffic.
@@ -68,37 +131,103 @@ struct FabricTarget {
 #[derive(Debug, Clone)]
 enum FabricControl {
     Subscribe(FabricSubscription),
-    UnsubscribeActor(u64),
+    UnsubscribeLocalActor(u64),
+    ReplaceRemoteNode {
+        node_id: NodeId,
+        subscriptions: Vec<FabricSubscription>,
+    },
+    RemoveRemoteNode(NodeId),
 }
 
 /// Ephemeral topic routing state.
 ///
 /// Every Fabric-enabled runtime shard keeps the same subscription metadata.
 /// A publisher therefore selects targets once on its own shard and then uses
-/// ordinary actor delivery for local/cross-shard payload transport.
+/// ordinary actor delivery for local/cross-shard payload transport and the
+/// existing distributed actor transport for remote targets.
 #[derive(Default)]
 struct FabricRegistry {
     subscriptions: Vec<FabricSubscription>,
-    group_cursors: HashMap<String, usize>,
+    // Queue-group cursors are scoped by concrete topic as well as group name;
+    // unrelated subjects using the same queue-group label must not perturb
+    // one another's deterministic round-robin order.
+    group_cursors: HashMap<(String, String), usize>,
 }
 
 impl FabricRegistry {
     fn insert(&mut self, candidate: FabricSubscription) -> bool {
-        if self.subscriptions.contains(&candidate) {
+        if let Some(existing) = self
+            .subscriptions
+            .iter_mut()
+            .find(|existing| existing.same_identity(&candidate))
+        {
+            // Local hot reloads may keep the same subscription identity while
+            // the numeric behavior-table slot changes. Refresh it rather than
+            // silently retaining the stale id.
+            if existing.behavior_id != candidate.behavior_id {
+                *existing = candidate;
+                return true;
+            }
             return false;
         }
         self.subscriptions.push(candidate);
         true
     }
 
-    fn unsubscribe_actor(&mut self, actor_id: u64) -> usize {
+    fn unsubscribe_local_actor(&mut self, actor_id: u64) -> usize {
         let before = self.subscriptions.len();
-        self.subscriptions.retain(|sub| sub.actor_id != actor_id);
+        self.subscriptions
+            .retain(|sub| sub.node_id.is_some() || sub.actor_id != actor_id);
         before - self.subscriptions.len()
+    }
+
+    fn remove_remote_node(&mut self, node_id: NodeId) -> usize {
+        let before = self.subscriptions.len();
+        self.subscriptions
+            .retain(|sub| sub.node_id != Some(node_id));
+        before - self.subscriptions.len()
+    }
+
+    fn replace_remote_node(
+        &mut self,
+        node_id: NodeId,
+        subscriptions: Vec<FabricSubscription>,
+    ) -> usize {
+        let removed = self.remove_remote_node(node_id);
+        let mut inserted = 0;
+        for subscription in subscriptions {
+            debug_assert_eq!(subscription.node_id, Some(node_id));
+            if self.insert(subscription) {
+                inserted += 1;
+            }
+        }
+        removed + inserted
+    }
+
+    fn local_advertisements(&self, node_id: NodeId, limit: usize) -> Vec<FabricAdvertisement> {
+        self.subscriptions
+            .iter()
+            .filter(|sub| sub.node_id.is_none())
+            .take(limit)
+            .map(|sub| FabricAdvertisement {
+                node_id,
+                pattern: sub.pattern.clone(),
+                actor_id: sub.actor_id,
+                behavior: sub.behavior.clone(),
+                group: sub.group.clone(),
+            })
+            .collect()
     }
 
     fn len(&self) -> usize {
         self.subscriptions.len()
+    }
+
+    fn remote_len(&self) -> usize {
+        self.subscriptions
+            .iter()
+            .filter(|sub| sub.node_id.is_some())
+            .count()
     }
 
     fn route(&mut self, topic: &str) -> Result<Vec<FabricTarget>, String> {
@@ -113,9 +242,20 @@ impl FabricRegistry {
             if !pattern_matches(&sub.pattern, topic) {
                 continue;
             }
-            let target = FabricTarget {
-                actor_id: sub.actor_id,
-                behavior_id: sub.behavior_id,
+            let target = match (sub.node_id, sub.behavior_id) {
+                (None, Some(behavior_id)) => FabricTarget::Local {
+                    actor_id: sub.actor_id,
+                    behavior_id,
+                },
+                (Some(node_id), _) => FabricTarget::Remote {
+                    node_id,
+                    actor_id: sub.actor_id,
+                    behavior: sub.behavior.clone(),
+                },
+                // A local entry without a behavior id violates the registry's
+                // construction invariant. Skip it rather than dispatching to
+                // an arbitrary behavior.
+                (None, None) => continue,
             };
             if let Some(group) = &sub.group {
                 grouped.entry(group.clone()).or_default().push(target);
@@ -128,7 +268,8 @@ impl FabricRegistry {
             if members.is_empty() {
                 continue;
             }
-            let cursor = self.group_cursors.entry(group).or_insert(0);
+            let key = (topic.to_string(), group);
+            let cursor = self.group_cursors.entry(key).or_insert(0);
             let index = *cursor % members.len();
             targets.push(members[index].clone());
             *cursor = cursor.wrapping_add(1);
@@ -303,8 +444,21 @@ impl Runtime {
                     self.distributed.fabric.insert(subscription);
                     applied += 1;
                 }
-                Ok(FabricControl::UnsubscribeActor(actor_id)) => {
-                    self.distributed.fabric.unsubscribe_actor(actor_id);
+                Ok(FabricControl::UnsubscribeLocalActor(actor_id)) => {
+                    self.distributed.fabric.unsubscribe_local_actor(actor_id);
+                    applied += 1;
+                }
+                Ok(FabricControl::ReplaceRemoteNode {
+                    node_id,
+                    subscriptions,
+                }) => {
+                    self.distributed
+                        .fabric
+                        .replace_remote_node(node_id, subscriptions);
+                    applied += 1;
+                }
+                Ok(FabricControl::RemoveRemoteNode(node_id)) => {
+                    self.distributed.fabric.remove_remote_node(node_id);
                     applied += 1;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -337,7 +491,7 @@ impl Runtime {
             format!("Fabric subscriber actor {actor_id} has no behavior `{behavior}`")
         })?;
         let subscription =
-            FabricSubscription::validated(pattern, actor_id, behavior, behavior_id, None)?;
+            FabricSubscription::local(pattern, actor_id, behavior, behavior_id, None)?;
         let inserted = self.distributed.fabric.insert(subscription.clone());
         if inserted {
             self.fabric_broadcast_control(FabricControl::Subscribe(subscription));
@@ -348,8 +502,8 @@ impl Runtime {
     /// Subscribe a local actor as a competing consumer in `group`.
     ///
     /// For each publication, Fabric selects exactly one matching subscriber
-    /// from every consumer group using deterministic per-publisher-shard
-    /// round-robin routing.
+    /// from every consumer group using deterministic per-topic round-robin
+    /// routing.
     pub fn fabric_subscribe_group(
         &mut self,
         pattern: &str,
@@ -365,7 +519,7 @@ impl Runtime {
             format!("Fabric subscriber actor {actor_id} has no behavior `{behavior}`")
         })?;
         let subscription =
-            FabricSubscription::validated(pattern, actor_id, behavior, behavior_id, Some(group))?;
+            FabricSubscription::local(pattern, actor_id, behavior, behavior_id, Some(group))?;
         let inserted = self.distributed.fabric.insert(subscription.clone());
         if inserted {
             self.fabric_broadcast_control(FabricControl::Subscribe(subscription));
@@ -373,13 +527,90 @@ impl Runtime {
         Ok(inserted)
     }
 
-    /// Remove every Fabric subscription owned by `actor_id` and replicate the
-    /// removal to the other Fabric-enabled shards.
+    /// Remove every local Fabric subscription owned by `actor_id` and
+    /// replicate the removal to the other Fabric-enabled shards.
+    ///
+    /// Remote entries with the same numeric actor id are intentionally kept:
+    /// actor ids are not globally unique across independent cluster nodes.
     pub fn fabric_unsubscribe_actor(&mut self, actor_id: u64) -> usize {
         self.fabric_sync();
-        let removed = self.distributed.fabric.unsubscribe_actor(actor_id);
+        let removed = self.distributed.fabric.unsubscribe_local_actor(actor_id);
         if removed > 0 {
-            self.fabric_broadcast_control(FabricControl::UnsubscribeActor(actor_id));
+            self.fabric_broadcast_control(FabricControl::UnsubscribeLocalActor(actor_id));
+        }
+        removed
+    }
+
+    /// Return a bounded snapshot of this node's local subscriptions suitable
+    /// for cluster advertisement. Remote subscriptions learned from other
+    /// nodes are never re-advertised by this method.
+    ///
+    /// An undistributed runtime has no cluster node identity and therefore
+    /// returns an empty advertisement set.
+    pub fn fabric_advertisements(&mut self, limit: usize) -> Vec<FabricAdvertisement> {
+        self.fabric_sync();
+        let Some(node_id) = self.distributed.node_id else {
+            return Vec::new();
+        };
+        self.distributed
+            .fabric
+            .local_advertisements(node_id, limit)
+    }
+
+    /// Replace the complete remote subscription snapshot for one cluster node.
+    ///
+    /// The caller is expected to invoke this with a complete snapshot from a
+    /// trusted cluster transport (for example a Fabric tail on NUL0 gossip).
+    /// Every advertisement must claim the same `node_id`; mismatches are
+    /// rejected so a peer cannot smuggle another node's routing identity into
+    /// a direct snapshot.
+    pub fn fabric_replace_remote_advertisements(
+        &mut self,
+        node_id: NodeId,
+        advertisements: Vec<FabricAdvertisement>,
+    ) -> Result<usize, String> {
+        self.fabric_sync();
+        if !self.distributed.enabled || self.distributed.node_id.is_none() {
+            return Err("Fabric remote advertisements require distribution to be enabled".into());
+        }
+        if self.distributed.node_id == Some(node_id) {
+            return Ok(0);
+        }
+
+        let mut subscriptions = Vec::with_capacity(advertisements.len());
+        for advertisement in advertisements {
+            if advertisement.node_id != node_id {
+                return Err(format!(
+                    "Fabric advertisement node mismatch: snapshot owner {:?}, entry claims {:?}",
+                    node_id, advertisement.node_id
+                ));
+            }
+            subscriptions.push(FabricSubscription::remote(advertisement)?);
+        }
+
+        let changed = self
+            .distributed
+            .fabric
+            .replace_remote_node(node_id, subscriptions.clone());
+        // Broadcast even if this shard already had the same logical snapshot:
+        // another shard may have joined the control plane later and need the
+        // authoritative replacement to converge.
+        self.fabric_broadcast_control(FabricControl::ReplaceRemoteNode {
+            node_id,
+            subscriptions,
+        });
+        Ok(changed)
+    }
+
+    /// Remove all subscriptions learned from `node_id`.
+    ///
+    /// Cluster failure/removal handling should call this as soon as a node is
+    /// no longer routable so Fabric cannot select dead remote consumers.
+    pub fn fabric_remove_remote_node(&mut self, node_id: NodeId) -> usize {
+        self.fabric_sync();
+        let removed = self.distributed.fabric.remove_remote_node(node_id);
+        if removed > 0 {
+            self.fabric_broadcast_control(FabricControl::RemoveRemoteNode(node_id));
         }
         removed
     }
@@ -392,18 +623,45 @@ impl Runtime {
         self.distributed.fabric.len()
     }
 
+    /// Number of subscriptions currently learned from remote cluster nodes.
+    pub fn fabric_remote_subscription_count(&self) -> usize {
+        self.distributed.fabric.remote_len()
+    }
+
     /// Publish an ephemeral Fabric message to a concrete topic.
     ///
     /// The returned count is the number of actor deliveries selected by
-    /// routing. In a Fabric-sharded runtime, subscription metadata is synced
-    /// first and ordinary `send_message_by_id` handles local vs cross-shard
-    /// payload delivery.
+    /// routing. Local and same-process cross-shard targets use numeric actor
+    /// delivery; remote targets use the existing location-transparent actor
+    /// transport and resolve behavior by name on the destination node.
     pub fn fabric_publish(&mut self, topic: &str, args: &[Value]) -> Result<usize, String> {
         self.fabric_sync();
         let targets = self.distributed.fabric.route(topic)?;
+        if !self.distributed.enabled
+            && targets
+                .iter()
+                .any(|target| matches!(target, FabricTarget::Remote { .. }))
+        {
+            return Err("Fabric remote publication requires distribution to be enabled".into());
+        }
+
         let delivered = targets.len();
         for target in targets {
-            self.send_message_by_id(target.actor_id, target.behavior_id, args);
+            match target {
+                FabricTarget::Local {
+                    actor_id,
+                    behavior_id,
+                } => self.send_message_by_id(actor_id, behavior_id, args),
+                FabricTarget::Remote {
+                    node_id,
+                    actor_id,
+                    behavior,
+                } => self.send_distributed(
+                    ActorAddress::remote(node_id, actor_id),
+                    &behavior,
+                    args,
+                ),
+            }
         }
         Ok(delivered)
     }
@@ -443,26 +701,24 @@ mod tests {
     fn fabric_fans_out_and_round_robins_consumer_groups() {
         let mut fabric = FabricRegistry::default();
         assert!(fabric.insert(
-            FabricSubscription::validated("orders.*", 1, "fanout", 10, None).unwrap()
+            FabricSubscription::local("orders.*", 1, "fanout", 10, None).unwrap()
         ));
         assert!(fabric.insert(
-            FabricSubscription::validated("orders.created", 2, "work", 20, Some("billing"))
-                .unwrap()
+            FabricSubscription::local("orders.created", 2, "work", 20, Some("billing")).unwrap()
         ));
         assert!(fabric.insert(
-            FabricSubscription::validated("orders.created", 3, "work", 30, Some("billing"))
-                .unwrap()
+            FabricSubscription::local("orders.created", 3, "work", 30, Some("billing")).unwrap()
         ));
 
         let first = fabric.route("orders.created").unwrap();
         assert_eq!(
             first,
             vec![
-                FabricTarget {
+                FabricTarget::Local {
                     actor_id: 1,
                     behavior_id: 10,
                 },
-                FabricTarget {
+                FabricTarget::Local {
                     actor_id: 2,
                     behavior_id: 20,
                 },
@@ -470,24 +726,44 @@ mod tests {
         );
 
         let second = fabric.route("orders.created").unwrap();
-        assert_eq!(second[0].actor_id, 1);
-        assert_eq!(second[1].actor_id, 3);
+        assert!(matches!(
+            second[0],
+            FabricTarget::Local { actor_id: 1, .. }
+        ));
+        assert!(matches!(
+            second[1],
+            FabricTarget::Local { actor_id: 3, .. }
+        ));
 
         let third = fabric.route("orders.created").unwrap();
-        assert_eq!(third[1].actor_id, 2);
+        assert!(matches!(
+            third[1],
+            FabricTarget::Local { actor_id: 2, .. }
+        ));
     }
 
     #[test]
-    fn fabric_deduplicates_identical_subscriptions_and_removes_actor_entries() {
+    fn fabric_deduplicates_identical_subscriptions_and_removes_local_actor_entries() {
         let mut fabric = FabricRegistry::default();
-        let fanout = FabricSubscription::validated("events.>", 7, "handle", 1, None).unwrap();
+        let fanout = FabricSubscription::local("events.>", 7, "handle", 1, None).unwrap();
         assert!(fabric.insert(fanout.clone()));
         assert!(!fabric.insert(fanout));
         assert!(fabric.insert(
-            FabricSubscription::validated("events.>", 7, "handle", 1, Some("workers")).unwrap()
+            FabricSubscription::local("events.>", 7, "handle", 1, Some("workers")).unwrap()
         ));
-        assert_eq!(fabric.unsubscribe_actor(7), 2);
-        assert!(fabric.route("events.created").unwrap().is_empty());
+
+        let remote = FabricSubscription::remote(FabricAdvertisement {
+            node_id: NodeId(99),
+            pattern: "events.>".into(),
+            actor_id: 7,
+            behavior: "handle".into(),
+            group: None,
+        })
+        .unwrap();
+        assert!(fabric.insert(remote));
+
+        assert_eq!(fabric.unsubscribe_local_actor(7), 2);
+        assert_eq!(fabric.remote_len(), 1);
     }
 
     #[test]
@@ -538,5 +814,85 @@ mod tests {
 
         shards[0].drain_cross_shard_messages();
         assert_eq!(shards[0].actors.get(&actor_id).unwrap().mailbox.len(), 1);
+    }
+
+    #[test]
+    fn fabric_exports_local_subscriptions_and_replaces_remote_snapshots() {
+        let mut source = Runtime::new();
+        source.distributed.enabled = true;
+        source.distributed.node_id = Some(NodeId(10));
+        let actor_id = source.spawn_actor(Box::new(|| Vec::new()));
+        source
+            .actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .register_behavior("handle", noop);
+        source
+            .fabric_subscribe_group("jobs.*", "workers", actor_id, "handle")
+            .unwrap();
+
+        let advertisements = source.fabric_advertisements(16);
+        assert_eq!(advertisements.len(), 1);
+        assert_eq!(advertisements[0].node_id, NodeId(10));
+        assert_eq!(advertisements[0].pattern, "jobs.*");
+        assert_eq!(advertisements[0].group.as_deref(), Some("workers"));
+
+        let mut target = Runtime::new();
+        target.distributed.enabled = true;
+        target.distributed.node_id = Some(NodeId(20));
+        assert_eq!(
+            target
+                .fabric_replace_remote_advertisements(NodeId(10), advertisements)
+                .unwrap(),
+            1
+        );
+        assert_eq!(target.fabric_remote_subscription_count(), 1);
+        assert_eq!(
+            target.distributed.fabric.route("jobs.render").unwrap(),
+            vec![FabricTarget::Remote {
+                node_id: NodeId(10),
+                actor_id,
+                behavior: "handle".into(),
+            }]
+        );
+
+        target
+            .fabric_replace_remote_advertisements(NodeId(10), Vec::new())
+            .unwrap();
+        assert_eq!(target.fabric_remote_subscription_count(), 0);
+    }
+
+    #[test]
+    fn fabric_remote_node_cleanup_does_not_remove_colliding_local_actor_id() {
+        let mut rt = Runtime::new();
+        rt.distributed.enabled = true;
+        rt.distributed.node_id = Some(NodeId(20));
+
+        let actor_id = rt.spawn_actor(Box::new(|| Vec::new()));
+        rt.actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .register_behavior("handle", noop);
+        rt.fabric_subscribe("events.*", actor_id, "handle")
+            .unwrap();
+
+        let advertisement = FabricAdvertisement {
+            node_id: NodeId(10),
+            pattern: "events.*".into(),
+            actor_id,
+            behavior: "handle".into(),
+            group: None,
+        };
+        rt.fabric_replace_remote_advertisements(NodeId(10), vec![advertisement])
+            .unwrap();
+        assert_eq!(rt.fabric_subscription_count(), 2);
+
+        assert_eq!(rt.fabric_remove_remote_node(NodeId(10)), 1);
+        assert_eq!(rt.fabric_subscription_count(), 1);
+        assert_eq!(rt.fabric_remote_subscription_count(), 0);
+        assert!(matches!(
+            rt.distributed.fabric.route("events.created").unwrap()[0],
+            FabricTarget::Local { actor_id: id, .. } if id == actor_id
+        ));
     }
 }
