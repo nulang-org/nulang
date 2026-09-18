@@ -43,12 +43,9 @@ pub struct FabricStreamReplicaAppend {
     pub payload: Vec<u8>,
 }
 
-pub(crate) const FABRIC_STREAM_REPLICA_BEHAVIOR: &str =
-    "__nulang_fabric_stream_replica_v1";
+pub(crate) const FABRIC_STREAM_REPLICA_BEHAVIOR: &str = "__nulang_fabric_stream_replica_v1";
 const MAX_REPLICA_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
-pub(crate) const FABRIC_STREAM_REPLICA_ACK_BEHAVIOR: &str =
-    "__nulang_fabric_stream_replica_ack_v1";
-
+pub(crate) const FABRIC_STREAM_REPLICA_ACK_BEHAVIOR: &str = "__nulang_fabric_stream_replica_ack_v1";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FabricStreamReplicaDispatchReport {
@@ -228,7 +225,10 @@ impl Runtime {
             payload,
         )?;
         let quorum = replication_factor / 2 + 1;
-        let local = self.distributed.node_id.expect("placement validated node id");
+        let local = self
+            .distributed
+            .node_id
+            .expect("placement validated node id");
 
         let key = (stream.to_string(), partition);
         let mut acknowledgements = HashSet::new();
@@ -445,11 +445,7 @@ impl Runtime {
         })
     }
 
-    fn fabric_stream_advance_commits(
-        &mut self,
-        stream: &str,
-        partition: u16,
-    ) -> io::Result<u64> {
+    fn fabric_stream_advance_commits(&mut self, stream: &str, partition: u16) -> io::Result<u64> {
         let mut committed = self.fabric_stream_committed_sequence(stream)?;
         let key = (stream.to_string(), partition);
 
@@ -480,7 +476,10 @@ impl Runtime {
                 false
             };
             if remove_partition {
-                self.distributed.fabric_stream_replication.pending.remove(&key);
+                self.distributed
+                    .fabric_stream_replication
+                    .pending
+                    .remove(&key);
             }
             committed = next;
         }
@@ -545,7 +544,10 @@ impl Runtime {
 
         if let Some(cluster) = self.distributed.cluster.as_ref() {
             let local_status = cluster.get_node(local).map(|member| member.status);
-            if !matches!(local_status, Some(NodeStatus::Healthy | NodeStatus::Joining)) {
+            if !matches!(
+                local_status,
+                Some(NodeStatus::Healthy | NodeStatus::Joining)
+            ) {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "local Fabric stream leader is not healthy",
@@ -753,7 +755,6 @@ impl Runtime {
 
         store.append_replica(&append.stream, append.sequence, &append.payload)
     }
-
 }
 
 fn compute_stream_placement(
@@ -801,9 +802,8 @@ fn compute_stream_placement(
     }
 
     let membership_fingerprint = membership_fingerprint(&candidates);
-    candidates.sort_by_key(|node| {
-        Reverse((rendezvous_score(stream, partition, *node), Reverse(node.0)))
-    });
+    candidates
+        .sort_by_key(|node| Reverse((rendezvous_score(stream, partition, *node), Reverse(node.0))));
     let replicas: Vec<NodeId> = candidates.into_iter().take(replication_factor).collect();
     let leader = *replicas
         .first()
@@ -859,10 +859,7 @@ mod tests {
         format!("127.0.0.1:{port}").parse().unwrap()
     }
 
-    fn runtime_with_members(
-        local_addr: SocketAddr,
-        peer_addrs: &[SocketAddr],
-    ) -> Runtime {
+    fn runtime_with_members(local_addr: SocketAddr, peer_addrs: &[SocketAddr]) -> Runtime {
         let local = NodeId::new(&local_addr);
         let mut runtime = Runtime::new();
         runtime.distributed.enabled = true;
@@ -982,7 +979,10 @@ mod tests {
             accepted: true,
         };
         let bytes = ack.to_wire_bytes().unwrap();
-        assert_eq!(FabricStreamReplicaAck::from_wire_bytes(&bytes).unwrap(), ack);
+        assert_eq!(
+            FabricStreamReplicaAck::from_wire_bytes(&bytes).unwrap(),
+            ack
+        );
     }
 
     #[test]
