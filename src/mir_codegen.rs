@@ -1446,7 +1446,7 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
                         ) =>
                     {
                         is_float[l.0 as usize] || is_float[r.0 as usize]
-                        }
+                    }
                     _ => false,
                 };
                 if result && !is_float[dst.0 as usize] {
@@ -1497,9 +1497,7 @@ const MAX_OPT_ITERATIONS: usize = 10;
 
 /// Materialize the small ownership-transfer side table as a lookup set used
 /// by optimization and Drop planning.
-fn ownership_transfer_pairs(
-    func: &mir::Function,
-) -> HashSet<(mir::LocalId, mir::LocalId)> {
+fn ownership_transfer_pairs(func: &mir::Function) -> HashSet<(mir::LocalId, mir::LocalId)> {
     func.ownership_transfers
         .iter()
         .map(|t| (t.src, t.dst))
@@ -2460,7 +2458,7 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
     let mut loads: Vec<(usize, usize)> = Vec::new();
 
     for (bi, block) in func.blocks.iter().enumerate() {
-        for (si, stmt) in block.stmts.iter().enumerate() {
+        for stmt in &block.stmts {
             for (u, kind) in stmt_uses_for_drop(stmt, &transfers) {
                 block_uses[bi].insert(u);
                 if kind == UseKind::Copy {
@@ -2606,9 +2604,7 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
                     // statement. Always sound for a candidate: the register
                     // holds the previous definition's product (or nil after
                     // an earlier drop), never an alias.
-                    if !is_transfer_clear(&block.stmts, si, &transfers)
-                        && esc_clear(d, &live)
-                    {
+                    if !is_transfer_clear(&block.stmts, si, &transfers) && esc_clear(d, &live) {
                         plan.before_stmt.entry((bi, si)).or_default().push(*dst);
                     }
                 }
@@ -2700,7 +2696,9 @@ mod tests {
         assert!(transfers.contains(&(src, dst)));
         let stmts = &f.blocks[0].stmts;
         assert!(
-            stmts.iter().any(|s| transfer_move(s, &transfers) == Some((src, dst))),
+            stmts
+                .iter()
+                .any(|s| transfer_move(s, &transfers) == Some((src, dst))),
             "DCE/folding must preserve ownership transfer move"
         );
         assert!(
@@ -3190,6 +3188,7 @@ mod tests {
                 name: "__main".into(),
                 type_params: vec![],
                 params: vec![],
+                param_caps: vec![],
                 dict_params: vec![],
                 ret: crate::types::Type::unit(),
                 effect: crate::types::EffectRow::empty(),
