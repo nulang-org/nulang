@@ -561,7 +561,6 @@ fn lagging_committed_replica_catches_up_and_receives_commit_boundary() {
     }
 }
 
-
 #[test]
 fn pending_stream_replication_retries_automatically_on_logical_clock() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
