@@ -604,7 +604,10 @@ impl Runtime {
         })?;
         let bytes = commit.to_wire_bytes()?;
         let cluster = self.distributed.cluster.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "cluster membership is unavailable")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "cluster membership is unavailable",
+            )
         })?;
         let mut targets = Vec::new();
         for node in &commit.proposal.to_policy.replicas {
@@ -619,7 +622,10 @@ impl Runtime {
             }
         }
         let transport = self.distributed.transport.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "network transport is unavailable")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "network transport is unavailable",
+            )
         })?;
         for (node, address) in targets {
             transport.send(
