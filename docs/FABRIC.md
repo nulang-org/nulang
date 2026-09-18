@@ -198,7 +198,9 @@ semantics that later cluster and stream layers can reuse.
 - [x] Explicit idempotent retry for recovered uncommitted sequences.
 - [ ] Automatic retry scheduling / backoff.
 - [ ] Leader epoch/lease and automatic failover.
-- [ ] Lagging committed-replica catch-up and committed-index propagation.
+- [x] Durable per-replica progress for application ACKs.
+- [x] Bounded lagging committed-replica catch-up.
+- [x] Committed-index propagation to followers.
 - [x] Durable monotonic consumer cursors.
 - [ ] Consumer ACK/NACK and timed redelivery.
 - [x] Replay by sequence and committed consumer cursor.
