@@ -6,10 +6,10 @@
 //! access. Keeping the two concepts distinct avoids overloading the word
 //! "capability" in compiler and runtime code.
 //!
-//! The current spawn pipeline still carries canonical authority tokens as
-//! strings. `AuthorityGrant` is the migration target and provides a strict
-//! parser/formatter so existing tokens can cross that boundary without making
-//! security-sensitive runtime decisions on ad-hoc string matching.
+//! The semantic spawn pipeline carries `AuthorityGrant` structurally through
+//! AST/HIR/MIR. Canonical strings remain only at stable artifact, persistence,
+//! and runtime-compatibility boundaries, where strict parsing prevents
+//! security-sensitive decisions from depending on ad-hoc string matching.
 
 use std::collections::BTreeSet;
 use std::error::Error;
