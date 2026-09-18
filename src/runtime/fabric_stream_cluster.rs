@@ -4,11 +4,11 @@
 //! zero). Placement is generic over a partition id so the ownership contract
 //! does not change when physical multi-partition logs land later.
 //!
-//! Important safety property: placement uses the stable *known* membership set,
-//! including Suspicious/Failed nodes, and changes only after a node is confirmed
-//! removed or gracefully leaving. A transient partition therefore does not
-//! elect a second writer. If the designated leader is unavailable, writes fail
-//! closed until an explicit failover/epoch mechanism is introduced.
+//! Important safety property: current membership is used to compute candidate
+//! placement for bootstrap and explicit reconfiguration, while an established
+//! stream's normal data plane follows its durable replication policy exactly.
+//! Suspicious/Failed nodes remain candidate members until confirmed removed, so
+//! transient liveness disagreement cannot independently move leadership.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
