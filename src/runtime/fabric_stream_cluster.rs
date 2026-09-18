@@ -11,6 +11,7 @@
 //! closed until an explicit failover/epoch mechanism is introduced.
 
 use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 
 use crate::runtime::{
@@ -45,12 +46,103 @@ pub struct FabricStreamReplicaAppend {
 pub(crate) const FABRIC_STREAM_REPLICA_BEHAVIOR: &str =
     "__nulang_fabric_stream_replica_v1";
 const MAX_REPLICA_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const FABRIC_STREAM_REPLICA_ACK_BEHAVIOR: &str =
+    "__nulang_fabric_stream_replica_ack_v1";
+
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FabricStreamReplicaDispatchReport {
     pub intended_remote: usize,
     pub dispatched: usize,
     pub unavailable: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FabricStreamReplicationStatus {
+    pub sequence: u64,
+    pub quorum: usize,
+    pub acknowledgements: usize,
+    pub rejections: usize,
+    pub committed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FabricStreamReplicatedAppendResult {
+    pub sequence: u64,
+    pub status: FabricStreamReplicationStatus,
+    pub dispatch: FabricStreamReplicaDispatchReport,
+}
+
+#[derive(Debug, Clone)]
+struct PendingReplicaCommit {
+    leader: NodeId,
+    membership_fingerprint: u64,
+    replicas: HashSet<NodeId>,
+    acknowledgements: HashSet<NodeId>,
+    rejections: HashSet<NodeId>,
+    quorum: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FabricStreamReplicationState {
+    pending: HashMap<(String, u16), BTreeMap<u64, PendingReplicaCommit>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FabricStreamReplicaAck {
+    pub stream: String,
+    pub partition: u16,
+    pub leader: NodeId,
+    pub membership_fingerprint: u64,
+    pub sequence: u64,
+    pub replica: NodeId,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FabricStreamReplicaAckWire {
+    stream: String,
+    partition: u16,
+    leader: u64,
+    membership_fingerprint: u64,
+    sequence: u64,
+    replica: u64,
+    accepted: bool,
+}
+
+impl FabricStreamReplicaAck {
+    pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
+        serde_json::to_vec(&FabricStreamReplicaAckWire {
+            stream: self.stream.clone(),
+            partition: self.partition,
+            leader: self.leader.0,
+            membership_fingerprint: self.membership_fingerprint,
+            sequence: self.sequence,
+            replica: self.replica.0,
+            accepted: self.accepted,
+        })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
+        let wire: FabricStreamReplicaAckWire = serde_json::from_slice(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if wire.stream.is_empty() || wire.sequence == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Fabric stream replica ACK",
+            ));
+        }
+        Ok(Self {
+            stream: wire.stream,
+            partition: wire.partition,
+            leader: NodeId(wire.leader),
+            membership_fingerprint: wire.membership_fingerprint,
+            sequence: wire.sequence,
+            replica: NodeId(wire.replica),
+            accepted: wire.accepted,
+        })
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -121,6 +213,211 @@ impl FabricStreamReplicaAppend {
 
 
 impl Runtime {
+    /// Append locally as leader, create a pending quorum ticket, and dispatch
+    /// the replica envelope to reachable followers.
+    pub fn fabric_stream_replicated_append(
+        &mut self,
+        stream: &str,
+        partition: u16,
+        replication_factor: usize,
+        payload: &[u8],
+    ) -> io::Result<FabricStreamReplicatedAppendResult> {
+        let (placement, append) = self.fabric_stream_prepare_replica_append(
+            stream,
+            partition,
+            replication_factor,
+            payload,
+        )?;
+        let quorum = replication_factor / 2 + 1;
+        let local = self.distributed.node_id.expect("placement validated node id");
+
+        let key = (stream.to_string(), partition);
+        let mut acknowledgements = HashSet::new();
+        acknowledgements.insert(local);
+        self.distributed
+            .fabric_stream_replication
+            .pending
+            .entry(key)
+            .or_default()
+            .insert(
+                append.sequence,
+                PendingReplicaCommit {
+                    leader: placement.leader,
+                    membership_fingerprint: placement.membership_fingerprint,
+                    replicas: placement.replicas.iter().copied().collect(),
+                    acknowledgements,
+                    rejections: HashSet::new(),
+                    quorum,
+                },
+            );
+
+        // Replication factor one is committed by the leader's own fsync.
+        if quorum == 1 {
+            self.fabric_stream_advance_commits(stream, partition)?;
+        }
+
+        let dispatch = self.fabric_stream_dispatch_replica_append(&placement, &append)?;
+        let status = self.fabric_stream_replication_status(stream, partition, append.sequence)?;
+        Ok(FabricStreamReplicatedAppendResult {
+            sequence: append.sequence,
+            status,
+            dispatch,
+        })
+    }
+
+    pub fn fabric_stream_replication_status(
+        &mut self,
+        stream: &str,
+        partition: u16,
+        sequence: u64,
+    ) -> io::Result<FabricStreamReplicationStatus> {
+        let committed = self.fabric_stream_committed_sequence(stream)?;
+        if sequence <= committed {
+            return Ok(FabricStreamReplicationStatus {
+                sequence,
+                quorum: 0,
+                acknowledgements: 0,
+                rejections: 0,
+                committed: true,
+            });
+        }
+
+        let key = (stream.to_string(), partition);
+        let pending = self
+            .distributed
+            .fabric_stream_replication
+            .pending
+            .get(&key)
+            .and_then(|entries| entries.get(&sequence))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "no pending Fabric replication ticket for {stream} partition {partition} sequence {sequence}"
+                    ),
+                )
+            })?;
+
+        Ok(FabricStreamReplicationStatus {
+            sequence,
+            quorum: pending.quorum,
+            acknowledgements: pending.acknowledgements.len(),
+            rejections: pending.rejections.len(),
+            committed: false,
+        })
+    }
+
+    pub(crate) fn fabric_stream_record_replica_ack(
+        &mut self,
+        ack: FabricStreamReplicaAck,
+    ) -> io::Result<FabricStreamReplicationStatus> {
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream replica ACK requires distribution",
+            )
+        })?;
+        if ack.leader != local {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Fabric stream replica ACK targets a different leader",
+            ));
+        }
+
+        let key = (ack.stream.clone(), ack.partition);
+        {
+            let ticket = self
+                .distributed
+                .fabric_stream_replication
+                .pending
+                .get_mut(&key)
+                .and_then(|entries| entries.get_mut(&ack.sequence))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "Fabric stream replica ACK has no pending ticket",
+                    )
+                })?;
+
+            if ticket.leader != ack.leader
+                || ticket.membership_fingerprint != ack.membership_fingerprint
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stale Fabric stream replica ACK",
+                ));
+            }
+            if !ticket.replicas.contains(&ack.replica) || ack.replica == local {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Fabric stream replica ACK came from a non-follower",
+                ));
+            }
+
+            if ack.accepted {
+                ticket.rejections.remove(&ack.replica);
+                ticket.acknowledgements.insert(ack.replica);
+            } else if !ticket.acknowledgements.contains(&ack.replica) {
+                ticket.rejections.insert(ack.replica);
+            }
+        }
+
+        self.fabric_stream_advance_commits(&ack.stream, ack.partition)?;
+        self.fabric_stream_replication_status(&ack.stream, ack.partition, ack.sequence)
+            .or_else(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    Ok(FabricStreamReplicationStatus {
+                        sequence: ack.sequence,
+                        quorum: 0,
+                        acknowledgements: 0,
+                        rejections: 0,
+                        committed: true,
+                    })
+                } else {
+                    Err(error)
+                }
+            })
+    }
+
+    fn fabric_stream_advance_commits(
+        &mut self,
+        stream: &str,
+        partition: u16,
+    ) -> io::Result<u64> {
+        let mut committed = self.fabric_stream_committed_sequence(stream)?;
+        let key = (stream.to_string(), partition);
+
+        loop {
+            let next = committed.saturating_add(1);
+            let ready = self
+                .distributed
+                .fabric_stream_replication
+                .pending
+                .get(&key)
+                .and_then(|entries| entries.get(&next))
+                .map(|ticket| ticket.acknowledgements.len() >= ticket.quorum)
+                .unwrap_or(false);
+            if !ready {
+                break;
+            }
+
+            self.fabric_stream_commit_through(stream, next)?;
+            if let Some(entries) = self
+                .distributed
+                .fabric_stream_replication
+                .pending
+                .get_mut(&key)
+            {
+                entries.remove(&next);
+                if entries.is_empty() {
+                    self.distributed.fabric_stream_replication.pending.remove(&key);
+                }
+            }
+            committed = next;
+        }
+        Ok(committed)
+    }
+
     /// Compute deterministic rendezvous placement for a stream partition.
     ///
     /// Failed/Suspicious members remain candidates until confirmed removed, so
@@ -602,6 +899,21 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root_a);
         let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[test]
+    fn replica_ack_wire_roundtrip_preserves_contract() {
+        let ack = FabricStreamReplicaAck {
+            stream: "orders".into(),
+            partition: 0,
+            leader: NodeId(10),
+            membership_fingerprint: 44,
+            sequence: 3,
+            replica: NodeId(11),
+            accepted: true,
+        };
+        let bytes = ack.to_wire_bytes().unwrap();
+        assert_eq!(FabricStreamReplicaAck::from_wire_bytes(&bytes).unwrap(), ack);
     }
 
     #[test]
