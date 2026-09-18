@@ -170,6 +170,42 @@ impl MirCodegen {
         }
     }
 
+    /// Transfer one local's counted slot into a physical register and
+    /// invalidate the source without retain/release. Handles spilled sources
+    /// by clearing the spill slot itself, not merely a transient scratch.
+    fn transfer_local_to_reg(&mut self, id: mir::LocalId, dst: u8) -> NuResult<()> {
+        if let Some(slot) = self.spill_map.get(&id.0).copied() {
+            let scratch = if dst != SPILL_TEMP2 { SPILL_TEMP2 } else { SPILL_TEMP3 };
+            self.emit(Instruction::new3(
+                OpCode::SpillLoad,
+                (slot >> 8) as u8,
+                (slot & 0xFF) as u8,
+                scratch,
+            ));
+            if scratch != dst {
+                self.emit(Instruction::new2(OpCode::Move, scratch, dst));
+            }
+            self.load_constant(scratch, &Constant::Nil);
+            self.emit(Instruction::new3(
+                OpCode::SpillStore,
+                scratch,
+                (slot >> 8) as u8,
+                (slot & 0xFF) as u8,
+            ));
+        } else {
+            let src = (LOCAL_BASE + id.0) as u8;
+            if src == dst {
+                return Err(compile_err(
+                    "internal: ownership transfer source and destination must be distinct",
+                    Span::default(),
+                ));
+            }
+            self.emit(Instruction::new2(OpCode::Move, src, dst));
+            self.load_constant(src, &Constant::Nil);
+        }
+        Ok(())
+    }
+
     /// For compound rvalues that write to dst then call local_reg: save dst
     /// to r11 (safe from local_reg) to prevent clobbering. Returns the
     /// register (r11 or dst) to use for subsequent construction operations.
@@ -280,7 +316,7 @@ impl MirCodegen {
         let mut main_idx = None;
         let mut user_main_idx = None;
         for (idx, func) in mir.functions.iter().enumerate() {
-            let offset = self.compile_function(func)?;
+            let offset = self.compile_function(func, true)?;
             self.module.function_table[idx] = offset;
             self.module.function_local_counts[idx] = LOCAL_BASE as usize + func.locals.len();
             if func.name == "__main" {
@@ -302,7 +338,7 @@ impl MirCodegen {
         // behaviors compile in this order, so this loop must not be
         // reordered or interleaved with function compilation.
         for func in &mir.behaviors {
-            let offset = self.compile_function(func)?;
+            let offset = self.compile_function(func, false)?;
             let end = self.module.instructions.len();
 
             // Compute BLAKE3 content hash from the compiled bytecode slice +
@@ -434,7 +470,11 @@ impl MirCodegen {
         Ok(&self.module)
     }
 
-    fn compile_function(&mut self, func: &mir::Function) -> NuResult<usize> {
+    fn compile_function(
+        &mut self,
+        func: &mir::Function,
+        allow_owned_params: bool,
+    ) -> NuResult<usize> {
         // Isolate this function's bytecode so block offsets are relative to
         // the function start while still allowing forward jump resolution.
         let mut saved_instructions = Vec::new();
@@ -474,6 +514,8 @@ impl MirCodegen {
         self.spill_read_cycle = 0;
 
         // Prologue: move incoming arguments into their local registers.
+        // Staging registers are transient ABI slots and are cleared once
+        // parameter locals have received their values.
         for (i, param) in func.params.iter().enumerate() {
             let dst = self.local_dst(*param);
             let src = i as u8;
@@ -481,6 +523,9 @@ impl MirCodegen {
                 self.emit(Instruction::new2(OpCode::Move, src, dst));
             }
             self.spill_write_done(*param);
+        }
+        for i in 0..func.params.len() {
+            self.load_constant(i as u8, &Constant::Nil);
         }
         for (i, cap) in func.captures.iter().enumerate() {
             let dst = self.local_dst(*cap);
@@ -517,7 +562,7 @@ impl MirCodegen {
 
         // Conservative liveness-based placement of `Drop` instructions (see
         // the module docs and `plan_drops`).
-        let drop_plan = plan_drops(func);
+        let drop_plan = plan_drops(func, allow_owned_params);
 
         // Source-line map: `(block id, statement index) -> line`, translated
         // to bytecode PCs below so the debugger can place breakpoints and
@@ -762,6 +807,42 @@ impl MirCodegen {
         Ok(())
     }
 
+    /// Stage a function call, transferring source ownership only at declared
+    /// sink positions. Non-sink positions remain ordinary uncounted copies.
+    fn stage_call_args(
+        &mut self,
+        args: &[mir::LocalId],
+        sink_args: &[bool],
+    ) -> NuResult<()> {
+        if args.len() != sink_args.len() {
+            return Err(compile_err(
+                "internal: call sink mask length does not match argument count",
+                Span::default(),
+            ));
+        }
+        if args.len() > MAX_STAGED_ARGS {
+            return Err(compile_err(
+                format!(
+                    "call with {} arguments exceeds the MIR staging limit of {}",
+                    args.len(),
+                    MAX_STAGED_ARGS
+                ),
+                Span::default(),
+            ));
+        }
+        for (i, (arg, sink)) in args.iter().zip(sink_args).enumerate() {
+            if *sink {
+                self.transfer_local_to_reg(*arg, i as u8)?;
+            } else {
+                let src = self.local_reg(*arg);
+                if src != i as u8 {
+                    self.emit(Instruction::new2(OpCode::Move, src, i as u8));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn compile_rvalue(&mut self, dst: u8, rv: &mir::RValue) -> NuResult<()> {
         match rv {
             mir::RValue::Const(c) => {
@@ -779,51 +860,7 @@ impl MirCodegen {
                 }
             }
             mir::RValue::MoveOut(id) => {
-                if let Some(slot) = self.spill_map.get(&id.0).copied() {
-                    // A spilled source does not live in the scratch register
-                    // returned by local_reg(): that register is only a cache
-                    // of the spill slot. MoveOut must invalidate the spill
-                    // slot itself or both source and destination would retain
-                    // the same counted ownership.
-                    //
-                    // Use a scratch distinct from dst so a spilled destination
-                    // (SPILL_TEMP) or another scratch-directed lowering cannot
-                    // be clobbered while the source slot is cleared.
-                    let scratch = if dst != SPILL_TEMP2 {
-                        SPILL_TEMP2
-                    } else {
-                        SPILL_TEMP3
-                    };
-                    self.emit(Instruction::new3(
-                        OpCode::SpillLoad,
-                        (slot >> 8) as u8,
-                        (slot & 0xFF) as u8,
-                        scratch,
-                    ));
-                    if scratch != dst {
-                        self.emit(Instruction::new2(OpCode::Move, scratch, dst));
-                    }
-                    self.load_constant(scratch, &Constant::Nil);
-                    self.emit(Instruction::new3(
-                        OpCode::SpillStore,
-                        scratch,
-                        (slot >> 8) as u8,
-                        (slot & 0xFF) as u8,
-                    ));
-                } else {
-                    let src = (LOCAL_BASE + id.0) as u8;
-                    if src == dst {
-                        return Err(compile_err(
-                            "internal: MoveOut source and destination must be distinct locals",
-                            Span::default(),
-                        ));
-                    }
-                    self.emit(Instruction::new2(OpCode::Move, src, dst));
-                    // MoveOut transfers the counted slot; invalidating the
-                    // source must not release it. Reuse the existing constant
-                    // load so the serialized bytecode format stays unchanged.
-                    self.load_constant(src, &Constant::Nil);
-                }
+                self.transfer_local_to_reg(*id, dst)?;
             }
             mir::RValue::LoadFieldNamed { obj, field } => {
                 let fid = self.field_id(field)?;
@@ -925,7 +962,11 @@ impl MirCodegen {
                 let _rr = self.local_reg(*r);
                 self.emit(Instruction::new3(OpCode::SConcat, _rl, _rr, dst));
             }
-            mir::RValue::Call { func, args } => {
+            mir::RValue::Call {
+                func,
+                args,
+                sink_args,
+            } => {
                 // Load the callee value first (it lives above the staging
                 // zone, so staging cannot clobber it).
                 match func {
@@ -937,7 +978,7 @@ impl MirCodegen {
                         self.emit(Instruction::new2(OpCode::Move, _rid, FUNC_VALUE_REG));
                     }
                 }
-                self.stage_args(args)?;
+                self.stage_call_args(args, sink_args)?;
                 self.emit(Instruction::new3(
                     OpCode::Call,
                     FUNC_VALUE_REG,
@@ -2299,12 +2340,20 @@ fn rvalue_uses(op: &mir::RValue) -> Vec<(usize, UseKind)> {
             ro(&mut out, *l);
             ro(&mut out, *r);
         }
-        Call { func, args } => {
+        Call {
+            func,
+            args,
+            sink_args,
+        } => {
             if let mir::FuncRef::Local(f) = func {
                 cp(&mut out, *f);
             }
-            for a in args {
-                cp(&mut out, *a);
+            for (idx, a) in args.iter().enumerate() {
+                if sink_args.get(idx).copied().unwrap_or(false) {
+                    out.push((a.0 as usize, UseKind::Transfer));
+                } else {
+                    cp(&mut out, *a);
+                }
             }
         }
         Closure { captures, .. } => {
@@ -2405,7 +2454,7 @@ struct DropPlan {
 
 /// Compute conservative `Drop` placements for one function; see the section
 /// docs above for the soundness argument.
-fn plan_drops(func: &mir::Function) -> DropPlan {
+fn plan_drops(func: &mir::Function, allow_owned_params: bool) -> DropPlan {
     let mut plan = DropPlan::default();
     let nlocals = func.locals.len();
     let nblocks = func.blocks.len();
@@ -2419,10 +2468,20 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         .map(|l| may_hold_heap_ptr(&l.ty))
         .collect();
 
-    // Locals that receive their value outside MIR assignments can never be
-    // proven solely owned.
+    // Direct-call ordinary functions may receive linear parameters by
+    // ownership transfer. Behaviors, captures and non-linear parameters are
+    // still external unowned copies.
     let mut excluded = vec![false; nlocals];
-    for id in func.params.iter().chain(&func.captures) {
+    let mut incoming_owned = vec![false; nlocals];
+    for id in &func.params {
+        let idx = id.0 as usize;
+        if allow_owned_params && func.locals[idx].cap.is_linear() {
+            incoming_owned[idx] = true;
+        } else {
+            excluded[idx] = true;
+        }
+    }
+    for id in &func.captures {
         excluded[id.0 as usize] = true;
     }
     for table in &func.handler_tables {
@@ -2434,7 +2493,7 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
     }
 
     // Scan defs and uses for the whole function.
-    let mut has_def = vec![false; nlocals];
+    let mut has_def = incoming_owned.clone();
     // Every definition of a candidate must either create a fresh owned value
     // or transfer one from another ownership-proven local. Any ordinary
     // borrowed/copied definition permanently disqualifies the destination.
@@ -2727,7 +2786,7 @@ mod tests {
         b.terminate(mir::Terminator::Return(Some(len)));
 
         let func = b.build();
-        let plan = plan_drops(&func);
+        let plan = plan_drops(&func, false);
 
         assert!(
             plan_contains(&plan.after_stmt, (0, 2), moved),
@@ -2834,7 +2893,7 @@ mod tests {
         b.terminate(mir::Terminator::Return(Some(len)));
 
         let func = b.build();
-        let plan = plan_drops(&func);
+        let plan = plan_drops(&func, false);
         let appears = plan
             .block_entry
             .values()
@@ -2876,7 +2935,7 @@ mod tests {
         b.terminate(mir::Terminator::Return(Some(borrowed_field)));
 
         let func = b.build();
-        let plan = plan_drops(&func);
+        let plan = plan_drops(&func, false);
 
         assert!(
             !plan_contains(&plan.after_stmt, (0, 4), moved),
