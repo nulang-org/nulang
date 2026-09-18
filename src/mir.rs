@@ -95,6 +95,11 @@ pub struct Function {
     /// sequence. This metadata lets ownership analyses distinguish that pair
     /// from alias creation without changing bytecode, WASM, or AOT ABIs.
     pub ownership_transfers: Vec<OwnershipTransfer>,
+    /// Whether this function is part of the module's externally callable
+    /// surface. Ownership-call analysis must never infer an internal-only
+    /// calling convention for a public function without an exported ABI
+    /// contract.
+    pub public: bool,
     /// Web framework compile-time placement hint (None = infer from effect row).
     pub placement: Option<crate::types::Placement>,
 }
@@ -393,6 +398,7 @@ pub struct FunctionBuilder {
     current_line: Option<u32>,
     line_table: Vec<((BlockId, usize), u32)>,
     ownership_transfers: Vec<OwnershipTransfer>,
+    public: bool,
     placement: Option<crate::types::Placement>,
 }
 
@@ -412,6 +418,7 @@ impl FunctionBuilder {
             current_line: None,
             line_table: Vec::new(),
             ownership_transfers: Vec::new(),
+            public: false,
             placement: None,
         };
         builder.create_block(); // entry block
@@ -420,6 +427,10 @@ impl FunctionBuilder {
 
     pub fn set_placement(&mut self, placement: Option<crate::types::Placement>) {
         self.placement = placement;
+    }
+
+    pub fn set_public(&mut self, public: bool) {
+        self.public = public;
     }
 
     pub fn add_param(&mut self, name: impl Into<String>, ty: Type) -> LocalId {
@@ -587,6 +598,7 @@ impl FunctionBuilder {
             type_metadata,
             line_table: self.line_table,
             ownership_transfers: self.ownership_transfers,
+            public: self.public,
             placement: self.placement,
         }
     }
