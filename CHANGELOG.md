@@ -45,6 +45,17 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric stream replica placement — 2026-09-17
+- **Deterministic Fabric stream ownership** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/fabric_stream.rs`).
+  Adds rendezvous-hash replica placement over the stable known-membership set,
+  exact-sequence idempotent replica application, leader-produced replica
+  envelopes, and stale-membership/leader/configuration rejection. Failed and
+  suspicious nodes remain in placement until confirmed removed so transient
+  partitions cannot silently elect a second writer. The current physical store
+  remains partition 0 only; remote transport, quorum ACKs, automatic failover,
+  and physical multi-partition logs remain follow-up work.
+
 ### Fabric durable stream storage — 2026-09-17
 - **File-backed Fabric stream log** (Experimental, `src/runtime/fabric_stream.rs`).
   Adds a dedicated append-only segmented log for Fabric Streams rather than
