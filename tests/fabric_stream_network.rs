@@ -978,3 +978,206 @@ fn epoch_repair_brings_lagging_survivor_to_proposal_tail() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+
+#[test]
+fn epoch_pull_reconciles_candidate_behind_a_survivor() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addrs: Vec<SocketAddr> = [
+        "127.0.0.1:35001",
+        "127.0.0.1:35002",
+        "127.0.0.1:35003",
+    ]
+    .into_iter()
+    .map(|addr| addr.parse().unwrap())
+    .collect();
+    let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
+    let mut nodes: Vec<Runtime> = addrs
+        .iter()
+        .copied()
+        .map(|addr| runtime(addr, bus.clone()))
+        .collect();
+
+    for i in 0..nodes.len() {
+        for j in 0..nodes.len() {
+            if i == j {
+                continue;
+            }
+            nodes[i]
+                .distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(ids[j], addrs[j]);
+        }
+    }
+
+    let initial = nodes[0]
+        .fabric_stream_placement("epoch-pull", 0, 3)
+        .unwrap();
+    let old_leader = ids
+        .iter()
+        .position(|node| *node == initial.leader)
+        .unwrap();
+    let survivors: Vec<usize> = (0..3).filter(|index| *index != old_leader).collect();
+
+    // Determine the future RF=2 leader after the old leader is removed.
+    let scratch_local = survivors[0];
+    let mut scratch = Runtime::new();
+    scratch.distributed.enabled = true;
+    scratch.distributed.node_id = Some(ids[scratch_local]);
+    let mut scratch_cluster = ClusterState::new(ids[scratch_local], addrs[scratch_local]);
+    let scratch_peer = survivors[1];
+    scratch_cluster.handle_heartbeat(ids[scratch_peer], addrs[scratch_peer]);
+    scratch.distributed.cluster = Some(scratch_cluster);
+    let future = scratch.fabric_stream_placement("epoch-pull", 0, 2).unwrap();
+    let candidate = survivors
+        .iter()
+        .copied()
+        .find(|index| ids[*index] == future.leader)
+        .unwrap();
+    let ahead = survivors
+        .iter()
+        .copied()
+        .find(|index| *index != candidate)
+        .unwrap();
+
+    let roots: Vec<PathBuf> = (0..3)
+        .map(|index| temp_dir(&format!("epoch-pull-{index}")))
+        .collect();
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+    nodes[old_leader]
+        .fabric_stream_create("epoch-pull", FabricStreamConfig::default())
+        .unwrap();
+
+    // Common committed sequence 1.
+    nodes[old_leader]
+        .fabric_stream_replicated_append("epoch-pull", 0, 3, b"common")
+        .unwrap();
+    for index in &survivors {
+        nodes[*index].process_network();
+    }
+    nodes[old_leader].process_network();
+    nodes[old_leader].process_network();
+    for index in &survivors {
+        nodes[*index].process_network();
+        nodes[*index].process_network();
+    }
+
+    // Sequence 2 reaches the old leader + non-candidate survivor. It commits
+    // under epoch 1 while the future deterministic leader remains at tail 1.
+    nodes[old_leader]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([ids[candidate]]));
+    nodes[old_leader]
+        .fabric_stream_replicated_append("epoch-pull", 0, 3, b"ahead-survivor")
+        .unwrap();
+    nodes[ahead].process_network();
+    nodes[old_leader].process_network();
+    nodes[ahead].process_network();
+    nodes[old_leader]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+
+    assert_eq!(
+        nodes[candidate]
+            .fabric_stream_info("epoch-pull")
+            .unwrap()
+            .last_sequence,
+        Some(1)
+    );
+    assert_eq!(
+        nodes[ahead]
+            .fabric_stream_info("epoch-pull")
+            .unwrap()
+            .last_sequence,
+        Some(2)
+    );
+
+    for index in &survivors {
+        nodes[*index]
+            .distributed
+            .cluster
+            .as_mut()
+            .unwrap()
+            .mark_removed(ids[old_leader]);
+    }
+
+    // Term 2 binds candidate tail 1. The ahead survivor rejects with tail 2.
+    let first = nodes[candidate]
+        .fabric_stream_begin_epoch_transition("epoch-pull", 0, 2)
+        .unwrap();
+    assert_eq!(first.to_epoch, 2);
+    assert_eq!(first.affirmative_votes, 1);
+    nodes[ahead].process_network();
+    nodes[candidate].process_network();
+
+    // Candidate pulls the missing exact suffix under the stale term-2
+    // proposal. Applying it changes candidate tail but does not install term 2.
+    let pull = nodes[candidate]
+        .fabric_stream_pull_epoch_transition("epoch-pull", 10)
+        .unwrap();
+    assert_eq!(pull.ahead_replicas, 1);
+    assert_eq!(pull.requests_dispatched, 1);
+    assert_eq!(pull.source_tail, 2);
+
+    nodes[ahead].process_network();
+    nodes[candidate].process_network();
+
+    assert_eq!(
+        nodes[candidate]
+            .fabric_stream_info("epoch-pull")
+            .unwrap()
+            .last_sequence,
+        Some(2)
+    );
+    assert_eq!(
+        nodes[candidate].fabric_stream_epoch("epoch-pull").unwrap(),
+        Some(1)
+    );
+
+    // Because the candidate tail changed, a higher term supersedes the stale
+    // term-2 proposal. The survivor now matches the term-3 candidate tail and
+    // can durably vote yes.
+    let second = nodes[candidate]
+        .fabric_stream_begin_epoch_transition("epoch-pull", 0, 2)
+        .unwrap();
+    assert_eq!(second.to_epoch, 3);
+    assert_eq!(second.affirmative_votes, 1);
+
+    nodes[ahead].process_network();
+    nodes[candidate].process_network();
+    nodes[ahead].process_network();
+
+    for index in &survivors {
+        assert_eq!(
+            nodes[*index].fabric_stream_epoch("epoch-pull").unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_committed_sequence("epoch-pull")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_read_committed("epoch-pull", 1, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
