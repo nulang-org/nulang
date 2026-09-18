@@ -22,6 +22,12 @@ const RECORD_HEADER_LEN: usize = 8 + 4 + 16;
 const MIN_SEGMENT_BYTES: u64 = (SEGMENT_HEADER_LEN + RECORD_HEADER_LEN + 1) as u64;
 const DEFAULT_SEGMENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
+pub(crate) const FABRIC_STREAM_INITIAL_EPOCH: u64 = 1;
+
+fn initial_stream_epoch() -> u64 {
+    FABRIC_STREAM_INITIAL_EPOCH
+}
+
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,8 +94,27 @@ struct CommitFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricStreamReplicationPolicy {
+    pub partition: u16,
+    #[serde(default = "initial_stream_epoch")]
+    pub epoch: u64,
+    pub leader: u64,
+    pub membership_fingerprint: u64,
+    pub replication_factor: usize,
+    pub replicas: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplicationPolicyFile {
+    version: u16,
+    policy: FabricStreamReplicationPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FabricStreamPendingIntent {
     pub partition: u16,
+    #[serde(default = "initial_stream_epoch")]
+    pub epoch: u64,
     pub leader: u64,
     pub membership_fingerprint: u64,
     pub replication_factor: usize,
@@ -463,6 +488,59 @@ impl FileFabricStreamStore {
         Ok(records)
     }
 
+    pub(crate) fn replication_policy(
+        &mut self,
+        name: &str,
+    ) -> io::Result<Option<FabricStreamReplicationPolicy>> {
+        self.ensure_state(name)?;
+        read_replication_policy(&self.stream_dir(name).join("replication_policy.json"))
+    }
+
+    /// Atomically establish the stream's durable replication policy.
+    ///
+    /// This layer only establishes epoch 1. Any different existing policy
+    /// fails closed until a future quorum-backed epoch transition protocol
+    /// explicitly replaces it.
+    pub(crate) fn establish_replication_policy(
+        &mut self,
+        name: &str,
+        policy: FabricStreamReplicationPolicy,
+    ) -> io::Result<FabricStreamReplicationPolicy> {
+        self.ensure_state(name)?;
+        if policy.epoch == 0
+            || policy.replication_factor == 0
+            || policy.replicas.len() != policy.replication_factor
+            || !policy.replicas.contains(&policy.leader)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Fabric stream replication policy",
+            ));
+        }
+
+        let path = self.stream_dir(name).join("replication_policy.json");
+        if let Some(existing) = read_replication_policy(&path)? {
+            if existing == policy {
+                return Ok(existing);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric stream replication policy conflict: durable epoch {} cannot be reinterpreted as epoch {}",
+                    existing.epoch, policy.epoch
+                ),
+            ));
+        }
+
+        let file = ReplicationPolicyFile {
+            version: STREAM_FORMAT_VERSION,
+            policy: policy.clone(),
+        };
+        write_json_atomic(&path, &file)?;
+        sync_dir(&self.stream_dir(name))?;
+        Ok(policy)
+    }
+
     /// Persist replication intent before the matching leader append.
     ///
     /// Reserving first closes the crash window where an uncommitted durable
@@ -749,6 +827,22 @@ impl Runtime {
     ) -> io::Result<()> {
         self.fabric_stream_store_mut()?
             .commit_through(name, sequence)
+    }
+
+    pub(crate) fn fabric_stream_replication_policy(
+        &mut self,
+        name: &str,
+    ) -> io::Result<Option<FabricStreamReplicationPolicy>> {
+        self.fabric_stream_store_mut()?.replication_policy(name)
+    }
+
+    pub(crate) fn fabric_stream_establish_replication_policy(
+        &mut self,
+        name: &str,
+        policy: FabricStreamReplicationPolicy,
+    ) -> io::Result<FabricStreamReplicationPolicy> {
+        self.fabric_stream_store_mut()?
+            .establish_replication_policy(name, policy)
     }
 
     pub(crate) fn fabric_stream_reserve_replication_intent(
@@ -1072,6 +1166,34 @@ fn segment_path(dir: &Path, base_sequence: u64) -> PathBuf {
     dir.join(format!("{base_sequence:020}.seg"))
 }
 
+fn read_replication_policy(path: &Path) -> io::Result<Option<FabricStreamReplicationPolicy>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    let file: ReplicationPolicyFile = serde_json::from_slice(&bytes).map_err(json_error)?;
+    if file.version != STREAM_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported Fabric replication policy version {}",
+                file.version
+            ),
+        ));
+    }
+    if file.policy.epoch == 0
+        || file.policy.replication_factor == 0
+        || file.policy.replicas.len() != file.policy.replication_factor
+        || !file.policy.replicas.contains(&file.policy.leader)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid durable Fabric replication policy",
+        ));
+    }
+    Ok(Some(file.policy))
+}
+
 fn read_replica_progress(path: &Path) -> io::Result<ReplicaProgressFile> {
     if !path.exists() {
         return Ok(ReplicaProgressFile::default());
@@ -1364,6 +1486,43 @@ mod tests {
     }
 
     #[test]
+    fn replication_policy_is_durable_and_conflicts_fail_closed() {
+        let root = test_dir("replication-policy");
+        let policy = FabricStreamReplicationPolicy {
+            partition: 0,
+            epoch: FABRIC_STREAM_INITIAL_EPOCH,
+            leader: 10,
+            membership_fingerprint: 44,
+            replication_factor: 2,
+            replicas: vec![10, 11],
+        };
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream("events", FabricStreamConfig::default())
+                .unwrap();
+            assert_eq!(
+                store
+                    .establish_replication_policy("events", policy.clone())
+                    .unwrap(),
+                policy
+            );
+        }
+
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.replication_policy("events").unwrap(),
+            Some(policy.clone())
+        );
+        let mut conflicting = policy;
+        conflicting.epoch = 2;
+        assert!(reopened
+            .establish_replication_policy("events", conflicting)
+            .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn replica_progress_is_monotonic_and_persists() {
         let root = test_dir("replica-progress");
         {
@@ -1393,6 +1552,7 @@ mod tests {
                 .unwrap();
             let intent = FabricStreamPendingIntent {
                 partition: 0,
+                epoch: FABRIC_STREAM_INITIAL_EPOCH,
                 leader: 10,
                 membership_fingerprint: 44,
                 replication_factor: 2,
@@ -1438,6 +1598,7 @@ mod tests {
                 "events",
                 FabricStreamPendingIntent {
                     partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
                     leader: 10,
                     membership_fingerprint: 44,
                     replication_factor: 2,
