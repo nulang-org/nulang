@@ -61,6 +61,12 @@ observe. Cross-shard and remote candidates currently have locality tiers but no
 live mailbox-pressure component; propagating bounded load summaries through the
 Fabric control plane is a later optimization.
 
+Cluster convergence is covered under deterministic transport faults: bounded
+adjacent packet reordering verifies that a newer generation applied before an
+older one cannot be rolled back, and a bidirectional partition verifies route
+cleanup on node failure followed by probe/gossip-driven reconvergence after the
+partition heals.
+
 Subscriptions are lifecycle-bound to their actors: normal exit, faults, linked
 exit cascades, and supervisor shutdown remove the actor's ephemeral routing
 entries. Subscription registration verifies that the requested behavior exists
@@ -180,7 +186,7 @@ semantics that later cluster and stream layers can reuse.
 - [x] Placement-aware consumer selection using same-shard mailbox pressure and
   locality.
 - [ ] Propagate cross-shard/remote load summaries.
-- [ ] Deterministic partition/reorder coverage for automatic gossip.
+- [x] Deterministic partition/reorder coverage for automatic gossip.
 
 ### Phase 3 — durable streams
 
