@@ -705,6 +705,22 @@ impl MirCodegen {
                 .iter()
                 .map(|p| LOCAL_BASE as usize + p.0 as usize)
                 .collect(),
+            sink_mask: if allow_owned_params {
+                func.params
+                    .iter()
+                    .enumerate()
+                    .fold(0u16, |mask, (idx, p)| {
+                        if idx < u16::BITS as usize
+                            && func.locals[p.0 as usize].cap.is_linear()
+                        {
+                            mask | (1u16 << idx)
+                        } else {
+                            mask
+                        }
+                    })
+            } else {
+                0
+            },
             locals: func
                 .locals
                 .iter()
