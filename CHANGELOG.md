@@ -45,6 +45,21 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric quorum-backed epoch transition — 2026-09-18
+- **Durable prepare/vote/commit ownership transition** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/fabric_stream.rs`,
+  `src/runtime/distributed.rs`). Existing replicas can now move a stream from
+  epoch N to N+1 after an old-policy majority fsyncs a single-proposal promise.
+  A higher promise immediately fences normal traffic from the old epoch.
+  Affirmative voters must hold the candidate's exact durable tail, every new
+  replica must be an affirmative old-policy voter, and finalization promotes
+  that majority-shared tail to the new committed boundary. Finalized transition
+  state is restart-resumable, old pending tickets are retired, and prepare,
+  vote, and commit messages reuse reserved NUL0-v1 ActorMessage behaviors.
+  The first version supports shrink/leadership transition within the old replica
+  set (for example RF3 -> RF2 after confirmed loss); adding a replacement
+  replica and automatic failover remain follow-up work.
+
 ### Fabric stream epoch fencing — 2026-09-18
 - **Durable replication policy + epoch-1 fencing** (Experimental,
   `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`,
