@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use nulang::runtime::{
     ClusterState, DeterministicNetworkTransport, FabricStreamConfig, IncomingPacket, NodeId,
-    OutgoingPacket, Runtime,
+    OutgoingPacket, Packet, Runtime,
 };
 
 type Bus = Arc<
@@ -1166,6 +1166,158 @@ fn epoch_pull_reconciles_candidate_behind_a_survivor() {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+
+#[test]
+fn confirmed_goodbye_automatically_transitions_stream_leadership() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addrs: Vec<SocketAddr> = [
+        "127.0.0.1:35101",
+        "127.0.0.1:35102",
+        "127.0.0.1:35103",
+    ]
+    .into_iter()
+    .map(|addr| addr.parse().unwrap())
+    .collect();
+    let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
+    let mut nodes: Vec<Runtime> = addrs
+        .iter()
+        .copied()
+        .map(|addr| runtime(addr, bus.clone()))
+        .collect();
+
+    for i in 0..nodes.len() {
+        for j in 0..nodes.len() {
+            if i == j {
+                continue;
+            }
+            nodes[i]
+                .distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(ids[j], addrs[j]);
+        }
+    }
+
+    let initial = nodes[0]
+        .fabric_stream_placement("auto-failover", 0, 3)
+        .unwrap();
+    let old_leader = ids
+        .iter()
+        .position(|node| *node == initial.leader)
+        .unwrap();
+    let survivors: Vec<usize> = (0..3).filter(|index| *index != old_leader).collect();
+
+    let roots: Vec<PathBuf> = (0..3)
+        .map(|index| temp_dir(&format!("auto-failover-{index}")))
+        .collect();
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+    nodes[old_leader]
+        .fabric_stream_create("auto-failover", FabricStreamConfig::default())
+        .unwrap();
+
+    nodes[old_leader]
+        .fabric_stream_replicated_append("auto-failover", 0, 3, b"stable-prefix")
+        .unwrap();
+    for index in &survivors {
+        nodes[*index].process_network();
+    }
+    nodes[old_leader].process_network();
+    nodes[old_leader].process_network();
+    for index in &survivors {
+        nodes[*index].process_network();
+        nodes[*index].process_network();
+    }
+
+    for index in &survivors {
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_committed_sequence("auto-failover")
+                .unwrap(),
+            1
+        );
+    }
+
+    // Determine which survivor should lead the reduced RF=2 placement.
+    let scratch_local = survivors[0];
+    let mut scratch = Runtime::new();
+    scratch.distributed.enabled = true;
+    scratch.distributed.node_id = Some(ids[scratch_local]);
+    let mut scratch_cluster = ClusterState::new(ids[scratch_local], addrs[scratch_local]);
+    let scratch_peer = survivors[1];
+    scratch_cluster.handle_heartbeat(ids[scratch_peer], addrs[scratch_peer]);
+    scratch.distributed.cluster = Some(scratch_cluster);
+    let reduced = scratch
+        .fabric_stream_placement("auto-failover", 0, 2)
+        .unwrap();
+    let candidate = survivors
+        .iter()
+        .copied()
+        .find(|index| ids[*index] == reduced.leader)
+        .unwrap();
+    let voter = survivors
+        .iter()
+        .copied()
+        .find(|index| *index != candidate)
+        .unwrap();
+
+    // A positive goodbye is a confirmed-removal path. Queue the goodbye on
+    // both survivors before either processes it so both compute the same
+    // reduced membership before prepare/vote traffic runs.
+    for index in &survivors {
+        nodes[old_leader]
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
+            .send(
+                ids[*index],
+                addrs[*index],
+                Packet::NodeGoodbye {
+                    node_id: ids[old_leader],
+                    durable: Vec::new(),
+                },
+            );
+    }
+
+    // Candidate processes goodbye and automatically starts the transition.
+    nodes[candidate].process_network();
+    assert_eq!(
+        nodes[candidate]
+            .fabric_stream_epoch("auto-failover")
+            .unwrap(),
+        Some(1)
+    );
+
+    // The other survivor processes its goodbye before the candidate's prepare,
+    // then votes for the exact shared tail. Candidate finalizes and sends the
+    // epoch commit back.
+    nodes[voter].process_network();
+    nodes[candidate].process_network();
+    nodes[voter].process_network();
+
+    for index in &survivors {
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_epoch("auto-failover")
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_committed_sequence("auto-failover")
+                .unwrap(),
+            1
         );
     }
 
