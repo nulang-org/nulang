@@ -10,7 +10,7 @@ use std::sync::{mpsc, Arc};
 
 use crate::runtime::cluster::{ClusterState, NodeId};
 use crate::runtime::network::NetworkTransport;
-use crate::runtime::{ActorAddress, AddressResolver, Runtime};
+use crate::runtime::{ActorAddress, AddressResolver, MessageAdmission, Runtime};
 use crate::vm::Value;
 
 /// Cluster advertisement for one ephemeral Fabric subscription.
@@ -39,6 +39,21 @@ pub struct FabricAdvertisementSnapshot {
     pub generation: u64,
     pub subscriptions: Vec<FabricAdvertisement>,
 }
+
+/// Admission accounting for one ephemeral Fabric publication.
+///
+/// Remote entries are counted as `forwarded_remote` because the local node can
+/// only confirm that it attempted the existing distributed actor send; final
+/// mailbox admission is owned by the destination node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FabricPublishReport {
+    pub selected: usize,
+    pub admitted: usize,
+    pub backpressured: usize,
+    pub rejected: usize,
+    pub forwarded_remote: usize,
+}
+
 
 /// One ephemeral Fabric subscription.
 ///
@@ -730,14 +745,18 @@ impl Runtime {
         self.distributed.fabric.remote_len()
     }
 
-    /// Publish an ephemeral Fabric message to a concrete topic.
+    /// Publish an ephemeral Fabric message with admission accounting.
     ///
-    /// The returned count is the number of actor deliveries selected by
-    /// routing, not a transport acknowledgement count. Local and same-process
-    /// cross-shard targets use numeric actor delivery; remote targets use the
-    /// existing location-transparent actor transport and resolve behavior by
-    /// name on the destination node.
-    pub fn fabric_publish(&mut self, topic: &str, args: &[Value]) -> Result<usize, String> {
+    /// `admitted` counts successful same-process mailbox/channel admission.
+    /// `backpressured` reports bounded mailbox or cross-shard-channel
+    /// saturation. `rejected` covers stale local targets or payloads that
+    /// cannot cross a shard boundary. Remote node sends are counted separately
+    /// as `forwarded_remote` because this node has no destination-mailbox ACK.
+    pub fn fabric_publish_report(
+        &mut self,
+        topic: &str,
+        args: &[Value],
+    ) -> Result<FabricPublishReport, String> {
         self.fabric_sync();
         let targets = self.distributed.fabric.route(topic)?;
         if !self.distributed.enabled
@@ -748,23 +767,51 @@ impl Runtime {
             return Err("Fabric remote publication requires distribution to be enabled".into());
         }
 
-        let selected = targets.len();
+        let mut report = FabricPublishReport {
+            selected: targets.len(),
+            ..FabricPublishReport::default()
+        };
         for target in targets {
             match target {
                 FabricTarget::Local {
                     actor_id,
                     behavior_id,
-                } => self.send_message_by_id(actor_id, behavior_id, args),
+                } => match self.fabric_admit_local(actor_id, behavior_id, args) {
+                    MessageAdmission::Accepted => report.admitted += 1,
+                    MessageAdmission::Backpressured => report.backpressured += 1,
+                    MessageAdmission::Rejected => report.rejected += 1,
+                },
                 FabricTarget::Remote {
                     node_id,
                     actor_id,
                     behavior,
                 } => {
-                    self.send_distributed(ActorAddress::remote(node_id, actor_id), &behavior, args)
+                    self.send_distributed(
+                        ActorAddress::remote(node_id, actor_id),
+                        &behavior,
+                        args,
+                    );
+                    report.forwarded_remote += 1;
                 }
             }
         }
-        Ok(selected)
+        debug_assert_eq!(
+            report.selected,
+            report.admitted
+                + report.backpressured
+                + report.rejected
+                + report.forwarded_remote
+        );
+        Ok(report)
+    }
+
+    /// Publish an ephemeral Fabric message to a concrete topic.
+    ///
+    /// Preserves the original API: the returned count is the number of routes
+    /// selected. Call `fabric_publish_report` when admission/backpressure
+    /// details are needed.
+    pub fn fabric_publish(&mut self, topic: &str, args: &[Value]) -> Result<usize, String> {
+        Ok(self.fabric_publish_report(topic, args)?.selected)
     }
 }
 
@@ -906,6 +953,62 @@ mod tests {
 
         shards[0].drain_cross_shard_messages();
         assert_eq!(shards[0].actors.get(&actor_id).unwrap().mailbox.len(), 1);
+    }
+
+    #[test]
+    fn fabric_publish_report_exposes_bounded_mailbox_backpressure() {
+        let mut rt = Runtime::new();
+        let actor_id = 9000_u64;
+        let mut actor = Actor::new(actor_id, "bounded-fabric-target", 1);
+        actor.state = ActorState::Running;
+        actor.register_behavior("handle", noop);
+        rt.actors.insert(actor_id, actor);
+        rt.fabric_subscribe("events.*", actor_id, "handle").unwrap();
+
+        let first = rt
+            .fabric_publish_report("events.created", &[Value::int(1)])
+            .unwrap();
+        assert_eq!(first.selected, 1);
+        assert_eq!(first.admitted, 1);
+        assert_eq!(first.backpressured, 0);
+
+        let second = rt
+            .fabric_publish_report("events.created", &[Value::int(2)])
+            .unwrap();
+        assert_eq!(second.selected, 1);
+        assert_eq!(second.admitted, 0);
+        assert_eq!(second.backpressured, 1);
+        assert_eq!(second.rejected, 0);
+        assert_eq!(second.forwarded_remote, 0);
+        assert_eq!(rt.actors.get(&actor_id).unwrap().mailbox.len(), 1);
+    }
+
+    #[test]
+    fn fabric_publish_report_exposes_cross_shard_channel_backpressure() {
+        let mut shards = Runtime::new_fabric_sharded(2);
+        let actor_id = 2_u64;
+        let mut actor = Actor::new(actor_id, "cross-shard-fabric-target", 0);
+        actor.state = ActorState::Running;
+        actor.register_behavior("handle", noop);
+        shards[0].actors.insert(actor_id, actor);
+        shards[0]
+            .fabric_subscribe("jobs.*", actor_id, "handle")
+            .unwrap();
+        shards[1].fabric_sync();
+
+        for _ in 0..1024 {
+            let report = shards[1]
+                .fabric_publish_report("jobs.run", &[Value::int(1)])
+                .unwrap();
+            assert_eq!(report.admitted, 1);
+            assert_eq!(report.backpressured, 0);
+        }
+        let saturated = shards[1]
+            .fabric_publish_report("jobs.run", &[Value::int(2)])
+            .unwrap();
+        assert_eq!(saturated.selected, 1);
+        assert_eq!(saturated.admitted, 0);
+        assert_eq!(saturated.backpressured, 1);
     }
 
     #[test]
