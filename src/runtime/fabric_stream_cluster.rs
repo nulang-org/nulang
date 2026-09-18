@@ -405,17 +405,6 @@ impl Runtime {
         }
     }
 
-    fn fabric_stream_current_policy_for_placement(
-        &mut self,
-        placement: &FabricStreamPlacement,
-    ) -> io::Result<FabricStreamReplicationPolicy> {
-        let epoch = self
-            .fabric_stream_replication_policy(&placement.stream)?
-            .map(|policy| policy.epoch)
-            .unwrap_or(FABRIC_STREAM_INITIAL_EPOCH);
-        self.fabric_stream_policy_for_placement(placement, epoch)
-    }
-
     fn fabric_stream_placement_from_policy(
         stream: &str,
         policy: &FabricStreamReplicationPolicy,
@@ -1667,9 +1656,11 @@ impl Runtime {
 
     /// Apply a leader-produced record on a replica.
     ///
-    /// The receiver recomputes placement and rejects stale membership
-    /// fingerprints, wrong leaders, non-replica destinations, sequence gaps,
-    /// and conflicting duplicate data.
+    /// An established receiver validates against its durable installed policy.
+    /// Only a replica with no local policy yet computes current rendezvous
+    /// placement for epoch-1 bootstrap. Wrong leaders, non-replica
+    /// destinations, sequence gaps, and conflicting duplicate data are
+    /// rejected.
     pub fn fabric_stream_apply_replica(
         &mut self,
         append: &FabricStreamReplicaAppend,
