@@ -84,9 +84,6 @@ impl Runtime {
                 .collect(),
             None => vec![local],
         };
-        if !candidates.contains(&local) {
-            candidates.push(local);
-        }
         candidates.sort_unstable();
         candidates.dedup();
 
