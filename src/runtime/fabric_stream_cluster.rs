@@ -478,12 +478,7 @@ impl Runtime {
                 )
             })?;
         let epoch = policy.epoch;
-        self.fabric_stream_validate_installed_policy(
-            stream,
-            partition,
-            replication_factor,
-            epoch,
-        )
+        self.fabric_stream_validate_installed_policy(stream, partition, replication_factor, epoch)
     }
 
     fn fabric_stream_current_or_bootstrap_policy_placement(
@@ -2071,10 +2066,7 @@ mod tests {
         let mut a = runtime_with_members(a_addr, &[b_addr]);
         let mut b = runtime_with_members(b_addr, &[a_addr]);
         let initial = a.fabric_stream_placement("stable", 0, 2).unwrap();
-        assert_eq!(
-            initial,
-            b.fabric_stream_placement("stable", 0, 2).unwrap()
-        );
+        assert_eq!(initial, b.fabric_stream_placement("stable", 0, 2).unwrap());
 
         let root_a = test_dir("stable-a");
         let root_b = test_dir("stable-b");
@@ -2142,7 +2134,10 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(active, initial);
-        assert_eq!(second.membership_fingerprint, initial.membership_fingerprint);
+        assert_eq!(
+            second.membership_fingerprint,
+            initial.membership_fingerprint
+        );
         assert_eq!(second.leader, initial.leader);
 
         if initial.leader == a_id {
