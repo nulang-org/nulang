@@ -1,5 +1,5 @@
 //! VM throughput benchmarks: arithmetic, function calls, closures, dispatch,
-//! record/array access.
+//! record/array access, and specialized numeric fast paths.
 
 use criterion::{black_box, criterion_group, BatchSize, Criterion};
 use nulang::bytecode::CodeModule;
@@ -123,6 +123,61 @@ fn bench_array_indexing(c: &mut Criterion) {
     });
 }
 
+/// Compare the VM's specialized IPow path (binary exponentiation) with the
+/// old std.math.pow strategy: an O(exp) user-level recursive multiply loop.
+/// Keep the base mutable so MIR constant folding cannot erase the operation.
+fn bench_int_pow_fastpath(c: &mut Criterion) {
+    let specialized = compile(
+        "var sum = 0; var x = 3; var i = 0; while i < 1000 { sum = sum + (x ** 13); x = if x < 7 then x + 1 else 3; i = i + 1; }; sum",
+    );
+    let user_loop = compile(
+        "fn pow_loop(base: Int, exp: Int) -> Int { let rec loop = fn(b: Int, e: Int, acc: Int) -> Int { if e == 0 then acc else loop(b, e - 1, acc * b) }; loop(base, exp, 1) }; var sum = 0; var x = 3; var i = 0; while i < 1000 { sum = sum + pow_loop(x, 13); x = if x < 7 then x + 1 else 3; i = i + 1; }; sum",
+    );
+
+    c.bench_function("vm/int_pow_ipow", |b| {
+        b.iter_batched(
+            || fresh_vm(&specialized),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+    c.bench_function("vm/int_pow_user_loop", |b| {
+        b.iter_batched(
+            || fresh_vm(&user_loop),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
+/// Compare native Float.sqrt builtin dispatch with the previous std.math.sqrt
+/// implementation, which performed twenty Newton iterations in bytecode for
+/// every call. Inputs vary per iteration so this is not a constant-folding
+/// benchmark.
+fn bench_float_sqrt_fastpath(c: &mut Criterion) {
+    let builtin = compile(
+        "var sum = 0.0; var x = 1.0; var i = 0; while i < 200 { sum = sum + perform Float.sqrt(x); x = x + 1.0; i = i + 1; }; sum",
+    );
+    let newton = compile(
+        "fn sqrt_loop(x: Float) -> Float { if x < 0.0 then -1.0 else if x == 0.0 then 0.0 else { var guess = x / 2.0; var j = 0; while j < 20 { guess = (guess + x / guess) / 2.0; j = j + 1 }; guess } }; var sum = 0.0; var x = 1.0; var i = 0; while i < 200 { sum = sum + sqrt_loop(x); x = x + 1.0; i = i + 1; }; sum",
+    );
+
+    c.bench_function("vm/float_sqrt_builtin", |b| {
+        b.iter_batched(
+            || fresh_vm(&builtin),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+    c.bench_function("vm/float_sqrt_newton_loop", |b| {
+        b.iter_batched(
+            || fresh_vm(&newton),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 criterion_group!(
     benches,
     bench_int_arithmetic,
@@ -131,4 +186,6 @@ criterion_group!(
     bench_closure_capture,
     bench_record_access,
     bench_array_indexing,
+    bench_int_pow_fastpath,
+    bench_float_sqrt_fastpath,
 );
