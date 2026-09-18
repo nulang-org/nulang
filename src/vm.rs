@@ -4893,6 +4893,14 @@ impl VM {
                 let mut new_frame = Frame::new(Some(frame_idx), module_idx);
                 new_frame.pc = code_offset;
                 new_frame.regs[..argc as usize].copy_from_slice(&frame.regs[..argc as usize]);
+                // r0..rN are transient call staging slots. Once copied into
+                // the callee frame they must not remain stale pointer roots
+                // in the suspended caller. Sink calls additionally clear
+                // their source locals during staging; ordinary calls keep
+                // their source locals and lose only these scratch duplicates.
+                for reg in &mut frame.regs[..argc as usize] {
+                    *reg = Value::nil();
+                }
                 new_frame.return_dst = dst;
                 new_frame.closure_env = closure_env;
                 self.frames.push(new_frame);
