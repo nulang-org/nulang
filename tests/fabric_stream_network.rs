@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use nulang::runtime::{
     DeterministicNetworkTransport, FabricStreamConfig, IncomingPacket, NodeId, OutgoingPacket,
@@ -558,6 +559,94 @@ fn lagging_committed_replica_catches_up_and_receives_commit_boundary() {
     assert_eq!(
         nodes[lagging_follower]
             .fabric_stream_committed_sequence("catchup")
+            .unwrap(),
+        1
+    );
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+
+#[test]
+fn pending_stream_replication_retries_automatically_on_logical_clock() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:34701".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:34702".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut nodes = vec![runtime(addr_a, bus.clone()), runtime(addr_b, bus)];
+    nodes[0]
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    nodes[1]
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let placement = nodes[0]
+        .fabric_stream_placement("auto-retry", 0, 2)
+        .unwrap();
+    let leader_index = if placement.leader == node_a { 0 } else { 1 };
+    let follower_index = 1 - leader_index;
+    let follower_id = if follower_index == 0 { node_a } else { node_b };
+
+    let roots = vec![temp_dir("auto-retry-a"), temp_dir("auto-retry-b")];
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+    nodes[leader_index]
+        .fabric_stream_create("auto-retry", FabricStreamConfig::default())
+        .unwrap();
+
+    nodes[leader_index]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([follower_id]));
+
+    let append = nodes[leader_index]
+        .fabric_stream_replicated_append("auto-retry", 0, 2, b"retry-me")
+        .unwrap();
+    assert!(!append.status.committed);
+
+    // Heal immediately, but the scheduler must respect its 500ms initial delay.
+    nodes[leader_index]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+    nodes[leader_index].advance_time(Duration::from_millis(499));
+    nodes[leader_index].process_network();
+    nodes[follower_index].process_network();
+    assert!(nodes[follower_index]
+        .fabric_stream_read("auto-retry", 1, 10)
+        .is_err());
+
+    nodes[leader_index].advance_time(Duration::from_millis(1));
+    nodes[leader_index].process_network();
+    nodes[follower_index].process_network();
+    nodes[leader_index].process_network();
+    nodes[follower_index].process_network();
+
+    assert_eq!(
+        nodes[leader_index]
+            .fabric_stream_committed_sequence("auto-retry")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        nodes[follower_index]
+            .fabric_stream_committed_sequence("auto-retry")
             .unwrap(),
         1
     );
