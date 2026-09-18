@@ -49,15 +49,32 @@ pub enum HostAuthorityRequirement {
     CheckedEffectRow(&'static str),
 }
 
-/// Conservative replay contract for durable execution.
+/// Replay contract shared with RFC 0020 / Behavior Manifest v0alpha1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HostReplayClass {
-    ReadOnly,
-    IdempotentMutation,
-    DurableWait,
-    /// Re-execution can duplicate externally visible work; recover a durable
-    /// receipt/result instead of blindly invoking the operation again.
-    ReceiptRequired,
+    Pure,
+    LocalReplaySafe,
+    /// Persist the observed result and replay that result rather than
+    /// re-running the effect after completion.
+    JournalResult,
+    ExternalIdempotent,
+    ExternalRequiresIdempotencyKey,
+    /// No safe automatic redispatch is claimed after an ambiguous crash.
+    ExternalNonreplayable,
+}
+
+impl HostReplayClass {
+    /// Exact v0alpha1 Behavior Manifest spelling.
+    pub const fn manifest_class(self) -> &'static str {
+        match self {
+            Self::Pure => "pure",
+            Self::LocalReplaySafe => "local-replay-safe",
+            Self::JournalResult => "journal-result",
+            Self::ExternalIdempotent => "external-idempotent",
+            Self::ExternalRequiresIdempotencyKey => "external-requires-idempotency-key",
+            Self::ExternalNonreplayable => "external-nonreplayable",
+        }
+    }
 }
 
 /// Compiler-owned identity for one source operation that crosses the host ABI.
@@ -107,7 +124,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Field("content"),
         authority: HostAuthorityRequirement::CheckedEffectRow("Inference"),
-        replay: HostReplayClass::ReceiptRequired,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Storage",
@@ -120,7 +137,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Discard,
         authority: HostAuthorityRequirement::CheckedEffectRow("Storage"),
-        replay: HostReplayClass::IdempotentMutation,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Storage",
@@ -133,7 +150,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Field("value"),
         authority: HostAuthorityRequirement::CheckedEffectRow("Storage"),
-        replay: HostReplayClass::ReadOnly,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Storage",
@@ -146,7 +163,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Discard,
         authority: HostAuthorityRequirement::CheckedEffectRow("Storage"),
-        replay: HostReplayClass::IdempotentMutation,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Queue",
@@ -159,7 +176,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Discard,
         authority: HostAuthorityRequirement::CheckedEffectRow("Queue"),
-        replay: HostReplayClass::ReceiptRequired,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Queue",
@@ -172,7 +189,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Field("message"),
         authority: HostAuthorityRequirement::CheckedEffectRow("Queue"),
-        replay: HostReplayClass::ReceiptRequired,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Http",
@@ -185,7 +202,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Field("body"),
         authority: HostAuthorityRequirement::CheckedEffectRow("Http"),
-        replay: HostReplayClass::ReceiptRequired,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Timer",
@@ -198,7 +215,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Discard,
         authority: HostAuthorityRequirement::CheckedEffectRow("Timer"),
-        replay: HostReplayClass::DurableWait,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Comms",
@@ -211,7 +228,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Passthrough,
         authority: HostAuthorityRequirement::CheckedEffectRow("Comms"),
-        replay: HostReplayClass::ReceiptRequired,
+        replay: HostReplayClass::ExternalRequiresIdempotencyKey,
     },
     HostOperationDescriptor {
         source_effect: "Comms",
@@ -224,7 +241,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Passthrough,
         authority: HostAuthorityRequirement::CheckedEffectRow("Comms"),
-        replay: HostReplayClass::ReceiptRequired,
+        replay: HostReplayClass::ExternalNonreplayable,
     },
     HostOperationDescriptor {
         source_effect: "Agent",
@@ -237,7 +254,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Passthrough,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
-        replay: HostReplayClass::ReceiptRequired,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Agent",
@@ -250,7 +267,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Passthrough,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
-        replay: HostReplayClass::ReceiptRequired,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Agent",
@@ -263,7 +280,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Passthrough,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
-        replay: HostReplayClass::ReadOnly,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Agent",
@@ -276,7 +293,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Passthrough,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
-        replay: HostReplayClass::ReadOnly,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Agent",
@@ -289,7 +306,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Passthrough,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
-        replay: HostReplayClass::ReceiptRequired,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Agent",
@@ -302,7 +319,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Passthrough,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
-        replay: HostReplayClass::ReceiptRequired,
+        replay: HostReplayClass::JournalResult,
     },
     HostOperationDescriptor {
         source_effect: "Agent",
@@ -315,7 +332,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
         },
         response: HostResponseProjection::Passthrough,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
-        replay: HostReplayClass::ReadOnly,
+        replay: HostReplayClass::JournalResult,
     },
 ];
 
@@ -432,10 +449,36 @@ mod tests {
             r#"{"operation":"Write","key":{"$arg":0},"value":{"$arg":1}}"#
         );
         assert_eq!(operation.response, HostResponseProjection::Discard);
-        assert_eq!(operation.replay, HostReplayClass::IdempotentMutation);
+        assert_eq!(operation.replay, HostReplayClass::JournalResult);
+        assert_eq!(operation.replay.manifest_class(), "journal-result");
         assert_eq!(
             operation.canonical_id(),
             "nulang.host-effects/v0alpha1:nulang:storage/string#Write"
+        );
+    }
+
+    #[test]
+    fn replay_classes_match_behavior_manifest_v0alpha1_vocabulary() {
+        assert_eq!(HostReplayClass::Pure.manifest_class(), "pure");
+        assert_eq!(
+            HostReplayClass::LocalReplaySafe.manifest_class(),
+            "local-replay-safe"
+        );
+        assert_eq!(
+            HostReplayClass::JournalResult.manifest_class(),
+            "journal-result"
+        );
+        assert_eq!(
+            HostReplayClass::ExternalIdempotent.manifest_class(),
+            "external-idempotent"
+        );
+        assert_eq!(
+            HostReplayClass::ExternalRequiresIdempotencyKey.manifest_class(),
+            "external-requires-idempotency-key"
+        );
+        assert_eq!(
+            HostReplayClass::ExternalNonreplayable.manifest_class(),
+            "external-nonreplayable"
         );
     }
 
