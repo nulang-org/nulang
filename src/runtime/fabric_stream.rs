@@ -695,8 +695,8 @@ impl FileFabricStreamStore {
             let supersedes_abandoned = !existing.finalized
                 && existing.proposal.from_policy == proposal.from_policy
                 && proposal.to_policy.epoch > existing.proposal.to_policy.epoch;
-            let follows_finalized = existing.finalized
-                && existing.proposal.to_policy == proposal.from_policy;
+            let follows_finalized =
+                existing.finalized && existing.proposal.to_policy == proposal.from_policy;
             if !supersedes_abandoned && !follows_finalized {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
