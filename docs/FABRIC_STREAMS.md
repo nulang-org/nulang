@@ -584,8 +584,10 @@ A promise for epoch `N+1` immediately fences normal stream traffic from epoch
 `N` on that node. Repeating the same proposal is idempotent. A conflicting
 proposal for the same epoch is rejected.
 
-After the durable policy itself advances, the next transition may replace the
-older promise with a promise for the next sequential epoch.
+A strictly higher term may supersede an abandoned lower promise even when the
+installed policy has not advanced yet. This mirrors consensus election terms:
+a stalled epoch 2 proposal can be abandoned in favor of epoch 3, and the epoch
+3 promise fences both epoch 1 and epoch 2 traffic.
 
 This creates the key failover invariant:
 
@@ -661,11 +663,16 @@ A new replica accepts the transition commit only when:
 
 It then installs epoch `N+1` and persists that committed boundary.
 
-### Sequential transitions
+### Monotonic election terms
 
-A finalized transition file can be replaced only by a proposal whose
-`from_policy` is exactly the previous transition's installed `to_policy`.
-Epochs therefore cannot be skipped by the local transition state machine.
+Installed policies move only forward, but abandoned election terms may be
+skipped. A non-finalized proposal can be superseded only by a higher term with
+the same installed `from_policy`. A finalized transition can be replaced only
+by a proposal whose `from_policy` is exactly the previously installed
+`to_policy`.
+
+This prevents an interrupted election from permanently wedging the stream while
+still forbidding rollback to an older term.
 
 ### NUL0 compatibility
 
