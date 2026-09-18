@@ -16,7 +16,7 @@
 
 use crate::bytecode::Constant;
 use crate::mir::{self, LocalId};
-use crate::types::{PrimitiveType, Type};
+use crate::types::{Capability, PrimitiveType, Type};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Infer safe last-use ownership transfers in every function and behavior.
@@ -308,6 +308,404 @@ fn rvalue_reads(rv: &mir::RValue, out: &mut Vec<LocalId>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ownership-aware direct-call candidate analysis
+// ---------------------------------------------------------------------------
+
+/// Why a parameter cannot yet become an owned call parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOwnershipBlocker {
+    PublicFunction,
+    Entrypoint,
+    DynamicCallable,
+    NoDirectCallers,
+    NonLinearParameter,
+    UntransferableCallArgument,
+}
+
+/// Evidence available for one direct-call argument at the current MIR stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgTransferEvidence {
+    /// Single-use compiler temporary with a counted owning definition.
+    OwnedTemporary,
+    /// Exactly-once parameter used only at this call. This becomes transferable
+    /// only if the caller itself eventually receives that parameter as owned.
+    LinearForward,
+    NotTransferable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamOwnershipCandidate {
+    pub param: LocalId,
+    pub cap: Capability,
+    pub candidate_owned: bool,
+    pub requires_upstream_owned_param: bool,
+    pub blockers: Vec<CallOwnershipBlocker>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnOwnershipCandidate {
+    BorrowedOrImmediate,
+    /// Every value-return path returns a locally-created counted owner.
+    OwnedLocal,
+    /// Every value-return path returns an exactly-once parameter. Activation
+    /// requires that parameter to be promoted to owned first.
+    OwnedFromLinearParam,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionOwnershipCandidate {
+    pub function_idx: usize,
+    pub name: String,
+    pub direct_call_sites: usize,
+    pub public: bool,
+    pub dynamic_callable: bool,
+    pub params: Vec<ParamOwnershipCandidate>,
+    pub return_ownership: ReturnOwnershipCandidate,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CallerRef {
+    Function(usize),
+    Behavior(usize),
+}
+
+#[derive(Debug, Clone)]
+struct DirectCallSite {
+    caller: CallerRef,
+    args: Vec<LocalId>,
+}
+
+#[derive(Debug, Clone)]
+struct CallLocalFacts {
+    def_count: Vec<usize>,
+    owning_def: Vec<bool>,
+    use_count: Vec<usize>,
+}
+
+/// Analyze which direct-call ownership contracts are locally plausible.
+///
+/// This is intentionally diagnostic metadata only. It does not alter MIR,
+/// bytecode, parameter Drop roots, or the VM calling convention.
+pub fn analyze_call_ownership(module: &mir::Module) -> Vec<FunctionOwnershipCandidate> {
+    let mut call_sites: Vec<Vec<DirectCallSite>> =
+        (0..module.functions.len()).map(|_| Vec::new()).collect();
+    let mut dynamic_callable = vec![false; module.functions.len()];
+
+    for (idx, func) in module.functions.iter().enumerate() {
+        collect_function_calls(
+            func,
+            CallerRef::Function(idx),
+            &mut call_sites,
+            &mut dynamic_callable,
+        );
+    }
+    for (idx, func) in module.behaviors.iter().enumerate() {
+        collect_function_calls(
+            func,
+            CallerRef::Behavior(idx),
+            &mut call_sites,
+            &mut dynamic_callable,
+        );
+    }
+
+    let function_facts: Vec<CallLocalFacts> =
+        module.functions.iter().map(call_local_facts).collect();
+    let behavior_facts: Vec<CallLocalFacts> =
+        module.behaviors.iter().map(call_local_facts).collect();
+
+    module
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(idx, func)| {
+            let sites = &call_sites[idx];
+            let function_blockers = function_level_blockers(func, dynamic_callable[idx], sites.len());
+            let params = func
+                .params
+                .iter()
+                .enumerate()
+                .map(|(param_idx, param)| {
+                    let cap = func.locals[param.0 as usize].cap;
+                    let mut blockers = function_blockers.clone();
+                    let linear = matches!(cap, Capability::LinearIso | Capability::Linear);
+                    if !linear {
+                        blockers.push(CallOwnershipBlocker::NonLinearParameter);
+                    }
+
+                    let mut requires_upstream = false;
+                    if linear && blockers.iter().all(|b| {
+                        !matches!(b, CallOwnershipBlocker::UntransferableCallArgument)
+                    }) {
+                        for site in sites {
+                            let Some(arg) = site.args.get(param_idx).copied() else {
+                                blockers.push(CallOwnershipBlocker::UntransferableCallArgument);
+                                continue;
+                            };
+                            let evidence = match site.caller {
+                                CallerRef::Function(caller_idx) => arg_transfer_evidence(
+                                    &module.functions[caller_idx],
+                                    &function_facts[caller_idx],
+                                    arg,
+                                ),
+                                CallerRef::Behavior(caller_idx) => arg_transfer_evidence(
+                                    &module.behaviors[caller_idx],
+                                    &behavior_facts[caller_idx],
+                                    arg,
+                                ),
+                            };
+                            match evidence {
+                                ArgTransferEvidence::OwnedTemporary => {}
+                                ArgTransferEvidence::LinearForward => {
+                                    requires_upstream = true;
+                                }
+                                ArgTransferEvidence::NotTransferable => {
+                                    blockers.push(CallOwnershipBlocker::UntransferableCallArgument);
+                                }
+                            }
+                        }
+                    }
+                    blockers.sort_by_key(|b| *b as u8);
+                    blockers.dedup();
+
+                    ParamOwnershipCandidate {
+                        param: *param,
+                        cap,
+                        candidate_owned: blockers.is_empty(),
+                        requires_upstream_owned_param: requires_upstream,
+                        blockers,
+                    }
+                })
+                .collect();
+
+            FunctionOwnershipCandidate {
+                function_idx: idx,
+                name: func.name.clone(),
+                direct_call_sites: sites.len(),
+                public: func.public,
+                dynamic_callable: dynamic_callable[idx],
+                params,
+                return_ownership: analyze_return_candidate(func, &function_facts[idx]),
+            }
+        })
+        .collect()
+}
+
+fn function_level_blockers(
+    func: &mir::Function,
+    dynamic_callable: bool,
+    direct_call_sites: usize,
+) -> Vec<CallOwnershipBlocker> {
+    let mut blockers = Vec::new();
+    if func.public {
+        blockers.push(CallOwnershipBlocker::PublicFunction);
+    }
+    if matches!(func.name.as_str(), "main" | "__main") {
+        blockers.push(CallOwnershipBlocker::Entrypoint);
+    }
+    if dynamic_callable {
+        blockers.push(CallOwnershipBlocker::DynamicCallable);
+    }
+    if direct_call_sites == 0 {
+        blockers.push(CallOwnershipBlocker::NoDirectCallers);
+    }
+    blockers
+}
+
+fn collect_function_calls(
+    func: &mir::Function,
+    caller: CallerRef,
+    call_sites: &mut [Vec<DirectCallSite>],
+    dynamic_callable: &mut [bool],
+) {
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            if let mir::Stmt::Assign { op, .. } = stmt {
+                collect_rvalue_calls(op, caller, call_sites, dynamic_callable);
+            }
+        }
+    }
+}
+
+fn collect_rvalue_calls(
+    rv: &mir::RValue,
+    caller: CallerRef,
+    call_sites: &mut [Vec<DirectCallSite>],
+    dynamic_callable: &mut [bool],
+) {
+    match rv {
+        mir::RValue::Call {
+            func: mir::FuncRef::Index(target),
+            args,
+        } => {
+            if let Some(sites) = call_sites.get_mut(*target) {
+                sites.push(DirectCallSite {
+                    caller,
+                    args: args.clone(),
+                });
+            }
+        }
+        mir::RValue::Closure { func, .. } => {
+            if let Some(dynamic) = dynamic_callable.get_mut(*func) {
+                *dynamic = true;
+            }
+        }
+        mir::RValue::Spawn { init, .. } => {
+            for (_, nested) in init {
+                collect_rvalue_calls(nested, caller, call_sites, dynamic_callable);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn call_local_facts(func: &mir::Function) -> CallLocalFacts {
+    let nlocals = func.locals.len();
+    let transfers: FxHashSet<(LocalId, LocalId)> = func
+        .ownership_transfers
+        .iter()
+        .map(|t| (t.src, t.dst))
+        .collect();
+    let mut def_count = vec![0usize; nlocals];
+    let mut owning_def = vec![false; nlocals];
+    let mut use_count = vec![0usize; nlocals];
+
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            if let mir::Stmt::Assign { dst, op } = stmt {
+                let d = dst.0 as usize;
+                def_count[d] += 1;
+                if def_count[d] == 1 {
+                    owning_def[d] = counted_owning_definition(op, &func.locals[d].ty)
+                        || matches!(
+                            op,
+                            mir::RValue::Load(src)
+                                if transfers.contains(&(*src, *dst))
+                        );
+                } else {
+                    owning_def[d] = false;
+                }
+            }
+            let mut reads = Vec::new();
+            stmt_reads(stmt, &mut reads);
+            for id in reads {
+                use_count[id.0 as usize] += 1;
+            }
+        }
+        let mut reads = Vec::new();
+        terminator_reads(&block.terminator, &mut reads);
+        for id in reads {
+            use_count[id.0 as usize] += 1;
+        }
+    }
+
+    CallLocalFacts {
+        def_count,
+        owning_def,
+        use_count,
+    }
+}
+
+fn arg_transfer_evidence(
+    caller: &mir::Function,
+    facts: &CallLocalFacts,
+    arg: LocalId,
+) -> ArgTransferEvidence {
+    let i = arg.0 as usize;
+    if facts.use_count.get(i).copied() != Some(1) {
+        return ArgTransferEvidence::NotTransferable;
+    }
+    let Some(local) = caller.locals.get(i) else {
+        return ArgTransferEvidence::NotTransferable;
+    };
+
+    let compiler_temp = local
+        .name
+        .as_deref()
+        .map(|n| n.starts_with("__"))
+        .unwrap_or(true);
+    if compiler_temp
+        && facts.def_count.get(i).copied() == Some(1)
+        && facts.owning_def.get(i).copied() == Some(true)
+    {
+        return ArgTransferEvidence::OwnedTemporary;
+    }
+
+    if caller.params.contains(&arg)
+        && matches!(local.cap, Capability::LinearIso | Capability::Linear)
+    {
+        return ArgTransferEvidence::LinearForward;
+    }
+
+    ArgTransferEvidence::NotTransferable
+}
+
+fn counted_owning_definition(op: &mir::RValue, ty: &Type) -> bool {
+    if !definitely_counted_heap_type(ty) {
+        return false;
+    }
+    matches!(
+        op,
+        mir::RValue::Tuple(_)
+            | mir::RValue::Record(_)
+            | mir::RValue::RecordUpdate { .. }
+            | mir::RValue::ArrayLit(_)
+    )
+}
+
+fn definitely_counted_heap_type(ty: &Type) -> bool {
+    match ty {
+        Type::Primitive(PrimitiveType::String) => true,
+        Type::Tuple(_) | Type::Record(_) | Type::Array(_) | Type::Variant(_) | Type::App { .. } => true,
+        Type::Nominal { underlying, .. } => definitely_counted_heap_type(underlying),
+        Type::Reference { inner, .. } => definitely_counted_heap_type(inner),
+        _ => false,
+    }
+}
+
+fn analyze_return_candidate(
+    func: &mir::Function,
+    facts: &CallLocalFacts,
+) -> ReturnOwnershipCandidate {
+    let mut saw_value_return = false;
+    let mut saw_local_owner = false;
+    let mut saw_linear_param = false;
+
+    for block in &func.blocks {
+        let mir::Terminator::Return(Some(id)) = &block.terminator else {
+            continue;
+        };
+        saw_value_return = true;
+        let i = id.0 as usize;
+        let local_owner = facts.def_count.get(i).copied() == Some(1)
+            && facts.owning_def.get(i).copied() == Some(true);
+        if local_owner {
+            saw_local_owner = true;
+            continue;
+        }
+        let linear_param = func.params.contains(id)
+            && func
+                .locals
+                .get(i)
+                .map(|l| matches!(l.cap, Capability::LinearIso | Capability::Linear))
+                .unwrap_or(false);
+        if linear_param {
+            saw_linear_param = true;
+            continue;
+        }
+        return ReturnOwnershipCandidate::BorrowedOrImmediate;
+    }
+
+    if !saw_value_return {
+        ReturnOwnershipCandidate::BorrowedOrImmediate
+    } else if saw_linear_param {
+        ReturnOwnershipCandidate::OwnedFromLinearParam
+    } else if saw_local_owner {
+        ReturnOwnershipCandidate::OwnedLocal
+    } else {
+        ReturnOwnershipCandidate::BorrowedOrImmediate
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
