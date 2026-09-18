@@ -6,6 +6,14 @@ use crate::runtime::object_store::ObjectId;
 use crate::vm::Value;
 use std::collections::{HashMap, HashSet};
 
+/// Initial ORCA bump-block capacity for a newly-created actor.
+///
+/// Actor heaps already grow by chaining non-moving blocks, so reserving a
+/// large block for every idle actor only lowers actor density. Keep the first
+/// block small and let allocation-heavy actors pay for additional blocks on
+/// demand.
+const INITIAL_ACTOR_HEAP_BYTES: usize = 2 * 1024;
+
 /// Actor state machine: Created → Running → Waiting → Suspended → Terminated
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorState {
@@ -83,7 +91,10 @@ impl FlightRecorder {
     /// Create a new flight recorder retaining up to `max_entries` messages.
     pub fn new(max_entries: usize) -> Self {
         FlightRecorder {
-            entries: Vec::with_capacity(max_entries),
+            // Do not reserve `max_entries` eagerly. Most actors are idle or
+            // lightly used, and preallocating the full trace ring made the
+            // recorder one of the largest fixed per-actor memory costs.
+            entries: Vec::new(),
             cursor: 0,
             next_seq: 0,
             max_entries,
@@ -92,6 +103,10 @@ impl FlightRecorder {
 
     /// Record a message delivery.
     pub fn record(&mut self, sender: u64, behavior_id: u16, payload: &[Value]) {
+        if self.max_entries == 0 {
+            return;
+        }
+
         let seq = self.next_seq;
         self.next_seq += 1;
 
@@ -334,7 +349,7 @@ impl Actor {
             state: ActorState::Created,
             mailbox: Mailbox::new(mailbox_cap),
             heap: {
-                let mut heap = ActorHeap::new(16 * 1024); // 16KB initial heap (density: ~64k actors/GB)
+                let mut heap = ActorHeap::new(INITIAL_ACTOR_HEAP_BYTES);
                 heap.set_actor_id(id);
                 heap
             },
@@ -633,6 +648,41 @@ mod tests {
         assert!(!actor.is_agent);
         assert_eq!(actor.max_reductions, 1000);
         assert_eq!(actor.reduction_count, 0);
+    }
+
+    #[test]
+    fn test_flight_recorder_does_not_preallocate_idle_capacity() {
+        let mut recorder = FlightRecorder::new(1000);
+        assert_eq!(recorder.entries.capacity(), 0);
+        assert!(recorder.is_empty());
+
+        recorder.record(1, 0, &[]);
+        assert_eq!(recorder.len(), 1);
+        assert!(recorder.entries.capacity() > 0);
+    }
+
+    #[test]
+    fn test_zero_length_flight_recorder_drops_entries() {
+        let mut recorder = FlightRecorder::new(0);
+        recorder.record(1, 0, &[Value::int(42)]);
+        assert!(recorder.is_empty());
+    }
+
+    #[test]
+    fn test_actor_heap_grows_past_small_initial_block() {
+        let mut actor = Actor::new(1, "test", 0);
+        let initial_capacity = actor.heap.used() + actor.heap.free_bytes();
+        let payload = "x".repeat(96);
+
+        for _ in 0..4096 {
+            let value = actor.allocate_string(&payload);
+            assert!(!value.is_nil(), "actor heap allocation should succeed");
+            if actor.heap.used() > initial_capacity {
+                return;
+            }
+        }
+
+        panic!("actor heap did not grow beyond its initial block");
     }
 
     #[test]
