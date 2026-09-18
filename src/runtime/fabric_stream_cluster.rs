@@ -1923,6 +1923,26 @@ pub(crate) fn compute_stream_placement(
     partition: u16,
     replication_factor: usize,
 ) -> io::Result<FabricStreamPlacement> {
+    let candidates: Vec<NodeId> = match cluster {
+        Some(cluster) => cluster
+            .all_members()
+            .into_iter()
+            .filter(|member| {
+                member.status != NodeStatus::Leaving && !cluster.is_removed(member.node_id)
+            })
+            .map(|member| member.node_id)
+            .collect(),
+        None => vec![local],
+    };
+    compute_stream_placement_from_candidates(stream, partition, replication_factor, &candidates)
+}
+
+pub(crate) fn compute_stream_placement_from_candidates(
+    stream: &str,
+    partition: u16,
+    replication_factor: usize,
+    candidates: &[NodeId],
+) -> io::Result<FabricStreamPlacement> {
     if stream.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1936,17 +1956,7 @@ pub(crate) fn compute_stream_placement(
         ));
     }
 
-    let mut candidates: Vec<NodeId> = match cluster {
-        Some(cluster) => cluster
-            .all_members()
-            .into_iter()
-            .filter(|member| {
-                member.status != NodeStatus::Leaving && !cluster.is_removed(member.node_id)
-            })
-            .map(|member| member.node_id)
-            .collect(),
-        None => vec![local],
-    };
+    let mut candidates = candidates.to_vec();
     candidates.sort_unstable();
     candidates.dedup();
 
@@ -1954,7 +1964,7 @@ pub(crate) fn compute_stream_placement(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "Fabric stream replication_factor {replication_factor} exceeds known membership {}",
+                "Fabric stream replication_factor {replication_factor} exceeds candidate membership {}",
                 candidates.len()
             ),
         ));
