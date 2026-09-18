@@ -1446,7 +1446,7 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
                         ) =>
                     {
                         is_float[l.0 as usize] || is_float[r.0 as usize]
-                    }
+                        }
                     _ => false,
                 };
                 if result && !is_float[dst.0 as usize] {
@@ -1495,8 +1495,8 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
 
 const MAX_OPT_ITERATIONS: usize = 10;
 
-/// Optimize one MIR function in place. `_module_consts` reserves space for
-/// module-level constant pooling; unused by the current transforms.
+/// Materialize the small ownership-transfer side table as a lookup set used
+/// by optimization and Drop planning.
 fn ownership_transfer_pairs(
     func: &mir::Function,
 ) -> HashSet<(mir::LocalId, mir::LocalId)> {
@@ -1545,6 +1545,8 @@ fn is_transfer_clear(
     )
 }
 
+/// Optimize one MIR function in place. `_module_consts` reserves space for
+/// module-level constant pooling; unused by the current transforms.
 fn optimize_function(func: &mut mir::Function, _module_consts: &mut Vec<mir::RValue>) {
     for _ in 0..MAX_OPT_ITERATIONS {
         let const_locals = collect_const_locals(func);
@@ -1939,8 +1941,8 @@ fn dead_store_elim(func: &mut mir::Function) -> bool {
                 false
             } else {
                 match &stmt {
-                mir::Stmt::Assign { dst, op } => {
-                    let self_move = matches!(op, mir::RValue::Load(src) if src == dst);
+                    mir::Stmt::Assign { dst, op } => {
+                        let self_move = matches!(op, mir::RValue::Load(src) if src == dst);
                     // Source-named locals stay visible to the debugger at
                     // breakpoints: constant propagation can make their
                     // definition look dead (the folded RValue no longer
