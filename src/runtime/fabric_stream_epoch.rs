@@ -22,7 +22,9 @@ use crate::runtime::fabric_stream::{
     FabricStreamEpochProposalState, FabricStreamEpochTransitionState, FabricStreamEpochVoteState,
     FabricStreamReplicationPolicy,
 };
-use crate::runtime::fabric_stream_cluster::{compute_stream_placement, FabricStreamPlacement};
+use crate::runtime::fabric_stream_cluster::{
+    compute_stream_placement, compute_stream_placement_from_candidates, FabricStreamPlacement,
+};
 use crate::runtime::{ClusterState, MessagePriority, NodeId, NodeStatus, Packet, Runtime};
 
 pub(crate) const FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR: &str =
@@ -201,6 +203,83 @@ impl FabricStreamEpochCommit {
 }
 
 impl Runtime {
+    fn fabric_stream_locally_eligible_old_replicas(
+        policy: &FabricStreamReplicationPolicy,
+        cluster: &ClusterState,
+    ) -> Vec<NodeId> {
+        policy
+            .replicas
+            .iter()
+            .copied()
+            .map(NodeId)
+            .filter(|node| {
+                if cluster.is_removed(*node) {
+                    return false;
+                }
+                !matches!(
+                    cluster.get_node(*node).map(|info| info.status),
+                    Some(NodeStatus::Failed | NodeStatus::Leaving)
+                )
+            })
+            .collect()
+    }
+
+    fn fabric_stream_validate_transition_placement(
+        &self,
+        stream: &str,
+        proposal: &FabricStreamEpochProposalState,
+        cluster: &ClusterState,
+    ) -> io::Result<FabricStreamPlacement> {
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch transition placement requires distribution",
+            )
+        })?;
+
+        // Preserve ordinary manual/reconfiguration behavior when the current
+        // whole-cluster candidate placement already matches the proposal.
+        if let Ok(placement) = compute_stream_placement(
+            local,
+            Some(cluster),
+            stream,
+            proposal.to_policy.partition,
+            proposal.to_policy.replication_factor,
+        ) {
+            if policy_from_placement(&placement, proposal.to_policy.epoch)
+                == proposal.to_policy
+            {
+                return Ok(placement);
+            }
+        }
+
+        // Pre-removal failover may reduce only the installed old replica set.
+        // Missing/unknown and Suspicious old replicas remain eligible. A node
+        // is excluded only after this receiver independently sees Failed,
+        // Leaving, or confirmed Removed state.
+        let eligible =
+            Self::fabric_stream_locally_eligible_old_replicas(&proposal.from_policy, cluster);
+        if proposal.to_policy.replication_factor > eligible.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch proposal requires more replicas than locally eligible old policy",
+            ));
+        }
+        let reduced = compute_stream_placement_from_candidates(
+            stream,
+            proposal.to_policy.partition,
+            proposal.to_policy.replication_factor,
+            &eligible,
+        )?;
+        if policy_from_placement(&reduced, proposal.to_policy.epoch) != proposal.to_policy {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch proposal does not match locally corroborated survivor placement",
+            ));
+        }
+        Ok(reduced)
+    }
+
     /// Start safe stream ownership transitions after a node is confirmed removed.
     ///
     /// This is intentionally narrower than generic reconfiguration:
