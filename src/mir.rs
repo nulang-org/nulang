@@ -38,7 +38,6 @@ pub struct OwnershipTransfer {
     pub dst: LocalId,
 }
 
-
 // ---------------------------------------------------------------------------
 // Module and functions
 // ---------------------------------------------------------------------------
@@ -549,7 +548,8 @@ impl FunctionBuilder {
     /// that the Load is a transfer rather than an aliasing copy.
     pub fn transfer(&mut self, dst: LocalId, src: LocalId) {
         debug_assert_ne!(dst, src, "ownership transfer requires distinct locals");
-        self.ownership_transfers.push(OwnershipTransfer { src, dst });
+        self.ownership_transfers
+            .push(OwnershipTransfer { src, dst });
         self.assign(dst, RValue::Load(src));
         self.assign(src, RValue::Const(Constant::Nil));
     }
