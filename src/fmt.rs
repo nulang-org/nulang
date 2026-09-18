@@ -1289,7 +1289,10 @@ mod tests {
 }
 "#;
         let out = format_source(src).expect("function with using params formats");
-        assert!(out.contains("pub fn fetch[T]("), "pub/type params lost: {out}");
+        assert!(
+            out.contains("pub fn fetch[T]("),
+            "pub/type params lost: {out}"
+        );
         assert!(
             out.contains("lineariso id: Int = 1"),
             "capability/default lost: {out}"
