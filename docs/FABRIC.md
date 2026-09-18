@@ -194,9 +194,11 @@ semantics that later cluster and stream layers can reuse.
 - [x] Deterministic partition ownership and replica placement.
 - [x] Replica transport over existing NUL0 v1 ActorMessage envelopes.
 - [x] Application replica ACK/NACK and majority quorum commit index.
-- [ ] Persist/reconstruct pending replication tickets across leader restart.
+- [x] Persist/reconstruct pending replication intent across leader restart.
+- [x] Explicit idempotent retry for recovered uncommitted sequences.
+- [ ] Automatic retry scheduling / backoff.
 - [ ] Leader epoch/lease and automatic failover.
-- [ ] Lagging-replica catch-up and committed-index propagation.
+- [ ] Lagging committed-replica catch-up and committed-index propagation.
 - [x] Durable monotonic consumer cursors.
 - [ ] Consumer ACK/NACK and timed redelivery.
 - [x] Replay by sequence and committed consumer cursor.
