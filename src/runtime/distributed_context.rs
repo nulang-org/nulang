@@ -208,10 +208,10 @@ impl FabricRegistry {
         before - self.subscriptions.len()
     }
 
-    fn remove_remote_node(&mut self, node_id: NodeId) -> usize {
+    fn remove_remote_node(&mut self, node_id: NodeId) -> (usize, bool) {
         let removed = self.remove_remote_subscriptions(node_id);
-        self.remote_generations.remove(&node_id);
-        removed
+        let generation_removed = self.remote_generations.remove(&node_id).is_some();
+        (removed, generation_removed)
     }
 
     /// Apply a complete remote snapshot if and only if its generation is
@@ -545,7 +545,7 @@ impl Runtime {
                     applied += 1;
                 }
                 Ok(FabricControl::RemoveRemoteNode(node_id)) => {
-                    self.distributed.fabric.remove_remote_node(node_id);
+                    let _ = self.distributed.fabric.remove_remote_node(node_id);
                     applied += 1;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -647,10 +647,9 @@ impl Runtime {
         limit: usize,
     ) -> Result<FabricAdvertisementSnapshot, String> {
         self.fabric_sync();
-        let node_id = self
-            .distributed
-            .node_id
-            .ok_or_else(|| "Fabric advertisements require distribution to be enabled".to_string())?;
+        let node_id = self.distributed.node_id.ok_or_else(|| {
+            "Fabric advertisements require distribution to be enabled".to_string()
+        })?;
         let generation = self.fabric_current_generation();
         self.distributed
             .fabric
@@ -688,11 +687,10 @@ impl Runtime {
             subscriptions.push(FabricSubscription::remote(advertisement)?);
         }
 
-        let changed = self.distributed.fabric.replace_remote_node(
-            node_id,
-            generation,
-            subscriptions.clone(),
-        );
+        let changed =
+            self.distributed
+                .fabric
+                .replace_remote_node(node_id, generation, subscriptions.clone());
         // Broadcast the authoritative snapshot even when this shard already
         // had the same logical generation: another shard may have joined the
         // control plane later and still need to converge.
@@ -712,8 +710,8 @@ impl Runtime {
     /// node with the same NodeId to begin a fresh sequence.
     pub fn fabric_remove_remote_node(&mut self, node_id: NodeId) -> usize {
         self.fabric_sync();
-        let removed = self.distributed.fabric.remove_remote_node(node_id);
-        if removed > 0 {
+        let (removed, generation_removed) = self.distributed.fabric.remove_remote_node(node_id);
+        if removed > 0 || generation_removed {
             self.fabric_broadcast_control(FabricControl::RemoveRemoteNode(node_id));
         }
         removed
@@ -761,11 +759,9 @@ impl Runtime {
                     node_id,
                     actor_id,
                     behavior,
-                } => self.send_distributed(
-                    ActorAddress::remote(node_id, actor_id),
-                    &behavior,
-                    args,
-                ),
+                } => {
+                    self.send_distributed(ActorAddress::remote(node_id, actor_id), &behavior, args)
+                }
             }
         }
         Ok(selected)
@@ -805,9 +801,9 @@ mod tests {
     #[test]
     fn fabric_fans_out_and_round_robins_consumer_groups() {
         let mut fabric = FabricRegistry::default();
-        assert!(fabric.insert(
-            FabricSubscription::local("orders.*", 1, "fanout", 10, None).unwrap()
-        ));
+        assert!(
+            fabric.insert(FabricSubscription::local("orders.*", 1, "fanout", 10, None).unwrap())
+        );
         assert!(fabric.insert(
             FabricSubscription::local("orders.created", 2, "work", 20, Some("billing")).unwrap()
         ));
@@ -831,20 +827,11 @@ mod tests {
         );
 
         let second = fabric.route("orders.created").unwrap();
-        assert!(matches!(
-            second[0],
-            FabricTarget::Local { actor_id: 1, .. }
-        ));
-        assert!(matches!(
-            second[1],
-            FabricTarget::Local { actor_id: 3, .. }
-        ));
+        assert!(matches!(second[0], FabricTarget::Local { actor_id: 1, .. }));
+        assert!(matches!(second[1], FabricTarget::Local { actor_id: 3, .. }));
 
         let third = fabric.route("orders.created").unwrap();
-        assert!(matches!(
-            third[1],
-            FabricTarget::Local { actor_id: 2, .. }
-        ));
+        assert!(matches!(third[1], FabricTarget::Local { actor_id: 2, .. }));
     }
 
     #[test]
@@ -941,10 +928,7 @@ mod tests {
         assert_eq!(snapshot.generation, 1);
         assert_eq!(snapshot.subscriptions.len(), 1);
         assert_eq!(snapshot.subscriptions[0].pattern, "jobs.*");
-        assert_eq!(
-            snapshot.subscriptions[0].group.as_deref(),
-            Some("workers")
-        );
+        assert_eq!(snapshot.subscriptions[0].group.as_deref(), Some("workers"));
 
         let mut target = Runtime::new();
         target.distributed.enabled = true;
@@ -1061,8 +1045,7 @@ mod tests {
             .get_mut(&actor_id)
             .unwrap()
             .register_behavior("handle", noop);
-        rt.fabric_subscribe("events.*", actor_id, "handle")
-            .unwrap();
+        rt.fabric_subscribe("events.*", actor_id, "handle").unwrap();
 
         let snapshot = FabricAdvertisementSnapshot {
             node_id: NodeId(10),
