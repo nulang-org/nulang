@@ -314,6 +314,56 @@ impl Runtime {
         })
     }
 
+    pub(crate) fn fabric_stream_record_replica_ack_from_cluster(
+        &mut self,
+        ack: FabricStreamReplicaAck,
+        cluster: &ClusterState,
+    ) -> io::Result<FabricStreamReplicationStatus> {
+        let committed = self.fabric_stream_committed_sequence(&ack.stream)?;
+        if ack.sequence <= committed {
+            return self.fabric_stream_record_replica_ack(ack);
+        }
+
+        let key = (ack.stream.clone(), ack.partition);
+        let replication_factor = self
+            .distributed
+            .fabric_stream_replication
+            .pending
+            .get(&key)
+            .and_then(|entries| entries.get(&ack.sequence))
+            .map(|ticket| ticket.replicas.len())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Fabric stream replica ACK has no pending ticket",
+                )
+            })?;
+
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream replica ACK requires distribution",
+            )
+        })?;
+        let current = compute_stream_placement(
+            local,
+            Some(cluster),
+            &ack.stream,
+            ack.partition,
+            replication_factor,
+        )?;
+        if current.membership_fingerprint != ack.membership_fingerprint
+            || current.leader != ack.leader
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stale Fabric stream replica ACK after membership change",
+            ));
+        }
+
+        self.fabric_stream_record_replica_ack(ack)
+    }
+
     pub(crate) fn fabric_stream_record_replica_ack(
         &mut self,
         ack: FabricStreamReplicaAck,
