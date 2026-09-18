@@ -34,7 +34,7 @@ fn test_authority_snapshot_round_trip_recovery() {
     rt.actors.remove(&actor_id);
     assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
     let recovered = rt.actors.get(&actor_id).unwrap();
-    assert_eq!(recovered.authority_manifest().unwrap(), manifest);
+    assert_eq!(recovered.authority_manifest(), &manifest);
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn test_migration_preserves_authority_manifest() {
     let mut rt = Runtime::new();
     assert!(rt.receive_migrated_actor(actor_id, nbc, json));
     let actor = rt.actors.get(&actor_id).unwrap();
-    assert_eq!(actor.authority_manifest().unwrap(), manifest);
+    assert_eq!(actor.authority_manifest(), &manifest);
 }
 
 #[test]
