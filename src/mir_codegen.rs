@@ -2589,6 +2589,23 @@ mod tests {
     }
 
     #[test]
+    fn test_mir_codegen_moveout_transfers_value_and_clears_source() {
+        let moved = run_mir_source("let x = 42 in consume x").unwrap();
+        assert_eq!(moved.as_int(), Some(42));
+
+        // This helper intentionally exercises MIR/codegen directly rather than
+        // the capability checker. Reading the source after MoveOut lets the
+        // backend test observe the physical invalidation contract: the source
+        // register must contain nil after the transfer.
+        let source_after =
+            run_mir_source("let x = 42 in { let y = consume x; x }").unwrap();
+        assert!(
+            source_after.is_nil(),
+            "MoveOut must invalidate the source register without releasing the transferred value"
+        );
+    }
+
+    #[test]
     fn test_mir_codegen_simple_arithmetic() {
         let value = run_mir_source("1 + 2 * 3").unwrap();
         assert_eq!(value.as_int(), Some(7));
