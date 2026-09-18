@@ -748,3 +748,86 @@ Pulling old-policy data from an ahead survivor into an already-fenced candidate
 requires a separate proposal-scoped pull/reconciliation protocol. Once the
 candidate tail changes, it must start a higher election term because the old
 proposal hash binds the earlier tail.
+
+
+## Proposal-scoped pull reconciliation for an ahead survivor
+
+The inverse transition-repair case is now supported: the deterministic
+prospective leader can be behind another surviving proposed replica.
+
+New API:
+
+`fabric_stream_pull_epoch_transition(stream, max_records)`
+
+The candidate uses the active transition's rejected votes to identify proposed
+replicas whose durable tail is ahead of its own proposal tail. It selects the
+highest reported tail deterministically and sends a bounded request through:
+
+- `__nulang_fabric_stream_epoch_pull_request_v1`
+- `__nulang_fabric_stream_epoch_pull_response_v1`
+
+### Source validation
+
+The source accepts a request only when:
+
+- requester is the proposal's prospective leader,
+- source is the addressed proposed replica,
+- durable installed policy still equals the proposal's old policy,
+- current deterministic placement still equals the proposed new policy,
+- no newer/conflicting durable promise fences the proposal,
+- the requested start sequence is within the source's durable tail.
+
+The source returns raw exact-sequence records plus its current durable tail.
+
+### Candidate validation
+
+The candidate accepts a response only when:
+
+- it still owns the exact active proposal,
+- sender is a proposed replica,
+- installed old policy and current proposed placement still match,
+- the source's returned tail equals the tail recorded in its rejected vote,
+- the candidate local tail is still exactly the proposal's original candidate
+  tail,
+- the response begins at the candidate's next sequence and contains no gaps.
+
+The response is then appended to the candidate's durable log through the
+transition-repair append path.
+
+### Mandatory higher term after pull
+
+Applying even one pulled record changes the candidate tail. Because the proposal
+hash binds that tail, the existing election proposal becomes stale immediately.
+
+The candidate therefore does **not** install the old proposal after pulling.
+The caller starts `fabric_stream_begin_epoch_transition(...)` again. Durable
+promise state selects a strictly higher term, whose proposal hash binds the new
+candidate tail.
+
+Example:
+
+```text
+installed epoch 1
+candidate proposes term 2 at tail 1
+peer rejects with tail 2
+candidate pulls sequence 2
+term-2 proposal is now stale
+candidate starts term 3 at tail 2
+peer matches tail 2 and votes yes
+term 3 installs
+```
+
+For bounded pulls where the source remains ahead after one batch, the same
+process repeats through higher terms. This is intentionally conservative:
+candidate log mutation and election identity are never hidden inside the same
+proposal.
+
+### Safety boundary
+
+Pull reconciliation trusts durable records held by an old-policy replica under
+Nulang's crash/partition trust model. After the candidate copies the suffix, an
+old-policy majority can hold that exact tail and certify it in the higher term.
+
+Fabric stream records do not yet persist per-record origin term metadata. A
+future log-format upgrade can strengthen provenance validation before expanding
+the threat model beyond trusted cluster replicas.
