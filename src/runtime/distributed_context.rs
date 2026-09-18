@@ -167,7 +167,6 @@ struct FabricPlacementScore {
     mailbox_depth: usize,
 }
 
-
 /// Cross-shard Fabric control traffic.
 ///
 /// Payload publications continue to use the Runtime's existing CrossShardMsg
@@ -818,12 +817,7 @@ impl Runtime {
         let local_mailboxes: HashMap<u64, (usize, usize)> = self
             .actors
             .iter()
-            .map(|(&actor_id, actor)| {
-                (
-                    actor_id,
-                    (actor.mailbox.len(), actor.mailbox.capacity()),
-                )
-            })
+            .map(|(&actor_id, actor)| (actor_id, (actor.mailbox.len(), actor.mailbox.capacity())))
             .collect();
         let cluster_known = self.distributed.cluster.is_some();
         let healthy_remote: HashSet<NodeId> = self
@@ -839,35 +833,38 @@ impl Runtime {
             })
             .unwrap_or_default();
 
-        let targets = self.distributed.fabric.route_scored(topic, |target| match target {
-            FabricTarget::Local { actor_id, .. } => {
-                let owner_shard = (*actor_id % shard_count as u64) as u16;
-                if owner_shard == shard_idx {
-                    let (depth, capacity) = *local_mailboxes.get(actor_id)?;
-                    if capacity > 0 && depth >= capacity {
+        let targets = self
+            .distributed
+            .fabric
+            .route_scored(topic, |target| match target {
+                FabricTarget::Local { actor_id, .. } => {
+                    let owner_shard = (*actor_id % shard_count as u64) as u16;
+                    if owner_shard == shard_idx {
+                        let (depth, capacity) = *local_mailboxes.get(actor_id)?;
+                        if capacity > 0 && depth >= capacity {
+                            return None;
+                        }
+                        Some(FabricPlacementScore {
+                            locality: 0,
+                            mailbox_depth: depth,
+                        })
+                    } else {
+                        Some(FabricPlacementScore {
+                            locality: 1,
+                            mailbox_depth: 0,
+                        })
+                    }
+                }
+                FabricTarget::Remote { node_id, .. } => {
+                    if cluster_known && !healthy_remote.contains(node_id) {
                         return None;
                     }
                     Some(FabricPlacementScore {
-                        locality: 0,
-                        mailbox_depth: depth,
-                    })
-                } else {
-                    Some(FabricPlacementScore {
-                        locality: 1,
+                        locality: 2,
                         mailbox_depth: 0,
                     })
                 }
-            }
-            FabricTarget::Remote { node_id, .. } => {
-                if cluster_known && !healthy_remote.contains(node_id) {
-                    return None;
-                }
-                Some(FabricPlacementScore {
-                    locality: 2,
-                    mailbox_depth: 0,
-                })
-            }
-        })?;
+            })?;
         if !self.distributed.enabled
             && targets
                 .iter()
@@ -895,21 +892,14 @@ impl Runtime {
                     actor_id,
                     behavior,
                 } => {
-                    self.send_distributed(
-                        ActorAddress::remote(node_id, actor_id),
-                        &behavior,
-                        args,
-                    );
+                    self.send_distributed(ActorAddress::remote(node_id, actor_id), &behavior, args);
                     report.forwarded_remote += 1;
                 }
             }
         }
         debug_assert_eq!(
             report.selected,
-            report.admitted
-                + report.backpressured
-                + report.rejected
-                + report.forwarded_remote
+            report.admitted + report.backpressured + report.rejected + report.forwarded_remote
         );
         Ok(report)
     }
@@ -1067,15 +1057,12 @@ mod tests {
     #[test]
     fn fabric_scored_routing_prefers_lower_score_and_round_robins_ties() {
         let mut fabric = FabricRegistry::default();
-        assert!(fabric.insert(
-            FabricSubscription::local("jobs.*", 2, "work", 20, Some("workers")).unwrap()
-        ));
-        assert!(fabric.insert(
-            FabricSubscription::local("jobs.*", 4, "work", 40, Some("workers")).unwrap()
-        ));
-        assert!(fabric.insert(
-            FabricSubscription::local("jobs.*", 6, "work", 60, Some("workers")).unwrap()
-        ));
+        assert!(fabric
+            .insert(FabricSubscription::local("jobs.*", 2, "work", 20, Some("workers")).unwrap()));
+        assert!(fabric
+            .insert(FabricSubscription::local("jobs.*", 4, "work", 40, Some("workers")).unwrap()));
+        assert!(fabric
+            .insert(FabricSubscription::local("jobs.*", 6, "work", 60, Some("workers")).unwrap()));
 
         let first = fabric
             .route_scored("jobs.run", |target| match target {
@@ -1090,10 +1077,7 @@ mod tests {
                 FabricTarget::Remote { .. } => None,
             })
             .unwrap();
-        assert!(matches!(
-            first[0],
-            FabricTarget::Local { actor_id: 4, .. }
-        ));
+        assert!(matches!(first[0], FabricTarget::Local { actor_id: 4, .. }));
 
         let second = fabric
             .route_scored("jobs.run", |target| match target {
@@ -1108,10 +1092,7 @@ mod tests {
                 FabricTarget::Remote { .. } => None,
             })
             .unwrap();
-        assert!(matches!(
-            second[0],
-            FabricTarget::Local { actor_id: 6, .. }
-        ));
+        assert!(matches!(second[0], FabricTarget::Local { actor_id: 6, .. }));
     }
 
     #[test]
