@@ -677,6 +677,15 @@ impl MirCodegen {
         handle_patches: &mut Vec<(usize, usize)>,
     ) -> NuResult<()> {
         match stmt {
+            mir::Stmt::Assign {
+                dst,
+                op: mir::RValue::MoveOut(src),
+            } if dst == src => {
+                return Err(compile_err(
+                    "internal: MoveOut source and destination must be distinct locals",
+                    Span::default(),
+                ));
+            }
             mir::Stmt::Assign { dst, op } => {
                 let _spill_dst = self.local_dst(*dst);
                 self.compile_rvalue(_spill_dst, op)?;
@@ -2727,6 +2736,24 @@ mod tests {
         assert!(
             !plan_contains(&plan.after_stmt, (0, 1), source),
             "MoveOut transfers ownership; the source must not be released at the transfer"
+        );
+    }
+
+    #[test]
+    fn test_codegen_rejects_moveout_to_same_local() {
+        let mut b = mir::FunctionBuilder::new("main", Some(Type::unit()));
+        let x = b.add_temp(Type::unit());
+        b.assign(x, mir::RValue::ArrayLit(Vec::new()));
+        b.assign(x, mir::RValue::MoveOut(x));
+        b.terminate(mir::Terminator::Return(Some(x)));
+
+        let mut module = mir::Module::new("self_moveout");
+        module.functions.push(b.build());
+        let err = compile_mir(&mut module, "self_moveout")
+            .expect_err("MoveOut to the same local must be rejected");
+        assert!(
+            err.to_string().contains("source and destination must be distinct"),
+            "unexpected error: {err}"
         );
     }
 
