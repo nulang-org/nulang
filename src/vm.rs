@@ -6146,6 +6146,100 @@ mod vm_tests {
     use super::*;
     use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
 
+    #[derive(Debug)]
+    struct CountingDropCallbacks {
+        drops: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl ActorVmCallbacks for CountingDropCallbacks {
+        fn alloc(&mut self, _size: usize, _type_tag: HeapTypeTag) -> Option<*mut u8> {
+            None
+        }
+
+        fn drop_ref(&mut self, _ptr: *mut u8) {
+            self.drops.set(self.drops.get() + 1);
+        }
+
+        fn retain_ref(&mut self, _ptr: *mut u8) {}
+
+        fn array_len(&self, _ptr: *mut u8) -> Option<usize> {
+            None
+        }
+
+        fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+    }
+
+    fn cleanup_test_module() -> CodeModule {
+        let mut module = CodeModule::new("cleanup_test");
+        module.emit(Instruction::new0(OpCode::Panic));
+        module.entry_point = Some(0);
+        module.debug_functions.push(crate::bytecode::DebugFunctionInfo {
+            name: "main".to_string(),
+            code_offset: 0,
+            code_len: 1,
+            params: vec![],
+            locals: vec![],
+            cleanup_regs: vec![16],
+            cleanup_spills: vec![0],
+        });
+        module
+    }
+
+    #[test]
+    fn test_true_runtime_error_reclaims_register_and_spill_owners() {
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut vm = VM::new();
+        vm.load_module(cleanup_test_module());
+        vm.set_actor_callbacks(Box::new(CountingDropCallbacks {
+            drops: drops.clone(),
+        }));
+
+        let reg_ptr = Box::into_raw(Box::new(1u8));
+        let spill_ptr = Box::into_raw(Box::new(2u8));
+        let mut frame = Frame::new(None, 0);
+        frame.regs[16] = unsafe { Value::ptr(reg_ptr) };
+        frame.spilled.push(unsafe { Value::ptr(spill_ptr) });
+        vm.set_current_frame(frame);
+
+        let err = vm.run_from(0, 0).expect_err("panic must abandon the frame");
+        assert_eq!(drops.get(), 2, "both proven owner slots must be released");
+        assert!(vm.frames().is_empty(), "abandoned frames must be discarded");
+        assert_eq!(vm.current_frame_index(), None);
+        assert!(
+            err.to_string().contains("Stack trace:"),
+            "error must be enriched before cleanup removes the frames"
+        );
+
+        unsafe {
+            drop(Box::from_raw(reg_ptr));
+            drop(Box::from_raw(spill_ptr));
+        }
+    }
+
+    #[test]
+    fn test_suspension_preserves_owner_slots_and_frame_state() {
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut vm = VM::new();
+        vm.load_module(cleanup_test_module());
+        vm.set_actor_callbacks(Box::new(CountingDropCallbacks {
+            drops: drops.clone(),
+        }));
+
+        let reg_ptr = Box::into_raw(Box::new(3u8));
+        let mut frame = Frame::new(None, 0);
+        frame.regs[16] = unsafe { Value::ptr(reg_ptr) };
+        vm.set_current_frame(frame);
+
+        let err = vm.finalize_execution_error(NuError::Suspended(VmSuspension::SignalWait));
+        assert!(matches!(err, NuError::Suspended(VmSuspension::SignalWait)));
+        assert_eq!(drops.get(), 0, "suspension must not release resumable owners");
+        assert_eq!(vm.frames().len(), 1, "suspension must preserve the frame");
+        assert_eq!(vm.frames()[0].regs[16].as_ptr(), Some(reg_ptr));
+
+        unsafe {
+            drop(Box::from_raw(reg_ptr));
+        }
+    }
     /// A NULL C string return (nil from cstr_to_value) must pass through
     /// instead of erroring on the missing pointer.
     #[test]
