@@ -770,8 +770,45 @@ impl MirCodegen {
                 }
             }
             mir::RValue::MoveOut(id) => {
-                let src = self.local_reg(*id);
-                if src != dst {
+                if let Some(slot) = self.spill_map.get(&id.0).copied() {
+                    // A spilled source does not live in the scratch register
+                    // returned by local_reg(): that register is only a cache
+                    // of the spill slot. MoveOut must invalidate the spill
+                    // slot itself or both source and destination would retain
+                    // the same counted ownership.
+                    //
+                    // Use a scratch distinct from dst so a spilled destination
+                    // (SPILL_TEMP) or another scratch-directed lowering cannot
+                    // be clobbered while the source slot is cleared.
+                    let scratch = if dst != SPILL_TEMP2 {
+                        SPILL_TEMP2
+                    } else {
+                        SPILL_TEMP3
+                    };
+                    self.emit(Instruction::new3(
+                        OpCode::SpillLoad,
+                        (slot >> 8) as u8,
+                        (slot & 0xFF) as u8,
+                        scratch,
+                    ));
+                    if scratch != dst {
+                        self.emit(Instruction::new2(OpCode::Move, scratch, dst));
+                    }
+                    self.load_constant(scratch, &Constant::Nil);
+                    self.emit(Instruction::new3(
+                        OpCode::SpillStore,
+                        scratch,
+                        (slot >> 8) as u8,
+                        (slot & 0xFF) as u8,
+                    ));
+                } else {
+                    let src = (LOCAL_BASE + id.0) as u8;
+                    if src == dst {
+                        return Err(compile_err(
+                            "internal: MoveOut source and destination must be distinct locals",
+                            Span::default(),
+                        ));
+                    }
                     self.emit(Instruction::new2(OpCode::Move, src, dst));
                     // MoveOut transfers the counted slot; invalidating the
                     // source must not release it. Reuse the existing constant
@@ -2553,9 +2590,15 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
         for (si, stmt) in block.stmts.iter().enumerate().rev() {
             let uses = stmt_uses(stmt);
-            // Last-use drops for candidates this statement reads.
-            for (u, _) in &uses {
-                if candidate[*u] && !live.contains(u) && esc_clear(*u, &live) {
+            // Last-use drops for candidates this statement reads. Transfer is
+            // different: MoveOut invalidates the source without releasing it,
+            // and the counted ownership continues in the destination.
+            for (u, kind) in &uses {
+                if *kind != UseKind::Transfer
+                    && candidate[*u]
+                    && !live.contains(u)
+                    && esc_clear(*u, &live)
+                {
                     plan.after_stmt
                         .entry((bi, si))
                         .or_default()
