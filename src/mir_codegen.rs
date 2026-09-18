@@ -2818,6 +2818,150 @@ mod tests {
     }
 
     #[test]
+    fn test_drop_plan_treats_linear_param_as_owned_only_for_sink_abi() {
+        let mut b = mir::FunctionBuilder::new("take", Some(Type::int()));
+        let param = b.add_param_with_cap(
+            "p",
+            Type::unit(),
+            crate::types::Capability::LinearIso,
+        );
+        let len = b.add_temp(Type::int());
+        b.assign(len, mir::RValue::ArrayLen(param));
+        b.terminate(mir::Terminator::Return(Some(len)));
+        let func = b.build();
+
+        let sink_plan = plan_drops(&func, true);
+        assert!(
+            plan_contains(&sink_plan.after_stmt, (0, 0), param),
+            "sink ABI must let the callee release its transferred parameter after the last read"
+        );
+
+        let ordinary_plan = plan_drops(&func, false);
+        let ordinary_has_param = ordinary_plan
+            .block_entry
+            .values()
+            .chain(ordinary_plan.before_stmt.values())
+            .chain(ordinary_plan.after_stmt.values())
+            .any(|ids| ids.contains(&param));
+        assert!(
+            !ordinary_has_param,
+            "the same parameter must remain unowned outside the sink ABI"
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_releases_unused_linear_sink_param_at_entry() {
+        let mut b = mir::FunctionBuilder::new("ignore", Some(Type::int()));
+        let param = b.add_param_with_cap(
+            "p",
+            Type::unit(),
+            crate::types::Capability::LinearIso,
+        );
+        let result = b.add_temp(Type::int());
+        b.assign(result, mir::RValue::Const(Constant::Int(7)));
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let func = b.build();
+
+        let plan = plan_drops(&func, true);
+        assert!(
+            plan.block_entry
+                .get(&(func.entry.0 as usize))
+                .is_some_and(|ids| ids.contains(&param)),
+            "unused transferred ownership must be released at function entry"
+        );
+    }
+
+    fn sink_call_module(return_source_after_call: bool, spill_source: bool) -> mir::Module {
+        let mut callee = mir::FunctionBuilder::new("take", Some(Type::int()));
+        let param = callee.add_param_with_cap(
+            "p",
+            Type::unit(),
+            crate::types::Capability::LinearIso,
+        );
+        let len = callee.add_temp(Type::int());
+        callee.assign(len, mir::RValue::ArrayLen(param));
+        callee.terminate(mir::Terminator::Return(Some(len)));
+
+        let mut caller = mir::FunctionBuilder::new(
+            "main",
+            Some(if return_source_after_call {
+                Type::unit()
+            } else {
+                Type::int()
+            }),
+        );
+        if spill_source {
+            let spilled_threshold = FUNC_VALUE_REG as u32 - LOCAL_BASE;
+            for _ in 0..spilled_threshold {
+                let _ = caller.add_temp(Type::int());
+            }
+        }
+        let elem = caller.add_temp(Type::int());
+        let source = caller.add_temp(Type::unit());
+        let result = caller.add_temp(Type::int());
+        caller.assign(elem, mir::RValue::Const(Constant::Int(7)));
+        caller.assign(source, mir::RValue::ArrayLit(vec![elem]));
+        caller.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![source],
+                sink_args: vec![true],
+            },
+        );
+        caller.terminate(mir::Terminator::Return(Some(if return_source_after_call {
+            source
+        } else {
+            result
+        })));
+
+        let mut module = mir::Module::new("sink_call");
+        module.functions.push(callee.build());
+        module.functions.push(caller.build());
+        module
+    }
+
+    #[test]
+    fn test_sink_call_transfers_value_to_callee() {
+        let mut module = sink_call_module(false, false);
+        let code = compile_mir(&mut module, "sink_call_value").expect("compile");
+        let mut vm = VM::new();
+        vm.load_module(code);
+        let value = vm.run().expect("run");
+        assert_eq!(
+            value.as_int(),
+            Some(1),
+            "callee must receive the transferred array and observe its length"
+        );
+    }
+
+    #[test]
+    fn test_sink_call_invalidates_caller_source() {
+        let mut module = sink_call_module(true, false);
+        let code = compile_mir(&mut module, "sink_call_clear").expect("compile");
+        let mut vm = VM::new();
+        vm.load_module(code);
+        let value = vm.run().expect("run");
+        assert!(
+            value.is_nil(),
+            "direct sink call must clear the caller's source local"
+        );
+    }
+
+    #[test]
+    fn test_sink_call_invalidates_spilled_caller_source() {
+        let mut module = sink_call_module(true, true);
+        let code = compile_mir(&mut module, "sink_call_spill_clear").expect("compile");
+        let mut vm = VM::new();
+        vm.load_module(code);
+        let value = vm.run().expect("run");
+        assert!(
+            value.is_nil(),
+            "direct sink call must clear the caller's spill slot, not only a scratch register"
+        );
+    }
+
+    #[test]
     fn test_codegen_rejects_moveout_to_same_local() {
         let mut b = mir::FunctionBuilder::new("main", Some(Type::unit()));
         let x = b.add_temp(Type::unit());
