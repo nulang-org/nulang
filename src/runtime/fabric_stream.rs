@@ -66,6 +66,9 @@ pub struct FabricStreamInfo {
     pub segment_count: usize,
     pub next_sequence: u64,
     pub last_sequence: Option<u64>,
+    /// Highest sequence known committed by the stream's replication policy.
+    /// Local/raw appends may exist beyond this boundary.
+    pub committed_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +81,21 @@ struct StreamMetadata {
 struct CursorFile {
     version: u16,
     cursors: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommitFile {
+    version: u16,
+    committed_sequence: u64,
+}
+
+impl Default for CommitFile {
+    fn default() -> Self {
+        Self {
+            version: STREAM_FORMAT_VERSION,
+            committed_sequence: 0,
+        }
+    }
 }
 
 impl Default for CursorFile {
@@ -165,12 +183,15 @@ impl FileFabricStreamStore {
             .get(name)
             .expect("stream state must exist after ensure_state");
         let segment_count = list_segments(&self.stream_dir(name))?.len();
+        let committed_sequence = read_commit(&self.stream_dir(name).join("commit.json"))?
+            .committed_sequence;
         Ok(FabricStreamInfo {
             name: name.to_string(),
             segment_max_bytes: state.config.segment_max_bytes,
             segment_count,
             next_sequence: state.next_sequence,
             last_sequence: state.next_sequence.checked_sub(1).filter(|&seq| seq > 0),
+            committed_sequence,
         })
     }
 
@@ -349,6 +370,69 @@ impl FileFabricStreamStore {
         Ok(result)
     }
 
+    /// Highest sequence made visible by the stream replication policy.
+    pub fn committed_sequence(&mut self, name: &str) -> io::Result<u64> {
+        self.ensure_state(name)?;
+        Ok(read_commit(&self.stream_dir(name).join("commit.json"))?.committed_sequence)
+    }
+
+    /// Persist a monotonic committed boundary.
+    ///
+    /// The boundary may never move past the local durable tail. This method
+    /// does not decide quorum; it only durably records a decision made by the
+    /// replication layer.
+    pub fn commit_through(&mut self, name: &str, sequence: u64) -> io::Result<()> {
+        self.ensure_state(name)?;
+        let tail = self
+            .states
+            .get(name)
+            .and_then(|state| state.next_sequence.checked_sub(1))
+            .filter(|&seq| seq > 0)
+            .unwrap_or(0);
+        if sequence > tail {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Fabric committed sequence {sequence} is beyond local stream tail {tail}"
+                ),
+            ));
+        }
+
+        let path = self.stream_dir(name).join("commit.json");
+        let mut commit = read_commit(&path)?;
+        if sequence < commit.committed_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Fabric committed sequence cannot move backwards from {} to {sequence}",
+                    commit.committed_sequence
+                ),
+            ));
+        }
+        if sequence == commit.committed_sequence {
+            return Ok(());
+        }
+        commit.committed_sequence = sequence;
+        write_json_atomic(&path, &commit)?;
+        sync_dir(&self.stream_dir(name))
+    }
+
+    /// Read only records at or below the persisted committed boundary.
+    pub fn read_committed(
+        &mut self,
+        name: &str,
+        start_sequence: u64,
+        limit: usize,
+    ) -> io::Result<Vec<FabricStreamRecord>> {
+        let committed = self.committed_sequence(name)?;
+        if committed == 0 || start_sequence > committed || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut records = self.read_from(name, start_sequence, limit)?;
+        records.retain(|record| record.sequence <= committed);
+        Ok(records)
+    }
+
     /// Read records after the consumer's last committed sequence.
     pub fn read_consumer(
         &mut self,
@@ -484,6 +568,28 @@ impl Runtime {
 
     pub fn fabric_stream_info(&mut self, name: &str) -> io::Result<FabricStreamInfo> {
         self.fabric_stream_store_mut()?.stream_info(name)
+    }
+
+    pub fn fabric_stream_committed_sequence(&mut self, name: &str) -> io::Result<u64> {
+        self.fabric_stream_store_mut()?.committed_sequence(name)
+    }
+
+    pub fn fabric_stream_read_committed(
+        &mut self,
+        name: &str,
+        start_sequence: u64,
+        limit: usize,
+    ) -> io::Result<Vec<FabricStreamRecord>> {
+        self.fabric_stream_store_mut()?
+            .read_committed(name, start_sequence, limit)
+    }
+
+    pub(crate) fn fabric_stream_commit_through(
+        &mut self,
+        name: &str,
+        sequence: u64,
+    ) -> io::Result<()> {
+        self.fabric_stream_store_mut()?.commit_through(name, sequence)
     }
 
     pub fn fabric_stream_config(&mut self, name: &str) -> io::Result<FabricStreamConfig> {
@@ -747,6 +853,21 @@ fn segment_path(dir: &Path, base_sequence: u64) -> PathBuf {
     dir.join(format!("{base_sequence:020}.seg"))
 }
 
+fn read_commit(path: &Path) -> io::Result<CommitFile> {
+    if !path.exists() {
+        return Ok(CommitFile::default());
+    }
+    let bytes = fs::read(path)?;
+    let commit: CommitFile = serde_json::from_slice(&bytes).map_err(json_error)?;
+    if commit.version != STREAM_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported Fabric commit version {}", commit.version),
+        ));
+    }
+    Ok(commit)
+}
+
 fn read_cursors(path: &Path) -> io::Result<CursorFile> {
     if !path.exists() {
         return Ok(CursorFile::default());
@@ -978,6 +1099,32 @@ mod tests {
         store.commit_cursor("events", "worker", 2).unwrap();
         assert!(store.commit_cursor("events", "worker", 1).is_err());
         assert!(store.commit_cursor("events", "worker", 3).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_boundary_is_persisted_and_hides_uncommitted_tail() {
+        let root = test_dir("commit-boundary");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream("events", FabricStreamConfig::default())
+                .unwrap();
+            store.append("events", b"one").unwrap();
+            store.append("events", b"two").unwrap();
+            store.commit_through("events", 1).unwrap();
+
+            let committed = store.read_committed("events", 1, 10).unwrap();
+            assert_eq!(committed.len(), 1);
+            assert_eq!(committed[0].sequence, 1);
+        }
+
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(reopened.committed_sequence("events").unwrap(), 1);
+        let committed = reopened.read_committed("events", 1, 10).unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(reopened.read_from("events", 1, 10).unwrap().len(), 2);
+        assert!(reopened.commit_through("events", 3).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
