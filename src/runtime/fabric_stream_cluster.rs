@@ -722,11 +722,11 @@ impl Runtime {
                 .retry_schedules
                 .get_mut(&(stream.clone(), partition))
             {
-                schedule.next_attempt = now + schedule.backoff;
                 schedule.backoff = schedule
                     .backoff
                     .saturating_mul(2)
                     .min(FABRIC_STREAM_RETRY_MAX);
+                schedule.next_attempt = now + schedule.backoff;
             }
             if let Err(error) = result {
                 tracing::warn!(
