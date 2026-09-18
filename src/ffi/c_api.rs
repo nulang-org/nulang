@@ -1,8 +1,8 @@
 //! Stable C API for embedding the Nulang runtime.
 //!
 //! This module exposes a minimal, ABI-stable boundary so that C (or any other
-//! language that can call C) can create a runtime, compile Nulang source,
-//! execute it, and read the results.
+//! language that can call C) can create a runtime, compile or load Nulang
+//! bytecode, execute it, and read the results.
 //!
 //! All public functions are `#[no_mangle] extern "C"`. The `NulangRuntime`
 //! and `NulangValue` types are `#[repr(C)]` and can be passed by pointer or
@@ -33,6 +33,9 @@ pub struct NulangRuntime {
     module_handles: Vec<usize>,
     /// Source-hash -> unique compiled module index.
     compile_cache: HashMap<[u8; 32], usize>,
+    /// Whether executions may use the native JIT tier when it is compiled in.
+    /// Restricted/mobile hosts explicitly disable it.
+    jit_enabled: bool,
     last_error: Option<String>,
     /// Holds the CString backing `nulang_last_error`.
     error_cstring: Option<CString>,
@@ -42,10 +45,19 @@ pub struct NulangRuntime {
 
 impl NulangRuntime {
     fn new() -> Self {
+        Self::new_with_jit(true)
+    }
+
+    fn new_without_jit() -> Self {
+        Self::new_with_jit(false)
+    }
+
+    fn new_with_jit(jit_enabled: bool) -> Self {
         NulangRuntime {
             modules: Vec::new(),
             module_handles: Vec::new(),
             compile_cache: HashMap::new(),
+            jit_enabled,
             last_error: None,
             error_cstring: None,
             string_cache: Vec::new(),
@@ -54,6 +66,10 @@ impl NulangRuntime {
 
     fn set_error(&mut self, err: NuError) {
         self.last_error = Some(err.to_string());
+    }
+
+    fn set_error_message(&mut self, message: impl Into<String>) {
+        self.last_error = Some(message.into());
     }
 
     fn clear_error(&mut self) {
@@ -75,6 +91,14 @@ impl NulangRuntime {
         let module_index = *self.module_handles.get(module_handle)?;
         self.modules.get(module_index)?;
         Some(module_index)
+    }
+
+    fn new_vm(&self) -> VM {
+        if self.jit_enabled {
+            VM::new()
+        } else {
+            VM::new_without_jit()
+        }
     }
 
     fn compile(&mut self, source: &str) -> Option<usize> {
@@ -105,11 +129,26 @@ impl NulangRuntime {
         }
     }
 
+    fn load_nbc(&mut self, bytes: &[u8]) -> Option<usize> {
+        self.clear_error();
+        match crate::bytecode::CodeModule::from_nbc(bytes) {
+            Ok(artifact) => {
+                let module_index = self.modules.len();
+                self.modules.push(artifact.module);
+                Some(self.fresh_handle_for(module_index))
+            }
+            Err(e) => {
+                self.set_error_message(e.to_string());
+                None
+            }
+        }
+    }
+
     fn run(&mut self, module_handle: usize) -> Option<Value> {
         self.clear_error();
         let module_index = self.module_index_for_handle(module_handle)?;
         let module = self.modules.get(module_index)?.clone();
-        let mut vm = VM::new();
+        let mut vm = self.new_vm();
         vm.load_module(module);
         match vm.run() {
             Ok(value) => Some(self.stabilize_string_value(value, &vm, module_handle)),
@@ -130,7 +169,7 @@ impl NulangRuntime {
         let module_index = self.module_index_for_handle(module_handle)?;
         let module = self.modules.get(module_index)?.clone();
         let offset = module.function_offset_by_name(name)?;
-        let mut vm = VM::new();
+        let mut vm = self.new_vm();
         vm.load_module(module);
         let mut arg_values = Vec::with_capacity(args.len());
         for &arg in args {
@@ -313,15 +352,27 @@ pub extern "C" fn nulang_runtime_new() -> *mut NulangRuntime {
     Box::into_raw(runtime)
 }
 
-/// Free a Nulang runtime created by `nulang_runtime_new`.
+/// Create a Nulang runtime that never enters the JIT tier.
+///
+/// This is the recommended constructor for iOS and other restricted hosts.
+/// Bytecode still uses the same VM and `.nbc` format; only native tiering is
+/// disabled.
+#[no_mangle]
+pub extern "C" fn nulang_runtime_new_interpreter() -> *mut NulangRuntime {
+    let runtime = Box::new(NulangRuntime::new_without_jit());
+    Box::into_raw(runtime)
+}
+
+/// Free a Nulang runtime created by `nulang_runtime_new` or
+/// `nulang_runtime_new_interpreter`.
 ///
 /// # Safety
-/// `runtime` must be a pointer returned by `nulang_runtime_new` and must not
-/// be used after this call.
+/// `runtime` must be a pointer returned by a Nulang runtime constructor and
+/// must not be used after this call.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_runtime_free(runtime: *mut NulangRuntime) {
     if !runtime.is_null() {
-        // SAFETY: caller guarantees the pointer came from `nulang_runtime_new`.
+        // SAFETY: caller guarantees the pointer came from a Nulang runtime constructor.
         unsafe {
             let _ = Box::from_raw(runtime);
         }
@@ -355,13 +406,49 @@ pub unsafe extern "C" fn nulang_compile(runtime: *mut NulangRuntime, source: *co
     }
 }
 
-/// Run a previously compiled module.
+/// Load a frozen `.nbc` bytecode artifact.
+///
+/// Packaged/native applications should compile ahead of time and call this
+/// function on-device. Format and language compatibility checks are delegated
+/// to the canonical `CodeModule::from_nbc` decoder.
+///
+/// Returns a non-negative public module handle on success, or -1 on error.
+///
+/// # Safety
+/// `runtime` must be a valid Nulang runtime. When `len > 0`, `bytes` must point
+/// to at least `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_load_nbc(
+    runtime: *mut NulangRuntime,
+    bytes: *const u8,
+    len: usize,
+) -> i64 {
+    if runtime.is_null() || (len > 0 && bytes.is_null()) {
+        return -1;
+    }
+
+    let data = if len == 0 {
+        &[]
+    } else {
+        // SAFETY: caller guarantees `bytes` points to `len` readable bytes.
+        unsafe { std::slice::from_raw_parts(bytes, len) }
+    };
+
+    // SAFETY: runtime is non-null and valid.
+    let rt = unsafe { &mut *runtime };
+    match rt.load_nbc(data) {
+        Some(handle) => handle as i64,
+        None => -1,
+    }
+}
+
+/// Run a previously compiled or loaded module.
 ///
 /// Returns the resulting value. If execution failed, the result is `nil` and
 /// `nulang_last_error` will return the error message.
 ///
 /// # Safety
-/// `runtime` must be a valid pointer returned by `nulang_runtime_new`.
+/// `runtime` must be a valid pointer returned by a Nulang runtime constructor.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_run(
     runtime: *mut NulangRuntime,
@@ -425,7 +512,7 @@ pub unsafe extern "C" fn nulang_call_function(
 /// Clear the runtime's last error state.
 ///
 /// # Safety
-/// `runtime` must be a valid pointer returned by `nulang_runtime_new`.
+/// `runtime` must be a valid pointer returned by a Nulang runtime constructor.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_clear_error(runtime: *mut NulangRuntime) {
     if !runtime.is_null() {
@@ -441,7 +528,7 @@ pub unsafe extern "C" fn nulang_clear_error(runtime: *mut NulangRuntime) {
 /// next call that modifies the error state or until the runtime is freed.
 ///
 /// # Safety
-/// `runtime` must be a valid pointer returned by `nulang_runtime_new`.
+/// `runtime` must be a valid pointer returned by a Nulang runtime constructor.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_last_error(runtime: *mut NulangRuntime) -> *const c_char {
     if runtime.is_null() {
@@ -590,7 +677,7 @@ pub unsafe extern "C" fn nulang_free_string(
 /// payload cannot establish that it points into a live Nulang host heap.
 ///
 /// # Safety
-/// `runtime` must be a valid pointer returned by `nulang_runtime_new`.
+/// `runtime` must be a valid pointer returned by a Nulang runtime constructor.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_value_to_string(
     runtime: *mut NulangRuntime,
@@ -689,6 +776,60 @@ mod tests {
         assert_eq!(nulang_value_int(value), 3);
 
         // SAFETY: rt is valid.
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_interpreter_runtime_runs_and_calls_functions() {
+        let rt = nulang_runtime_new_interpreter();
+        assert!(!rt.is_null());
+
+        let source = CString::new("fn add(a: Int, b: Int) -> Int { a + b } add(0, 0)").unwrap();
+        let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(handle >= 0);
+
+        let value = unsafe { nulang_run(rt, handle) };
+        assert_eq!(nulang_value_int(value), 0);
+
+        let args = [nulang_value_int_new(20), nulang_value_int_new(22)];
+        let name = CString::new("add").unwrap();
+        let result =
+            unsafe { nulang_call_function(rt, handle, name.as_ptr(), args.as_ptr(), args.len()) };
+        assert_eq!(nulang_value_int(result), 42);
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_c_api_load_nbc_and_run() {
+        let module = compile_source("40 + 2").expect("compile source");
+        let nbc = module.to_nbc(None).expect("encode .nbc");
+
+        let rt = nulang_runtime_new_interpreter();
+        assert!(!rt.is_null());
+
+        let handle = unsafe { nulang_load_nbc(rt, nbc.as_ptr(), nbc.len()) };
+        assert!(handle >= 0, "loading valid .nbc should succeed");
+
+        let value = unsafe { nulang_run(rt, handle) };
+        assert_eq!(nulang_value_int(value), 42);
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_c_api_load_nbc_rejects_invalid_artifact() {
+        let rt = nulang_runtime_new_interpreter();
+        let bad = b"not-an-nbc";
+
+        let handle = unsafe { nulang_load_nbc(rt, bad.as_ptr(), bad.len()) };
+        assert_eq!(handle, -1);
+
+        let err = unsafe { nulang_last_error(rt) };
+        assert!(!err.is_null());
+        let message = unsafe { CStr::from_ptr(err).to_string_lossy() };
+        assert!(!message.is_empty());
+
         unsafe { nulang_runtime_free(rt) };
     }
 

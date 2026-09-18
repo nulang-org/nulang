@@ -174,7 +174,7 @@ tar = "0.4"
 
 [lib]
 name = "nulang"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib", "cdylib", "staticlib"]
 path = "src/lib.rs"
 
 [[bin]]
