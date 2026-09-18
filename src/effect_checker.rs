@@ -468,9 +468,7 @@ impl EffectContext {
 // Effect Checker
 // ---------------------------------------------------------------------------
 
-/// Stateful effect checker.
-///
-/// Accumulates error messages so that multiple violations can be reported.
+/// Stable per-function effect report returned after module checking.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionEffectReport {
     pub name: String,
@@ -482,6 +480,9 @@ pub struct FunctionEffectReport {
     pub declared: bool,
 }
 
+/// Stateful effect checker.
+///
+/// Accumulates error messages so that multiple violations can be reported.
 pub struct EffectChecker {
     /// Accumulated diagnostics (errors + warnings).
     pub diagnostics: Vec<String>,
