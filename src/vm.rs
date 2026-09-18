@@ -3381,9 +3381,7 @@ impl VM {
         // artifact), any pointer host call fails closed because the VM cannot
         // prove that no parameter will consume the pointer.
         let has_pointer_args = args.iter().any(|v| v.as_ptr().is_some());
-        let metadata_present = sink_info
-            .map(|(_, present)| present)
-            .unwrap_or(false);
+        let metadata_present = sink_info.map(|(_, present)| present).unwrap_or(false);
         if has_pointer_args && !metadata_present {
             return Err(NuError::VMError {
                 msg: "call_function: pointer arguments require authoritative function ownership metadata"
@@ -3393,10 +3391,7 @@ impl VM {
         }
         let sink_mask = sink_info.map(|(mask, _)| mask).unwrap_or(0);
         for (i, arg) in args.iter().enumerate() {
-            if arg.as_ptr().is_some()
-                && i < u16::BITS as usize
-                && (sink_mask & (1u16 << i)) != 0
-            {
+            if arg.as_ptr().is_some() && i < u16::BITS as usize && (sink_mask & (1u16 << i)) != 0 {
                 return Err(NuError::VMError {
                     msg: format!(
                         "call_function: pointer argument {} targets a linear ownership sink; borrowed host calls cannot transfer unique ownership",
