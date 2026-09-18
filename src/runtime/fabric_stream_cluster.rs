@@ -511,11 +511,8 @@ impl Runtime {
                     )
                 })?;
 
-            let placement = self.fabric_stream_placement(
-                stream,
-                partition,
-                ticket.replicas.len(),
-            )?;
+            let placement =
+                self.fabric_stream_placement(stream, partition, ticket.replicas.len())?;
             if placement.leader != ticket.leader
                 || placement.membership_fingerprint != ticket.membership_fingerprint
                 || placement.replicas.iter().copied().collect::<HashSet<_>>() != ticket.replicas
