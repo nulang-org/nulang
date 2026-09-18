@@ -413,9 +413,7 @@ fn lower_function_def(ctx: &mut ModuleCtx, f: &hir::FunctionDef) -> NuResult<mir
         ));
     }
     for ((name, ty), cap) in f.params.iter().zip(&f.param_caps) {
-        let id = lowerer
-            .b
-            .add_param_with_cap(name.clone(), ty.clone(), *cap);
+        let id = lowerer.b.add_param_with_cap(name.clone(), ty.clone(), *cap);
         lowerer.bind(name, id);
     }
     lowerer.lower_body_top(&f.body)?;
@@ -1046,7 +1044,9 @@ impl<'c> FnLowerer<'c> {
                                 .ctx
                                 .func_param_caps
                                 .get(&idx)
-                                .map(|caps| caps.iter().map(|cap| cap.is_linear()).collect::<Vec<_>>())
+                                .map(|caps| {
+                                    caps.iter().map(|cap| cap.is_linear()).collect::<Vec<_>>()
+                                })
                                 .unwrap_or_default();
                             sinks.resize(aids.len(), false);
                             sinks.truncate(aids.len());
@@ -2953,12 +2953,11 @@ mod tests {
 
     #[test]
     fn test_sink_function_cannot_be_lowered_as_first_class_value() {
-        let result = lower_source(
-            "fn take(lineariso x: Int) -> Int { x }\nlet f = take in 0",
-        );
+        let result = lower_source("fn take(lineariso x: Int) -> Int { x }\nlet f = take in 0");
         let err = result.expect_err("sink-bearing function value must be rejected");
         assert!(
-            err.to_string().contains("cannot be used as a first-class value"),
+            err.to_string()
+                .contains("cannot be used as a first-class value"),
             "unexpected error: {err}"
         );
     }
