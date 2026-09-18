@@ -323,6 +323,12 @@ fn walk_value(
 
         // SAFETY: ptr is a valid heap payload pointer from the actor's heap.
         let header = unsafe { &*ActorHeap::header_of(ptr) };
+        if header.type_tag == TypeTag::ArrayBuilder {
+            return Err(
+                "ArrayBuilder cannot cross a durable continuation boundary; materialize it with ArrayBuilder.to_array first"
+                    .to_string(),
+            );
+        }
         let payload_ptr = ptr;
         let payload_size = header.payload_size as u32;
 
@@ -345,6 +351,12 @@ fn walk_value(
                 }
             }
             TypeTag::String | TypeTag::ActorRef | TypeTag::RemoteActor | TypeTag::Raw => {}
+            TypeTag::ArrayBuilder => {
+                return Err(
+                    "ArrayBuilder cannot cross a durable continuation boundary; materialize it with ArrayBuilder.to_array first"
+                        .to_string(),
+                );
+            }
         }
     }
 
