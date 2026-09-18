@@ -1093,12 +1093,9 @@ impl MirCodegen {
                 capabilities,
             } => {
                 if let Some(node) = target_node {
-                    if !capabilities.is_empty() {
-                        return Err(compile_err(
-                            "spawn@node authority grants are unsupported until the distributed spawn protocol carries typed authority",
-                            Span::default(),
-                        ));
-                    }
+                    let authority_manifest = crate::authority::AuthorityManifest::from_grants(
+                        capabilities.iter().cloned(),
+                    );
                     let node_reg = self.local_reg(*node);
                     if init.len() > MAX_STAGED_ARGS {
                         return Err(compile_err(
@@ -1117,6 +1114,11 @@ impl MirCodegen {
                     }
                     if !names.is_empty() {
                         self.module.remote_spawn_init_fields.push((pc, names));
+                    }
+                    if !authority_manifest.is_empty() {
+                        self.module
+                            .spawn_capability_grants
+                            .push((pc, authority_manifest.canonical_tokens()));
                     }
                     self.emit(Instruction::new3(
                         OpCode::RSpawn,
