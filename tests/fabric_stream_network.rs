@@ -342,3 +342,114 @@ fn replica_nack_does_not_advance_quorum_commit() {
     let _ = std::fs::remove_dir_all(root_a);
     let _ = std::fs::remove_dir_all(root_b);
 }
+
+
+#[test]
+fn leader_restart_recovers_pending_ticket_and_retries_replica() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:34501".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:34502".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut nodes = vec![runtime(addr_a, bus.clone()), runtime(addr_b, bus.clone())];
+    nodes[0]
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    nodes[1]
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let placement = nodes[0]
+        .fabric_stream_placement("recovery", 0, 2)
+        .unwrap();
+    assert_eq!(
+        placement,
+        nodes[1]
+            .fabric_stream_placement("recovery", 0, 2)
+            .unwrap()
+    );
+
+    let roots = vec![temp_dir("recovery-a"), temp_dir("recovery-b")];
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+
+    let leader_index = if placement.leader == node_a { 0 } else { 1 };
+    let follower_index = 1 - leader_index;
+    nodes[leader_index]
+        .fabric_stream_create("recovery", FabricStreamConfig::default())
+        .unwrap();
+
+    let initial = nodes[leader_index]
+        .fabric_stream_replicated_append("recovery", 0, 2, b"survive-restart")
+        .unwrap();
+    assert_eq!(initial.status.acknowledgements, 1);
+    assert!(!initial.status.committed);
+
+    // Crash the leader before the follower processes the first dispatch.
+    let leader_addr = if leader_index == 0 { addr_a } else { addr_b };
+    let follower_addr = if follower_index == 0 { addr_a } else { addr_b };
+    let follower_id = if follower_index == 0 { node_a } else { node_b };
+    let dead = std::mem::replace(&mut nodes[leader_index], Runtime::new());
+    drop(dead);
+
+    // Registering the restarted transport at the same address replaces the
+    // dead endpoint in the deterministic bus, preserving stable NodeId.
+    let mut restarted = runtime(leader_addr, bus.clone());
+    restarted
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(follower_id, follower_addr);
+    restarted.fabric_stream_open(&roots[leader_index]).unwrap();
+
+    let recovered = restarted.fabric_stream_recover_pending("recovery").unwrap();
+    assert_eq!(recovered.recovered, 1);
+    assert_eq!(recovered.removed_committed, 0);
+    assert_eq!(recovered.removed_orphan_reservations, 0);
+
+    let status = restarted
+        .fabric_stream_replication_status("recovery", 0, initial.sequence)
+        .unwrap();
+    assert_eq!(status.acknowledgements, 1);
+    assert!(!status.committed);
+
+    let retry = restarted
+        .fabric_stream_retry_pending("recovery", 0)
+        .unwrap();
+    assert_eq!(retry.pending_sequences, 1);
+    assert_eq!(retry.dispatched, 1);
+
+    // Duplicate delivery is possible: the original pre-crash dispatch may
+    // still be queued. Exact-sequence follower application is idempotent.
+    nodes[follower_index].process_network();
+    nodes[follower_index].process_network();
+    restarted.process_network();
+    restarted.process_network();
+
+    assert_eq!(
+        restarted
+            .fabric_stream_committed_sequence("recovery")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        restarted
+            .fabric_stream_read_committed("recovery", 1, 10)
+            .unwrap()[0]
+            .payload,
+        b"survive-restart"
+    );
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
