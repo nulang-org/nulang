@@ -1112,6 +1112,15 @@ impl WasmBackend {
             RValue::Load(l) => {
                 body.instruction(&Instruction::LocalGet(self.mir_local(l, func)));
             }
+            RValue::MoveOut(l) => {
+                let src = self.mir_local(l, func);
+                // Leave the transferred value on the operand stack for the
+                // enclosing assignment, then invalidate the reusable source
+                // local without releasing it.
+                body.instruction(&Instruction::LocalGet(src));
+                body.instruction(&Instruction::I64Const(value_layout::TAG_NIL as i64));
+                body.instruction(&Instruction::LocalSet(src));
+            }
             RValue::Binary(op, a, b) => {
                 body.instruction(&Instruction::LocalGet(self.mir_local(a, func)));
                 body.instruction(&Instruction::LocalGet(self.mir_local(b, func)));
