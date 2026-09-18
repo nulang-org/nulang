@@ -1,0 +1,17 @@
+// Explicit handlers must take precedence over builtin fallback dispatch.
+// This guards the optimization contract for module-load PerformDirect caches.
+fn main() {
+    let handled_builtin = handle {
+        perform Float.sqrt(9.0)
+    } {
+        | Float.sqrt(x) resume => 144.0
+    }
+    perform IO.print(perform Float.to_int(handled_builtin))
+
+    let handled_custom = handle {
+        perform Counter.ask()
+    } {
+        | Counter.ask() resume => 7
+    }
+    perform IO.print(handled_custom)
+}
