@@ -97,7 +97,6 @@ pub struct FabricStreamCatchUpReport {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FabricStreamReplicaAckOutcome {
-    pub status: FabricStreamReplicationStatus,
     pub placement: FabricStreamPlacement,
     pub committed_sequence: u64,
 }
@@ -790,13 +789,6 @@ impl Runtime {
         let committed = self.fabric_stream_committed_sequence(&ack.stream)?;
         if ack.sequence <= committed {
             return Ok(FabricStreamReplicaAckOutcome {
-                status: FabricStreamReplicationStatus {
-                    sequence: ack.sequence,
-                    quorum: ack.replication_factor / 2 + 1,
-                    acknowledgements: 0,
-                    rejections: 0,
-                    committed: true,
-                },
                 placement: current,
                 committed_sequence: committed,
             });
@@ -814,10 +806,9 @@ impl Runtime {
             self.fabric_stream_recover_pending_from_cluster(&ack.stream, cluster)?;
         }
 
-        let status = self.fabric_stream_record_replica_ack(ack)?;
+        self.fabric_stream_record_replica_ack(ack)?;
         let committed_sequence = self.fabric_stream_committed_sequence(&current.stream)?;
         Ok(FabricStreamReplicaAckOutcome {
-            status,
             placement: current,
             committed_sequence,
         })
