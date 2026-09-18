@@ -198,7 +198,9 @@ semantics that later cluster and stream layers can reuse.
 - [x] Explicit idempotent retry for recovered uncommitted sequences.
 - [x] Automatic pending-quorum retry scheduling with exponential backoff.
 - [x] Durable replication policy and epoch-1 fencing.
-- [ ] Quorum-backed epoch transition.
+- [x] Quorum-backed sequential epoch transition among old replicas.
+- [x] Durable one-proposal-per-epoch promises that fence the old epoch.
+- [ ] Replica-set expansion/bootstrap during reconfiguration.
 - [ ] Leader lease / automatic failover.
 - [x] Durable per-replica progress for application ACKs.
 - [x] Bounded lagging committed-replica catch-up.
