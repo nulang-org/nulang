@@ -2418,14 +2418,48 @@ fn stmt_uses(stmt: &mir::Stmt) -> Vec<(usize, UseKind)> {
     }
 }
 
+fn rvalue_uses_for_drop(
+    op: &mir::RValue,
+    owned_param_masks: &[Vec<bool>],
+) -> Vec<(usize, UseKind)> {
+    if let mir::RValue::Call {
+        func: mir::FuncRef::Index(target),
+        args,
+    } = op
+    {
+        let mask = owned_param_masks.get(*target);
+        return args
+            .iter()
+            .enumerate()
+            .map(|(idx, arg)| {
+                let kind = if mask
+                    .and_then(|m| m.get(idx))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    UseKind::Transfer
+                } else {
+                    UseKind::Copy
+                };
+                (arg.0 as usize, kind)
+            })
+            .collect();
+    }
+    rvalue_uses(op)
+}
+
 fn stmt_uses_for_drop(
     stmt: &mir::Stmt,
     transfers: &HashSet<(mir::LocalId, mir::LocalId)>,
+    owned_param_masks: &[Vec<bool>],
 ) -> Vec<(usize, UseKind)> {
     if let Some((src, _dst)) = transfer_move(stmt, transfers) {
         return vec![(src.0 as usize, UseKind::Transfer)];
     }
-    stmt_uses(stmt)
+    match stmt {
+        mir::Stmt::Assign { op, .. } => rvalue_uses_for_drop(op, owned_param_masks),
+        _ => stmt_uses(stmt),
+    }
 }
 
 fn terminator_uses(term: &mir::Terminator) -> Vec<(usize, UseKind)> {
@@ -2467,7 +2501,11 @@ struct DropPlan {
 
 /// Compute conservative `Drop` placements for one function; see the section
 /// docs above for the soundness argument.
-fn plan_drops(func: &mir::Function) -> DropPlan {
+fn plan_drops(
+    func: &mir::Function,
+    owned_params: &[bool],
+    owned_param_masks: &[Vec<bool>],
+) -> DropPlan {
     let mut plan = DropPlan::default();
     let nlocals = func.locals.len();
     let nblocks = func.blocks.len();
@@ -2483,10 +2521,17 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         .map(|l| may_hold_heap_ptr(&l.ty))
         .collect();
 
-    // Locals that receive their value outside MIR assignments can never be
-    // proven solely owned.
+    // Borrowed parameters and captures receive their value outside MIR
+    // assignments and are not counted owners. Resolved owned parameters are
+    // the exception: their counted slot is transferred by every direct caller.
     let mut excluded = vec![false; nlocals];
-    for id in func.params.iter().chain(&func.captures) {
+    for (param_idx, id) in func.params.iter().enumerate() {
+        let owned = owned_params.get(param_idx).copied().unwrap_or(false);
+        if !owned {
+            excluded[id.0 as usize] = true;
+        }
+    }
+    for id in &func.captures {
         excluded[id.0 as usize] = true;
     }
     for table in &func.handler_tables {
@@ -2501,6 +2546,12 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
     let mut has_def = vec![false; nlocals];
     let mut defs_owning = vec![true; nlocals];
     let mut no_copy_use = vec![true; nlocals];
+    for (param_idx, id) in func.params.iter().enumerate() {
+        if owned_params.get(param_idx).copied().unwrap_or(false) {
+            has_def[id.0 as usize] = true;
+            defs_owning[id.0 as usize] = true;
+        }
+    }
     // Error cleanup is safe only while a counted owner has not crossed an
     // uncounted escape channel. A Return is the sole exception: cleanup runs
     // only on failure, which by definition happens before that return executes.
@@ -2512,7 +2563,7 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
 
     for (bi, block) in func.blocks.iter().enumerate() {
         for (si, stmt) in block.stmts.iter().enumerate() {
-            for (u, kind) in stmt_uses_for_drop(stmt, &transfers) {
+            for (u, kind) in stmt_uses_for_drop(stmt, &transfers, owned_param_masks) {
                 block_uses[bi].insert(u);
                 if kind == UseKind::Copy {
                     no_copy_use[u] = false;
@@ -2645,7 +2696,7 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
             live.insert(u);
         }
         for (si, stmt) in block.stmts.iter().enumerate().rev() {
-            let uses = stmt_uses_for_drop(stmt, &transfers);
+            let uses = stmt_uses_for_drop(stmt, &transfers, owned_param_masks);
             // Last-use drops for candidates this statement reads. A transfer
             // is different: the counted slot continues in the destination, so
             // releasing the source here would double-own/double-free.
