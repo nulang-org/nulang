@@ -103,6 +103,21 @@ struct ReplicationFile {
     pending: BTreeMap<u64, FabricStreamPendingIntent>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplicaProgressFile {
+    version: u16,
+    replicas: BTreeMap<u64, u64>,
+}
+
+impl Default for ReplicaProgressFile {
+    fn default() -> Self {
+        Self {
+            version: STREAM_FORMAT_VERSION,
+            replicas: BTreeMap::new(),
+        }
+    }
+}
+
 impl Default for ReplicationFile {
     fn default() -> Self {
         Self {
@@ -527,6 +542,39 @@ impl FileFabricStreamStore {
         Ok(removed)
     }
 
+    pub(crate) fn replica_progress(&mut self, name: &str, replica: u64) -> io::Result<u64> {
+        self.ensure_state(name)?;
+        Ok(read_replica_progress(&self.stream_dir(name).join("replica_progress.json"))?
+            .replicas
+            .get(&replica)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    pub(crate) fn record_replica_progress(
+        &mut self,
+        name: &str,
+        replica: u64,
+        sequence: u64,
+    ) -> io::Result<()> {
+        self.ensure_state(name)?;
+        if sequence == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric replica progress sequence must be non-zero",
+            ));
+        }
+        let path = self.stream_dir(name).join("replica_progress.json");
+        let mut progress = read_replica_progress(&path)?;
+        let current = progress.replicas.get(&replica).copied().unwrap_or(0);
+        if sequence <= current {
+            return Ok(());
+        }
+        progress.replicas.insert(replica, sequence);
+        write_json_atomic(&path, &progress)?;
+        sync_dir(&self.stream_dir(name))
+    }
+
     pub(crate) fn append_reserved_replica(
         &mut self,
         name: &str,
@@ -735,6 +783,24 @@ impl Runtime {
     ) -> io::Result<()> {
         self.fabric_stream_store_mut()?
             .append_reserved_replica(name, sequence, payload)
+    }
+
+    pub(crate) fn fabric_stream_replica_progress(
+        &mut self,
+        name: &str,
+        replica: u64,
+    ) -> io::Result<u64> {
+        self.fabric_stream_store_mut()?.replica_progress(name, replica)
+    }
+
+    pub(crate) fn fabric_stream_record_replica_progress(
+        &mut self,
+        name: &str,
+        replica: u64,
+        sequence: u64,
+    ) -> io::Result<()> {
+        self.fabric_stream_store_mut()?
+            .record_replica_progress(name, replica, sequence)
     }
 
     pub fn fabric_stream_config(&mut self, name: &str) -> io::Result<FabricStreamConfig> {
@@ -1001,6 +1067,24 @@ fn list_segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 
 fn segment_path(dir: &Path, base_sequence: u64) -> PathBuf {
     dir.join(format!("{base_sequence:020}.seg"))
+}
+
+fn read_replica_progress(path: &Path) -> io::Result<ReplicaProgressFile> {
+    if !path.exists() {
+        return Ok(ReplicaProgressFile::default());
+    }
+    let bytes = fs::read(path)?;
+    let progress: ReplicaProgressFile = serde_json::from_slice(&bytes).map_err(json_error)?;
+    if progress.version != STREAM_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported Fabric replica progress version {}",
+                progress.version
+            ),
+        ));
+    }
+    Ok(progress)
 }
 
 fn read_replication(path: &Path) -> io::Result<ReplicationFile> {
@@ -1273,6 +1357,26 @@ mod tests {
         store.commit_cursor("events", "worker", 2).unwrap();
         assert!(store.commit_cursor("events", "worker", 1).is_err());
         assert!(store.commit_cursor("events", "worker", 3).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replica_progress_is_monotonic_and_persists() {
+        let root = test_dir("replica-progress");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream("events", FabricStreamConfig::default())
+                .unwrap();
+            store.record_replica_progress("events", 42, 3).unwrap();
+            store.record_replica_progress("events", 42, 2).unwrap();
+            assert_eq!(store.replica_progress("events", 42).unwrap(), 3);
+        }
+
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(reopened.replica_progress("events", 42).unwrap(), 3);
+        reopened.record_replica_progress("events", 42, 5).unwrap();
+        assert_eq!(reopened.replica_progress("events", 42).unwrap(), 5);
         let _ = fs::remove_dir_all(root);
     }
 
