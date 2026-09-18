@@ -1,4 +1,4 @@
-//! Stable message identity and causal metadata.
+//! Stable message identity, causal metadata, and bounded deduplication.
 //!
 //! Message identity is deliberately independent of packet sequence numbers,
 //! actor ids, and tracing ids. A logical delivery keeps the same `MessageId`
@@ -6,6 +6,7 @@
 //! a retry for a new message.
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -167,6 +168,164 @@ impl MessageMeta {
     }
 }
 
+/// Result of recording a message id after its associated state transition has
+/// been durably committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupCommit {
+    /// The window is disabled (`capacity == 0`), so no id was retained.
+    TrackingDisabled,
+    /// The message id had already been committed. Its eviction age is not
+    /// refreshed; repeated duplicates therefore cannot pin themselves in the
+    /// dedup window forever.
+    AlreadyCommitted,
+    /// The id was newly committed. `evicted` is the oldest committed id that
+    /// fell out of the bounded retention window, if any.
+    Committed { evicted: Option<MessageId> },
+}
+
+/// Serializable, ordered representation of a bounded dedup window.
+///
+/// `committed` is oldest-to-newest. Keeping order explicit makes retention
+/// behavior deterministic across snapshot/recovery rather than depending on a
+/// hash-table iteration order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedupSnapshot {
+    pub capacity: usize,
+    pub committed: Vec<MessageId>,
+}
+
+/// Validation failure while restoring a persisted dedup snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupRestoreError {
+    DisabledWindowContainsIds,
+    TooManyCommittedIds,
+    DuplicateCommittedId,
+}
+
+impl fmt::Display for DedupRestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DedupRestoreError::DisabledWindowContainsIds => {
+                write!(f, "disabled dedup window cannot contain committed ids")
+            }
+            DedupRestoreError::TooManyCommittedIds => {
+                write!(f, "dedup snapshot contains more ids than its capacity")
+            }
+            DedupRestoreError::DuplicateCommittedId => {
+                write!(f, "dedup snapshot contains a duplicate message id")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DedupRestoreError {}
+
+/// Exact bounded set of committed logical message ids.
+///
+/// This intentionally uses an exact `HashSet` + FIFO order instead of a Bloom
+/// filter: a false positive in message deduplication could suppress legitimate
+/// work. The capacity bound makes memory use explicit and operationally finite.
+///
+/// The runtime should call [`DedupWindow::contains`] before processing and
+/// [`DedupWindow::commit`] only after the state transition and message-id
+/// commit are durably recorded together. This type does not itself provide the
+/// storage transaction; it provides deterministic retention semantics for that
+/// persistence layer.
+#[derive(Debug, Clone)]
+pub struct DedupWindow {
+    capacity: usize,
+    committed: HashSet<MessageId>,
+    order: VecDeque<MessageId>,
+}
+
+impl DedupWindow {
+    /// Create a window retaining at most `capacity` committed ids.
+    ///
+    /// Capacity zero explicitly disables tracking. This is useful for transient
+    /// actors, while durable/effectively-once paths should choose a non-zero
+    /// retention policy.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            committed: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    pub fn contains(&self, id: &MessageId) -> bool {
+        self.committed.contains(id)
+    }
+
+    /// Record a logical message id after its work has been committed.
+    ///
+    /// Recommitting an existing id returns `AlreadyCommitted` without moving
+    /// the id to the back of the FIFO. This prevents duplicate traffic from
+    /// extending its own dedup retention indefinitely.
+    pub fn commit(&mut self, id: MessageId) -> DedupCommit {
+        if self.capacity == 0 {
+            return DedupCommit::TrackingDisabled;
+        }
+        if self.committed.contains(&id) {
+            return DedupCommit::AlreadyCommitted;
+        }
+
+        let evicted = if self.order.len() == self.capacity {
+            let oldest = self
+                .order
+                .pop_front()
+                .expect("non-zero full dedup window must have an oldest id");
+            self.committed.remove(&oldest);
+            Some(oldest)
+        } else {
+            None
+        };
+
+        self.order.push_back(id);
+        self.committed.insert(id);
+        DedupCommit::Committed { evicted }
+    }
+
+    pub fn snapshot(&self) -> DedupSnapshot {
+        DedupSnapshot {
+            capacity: self.capacity,
+            committed: self.order.iter().copied().collect(),
+        }
+    }
+
+    /// Restore a previously persisted exact window while validating its
+    /// capacity and uniqueness invariants. Corrupt snapshots fail closed rather
+    /// than silently widening or weakening deduplication.
+    pub fn restore(snapshot: DedupSnapshot) -> Result<Self, DedupRestoreError> {
+        if snapshot.capacity == 0 && !snapshot.committed.is_empty() {
+            return Err(DedupRestoreError::DisabledWindowContainsIds);
+        }
+        if snapshot.committed.len() > snapshot.capacity {
+            return Err(DedupRestoreError::TooManyCommittedIds);
+        }
+
+        let mut window = Self::new(snapshot.capacity);
+        for id in snapshot.committed {
+            if !window.committed.insert(id) {
+                return Err(DedupRestoreError::DuplicateCommittedId);
+            }
+            window.order.push_back(id);
+        }
+        Ok(window)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +391,118 @@ mod tests {
         assert_eq!(child.correlation_id, root.id);
         assert_eq!(child.causation_id, Some(root.id));
         assert_ne!(child.id, root.id);
+    }
+
+    #[test]
+    fn dedup_window_recognizes_committed_retry() {
+        let meta = MessageMeta::root(MessageId::new(9, 1));
+        let retry = meta.retry();
+        let mut window = DedupWindow::new(8);
+
+        assert_eq!(
+            window.commit(meta.id),
+            DedupCommit::Committed { evicted: None }
+        );
+        assert!(window.contains(&retry.id));
+        assert_eq!(window.commit(retry.id), DedupCommit::AlreadyCommitted);
+    }
+
+    #[test]
+    fn duplicate_does_not_refresh_fifo_retention() {
+        let a = MessageId::new(1, 1);
+        let b = MessageId::new(1, 2);
+        let c = MessageId::new(1, 3);
+        let mut window = DedupWindow::new(2);
+
+        window.commit(a);
+        window.commit(b);
+        assert_eq!(window.commit(a), DedupCommit::AlreadyCommitted);
+        assert_eq!(
+            window.commit(c),
+            DedupCommit::Committed { evicted: Some(a) }
+        );
+
+        assert!(!window.contains(&a));
+        assert!(window.contains(&b));
+        assert!(window.contains(&c));
+    }
+
+    #[test]
+    fn same_sequence_from_different_origins_is_not_duplicate() {
+        let a = MessageId::new(10, 7);
+        let b = MessageId::new(11, 7);
+        let mut window = DedupWindow::new(4);
+
+        assert_eq!(
+            window.commit(a),
+            DedupCommit::Committed { evicted: None }
+        );
+        assert_eq!(
+            window.commit(b),
+            DedupCommit::Committed { evicted: None }
+        );
+        assert_eq!(window.len(), 2);
+    }
+
+    #[test]
+    fn zero_capacity_explicitly_disables_tracking() {
+        let id = MessageId::new(1, 1);
+        let mut window = DedupWindow::new(0);
+        assert_eq!(window.commit(id), DedupCommit::TrackingDisabled);
+        assert!(!window.contains(&id));
+        assert!(window.is_empty());
+    }
+
+    #[test]
+    fn dedup_snapshot_round_trips_fifo_order() {
+        let ids = [
+            MessageId::new(3, 1),
+            MessageId::new(3, 2),
+            MessageId::new(3, 3),
+        ];
+        let mut original = DedupWindow::new(3);
+        for id in ids {
+            original.commit(id);
+        }
+
+        let snapshot = original.snapshot();
+        assert_eq!(snapshot.committed, ids);
+        let mut restored = DedupWindow::restore(snapshot).unwrap();
+        assert_eq!(restored.len(), 3);
+        assert_eq!(
+            restored.commit(MessageId::new(3, 4)),
+            DedupCommit::Committed {
+                evicted: Some(ids[0])
+            }
+        );
+    }
+
+    #[test]
+    fn corrupt_dedup_snapshots_fail_closed() {
+        let id = MessageId::new(1, 1);
+        assert_eq!(
+            DedupWindow::restore(DedupSnapshot {
+                capacity: 0,
+                committed: vec![id],
+            })
+            .unwrap_err(),
+            DedupRestoreError::DisabledWindowContainsIds
+        );
+        assert_eq!(
+            DedupWindow::restore(DedupSnapshot {
+                capacity: 1,
+                committed: vec![id, MessageId::new(1, 2)],
+            })
+            .unwrap_err(),
+            DedupRestoreError::TooManyCommittedIds
+        );
+        assert_eq!(
+            DedupWindow::restore(DedupSnapshot {
+                capacity: 2,
+                committed: vec![id, id],
+            })
+            .unwrap_err(),
+            DedupRestoreError::DuplicateCommittedId
+        );
     }
 }
