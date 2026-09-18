@@ -1249,7 +1249,10 @@ mod tests {
 
         let records = store.read_from("events", 1, 10).unwrap();
         assert_eq!(
-            records.iter().map(|record| record.sequence).collect::<Vec<_>>(),
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
             vec![1, 2]
         );
         let _ = fs::remove_dir_all(root);
