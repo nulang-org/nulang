@@ -1664,12 +1664,7 @@ impl Runtime {
             let target_shard = (target_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
                 let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
-                self.send_cross_shard_named_message(
-                    target_id,
-                    behavior,
-                    args.to_vec(),
-                    out_trace,
-                );
+                self.send_cross_shard_named_message(target_id, behavior, args.to_vec(), out_trace);
                 return;
             }
         }
@@ -2159,16 +2154,15 @@ impl Runtime {
                     objects.push((id, entry.as_bytes().to_vec()));
                 }
             }
-            let _ = tx[target_shard as usize].try_send(
-                CrossShardMsg::DeliverNamedMessageWithObjects {
+            let _ =
+                tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessageWithObjects {
                     target_id,
                     behavior_name: behavior_name.to_string(),
                     payload: args,
                     objects,
                     sender: self.current_actor.unwrap_or(0),
                     trace_id: out_trace,
-                },
-            );
+                });
         }
         true
     }
