@@ -698,3 +698,53 @@ Automatic leader failover is still disabled. The next layer can use this
 protocol to trigger transitions after confirmed failure, but it must preserve
 the exact-tail requirement and avoid repeatedly shrinking replication factor
 without explicit policy.
+
+
+## Proposal-scoped repair for lagging epoch voters
+
+A proposed new-policy replica may be behind the prospective leader even though
+both survived the old leader. Fabric can now repair that voter without
+re-enabling ordinary traffic from the fenced old epoch.
+
+New API:
+
+`fabric_stream_repair_epoch_transition(stream, max_records_per_replica)`
+
+The candidate reads the durable transition state and considers rejected voters
+that are members of the proposed new replica set.
+
+For a rejected voter whose durable tail is below the proposal's candidate tail:
+
+1. read a bounded exact suffix from the candidate's local durable log,
+2. send it through reserved behavior
+   `__nulang_fabric_stream_epoch_repair_v1`,
+3. receiver validates stream identity, proposal hash, old durable policy,
+   proposed placement, target identity, and promise fencing,
+4. receiver applies the exact missing sequences,
+5. receiver immediately re-evaluates the same prepare proposal,
+6. receiver returns an updated rejection (partial repair) or an affirmative
+   durable vote (fully caught up).
+
+Repair batches are idempotent. Already-applied records are compared against the
+local durable sequence and payload; only the missing suffix is appended.
+
+The repair channel is intentionally separate from normal replica append traffic.
+A node that has promised a higher election term never needs to weaken that
+promise in order to reconcile data.
+
+### Bounded multi-round repair
+
+The caller supplies a per-replica record bound. If a voter is more than one
+batch behind, its updated rejection reports the new tail and a later repair call
+continues from there.
+
+### Candidate-behind case
+
+If a rejected voter is ahead of the prospective leader,
+`FabricStreamEpochRepairReport.ahead_replicas` reports it and no records are
+modified.
+
+Pulling old-policy data from an ahead survivor into an already-fenced candidate
+requires a separate proposal-scoped pull/reconciliation protocol. Once the
+candidate tail changes, it must start a higher election term because the old
+proposal hash binds the earlier tail.
