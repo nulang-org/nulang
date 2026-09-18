@@ -40,6 +40,7 @@ pub(crate) const FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR: &str =
 const FABRIC_STREAM_FAILOVER_RETRY_INITIAL: std::time::Duration =
     std::time::Duration::from_millis(500);
 const FABRIC_STREAM_FAILOVER_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+const FABRIC_STREAM_AUTO_REPAIR_MAX_RECORDS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FabricStreamEpochTransitionStatus {
@@ -350,6 +351,100 @@ impl Runtime {
         Ok(report)
     }
 
+    fn fabric_stream_drive_auto_failover_once(
+        &mut self,
+        stream: &str,
+    ) -> io::Result<FabricStreamEpochTransitionStatus> {
+        let state = self
+            .fabric_stream_epoch_transition_state(stream)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Fabric automatic failover transition is not in progress",
+                )
+            })?;
+
+        if state.finalized {
+            return self.fabric_stream_resume_epoch_transition(stream);
+        }
+
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric automatic failover requires distribution",
+            )
+        })?;
+        if state.proposal.to_policy.leader != local.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "local node is not the Fabric automatic-failover candidate",
+            ));
+        }
+
+        let local_tail = self.fabric_stream_info(stream)?.last_sequence.unwrap_or(0);
+        if local_tail != state.proposal.candidate_tail {
+            tracing::info!(
+                stream = %stream,
+                from_term = state.proposal.to_policy.epoch,
+                old_candidate_tail = state.proposal.candidate_tail,
+                new_candidate_tail = local_tail,
+                "nulang-fabric-stream: automatic failover candidate tail changed; superseding with higher term"
+            );
+            return self.fabric_stream_begin_epoch_transition(
+                stream,
+                state.proposal.to_policy.partition,
+                state.proposal.to_policy.replication_factor,
+            );
+        }
+
+        let mut has_ahead = false;
+        let mut has_behind = false;
+        for vote in state.votes.values() {
+            if vote.accepted || !state.proposal.to_policy.replicas.contains(&vote.voter) {
+                continue;
+            }
+            if vote.tail > state.proposal.candidate_tail {
+                has_ahead = true;
+            } else if vote.tail < state.proposal.candidate_tail {
+                has_behind = true;
+            }
+        }
+
+        if has_ahead {
+            let report = self.fabric_stream_pull_epoch_transition(
+                stream,
+                FABRIC_STREAM_AUTO_REPAIR_MAX_RECORDS,
+            )?;
+            if report.requests_dispatched > 0 {
+                tracing::info!(
+                    stream = %stream,
+                    source_tail = report.source_tail,
+                    ahead_replicas = report.ahead_replicas,
+                    "nulang-fabric-stream: automatic failover requested candidate reconciliation from ahead survivor"
+                );
+                return Ok(status_from_state(&state));
+            }
+        }
+
+        if has_behind {
+            let report = self.fabric_stream_repair_epoch_transition(
+                stream,
+                FABRIC_STREAM_AUTO_REPAIR_MAX_RECORDS,
+            )?;
+            if report.records_dispatched > 0 {
+                tracing::info!(
+                    stream = %stream,
+                    records = report.records_dispatched,
+                    replicas = report.replicas_examined,
+                    "nulang-fabric-stream: automatic failover pushed proposal-scoped repair to lagging survivor"
+                );
+                return Ok(status_from_state(&state));
+            }
+        }
+
+        self.fabric_stream_resume_epoch_transition(stream)
+    }
+
     /// Retry active automatic ownership transitions with logical-clock backoff.
     ///
     /// Durable transition state is the restart source of truth; if the
@@ -392,7 +487,7 @@ impl Runtime {
             .collect();
 
         for stream in due {
-            let result = self.fabric_stream_resume_epoch_transition(&stream);
+            let result = self.fabric_stream_drive_auto_failover_once(&stream);
             match result {
                 Ok(status) if status.finalized => {
                     self.distributed
