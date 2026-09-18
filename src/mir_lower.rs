@@ -79,6 +79,7 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
             }
             let idx = ctx.reserve_function(&f.name);
             ctx.func_map.insert(f.name.clone(), idx);
+            ctx.func_param_caps.insert(idx, f.param_caps.clone());
             if f.param_caps.iter().any(|cap| cap.is_linear()) {
                 ctx.sink_functions.insert(f.name.clone());
             }
@@ -271,6 +272,9 @@ struct ModuleCtx {
     /// function values carry parameter-capability signatures, these functions
     /// are direct-call-only so the caller-side sink transfer cannot be lost.
     sink_functions: HashSet<String>,
+    /// Parameter capabilities by reserved top-level function index. This is
+    /// available before bodies are lowered, including forward references.
+    func_param_caps: FxHashMap<usize, Vec<Capability>>,
     extern_map: FxHashMap<String, usize>,
     foreign: Vec<mir::ForeignFunction>,
     /// Actor behaviors, reserved (with their fully-qualified "Actor.behavior"
@@ -297,6 +301,7 @@ impl ModuleCtx {
             functions: Vec::new(),
             func_map: FxHashMap::default(),
             sink_functions: HashSet::new(),
+            func_param_caps: FxHashMap::default(),
             extern_map: FxHashMap::default(),
             foreign: Vec::new(),
             behaviors: Vec::new(),
@@ -1032,12 +1037,20 @@ impl<'c> FnLowerer<'c> {
                 for a in args {
                     aids.push(self.lower_operand(a)?);
                 }
-                let func_ref = match func {
+                let (func_ref, sink_args) = match func {
                     hir::Operand::Var(name, _) => {
                         if let Some(id) = self.lookup(name) {
-                            mir::FuncRef::Local(id)
+                            (mir::FuncRef::Local(id), vec![false; aids.len()])
                         } else if let Some(&idx) = self.ctx.func_map.get(name) {
-                            mir::FuncRef::Index(idx)
+                            let mut sinks = self
+                                .ctx
+                                .func_param_caps
+                                .get(&idx)
+                                .map(|caps| caps.iter().map(|cap| cap.is_linear()).collect::<Vec<_>>())
+                                .unwrap_or_default();
+                            sinks.resize(aids.len(), false);
+                            sinks.truncate(aids.len());
+                            (mir::FuncRef::Index(idx), sinks)
                         } else if let Some(&eidx) = self.ctx.extern_map.get(name) {
                             self.b.assign(
                                 dst,
@@ -1048,10 +1061,6 @@ impl<'c> FnLowerer<'c> {
                             );
                             return Ok(());
                         } else if let Some(&has_payload) = self.ctx.ctor_map.get(name) {
-                            // Declared variant constructor call. Locals,
-                            // top-level functions and externs shadow
-                            // constructors (resolved above), so a user
-                            // `fn Some(...)` wins over the ctor.
                             return self.lower_ctor_call(dst, name, has_payload, aids);
                         } else {
                             return Err(compile_err(
@@ -1062,7 +1071,7 @@ impl<'c> FnLowerer<'c> {
                     }
                     _ => {
                         let id = self.lower_operand(func)?;
-                        mir::FuncRef::Local(id)
+                        (mir::FuncRef::Local(id), vec![false; aids.len()])
                     }
                 };
                 self.b.assign(
@@ -1070,6 +1079,7 @@ impl<'c> FnLowerer<'c> {
                     mir::RValue::Call {
                         func: func_ref,
                         args: aids,
+                        sink_args,
                     },
                 );
                 Ok(())
