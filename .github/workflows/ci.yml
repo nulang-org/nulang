@@ -337,3 +337,47 @@ jobs:
       - name: Fail the job if a regression was found
         if: steps.regression_check.outcome == 'failure'
         run: exit 1
+
+  # Temporary branch-only comparison for #369 Stage 1. This job exists only on
+  # bench/perform-cache-stage1-compare and is never intended to merge.
+  perform_cache_compare:
+    name: Compare Perform cache Stage 1
+    if: github.event_name == 'pull_request' && github.head_ref == 'bench/perform-cache-stage1-compare'
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/nulang-perform-bench-target
+    steps:
+      - name: Checkout baseline
+        uses: actions/checkout@v7
+        with:
+          ref: 5535c63b7829c87e39ceec4c0c055e95e915a4f3
+          path: baseline
+
+      - name: Checkout Stage 1
+        uses: actions/checkout@v7
+        with:
+          ref: c7f693d411748a912a0d0f43e129d87bca779e0e
+          path: stage1
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Baseline generic Perform
+        working-directory: baseline
+        run: cargo bench --bench vm_bench -- 'vm/perform/' 2>&1 | tee ../baseline-perform.txt
+
+      - name: Stage 1 generic Perform
+        working-directory: stage1
+        run: cargo bench --bench vm_bench -- 'vm/perform/' 2>&1 | tee ../stage1-perform.txt
+
+      - name: Upload comparison logs
+        uses: actions/upload-artifact@v7
+        with:
+          name: perform-cache-stage1-comparison
+          path: |
+            baseline-perform.txt
+            stage1-perform.txt
+          retention-days: 30
