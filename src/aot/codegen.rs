@@ -447,7 +447,7 @@ fn resuming_threading(
 fn stmt_rvalue_uses(op: &mir::RValue) -> Vec<mir::LocalId> {
     let mut out = Vec::new();
     match op {
-        mir::RValue::Load(l) => out.push(*l),
+        mir::RValue::Load(l) | mir::RValue::MoveOut(l) => out.push(*l),
         mir::RValue::Panic(_) => {}
         mir::RValue::LoadFieldNamed { obj, .. } => out.push(*obj),
         mir::RValue::LoadFieldPos { obj, .. } => out.push(*obj),
@@ -546,6 +546,11 @@ fn compute_live_ins(
             match stmt {
                 mir::Stmt::Assign { dst, op } => {
                     stmt_uses(&mut g, &k, op);
+                    if let mir::RValue::MoveOut(src) = op {
+                        // MoveOut reads the old source then defines it as
+                        // invalid/nil, so the pre-move value is not live out.
+                        k.insert(local_base + src.0);
+                    }
                     k.insert(local_base + dst.0);
                 }
                 mir::Stmt::StoreFieldNamed { obj, src, .. } => {
@@ -2141,6 +2146,12 @@ fn compile_stmt(
                 foreign_functions,
             )?;
             let reg = mir::FunctionBuilder::LOCAL_BASE + dst.0;
+            if let mir::RValue::MoveOut(src) = op {
+                // Cranelift locals are SSA values in this map. Removing the
+                // source models MoveOut invalidation; the destination below
+                // receives the exact value without retain/release.
+                local_vals.remove(&(mir::FunctionBuilder::LOCAL_BASE + src.0));
+            }
             local_vals.insert(reg, val);
             Ok(())
         }
@@ -2272,7 +2283,7 @@ fn compile_rvalue(
             "Panic: contract violations require the bytecode backend (unavailable with --backend native)".into(),
         )),
 
-        mir::RValue::Load(id) => {
+        mir::RValue::Load(id) | mir::RValue::MoveOut(id) => {
             let reg = mir::FunctionBuilder::LOCAL_BASE + id.0;
             local_vals
                 .get(&reg)
