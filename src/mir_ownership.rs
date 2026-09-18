@@ -932,6 +932,102 @@ mod tests {
     }
 
     #[test]
+    fn call_ownership_resolution_propagates_fresh_owner_through_forwarder() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let target = linear_array_callee(false);
+
+        let mut forwarder = mir::FunctionBuilder::new("forwarder", None);
+        let forwarded =
+            forwarder.add_param_with_cap("x", array_ty.clone(), Capability::LinearIso);
+        let forwarded_result = forwarder.add_temp(Type::unit());
+        forwarder.assign(
+            forwarded_result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![forwarded],
+            },
+        );
+        forwarder.terminate(mir::Terminator::Return(None));
+
+        let mut root = mir::FunctionBuilder::new("root", None);
+        let owned = root.add_temp(array_ty);
+        let root_result = root.add_temp(Type::unit());
+        root.assign(owned, mir::RValue::ArrayLit(vec![]));
+        root.assign(
+            root_result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(1),
+                args: vec![owned],
+            },
+        );
+        root.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(target);
+        module.functions.push(forwarder.build());
+        module.functions.push(root.build());
+
+        let candidates = analyze_call_ownership(&module);
+        assert_eq!(
+            candidates[0].params[0].dependencies,
+            vec![ParamOwnershipDependency {
+                function_idx: 1,
+                param_idx: 0,
+            }]
+        );
+        assert!(candidates[1].params[0].dependencies.is_empty());
+
+        let resolved = resolve_call_ownership(&module);
+        assert_eq!(resolved[0].owned_params, vec![true]);
+        assert_eq!(resolved[1].owned_params, vec![true]);
+    }
+
+    #[test]
+    fn call_ownership_resolution_prunes_dependency_on_public_forwarder() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let target = linear_array_callee(false);
+
+        let mut forwarder = mir::FunctionBuilder::new("forwarder", None);
+        forwarder.set_public(true);
+        let forwarded =
+            forwarder.add_param_with_cap("x", array_ty.clone(), Capability::LinearIso);
+        let forwarded_result = forwarder.add_temp(Type::unit());
+        forwarder.assign(
+            forwarded_result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![forwarded],
+            },
+        );
+        forwarder.terminate(mir::Terminator::Return(None));
+
+        let mut root = mir::FunctionBuilder::new("root", None);
+        let owned = root.add_temp(array_ty);
+        let root_result = root.add_temp(Type::unit());
+        root.assign(owned, mir::RValue::ArrayLit(vec![]));
+        root.assign(
+            root_result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(1),
+                args: vec![owned],
+            },
+        );
+        root.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(target);
+        module.functions.push(forwarder.build());
+        module.functions.push(root.build());
+
+        let resolved = resolve_call_ownership(&module);
+        assert_eq!(resolved[1].owned_params, vec![false]);
+        assert_eq!(
+            resolved[0].owned_params,
+            vec![false],
+            "downstream ownership must be pruned when its forwarding source is not owned"
+        );
+    }
+    #[test]
     fn return_ownership_candidates_distinguish_local_and_linear_param() {
         let array_ty = Type::Array(Box::new(Type::int()));
 
