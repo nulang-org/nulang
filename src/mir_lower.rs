@@ -2978,13 +2978,14 @@ mod tests {
                     mir::Stmt::Assign {
                         op: mir::RValue::Call {
                             func: mir::FuncRef::Index(_),
+                            sink_args,
                             ..
                         },
                         ..
-                    }
+                    } if sink_args == &vec![true]
                 )
             }),
-            "direct sink call should remain a statically-resolved MIR call"
+            "direct sink call should remain statically resolved and carry its ownership-transfer mask"
         );
     }
 
