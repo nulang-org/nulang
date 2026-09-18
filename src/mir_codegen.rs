@@ -2220,11 +2220,13 @@ fn rvalue_reads(rv: &mir::RValue, out: &mut HashSet<mir::LocalId>) {
         RValue::Spawn {
             init, target_node, ..
         } => {
+            // Local spawn does not evaluate non-constant init MIR; only
+            // remote spawn lowers init rvalues into staging registers.
             if let Some(n) = target_node {
                 out.insert(*n);
-            }
-            for (_, init_rv) in init {
-                rvalue_reads(init_rv, out);
+                for (_, init_rv) in init {
+                    rvalue_reads(init_rv, out);
+                }
             }
         }
         RValue::Send { actor, args, .. } | RValue::Ask { actor, args, .. } => {
@@ -2481,6 +2483,19 @@ fn rvalue_uses_for_drop(
     op: &mir::RValue,
     owned_param_masks: &[Vec<bool>],
 ) -> Vec<(usize, UseKind)> {
+    if let mir::RValue::Spawn {
+        init, target_node, ..
+    } = op
+    {
+        let mut out = Vec::new();
+        if let Some(node) = target_node {
+            out.push((node.0 as usize, UseKind::ReadOnly));
+            for (_, init_rv) in init {
+                out.extend(rvalue_uses_for_drop(init_rv, owned_param_masks));
+            }
+        }
+        return out;
+    }
     if let mir::RValue::Call {
         func: mir::FuncRef::Index(target),
         args,
