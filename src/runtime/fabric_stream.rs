@@ -87,6 +87,31 @@ struct CommitFile {
     committed_sequence: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricStreamPendingIntent {
+    pub partition: u16,
+    pub leader: u64,
+    pub membership_fingerprint: u64,
+    pub replication_factor: usize,
+    pub replicas: Vec<u64>,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplicationFile {
+    version: u16,
+    pending: BTreeMap<u64, FabricStreamPendingIntent>,
+}
+
+impl Default for ReplicationFile {
+    fn default() -> Self {
+        Self {
+            version: STREAM_FORMAT_VERSION,
+            pending: BTreeMap::new(),
+        }
+    }
+}
+
 impl Default for CommitFile {
     fn default() -> Self {
         Self {
@@ -423,6 +448,106 @@ impl FileFabricStreamStore {
         Ok(records)
     }
 
+    /// Persist replication intent before the matching leader append.
+    ///
+    /// Reserving first closes the crash window where an uncommitted durable
+    /// record could exist without enough metadata to reconstruct replication.
+    pub(crate) fn reserve_replication_intent(
+        &mut self,
+        name: &str,
+        intent: FabricStreamPendingIntent,
+    ) -> io::Result<()> {
+        self.ensure_state(name)?;
+        let next_sequence = self
+            .states
+            .get(name)
+            .expect("stream state must exist after ensure_state")
+            .next_sequence;
+        if intent.sequence != next_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Fabric replication intent sequence {} must equal next stream sequence {}",
+                    intent.sequence, next_sequence
+                ),
+            ));
+        }
+        if intent.replication_factor == 0
+            || intent.replicas.len() != intent.replication_factor
+            || !intent.replicas.contains(&intent.leader)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Fabric replication intent replica set",
+            ));
+        }
+
+        let path = self.stream_dir(name).join("replication.json");
+        let mut file = read_replication(&path)?;
+        if let Some(existing) = file.pending.get(&intent.sequence) {
+            if existing == &intent {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "conflicting Fabric replication intent already exists",
+            ));
+        }
+        file.pending.insert(intent.sequence, intent);
+        write_json_atomic(&path, &file)?;
+        sync_dir(&self.stream_dir(name))
+    }
+
+    pub(crate) fn pending_replication_intents(
+        &mut self,
+        name: &str,
+    ) -> io::Result<Vec<FabricStreamPendingIntent>> {
+        self.ensure_state(name)?;
+        Ok(read_replication(&self.stream_dir(name).join("replication.json"))?
+            .pending
+            .into_values()
+            .collect())
+    }
+
+    pub(crate) fn remove_replication_intent(
+        &mut self,
+        name: &str,
+        sequence: u64,
+    ) -> io::Result<bool> {
+        self.ensure_state(name)?;
+        let path = self.stream_dir(name).join("replication.json");
+        let mut file = read_replication(&path)?;
+        let removed = file.pending.remove(&sequence).is_some();
+        if removed {
+            write_json_atomic(&path, &file)?;
+            sync_dir(&self.stream_dir(name))?;
+        }
+        Ok(removed)
+    }
+
+    pub(crate) fn append_reserved_replica(
+        &mut self,
+        name: &str,
+        sequence: u64,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let intents = self.pending_replication_intents(name)?;
+        if !intents.iter().any(|intent| intent.sequence == sequence) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Fabric reserved append has no durable replication intent",
+            ));
+        }
+        let appended = self.append_replica(name, sequence, payload)?;
+        if !appended {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Fabric reserved append sequence already exists",
+            ));
+        }
+        Ok(())
+    }
+
     /// Read records after the consumer's last committed sequence.
     pub fn read_consumer(
         &mut self,
@@ -572,6 +697,42 @@ impl Runtime {
     ) -> io::Result<()> {
         self.fabric_stream_store_mut()?
             .commit_through(name, sequence)
+    }
+
+    pub(crate) fn fabric_stream_reserve_replication_intent(
+        &mut self,
+        name: &str,
+        intent: FabricStreamPendingIntent,
+    ) -> io::Result<()> {
+        self.fabric_stream_store_mut()?
+            .reserve_replication_intent(name, intent)
+    }
+
+    pub(crate) fn fabric_stream_pending_replication_intents(
+        &mut self,
+        name: &str,
+    ) -> io::Result<Vec<FabricStreamPendingIntent>> {
+        self.fabric_stream_store_mut()?
+            .pending_replication_intents(name)
+    }
+
+    pub(crate) fn fabric_stream_remove_replication_intent(
+        &mut self,
+        name: &str,
+        sequence: u64,
+    ) -> io::Result<bool> {
+        self.fabric_stream_store_mut()?
+            .remove_replication_intent(name, sequence)
+    }
+
+    pub(crate) fn fabric_stream_append_reserved_replica(
+        &mut self,
+        name: &str,
+        sequence: u64,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        self.fabric_stream_store_mut()?
+            .append_reserved_replica(name, sequence, payload)
     }
 
     pub fn fabric_stream_config(&mut self, name: &str) -> io::Result<FabricStreamConfig> {
@@ -840,6 +1001,24 @@ fn segment_path(dir: &Path, base_sequence: u64) -> PathBuf {
     dir.join(format!("{base_sequence:020}.seg"))
 }
 
+fn read_replication(path: &Path) -> io::Result<ReplicationFile> {
+    if !path.exists() {
+        return Ok(ReplicationFile::default());
+    }
+    let bytes = fs::read(path)?;
+    let replication: ReplicationFile = serde_json::from_slice(&bytes).map_err(json_error)?;
+    if replication.version != STREAM_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported Fabric replication metadata version {}",
+                replication.version
+            ),
+        ));
+    }
+    Ok(replication)
+}
+
 fn read_commit(path: &Path) -> io::Result<CommitFile> {
     if !path.exists() {
         return Ok(CommitFile::default());
@@ -1089,6 +1268,74 @@ mod tests {
         store.commit_cursor("events", "worker", 2).unwrap();
         assert!(store.commit_cursor("events", "worker", 1).is_err());
         assert!(store.commit_cursor("events", "worker", 3).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replication_intent_persists_before_append_and_can_be_removed() {
+        let root = test_dir("replication-intent");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream("events", FabricStreamConfig::default())
+                .unwrap();
+            let intent = FabricStreamPendingIntent {
+                partition: 0,
+                leader: 10,
+                membership_fingerprint: 44,
+                replication_factor: 2,
+                replicas: vec![10, 11],
+                sequence: 1,
+            };
+            store
+                .reserve_replication_intent("events", intent.clone())
+                .unwrap();
+            assert_eq!(
+                store.pending_replication_intents("events").unwrap(),
+                vec![intent]
+            );
+        }
+
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .pending_replication_intents("events")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(reopened.remove_replication_intent("events", 1).unwrap());
+        assert!(reopened
+            .pending_replication_intents("events")
+            .unwrap()
+            .is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reserved_replica_append_requires_matching_durable_intent() {
+        let root = test_dir("reserved-append");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        assert!(store.append_reserved_replica("events", 1, b"a").is_err());
+
+        store
+            .reserve_replication_intent(
+                "events",
+                FabricStreamPendingIntent {
+                    partition: 0,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                    sequence: 1,
+                },
+            )
+            .unwrap();
+        store.append_reserved_replica("events", 1, b"a").unwrap();
+        assert_eq!(store.read_from("events", 1, 10).unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
