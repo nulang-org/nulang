@@ -34,7 +34,9 @@ pub use distributed_context::{
 pub use fabric_stream::{
     FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
 };
-pub use fabric_stream_cluster::{FabricStreamPlacement, FabricStreamReplicaAppend};
+pub use fabric_stream_cluster::{
+    FabricStreamPlacement, FabricStreamReplicaAppend, FabricStreamReplicaDispatchReport,
+};
 #[cfg(feature = "ai-runtime")]
 mod agent;
 #[cfg(feature = "ai-runtime")]
