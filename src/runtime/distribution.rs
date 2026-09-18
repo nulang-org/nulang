@@ -335,9 +335,7 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                 // An oversized local routing set therefore omits the Fabric
                 // extension for this round instead of advertising a partial
                 // replacement that would delete live remote routes.
-                let fabric = rt
-                    .fabric_advertisements(GOSSIP_PAYLOAD_MAX_ENTRIES)
-                    .ok();
+                let fabric = rt.fabric_advertisements(GOSSIP_PAYLOAD_MAX_ENTRIES).ok();
                 if let (Some(transport), Some(cluster)) =
                     (&mut rt.distributed.transport, &rt.distributed.cluster)
                 {
