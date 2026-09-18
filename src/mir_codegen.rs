@@ -259,11 +259,28 @@ impl MirCodegen {
         // Resolve the experimental internal ownership-call ABI only after
         // MIR optimization, so call/use counts describe the exact MIR that
         // this backend is about to compile.
+        let candidates = crate::mir_ownership::analyze_call_ownership(mir);
         let ownership = crate::mir_ownership::resolve_call_ownership(mir);
         self.owned_param_masks = vec![Vec::new(); mir.functions.len()];
         for function in ownership {
+            let mut owned_params = function.owned_params;
+            // Return ownership is not part of the bytecode pilot yet. If a
+            // function may return one of its linear parameters, keep all of
+            // its parameters borrowed until the return-transfer ABI lands;
+            // otherwise successful execution could move ownership into the
+            // callee without transferring it back to the caller result.
+            if candidates
+                .get(function.function_idx)
+                .map(|f| {
+                    f.return_ownership
+                        == crate::mir_ownership::ReturnOwnershipCandidate::OwnedFromLinearParam
+                })
+                .unwrap_or(false)
+            {
+                owned_params.fill(false);
+            }
             if let Some(mask) = self.owned_param_masks.get_mut(function.function_idx) {
-                *mask = function.owned_params;
+                *mask = owned_params;
             }
         }
 
@@ -2869,7 +2886,7 @@ mod tests {
         b.terminate(mir::Terminator::Return(None));
         let f = b.build();
 
-        let plan = plan_drops(&f);
+        let plan = plan_drops(&f, &[], &[]);
         let transfers = ownership_transfer_pairs(&f);
         let move_si = f.blocks[0]
             .stmts
@@ -2939,7 +2956,7 @@ mod tests {
         b.terminate(mir::Terminator::Return(None));
         let f = b.build();
 
-        let plan = plan_drops(&f);
+        let plan = plan_drops(&f, &[], &[]);
         let dst_use_si = f.blocks[0]
             .stmts
             .iter()
@@ -2972,7 +2989,7 @@ mod tests {
         b.terminate(mir::Terminator::Return(Some(value)));
         let f = b.build();
 
-        let plan = plan_drops(&f);
+        let plan = plan_drops(&f, &[], &[]);
         assert!(
             plan.cleanup_owned.contains(&value),
             "an owned value pending return must be reclaimable if the frame aborts"
@@ -3002,7 +3019,7 @@ mod tests {
         b.terminate(mir::Terminator::Return(None));
         let f = b.build();
 
-        let plan = plan_drops(&f);
+        let plan = plan_drops(&f, &[], &[]);
         assert!(
             !plan.cleanup_owned.contains(&value),
             "an owner copied into a call may have escaped and cannot be reclaimed on abort"
