@@ -935,6 +935,11 @@ impl<'c> FnLowerer<'c> {
                 self.b.assign(dst, mir::RValue::Load(id));
                 Ok(())
             }
+            hir::RValue::MoveOut(op) => {
+                let id = self.lower_operand(op)?;
+                self.b.assign(dst, mir::RValue::MoveOut(id));
+                Ok(())
+            }
             hir::RValue::Panic(msg) => {
                 self.b.assign(dst, mir::RValue::Panic(msg.clone()));
                 Ok(())
