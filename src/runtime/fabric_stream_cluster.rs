@@ -647,7 +647,7 @@ impl Runtime {
     pub(crate) fn fabric_stream_recover_pending_from_cluster(
         &mut self,
         stream: &str,
-        cluster: &ClusterState,
+        _cluster: &ClusterState,
     ) -> io::Result<FabricStreamRecoveryReport> {
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
@@ -687,14 +687,12 @@ impl Runtime {
                 ));
             }
 
-            let placement = compute_stream_placement(
-                local,
-                Some(cluster),
+            let (placement, policy) = self.fabric_stream_validate_installed_policy(
                 stream,
                 intent.partition,
                 intent.replication_factor,
+                intent.epoch,
             )?;
-            let policy = self.fabric_stream_policy_for_placement(&placement, intent.epoch)?;
             let intent_replicas: Vec<NodeId> =
                 intent.replicas.iter().copied().map(NodeId).collect();
             if policy.epoch != intent.epoch
@@ -705,7 +703,7 @@ impl Runtime {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "Fabric replication intent for sequence {} no longer matches current placement",
+                        "Fabric replication intent for sequence {} no longer matches installed policy",
                         intent.sequence
                     ),
                 ));
@@ -817,9 +815,12 @@ impl Runtime {
                     )
                 })?;
 
-            let placement =
-                self.fabric_stream_placement(stream, partition, ticket.replicas.len())?;
-            let policy = self.fabric_stream_policy_for_placement(&placement, ticket.epoch)?;
+            let (placement, policy) = self.fabric_stream_validate_installed_policy(
+                stream,
+                partition,
+                ticket.replicas.len(),
+                ticket.epoch,
+            )?;
             if policy.epoch != ticket.epoch
                 || placement.leader != ticket.leader
                 || placement.membership_fingerprint != ticket.membership_fingerprint
@@ -827,7 +828,7 @@ impl Runtime {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "pending Fabric replication ticket no longer matches current placement",
+                    "pending Fabric replication ticket no longer matches installed policy",
                 ));
             }
 
