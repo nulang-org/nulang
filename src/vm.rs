@@ -3259,13 +3259,7 @@ impl VM {
                         .map(|f| f.regs[0])
                         .unwrap_or(Value::unit()));
                 }
-                Err(NuError::VMError { msg, span }) => {
-                    return Err(NuError::VMError {
-                        msg: self.enrich_error(msg),
-                        span,
-                    })
-                }
-                Err(e) => return Err(e),
+                Err(e) => return Err(self.finalize_execution_error(e)),
             }
         }
     }
@@ -3335,13 +3329,7 @@ impl VM {
                         .map(|f| f.regs[0])
                         .unwrap_or(Value::unit()));
                 }
-                Err(NuError::VMError { msg, span }) => {
-                    return Err(NuError::VMError {
-                        msg: self.enrich_error(msg),
-                        span,
-                    })
-                }
-                Err(e) => return Err(e),
+                Err(e) => return Err(self.finalize_execution_error(e)),
             }
         }
     }
@@ -3426,13 +3414,7 @@ impl VM {
                         .map(|f| f.regs[0])
                         .unwrap_or(Value::unit()));
                 }
-                Err(NuError::VMError { msg, span }) => {
-                    return Err(NuError::VMError {
-                        msg: self.enrich_error(msg),
-                        span,
-                    })
-                }
-                Err(e) => return Err(e),
+                Err(e) => return Err(self.finalize_execution_error(e)),
             }
         }
     }
@@ -4758,6 +4740,84 @@ impl VM {
             }
         }
         Ok(())
+    }
+    /// Find cleanup metadata for the function containing a frame's current
+    /// program counter. Runtime errors usually observe pc one past the
+    /// failing instruction, so both pc and pc-1 are accepted.
+    fn frame_cleanup_slots(&self, frame_idx: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+        let frame = self.frames.get(frame_idx)?;
+        let module = self.modules.get(frame.module_idx)?;
+        let contains = |info: &crate::bytecode::DebugFunctionInfo, pc: usize| {
+            pc >= info.code_offset && pc < info.code_offset.saturating_add(info.code_len)
+        };
+        let info = module
+            .debug_functions
+            .iter()
+            .find(|info| contains(info, frame.pc))
+            .or_else(|| {
+                frame.pc.checked_sub(1).and_then(|pc| {
+                    module.debug_functions.iter().find(|info| contains(info, pc))
+                })
+            })?;
+        Some((info.cleanup_regs.clone(), info.cleanup_spills.clone()))
+    }
+
+    /// Reclaim compiler-proven owning slots from frames permanently abandoned
+    /// by a true runtime error. Slots are cleared before the decrement,
+    /// matching OpCode::Drop and making already-dropped values harmless.
+    fn cleanup_abandoned_frames(&mut self) {
+        let cleanup: Vec<_> = (0..self.frames.len())
+            .filter_map(|frame_idx| {
+                self.frame_cleanup_slots(frame_idx)
+                    .map(|(regs, spills)| (frame_idx, regs, spills))
+            })
+            .collect();
+
+        let mut ptrs = Vec::new();
+        for (frame_idx, regs, spills) in cleanup {
+            for reg_idx in regs {
+                if let Some(reg) = self.frames[frame_idx].regs.get_mut(reg_idx) {
+                    let value = std::mem::replace(reg, Value::nil());
+                    if let Some(ptr) = value.as_ptr() {
+                        ptrs.push(ptr);
+                    }
+                }
+            }
+            for spill_idx in spills {
+                if let Some(slot) = self.frames[frame_idx].spilled.get_mut(spill_idx) {
+                    let value = std::mem::replace(slot, Value::nil());
+                    if let Some(ptr) = value.as_ptr() {
+                        ptrs.push(ptr);
+                    }
+                }
+            }
+        }
+
+        for ptr in ptrs {
+            self.actor_callbacks.drop_ref(ptr);
+        }
+
+        self.frames.clear();
+        self.current_frame_idx = None;
+        self.handler_stack.clear();
+    }
+
+    /// Preserve resumable control flow. For a real failure, capture the stack
+    /// trace while frames still exist, then reclaim and discard the frames.
+    fn finalize_execution_error(&mut self, err: NuError) -> NuError {
+        if matches!(err, NuError::Suspended(_)) || is_debug_pause(&err) {
+            return err;
+        }
+
+        let err = match err {
+            NuError::VMError { msg, span } => NuError::VMError {
+                msg: self.enrich_error(msg),
+                span,
+            },
+            other => other,
+        };
+        self.cleanup_abandoned_frames();
+        err
     }
     fn enrich_error(&self, msg: String) -> String {
         let mut e = msg;
