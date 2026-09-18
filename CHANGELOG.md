@@ -45,6 +45,18 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric stream replica transport — 2026-09-17
+- **NUL0-v1-compatible Fabric stream replication transport** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distributed.rs`).
+  Leader-produced replica envelopes can now be dispatched through the existing
+  `Packet::ActorMessage` shape using reserved system actor 0 plus an internal
+  behavior name; no packet discriminant or wire-version change is required.
+  Receivers verify transport sender identity, envelope leader, placement, and
+  exact-sequence durable application before accepting data. Duplicate network
+  retry remains idempotent. Dispatch reporting distinguishes reachable sends
+  from unavailable replicas. Transport ACKs are explicitly not treated as
+  replica fsync/quorum ACKs; application-level quorum commit remains follow-up.
+
 ### Fabric stream replica placement — 2026-09-17
 - **Deterministic Fabric stream ownership** (Experimental,
   `src/runtime/fabric_stream_cluster.rs`, `src/runtime/fabric_stream.rs`).
