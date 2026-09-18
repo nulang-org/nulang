@@ -1943,25 +1943,25 @@ fn dead_store_elim(func: &mut mir::Function) -> bool {
                 match &stmt {
                     mir::Stmt::Assign { dst, op } => {
                         let self_move = matches!(op, mir::RValue::Load(src) if src == dst);
-                    // Source-named locals stay visible to the debugger at
-                    // breakpoints: constant propagation can make their
-                    // definition look dead (the folded RValue no longer
-                    // references them), but removing the store would make
-                    // the paused frame report nil. Only anonymous temps and
-                    // compiler-generated names (hir_lower's `__tmpN`) are
-                    // safe to drop.
-                    let named = func
-                        .locals
-                        .get(dst.0 as usize)
-                        .and_then(|l| l.name.as_deref())
-                        .map(|n| !n.starts_with("__"))
-                        .unwrap_or(false);
-                    self_move
-                        || (!named
-                            && !func.captures.contains(dst)
-                            && !reads.contains(dst)
-                            && !rvalue_side_effecting(op))
-                }
+                        // Source-named locals stay visible to the debugger at
+                        // breakpoints: constant propagation can make their
+                        // definition look dead (the folded RValue no longer
+                        // references them), but removing the store would make
+                        // the paused frame report nil. Only anonymous temps and
+                        // compiler-generated names (hir_lower's `__tmpN`) are
+                        // safe to drop.
+                        let named = func
+                            .locals
+                            .get(dst.0 as usize)
+                            .and_then(|l| l.name.as_deref())
+                            .map(|n| !n.starts_with("__"))
+                            .unwrap_or(false);
+                        self_move
+                            || (!named
+                                && !func.captures.contains(dst)
+                                && !reads.contains(dst)
+                                && !rvalue_side_effecting(op))
+                    }
                     _ => false,
                 }
             };
