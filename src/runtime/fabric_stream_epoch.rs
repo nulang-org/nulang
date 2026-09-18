@@ -49,6 +49,17 @@ pub struct FabricStreamEpochTransitionStatus {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FabricStreamAutoFailoverReport {
+    pub streams_examined: usize,
+    pub leader_streams: usize,
+    pub transitions_started: usize,
+    pub skipped_no_old_quorum: usize,
+    pub skipped_not_candidate: usize,
+    pub skipped_requires_new_replica: usize,
+    pub errors: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FabricStreamEpochRepairReport {
     pub replicas_examined: usize,
     pub records_dispatched: usize,
@@ -185,6 +196,149 @@ impl FabricStreamEpochCommit {
 }
 
 impl Runtime {
+    /// Start safe stream ownership transitions after a node is confirmed removed.
+    ///
+    /// This is intentionally narrower than generic reconfiguration:
+    /// - only streams whose durable leader is the removed node are considered,
+    /// - enough surviving old replicas must remain for the old-policy quorum,
+    /// - the reduced current placement must contain only surviving old replicas,
+    /// - only the deterministic proposed leader initiates the transition.
+    pub fn fabric_stream_failover_confirmed_removed(
+        &mut self,
+        removed: NodeId,
+    ) -> io::Result<FabricStreamAutoFailoverReport> {
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric automatic failover requires distribution",
+            )
+        })?;
+        if self.distributed.cluster.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric automatic failover requires cluster membership",
+            ));
+        }
+
+        let streams = match self.fabric_stream_names() {
+            Ok(streams) => streams,
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => {
+                return Ok(FabricStreamAutoFailoverReport::default());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut report = FabricStreamAutoFailoverReport::default();
+
+        for stream in streams {
+            report.streams_examined += 1;
+            let policy = match self.fabric_stream_replication_policy(&stream) {
+                Ok(Some(policy)) => policy,
+                Ok(None) => continue,
+                Err(error) => {
+                    report.errors += 1;
+                    tracing::warn!(
+                        stream = %stream,
+                        "nulang-fabric-stream: cannot inspect failover policy: {}",
+                        error
+                    );
+                    continue;
+                }
+            };
+            if policy.leader != removed.0 {
+                continue;
+            }
+            report.leader_streams += 1;
+
+            let surviving: Vec<u64> = {
+                let cluster = self
+                    .distributed
+                    .cluster
+                    .as_ref()
+                    .expect("cluster availability checked above");
+                policy
+                    .replicas
+                    .iter()
+                    .copied()
+                    .filter(|node| !cluster.is_removed(NodeId(*node)))
+                    .collect()
+            };
+            let old_quorum = policy.replication_factor / 2 + 1;
+            if surviving.len() < old_quorum {
+                report.skipped_no_old_quorum += 1;
+                tracing::warn!(
+                    stream = %stream,
+                    old_replication_factor = policy.replication_factor,
+                    survivors = surviving.len(),
+                    old_quorum,
+                    "nulang-fabric-stream: confirmed leader removal cannot fail over without old-policy quorum"
+                );
+                continue;
+            }
+
+            let new_replication_factor = surviving.len();
+            let placement = match self.fabric_stream_placement(
+                &stream,
+                policy.partition,
+                new_replication_factor,
+            ) {
+                Ok(placement) => placement,
+                Err(error) => {
+                    report.errors += 1;
+                    tracing::warn!(
+                        stream = %stream,
+                        "nulang-fabric-stream: cannot compute failover placement: {}",
+                        error
+                    );
+                    continue;
+                }
+            };
+
+            let surviving_set: HashSet<u64> = surviving.iter().copied().collect();
+            let placement_set: HashSet<u64> =
+                placement.replicas.iter().map(|node| node.0).collect();
+            if placement_set != surviving_set {
+                report.skipped_requires_new_replica += 1;
+                tracing::warn!(
+                    stream = %stream,
+                    "nulang-fabric-stream: automatic failover would require replica-set expansion; skipping"
+                );
+                continue;
+            }
+            if placement.leader != local {
+                report.skipped_not_candidate += 1;
+                continue;
+            }
+
+            match self.fabric_stream_begin_epoch_transition(
+                &stream,
+                policy.partition,
+                new_replication_factor,
+            ) {
+                Ok(status) => {
+                    report.transitions_started += 1;
+                    tracing::info!(
+                        stream = %stream,
+                        removed = removed.0,
+                        from_epoch = status.from_epoch,
+                        to_epoch = status.to_epoch,
+                        new_replication_factor,
+                        "nulang-fabric-stream: started automatic confirmed-removal failover"
+                    );
+                }
+                Err(error) => {
+                    report.errors += 1;
+                    tracing::warn!(
+                        stream = %stream,
+                        "nulang-fabric-stream: automatic failover transition failed: {}",
+                        error
+                    );
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
     /// Start or resume a quorum-backed transition to a higher election term.
     ///
     /// The proposed replica set is the current deterministic placement for
