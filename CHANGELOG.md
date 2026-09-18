@@ -45,6 +45,20 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric confirmed-removal automatic failover — 2026-09-18
+- **Automatic ownership transition after confirmed leader removal**
+  (Experimental, `src/runtime/fabric_stream_epoch.rs`,
+  `src/runtime/distribution.rs`). Confirmed removed nodes are queued until
+  Runtime regains cluster/transport ownership, then durable stream policies are
+  scanned. A stream transitions automatically only when surviving old replicas
+  still satisfy the old majority, reduced placement contains exactly those old
+  survivors, and the local node is the deterministic candidate. Insufficient
+  quorum or placement requiring a new replica fails closed. Candidate prepare
+  traffic retries on the logical clock at 500ms/1s/2s/... up to 30s so
+  staggered removal confirmation cannot strand an otherwise safe transition.
+  Deterministic tests cover positive-goodbye automatic RF3->RF2 failover and
+  delayed peer removal followed by retry.
+
 ### Fabric epoch candidate reconciliation — 2026-09-18
 - **Proposal-scoped pull from an ahead surviving replica** (Experimental,
   `src/runtime/fabric_stream_epoch.rs`, `src/runtime/distributed.rs`).
