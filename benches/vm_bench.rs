@@ -1,5 +1,5 @@
 //! VM throughput benchmarks: arithmetic, function calls, closures, dispatch,
-//! record/array access.
+//! record/array access, and string assembly.
 
 use criterion::{black_box, criterion_group, BatchSize, Criterion};
 use nulang::bytecode::CodeModule;
@@ -123,6 +123,33 @@ fn bench_array_indexing(c: &mut Criterion) {
     });
 }
 
+/// Compare repeated immutable concatenation with the growable StrBuilder
+/// primitive used by the optimized string stdlib. Both produce the same
+/// 2 KiB payload; only the assembly strategy differs.
+fn bench_string_builder(c: &mut Criterion) {
+    let concat = compile(
+        "var s = \"\"; var i = 0; while i < 256 { s = perform String.concat(s, \"abcdefgh\"); i = i + 1; }; perform String.length(s)",
+    );
+    let builder = compile(
+        "var b = perform StrBuilder.new(); var i = 0; while i < 256 { b = perform StrBuilder.push(b, \"abcdefgh\"); i = i + 1; }; let s = perform StrBuilder.to_string(b); perform String.length(s)",
+    );
+
+    c.bench_function("vm/string_concat_loop", |b| {
+        b.iter_batched(
+            || fresh_vm(&concat),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+    c.bench_function("vm/string_builder_loop", |b| {
+        b.iter_batched(
+            || fresh_vm(&builder),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 criterion_group!(
     benches,
     bench_int_arithmetic,
@@ -131,4 +158,5 @@ criterion_group!(
     bench_closure_capture,
     bench_record_access,
     bench_array_indexing,
+    bench_string_builder,
 );
