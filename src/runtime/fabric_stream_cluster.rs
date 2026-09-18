@@ -47,6 +47,7 @@ pub struct FabricStreamReplicaAppend {
 pub(crate) const FABRIC_STREAM_REPLICA_BEHAVIOR: &str = "__nulang_fabric_stream_replica_v1";
 const MAX_REPLICA_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const FABRIC_STREAM_REPLICA_ACK_BEHAVIOR: &str = "__nulang_fabric_stream_replica_ack_v1";
+pub(crate) const FABRIC_STREAM_COMMIT_BEHAVIOR: &str = "__nulang_fabric_stream_commit_v1";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FabricStreamReplicaDispatchReport {
@@ -84,6 +85,77 @@ pub struct FabricStreamRetryReport {
     pub intended_remote: usize,
     pub dispatched: usize,
     pub unavailable: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FabricStreamCatchUpReport {
+    pub replicas_examined: usize,
+    pub records_dispatched: usize,
+    pub unavailable_replicas: usize,
+    pub commit_updates_dispatched: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FabricStreamReplicaAckOutcome {
+    pub status: FabricStreamReplicationStatus,
+    pub placement: FabricStreamPlacement,
+    pub committed_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FabricStreamCommitUpdate {
+    pub stream: String,
+    pub partition: u16,
+    pub leader: NodeId,
+    pub membership_fingerprint: u64,
+    pub replication_factor: usize,
+    pub committed_sequence: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FabricStreamCommitUpdateWire {
+    stream: String,
+    partition: u16,
+    leader: u64,
+    membership_fingerprint: u64,
+    replication_factor: usize,
+    committed_sequence: u64,
+}
+
+impl FabricStreamCommitUpdate {
+    pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
+        serde_json::to_vec(&FabricStreamCommitUpdateWire {
+            stream: self.stream.clone(),
+            partition: self.partition,
+            leader: self.leader.0,
+            membership_fingerprint: self.membership_fingerprint,
+            replication_factor: self.replication_factor,
+            committed_sequence: self.committed_sequence,
+        })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
+        let wire: FabricStreamCommitUpdateWire = serde_json::from_slice(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if wire.stream.is_empty()
+            || wire.replication_factor == 0
+            || wire.committed_sequence == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Fabric stream commit update",
+            ));
+        }
+        Ok(Self {
+            stream: wire.stream,
+            partition: wire.partition,
+            leader: NodeId(wire.leader),
+            membership_fingerprint: wire.membership_fingerprint,
+            replication_factor: wire.replication_factor,
+            committed_sequence: wire.committed_sequence,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -546,6 +618,96 @@ impl Runtime {
         Ok(report)
     }
 
+    /// Repair lagging replicas using only records already committed by quorum.
+    ///
+    /// Progress is leader-side durable ACK state. Dispatch does not advance
+    /// progress; followers must durably apply and application-ACK each record.
+    pub fn fabric_stream_catch_up_committed(
+        &mut self,
+        stream: &str,
+        partition: u16,
+        replication_factor: usize,
+        max_records_per_replica: usize,
+    ) -> io::Result<FabricStreamCatchUpReport> {
+        if max_records_per_replica == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric catch-up max_records_per_replica must be greater than zero",
+            ));
+        }
+        let placement = self.fabric_stream_placement(stream, partition, replication_factor)?;
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream catch-up requires distribution",
+            )
+        })?;
+        if placement.leader != local {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "only the Fabric stream leader may catch up replicas",
+            ));
+        }
+
+        let committed = self.fabric_stream_committed_sequence(stream)?;
+        let mut report = FabricStreamCatchUpReport::default();
+        if committed == 0 {
+            return Ok(report);
+        }
+        let stream_config = self.fabric_stream_config(stream)?;
+
+        for replica in placement.replicas.iter().copied().filter(|node| *node != local) {
+            report.replicas_examined += 1;
+            let progress = self.fabric_stream_replica_progress(stream, replica.0)?;
+            if progress >= committed {
+                if self.fabric_stream_dispatch_commit_update_to(
+                    replica,
+                    &placement,
+                    committed,
+                )? {
+                    report.commit_updates_dispatched += 1;
+                } else {
+                    report.unavailable_replicas += 1;
+                }
+                continue;
+            }
+
+            let records = self.fabric_stream_read_committed(
+                stream,
+                progress.saturating_add(1),
+                max_records_per_replica,
+            )?;
+            if records.is_empty() {
+                continue;
+            }
+
+            let mut unavailable = false;
+            for record in records {
+                let append = FabricStreamReplicaAppend {
+                    stream: stream.to_string(),
+                    partition,
+                    leader: placement.leader,
+                    membership_fingerprint: placement.membership_fingerprint,
+                    replication_factor,
+                    stream_config,
+                    sequence: record.sequence,
+                    payload: record.payload,
+                };
+                if self.fabric_stream_dispatch_replica_to(replica, &append)? {
+                    report.records_dispatched += 1;
+                } else {
+                    unavailable = true;
+                    break;
+                }
+            }
+            if unavailable {
+                report.unavailable_replicas += 1;
+            }
+        }
+
+        Ok(report)
+    }
+
     pub fn fabric_stream_replication_status(
         &mut self,
         stream: &str,
@@ -592,7 +754,7 @@ impl Runtime {
         &mut self,
         ack: FabricStreamReplicaAck,
         cluster: &ClusterState,
-    ) -> io::Result<FabricStreamReplicationStatus> {
+    ) -> io::Result<FabricStreamReplicaAckOutcome> {
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -627,12 +789,16 @@ impl Runtime {
 
         let committed = self.fabric_stream_committed_sequence(&ack.stream)?;
         if ack.sequence <= committed {
-            return Ok(FabricStreamReplicationStatus {
-                sequence: ack.sequence,
-                quorum: ack.replication_factor / 2 + 1,
-                acknowledgements: 0,
-                rejections: 0,
-                committed: true,
+            return Ok(FabricStreamReplicaAckOutcome {
+                status: FabricStreamReplicationStatus {
+                    sequence: ack.sequence,
+                    quorum: ack.replication_factor / 2 + 1,
+                    acknowledgements: 0,
+                    rejections: 0,
+                    committed: true,
+                },
+                placement: current,
+                committed_sequence: committed,
             });
         }
 
@@ -648,7 +814,13 @@ impl Runtime {
             self.fabric_stream_recover_pending_from_cluster(&ack.stream, cluster)?;
         }
 
-        self.fabric_stream_record_replica_ack(ack)
+        let status = self.fabric_stream_record_replica_ack(ack)?;
+        let committed_sequence = self.fabric_stream_committed_sequence(&current.stream)?;
+        Ok(FabricStreamReplicaAckOutcome {
+            status,
+            placement: current,
+            committed_sequence,
+        })
     }
 
     pub(crate) fn fabric_stream_record_replica_ack(
@@ -948,6 +1120,126 @@ impl Runtime {
         Ok(report)
     }
 
+    pub(crate) fn fabric_stream_dispatch_replica_to(
+        &mut self,
+        target: NodeId,
+        append: &FabricStreamReplicaAppend,
+    ) -> io::Result<bool> {
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream replication requires distribution",
+            )
+        })?;
+        if append.leader != local {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "only the Fabric stream leader may dispatch replica appends",
+            ));
+        }
+
+        let address = self
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.get_node(target))
+            .filter(|info| matches!(info.status, NodeStatus::Healthy | NodeStatus::Joining))
+            .map(|info| info.address);
+        let Some(address) = address else {
+            return Ok(false);
+        };
+        let bytes = append.to_wire_bytes()?;
+        let transport = self.distributed.transport.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream replication requires a network transport",
+            )
+        })?;
+        transport.send(
+            target,
+            address,
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name: FABRIC_STREAM_REPLICA_BEHAVIOR.to_string(),
+                content_hash: None,
+                payload: Vec::new(),
+                string_table: Vec::new(),
+                object_table: vec![(0, bytes)],
+                sender_actor: 0,
+                sender_node: local,
+                priority: MessagePriority::System,
+                trace_id: None,
+            },
+        );
+        Ok(true)
+    }
+
+    pub(crate) fn fabric_stream_dispatch_commit_update_to(
+        &mut self,
+        target: NodeId,
+        placement: &FabricStreamPlacement,
+        committed_sequence: u64,
+    ) -> io::Result<bool> {
+        if committed_sequence == 0 {
+            return Ok(false);
+        }
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream commit propagation requires distribution",
+            )
+        })?;
+        if placement.leader != local || !placement.replicas.contains(&target) || target == local {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid Fabric stream commit-update target",
+            ));
+        }
+        let address = self
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.get_node(target))
+            .filter(|info| matches!(info.status, NodeStatus::Healthy | NodeStatus::Joining))
+            .map(|info| info.address);
+        let Some(address) = address else {
+            return Ok(false);
+        };
+
+        let update = FabricStreamCommitUpdate {
+            stream: placement.stream.clone(),
+            partition: placement.partition,
+            leader: placement.leader,
+            membership_fingerprint: placement.membership_fingerprint,
+            replication_factor: placement.replicas.len(),
+            committed_sequence,
+        };
+        let bytes = update.to_wire_bytes()?;
+        let transport = self.distributed.transport.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream commit propagation requires a network transport",
+            )
+        })?;
+        transport.send(
+            target,
+            address,
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name: FABRIC_STREAM_COMMIT_BEHAVIOR.to_string(),
+                content_hash: None,
+                payload: Vec::new(),
+                string_table: Vec::new(),
+                object_table: vec![(0, bytes)],
+                sender_actor: 0,
+                sender_node: local,
+                priority: MessagePriority::System,
+                trace_id: None,
+            },
+        );
+        Ok(true)
+    }
+
     /// Apply a leader-produced record on a replica.
     ///
     /// The receiver recomputes placement and rejects stale membership
@@ -963,6 +1255,51 @@ impl Runtime {
             append.replication_factor,
         )?;
         self.fabric_stream_apply_replica_with_placement(append, placement)
+    }
+
+    pub(crate) fn fabric_stream_apply_commit_update_from_cluster(
+        &mut self,
+        update: &FabricStreamCommitUpdate,
+        cluster: &ClusterState,
+    ) -> io::Result<()> {
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream commit update requires distribution",
+            )
+        })?;
+        let placement = compute_stream_placement(
+            local,
+            Some(cluster),
+            &update.stream,
+            update.partition,
+            update.replication_factor,
+        )?;
+        if placement.leader != update.leader
+            || placement.membership_fingerprint != update.membership_fingerprint
+            || !placement.replicas.contains(&local)
+            || local == placement.leader
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "stale or unauthorized Fabric stream commit update",
+            ));
+        }
+
+        let tail = self
+            .fabric_stream_info(&update.stream)?
+            .last_sequence
+            .unwrap_or(0);
+        if update.committed_sequence > tail {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric commit update {} is ahead of local replica tail {tail}",
+                    update.committed_sequence
+                ),
+            ));
+        }
+        self.fabric_stream_commit_through(&update.stream, update.committed_sequence)
     }
 
     pub(crate) fn fabric_stream_apply_replica_from_cluster(
@@ -1335,6 +1672,23 @@ mod tests {
             .unwrap()
             .is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_update_wire_roundtrip_preserves_contract() {
+        let update = FabricStreamCommitUpdate {
+            stream: "orders".into(),
+            partition: 0,
+            leader: NodeId(10),
+            membership_fingerprint: 44,
+            replication_factor: 3,
+            committed_sequence: 7,
+        };
+        let bytes = update.to_wire_bytes().unwrap();
+        assert_eq!(
+            FabricStreamCommitUpdate::from_wire_bytes(&bytes).unwrap(),
+            update
+        );
     }
 
     #[test]
