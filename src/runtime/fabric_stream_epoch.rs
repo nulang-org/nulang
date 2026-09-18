@@ -396,8 +396,8 @@ impl Runtime {
             match result {
                 Ok(status) if status.finalized => {
                     self.distributed
-                    .fabric_stream_failover_retry
-                    .remove(&stream);
+                        .fabric_stream_failover_retry
+                        .remove(&stream);
                 }
                 Ok(_) | Err(_) => {
                     let now = self.now();
