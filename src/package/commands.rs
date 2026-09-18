@@ -289,7 +289,7 @@ fn print_usage() {
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build the package (type-check + .nbc artifact in .nula/dist/)");
-    println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
+    println!("  build-wasm    Build .wasm + .behavior.json + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
     println!("  run           Build and run the package entry point");
     println!("  run --watch   Build and re-run on source changes");
@@ -1209,9 +1209,33 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
     })
 }
 
-/// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
-/// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
+/// `nula build-wasm`: compile the package once and emit the canonical Wasm
+/// artifact, Behavior Manifest sidecar, and AOT-precompiled `.cwasm`.
 fn cmd_build_wasm() -> NuResult<()> {
+    #[cfg(not(feature = "wasm-backend"))]
+    {
+        return Err(NuError::PackageError {
+            msg: "nula build-wasm requires a Nulang build with the 'wasm-backend' feature"
+                .to_string(),
+            span: Span::default(),
+        });
+    }
+
+    #[cfg(feature = "wasm-backend")]
+    {
+        cmd_build_wasm_integrated()
+    }
+}
+
+#[cfg(feature = "wasm-backend")]
+fn cmd_build_wasm_integrated() -> NuResult<()> {
+    cmd_build_wasm_integrated_with_aot(true)
+}
+
+#[cfg(feature = "wasm-backend")]
+fn cmd_build_wasm_integrated_with_aot(aot: bool) -> NuResult<()> {
+    use crate::behavior_build::{compile_wasm_behavior, BehaviorBuildInput};
+
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1220,8 +1244,28 @@ fn cmd_build_wasm() -> NuResult<()> {
     })?;
     let name = manifest.package.name.clone();
 
+    // prepare_package is authoritative for dependency resolution and writes the
+    // post-resolution Nulang.lock. Read that exact lockfile below so manifest
+    // provenance cannot describe a dependency state different from this build.
     let entry = prepare_package()?;
-    let entry_str = entry.to_string_lossy().into_owned();
+    let lock_path = root.join(LOCKFILE_FILE);
+    let dependency_bytes = std::fs::read(&lock_path).map_err(|e| NuError::PackageError {
+        msg: format!("cannot read resolved dependency lock {}: {}", lock_path.display(), e),
+        span: Span::default(),
+    })?;
+
+    let compiler_path = std::env::current_exe().map_err(|e| NuError::PackageError {
+        msg: format!("cannot locate compiler executable for provenance: {}", e),
+        span: Span::default(),
+    })?;
+    let compiler_bytes = std::fs::read(&compiler_path).map_err(|e| NuError::PackageError {
+        msg: format!(
+            "cannot read compiler executable {} for provenance: {}",
+            compiler_path.display(),
+            e
+        ),
+        span: Span::default(),
+    })?;
 
     let dist_dir = root.join(".nula").join("dist");
     std::fs::create_dir_all(&dist_dir).map_err(|e| NuError::PackageError {
@@ -1230,12 +1274,56 @@ fn cmd_build_wasm() -> NuResult<()> {
     })?;
 
     let wasm_path = dist_dir.join(format!("{}.wasm", name));
-    let wasm_path_str = wasm_path.to_string_lossy().into_owned();
+    let manifest_out = dist_dir.join(format!("{}.behavior.json", name));
+    let cwasm_path = dist_dir.join(format!("{}.cwasm", name));
 
-    eprintln!("Building {} (WASM AOT)...", name);
-    eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
-    println!("WASM AOT build succeeded.");
+    eprintln!("Building {} (WASM + Behavior Manifest + AOT)...", name);
+    eprintln!("  Checking and compiling {}...", entry.display());
+
+    let output = compile_wasm_behavior(BehaviorBuildInput {
+        source_path: &entry,
+        package_name: &manifest.package.name,
+        package_version: &manifest.package.version,
+        dependency_bytes: &dependency_bytes,
+        compiler_implementation: "nulang-rust",
+        compiler_version: env!("CARGO_PKG_VERSION"),
+        compiler_bytes: &compiler_bytes,
+        with_capabilities: &manifest.package.capabilities,
+        deny_warnings: false,
+    })?;
+
+    std::fs::write(&wasm_path, &output.wasm_bytes).map_err(|e| NuError::PackageError {
+        msg: format!("cannot write {}: {}", wasm_path.display(), e),
+        span: Span::default(),
+    })?;
+
+    let manifest_json = output
+        .manifest
+        .to_canonical_json()
+        .map_err(|e| NuError::PackageError {
+            msg: format!("cannot serialize Behavior Manifest: {}", e),
+            span: Span::default(),
+        })?;
+    std::fs::write(&manifest_out, manifest_json).map_err(|e| NuError::PackageError {
+        msg: format!("cannot write {}: {}", manifest_out.display(), e),
+        span: Span::default(),
+    })?;
+
+    println!("Wrote {}", wasm_path.display());
+    println!("Wrote {}", manifest_out.display());
+
+    if aot {
+        let wasm_path_str = wasm_path.to_string_lossy().into_owned();
+        let cwasm_path_str = cwasm_path.to_string_lossy().into_owned();
+        crate::wasm_runtime::aot_compile(&wasm_path_str, &cwasm_path_str).map_err(|e| {
+            NuError::PackageError {
+                msg: format!("AOT compilation failed: {}", e),
+                span: Span::default(),
+            }
+        })?;
+        println!("Wrote {} (precompiled)", cwasm_path.display());
+    }
+
     Ok(())
 }
 
@@ -3003,6 +3091,79 @@ mod tests {
                 msg
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(feature = "wasm-backend"))]
+    #[test]
+    fn test_cmd_build_wasm_requires_backend_feature() {
+        let err = cmd_build_wasm().expect_err("build-wasm must fail without wasm-backend");
+        assert!(err.to_string().contains("wasm-backend"));
+    }
+
+    #[cfg(feature = "wasm-backend")]
+    #[test]
+    fn test_cmd_build_wasm_emits_behavior_manifest_from_same_build() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_wasm_manifest_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "wasm-manifest-app", "default")
+            .expect("scaffold should succeed");
+
+        let main = dir.join("src/main.nula");
+        let imported = dir.join("src/helper.nula");
+        std::fs::write(&main, "import helper\nfn main() { helper() }\n").unwrap();
+        std::fs::write(&imported, "fn helper() { 7 }\n").unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_wasm_integrated_with_aot(false)
+            .expect("integrated build-wasm should succeed without external AOT tool");
+
+        let dist = dir.join(".nula/dist");
+        let wasm = dist.join("wasm-manifest-app.wasm");
+        let behavior = dist.join("wasm-manifest-app.behavior.json");
+        let lock = dir.join(LOCKFILE_FILE);
+        assert!(wasm.exists(), "Wasm artifact should exist");
+        assert!(behavior.exists(), "Behavior Manifest should exist");
+        assert!(lock.exists(), "resolved lockfile should exist");
+
+        let wasm_bytes = std::fs::read(&wasm).unwrap();
+        let lock_bytes = std::fs::read(&lock).unwrap();
+        let first_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&behavior).unwrap()).unwrap();
+        let wasm_digest = crate::behavior_manifest::digest(&wasm_bytes);
+        let dependency_digest = crate::behavior_manifest::digest(&lock_bytes);
+        assert_eq!(
+            first_json["artifact"]["digest"].as_str(),
+            Some(wasm_digest.as_str())
+        );
+        assert_eq!(
+            first_json["provenance"]["dependency_digest"].as_str(),
+            Some(dependency_digest.as_str())
+        );
+        assert_eq!(
+            first_json["package"]["name"].as_str(),
+            Some("wasm-manifest-app")
+        );
+
+        let first_source_digest = first_json["provenance"]["source_digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        std::fs::write(&imported, "fn helper() { 8 }\n").unwrap();
+        cmd_build_wasm_integrated_with_aot(false)
+            .expect("rebuild after imported-source mutation should succeed");
+        let second_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&behavior).unwrap()).unwrap();
+        assert_ne!(
+            second_json["provenance"]["source_digest"].as_str(),
+            Some(first_source_digest.as_str())
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
