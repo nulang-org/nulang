@@ -2223,7 +2223,10 @@ fn rvalue_uses(op: &mir::RValue) -> Vec<(usize, UseKind)> {
         // The timeout value is staged into r0 with a plain Move — an
         // uncounted copy channel like call/effect argument staging.
         ReceiveWait { timeout, .. } => cp(&mut out, *timeout),
-        Load(x) => cp(&mut out, *x),
+        // Phase 1 models MoveOut explicitly but does not yet establish a
+        // transferable drop token. Keep it in the conservative copy class
+        // until #402 phase 2 teaches the planner ownership propagation.
+        Load(x) | MoveOut(x) => cp(&mut out, *x),
         LoadFieldNamed { obj, .. } | LoadFieldPos { obj, .. } => ro(&mut out, *obj),
         ArrayLoad { arr, idx } => {
             ro(&mut out, *arr);
