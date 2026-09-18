@@ -204,7 +204,7 @@ impl CodeModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
+    use crate::bytecode::{CodeModule, Constant, DebugFunctionInfo, Instruction, OpCode};
 
     fn sample_module() -> CodeModule {
         let mut m = CodeModule::new("test");
@@ -224,6 +224,35 @@ mod tests {
         assert_eq!(art.format_version, BYTECODE_VERSION);
         assert_eq!(art.language_version, LANGUAGE_VERSION);
         assert!(art.source_hash.is_none(), "no source hash supplied");
+    }
+
+    #[test]
+    fn test_nbc_does_not_serialize_runtime_sink_metadata() {
+        let mut m = sample_module();
+        m.function_table.push(0);
+        m.debug_functions.push(DebugFunctionInfo {
+            name: "take".into(),
+            code_offset: 0,
+            code_len: 1,
+            params: vec![16],
+            sink_mask: 1,
+            sink_metadata_present: true,
+            locals: vec![(16, Some("x".into()))],
+        });
+
+        let bytes = m.to_nbc(None).expect("encode");
+        let art = CodeModule::from_nbc(&bytes).expect("decode");
+        let info = art.module.debug_functions.first().expect("debug function");
+        assert_eq!(info.sink_mask, 0, "sink mask is runtime-only");
+        assert!(
+            !info.sink_metadata_present,
+            "deserialized NBC must not claim authoritative sink metadata"
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("sink_mask") && !text.contains("sink_metadata_present"),
+            "Frozen NBC metadata must not gain serialized sink fields"
+        );
     }
 
     #[test]
