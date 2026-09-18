@@ -2943,6 +2943,7 @@ mod tests {
                 name: "__main".into(),
                 type_params: vec![],
                 params: vec![],
+                param_caps: vec![],
                 dict_params: vec![],
                 ret: crate::types::Type::unit(),
                 effect: crate::types::EffectRow::empty(),
