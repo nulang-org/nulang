@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use crate::runtime::cluster::{ClusterState, NodeId};
 use crate::runtime::fabric_stream_cluster::FabricStreamReplicationState;
@@ -513,6 +514,8 @@ pub struct DistributedContext {
     /// Confirmed removed nodes awaiting Fabric stream ownership orchestration.
     /// Processing is deferred until Runtime owns cluster/transport state again.
     pub(crate) fabric_stream_removed_nodes_pending: HashSet<NodeId>,
+    /// Logical-clock retry state for active automatic ownership transitions.
+    pub(crate) fabric_stream_failover_retry: HashMap<String, (Instant, Duration)>,
 }
 
 impl DistributedContext {
