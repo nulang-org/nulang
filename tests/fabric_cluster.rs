@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use nulang::runtime::{Actor, DeterministicNetworkTransport, NodeId, Runtime};
 use nulang::vm::Value;
@@ -22,6 +23,7 @@ fn distributed_runtime(
     >,
 ) -> Runtime {
     let mut runtime = Runtime::new();
+    runtime.install_virtual_clock();
     let transport =
         DeterministicNetworkTransport::bind_with_bus(addr, bus).expect("transport should bind");
     transport.register_on_bus();
@@ -32,7 +34,7 @@ fn distributed_runtime(
 }
 
 #[test]
-fn fabric_remote_publish_reuses_distributed_actor_transport() {
+fn fabric_gossip_converges_routes_and_reuses_distributed_actor_transport() {
     let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let addr_a: SocketAddr = "127.0.0.1:32101".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:32102".parse().unwrap();
@@ -42,54 +44,59 @@ fn fabric_remote_publish_reuses_distributed_actor_transport() {
     let mut a = distributed_runtime(addr_a, bus.clone());
     let mut b = distributed_runtime(addr_b, bus);
 
-    // Install each peer in the real ClusterState. Two heartbeats also cover
-    // implementations that probation a newly discovered peer before marking
-    // it healthy.
-    for _ in 0..2 {
-        a.distributed
-            .cluster
-            .as_mut()
-            .unwrap()
-            .handle_heartbeat(node_b, addr_b);
-        b.distributed
-            .cluster
-            .as_mut()
-            .unwrap()
-            .handle_heartbeat(node_a, addr_a);
-    }
-    assert!(a
-        .distributed
+    // Seed both real ClusterState instances as healthy peers. Subsequent
+    // subscription propagation is automatic through Runtime::process_network.
+    a.distributed
         .cluster
-        .as_ref()
+        .as_mut()
         .unwrap()
-        .get_node(node_b)
-        .is_some());
+        .handle_heartbeat(node_b, addr_b);
+    b.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
 
-    let target = b.spawn_actor(Box::new(|| Vec::new()));
+    let target = b.spawn_actor(Box::new(Vec::new));
     b.actors
         .get_mut(&target)
         .unwrap()
         .register_behavior("handle", noop);
     b.fabric_subscribe("events.*", target, "handle").unwrap();
 
-    // This manually performs the control-plane exchange that the next Fabric
-    // slice will piggyback on cluster gossip. The data plane is already the
-    // production distributed actor path.
-    let snapshot = b.fabric_advertisements(16).unwrap();
-    assert_eq!(snapshot.node_id, node_b);
-    assert_eq!(snapshot.generation, 1);
-    assert_eq!(snapshot.subscriptions.len(), 1);
-    a.fabric_replace_remote_advertisements(snapshot).unwrap();
+    // B's cluster tick gossips its complete Fabric snapshot; A's next network
+    // turn decodes the additive FAB0 tail and installs the remote route.
+    b.advance_time(Duration::from_millis(600));
+    a.advance_time(Duration::from_millis(600));
+    b.process_network();
+    a.process_network();
+    assert_eq!(a.fabric_remote_subscription_count(), 1);
 
     assert_eq!(
         a.fabric_publish("events.created", &[Value::int(42)])
             .unwrap(),
         1
     );
-
-    // DeterministicNetworkTransport delivers synchronously to B's incoming
-    // queue. Processing the real network loop must turn the ActorMessage into
-    // an ordinary mailbox delivery on the subscribed actor.
     b.process_network();
     assert_eq!(b.actors.get(&target).unwrap().mailbox.len(), 1);
+
+    // Failure detection removes the learned route immediately rather than
+    // leaving a dead consumer selectable until the 60-second removal window.
+    a.advance_time(Duration::from_secs(8));
+    a.process_network();
+    assert_eq!(a.fabric_remote_subscription_count(), 0);
+
+    // A healthy peer with the same stable NodeId can advertise the same local
+    // generation after recovery because failure cleanup forgot the old remote
+    // generation together with the dead routes.
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    b.advance_time(Duration::from_millis(600));
+    a.advance_time(Duration::from_millis(600));
+    b.process_network();
+    a.process_network();
+    assert_eq!(a.fabric_remote_subscription_count(), 1);
 }
