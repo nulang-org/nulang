@@ -216,6 +216,21 @@ impl MirCodegen {
         }
     }
 
+    /// Invalidate a local after its counted ownership slot has been staged
+    /// for transfer. Unlike Drop, this does not decrement the reference.
+    fn clear_local_without_drop(&mut self, id: mir::LocalId) {
+        if let Some(&slot) = self.spill_map.get(&id.0) {
+            self.load_constant(SPILL_TEMP2, &Constant::Nil);
+            self.emit(Instruction::new3(
+                OpCode::SpillStore,
+                SPILL_TEMP2,
+                (slot >> 8) as u8,
+                (slot & 0xFF) as u8,
+            ));
+        } else {
+            self.load_constant((LOCAL_BASE + id.0) as u8, &Constant::Nil);
+        }
+    }
     /// Constant-pool index for a `self.field` name, reusing an existing
     /// entry if this field was already referenced elsewhere in the module.
     fn state_field_constant(&mut self, field: &str) -> usize {
@@ -912,17 +927,29 @@ impl MirCodegen {
             }
             mir::RValue::Call { func, args } => {
                 // Load the callee value first (it lives above the staging
-                // zone, so staging cannot clobber it).
-                match func {
+                // zone, so staging cannot clobber it). Only statically-known
+                // direct calls can use the internal ownership ABI.
+                let owned_args = match func {
                     mir::FuncRef::Index(idx) => {
                         self.load_constant(FUNC_VALUE_REG, &Constant::Int(*idx as i64));
+                        self.owned_param_masks.get(*idx).cloned().unwrap_or_default()
                     }
                     mir::FuncRef::Local(id) => {
                         let _rid = self.local_reg(*id);
                         self.emit(Instruction::new2(OpCode::Move, _rid, FUNC_VALUE_REG));
+                        Vec::new()
+                    }
+                };
+                self.stage_args(args)?;
+                // Staging registers now carry the raw values the callee will
+                // copy into its parameter locals. Invalidate caller owners
+                // before Call so callee failure cleanup has exactly one
+                // counted slot to release.
+                for (idx, arg) in args.iter().enumerate() {
+                    if owned_args.get(idx).copied().unwrap_or(false) {
+                        self.clear_local_without_drop(*arg);
                     }
                 }
-                self.stage_args(args)?;
                 self.emit(Instruction::new3(
                     OpCode::Call,
                     FUNC_VALUE_REG,
