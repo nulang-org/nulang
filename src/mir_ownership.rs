@@ -716,6 +716,150 @@ mod tests {
         module
     }
 
+    fn linear_array_callee(public: bool) -> mir::Function {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("consume_array", None);
+        b.set_public(public);
+        let _p = b.add_param_with_cap("x", array_ty, Capability::LinearIso);
+        b.terminate(mir::Terminator::Return(None));
+        b.build()
+    }
+
+    #[test]
+    fn call_ownership_candidate_accepts_single_use_owned_temp() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let callee = linear_array_callee(false);
+        let mut caller = mir::FunctionBuilder::new("caller", None);
+        let arg = caller.add_temp(array_ty);
+        let result = caller.add_temp(Type::unit());
+        caller.assign(arg, mir::RValue::ArrayLit(vec![]));
+        caller.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![arg],
+            },
+        );
+        caller.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(callee);
+        module.functions.push(caller.build());
+        let report = analyze_call_ownership(&module);
+        let p = &report[0].params[0];
+        assert!(p.candidate_owned, "fresh single-use owner should be a candidate: {:?}", p.blockers);
+        assert!(!p.requires_upstream_owned_param);
+        assert_eq!(report[0].direct_call_sites, 1);
+    }
+
+    #[test]
+    fn call_ownership_candidate_blocks_public_function() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let callee = linear_array_callee(true);
+        let mut caller = mir::FunctionBuilder::new("caller", None);
+        let arg = caller.add_temp(array_ty);
+        let result = caller.add_temp(Type::unit());
+        caller.assign(arg, mir::RValue::ArrayLit(vec![]));
+        caller.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![arg],
+            },
+        );
+        caller.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(callee);
+        module.functions.push(caller.build());
+        let report = analyze_call_ownership(&module);
+        let p = &report[0].params[0];
+        assert!(!p.candidate_owned);
+        assert!(p.blockers.contains(&CallOwnershipBlocker::PublicFunction));
+    }
+
+    #[test]
+    fn call_ownership_candidate_blocks_dynamic_closure_target() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let callee = linear_array_callee(false);
+        let mut caller = mir::FunctionBuilder::new("caller", None);
+        let arg = caller.add_temp(array_ty);
+        let clos = caller.add_temp(Type::unit());
+        let result = caller.add_temp(Type::unit());
+        caller.assign(arg, mir::RValue::ArrayLit(vec![]));
+        caller.assign(
+            clos,
+            mir::RValue::Closure {
+                func: 0,
+                captures: vec![],
+            },
+        );
+        caller.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![arg],
+            },
+        );
+        caller.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(callee);
+        module.functions.push(caller.build());
+        let report = analyze_call_ownership(&module);
+        assert!(report[0].dynamic_callable);
+        assert!(report[0].params[0]
+            .blockers
+            .contains(&CallOwnershipBlocker::DynamicCallable));
+    }
+
+    #[test]
+    fn call_ownership_candidate_marks_linear_forward_dependency() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let callee = linear_array_callee(false);
+        let mut caller = mir::FunctionBuilder::new("forwarder", None);
+        let arg = caller.add_param_with_cap("x", array_ty, Capability::LinearIso);
+        let result = caller.add_temp(Type::unit());
+        caller.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![arg],
+            },
+        );
+        caller.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(callee);
+        module.functions.push(caller.build());
+        let report = analyze_call_ownership(&module);
+        assert!(report[0].params[0].candidate_owned);
+        assert!(report[0].params[0].requires_upstream_owned_param);
+    }
+
+    #[test]
+    fn return_ownership_candidates_distinguish_local_and_linear_param() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+
+        let mut fresh = mir::FunctionBuilder::new("fresh", Some(array_ty.clone()));
+        let value = fresh.add_temp(array_ty.clone());
+        fresh.assign(value, mir::RValue::ArrayLit(vec![]));
+        fresh.terminate(mir::Terminator::Return(Some(value)));
+
+        let mut forwarding = mir::FunctionBuilder::new("forward", Some(array_ty.clone()));
+        let param = forwarding.add_param_with_cap("x", array_ty, Capability::LinearIso);
+        forwarding.terminate(mir::Terminator::Return(Some(param)));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(fresh.build());
+        module.functions.push(forwarding.build());
+        let report = analyze_call_ownership(&module);
+        assert_eq!(report[0].return_ownership, ReturnOwnershipCandidate::OwnedLocal);
+        assert_eq!(
+            report[1].return_ownership,
+            ReturnOwnershipCandidate::OwnedFromLinearParam
+        );
+    }
     #[test]
     fn infers_transfer_for_single_use_owning_temp() {
         let array_ty = Type::Array(Box::new(Type::int()));
