@@ -1,0 +1,94 @@
+{
+  "schema": "nulang.behavior/v0alpha1",
+  "package": {
+    "name": "payments",
+    "version": "0.4.0",
+    "language_version": "1.0.0-frozen"
+  },
+  "artifact": {
+    "kind": "wasm-module",
+    "digest": "blake3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "compiler": {
+    "implementation": "nulang-rust",
+    "version": "0.1.0",
+    "digest": "blake3:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "interfaces": [
+    {
+      "name": "payment.charge",
+      "input": "ChargeRequest",
+      "output": "Result<ChargeReceipt, ChargeError>"
+    }
+  ],
+  "actors": [
+    {
+      "name": "PaymentProcessor",
+      "protocol": "payment.v1",
+      "durability": "durable",
+      "state_schema": "payment-state/v7"
+    }
+  ],
+  "effects": [
+    {
+      "effect": "Storage.write",
+      "class": "external",
+      "determinism": "nondeterministic",
+      "replay": "requires-journal",
+      "cost_class": "state-write"
+    },
+    {
+      "effect": "Network.request",
+      "class": "external",
+      "determinism": "nondeterministic",
+      "replay": "requires-idempotency-key",
+      "cost_class": "network"
+    }
+  ],
+  "authority": [
+    {
+      "kind": "network",
+      "resource": "api.stripe.com:443",
+      "operations": ["connect"],
+      "required": true
+    },
+    {
+      "kind": "secret",
+      "resource": "payments/stripe",
+      "operations": ["read"],
+      "required": true
+    }
+  ],
+  "durability": [
+    {
+      "owner": "PaymentProcessor",
+      "persistence": "durable",
+      "schema": "payment-state/v7",
+      "migration_contract": "blake3:2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  ],
+  "replay": [
+    {
+      "effect": "Storage.write",
+      "class": "journal-result"
+    },
+    {
+      "effect": "Network.request",
+      "class": "external-requires-idempotency-key"
+    }
+  ],
+  "resources": {
+    "memory_min_bytes": 67108864,
+    "memory_max_bytes": 268435456,
+    "cpu_weight": 100,
+    "inference_budget_microusd": 0,
+    "residency": ["BR"],
+    "network_egress_class": "restricted"
+  },
+  "provenance": {
+    "source_digest": "blake3:3333333333333333333333333333333333333333333333333333333333333333",
+    "dependency_digest": "blake3:4444444444444444444444444444444444444444444444444444444444444444",
+    "interface_digests": [],
+    "state_schema_digests": []
+  }
+}
