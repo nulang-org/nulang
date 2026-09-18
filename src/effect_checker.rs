@@ -1857,19 +1857,18 @@ impl CapabilityAnalyzer {
         span: Span,
         consumed: &mut ConsumptionState,
     ) -> NuResult<()> {
-        // Record the span for LSP visualization regardless of error.
         self.consumed_spans.push(span);
-        if !consumed.insert(name.to_string()) {
-            let first_span = self.first_consumed.get(name);
+        if let Some(first_span) = consumed.maybe_moved.get(name) {
             let mut msg = format!("linear value `{}` used after being consumed", name);
-            if let Some(fs) = first_span {
-                msg.push_str(&format!(
-                    " (first consumed at line {}:{})",
-                    fs.start, fs.end
-                ));
-            }
+            msg.push_str(&format!(
+                " (first consumed at line {}:{})",
+                first_span.start, first_span.end
+            ));
             msg.push_str("\nhelp: linear/lineariso bindings may be used at most once");
-            msg.push_str(&format!("\nhelp: use `consume {}` to explicitly discharge the linear obligation on the first use, or restructure to avoid the second use", name));
+            msg.push_str(&format!(
+                "\nhelp: use `consume {}` to explicitly discharge the linear obligation on the first use, or restructure to avoid the second use",
+                name
+            ));
             self.diagnostics.push(msg.clone());
             return Err(NuError::cap_error_explained(
                 msg,
@@ -1877,18 +1876,15 @@ impl CapabilityAnalyzer {
                 "linear/lineariso bindings are moved on first use and may not be referenced again on the same path",
             ));
         }
-        self.first_consumed.insert(name.to_string(), span);
+        consumed.definite.insert(name.to_string());
+        consumed.maybe_moved.insert(name.to_string(), span);
+        self.first_consumed.entry(name.to_string()).or_insert(span);
         Ok(())
     }
 
     /// Mark an `Iso` binding as consumed after a move operation (send,
     /// ask, closure capture), erroring if it was already moved along this
     /// path.
-    ///
-    /// Unlike `LinearIso`/`Linear` (which are consumed on every variable
-    /// reference via `Expr::Var`), plain `Iso` is consumed only at explicit
-    /// ownership-transfer points.  The same `consumed` set is used so that
-    /// branch merge, loop rejection, and shadowing work identically.
     fn consume_if_iso(
         &mut self,
         name: &str,
@@ -1896,12 +1892,12 @@ impl CapabilityAnalyzer {
         consumed: &mut ConsumptionState,
     ) -> NuResult<()> {
         self.consumed_spans.push(span);
-        if !consumed.insert(name.to_string()) {
-            let first_span = self.first_consumed.get(name);
+        if let Some(first_span) = consumed.maybe_moved.get(name) {
             let mut msg = format!("iso value `{}` used after being moved", name);
-            if let Some(fs) = first_span {
-                msg.push_str(&format!(" (first moved at line {}:{})", fs.start, fs.end));
-            }
+            msg.push_str(&format!(
+                " (first moved at line {}:{})",
+                first_span.start, first_span.end
+            ));
             msg.push_str("\nhelp: iso bindings transfer ownership on send/ask");
             msg.push_str(&format!(
                 "\nhelp: use `consume {}` to explicitly discharge the iso before the move, or restructure to avoid the second use",
@@ -1914,23 +1910,43 @@ impl CapabilityAnalyzer {
                 "an iso binding transfers ownership on send/ask/closure-capture and cannot be moved twice",
             ));
         }
-        self.first_consumed.insert(name.to_string(), span);
+        consumed.definite.insert(name.to_string());
+        consumed.maybe_moved.insert(name.to_string(), span);
+        self.first_consumed.entry(name.to_string()).or_insert(span);
         Ok(())
     }
 
-    /// Recursive worker for [`infer_cap`] that tracks which `LinearIso`
-    /// bindings have already been consumed along the current path.
-    ///
-    /// Linearity rules (conservative MVP — at-most-once use):
-    /// - Referencing a variable whose capability is `LinearIso` consumes the
-    ///   binding; a second reference on the same path is a `CapError`.
-    /// - Branches merge conservatively: a binding is consumed after an
-    ///   `if`/`match`/`receive` only if *every* fall-through path consumes
-    ///   it, so a use in one branch never poisons a sibling branch.
-    /// - Consuming an outer linear binding inside a `for` body errors, since
-    ///   the loop may iterate more than once.
-    /// - A binding that is never used is NOT an error: exactly-once
-    ///   (must-use on all paths) analysis is a documented follow-up.
+    /// Explicit `consume x` invalidates the source binding regardless of
+    /// reference capability. #384 implements it as a runtime move-out, so a
+    /// later read is invalid even for a non-linear binding.
+    fn consume_explicit(
+        &mut self,
+        name: &str,
+        span: Span,
+        consumed: &mut ConsumptionState,
+    ) -> NuResult<()> {
+        self.consumed_spans.push(span);
+        if let Some(first_span) = consumed.maybe_moved.get(name) {
+            let msg = format!(
+                "value `{}` used after being moved (first moved at line {}:{})",
+                name, first_span.start, first_span.end
+            );
+            self.diagnostics.push(msg.clone());
+            return Err(NuError::cap_error_explained(
+                msg,
+                span,
+                "consume invalidates the source binding on every path where it executes",
+            ));
+        }
+        consumed.definite.insert(name.to_string());
+        consumed.maybe_moved.insert(name.to_string(), span);
+        self.first_consumed.entry(name.to_string()).or_insert(span);
+        Ok(())
+    }
+
+    /// Recursive worker for [`infer_cap`] that tracks both definite
+    /// consumption (for exactly-once obligations) and possible moves (for
+    /// use-after-move safety).
     fn infer_cap_tracked(
         &mut self,
         ctx: &CapContext,
@@ -1953,17 +1969,20 @@ impl CapabilityAnalyzer {
 
             Expr::Var(name, span) => {
                 let cap = ctx.lookup(name);
+                if let Some(first_span) = consumed.maybe_moved.get(name) {
+                    let msg = format!(
+                        "value `{}` used after being moved (first moved at line {}:{})",
+                        name, first_span.start, first_span.end
+                    );
+                    self.diagnostics.push(msg.clone());
+                    return Err(NuError::cap_error_explained(
+                        msg,
+                        *span,
+                        "a moved binding is unavailable on at least one path reaching this use",
+                    ));
+                }
                 if cap.is_linear() {
                     self.consume_linear(name, *span, consumed)?;
-                } else if cap == Capability::Iso && consumed.contains(name) {
-                    let first_span = self.first_consumed.get(name);
-                    let mut msg = format!("iso value `{}` used after being moved", name);
-                    if let Some(fs) = first_span {
-                        msg.push_str(&format!(" (first moved at line {}:{})", fs.start, fs.end));
-                    }
-                    msg.push_str("\nhelp: iso bindings transfer ownership on send/ask and may be used at most once thereafter");
-                    self.diagnostics.push(msg.clone());
-                    return Err(NuError::cap_error(msg, *span));
                 }
                 Ok(cap)
             }
