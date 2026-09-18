@@ -45,6 +45,18 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric epoch voter repair — 2026-09-18
+- **Proposal-scoped repair for lagging transition voters** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/distributed.rs`).
+  A prospective leader can now send a bounded exact suffix to a rejected
+  new-policy voter whose durable tail is behind the proposal tail, without
+  reopening normal traffic from the fenced old epoch. Repair batches validate
+  the active proposal and old durable policy, are idempotent across duplicate
+  delivery, append only the missing exact-sequence suffix, and immediately
+  re-evaluate/send the voter's proposal vote. Multi-round repair advances via
+  updated rejected-tail votes. Replicas ahead of the candidate are reported but
+  left untouched pending a separate pull/reconciliation protocol.
+
 ### Fabric quorum-backed epoch transition — 2026-09-18
 - **Durable prepare/vote/commit ownership transition** (Experimental,
   `src/runtime/fabric_stream_epoch.rs`, `src/runtime/fabric_stream.rs`,
