@@ -283,6 +283,7 @@ impl MirCodegen {
                 *mask = owned_params;
             }
         }
+        prune_owned_param_masks_for_body_flow(mir, &mut self.owned_param_masks);
 
         // Register foreign functions first so FFICall indices line up.
         for ff in &mir.foreign_functions {
@@ -2518,6 +2519,78 @@ fn terminator_uses(term: &mir::Terminator) -> Vec<(usize, UseKind)> {
 
 /// Successor block indices of a terminator (block ids are dense indices
 /// into `Function::blocks`).
+/// Prune caller-valid owned-parameter candidates whose callee body would
+/// leak or ambiguously copy the counted slot under the current bytecode ABI.
+///
+/// This is itself a greatest fixed point: forwarding a parameter is safe only
+/// while the downstream direct-call parameter remains owned. If that target is
+/// pruned, the forwarding use becomes an ordinary Copy and the upstream
+/// parameter is pruned on the next iteration.
+fn prune_owned_param_masks_for_body_flow(
+    module: &mir::Module,
+    masks: &mut [Vec<bool>],
+) {
+    loop {
+        let snapshot = masks.to_vec();
+        let mut changed = false;
+
+        for (function_idx, func) in module.functions.iter().enumerate() {
+            let transfers = ownership_transfer_pairs(func);
+            let Some(mask) = masks.get_mut(function_idx) else {
+                continue;
+            };
+            for (param_idx, param) in func.params.iter().enumerate() {
+                if !snapshot
+                    .get(function_idx)
+                    .and_then(|m| m.get(param_idx))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+
+                let param_local = param.0 as usize;
+                let mut saw_use = false;
+                let mut unsafe_copy = false;
+                for block in &func.blocks {
+                    for stmt in &block.stmts {
+                        for (local, kind) in
+                            stmt_uses_for_drop(stmt, &transfers, &snapshot)
+                        {
+                            if local == param_local {
+                                saw_use = true;
+                                if kind == UseKind::Copy {
+                                    unsafe_copy = true;
+                                }
+                            }
+                        }
+                    }
+                    for (local, kind) in terminator_uses(&block.terminator) {
+                        if local == param_local {
+                            saw_use = true;
+                            if kind == UseKind::Copy {
+                                unsafe_copy = true;
+                            }
+                        }
+                    }
+                }
+
+                if !saw_use || unsafe_copy {
+                    if let Some(active) = mask.get_mut(param_idx) {
+                        if *active {
+                            *active = false;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+}
 fn terminator_successors(term: &mir::Terminator) -> Vec<usize> {
     match term {
         mir::Terminator::Jump(t) => vec![t.0 as usize],
