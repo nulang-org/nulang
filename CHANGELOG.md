@@ -45,6 +45,20 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric stream crash recovery — 2026-09-18
+- **Durable replication intent + explicit retry** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`).
+  Leaders now fsync a versioned replication intent before appending an
+  uncommitted replicated sequence. Restart recovery reconciles intent with the
+  committed boundary and exact local log, removes stale committed intents and
+  orphan pre-append reservations, reconstructs pending quorum tickets with the
+  leader self-ACK only, and fails closed if current placement differs from the
+  persisted leader/fingerprint/replica set. Explicit retry redispatches exact
+  pending sequences idempotently; an ACK arriving immediately after restart can
+  trigger ticket reconstruction automatically. Commit cleanup persists the
+  committed boundary before deleting intent, so crash ordering cannot promote
+  local durability to quorum durability.
+
 ### Fabric stream quorum commit — 2026-09-17
 - **Application-level replica ACK/NACK and quorum visibility** (Experimental,
   `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distributed.rs`,
