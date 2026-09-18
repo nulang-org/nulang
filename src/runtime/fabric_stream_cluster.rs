@@ -418,6 +418,47 @@ impl Runtime {
         }
     }
 
+    fn fabric_stream_bootstrap_placement_from_append(
+        &self,
+        append: &FabricStreamReplicaAppend,
+    ) -> io::Result<Option<FabricStreamPlacement>> {
+        if append.replicas.is_empty() {
+            return Ok(None);
+        }
+        if append.epoch != FABRIC_STREAM_INITIAL_EPOCH
+            || append.replicas.len() != append.replication_factor
+            || append.replicas.first().copied() != Some(append.leader)
+            || append.replicas.iter().copied().collect::<HashSet<_>>().len()
+                != append.replicas.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Fabric replica policy bootstrap metadata",
+            ));
+        }
+
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric replica policy bootstrap requires distribution",
+            )
+        })?;
+        if !append.replicas.contains(&local) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "local node is not included in carried Fabric replica policy",
+            ));
+        }
+
+        Ok(Some(FabricStreamPlacement {
+            stream: append.stream.clone(),
+            partition: append.partition,
+            leader: append.leader,
+            replicas: append.replicas.clone(),
+            membership_fingerprint: append.membership_fingerprint,
+        }))
+    }
+
     fn fabric_stream_placement_from_policy(
         stream: &str,
         policy: &FabricStreamReplicationPolicy,
@@ -1695,6 +1736,10 @@ impl Runtime {
                 append.epoch,
             )?
             .0
+        } else if let Some(placement) =
+            self.fabric_stream_bootstrap_placement_from_append(append)?
+        {
+            placement
         } else {
             self.fabric_stream_placement(
                 &append.stream,
@@ -1768,6 +1813,10 @@ impl Runtime {
                 append.epoch,
             )?
             .0
+        } else if let Some(placement) =
+            self.fabric_stream_bootstrap_placement_from_append(append)?
+        {
+            placement
         } else {
             let local = self.distributed.node_id.ok_or_else(|| {
                 io::Error::new(
@@ -1802,6 +1851,12 @@ impl Runtime {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "stale Fabric stream replica append: membership fingerprint changed",
+            ));
+        }
+        if !append.replicas.is_empty() && append.replicas != placement.replicas {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric stream replica append ordered policy differs from installed placement",
             ));
         }
         if placement.leader != append.leader {
