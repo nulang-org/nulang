@@ -44,6 +44,8 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 
 use super::mailbox::{Message, MessagePriority};
+use crate::authority::AuthorityManifest;
+use crate::authority_runtime::RuntimeAuthorityError;
 use super::network::{NetworkTransport, Packet};
 use super::{ClusterState, NodeId, NodeStatus};
 use crate::runtime::Runtime;
@@ -1055,6 +1057,46 @@ pub fn process_network_packets(
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
+            Packet::SpawnRequestAuth {
+                request_id,
+                behavior_name,
+                initial_state,
+                bytecode: _,
+                content_hash: _,
+                authority,
+            } => {
+                // The packet decoder has already validated the complete
+                // manifest and canonical wire encoding. Cluster node identity
+                // is the attestation boundary for the sending actor's delegated
+                // authority; the sender runtime performs parent-subset checking
+                // before emitting this packet.
+                let handler = runtime.spawnable_behaviors.get(&behavior_name).copied();
+                let (actor_id, success) = match handler {
+                    Some(handler) => {
+                        let id = runtime.spawn_actor(Box::new(move || initial_state));
+                        if let Some(actor) = runtime.actors.get_mut(&id) {
+                            actor.install_authority_manifest(&authority);
+                            actor.register_behavior(behavior_name, handler);
+                        }
+                        (id, true)
+                    }
+                    None => (0, false),
+                };
+                let reply = Packet::SpawnResponse {
+                    request_id,
+                    actor_id,
+                    success,
+                };
+                let from = incoming.from_node;
+                let reply_addr = cluster
+                    .get_node(from)
+                    .map(|info| info.address)
+                    .or_else(|| transport.connection_addr(from));
+                if let Some(addr) = reply_addr {
+                    transport.send(from, addr, reply);
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
             Packet::SpawnResponse {
                 request_id,
                 actor_id,
@@ -1675,22 +1717,73 @@ pub fn spawn_on_node(
     behavior_name: &str,
     initial_state: Vec<(String, Value)>,
 ) -> ActorAddress {
+    spawn_on_node_with_authority(
+        runtime,
+        transport,
+        cluster,
+        resolver,
+        node,
+        behavior_name,
+        initial_state,
+        &AuthorityManifest::new(),
+    )
+    .expect("empty remote-spawn authority cannot escalate")
+}
+
+/// Spawn with an explicit external-authority manifest.
+///
+/// When an actor is currently executing, the requested manifest must be an
+/// exact subset of the parent's authority before any local actor is created
+/// or network packet is emitted. Root/runtime-initiated spawns are the trust
+/// boundary and may install a supplied manifest directly.
+pub fn spawn_on_node_with_authority(
+    runtime: &mut Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    resolver: &AddressResolver,
+    node: NodeId,
+    behavior_name: &str,
+    initial_state: Vec<(String, Value)>,
+    requested: &AuthorityManifest,
+) -> Result<ActorAddress, RuntimeAuthorityError> {
+    if let Some(parent_id) = runtime.current_actor {
+        if let Some(parent) = runtime.actors.get(&parent_id) {
+            parent.delegate_authority(requested)?;
+        } else if let Some(grant) = requested.iter().next() {
+            return Err(RuntimeAuthorityError::Denied(grant.clone()));
+        }
+    }
+
     if node == resolver.local_node() || node == NodeId::LOCAL {
         let id = runtime.spawn_actor(Box::new(move || initial_state));
-        ActorAddress::local(id)
+        if let Some(actor) = runtime.actors.get_mut(&id) {
+            actor.install_authority_manifest(requested);
+        }
+        Ok(ActorAddress::local(id))
     } else {
         let request_id = fast_random_u64();
-        // The placeholder VALUE the program will hold carries only this
-        // request id — record id → node and tag it pending so sends to
-        // the ref queue until the SpawnResponse arrives (RFC-0007).
         crate::runtime::distribution::record_remote_ref(runtime, node, request_id);
         runtime.spawn_placeholders.insert(request_id);
-        let packet = Packet::SpawnRequest {
-            request_id,
-            behavior_name: behavior_name.to_string(),
-            content_hash: None,
-            initial_state,
-            bytecode: None,
+
+        // Preserve the frozen type-3 SpawnRequest bytes for authority-free
+        // spawns. Privileged delegation uses the additive type-17 extension.
+        let packet = if requested.is_empty() {
+            Packet::SpawnRequest {
+                request_id,
+                behavior_name: behavior_name.to_string(),
+                content_hash: None,
+                initial_state,
+                bytecode: None,
+            }
+        } else {
+            Packet::SpawnRequestAuth {
+                request_id,
+                behavior_name: behavior_name.to_string(),
+                content_hash: None,
+                initial_state,
+                bytecode: None,
+                authority: requested.clone(),
+            }
         };
 
         if let Some(node_info) = cluster.get_node(node) {
@@ -1701,7 +1794,7 @@ pub fn spawn_on_node(
             notify_delivery_failed(runtime, sender, "spawn target node not in cluster");
         }
 
-        ActorAddress::remote(node, request_id)
+        Ok(ActorAddress::remote(node, request_id))
     }
 }
 
