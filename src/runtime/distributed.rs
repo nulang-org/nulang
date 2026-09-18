@@ -1493,6 +1493,7 @@ pub fn process_network_packets(
                                     application_ack = Some(FabricStreamReplicaAck {
                                         stream: append.stream.clone(),
                                         partition: append.partition,
+                                        epoch: append.epoch,
                                         leader: append.leader,
                                         membership_fingerprint: append.membership_fingerprint,
                                         replication_factor: append.replication_factor,
@@ -1606,6 +1607,7 @@ pub fn process_network_packets(
                                         let update = FabricStreamCommitUpdate {
                                             stream: outcome.placement.stream.clone(),
                                             partition: outcome.placement.partition,
+                                            epoch: outcome.epoch,
                                             leader: outcome.placement.leader,
                                             membership_fingerprint: outcome
                                                 .placement
