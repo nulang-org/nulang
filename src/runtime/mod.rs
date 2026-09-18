@@ -21,6 +21,7 @@ mod cluster;
 mod distributed;
 mod distributed_context;
 mod fabric_stream;
+mod fabric_stream_cluster;
 mod grain;
 mod network;
 mod object_store;
@@ -33,6 +34,7 @@ pub use distributed_context::{
 pub use fabric_stream::{
     FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
 };
+pub use fabric_stream_cluster::{FabricStreamPlacement, FabricStreamReplicaAppend};
 #[cfg(feature = "ai-runtime")]
 mod agent;
 #[cfg(feature = "ai-runtime")]
