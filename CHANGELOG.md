@@ -45,6 +45,18 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric automatic quorum retry — 2026-09-18
+- **Logical-clock pending replication retry** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distribution.rs`).
+  Pending uncommitted stream sequences now retry from the runtime network loop
+  after 500 ms, then with exponential 1s/2s/4s backoff capped at 30 seconds.
+  Scheduling uses `Runtime::now()`, preserving virtual-clock determinism in
+  DST. Retries reuse exact-sequence idempotent replica application and never
+  count transport dispatch as quorum durability. Commit removes the associated
+  retry schedule immediately; recovered durable intents install an immediate
+  schedule after ticket reconstruction. Majority-committed lagging-replica
+  repair remains separately bounded by the catch-up API.
+
 ### Fabric committed-replica catch-up — 2026-09-18
 - **Durable follower progress + committed-prefix repair** (Experimental,
   `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`,
