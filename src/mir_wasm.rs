@@ -3227,6 +3227,44 @@ mod tests {
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_direct_sink_call_delivers_value() {
+        let value = run_source(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main() -> Int {\n\
+                 let y = 42 :cap lineariso\n\
+                 take(y)\n\
+             }",
+        )
+        .expect("run sink call");
+        assert_eq!(
+            value.as_int(),
+            Some(42),
+            "WASM sink call must pass the value before clearing the caller local"
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_direct_sink_call_clears_caller_source() {
+        // Capability analysis normally rejects the final read. The WASM test
+        // intentionally bypasses that pass to observe the physical ABI.
+        let value = run_source(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main() {\n\
+                 let y = 42 :cap lineariso\n\
+                 let z = take(y)\n\
+                 y\n\
+             }",
+        )
+        .expect("run post-sink source read");
+        assert!(
+            value.is_nil(),
+            "WASM sink call must invalidate the caller source local"
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_moveout_transfers_value_and_clears_source() {
         let moved = run_source("let x = 42 in consume x").expect("run moved value");
         assert_eq!(moved.as_int(), Some(42));
