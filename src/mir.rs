@@ -9,6 +9,7 @@
 //! error, never silent misbehavior.
 
 use crate::ast::{BinOp, UnOp};
+use crate::authority::AuthorityGrant;
 use crate::bytecode::{ActorMeta, Constant};
 use crate::types::{Capability, Type};
 
@@ -312,8 +313,9 @@ pub enum RValue {
         behavior_idx: usize,
         init: Vec<(String, RValue)>,
         target_node: Option<LocalId>,
-        /// Spawn-time capability grant tokens (e.g. `Net::TcpOut(h:p)`).
-        capabilities: Vec<String>,
+        /// Typed spawn-time external authority grants. Stable backends
+        /// canonicalize these only when encoding artifact/runtime metadata.
+        capabilities: Vec<AuthorityGrant>,
     },
     /// `send actor behavior(args...)`. Fire-and-forget; evaluates to 0.
     Send {
