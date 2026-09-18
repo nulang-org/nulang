@@ -45,6 +45,19 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric epoch candidate reconciliation — 2026-09-18
+- **Proposal-scoped pull from an ahead surviving replica** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/distributed.rs`).
+  A prospective leader that is behind another proposed survivor can now request
+  a bounded exact durable suffix under the active proposal. The source validates
+  old policy, proposed placement, requester identity and promise fencing; the
+  candidate validates the recorded rejected-vote tail and exact next sequence
+  before appending. Because pulling changes the proposal-bound candidate tail,
+  the old proposal is never finalized: the caller starts a strictly higher
+  election term whose hash binds the reconciled tail. Deterministic coverage
+  exercises installed epoch 1 -> rejected term 2 -> pull sequence 2 -> successful
+  term 3 RF=2 transition.
+
 ### Fabric epoch voter repair — 2026-09-18
 - **Proposal-scoped repair for lagging transition voters** (Experimental,
   `src/runtime/fabric_stream_epoch.rs`, `src/runtime/distributed.rs`).
