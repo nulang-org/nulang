@@ -37,6 +37,11 @@ pub(crate) const FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR: &str =
 pub(crate) const FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR: &str =
     "__nulang_fabric_stream_epoch_pull_response_v1";
 
+const FABRIC_STREAM_FAILOVER_RETRY_INITIAL: std::time::Duration =
+    std::time::Duration::from_millis(500);
+const FABRIC_STREAM_FAILOVER_RETRY_MAX: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FabricStreamEpochTransitionStatus {
     pub from_epoch: u64,
@@ -316,6 +321,13 @@ impl Runtime {
             ) {
                 Ok(status) => {
                     report.transitions_started += 1;
+                    if !status.finalized {
+                        let retry_at = self.now() + FABRIC_STREAM_FAILOVER_RETRY_INITIAL;
+                        self.distributed.fabric_stream_failover_retry.insert(
+                            stream.clone(),
+                            (retry_at, FABRIC_STREAM_FAILOVER_RETRY_INITIAL),
+                        );
+                    }
                     tracing::info!(
                         stream = %stream,
                         removed = removed.0,
@@ -337,6 +349,75 @@ impl Runtime {
         }
 
         Ok(report)
+    }
+
+    /// Retry active automatic ownership transitions with logical-clock backoff.
+    ///
+    /// Durable transition state is the restart source of truth; if the
+    /// in-memory schedule is absent after restart, a local candidate rebuilds
+    /// an immediate retry entry from the transition file.
+    pub(crate) fn fabric_stream_tick_auto_failover(&mut self) {
+        let now = self.now();
+        let local = match self.distributed.node_id {
+            Some(local) => local,
+            None => return,
+        };
+
+        let streams = match self.fabric_stream_names() {
+            Ok(streams) => streams,
+            Err(_) => return,
+        };
+        for stream in streams {
+            let state = match self.fabric_stream_epoch_transition_state(&stream) {
+                Ok(Some(state)) => state,
+                _ => continue,
+            };
+            if state.finalized || state.proposal.to_policy.leader != local.0 {
+                self.distributed.fabric_stream_failover_retry.remove(&stream);
+                continue;
+            }
+            self.distributed
+                .fabric_stream_failover_retry
+                .entry(stream)
+                .or_insert((now, FABRIC_STREAM_FAILOVER_RETRY_INITIAL));
+        }
+
+        let due: Vec<String> = self
+            .distributed
+            .fabric_stream_failover_retry
+            .iter()
+            .filter(|(_, (next_attempt, _))| *next_attempt <= now)
+            .map(|(stream, _)| stream.clone())
+            .collect();
+
+        for stream in due {
+            let result = self.fabric_stream_resume_epoch_transition(&stream);
+            match result {
+                Ok(status) if status.finalized => {
+                    self.distributed.fabric_stream_failover_retry.remove(&stream);
+                }
+                Ok(_) | Err(_) => {
+                    let now = self.now();
+                    if let Some((next_attempt, backoff)) = self
+                        .distributed
+                        .fabric_stream_failover_retry
+                        .get_mut(&stream)
+                    {
+                        *backoff = backoff
+                            .saturating_mul(2)
+                            .min(FABRIC_STREAM_FAILOVER_RETRY_MAX);
+                        *next_attempt = now + *backoff;
+                    }
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            stream = %stream,
+                            "nulang-fabric-stream: automatic failover retry failed: {}",
+                            error
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Start or resume a quorum-backed transition to a higher election term.
