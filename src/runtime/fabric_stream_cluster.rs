@@ -1252,6 +1252,82 @@ mod tests {
     }
 
     #[test]
+    fn recovery_removes_intent_reserved_before_missing_append() {
+        let local_addr = addr(33501);
+        let local = NodeId::new(&local_addr);
+        let mut runtime = runtime_with_members(local_addr, &[]);
+        let root = test_dir("orphan-intent");
+        runtime.fabric_stream_open(&root).unwrap();
+        runtime
+            .fabric_stream_create("events", FabricStreamConfig::default())
+            .unwrap();
+
+        let placement = runtime.fabric_stream_placement("events", 0, 1).unwrap();
+        runtime
+            .fabric_stream_reserve_replication_intent(
+                "events",
+                FabricStreamPendingIntent {
+                    partition: 0,
+                    leader: local.0,
+                    membership_fingerprint: placement.membership_fingerprint,
+                    replication_factor: 1,
+                    replicas: vec![local.0],
+                    sequence: 1,
+                },
+            )
+            .unwrap();
+
+        let report = runtime.fabric_stream_recover_pending("events").unwrap();
+        assert_eq!(report.recovered, 0);
+        assert_eq!(report.removed_orphan_reservations, 1);
+        assert!(runtime
+            .fabric_stream_pending_replication_intents("events")
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_cleans_intent_left_behind_after_durable_commit() {
+        let local_addr = addr(33502);
+        let local = NodeId::new(&local_addr);
+        let mut runtime = runtime_with_members(local_addr, &[]);
+        let root = test_dir("committed-intent");
+        runtime.fabric_stream_open(&root).unwrap();
+        runtime
+            .fabric_stream_create("events", FabricStreamConfig::default())
+            .unwrap();
+
+        let placement = runtime.fabric_stream_placement("events", 0, 1).unwrap();
+        runtime
+            .fabric_stream_reserve_replication_intent(
+                "events",
+                FabricStreamPendingIntent {
+                    partition: 0,
+                    leader: local.0,
+                    membership_fingerprint: placement.membership_fingerprint,
+                    replication_factor: 1,
+                    replicas: vec![local.0],
+                    sequence: 1,
+                },
+            )
+            .unwrap();
+        runtime
+            .fabric_stream_append_reserved_replica("events", 1, b"committed")
+            .unwrap();
+        runtime.fabric_stream_commit_through("events", 1).unwrap();
+
+        let report = runtime.fabric_stream_recover_pending("events").unwrap();
+        assert_eq!(report.recovered, 0);
+        assert_eq!(report.removed_committed, 1);
+        assert!(runtime
+            .fabric_stream_pending_replication_intents("events")
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn replica_ack_wire_roundtrip_preserves_contract() {
         let ack = FabricStreamReplicaAck {
             stream: "orders".into(),
