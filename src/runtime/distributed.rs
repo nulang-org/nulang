@@ -1241,10 +1241,21 @@ pub fn process_network_packets(
                                         &cached,
                                         &behavior_name,
                                     );
-                                    // Resolve behavior_id against the updated module
-                                    msg.behavior_id = runtime
-                                        .behavior_id_for(target_actor, &behavior_name)
-                                        .unwrap_or(0);
+                                    // Resolve behavior id against the updated module.
+                                    // A successful fetch that still lacks the requested
+                                    // name is a failed delivery, never permission to run
+                                    // behavior 0.
+                                    let Some(behavior_id) =
+                                        runtime.behavior_id_for(target_actor, &behavior_name)
+                                    else {
+                                        notify_delivery_failed(
+                                            runtime,
+                                            msg.sender,
+                                            "unknown behavior after fetch",
+                                        );
+                                        continue;
+                                    };
+                                    msg.behavior_id = behavior_id;
                                     // Verify the hash now matches
                                     if !verify_behavior_hash(
                                         runtime,
@@ -1464,13 +1475,23 @@ pub fn process_network_packets(
                         );
                     }
                     // Resolve the behavior name against the target actor's
-                    // behavior table — the same rule local sends use
-                    // (`Runtime::send_message`). An unknown name falls back
-                    // to behavior 0, mirroring `send_message`'s
-                    // `unwrap_or(0)`.
-                    msg.behavior_id = runtime
-                        .behavior_id_for(target_actor, &behavior_name)
-                        .unwrap_or(0);
+                    // behavior table. Unknown names must never alias behavior 0.
+                    // If the sender attached a content hash, keep fetch-on-demand
+                    // viable with an invalid sentinel until the hash path loads the
+                    // missing implementation; the sentinel is never delivered.
+                    match runtime.behavior_id_for(target_actor, &behavior_name) {
+                        Some(behavior_id) => msg.behavior_id = behavior_id,
+                        None if content_hash.is_some() => msg.behavior_id = u16::MAX,
+                        None => {
+                            warn!(
+                                "nulang-net: rejecting message to actor {}: unknown behavior '{}'",
+                                target_actor, behavior_name
+                            );
+                            notify_delivery_failed(runtime, msg.sender, "unknown behavior");
+                            ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+                            continue;
+                        }
+                    }
                     // If the sender attached a content hash, verify it
                     // against the local behavior table.
                     if let Some(sender_hash) = content_hash {
@@ -1485,10 +1506,26 @@ pub fn process_network_packets(
                             if let Some(cached) = cached_module {
                                 // Hot-reload: install the cached module
                                 hot_reload_behavior(runtime, target_actor, &cached, &behavior_name);
-                                // Retry resolution after hot-reload
-                                msg.behavior_id = runtime
-                                    .behavior_id_for(target_actor, &behavior_name)
-                                    .unwrap_or(0);
+                                // Retry resolution after hot-reload. A fetched
+                                // module that still does not declare the name is
+                                // rejected rather than redirected to behavior 0.
+                                let Some(behavior_id) =
+                                    runtime.behavior_id_for(target_actor, &behavior_name)
+                                else {
+                                    notify_delivery_failed(
+                                        runtime,
+                                        msg.sender,
+                                        "unknown behavior after hot reload",
+                                    );
+                                    ack_packet(
+                                        transport,
+                                        cluster,
+                                        incoming.from_node,
+                                        incoming.seq,
+                                    );
+                                    continue;
+                                };
+                                msg.behavior_id = behavior_id;
                             } else {
                                 // Request the bytecode from the sender
                                 warn!(
@@ -2482,8 +2519,8 @@ mod tests {
             "remote send must dispatch the named behavior \"inc\""
         );
 
-        // Unknown behavior name: falls back to behavior 0, mirroring
-        // `Runtime::send_message`'s `unwrap_or(0)` for local sends.
+        // Unknown behavior name: reject it without enqueueing or executing
+        // any target handler.
         send_distributed(
             &mut runtime_a,
             &mut transport_a,
@@ -2508,8 +2545,8 @@ mod tests {
             .and_then(|v| v.as_int())
             .unwrap();
         assert_eq!(
-            count, 4,
-            "unknown behavior name must fall back to behavior 0 (\"dec\")"
+            count, 5,
+            "unknown behavior name must leave target state unchanged"
         );
 
         transport_a.shutdown();
