@@ -16,7 +16,7 @@ use crate::ast::{BinOp, Decl, Expr, FunctionAnnotation, Literal};
 use crate::hir;
 use crate::tool_schema::{function_to_tool_schema, ToolSchema};
 use crate::types::{Capability, EffectRow, Span, Type, TypeVar};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 pub fn lower_module(
     ast: &ast::AstModule,
@@ -1244,9 +1244,20 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             span,
             ..
         } => {
-            let lambda_body = with_fresh_defer_stack(|| lower_body(lb));
-            let ty = Type::unit();
+            // Compute captures before lowering the lambda body. Implicit
+            // `using` dependencies are included by free-variable analysis;
+            // only names that are actually lexical at the creation site are
+            // exposed as contextual bindings while lowering the body.
             let captures = lambda_captures(params, lb);
+            let lexical_captures: Vec<String> = captures
+                .iter()
+                .filter(|name| has_lexical_using_binding(body, name))
+                .cloned()
+                .collect();
+            let lambda_body = with_using_capture_bindings(&lexical_captures, || {
+                with_fresh_defer_stack(|| lower_body(lb))
+            });
+            let ty = Type::unit();
             let temp = fresh_temp_name();
             body.push(hir::Stmt::Let {
                 name: temp.clone(),
@@ -1294,18 +1305,24 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                 return hir::Operand::Var(temp, ty);
             }
 
-            // Resolve `using` params from `given` bindings and dict args.
+            // Resolve `using` params with lexical shadowing. Function/lambda
+            // parameters, captures, and active let bindings take precedence
+            // over a module-level `given` with the same name.
             let mut extra_given_args: Vec<ast::Expr> = Vec::new();
             let mut extra_dict_args: Vec<ast::Expr> = Vec::new();
             if let ast::Expr::Var(fn_name, _) = func.as_ref() {
                 FN_USING_PARAMS.with(|c| {
                     if let Some(using_names) = c.borrow().get(fn_name) {
                         for uname in using_names {
-                            GIVEN_BINDINGS.with(|g| {
-                                if let Some(val) = g.borrow().get(uname) {
-                                    extra_given_args.push(val.clone());
-                                }
-                            });
+                            if has_lexical_using_binding(body, uname) {
+                                extra_given_args.push(ast::Expr::Var(uname.clone(), *span));
+                            } else {
+                                GIVEN_BINDINGS.with(|g| {
+                                    if let Some(val) = g.borrow().get(uname) {
+                                        extra_given_args.push(val.clone());
+                                    }
+                                });
+                            }
                         }
                     }
                 });
@@ -2554,6 +2571,39 @@ thread_local! {
     static CURRENT_TYPE_PARAM_CONSTRAINTS: RefCell<Vec<(String, TypeVar, Vec<String>)>> = RefCell::new(Vec::new());
     #[allow(clippy::missing_const_for_thread_local)]
     static CURRENT_FN_PARAMS: RefCell<FxHashMap<String, Type>> = RefCell::new(FxHashMap::default());
+    /// Lexical values captured by the lambda currently being lowered. This is
+    /// separate from the full capture list because globals are capture
+    /// candidates too, but must not shadow module-level contextual givens.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static USING_CAPTURE_BINDINGS: RefCell<Vec<FxHashSet<String>>> = RefCell::new(Vec::new());
+}
+
+fn has_lexical_using_binding(body: &hir::Body, name: &str) -> bool {
+    if CURRENT_FN_PARAMS.with(|cell| cell.borrow().contains_key(name)) {
+        return true;
+    }
+    if USING_CAPTURE_BINDINGS.with(|cell| {
+        cell.borrow()
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name))
+    }) {
+        return true;
+    }
+    body.stmts.iter().rev().any(|stmt| {
+        matches!(stmt, hir::Stmt::Let { name: local, .. } if local == name)
+    })
+}
+
+fn with_using_capture_bindings<R>(names: &[String], f: impl FnOnce() -> R) -> R {
+    USING_CAPTURE_BINDINGS.with(|cell| {
+        cell.borrow_mut().push(names.iter().cloned().collect());
+    });
+    let result = f();
+    USING_CAPTURE_BINDINGS.with(|cell| {
+        cell.borrow_mut().pop();
+    });
+    result
 }
 
 // Thread-local: inferred function return types from type checker.
@@ -2650,6 +2700,55 @@ mod tests {
         };
         let hir = lower_module(&ast, &FxHashMap::default());
         assert_eq!(hir.decls.len(), 1);
+    }
+
+    #[test]
+    fn test_lower_using_prefers_lexical_parameter_over_given() {
+        let src = r#"
+given ctx: String = "global"
+fn inner() using (ctx: Int) -> Int { ctx }
+fn outer(ctx: Int) -> Int { inner() }
+"#;
+        let mut lexer = crate::lexer::Lexer::new(src);
+        let tokens = lexer.lex().expect("lex");
+        let mut parser = crate::parser::Parser::new(tokens);
+        let ast = parser.parse_module().expect("parse");
+        let mut tc = crate::typechecker::TypeChecker::new();
+        tc.check_module(&ast).expect("typecheck");
+        let lowered = lower_module(&ast, &tc.inferred_decl_types);
+        let outer = lowered
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                hir::Decl::Function(f) if f.name == "outer" => Some(f),
+                _ => None,
+            })
+            .expect("outer function");
+
+        let args = outer
+            .body
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt {
+                hir::Stmt::Let {
+                    value:
+                        hir::RValue::Call {
+                            func: hir::Operand::Var(name, _),
+                            args,
+                            ..
+                        },
+                    ..
+                } if name == "inner" => Some(args),
+                _ => None,
+            })
+            .expect("inner call");
+
+        assert_eq!(args.len(), 1, "using parameter should be injected once");
+        assert!(
+            matches!(&args[0], hir::Operand::Var(name, _) if name == "ctx"),
+            "lexical ctx should shadow global given, got {:?}",
+            args[0]
+        );
     }
 
     #[test]
@@ -2962,6 +3061,22 @@ fn free_vars(
             free_vars(func, bound, acc);
             for a in args {
                 free_vars(a, bound, acc);
+            }
+            // A direct call implicitly references any `using` parameter
+            // names it needs. Recording those as free-variable candidates
+            // lets a lambda capture a lexical contextual override from its
+            // creation scope. MIR lowering later filters globals that are not
+            // actual runtime bindings.
+            if let Expr::Var(fn_name, _) = func.as_ref() {
+                FN_USING_PARAMS.with(|cell| {
+                    if let Some(using_names) = cell.borrow().get(fn_name) {
+                        for uname in using_names {
+                            if !bound.contains(uname) {
+                                acc.insert(uname.clone());
+                            }
+                        }
+                    }
+                });
             }
         }
         Expr::Let {
