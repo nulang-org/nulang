@@ -45,8 +45,8 @@ pub mod format;
 #[cfg(feature = "native-codegen")]
 pub mod fuzz;
 pub mod hir;
-pub mod host_effect_abi;
 pub mod hir_lower;
+pub mod host_effect_abi;
 pub mod integration_tests;
 pub mod iso_arena;
 #[cfg(feature = "native-codegen")]
