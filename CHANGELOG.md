@@ -45,6 +45,14 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Runtime-local C embedding and protected calls — 2026-09-18
+- **C embedding handles and native registrations are runtime-scoped**
+  (`src/ffi/c_api.rs`, `src/ffi/native.rs`, `include/nulang.h`). Public
+  module handles now consistently resolve through deduplicated module storage,
+  string values retain module provenance, native registrations are isolated per
+  embedding runtime, and protected status-returning C entry points let hosts
+  surface call failures without relying on unchecked sentinel values.
+
 ### Fabric confirmed-removal automatic failover — 2026-09-18
 - **Automatic ownership transition after confirmed leader removal**
   (Experimental, `src/runtime/fabric_stream_epoch.rs`,
