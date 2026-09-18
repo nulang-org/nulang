@@ -251,6 +251,9 @@ pub enum Place {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RValue {
     Use(Operand),
+    /// Transfer ownership out of a reusable binding. The source becomes
+    /// unavailable after evaluation; no retain or release occurs.
+    MoveOut(Operand),
     /// Runtime panic with a message (contract violations).
     Panic(String),
     Literal(Literal, Type),
@@ -496,7 +499,7 @@ impl Place {
 impl RValue {
     pub fn ty(&self) -> Type {
         match self {
-            RValue::Use(op) => op.ty(),
+            RValue::Use(op) | RValue::MoveOut(op) => op.ty(),
             RValue::Panic(_) => Type::unit(),
             RValue::Literal(_, ty) => ty.clone(),
             RValue::Binary(_, _, _, ty) => ty.clone(),
