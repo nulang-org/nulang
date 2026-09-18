@@ -512,7 +512,10 @@ impl Runtime {
             }
         }
 
-        let local_tail = self.fabric_stream_info(&batch.stream)?.last_sequence.unwrap_or(0);
+        let local_tail = self
+            .fabric_stream_info(&batch.stream)?
+            .last_sequence
+            .unwrap_or(0);
         if batch.records.is_empty()
             || batch
                 .records
@@ -569,12 +572,7 @@ impl Runtime {
             expected_new = expected_new.saturating_add(1);
         }
 
-        self.fabric_stream_evaluate_epoch_prepare(
-            &batch.stream,
-            &batch.proposal,
-            sender,
-            cluster,
-        )
+        self.fabric_stream_evaluate_epoch_prepare(&batch.stream, &batch.proposal, sender, cluster)
     }
 
     pub(crate) fn fabric_stream_evaluate_epoch_prepare(
