@@ -14,7 +14,7 @@ use std::cmp::Reverse;
 use std::io;
 
 use crate::runtime::{
-    FabricStreamConfig, NodeId, NodeStatus, Runtime,
+    FabricStreamConfig, MessagePriority, NodeId, NodeStatus, Packet, Runtime,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,84 @@ pub struct FabricStreamReplicaAppend {
     pub sequence: u64,
     pub payload: Vec<u8>,
 }
+
+pub(crate) const FABRIC_STREAM_REPLICA_BEHAVIOR: &str =
+    "__nulang_fabric_stream_replica_v1";
+const MAX_REPLICA_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FabricStreamReplicaDispatchReport {
+    pub intended_remote: usize,
+    pub dispatched: usize,
+    pub unavailable: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FabricStreamReplicaAppendWire {
+    stream: String,
+    partition: u16,
+    leader: u64,
+    membership_fingerprint: u64,
+    replication_factor: usize,
+    stream_config: FabricStreamConfig,
+    sequence: u64,
+    payload: Vec<u8>,
+}
+
+impl FabricStreamReplicaAppend {
+    pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
+        let wire = FabricStreamReplicaAppendWire {
+            stream: self.stream.clone(),
+            partition: self.partition,
+            leader: self.leader.0,
+            membership_fingerprint: self.membership_fingerprint,
+            replication_factor: self.replication_factor,
+            stream_config: self.stream_config,
+            sequence: self.sequence,
+            payload: self.payload.clone(),
+        };
+        let bytes = serde_json::to_vec(&wire)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if bytes.len() > MAX_REPLICA_ENVELOPE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Fabric stream replica envelope exceeds {} bytes",
+                    MAX_REPLICA_ENVELOPE_BYTES
+                ),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() > MAX_REPLICA_ENVELOPE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric stream replica envelope exceeds receiver limit",
+            ));
+        }
+        let wire: FabricStreamReplicaAppendWire = serde_json::from_slice(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if wire.stream.is_empty() || wire.replication_factor == 0 || wire.sequence == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Fabric stream replica envelope",
+            ));
+        }
+        Ok(Self {
+            stream: wire.stream,
+            partition: wire.partition,
+            leader: NodeId(wire.leader),
+            membership_fingerprint: wire.membership_fingerprint,
+            replication_factor: wire.replication_factor,
+            stream_config: wire.stream_config,
+            sequence: wire.sequence,
+            payload: wire.payload,
+        })
+    }
+}
+
 
 impl Runtime {
     /// Compute deterministic rendezvous placement for a stream partition.
@@ -169,6 +247,93 @@ impl Runtime {
             payload: payload.to_vec(),
         };
         Ok((placement, envelope))
+    }
+
+    /// Dispatch a prepared replica append to currently reachable remote
+    /// replicas through the existing NUL0 ActorMessage envelope.
+    ///
+    /// This reports enqueue attempts only. It does not imply remote fsync or
+    /// quorum commit; application-level replica ACKs are a later layer.
+    pub fn fabric_stream_dispatch_replica_append(
+        &mut self,
+        placement: &FabricStreamPlacement,
+        append: &FabricStreamReplicaAppend,
+    ) -> io::Result<FabricStreamReplicaDispatchReport> {
+        if placement.stream != append.stream
+            || placement.partition != append.partition
+            || placement.leader != append.leader
+            || placement.membership_fingerprint != append.membership_fingerprint
+            || placement.replicas.len() != append.replication_factor
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric stream placement does not match replica append envelope",
+            ));
+        }
+
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream replication requires distribution to be enabled",
+            )
+        })?;
+        if local != placement.leader {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "only the Fabric stream leader may dispatch replica appends",
+            ));
+        }
+
+        let bytes = append.to_wire_bytes()?;
+        let cluster = self.distributed.cluster.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream replication requires cluster membership",
+            )
+        })?;
+
+        let mut report = FabricStreamReplicaDispatchReport::default();
+        let mut targets = Vec::new();
+        for node in &placement.replicas {
+            if *node == local {
+                continue;
+            }
+            report.intended_remote += 1;
+            match cluster.get_node(*node) {
+                Some(info) if matches!(info.status, NodeStatus::Healthy | NodeStatus::Joining) => {
+                    targets.push((*node, info.address));
+                }
+                _ => report.unavailable += 1,
+            }
+        }
+
+        if targets.is_empty() {
+            return Ok(report);
+        }
+        let transport = self.distributed.transport.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream replication requires a network transport",
+            )
+        })?;
+
+        for (node, address) in targets {
+            let packet = Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name: FABRIC_STREAM_REPLICA_BEHAVIOR.to_string(),
+                content_hash: None,
+                payload: Vec::new(),
+                string_table: Vec::new(),
+                object_table: vec![(0, bytes.clone())],
+                sender_actor: 0,
+                sender_node: local,
+                priority: MessagePriority::System,
+                trace_id: None,
+            };
+            transport.send(node, address, packet);
+            report.dispatched += 1;
+        }
+        Ok(report)
     }
 
     /// Apply a leader-produced record on a replica.
@@ -392,6 +557,23 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root_a);
         let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[test]
+    fn replica_envelope_wire_roundtrip_preserves_contract() {
+        let append = FabricStreamReplicaAppend {
+            stream: "events".into(),
+            partition: 0,
+            leader: NodeId(42),
+            membership_fingerprint: 99,
+            replication_factor: 3,
+            stream_config: FabricStreamConfig::default(),
+            sequence: 7,
+            payload: b"hello".to_vec(),
+        };
+        let bytes = append.to_wire_bytes().unwrap();
+        let decoded = FabricStreamReplicaAppend::from_wire_bytes(&bytes).unwrap();
+        assert_eq!(decoded, append);
     }
 
     #[test]
