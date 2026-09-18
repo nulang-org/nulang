@@ -45,6 +45,20 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric stream quorum commit — 2026-09-17
+- **Application-level replica ACK/NACK and quorum visibility** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distributed.rs`,
+  `src/runtime/fabric_stream.rs`). Replicated appends now create leader-local
+  pending tickets, count the leader's fsynced append as the first ACK, and
+  require a majority of the configured replica set before advancing a durable
+  contiguous commit index. Followers send a reserved application ACK/NACK only
+  after exact-sequence durable application; transport ACKs are never counted as
+  quorum durability. The committed boundary is persisted atomically and powers
+  committed-only reads, while raw local reads may expose uncommitted tails.
+  Duplicate ACKs are idempotent and pending ACKs are fenced to the current
+  membership fingerprint. Pending tickets remain volatile across restart;
+  uncommitted durable tails stay uncommitted until future retry/catch-up work.
+
 ### Fabric stream replica transport — 2026-09-17
 - **NUL0-v1-compatible Fabric stream replication transport** (Experimental,
   `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distributed.rs`).
