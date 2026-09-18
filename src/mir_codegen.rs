@@ -1497,6 +1497,54 @@ const MAX_OPT_ITERATIONS: usize = 10;
 
 /// Optimize one MIR function in place. `_module_consts` reserves space for
 /// module-level constant pooling; unused by the current transforms.
+fn ownership_transfer_pairs(
+    func: &mir::Function,
+) -> HashSet<(mir::LocalId, mir::LocalId)> {
+    func.ownership_transfers
+        .iter()
+        .map(|t| (t.src, t.dst))
+        .collect()
+}
+
+/// Return `(src, dst)` when this statement is the copy half of an explicit
+/// ownership transfer.
+fn transfer_move(
+    stmt: &mir::Stmt,
+    transfers: &HashSet<(mir::LocalId, mir::LocalId)>,
+) -> Option<(mir::LocalId, mir::LocalId)> {
+    match stmt {
+        mir::Stmt::Assign {
+            dst,
+            op: mir::RValue::Load(src),
+        } if transfers.contains(&(*src, *dst)) => Some((*src, *dst)),
+        _ => None,
+    }
+}
+
+/// The builder emits a transfer as two adjacent ordinary MIR statements:
+/// `dst = Load(src)` followed by `src = nil`. Recognize the second half
+/// structurally so optimizer rewrites cannot accidentally turn invalidation
+/// into an owning overwrite.
+fn is_transfer_clear(
+    stmts: &[mir::Stmt],
+    si: usize,
+    transfers: &HashSet<(mir::LocalId, mir::LocalId)>,
+) -> bool {
+    if si == 0 {
+        return false;
+    }
+    let Some((src, _)) = transfer_move(&stmts[si - 1], transfers) else {
+        return false;
+    };
+    matches!(
+        &stmts[si],
+        mir::Stmt::Assign {
+            dst,
+            op: mir::RValue::Const(Constant::Nil),
+        } if *dst == src
+    )
+}
+
 fn optimize_function(func: &mut mir::Function, _module_consts: &mut Vec<mir::RValue>) {
     for _ in 0..MAX_OPT_ITERATIONS {
         let const_locals = collect_const_locals(func);
@@ -1555,9 +1603,16 @@ fn fold_function(
     is_float: &[bool],
 ) -> bool {
     let mut changed = false;
+    let transfers = ownership_transfer_pairs(func);
     for block in &mut func.blocks {
         for stmt in &mut block.stmts {
-            if let mir::Stmt::Assign { op, .. } = stmt {
+            if let mir::Stmt::Assign { dst, op } = stmt {
+                if matches!(
+                    op,
+                    mir::RValue::Load(src) if transfers.contains(&(*src, *dst))
+                ) {
+                    continue;
+                }
                 let mut original = mir::RValue::Const(Constant::Nil);
                 std::mem::swap(op, &mut original);
                 let folded = fold_rvalue(original, const_locals, is_float);
@@ -1859,6 +1914,7 @@ fn thread_jumps(func: &mut mir::Function) -> bool {
 /// Self-moves (`x = Load(x)`) are removed unconditionally: the register
 /// already holds the value, so the statement is a no-op.
 fn dead_store_elim(func: &mut mir::Function) -> bool {
+    let transfers = ownership_transfer_pairs(func);
     let mut reads: HashSet<mir::LocalId> = HashSet::new();
     for block in &func.blocks {
         for stmt in &block.stmts {
@@ -1870,10 +1926,19 @@ fn dead_store_elim(func: &mut mir::Function) -> bool {
     let mut changed = false;
     for block in &mut func.blocks {
         let block_id = block.id;
+        let protected_transfer_stmt: Vec<bool> = (0..block.stmts.len())
+            .map(|si| {
+                transfer_move(&block.stmts[si], &transfers).is_some()
+                    || is_transfer_clear(&block.stmts, si, &transfers)
+            })
+            .collect();
         let mut removed: Vec<usize> = Vec::new();
         let mut kept: Vec<mir::Stmt> = Vec::with_capacity(block.stmts.len());
         for (si, stmt) in std::mem::take(&mut block.stmts).into_iter().enumerate() {
-            let removable = match &stmt {
+            let removable = if protected_transfer_stmt[si] {
+                false
+            } else {
+                match &stmt {
                 mir::Stmt::Assign { dst, op } => {
                     let self_move = matches!(op, mir::RValue::Load(src) if src == dst);
                     // Source-named locals stay visible to the debugger at
@@ -1895,7 +1960,8 @@ fn dead_store_elim(func: &mut mir::Function) -> bool {
                             && !reads.contains(dst)
                             && !rvalue_side_effecting(op))
                 }
-                _ => false,
+                    _ => false,
+                }
             };
             if removable {
                 removed.push(si);
@@ -2111,9 +2177,11 @@ pub fn compile_mir(mir: &mut mir::Module, module_name: impl Into<String>) -> NuR
 //   - every definition is an owning rvalue — Tuple/Record/ArrayLit (fresh
 //     allocation) or Const (never a heap pointer) — that does not read the
 //     local itself;
-//   - no use copies the value through an uncounted channel: Move/Load,
-//     `&`/`*`, call or effect arguments, closure captures, sends/asks,
-//     returns/resumes, `StateSet`, or the AI builtins' staging moves.
+//   - no use copies the value through an uncounted channel: ordinary
+//     Move/Load, `&`/`*`, call or effect arguments, closure captures,
+//     sends/asks, returns/resumes, `StateSet`, or staging moves.
+//     Explicit ownership-transfer Loads are exempt: MIR metadata proves that
+//     the source is invalidated and the destination receives the counted slot.
 //
 // Uses through the retaining barriers (container element stores) and
 // read-only uses (container base/length, operands, branch conditions) do
@@ -2143,6 +2211,9 @@ enum UseKind {
     /// Copied through a channel that takes no counted reference (Move/Load,
     /// call staging, send, capture, return, actor state).
     Copy,
+    /// Counted ownership moves to another local. The source becomes invalid
+    /// without a release; the destination becomes the sole owning register.
+    Transfer,
 }
 
 /// Locals of these types can hold NaN-boxed heap pointers at runtime. MIR
@@ -2304,6 +2375,16 @@ fn stmt_uses(stmt: &mir::Stmt) -> Vec<(usize, UseKind)> {
     }
 }
 
+fn stmt_uses_for_drop(
+    stmt: &mir::Stmt,
+    transfers: &HashSet<(mir::LocalId, mir::LocalId)>,
+) -> Vec<(usize, UseKind)> {
+    if let Some((src, _dst)) = transfer_move(stmt, transfers) {
+        return vec![(src.0 as usize, UseKind::Transfer)];
+    }
+    stmt_uses(stmt)
+}
+
 fn terminator_uses(term: &mir::Terminator) -> Vec<(usize, UseKind)> {
     match term {
         mir::Terminator::Return(Some(v)) | mir::Terminator::Resume(v) => {
@@ -2345,6 +2426,8 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         return plan;
     }
 
+    let transfers = ownership_transfer_pairs(func);
+
     let ptr_ty: Vec<bool> = func
         .locals
         .iter()
@@ -2375,8 +2458,8 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
     let mut loads: Vec<(usize, usize)> = Vec::new();
 
     for (bi, block) in func.blocks.iter().enumerate() {
-        for stmt in &block.stmts {
-            for (u, kind) in stmt_uses(stmt) {
+        for (si, stmt) in block.stmts.iter().enumerate() {
+            for (u, kind) in stmt_uses_for_drop(stmt, &transfers) {
                 block_uses[bi].insert(u);
                 if kind == UseKind::Copy {
                     no_copy_use[u] = false;
@@ -2386,7 +2469,11 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
                 let d = dst.0 as usize;
                 has_def[d] = true;
                 block_defs[bi].insert(d);
-                if !rvalue_is_owning(op) || rvalue_uses(op).iter().any(|(u, _)| *u == d) {
+                let transfer_dst =
+                    transfer_move(stmt, &transfers).is_some_and(|(_, td)| td == *dst);
+                if (!transfer_dst && !rvalue_is_owning(op))
+                    || rvalue_uses(op).iter().any(|(u, _)| *u == d)
+                {
                     defs_owning[d] = false;
                 }
                 match op {
@@ -2467,10 +2554,16 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
             live.insert(u);
         }
         for (si, stmt) in block.stmts.iter().enumerate().rev() {
-            let uses = stmt_uses(stmt);
-            // Last-use drops for candidates this statement reads.
-            for (u, _) in &uses {
-                if candidate[*u] && !live.contains(u) && esc_clear(*u, &live) {
+            let uses = stmt_uses_for_drop(stmt, &transfers);
+            // Last-use drops for candidates this statement reads. A transfer
+            // is different: the counted slot continues in the destination, so
+            // releasing the source here would double-own/double-free.
+            for (u, kind) in &uses {
+                if *kind != UseKind::Transfer
+                    && candidate[*u]
+                    && !live.contains(u)
+                    && esc_clear(*u, &live)
+                {
                     plan.after_stmt
                         .entry((bi, si))
                         .or_default()
@@ -2492,7 +2585,9 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
                     // statement. Always sound for a candidate: the register
                     // holds the previous definition's product (or nil after
                     // an earlier drop), never an alias.
-                    if esc_clear(d, &live) {
+                    if !is_transfer_clear(&block.stmts, si, &transfers)
+                        && esc_clear(d, &live)
+                    {
                         plan.before_stmt.entry((bi, si)).or_default().push(*dst);
                     }
                 }
@@ -2566,6 +2661,89 @@ mod tests {
         let mut vm = VM::new();
         vm.load_module(module);
         vm.run()
+    }
+
+    #[test]
+    fn test_ownership_transfer_survives_mir_optimization() {
+        let mut b = mir::FunctionBuilder::new("move_test", None);
+        let src = b.add_temp(Type::Array(Box::new(Type::int())));
+        let dst = b.add_temp(Type::Array(Box::new(Type::int())));
+        b.assign(src, mir::RValue::ArrayLit(vec![]));
+        b.transfer(dst, src);
+        b.terminate(mir::Terminator::Return(None));
+        let mut f = b.build();
+
+        optimize_function(&mut f, &mut Vec::new());
+
+        let transfers = ownership_transfer_pairs(&f);
+        assert!(transfers.contains(&(src, dst)));
+        let stmts = &f.blocks[0].stmts;
+        assert!(
+            stmts.iter().any(|s| transfer_move(s, &transfers) == Some((src, dst))),
+            "DCE/folding must preserve ownership transfer move"
+        );
+        assert!(
+            (0..stmts.len()).any(|si| is_transfer_clear(stmts, si, &transfers)),
+            "DCE/folding must preserve source invalidation"
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_moves_ownership_to_destination() {
+        let mut b = mir::FunctionBuilder::new("move_drop_test", None);
+        let src = b.add_temp(Type::Array(Box::new(Type::int())));
+        let dst = b.add_temp(Type::Array(Box::new(Type::int())));
+        let len = b.add_temp(Type::int());
+        b.assign(src, mir::RValue::ArrayLit(vec![]));
+        b.transfer(dst, src);
+        b.assign(len, mir::RValue::ArrayLen(dst));
+        b.terminate(mir::Terminator::Return(None));
+        let f = b.build();
+
+        let plan = plan_drops(&f);
+        let transfers = ownership_transfer_pairs(&f);
+        let move_si = f.blocks[0]
+            .stmts
+            .iter()
+            .position(|s| transfer_move(s, &transfers) == Some((src, dst)))
+            .expect("transfer move");
+        let clear_si = (0..f.blocks[0].stmts.len())
+            .find(|&si| is_transfer_clear(&f.blocks[0].stmts, si, &transfers))
+            .expect("transfer clear");
+        let len_si = f.blocks[0]
+            .stmts
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    mir::Stmt::Assign {
+                        dst: d,
+                        op: mir::RValue::ArrayLen(x)
+                    } if *d == len && *x == dst
+                )
+            })
+            .expect("array length use");
+
+        assert!(
+            !plan
+                .after_stmt
+                .get(&(0, move_si))
+                .is_some_and(|ids| ids.contains(&src)),
+            "source must not be released at ownership transfer"
+        );
+        assert!(
+            !plan
+                .before_stmt
+                .get(&(0, clear_si))
+                .is_some_and(|ids| ids.contains(&src)),
+            "source invalidation is not an owning overwrite"
+        );
+        assert!(
+            plan.after_stmt
+                .get(&(0, len_si))
+                .is_some_and(|ids| ids.contains(&dst)),
+            "destination should be reclaimable after its last read-only use"
+        );
     }
 
     #[test]
