@@ -4,7 +4,7 @@
 //! cluster membership, gossip, remote spawn, and the first Nulang Fabric
 //! messaging primitives.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -152,6 +152,18 @@ enum FabricTarget {
         behavior: String,
     },
 }
+
+/// Deterministic placement ordering for one queue-group candidate.
+///
+/// Lower scores are preferred. Locality is deliberately the primary key so
+/// Fabric avoids a network/shard hop when a same-shard consumer can accept
+/// work; mailbox depth breaks ties between same-shard workers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct FabricPlacementScore {
+    locality: u8,
+    mailbox_depth: usize,
+}
+
 
 /// Cross-shard Fabric control traffic.
 ///
@@ -307,13 +319,21 @@ impl FabricRegistry {
             .count()
     }
 
-    fn route(&mut self, topic: &str) -> Result<Vec<FabricTarget>, String> {
+    fn route_scored<F>(
+        &mut self,
+        topic: &str,
+        mut placement: F,
+    ) -> Result<Vec<FabricTarget>, String>
+    where
+        F: FnMut(&FabricTarget) -> Option<FabricPlacementScore>,
+    {
         validate_topic(topic)?;
 
         let mut targets = Vec::new();
         // BTreeMap keeps group iteration deterministic, which matters for DST
         // and makes routing tests reproducible across hash-map seeds.
-        let mut grouped: BTreeMap<String, Vec<FabricTarget>> = BTreeMap::new();
+        let mut grouped: BTreeMap<String, Vec<(FabricTarget, FabricPlacementScore)>> =
+            BTreeMap::new();
 
         for sub in &self.subscriptions {
             if !pattern_matches(&sub.pattern, topic) {
@@ -335,24 +355,50 @@ impl FabricRegistry {
                 (None, None) => continue,
             };
             if let Some(group) = &sub.group {
-                grouped.entry(group.clone()).or_default().push(target);
+                if let Some(score) = placement(&target) {
+                    grouped
+                        .entry(group.clone())
+                        .or_default()
+                        .push((target, score));
+                }
             } else {
+                // Fan-out semantics are intentionally placement-agnostic:
+                // every matching subscriber receives the publication.
                 targets.push(target);
             }
         }
 
         for (group, members) in grouped {
-            if members.is_empty() {
+            let Some(best_score) = members.iter().map(|(_, score)| *score).min() else {
+                continue;
+            };
+            let best_count = members
+                .iter()
+                .filter(|(_, score)| *score == best_score)
+                .count();
+            if best_count == 0 {
                 continue;
             }
+
             let key = (topic.to_string(), group);
             let cursor = self.group_cursors.entry(key).or_insert(0);
-            let index = *cursor % members.len();
-            targets.push(members[index].clone());
+            let index = *cursor % best_count;
+            let selected = members
+                .iter()
+                .filter(|(_, score)| *score == best_score)
+                .nth(index)
+                .expect("best-count and candidate iterator must agree")
+                .0
+                .clone();
+            targets.push(selected);
             *cursor = cursor.wrapping_add(1);
         }
 
         Ok(targets)
+    }
+
+    fn route(&mut self, topic: &str) -> Result<Vec<FabricTarget>, String> {
+        self.route_scored(topic, |_| Some(FabricPlacementScore::default()))
     }
 }
 
@@ -757,7 +803,62 @@ impl Runtime {
         args: &[Value],
     ) -> Result<FabricPublishReport, String> {
         self.fabric_sync();
-        let targets = self.distributed.fabric.route(topic)?;
+
+        let shard_idx = self.shard_idx;
+        let shard_count = self.shard_count.max(1);
+        let local_mailboxes: HashMap<u64, (usize, usize)> = self
+            .actors
+            .iter()
+            .map(|(&actor_id, actor)| {
+                (
+                    actor_id,
+                    (actor.mailbox.len(), actor.mailbox.capacity()),
+                )
+            })
+            .collect();
+        let cluster_known = self.distributed.cluster.is_some();
+        let healthy_remote: HashSet<NodeId> = self
+            .distributed
+            .cluster
+            .as_ref()
+            .map(|cluster| {
+                cluster
+                    .healthy_members()
+                    .into_iter()
+                    .map(|node| node.node_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let targets = self.distributed.fabric.route_scored(topic, |target| match target {
+            FabricTarget::Local { actor_id, .. } => {
+                let owner_shard = (*actor_id % shard_count as u64) as u16;
+                if owner_shard == shard_idx {
+                    let (depth, capacity) = *local_mailboxes.get(actor_id)?;
+                    if capacity > 0 && depth >= capacity {
+                        return None;
+                    }
+                    Some(FabricPlacementScore {
+                        locality: 0,
+                        mailbox_depth: depth,
+                    })
+                } else {
+                    Some(FabricPlacementScore {
+                        locality: 1,
+                        mailbox_depth: 0,
+                    })
+                }
+            }
+            FabricTarget::Remote { node_id, .. } => {
+                if cluster_known && !healthy_remote.contains(node_id) {
+                    return None;
+                }
+                Some(FabricPlacementScore {
+                    locality: 2,
+                    mailbox_depth: 0,
+                })
+            }
+        })?;
         if !self.distributed.enabled
             && targets
                 .iter()
@@ -952,6 +1053,95 @@ mod tests {
 
         shards[0].drain_cross_shard_messages();
         assert_eq!(shards[0].actors.get(&actor_id).unwrap().mailbox.len(), 1);
+    }
+
+    #[test]
+    fn fabric_scored_routing_prefers_lower_score_and_round_robins_ties() {
+        let mut fabric = FabricRegistry::default();
+        assert!(fabric.insert(
+            FabricSubscription::local("jobs.*", 2, "work", 20, Some("workers")).unwrap()
+        ));
+        assert!(fabric.insert(
+            FabricSubscription::local("jobs.*", 4, "work", 40, Some("workers")).unwrap()
+        ));
+        assert!(fabric.insert(
+            FabricSubscription::local("jobs.*", 6, "work", 60, Some("workers")).unwrap()
+        ));
+
+        let first = fabric
+            .route_scored("jobs.run", |target| match target {
+                FabricTarget::Local { actor_id: 2, .. } => Some(FabricPlacementScore {
+                    locality: 0,
+                    mailbox_depth: 5,
+                }),
+                FabricTarget::Local { .. } => Some(FabricPlacementScore {
+                    locality: 0,
+                    mailbox_depth: 1,
+                }),
+                FabricTarget::Remote { .. } => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            first[0],
+            FabricTarget::Local { actor_id: 4, .. }
+        ));
+
+        let second = fabric
+            .route_scored("jobs.run", |target| match target {
+                FabricTarget::Local { actor_id: 2, .. } => Some(FabricPlacementScore {
+                    locality: 0,
+                    mailbox_depth: 5,
+                }),
+                FabricTarget::Local { .. } => Some(FabricPlacementScore {
+                    locality: 0,
+                    mailbox_depth: 1,
+                }),
+                FabricTarget::Remote { .. } => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            second[0],
+            FabricTarget::Local { actor_id: 6, .. }
+        ));
+    }
+
+    #[test]
+    fn fabric_placement_prefers_same_shard_then_falls_back_when_full() {
+        let mut shards = Runtime::new_fabric_sharded(2);
+
+        let mut same_shard = Actor::new(2, "same-shard-worker", 1);
+        same_shard.state = ActorState::Running;
+        same_shard.register_behavior("work", noop);
+        shards[0].actors.insert(2, same_shard);
+
+        let mut cross_shard = Actor::new(3, "cross-shard-worker", 4);
+        cross_shard.state = ActorState::Running;
+        cross_shard.register_behavior("work", noop);
+        shards[1].actors.insert(3, cross_shard);
+
+        shards[0]
+            .fabric_subscribe_group("jobs.*", "workers", 2, "work")
+            .unwrap();
+        shards[1].fabric_sync();
+        shards[1]
+            .fabric_subscribe_group("jobs.*", "workers", 3, "work")
+            .unwrap();
+        shards[0].fabric_sync();
+
+        let first = shards[0]
+            .fabric_publish_report("jobs.run", &[Value::int(1)])
+            .unwrap();
+        assert_eq!(first.admitted, 1);
+        assert_eq!(shards[0].actors.get(&2).unwrap().mailbox.len(), 1);
+
+        let second = shards[0]
+            .fabric_publish_report("jobs.run", &[Value::int(2)])
+            .unwrap();
+        assert_eq!(second.admitted, 1);
+        assert_eq!(second.backpressured, 0);
+
+        shards[1].drain_cross_shard_messages();
+        assert_eq!(shards[1].actors.get(&3).unwrap().mailbox.len(), 1);
     }
 
     #[test]
