@@ -2938,6 +2938,56 @@ mod tests {
     // 3c. Spawn request/response roundtrips
     // ------------------------------------------------------------------
     #[test]
+    fn test_packet_serialize_deserialize_spawn_request_auth() {
+        let authority = AuthorityManifest::from_tokens([
+            "Secret::Read(STRIPE_KEY)",
+            "Net::TcpOut(api.example.com:443)",
+        ])
+        .unwrap();
+        let packet = Packet::SpawnRequestAuth {
+            request_id: 0xA11C_E001,
+            behavior_name: "store".to_string(),
+            content_hash: Some([0xAB; 32]),
+            initial_state: vec![("count".to_string(), Value::int(7))],
+            bytecode: None,
+            authority,
+        };
+        let bytes = packet.to_bytes(17);
+        // Type 17 is additive; the legacy type-3 SpawnRequest layout is untouched.
+        assert_eq!(bytes[4], TYPE_SPAWN_REQUEST_AUTH);
+        let (seq, decoded) = Packet::from_bytes(&bytes).expect("authority spawn decode");
+        assert_eq!(seq, 17);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_spawn_request_auth_rejects_malformed_authority() {
+        let authority =
+            AuthorityManifest::from_tokens(["Net::TcpOut(api.example.com:443)"]).unwrap();
+        let packet = Packet::SpawnRequestAuth {
+            request_id: 7,
+            behavior_name: "store".to_string(),
+            content_hash: None,
+            initial_state: vec![],
+            bytecode: None,
+            authority,
+        };
+        let mut bytes = packet.to_bytes(1);
+        let valid = b"Net::TcpOut(api.example.com:443)";
+        let malformed = b"Net::TcpOut(api.example.com-443)";
+        assert_eq!(valid.len(), malformed.len());
+        let pos = bytes
+            .windows(valid.len())
+            .position(|window| window == valid)
+            .expect("encoded authority token");
+        bytes[pos..pos + valid.len()].copy_from_slice(malformed);
+        assert!(
+            Packet::from_bytes(&bytes).is_none(),
+            "malformed authority must fail at the wire decode boundary"
+        );
+    }
+
+    #[test]
     fn test_packet_serialize_deserialize_spawn_response() {
         let packet = Packet::SpawnResponse {
             request_id: 0xDEAD_BEEF,
