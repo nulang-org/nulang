@@ -131,6 +131,12 @@ pub enum TypeTag {
     Raw = 7,
     /// Remote actor reference (node_id + actor_id).
     RemoteActor = 8,
+    /// Mutable array-construction buffer with explicit logical length/capacity.
+    ///
+    /// Experimental runtime-only representation. Durable continuation
+    /// serialization rejects live builders; callers must materialize them as
+    /// canonical `Array` values first.
+    ArrayBuilder = 9,
 }
 
 // ---------------------------------------------------------------------------
