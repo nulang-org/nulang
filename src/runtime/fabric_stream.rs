@@ -759,10 +759,23 @@ impl FileFabricStreamStore {
             if existing == &vote {
                 return Ok(transition);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "Fabric replica already recorded a different vote for this epoch",
-            ));
+            if existing.accepted {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "affirmative Fabric epoch vote is immutable",
+                ));
+            }
+            if existing.epoch != vote.epoch
+                || existing.proposal_hash != vote.proposal_hash
+                || existing.voter != vote.voter
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Fabric replica vote conflicts with the active epoch proposal",
+                ));
+            }
+            // A prior rejection may be replaced after the replica catches up
+            // to the exact candidate tail.
         }
         transition.votes.insert(vote.voter, vote);
         write_json_atomic(
