@@ -647,3 +647,166 @@ fn pending_stream_replication_retries_automatically_on_logical_clock() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+
+#[test]
+fn quorum_epoch_transition_fences_removed_old_leader() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addrs: Vec<SocketAddr> = [
+        "127.0.0.1:34801",
+        "127.0.0.1:34802",
+        "127.0.0.1:34803",
+    ]
+    .into_iter()
+    .map(|addr| addr.parse().unwrap())
+    .collect();
+    let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
+    let mut nodes: Vec<Runtime> = addrs
+        .iter()
+        .copied()
+        .map(|addr| runtime(addr, bus.clone()))
+        .collect();
+
+    for i in 0..nodes.len() {
+        for j in 0..nodes.len() {
+            if i == j {
+                continue;
+            }
+            nodes[i]
+                .distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(ids[j], addrs[j]);
+        }
+    }
+
+    let initial = nodes[0]
+        .fabric_stream_placement("epoch-transition", 0, 3)
+        .unwrap();
+    let old_leader = ids
+        .iter()
+        .position(|node| *node == initial.leader)
+        .unwrap();
+    let roots: Vec<PathBuf> = (0..3)
+        .map(|index| temp_dir(&format!("epoch-transition-{index}")))
+        .collect();
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+    nodes[old_leader]
+        .fabric_stream_create("epoch-transition", FabricStreamConfig::default())
+        .unwrap();
+
+    let first = nodes[old_leader]
+        .fabric_stream_replicated_append("epoch-transition", 0, 3, b"epoch-one")
+        .unwrap();
+    assert_eq!(first.sequence, 1);
+
+    for index in 0..3 {
+        if index != old_leader {
+            nodes[index].process_network();
+        }
+    }
+    nodes[old_leader].process_network();
+    nodes[old_leader].process_network();
+    for index in 0..3 {
+        if index != old_leader {
+            nodes[index].process_network();
+            nodes[index].process_network();
+        }
+    }
+
+    for node in &mut nodes {
+        assert_eq!(node.fabric_stream_epoch("epoch-transition").unwrap(), Some(1));
+        assert_eq!(
+            node.fabric_stream_committed_sequence("epoch-transition")
+                .unwrap(),
+            1
+        );
+    }
+
+    // Confirm the old leader removed on both surviving replicas. Their current
+    // deterministic RF=2 placement is the only eligible epoch-2 policy.
+    let survivors: Vec<usize> = (0..3).filter(|index| *index != old_leader).collect();
+    for index in &survivors {
+        nodes[*index]
+            .distributed
+            .cluster
+            .as_mut()
+            .unwrap()
+            .mark_removed(ids[old_leader]);
+    }
+
+    let next = nodes[survivors[0]]
+        .fabric_stream_placement("epoch-transition", 0, 2)
+        .unwrap();
+    let candidate = survivors
+        .iter()
+        .copied()
+        .find(|index| ids[*index] == next.leader)
+        .unwrap();
+    let voter = survivors
+        .iter()
+        .copied()
+        .find(|index| *index != candidate)
+        .unwrap();
+
+    let starting = nodes[candidate]
+        .fabric_stream_begin_epoch_transition("epoch-transition", 0, 2)
+        .unwrap();
+    assert_eq!(starting.from_epoch, 1);
+    assert_eq!(starting.to_epoch, 2);
+    assert_eq!(starting.affirmative_votes, 1);
+    assert!(!starting.finalized);
+
+    // The other survivor durably promises epoch 2 and votes. The candidate
+    // records the old-policy majority, installs epoch 2, and emits commit.
+    nodes[voter].process_network();
+    nodes[candidate].process_network();
+    nodes[voter].process_network();
+
+    for index in &survivors {
+        assert_eq!(
+            nodes[*index].fabric_stream_epoch("epoch-transition").unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_committed_sequence("epoch-transition")
+                .unwrap(),
+            1
+        );
+    }
+
+    // The removed old leader still has epoch 1 locally and can durably append
+    // to its own disk, but its old epoch cannot obtain a quorum from survivors.
+    let stale = nodes[old_leader]
+        .fabric_stream_replicated_append("epoch-transition", 0, 3, b"stale-old-epoch")
+        .unwrap();
+    assert_eq!(stale.status.acknowledgements, 1);
+    assert!(!stale.status.committed);
+
+    for index in &survivors {
+        nodes[*index].process_network();
+    }
+    nodes[old_leader].process_network();
+
+    assert_eq!(
+        nodes[old_leader]
+            .fabric_stream_committed_sequence("epoch-transition")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        nodes[old_leader]
+            .fabric_stream_read_committed("epoch-transition", 1, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
