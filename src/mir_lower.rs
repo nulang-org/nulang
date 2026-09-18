@@ -2604,7 +2604,9 @@ fn rvalue_use_locals(op: &mir::RValue, out: &mut Vec<mir::LocalId>) {
         | StateGet { .. } => {}
         mir::RValue::Resume(x) => out.push(*x),
         ReceiveWait { timeout, .. } => out.push(*timeout),
-        Load(x) | ArrayLen(x) | Unary(_, x) | CapabilityCheck { val: x } => out.push(*x),
+        Load(x) | MoveOut(x) | ArrayLen(x) | Unary(_, x) | CapabilityCheck { val: x } => {
+            out.push(*x)
+        }
         PerformAsync { args, .. } => out.extend(args.iter().copied()),
         LoadFieldNamed { obj, .. } | LoadFieldPos { obj, .. } => out.push(*obj),
         ArrayLoad { arr, idx } => {
