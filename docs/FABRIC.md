@@ -46,11 +46,20 @@ Subject patterns use NATS-style token matching:
 - `orders.*` matches one token after `orders`.
 - `orders.>` matches one-or-more tokens after `orders` and `>` must be terminal.
 
-Non-group subscriptions fan out to every matching actor. For each matching
-consumer group, Fabric selects one member using deterministic round-robin
-routing. Queue-group cursors are scoped by concrete topic plus group name, so
-unrelated subjects using the same group label cannot perturb each other's
-selection order. Identical subscriptions are deduplicated.
+Non-group subscriptions fan out to every matching actor. Consumer groups use
+placement-aware deterministic selection: an eligible same-shard worker is
+preferred first, with lower local mailbox depth winning; a full bounded mailbox
+is skipped. If no same-shard worker can accept work, Fabric falls back to a
+same-node cross-shard worker and then to a healthy remote-node worker. Equal
+placement scores retain deterministic round-robin fairness. Queue-group cursors
+are scoped by concrete topic plus group name, so unrelated subjects using the
+same group label cannot perturb each other's selection order. Identical
+subscriptions are deduplicated.
+
+The publishing shard intentionally does not invent load information it cannot
+observe. Cross-shard and remote candidates currently have locality tiers but no
+live mailbox-pressure component; propagating bounded load summaries through the
+Fabric control plane is a later optimization.
 
 Subscriptions are lifecycle-bound to their actors: normal exit, faults, linked
 exit cascades, and supervisor shutdown remove the actor's ephemeral routing
@@ -150,7 +159,10 @@ semantics that later cluster and stream layers can reuse.
 - [x] Queue-group cursors scoped by topic and group.
 - [x] Publish/backpressure result accounting on top of bounded actor mailboxes
   and bounded cross-shard channels.
-- [ ] Placement-aware queue-group selection across publishing shards.
+- [x] Placement-aware queue-group selection with same-shard mailbox pressure
+  and same-node/healthy-remote fallback.
+- [ ] Propagate bounded cross-shard/remote load summaries for deeper placement
+  decisions.
 
 ### Phase 2 — cluster-wide topics
 
@@ -165,7 +177,9 @@ semantics that later cluster and stream layers can reuse.
 - [x] Invoke node cleanup from cluster failure/removal handling.
 - [x] Two-node automatic subscription convergence over deterministic transport.
 - [x] Deterministic node-failure cleanup and same-NodeId rejoin coverage.
-- [ ] Placement-aware consumer selection using mailbox pressure and locality.
+- [x] Placement-aware consumer selection using same-shard mailbox pressure and
+  locality.
+- [ ] Propagate cross-shard/remote load summaries.
 - [ ] Deterministic partition/reorder coverage for automatic gossip.
 
 ### Phase 3 — durable streams
