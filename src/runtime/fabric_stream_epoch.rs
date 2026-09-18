@@ -19,20 +19,15 @@ use std::io;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::fabric_stream::{
-    FabricStreamEpochProposalState, FabricStreamEpochTransitionState,
-    FabricStreamEpochVoteState, FabricStreamReplicationPolicy,
+    FabricStreamEpochProposalState, FabricStreamEpochTransitionState, FabricStreamEpochVoteState,
+    FabricStreamReplicationPolicy,
 };
-use crate::runtime::fabric_stream_cluster::{
-    compute_stream_placement, FabricStreamPlacement,
-};
-use crate::runtime::{
-    ClusterState, MessagePriority, NodeId, NodeStatus, Packet, Runtime,
-};
+use crate::runtime::fabric_stream_cluster::{compute_stream_placement, FabricStreamPlacement};
+use crate::runtime::{ClusterState, MessagePriority, NodeId, NodeStatus, Packet, Runtime};
 
 pub(crate) const FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR: &str =
     "__nulang_fabric_stream_epoch_prepare_v1";
-pub(crate) const FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR: &str =
-    "__nulang_fabric_stream_epoch_vote_v1";
+pub(crate) const FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR: &str = "__nulang_fabric_stream_epoch_vote_v1";
 pub(crate) const FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR: &str =
     "__nulang_fabric_stream_epoch_commit_v1";
 
@@ -130,11 +125,7 @@ impl Runtime {
             ));
         }
 
-        let placement = self.fabric_stream_placement(
-            stream,
-            partition,
-            new_replication_factor,
-        )?;
+        let placement = self.fabric_stream_placement(stream, partition, new_replication_factor)?;
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -173,8 +164,7 @@ impl Runtime {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow"))?;
         let to_policy = policy_from_placement(&placement, to_epoch);
         let candidate_tail = self.fabric_stream_info(stream)?.last_sequence.unwrap_or(0);
-        let proposal_hash =
-            epoch_proposal_hash(stream, &from_policy, &to_policy, candidate_tail);
+        let proposal_hash = epoch_proposal_hash(stream, &from_policy, &to_policy, candidate_tail);
         let proposal = FabricStreamEpochProposalState {
             proposal_hash,
             from_policy,
@@ -197,12 +187,8 @@ impl Runtime {
                 "Fabric epoch transition requires cluster membership",
             )
         })?;
-        let own_vote = self.fabric_stream_evaluate_epoch_prepare(
-            stream,
-            &proposal,
-            local,
-            &cluster,
-        );
+        let own_vote =
+            self.fabric_stream_evaluate_epoch_prepare(stream, &proposal, local, &cluster);
         self.distributed.cluster = Some(cluster);
         let own_vote = own_vote?;
         let outcome = self.fabric_stream_record_epoch_vote_from_cluster(
@@ -330,9 +316,7 @@ impl Runtime {
             proposal.to_policy.partition,
             proposal.to_policy.replication_factor,
         )?;
-        if policy_from_placement(&placement, proposal.to_policy.epoch)
-            != proposal.to_policy
-        {
+        if policy_from_placement(&placement, proposal.to_policy.epoch) != proposal.to_policy {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Fabric epoch prepare does not match current deterministic placement",
@@ -387,8 +371,7 @@ impl Runtime {
             .values()
             .filter(|vote| vote.accepted && vote.tail == state.proposal.candidate_tail)
             .collect();
-        let affirmative_ids: HashSet<u64> =
-            affirmative.iter().map(|vote| vote.voter).collect();
+        let affirmative_ids: HashSet<u64> = affirmative.iter().map(|vote| vote.voter).collect();
         let new_replicas_ready = state
             .proposal
             .to_policy
@@ -414,10 +397,8 @@ impl Runtime {
         // Every affirmative voter has the exact candidate tail. An old-policy
         // majority therefore durably contains the complete candidate prefix.
         let quorum_committed = state.proposal.candidate_tail;
-        let finalized = self.fabric_stream_finalize_epoch_transition_state(
-            &vote.stream,
-            quorum_committed,
-        )?;
+        let finalized =
+            self.fabric_stream_finalize_epoch_transition_state(&vote.stream, quorum_committed)?;
 
         self.fabric_stream_complete_finalized_epoch_transition(&vote.stream, &finalized)?;
 
@@ -539,9 +520,7 @@ impl Runtime {
             .fabric_stream_info(&commit.stream)?
             .last_sequence
             .unwrap_or(0);
-        if tail != commit.committed_sequence
-            || tail != commit.proposal.candidate_tail
-        {
+        if tail != commit.committed_sequence || tail != commit.proposal.candidate_tail {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "Fabric epoch commit requires the exact quorum-certified tail",
@@ -556,10 +535,7 @@ impl Runtime {
         )?;
         let current_committed = self.fabric_stream_committed_sequence(&commit.stream)?;
         if commit.committed_sequence > current_committed {
-            self.fabric_stream_commit_through(
-                &commit.stream,
-                commit.committed_sequence,
-            )?;
+            self.fabric_stream_commit_through(&commit.stream, commit.committed_sequence)?;
         }
         self.fabric_stream_retire_old_epoch_pending(
             &commit.stream,
@@ -583,7 +559,10 @@ impl Runtime {
         }
         let bytes = prepare.to_wire_bytes()?;
         let cluster = self.distributed.cluster.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "cluster membership is unavailable")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "cluster membership is unavailable",
+            )
         })?;
         let mut targets = Vec::new();
         for node in &prepare.proposal.from_policy.replicas {
@@ -601,17 +580,16 @@ impl Runtime {
             }
         }
         let transport = self.distributed.transport.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "network transport is unavailable")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "network transport is unavailable",
+            )
         })?;
         for (node, address) in targets {
             transport.send(
                 node,
                 address,
-                system_packet(
-                    FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR,
-                    local,
-                    bytes.clone(),
-                ),
+                system_packet(FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR, local, bytes.clone()),
             );
         }
         Ok(())
@@ -647,11 +625,7 @@ impl Runtime {
             transport.send(
                 node,
                 address,
-                system_packet(
-                    FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR,
-                    local,
-                    bytes.clone(),
-                ),
+                system_packet(FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR, local, bytes.clone()),
             );
         }
         Ok(())
@@ -665,11 +639,9 @@ fn validate_proposal_shape(
     if stream.is_empty()
         || proposal.proposal_hash.is_empty()
         || proposal.to_policy.epoch
-            != proposal
-                .from_policy
-                .epoch
-                .checked_add(1)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow"))?
+            != proposal.from_policy.epoch.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow")
+            })?
         || proposal.to_policy.partition != proposal.from_policy.partition
         || proposal.to_policy.replication_factor == 0
         || proposal.to_policy.replicas.len() != proposal.to_policy.replication_factor
