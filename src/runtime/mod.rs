@@ -35,8 +35,9 @@ pub use fabric_stream::{
     FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
 };
 pub use fabric_stream_cluster::{
-    FabricStreamPlacement, FabricStreamReplicaAppend, FabricStreamReplicaDispatchReport,
-    FabricStreamReplicatedAppendResult, FabricStreamReplicationStatus,
+    FabricStreamPlacement, FabricStreamRecoveryReport, FabricStreamReplicaAppend,
+    FabricStreamReplicaDispatchReport, FabricStreamReplicatedAppendResult,
+    FabricStreamReplicationStatus, FabricStreamRetryReport,
 };
 #[cfg(feature = "ai-runtime")]
 mod agent;
