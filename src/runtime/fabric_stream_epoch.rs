@@ -2,7 +2,7 @@
 //!
 //! This module deliberately implements a conservative first transition
 //! protocol. A new epoch can be installed only when:
-//! - the proposal advances exactly one epoch,
+//! - the proposal advances to a strictly higher election term,
 //! - the prospective leader is the deterministic leader of the proposed set,
 //! - every new replica is drawn from the old replica set,
 //! - an old-policy majority durably promises the proposal,
@@ -185,7 +185,7 @@ impl FabricStreamEpochCommit {
 }
 
 impl Runtime {
-    /// Start or resume a quorum-backed transition to the next epoch.
+    /// Start or resume a quorum-backed transition to a higher election term.
     ///
     /// The proposed replica set is the current deterministic placement for
     /// `new_replication_factor`. For this first protocol version every new
@@ -494,7 +494,8 @@ impl Runtime {
             || request.source != local.0
             || !request.proposal.to_policy.replicas.contains(&local.0)
             || request.max_records == 0
-            || request.start_sequence == 0
+            || request.start_sequence
+                != request.proposal.candidate_tail.saturating_add(1)
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
