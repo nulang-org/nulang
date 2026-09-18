@@ -44,9 +44,7 @@ impl FabricStreamConfig {
         if self.segment_max_bytes < MIN_SEGMENT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "Fabric stream segment_max_bytes must be at least {MIN_SEGMENT_BYTES}"
-                ),
+                format!("Fabric stream segment_max_bytes must be at least {MIN_SEGMENT_BYTES}"),
             ));
         }
         Ok(self)
@@ -141,11 +139,7 @@ impl FileFabricStreamStore {
         &self.root
     }
 
-    pub fn create_stream(
-        &mut self,
-        name: &str,
-        config: FabricStreamConfig,
-    ) -> io::Result<()> {
+    pub fn create_stream(&mut self, name: &str, config: FabricStreamConfig) -> io::Result<()> {
         validate_name("stream", name)?;
         let config = config.validate()?;
         let dir = self.stream_dir(name);
@@ -183,8 +177,8 @@ impl FileFabricStreamStore {
             .get(name)
             .expect("stream state must exist after ensure_state");
         let segment_count = list_segments(&self.stream_dir(name))?.len();
-        let committed_sequence = read_commit(&self.stream_dir(name).join("commit.json"))?
-            .committed_sequence;
+        let committed_sequence =
+            read_commit(&self.stream_dir(name).join("commit.json"))?.committed_sequence;
         Ok(FabricStreamInfo {
             name: name.to_string(),
             segment_max_bytes: state.config.segment_max_bytes,
@@ -245,9 +239,7 @@ impl FileFabricStreamStore {
         if sequence > next_sequence {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "Fabric replica sequence gap: got {sequence}, expected {next_sequence}"
-                ),
+                format!("Fabric replica sequence gap: got {sequence}, expected {next_sequence}"),
             ));
         }
 
@@ -392,9 +384,7 @@ impl FileFabricStreamStore {
         if sequence > tail {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "Fabric committed sequence {sequence} is beyond local stream tail {tail}"
-                ),
+                format!("Fabric committed sequence {sequence} is beyond local stream tail {tail}"),
             ));
         }
 
@@ -448,12 +438,7 @@ impl FileFabricStreamStore {
     ///
     /// Cursors are monotonic. Committing beyond the stream tail or moving a
     /// cursor backwards is rejected.
-    pub fn commit_cursor(
-        &mut self,
-        name: &str,
-        consumer: &str,
-        sequence: u64,
-    ) -> io::Result<()> {
+    pub fn commit_cursor(&mut self, name: &str, consumer: &str, sequence: u64) -> io::Result<()> {
         validate_name("consumer", consumer)?;
         self.ensure_state(name)?;
         let last_sequence = self
@@ -465,9 +450,7 @@ impl FileFabricStreamStore {
         if sequence > last_sequence {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "Fabric cursor {sequence} is beyond stream tail {last_sequence}"
-                ),
+                format!("Fabric cursor {sequence} is beyond stream tail {last_sequence}"),
             ));
         }
 
@@ -477,9 +460,7 @@ impl FileFabricStreamStore {
         if sequence < current {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "Fabric cursor cannot move backwards from {current} to {sequence}"
-                ),
+                format!("Fabric cursor cannot move backwards from {current} to {sequence}"),
             ));
         }
         cursors.cursors.insert(consumer.to_string(), sequence);
@@ -589,7 +570,8 @@ impl Runtime {
         name: &str,
         sequence: u64,
     ) -> io::Result<()> {
-        self.fabric_stream_store_mut()?.commit_through(name, sequence)
+        self.fabric_stream_store_mut()?
+            .commit_through(name, sequence)
     }
 
     pub fn fabric_stream_config(&mut self, name: &str) -> io::Result<FabricStreamConfig> {
@@ -612,7 +594,10 @@ fn recover_stream(dir: &Path) -> io::Result<StreamState> {
         if error.kind() == io::ErrorKind::NotFound {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("Fabric stream metadata not found at {}", metadata_path.display()),
+                format!(
+                    "Fabric stream metadata not found at {}",
+                    metadata_path.display()
+                ),
             )
         } else {
             error
@@ -836,7 +821,9 @@ fn list_segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
         let stem = path
             .file_stem()
             .and_then(|stem| stem.to_str())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid segment filename"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid segment filename")
+            })?;
         let base = stem.parse::<u64>().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -976,7 +963,10 @@ mod tests {
 
         let records = store.read_from("orders", 2, 10).unwrap();
         assert_eq!(
-            records.iter().map(|record| record.sequence).collect::<Vec<_>>(),
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
             vec![2, 3]
         );
         assert_eq!(records[1].payload, b"three");
@@ -1149,7 +1139,10 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(restarted.fabric_stream_append("audit", b"second").unwrap(), 2);
+        assert_eq!(
+            restarted.fabric_stream_append("audit", b"second").unwrap(),
+            2
+        );
         let _ = fs::remove_dir_all(root);
     }
 }
