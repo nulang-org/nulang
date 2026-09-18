@@ -45,6 +45,19 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric durable stream storage — 2026-09-17
+- **File-backed Fabric stream log** (Experimental, `src/runtime/fabric_stream.rs`).
+  Adds a dedicated append-only segmented log for Fabric Streams rather than
+  overloading actor journals. Records receive monotonic sequence numbers and a
+  BLAKE3 integrity checksum; successful appends flush and `sync_data` before
+  acknowledgement. Stream recovery verifies segment continuity/checksums and
+  truncates only an incomplete final frame after a torn write. Persisted
+  consumer cursors are monotonic, atomically replaced, and support replay from
+  the first uncommitted sequence. New Runtime APIs open/create streams,
+  append/read records, inspect stream metadata, and commit/read consumer
+  cursors. Distributed replication, retention, ACK/NACK redelivery, DLQs, and
+  deduplication remain follow-up work.
+
 ### Runtime backend parity — 2026-09-17
 - **WASM guest-heap negation error parity** (`src/wasm_runtime.rs`,
   `src/mir_wasm.rs`): unary negation of a guest heap value now reports the
