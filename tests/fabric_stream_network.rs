@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nulang::runtime::{
-    DeterministicNetworkTransport, FabricStreamConfig, IncomingPacket, NodeId, OutgoingPacket,
-    Runtime,
+    ClusterState, DeterministicNetworkTransport, FabricStreamConfig, IncomingPacket, NodeId,
+    OutgoingPacket, Runtime,
 };
 
 type Bus = Arc<
@@ -802,6 +802,185 @@ fn quorum_epoch_transition_fences_removed_old_leader() {
             .len(),
         1
     );
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+
+#[test]
+fn epoch_repair_brings_lagging_survivor_to_proposal_tail() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addrs: Vec<SocketAddr> = [
+        "127.0.0.1:34901",
+        "127.0.0.1:34902",
+        "127.0.0.1:34903",
+    ]
+    .into_iter()
+    .map(|addr| addr.parse().unwrap())
+    .collect();
+    let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
+    let mut nodes: Vec<Runtime> = addrs
+        .iter()
+        .copied()
+        .map(|addr| runtime(addr, bus.clone()))
+        .collect();
+
+    for i in 0..nodes.len() {
+        for j in 0..nodes.len() {
+            if i == j {
+                continue;
+            }
+            nodes[i]
+                .distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(ids[j], addrs[j]);
+        }
+    }
+
+    let initial = nodes[0]
+        .fabric_stream_placement("epoch-repair", 0, 3)
+        .unwrap();
+    let old_leader = ids
+        .iter()
+        .position(|node| *node == initial.leader)
+        .unwrap();
+    let survivors: Vec<usize> = (0..3).filter(|index| *index != old_leader).collect();
+
+    // Determine which survivor will be the RF=2 leader after the old leader is
+    // removed, without mutating the real cluster state yet.
+    let scratch_local = survivors[0];
+    let mut scratch = Runtime::new();
+    scratch.distributed.enabled = true;
+    scratch.distributed.node_id = Some(ids[scratch_local]);
+    let mut scratch_cluster = ClusterState::new(ids[scratch_local], addrs[scratch_local]);
+    let scratch_peer = survivors[1];
+    scratch_cluster.handle_heartbeat(ids[scratch_peer], addrs[scratch_peer]);
+    scratch.distributed.cluster = Some(scratch_cluster);
+    let future = scratch
+        .fabric_stream_placement("epoch-repair", 0, 2)
+        .unwrap();
+    let candidate = survivors
+        .iter()
+        .copied()
+        .find(|index| ids[*index] == future.leader)
+        .unwrap();
+    let lagging = survivors
+        .iter()
+        .copied()
+        .find(|index| *index != candidate)
+        .unwrap();
+
+    let roots: Vec<PathBuf> = (0..3)
+        .map(|index| temp_dir(&format!("epoch-repair-{index}")))
+        .collect();
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+    nodes[old_leader]
+        .fabric_stream_create("epoch-repair", FabricStreamConfig::default())
+        .unwrap();
+
+    // Establish epoch 1 and a common committed sequence 1.
+    nodes[old_leader]
+        .fabric_stream_replicated_append("epoch-repair", 0, 3, b"common")
+        .unwrap();
+    for index in &survivors {
+        nodes[*index].process_network();
+    }
+    nodes[old_leader].process_network();
+    nodes[old_leader].process_network();
+    for index in &survivors {
+        nodes[*index].process_network();
+        nodes[*index].process_network();
+    }
+
+    // Sequence 2 reaches only the old leader + future candidate. That pair is
+    // an RF=3 majority, so sequence 2 commits while the other survivor lags.
+    nodes[old_leader]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([ids[lagging]]));
+    nodes[old_leader]
+        .fabric_stream_replicated_append("epoch-repair", 0, 3, b"majority-only")
+        .unwrap();
+    nodes[candidate].process_network();
+    nodes[old_leader].process_network();
+    nodes[candidate].process_network();
+    nodes[old_leader]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+
+    assert_eq!(
+        nodes[candidate]
+            .fabric_stream_committed_sequence("epoch-repair")
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        nodes[lagging]
+            .fabric_stream_info("epoch-repair")
+            .unwrap()
+            .last_sequence,
+        Some(1)
+    );
+
+    for index in &survivors {
+        nodes[*index]
+            .distributed
+            .cluster
+            .as_mut()
+            .unwrap()
+            .mark_removed(ids[old_leader]);
+    }
+
+    let starting = nodes[candidate]
+        .fabric_stream_begin_epoch_transition("epoch-repair", 0, 2)
+        .unwrap();
+    assert_eq!(starting.affirmative_votes, 1);
+
+    // Lagging survivor rejects because its tail is 1 instead of candidate tail 2.
+    nodes[lagging].process_network();
+    nodes[candidate].process_network();
+
+    let repair = nodes[candidate]
+        .fabric_stream_repair_epoch_transition("epoch-repair", 10)
+        .unwrap();
+    assert_eq!(repair.records_dispatched, 1);
+    assert_eq!(repair.ahead_replicas, 0);
+
+    // Repair applies exact sequence 2, then the receiver immediately re-votes.
+    nodes[lagging].process_network();
+    nodes[candidate].process_network();
+    nodes[lagging].process_network();
+
+    for index in &survivors {
+        assert_eq!(
+            nodes[*index].fabric_stream_epoch("epoch-repair").unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_committed_sequence("epoch-repair")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_read_committed("epoch-repair", 1, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 
     for root in roots {
         let _ = std::fs::remove_dir_all(root);
