@@ -2148,6 +2148,19 @@ impl CapabilityAnalyzer {
                                 arg_caps.iter().zip(expected_caps).enumerate()
                             {
                                 if expected.is_linear() && actual != expected {
+                                    // A literal is an ephemeral value with no
+                                    // reusable caller binding to invalidate.
+                                    // Existing Nulang programs rely on
+                                    // `use_once(42)` being valid for a
+                                    // linear parameter. MIR still gives the
+                                    // literal a temporary local and the sink
+                                    // ABI consumes that temporary.
+                                    let ephemeral_literal =
+                                        matches!(&args[idx], Expr::Literal(..));
+                                    if ephemeral_literal {
+                                        continue;
+                                    }
+
                                     let span = expr_span(&args[idx]);
                                     let msg = format!(
                                         "argument {} to `{}` has capability {}, but parameter {} is an ownership sink requiring {}",
@@ -2161,7 +2174,7 @@ impl CapabilityAnalyzer {
                                     return Err(NuError::cap_error_explained(
                                         msg,
                                         span,
-                                        "linear/lineariso sink calls transfer the caller's counted ownership slot; pass a value with the same linear capability",
+                                        "linear/lineariso sink calls transfer caller ownership; reusable bindings need the same linear capability, while ephemeral literals may be consumed directly",
                                     ));
                                 }
                             }
@@ -4775,6 +4788,22 @@ mod tests {
         assert!(
             analyzer.check_module(&ast.decls).is_ok(),
             "matching lineariso argument should satisfy a lineariso sink"
+        );
+    }
+
+    #[test]
+    fn test_direct_lineariso_sink_accepts_ephemeral_literal() {
+        // Compatibility contract: cap_30_fn_param_lineariso_single_use_ok
+        // already permits a literal to enter a linear sink without a caller
+        // binding that could be reused.
+        let ast = parse_module(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main() -> Int { take(42) }",
+        );
+        let mut analyzer = CapabilityAnalyzer::new();
+        assert!(
+            analyzer.check_module(&ast.decls).is_ok(),
+            "ephemeral literal should be consumable by a lineariso sink"
         );
     }
 
