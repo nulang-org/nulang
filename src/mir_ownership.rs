@@ -334,12 +334,19 @@ pub enum ArgTransferEvidence {
     NotTransferable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamOwnershipDependency {
+    pub function_idx: usize,
+    pub param_idx: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamOwnershipCandidate {
     pub param: LocalId,
     pub cap: Capability,
     pub candidate_owned: bool,
     pub requires_upstream_owned_param: bool,
+    pub dependencies: Vec<ParamOwnershipDependency>,
     pub blockers: Vec<CallOwnershipBlocker>,
 }
 
@@ -362,6 +369,13 @@ pub struct FunctionOwnershipCandidate {
     pub dynamic_callable: bool,
     pub params: Vec<ParamOwnershipCandidate>,
     pub return_ownership: ReturnOwnershipCandidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFunctionOwnership {
+    pub function_idx: usize,
+    pub name: String,
+    pub owned_params: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -434,46 +448,68 @@ pub fn analyze_call_ownership(module: &mir::Module) -> Vec<FunctionOwnershipCand
                         blockers.push(CallOwnershipBlocker::NonLinearParameter);
                     }
 
-                    let mut requires_upstream = false;
-                    if linear && blockers.iter().all(|b| {
-                        !matches!(b, CallOwnershipBlocker::UntransferableCallArgument)
-                    }) {
+                    let mut dependencies = Vec::new();
+                    if linear {
                         for site in sites {
                             let Some(arg) = site.args.get(param_idx).copied() else {
                                 blockers.push(CallOwnershipBlocker::UntransferableCallArgument);
                                 continue;
                             };
-                            let evidence = match site.caller {
-                                CallerRef::Function(caller_idx) => arg_transfer_evidence(
-                                    &module.functions[caller_idx],
-                                    &function_facts[caller_idx],
-                                    arg,
-                                ),
-                                CallerRef::Behavior(caller_idx) => arg_transfer_evidence(
-                                    &module.behaviors[caller_idx],
-                                    &behavior_facts[caller_idx],
-                                    arg,
-                                ),
-                            };
-                            match evidence {
-                                ArgTransferEvidence::OwnedTemporary => {}
-                                ArgTransferEvidence::LinearForward => {
-                                    requires_upstream = true;
+                            match site.caller {
+                                CallerRef::Function(caller_idx) => {
+                                    match arg_transfer_evidence(
+                                        &module.functions[caller_idx],
+                                        &function_facts[caller_idx],
+                                        arg,
+                                    ) {
+                                        ArgTransferEvidence::OwnedTemporary => {}
+                                        ArgTransferEvidence::LinearForward => {
+                                            let caller = &module.functions[caller_idx];
+                                            if let Some(caller_param_idx) =
+                                                caller.params.iter().position(|p| *p == arg)
+                                            {
+                                                dependencies.push(ParamOwnershipDependency {
+                                                    function_idx: caller_idx,
+                                                    param_idx: caller_param_idx,
+                                                });
+                                            } else {
+                                                blockers.push(
+                                                    CallOwnershipBlocker::UntransferableCallArgument,
+                                                );
+                                            }
+                                        }
+                                        ArgTransferEvidence::NotTransferable => blockers.push(
+                                            CallOwnershipBlocker::UntransferableCallArgument,
+                                        ),
+                                    }
                                 }
-                                ArgTransferEvidence::NotTransferable => {
-                                    blockers.push(CallOwnershipBlocker::UntransferableCallArgument);
+                                CallerRef::Behavior(caller_idx) => {
+                                    match arg_transfer_evidence(
+                                        &module.behaviors[caller_idx],
+                                        &behavior_facts[caller_idx],
+                                        arg,
+                                    ) {
+                                        ArgTransferEvidence::OwnedTemporary => {}
+                                        ArgTransferEvidence::LinearForward
+                                        | ArgTransferEvidence::NotTransferable => blockers.push(
+                                            CallOwnershipBlocker::UntransferableCallArgument,
+                                        ),
+                                    }
                                 }
                             }
                         }
                     }
                     blockers.sort_by_key(|b| *b as u8);
                     blockers.dedup();
+                    dependencies.sort_by_key(|d| (d.function_idx, d.param_idx));
+                    dependencies.dedup();
 
                     ParamOwnershipCandidate {
                         param: *param,
                         cap,
                         candidate_owned: blockers.is_empty(),
-                        requires_upstream_owned_param: requires_upstream,
+                        requires_upstream_owned_param: !dependencies.is_empty(),
+                        dependencies,
                         blockers,
                     }
                 })
@@ -492,6 +528,54 @@ pub fn analyze_call_ownership(module: &mir::Module) -> Vec<FunctionOwnershipCand
         .collect()
 }
 
+/// Resolve locally-valid parameter candidates through their forwarding
+/// dependencies. Starting from all candidates and pruning invalid
+/// dependencies computes the greatest fixed point, so mutually-recursive
+/// internal components remain eligible when every incoming edge satisfies
+/// the same ownership contract.
+pub fn resolve_call_ownership(module: &mir::Module) -> Vec<ResolvedFunctionOwnership> {
+    let candidates = analyze_call_ownership(module);
+    let mut active: Vec<Vec<bool>> = candidates
+        .iter()
+        .map(|f| f.params.iter().map(|p| p.candidate_owned).collect())
+        .collect();
+
+    loop {
+        let snapshot = active.clone();
+        let mut changed = false;
+        for (function_idx, function) in candidates.iter().enumerate() {
+            for (param_idx, param) in function.params.iter().enumerate() {
+                if !snapshot[function_idx][param_idx] {
+                    continue;
+                }
+                let deps_hold = param.dependencies.iter().all(|dep| {
+                    snapshot
+                        .get(dep.function_idx)
+                        .and_then(|params| params.get(dep.param_idx))
+                        .copied()
+                        .unwrap_or(false)
+                });
+                if !deps_hold {
+                    active[function_idx][param_idx] = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    candidates
+        .into_iter()
+        .enumerate()
+        .map(|(idx, function)| ResolvedFunctionOwnership {
+            function_idx: function.function_idx,
+            name: function.name,
+            owned_params: active[idx].clone(),
+        })
+        .collect()
+}
 fn function_level_blockers(
     func: &mir::Function,
     dynamic_callable: bool,
