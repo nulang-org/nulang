@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -442,6 +442,124 @@ fn leader_restart_recovers_pending_ticket_and_retries_replica() {
             .unwrap()[0]
             .payload,
         b"survive-restart"
+    );
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+
+#[test]
+fn lagging_committed_replica_catches_up_and_receives_commit_boundary() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addrs: Vec<SocketAddr> = [
+        "127.0.0.1:34601",
+        "127.0.0.1:34602",
+        "127.0.0.1:34603",
+    ]
+    .into_iter()
+    .map(|addr| addr.parse().unwrap())
+    .collect();
+    let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
+    let mut nodes: Vec<Runtime> = addrs
+        .iter()
+        .copied()
+        .map(|addr| runtime(addr, bus.clone()))
+        .collect();
+
+    for i in 0..nodes.len() {
+        for j in 0..nodes.len() {
+            if i == j {
+                continue;
+            }
+            nodes[i]
+                .distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(ids[j], addrs[j]);
+        }
+    }
+
+    let placement = nodes[0]
+        .fabric_stream_placement("catchup", 0, 3)
+        .unwrap();
+    let leader_index = ids.iter().position(|id| *id == placement.leader).unwrap();
+    let followers: Vec<usize> = (0..3).filter(|index| *index != leader_index).collect();
+    let quorum_follower = followers[0];
+    let lagging_follower = followers[1];
+
+    let roots: Vec<PathBuf> = (0..3)
+        .map(|index| temp_dir(&format!("catchup-{index}")))
+        .collect();
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+    nodes[leader_index]
+        .fabric_stream_create("catchup", FabricStreamConfig::default())
+        .unwrap();
+
+    // Drop leader -> lagging follower traffic while keeping membership stable.
+    nodes[leader_index]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([ids[lagging_follower]]));
+
+    let append = nodes[leader_index]
+        .fabric_stream_replicated_append("catchup", 0, 3, b"committed-with-majority")
+        .unwrap();
+    assert_eq!(append.status.quorum, 2);
+    assert_eq!(append.status.acknowledgements, 1);
+
+    nodes[quorum_follower].process_network();
+    nodes[leader_index].process_network();
+    nodes[quorum_follower].process_network();
+
+    assert_eq!(
+        nodes[leader_index]
+            .fabric_stream_committed_sequence("catchup")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        nodes[quorum_follower]
+            .fabric_stream_committed_sequence("catchup")
+            .unwrap(),
+        1
+    );
+
+    // Heal the link. Durable progress says the lagging replica has ACKed
+    // nothing, so catch-up sends sequence 1 only to that replica.
+    nodes[leader_index]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+
+    let catchup = nodes[leader_index]
+        .fabric_stream_catch_up_committed("catchup", 0, 3, 10)
+        .unwrap();
+    assert_eq!(catchup.records_dispatched, 1);
+    assert_eq!(catchup.unavailable_replicas, 0);
+
+    nodes[lagging_follower].process_network();
+    nodes[leader_index].process_network();
+    nodes[lagging_follower].process_network();
+
+    let records = nodes[lagging_follower]
+        .fabric_stream_read("catchup", 1, 10)
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].payload, b"committed-with-majority");
+    assert_eq!(
+        nodes[lagging_follower]
+            .fabric_stream_committed_sequence("catchup")
+            .unwrap(),
+        1
     );
 
     for root in roots {
