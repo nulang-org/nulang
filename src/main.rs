@@ -1080,6 +1080,7 @@ fn print_help() {
     println!("       nulang --lsp");
     println!("       nulang --dap");
     println!("       nulang fmt [--check] [<file>]");
+    println!("       nulang effects [--json] <file>");
     println!("       nulang node --listen <ADDR> [--seed <ADDR>] [--expected-nodes <N>]");
     println!("       nulang --doc");
     println!();
@@ -1556,11 +1557,6 @@ fn run_bench<F: FnMut() -> NuResult<()>>(mut run: F, n: usize) -> NuResult<()> {
     Ok(())
 }
 
-/// Shared frontend: lex -> parse -> typecheck -> effect check -> capability
-/// analysis. Returns the parsed module ready for compilation.
-///
-/// `file_path` is an optional display name for diagnostics (e.g. "main.nula").
-#[instrument(level = "debug", skip(source))]
 fn run_effects_cmd(args: &[String]) -> NuResult<()> {
     let mut json = false;
     let mut file: Option<&str> = None;
@@ -1613,7 +1609,7 @@ fn run_effects_cmd(args: &[String]) -> NuResult<()> {
             .iter()
             .map(|row| {
                 serde_json::json!({
-                    "function": row.name,
+                    "function": &row.name,
                     "effects": row.row.to_string(),
                     "declared": row.declared,
                 })
@@ -1642,6 +1638,11 @@ fn run_effects_cmd(args: &[String]) -> NuResult<()> {
     Ok(())
 }
 
+/// Shared frontend: lex -> parse -> typecheck -> effect check -> capability
+/// analysis. Returns the parsed module ready for compilation.
+///
+/// `file_path` is an optional display name for diagnostics (e.g. "main.nula").
+#[instrument(level = "debug", skip(source))]
 fn run_frontend(
     source: &str,
     file_path: Option<&str>,
