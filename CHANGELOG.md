@@ -45,6 +45,18 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Runtime durability — 2026-09-17
+- **Durable actor schema identity** (`src/runtime/schema_identity.rs`,
+  `src/runtime/persistence.rs`, `src/runtime/mod.rs`): snapshots now carry
+  the canonical `ActorMeta.name` of the actor they represent. Recovery,
+  migration, virtual-actor hydration, state defaults/models, workflow role,
+  behavior offsets, compensation layout, and type-hash selection resolve
+  against that exact schema instead of scanning or selecting unrelated
+  metadata from multi-actor modules. Unknown persisted schemas and ambiguous
+  legacy multi-schema snapshots fail closed; legacy single-schema snapshots
+  remain compatible. LibSQL and PostgreSQL persist the schema identity in a
+  backward-compatible nullable column rather than silently dropping it.
+
 ### Runtime backend parity — 2026-09-17
 - **WASM guest-heap negation error parity** (`src/wasm_runtime.rs`,
   `src/mir_wasm.rs`): unary negation of a guest heap value now reports the
