@@ -3,11 +3,12 @@
 // Import: `import stdlib::string`
 //
 // Built on primitives: String.length, String.charAt (→ Int code),
-// String.substring(s, start, length), String.concat(s1, s2).
+// String.substring(s, start, length), String.concat(s1, s2), and the
+// amortized-linear StrBuilder primitives for repeated text assembly.
 //
 // NOTE: `a + b` where both operands are non-literal strings returns 0
-// (VM bug). Use `perform String.concat(a, b)` for variable-to-variable
-// concatenation.
+// (VM bug). Use `perform String.concat(a, b)` for one-off variable-to-variable
+// concatenation and StrBuilder for loops that append repeatedly.
 
 /// Length of the string in bytes.
 pub fn length(s) { perform String.length(s) }
@@ -46,17 +47,10 @@ pub fn ends_with(s, suffix) {
 }
 
 /// True when s contains the substring needle.
+/// Reuse the allocation-free byte comparison in index_of instead of
+/// materializing a candidate substring at every position.
 pub fn contains(s, needle) {
-    let slen = perform String.length(s);
-    let nlen = perform String.length(needle);
-    if nlen == 0 then { return true } else {};
-    if nlen > slen then { return false } else {};
-    var i = 0;
-    while i + nlen <= slen {
-        if perform String.substring(s, i, nlen) == needle then { return true } else {};
-        i = i + 1
-    };
-    false
+    index_of(s, needle) >= 0
 }
 
 /// First index of substring ch in s, or -1 if not found.
@@ -68,7 +62,7 @@ pub fn index_of(s, ch) {
     while i + chlen <= slen {
         var found = true;
         var j = 0;
-        while j < chlen {
+        while j < chlen && found {
             if perform String.charAt(s, i + j) != perform String.charAt(ch, j) then { found = false } else {};
             j = j + 1
         };
@@ -81,26 +75,27 @@ pub fn index_of(s, ch) {
 // ── Building and repeating ────────────────────────────────────────────────
 
 /// Repeat string s n times.
+/// Uses StrBuilder so repeated append is amortized linear in the output size.
 pub fn repeat(s, n) {
-    var result = "";
+    var b = perform StrBuilder.new();
     var i = 0;
     while i < n {
-        result = perform String.concat(result, s);
+        b = perform StrBuilder.push(b, s);
         i = i + 1
     };
-    result
+    perform StrBuilder.to_string(b)
 }
 
 /// Reverse the string.
 pub fn reverse(s: String) -> String {
-    var result = "";
+    var b = perform StrBuilder.new();
     var i = perform String.length(s) - 1;
     while i >= 0 {
         let code = perform String.charAt(s, i);
-        result = perform String.concat(result, perform String.from_char(code));
+        b = perform StrBuilder.push(b, perform String.from_char(code));
         i = i - 1
     };
-    result
+    perform StrBuilder.to_string(b)
 }
 
 // ── Whitespace trimming ───────────────────────────────────────────────────
@@ -131,15 +126,8 @@ pub fn trim(s) {
 
     let start_idx = find_start(0);
     let end_idx = find_end(len);
-
-    // Build trimmed string.
-    var result = "";
-    var i = start_idx;
-    while i < end_idx {
-        result = perform String.concat(result, perform String.substring(s, i, 1));
-        i = i + 1
-    };
-    result
+    if start_idx >= end_idx then ""
+    else perform String.substring(s, start_idx, end_idx - start_idx)
 }
 
 // ── Split and join ────────────────────────────────────────────────────────
@@ -148,96 +136,96 @@ pub fn trim(s) {
 /// Returns an array of substrings.
 pub fn split(s, delim) {
     var result = [];
-    var current = "";
+    var current = perform StrBuilder.new();
     var i = 0;
     let len = perform String.length(s);
     let dcode = perform String.charAt(delim, 0);
     while i < len {
         let c = perform String.charAt(s, i);
         if c == dcode then {
-            result = perform Array.push(result, current);
-            current = ""
+            result = perform Array.push(result, perform StrBuilder.to_string(current));
+            current = perform StrBuilder.reset(current)
         } else {
-            current = perform String.concat(current, perform String.substring(s, i, 1))
+            current = perform StrBuilder.push(current, perform String.substring(s, i, 1))
         };
         i = i + 1
     };
-    perform Array.push(result, current)
+    perform Array.push(result, perform StrBuilder.to_string(current))
 }
 
 /// Join an array of strings with a separator string.
 pub fn join(parts, sep) {
-    var result = "";
+    var b = perform StrBuilder.new();
     var i = 0;
     let len = perform Array.length(parts);
     while i < len {
-        if i > 0 then { result = perform String.concat(result, sep) } else {};
-        result = perform String.concat(result, parts[i]);
+        if i > 0 then { b = perform StrBuilder.push(b, sep) } else {};
+        b = perform StrBuilder.push(b, parts[i]);
         i = i + 1
     };
-    result
+    perform StrBuilder.to_string(b)
 }
 
 // ── Replace ───────────────────────────────────────────────────────────────
 
 /// Replace all occurrences of substring `from` with `to` in s.
 pub fn replace(s, from, to) {
-    var result = "";
+    var b = perform StrBuilder.new();
     var i = 0;
     let slen = perform String.length(s);
     let flen = perform String.length(from);
     while i < slen {
         var found_match = flen > 0 && i + flen <= slen;
         var j = 0;
-        while j < flen {
+        while j < flen && found_match {
             if perform String.charAt(s, i + j) != perform String.charAt(from, j) then { found_match = false } else {};
             j = j + 1
         };
         if found_match then {
-            result = perform String.concat(result, to);
+            b = perform StrBuilder.push(b, to);
             i = i + flen
         } else {
-            result = perform String.concat(result, perform String.substring(s, i, 1));
+            b = perform StrBuilder.push(b, perform String.substring(s, i, 1));
             i = i + 1
         }
     };
-    result
+    perform StrBuilder.to_string(b)
 }
 
 // ── Case conversion ───────────────────────────────────────────────────────
 
 /// Convert string to lowercase (ASCII only, non-ASCII passthrough).
 pub fn to_lower(s: String) -> String {
-    var result = "";
+    var b = perform StrBuilder.new();
     var i = 0;
     let len = perform String.length(s);
     while i < len {
         let c = perform String.charAt(s, i);
         if c >= 65 && c <= 90 then {
-            result = perform String.concat(result, perform String.from_char(c + 32))
+            b = perform StrBuilder.push(b, perform String.from_char(c + 32))
         } else {
-            result = perform String.concat(result, perform String.from_char(c))
+            b = perform StrBuilder.push(b, perform String.from_char(c))
         };
         i = i + 1
     };
-    result
+    perform StrBuilder.to_string(b)
 }
 
 /// Convert string to uppercase (ASCII only, non-ASCII passthrough).
 pub fn to_upper(s: String) -> String {
-    var result = "";
+    var b = perform StrBuilder.new();
     var i = 0;
     let len = perform String.length(s);
     while i < len {
         let c = perform String.charAt(s, i);
         if c >= 97 && c <= 122 then {
-            result = perform String.concat(result, perform String.from_char(c - 32))
+            b = perform StrBuilder.push(b, perform String.from_char(c - 32))
         } else {
-            result = perform String.concat(result, perform String.from_char(c))
+            b = perform StrBuilder.push(b, perform String.from_char(c))
         };
         i = i + 1
     };
-    result
+    perform StrBuilder.to_string(b)
 }
 
 /// True when no alphabetic character in the string is lowercase.
