@@ -8009,9 +8009,7 @@ mod vm_tests {
     fn test_perform_name_cache_tracks_only_perform_constants() {
         let mut module = CodeModule::new("test_perform_name_cache");
         module.constants.push(Constant::String("Float.sqrt".to_string()));
-        module
-            .constants
-            .push(Constant::String("unused.constant".to_string()));
+        module.constants.push(Constant::String("unused.constant".to_string()));
         module.emit(Instruction::new3(OpCode::Perform, 0, 0, 0));
         module.emit(Instruction::new0(OpCode::Halt));
         module.entry_point = Some(0);
