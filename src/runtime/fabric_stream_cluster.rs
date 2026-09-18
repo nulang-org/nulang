@@ -1481,6 +1481,7 @@ impl Runtime {
             || placement.leader != append.leader
             || placement.membership_fingerprint != append.membership_fingerprint
             || placement.replicas.len() != append.replication_factor
+            || (!append.replicas.is_empty() && append.replicas != placement.replicas)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1578,6 +1579,7 @@ impl Runtime {
         )?;
         if placement.leader != append.leader
             || placement.membership_fingerprint != append.membership_fingerprint
+            || (!append.replicas.is_empty() && append.replicas != placement.replicas)
             || !placement.replicas.contains(&target)
         {
             return Err(io::Error::new(
