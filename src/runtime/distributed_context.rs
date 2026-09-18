@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
 use crate::runtime::cluster::{ClusterState, NodeId};
+use crate::runtime::fabric_stream_cluster::FabricStreamReplicationState;
 use crate::runtime::network::NetworkTransport;
 use crate::runtime::{
     ActorAddress, AddressResolver, FileFabricStreamStore, MessageAdmission, Runtime,
@@ -507,6 +508,9 @@ pub struct DistributedContext {
     /// Optional durable local stream store. Stream replication is layered on
     /// top later; this first slice owns the append log and replay cursors.
     pub(crate) fabric_streams: Option<FileFabricStreamStore>,
+    /// Leader-local pending quorum tickets for durable Fabric stream appends.
+    /// The durable committed boundary itself lives in the stream store.
+    pub(crate) fabric_stream_replication: FabricStreamReplicationState,
 }
 
 impl DistributedContext {
