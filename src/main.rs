@@ -10,6 +10,7 @@
 //!   nulang agent <init|run|chat|goals|graph>
 //!   nulang nula <new|build|build-wasm|test|run|add|remove|publish|deploy|watch|doc>
 //!   nulang fmt [--check] [<file>]
+//!   nulang effects [--json] <file>
 //!
 //! Options:
 //!   -r, --repl               Start interactive REPL
@@ -174,6 +175,15 @@ fn main() {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
+    }
+
+    // `nulang effects <file>` — print transitive per-function effect rows.
+    if args[1] == "effects" {
+        if let Err(e) = run_effects_cmd(&args[2..]) {
+            print_error(&e, true);
+            std::process::exit(exit_code(&e));
+        }
+        return;
     }
 
     // `nulang nula <cmd>` dispatches to the package manager.
@@ -1551,6 +1561,87 @@ fn run_bench<F: FnMut() -> NuResult<()>>(mut run: F, n: usize) -> NuResult<()> {
 ///
 /// `file_path` is an optional display name for diagnostics (e.g. "main.nula").
 #[instrument(level = "debug", skip(source))]
+fn run_effects_cmd(args: &[String]) -> NuResult<()> {
+    let mut json = false;
+    let mut file: Option<&str> = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            s if s.starts_with('-') => {
+                return Err(NuError::VMError {
+                    msg: format!("unknown effects option '{}'", s),
+                    span: Span::default(),
+                });
+            }
+            s => {
+                if file.replace(s).is_some() {
+                    return Err(NuError::VMError {
+                        msg: "effects accepts exactly one source file".to_string(),
+                        span: Span::default(),
+                    });
+                }
+            }
+        }
+    }
+
+    let file = file.ok_or_else(|| NuError::VMError {
+        msg: "usage: nulang effects [--json] <file>".to_string(),
+        span: Span::default(),
+    })?;
+    let source = std::fs::read_to_string(file).map_err(|e| NuError::VMError {
+        msg: format!("cannot read '{}': {}", file, e),
+        span: Span::default(),
+    })?;
+
+    let mut lexer = Lexer::new(&source);
+    let tokens = lexer.lex()?;
+    let mut parser = Parser::new(tokens);
+    let ast = parser.parse_module()?;
+
+    // Keep effect reports aligned with normal compilation: type errors are
+    // rejected before effect inference.
+    let mut type_checker = TypeChecker::new();
+    type_checker.check_module(&ast)?;
+
+    let mut checker = EffectChecker::new();
+    checker.check_module(&ast.decls)?;
+    let report = checker.function_effect_report(&ast.decls);
+
+    if json {
+        let rows: Vec<_> = report
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "function": row.name,
+                    "effects": row.row.to_string(),
+                    "declared": row.declared,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).map_err(|e| NuError::VMError {
+                msg: format!("failed to serialize effect report: {}", e),
+                span: Span::default(),
+            })?
+        );
+    } else if report.is_empty() {
+        println!("No module-level functions.");
+    } else {
+        for row in report {
+            println!(
+                "{} ! {} [{}]",
+                row.name,
+                row.row,
+                if row.declared { "declared" } else { "inferred" }
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn run_frontend(
     source: &str,
     file_path: Option<&str>,
