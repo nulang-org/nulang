@@ -3106,11 +3106,17 @@ mod tests {
 fn leaf() ! { IO } {
     perform IO.print(1)
 }
-fn caller() {
+fn middle() {
     leaf()
+}
+fn caller() {
+    middle()
 }
 fn declared() ! { IO } {
     caller()
+}
+fn contract_only() ! { Net } {
+    1
 }
 "#;
         let mut lexer = crate::lexer::Lexer::new(src);
@@ -3124,7 +3130,7 @@ fn declared() ! { IO } {
 
         assert_eq!(
             report.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-            vec!["caller", "declared", "leaf"]
+            vec!["caller", "contract_only", "declared", "leaf", "middle"]
         );
 
         let caller = report.iter().find(|r| r.name == "caller").unwrap();
@@ -3134,10 +3140,44 @@ fn declared() ! { IO } {
             caller.row
         );
         assert!(!caller.declared);
+        let caller_io = caller
+            .origins
+            .iter()
+            .find(|o| o.effect == Effect::IO)
+            .expect("caller IO origin");
+        assert_eq!(
+            caller_io.path,
+            vec!["caller", "middle", "leaf"],
+            "transitive origin should use the shortest call path"
+        );
+        assert_eq!(caller_io.kind, EffectOriginKind::Body);
 
         let declared = report.iter().find(|r| r.name == "declared").unwrap();
         assert!(declared.declared);
         assert!(declared.row.effects().contains(&Effect::IO));
+        let declared_io = declared
+            .origins
+            .iter()
+            .find(|o| o.effect == Effect::IO)
+            .expect("declared IO origin");
+        assert_eq!(
+            declared_io.path,
+            vec!["declared", "caller", "middle", "leaf"],
+            "a declared wrapper should still point to the performing body when known"
+        );
+        assert_eq!(declared_io.kind, EffectOriginKind::Body);
+
+        let contract = report
+            .iter()
+            .find(|r| r.name == "contract_only")
+            .unwrap();
+        let net = contract
+            .origins
+            .iter()
+            .find(|o| o.effect == Effect::Net)
+            .expect("contract Net origin");
+        assert_eq!(net.path, vec!["contract_only"]);
+        assert_eq!(net.kind, EffectOriginKind::Declared);
     }
 
     #[test]
