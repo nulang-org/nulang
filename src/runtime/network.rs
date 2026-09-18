@@ -1256,6 +1256,73 @@ impl Packet {
             bytecode,
         })
     }
+    fn read_spawn_request_auth(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 8 {
+            return None;
+        }
+        let request_id = read_u64(payload, 0)?;
+        let (behavior_name, consumed) = read_string(payload, 8)?;
+        let mut offset = 8 + consumed;
+        let (content_hash, hash_consumed) = read_optional_hash(payload, offset)?;
+        offset = offset.checked_add(hash_consumed)?;
+        let count = read_u32(payload, offset)? as usize;
+        offset = offset.checked_add(4)?;
+        let mut initial_state = Vec::with_capacity(count.min(256));
+        for _ in 0..count {
+            let (key, consumed_key) = read_string(payload, offset)?;
+            offset = offset.checked_add(consumed_key)?;
+            let (value, consumed_val) = read_value(payload, offset)?;
+            offset = offset.checked_add(consumed_val)?;
+            initial_state.push((key, value));
+        }
+
+        let bytecode_len = read_u32(payload, offset)? as usize;
+        offset = offset.checked_add(4)?;
+        let bytecode = if bytecode_len > 0 {
+            let end = offset.checked_add(bytecode_len)?;
+            if end > payload.len() {
+                return None;
+            }
+            let bytes = payload[offset..end].to_vec();
+            offset = end;
+            Some(bytes)
+        } else {
+            None
+        };
+
+        let authority_count = read_u32(payload, offset)? as usize;
+        offset = offset.checked_add(4)?;
+        if authority_count > 1024 {
+            return None;
+        }
+        let mut authority_tokens = Vec::with_capacity(authority_count);
+        for _ in 0..authority_count {
+            let (token, consumed) = read_string(payload, offset)?;
+            offset = offset.checked_add(consumed)?;
+            authority_tokens.push(token);
+        }
+        if offset != payload.len() {
+            return None;
+        }
+
+        let authority = AuthorityManifest::from_tokens(
+            authority_tokens.iter().map(String::as_str),
+        )
+        .ok()?;
+        if authority.canonical_tokens() != authority_tokens {
+            return None;
+        }
+
+        Some(Packet::SpawnRequestAuth {
+            request_id,
+            behavior_name,
+            content_hash,
+            initial_state,
+            bytecode,
+            authority,
+        })
+    }
+
     fn read_spawn_response(payload: &[u8]) -> Option<Self> {
         if payload.len() < 17 {
             return None;
