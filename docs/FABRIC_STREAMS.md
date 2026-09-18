@@ -378,3 +378,81 @@ per-replica progress / catch-up state and committed-index propagation.
 
 Automatic timer-based retry is also intentionally deferred; retry is currently
 explicit so failure/recovery semantics can stabilize before adding scheduling.
+
+
+## Lagging committed-replica catch-up
+
+Fabric now tracks a durable leader-side high-water mark for every follower that
+successfully application-ACKs a stream record.
+
+`replica_progress.json` stores:
+
+- replica NodeId,
+- highest exact sequence durably ACKed by that replica.
+
+Progress is monotonic and persisted before an accepted ACK is allowed to affect
+leader bookkeeping. Losing progress metadata is safe but conservative: the
+leader can resend older committed records because exact-sequence replica
+application is idempotent.
+
+### Catch-up
+
+`fabric_stream_catch_up_committed(stream, partition, replication_factor, max)`
+repairs followers using only the leader's durable committed prefix.
+
+For each remote replica:
+
+1. read its persisted progress,
+2. compare progress with the leader committed sequence,
+3. read at most `max` missing committed records,
+4. dispatch those exact sequences only to that replica,
+5. wait for normal application ACKs to advance durable progress.
+
+No uncommitted leader tail is used for catch-up.
+
+The bounded record count prevents a single repair call from monopolizing the
+runtime for a severely lagging replica.
+
+### Commit-boundary propagation
+
+Replica data and commit visibility remain separate.
+
+Fabric uses the reserved internal behavior
+`__nulang_fabric_stream_commit_v1` to propagate a leader's durable committed
+sequence without adding a NUL0 packet discriminant.
+
+A commit update carries:
+
+- stream + partition,
+- leader NodeId,
+- membership fingerprint,
+- replication factor,
+- committed sequence.
+
+A follower accepts the update only when current deterministic placement still
+matches and its local durable tail is at least the advertised committed
+sequence. The follower then persists its own `commit.json` boundary.
+
+The leader never sends a commit boundary merely because a packet was
+dispatched. It sends commit updates only to replicas whose persisted application
+ACK progress proves they already contain that committed prefix.
+
+Whenever an application ACK is processed, the leader checks all replicas whose
+durable progress has reached the current commit boundary and sends them a commit
+update. This covers:
+
+- followers that formed the original quorum,
+- a follower catching up after a partition,
+- duplicate/idempotent catch-up ACKs.
+
+If a replica was unavailable for the update, a later explicit catch-up call
+retries the commit boundary when its recorded progress is already sufficient.
+
+### Current safety boundary
+
+Catch-up repairs data and committed visibility under the existing deterministic
+leader placement. It does **not** move leadership.
+
+A membership change that changes placement still requires a future monotonic
+leader epoch/lease protocol before automatic failover can safely reinterpret
+stream ownership.
