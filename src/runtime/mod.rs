@@ -2871,16 +2871,7 @@ impl Runtime {
                     state.insert(name.clone(), persisted);
                 }
             }
-            let authority_tokens = match actor.authority_manifest() {
-                Ok(manifest) => manifest.canonical_token_set(),
-                Err(err) => {
-                    warn!(
-                        "nulang-persist: refusing to snapshot actor {} with invalid authority: {}",
-                        actor_id, err
-                    );
-                    return None;
-                }
-            };
+            let authority_tokens = actor.authority_manifest().canonical_token_set();
             (actor.waiting_signal.clone(), authority_tokens)
         };
         let sequence = self.next_sequence(actor_id);
