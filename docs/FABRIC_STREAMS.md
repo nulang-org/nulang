@@ -456,3 +456,36 @@ leader placement. It does **not** move leadership.
 A membership change that changes placement still requires a future monotonic
 leader epoch/lease protocol before automatic failover can safely reinterpret
 stream ownership.
+
+
+## Automatic pending-quorum retry
+
+Pending **uncommitted** Fabric Stream replication now retries automatically from
+the runtime network loop.
+
+The retry scheduler uses `Runtime::now()`, so production uses the monotonic
+wall clock and deterministic tests use the installed virtual clock.
+
+The schedule is exponential:
+
+- first retry: 500 ms after the initial dispatch,
+- then 1 s,
+- 2 s,
+- 4 s,
+- continuing up to a 30 s cap.
+
+A retry redispatches each still-pending exact sequence using the existing
+idempotent replica-append contract. The scheduler never converts transport
+dispatch into an ACK; quorum still advances only from follower application ACKs.
+
+When a partition's pending ticket set becomes empty after commit, its retry
+schedule is removed immediately.
+
+Restart recovery remains driven by durable replication intent. Once
+`fabric_stream_recover_pending` reconstructs a ticket (explicitly or because an
+incoming ACK triggers reconstruction), an immediate retry schedule is installed.
+
+This scheduler targets **pending quorum work** only. Repairing followers that
+missed records already committed by a majority remains the bounded
+`fabric_stream_catch_up_committed` path, because bulk catch-up needs separate
+workload/rate controls.
