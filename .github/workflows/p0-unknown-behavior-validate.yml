@@ -1,0 +1,60 @@
+name: P0 Unknown Behavior Validation
+
+on:
+  push:
+    branches: [fix/p0-fail-closed-unknown-behavior-main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p0-unknown-behavior-validation
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev pkg-config
+
+      - name: Apply guarded semantic patch
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+          python3 scripts/p0_apply_unknown_behavior_fix.py
+          python3 scripts/p0_adjust_remote_fallback_test.py
+          python3 scripts/p0_adjust_stress_tests.py
+          python3 scripts/p0_harden_remote_behavior_resolution.py
+          cargo fmt --all
+          git diff --check
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' src/runtime/distributed.rs src/runtime/mod.rs src/runtime/tests.rs src/stress_tests.rs | sort)"
+          test "$changed" = "$expected"
+
+      - name: Focused fail-closed regressions
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features runtime::tests::p0_unknown_named_send_is_rejected -- --exact
+          cargo test --no-default-features runtime::tests::p0_unknown_numeric_ask_is_rejected_without_running_behavior_zero -- --exact
+          cargo test runtime::distributed::tests::test_remote_send_dispatches_named_behavior -- --exact
+          cargo test --no-default-features runtime::tests::p0_cross_shard_named_send_resolves_on_owner_and_unknown_fails_closed -- --exact
+
+      - name: Representative compatibility regressions
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features runtime::tests::test_send_carries_current_trace_span -- --exact
+          cargo test --no-default-features runtime::tests::test_cross_actor_send_foreign_count_lifecycle -- --exact
+          cargo test --no-default-features runtime::tests::test_distributed_remote_address_local_fallback -- --exact
+          cargo test --no-default-features integration_tests::tests::test_flight_recorder_records_messages -- --exact
+
+      - name: Full minimal regression gate
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features
+          cargo fmt --all -- --check
+          git diff --check
