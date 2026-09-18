@@ -1300,6 +1300,24 @@ impl Runtime {
             .append_reserved_replica(name, sequence, payload)
     }
 
+    pub(crate) fn fabric_stream_apply_transition_repair_record(
+        &mut self,
+        name: &str,
+        sequence: u64,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let appended = self
+            .fabric_stream_store_mut()?
+            .append_replica(name, sequence, payload)?;
+        if !appended {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Fabric epoch repair record already exists",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn fabric_stream_replica_progress(
         &mut self,
         name: &str,
