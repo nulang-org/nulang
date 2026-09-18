@@ -310,11 +310,12 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                 }
             }
             ClusterAction::NodeFailed { node } => {
+                let node = NodeId(node.0);
                 if let Some(transport) = &mut rt.distributed.transport {
-                    let net_node_id = NodeId(node.0);
-                    transport.disconnect(net_node_id);
+                    transport.disconnect(node);
                 }
-                handle_node_failed(rt, NodeId(node.0));
+                rt.distributed.fabric_stream_failed_nodes_pending.insert(node);
+                handle_node_failed(rt, node);
             }
             ClusterAction::NodeRemoved { node } => {
                 if let Some(transport) = &mut rt.distributed.transport {
@@ -399,9 +400,20 @@ pub(crate) fn process_network(rt: &mut Runtime) {
         }
     }
 
-    // Confirmed removals can be observed while packet processing temporarily
+    // Failed/removal observations can occur while packet processing temporarily
     // owns ClusterState outside Runtime. Drain them only now, after the
     // runtime-owned transport/cluster state has been restored.
+    let failed_nodes = std::mem::take(&mut rt.distributed.fabric_stream_failed_nodes_pending);
+    for failed in failed_nodes {
+        if let Err(error) = rt.fabric_stream_failover_failed(failed) {
+            tracing::warn!(
+                failed = failed.0,
+                "nulang-fabric-stream: failed-node quorum transition attempt failed: {}",
+                error
+            );
+        }
+    }
+
     let removed_nodes = std::mem::take(&mut rt.distributed.fabric_stream_removed_nodes_pending);
     for removed in removed_nodes {
         if let Err(error) = rt.fabric_stream_failover_confirmed_removed(removed) {
