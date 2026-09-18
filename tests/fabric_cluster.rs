@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nulang::runtime::{Actor, DeterministicNetworkTransport, NodeId, Runtime};
+use nulang::runtime::{
+    Actor, DeterministicNetworkTransport, FabricAdvertisement, FabricAdvertisementSnapshot,
+    NodeId, Packet, Runtime,
+};
 use nulang::vm::Value;
 
 fn noop(_actor: &mut Actor, _args: &[Value]) {}
@@ -100,6 +103,185 @@ fn fabric_gossip_converges_routes_and_reuses_distributed_actor_transport() {
         .handle_heartbeat(node_b, addr_b);
     b.advance_time(Duration::from_millis(600));
     a.advance_time(Duration::from_millis(600));
+    b.process_network();
+    a.process_network();
+    assert_eq!(a.fabric_remote_subscription_count(), 1);
+}
+
+
+#[test]
+fn fabric_gossip_reordering_keeps_newest_snapshot_generation() {
+    let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:32201".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:32202".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut a = distributed_runtime(addr_a, bus.clone());
+    let mut b = distributed_runtime(addr_b, bus);
+
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    b.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let target = b.spawn_actor(Box::new(Vec::new));
+    b.actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("handle", noop);
+
+    let older = FabricAdvertisementSnapshot {
+        node_id: node_b,
+        generation: 1,
+        subscriptions: vec![FabricAdvertisement {
+            node_id: node_b,
+            pattern: "events.old".into(),
+            actor_id: target,
+            behavior: "handle".into(),
+            group: None,
+        }],
+    };
+    let newer = FabricAdvertisementSnapshot {
+        node_id: node_b,
+        generation: 2,
+        subscriptions: vec![FabricAdvertisement {
+            node_id: node_b,
+            pattern: "events.new".into(),
+            actor_id: target,
+            behavior: "handle".into(),
+            group: None,
+        }],
+    };
+
+    let transport = b.distributed.transport.as_mut().unwrap();
+    transport.set_reorder(true);
+    transport.send(
+        node_a,
+        addr_a,
+        Packet::Gossip {
+            members: vec![],
+            directory: vec![],
+            fabric: Some(older),
+        },
+    );
+    transport.send(
+        node_a,
+        addr_a,
+        Packet::Gossip {
+            members: vec![],
+            directory: vec![],
+            fabric: Some(newer),
+        },
+    );
+    transport.flush_held();
+
+    // Bounded-adjacent reordering delivers generation 2 before generation 1.
+    // The second arrival must therefore be ignored as stale.
+    a.process_network();
+    assert_eq!(a.fabric_remote_subscription_count(), 1);
+    assert_eq!(a.fabric_publish("events.old", &[]).unwrap(), 0);
+
+    let report = a.fabric_publish_report("events.new", &[]).unwrap();
+    assert_eq!(report.selected, 1);
+    assert_eq!(report.forwarded_remote, 1);
+}
+
+#[test]
+fn fabric_partition_removes_routes_and_heals_via_gossip() {
+    let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:32301".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:32302".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut a = distributed_runtime(addr_a, bus.clone());
+    let mut b = distributed_runtime(addr_b, bus);
+
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    b.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let target = b.spawn_actor(Box::new(Vec::new));
+    b.actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("handle", noop);
+    b.fabric_subscribe("events.*", target, "handle").unwrap();
+
+    // While B -> A is partitioned, B's automatic Fabric gossip cannot
+    // populate A's routing directory.
+    b.distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([node_a]));
+    b.advance_time(Duration::from_millis(600));
+    a.advance_time(Duration::from_millis(600));
+    b.process_network();
+    a.process_network();
+    assert_eq!(a.fabric_remote_subscription_count(), 0);
+
+    // Heal the link and verify the next gossip round converges the route.
+    b.distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+    b.advance_time(Duration::from_millis(600));
+    a.advance_time(Duration::from_millis(600));
+    b.process_network();
+    a.process_network();
+    assert_eq!(a.fabric_remote_subscription_count(), 1);
+
+    // Drain any already-enqueued traffic, then isolate both directions so the
+    // failure detector sees a clean outage window.
+    let _ = a.distributed.transport.as_ref().unwrap().receive();
+    let _ = b.distributed.transport.as_ref().unwrap().receive();
+    a.distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([node_b]));
+    b.distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([node_a]));
+
+    a.advance_time(Duration::from_secs(8));
+    a.process_network();
+    assert_eq!(a.fabric_remote_subscription_count(), 0);
+
+    // Clear the partition. A's next failed-node probe reaches B; B processes
+    // it and emits heartbeat/gossip back, restoring both membership and Fabric.
+    a.distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+    b.distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+
+    a.advance_time(Duration::from_secs(6));
+    b.advance_time(Duration::from_secs(6));
+    a.process_network();
     b.process_network();
     a.process_network();
     assert_eq!(a.fabric_remote_subscription_count(), 1);
