@@ -382,8 +382,8 @@ pub(crate) fn spawn_from_module(
 /// manifest atomically with actor creation.
 ///
 /// If a parent actor is currently executing, delegation is validated before
-/// the child is created, so a denied or malformed grant cannot leave a
-/// partially-created privileged actor behind. With no current actor, the
+/// the child is created, so a denied grant cannot leave a partially-created
+/// privileged actor behind. With no current actor, the
 /// runtime is the root trust boundary and may install the supplied manifest
 /// directly; host policy can further constrain that root boundary later.
 ///
@@ -473,7 +473,6 @@ mod authority_tests {
 
         assert!(actor
             .authority_manifest()
-            .unwrap()
             .allows(&AuthorityGrant::SecretRead {
                 name: "STRIPE_KEY".into(),
             }));
@@ -499,9 +498,8 @@ mod authority_tests {
             rt.actors
                 .get(&child_id)
                 .unwrap()
-                .authority_manifest()
-                .unwrap(),
-            parent_manifest
+                .authority_manifest(),
+            &parent_manifest
         );
     }
 
@@ -522,29 +520,6 @@ mod authority_tests {
                 name: "STRIPE_KEY".into(),
             }))
         );
-        assert_eq!(rt.actors.len(), before);
-    }
-
-    #[test]
-    fn malformed_parent_manifest_fails_before_child_creation() {
-        let mut rt = Runtime::new();
-        let parent_id = rt.spawn_actor(Box::new(|| vec![]));
-        rt.actors
-            .get_mut(&parent_id)
-            .unwrap()
-            .capabilities
-            .insert("Net::TcpOut(malformed)".to_string());
-        rt.current_actor = Some(parent_id);
-        let before = rt.actors.len();
-        let requested = AuthorityManifest::new();
-        let module = CodeModule::new("malformed-parent-authority");
-
-        let result = spawn_from_module_with_authority(&mut rt, &module, 0, vec![], &requested);
-
-        assert!(matches!(
-            result,
-            Err(RuntimeAuthorityError::InvalidManifest(_))
-        ));
         assert_eq!(rt.actors.len(), before);
     }
 
@@ -580,7 +555,6 @@ mod authority_tests {
         assert_eq!(actor.sequence, 7);
         assert!(actor
             .authority_manifest()
-            .unwrap()
             .allows(&AuthorityGrant::SecretRead {
                 name: "RESTART_KEY".into(),
             }));
