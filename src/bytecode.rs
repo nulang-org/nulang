@@ -654,6 +654,11 @@ pub struct DebugFunctionInfo {
     pub code_len: usize,
     /// Register indices of the function parameters.
     pub params: Vec<usize>,
+    /// Bit i is set when parameter i is a linear/lineariso ownership sink.
+    /// Used by safe host invocation to retain borrowed pointer arguments
+    /// before the callee consumes its ownership reference.
+    #[serde(default)]
+    pub sink_mask: u16,
     /// `(register index, optional local name)` for every local.
     pub locals: Vec<(usize, Option<String>)>,
 }
