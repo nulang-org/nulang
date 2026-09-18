@@ -851,9 +851,12 @@ impl FileFabricStreamStore {
             ));
         }
 
-        let current = self
-            .replication_policy(name)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric replication policy is not established"))?;
+        let current = self.replication_policy(name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Fabric replication policy is not established",
+            )
+        })?;
         if current == *to_policy {
             return Ok(());
         }
