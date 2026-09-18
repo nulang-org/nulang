@@ -45,6 +45,13 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Nula build-wasm capability forwarding — 2026-09-18
+- **Package capability grants now reach the WASM compiler invocation**
+  (`src/package/commands.rs`). `nula build-wasm` preserves manifest-derived
+  `--with` capability arguments when invoking the compiler, matching the
+  package's declared authority instead of silently compiling without those
+  grants.
+
 ### Fabric confirmed-removal automatic failover — 2026-09-18
 - **Automatic ownership transition after confirmed leader removal**
   (Experimental, `src/runtime/fabric_stream_epoch.rs`,
