@@ -2653,6 +2653,98 @@ mod tests {
         vm.run()
     }
 
+    fn plan_contains(
+        map: &FxHashMap<(usize, usize), Vec<mir::LocalId>>,
+        point: (usize, usize),
+        id: mir::LocalId,
+    ) -> bool {
+        map.get(&point)
+            .is_some_and(|ids| ids.iter().any(|candidate| *candidate == id))
+    }
+
+    #[test]
+    fn test_drop_plan_transfers_owned_token_through_moveout() {
+        let mut b = mir::FunctionBuilder::new("transfer", Some(Type::int()));
+        let source = b.add_temp(Type::unit());
+        let moved = b.add_temp(Type::unit());
+        let len = b.add_temp(Type::int());
+
+        b.assign(source, mir::RValue::ArrayLit(Vec::new()));
+        b.assign(moved, mir::RValue::MoveOut(source));
+        b.assign(len, mir::RValue::ArrayLen(moved));
+        b.terminate(mir::Terminator::Return(Some(len)));
+
+        let func = b.build();
+        let plan = plan_drops(&func);
+
+        assert!(
+            plan_contains(&plan.after_stmt, (0, 2), moved),
+            "the transferred owner must be released after its last read-only use"
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_does_not_invent_ownership_for_moved_parameter() {
+        let mut b = mir::FunctionBuilder::new("borrowed_param", Some(Type::int()));
+        let param = b.add_param("p", Type::unit());
+        let moved = b.add_temp(Type::unit());
+        let len = b.add_temp(Type::int());
+
+        b.assign(moved, mir::RValue::MoveOut(param));
+        b.assign(len, mir::RValue::ArrayLen(moved));
+        b.terminate(mir::Terminator::Return(Some(len)));
+
+        let func = b.build();
+        let plan = plan_drops(&func);
+        let appears = plan
+            .block_entry
+            .values()
+            .chain(plan.before_stmt.values())
+            .chain(plan.after_stmt.values())
+            .any(|ids| ids.iter().any(|id| *id == moved));
+
+        assert!(
+            !appears,
+            "MoveOut from an ABI parameter must stay non-owning until a sink ABI transfers ownership"
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_preserves_escapees_across_moveout_lineage() {
+        let mut b = mir::FunctionBuilder::new("escapee", Some(Type::unit()));
+        let payload = b.add_temp(Type::unit());
+        let source = b.add_temp(Type::unit());
+        let borrowed_field = b.add_temp(Type::unit());
+        let moved = b.add_temp(Type::unit());
+        let len = b.add_temp(Type::int());
+
+        b.assign(payload, mir::RValue::ArrayLit(Vec::new()));
+        b.assign(
+            source,
+            mir::RValue::Record(vec![("field".to_string(), payload)]),
+        );
+        b.assign(
+            borrowed_field,
+            mir::RValue::LoadFieldNamed {
+                obj: source,
+                field: "field".to_string(),
+            },
+        );
+        b.assign(moved, mir::RValue::MoveOut(source));
+        b.assign(len, mir::RValue::ArrayLen(moved));
+        // The uncounted field alias escapes through the return. The moved
+        // record owner must therefore not be released at its last direct use.
+        b.terminate(mir::Terminator::Return(Some(borrowed_field)));
+
+        let func = b.build();
+        let plan = plan_drops(&func);
+
+        assert!(
+            !plan_contains(&plan.after_stmt, (0, 4), moved),
+            "an alias borrowed before MoveOut must remain an escapee of the new owner"
+        );
+    }
+
     #[test]
     fn test_mir_codegen_moveout_transfers_value_and_clears_source() {
         let moved = run_mir_source("let x = 42 in consume x").unwrap();
