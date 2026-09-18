@@ -1966,17 +1966,14 @@ mod tests {
                 promised
             );
             assert!(store.promise_epoch("events", 2, "proposal-b").is_err());
+            let superseding = store.promise_epoch("events", 3, "proposal-c").unwrap();
+            assert_eq!(superseding.epoch, 3);
         }
 
         let mut reopened = FileFabricStreamStore::open(&root).unwrap();
-        assert_eq!(
-            reopened
-                .epoch_promise("events")
-                .unwrap()
-                .unwrap()
-                .proposal_hash,
-            "proposal-a"
-        );
+        let promise = reopened.epoch_promise("events").unwrap().unwrap();
+        assert_eq!(promise.epoch, 3);
+        assert_eq!(promise.proposal_hash, "proposal-c");
         let _ = fs::remove_dir_all(root);
     }
 
