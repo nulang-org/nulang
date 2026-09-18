@@ -402,8 +402,7 @@ pub(crate) fn process_network(rt: &mut Runtime) {
     // Confirmed removals can be observed while packet processing temporarily
     // owns ClusterState outside Runtime. Drain them only now, after the
     // runtime-owned transport/cluster state has been restored.
-    let removed_nodes =
-        std::mem::take(&mut rt.distributed.fabric_stream_removed_nodes_pending);
+    let removed_nodes = std::mem::take(&mut rt.distributed.fabric_stream_removed_nodes_pending);
     for removed in removed_nodes {
         if let Err(error) = rt.fabric_stream_failover_confirmed_removed(removed) {
             tracing::warn!(
