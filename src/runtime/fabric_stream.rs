@@ -503,10 +503,12 @@ impl FileFabricStreamStore {
         name: &str,
     ) -> io::Result<Vec<FabricStreamPendingIntent>> {
         self.ensure_state(name)?;
-        Ok(read_replication(&self.stream_dir(name).join("replication.json"))?
-            .pending
-            .into_values()
-            .collect())
+        Ok(
+            read_replication(&self.stream_dir(name).join("replication.json"))?
+                .pending
+                .into_values()
+                .collect(),
+        )
     }
 
     pub(crate) fn remove_replication_intent(
