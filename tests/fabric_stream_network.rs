@@ -1469,3 +1469,356 @@ fn automatic_failover_retries_until_survivor_confirms_removal() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+
+#[test]
+fn automatic_failover_pushes_lagging_survivor_before_transition() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addrs: Vec<SocketAddr> = ["127.0.0.1:35301", "127.0.0.1:35302", "127.0.0.1:35303"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
+    let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
+    let mut nodes: Vec<Runtime> = addrs
+        .iter()
+        .copied()
+        .map(|addr| runtime(addr, bus.clone()))
+        .collect();
+
+    for i in 0..nodes.len() {
+        for j in 0..nodes.len() {
+            if i == j {
+                continue;
+            }
+            nodes[i]
+                .distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(ids[j], addrs[j]);
+        }
+    }
+
+    let initial = nodes[0]
+        .fabric_stream_placement("auto-failover-push", 0, 3)
+        .unwrap();
+    let old_leader = ids.iter().position(|node| *node == initial.leader).unwrap();
+    let survivors: Vec<usize> = (0..3).filter(|index| *index != old_leader).collect();
+
+    let scratch_local = survivors[0];
+    let mut scratch = Runtime::new();
+    scratch.distributed.enabled = true;
+    scratch.distributed.node_id = Some(ids[scratch_local]);
+    let mut scratch_cluster = ClusterState::new(ids[scratch_local], addrs[scratch_local]);
+    let scratch_peer = survivors[1];
+    scratch_cluster.handle_heartbeat(ids[scratch_peer], addrs[scratch_peer]);
+    scratch.distributed.cluster = Some(scratch_cluster);
+    let reduced = scratch
+        .fabric_stream_placement("auto-failover-push", 0, 2)
+        .unwrap();
+    let candidate = survivors
+        .iter()
+        .copied()
+        .find(|index| ids[*index] == reduced.leader)
+        .unwrap();
+    let lagging = survivors
+        .iter()
+        .copied()
+        .find(|index| *index != candidate)
+        .unwrap();
+
+    let roots: Vec<PathBuf> = (0..3)
+        .map(|index| temp_dir(&format!("auto-failover-push-{index}")))
+        .collect();
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+    nodes[old_leader]
+        .fabric_stream_create("auto-failover-push", FabricStreamConfig::default())
+        .unwrap();
+
+    nodes[old_leader]
+        .fabric_stream_replicated_append("auto-failover-push", 0, 3, b"common")
+        .unwrap();
+    for index in &survivors {
+        nodes[*index].process_network();
+    }
+    nodes[old_leader].process_network();
+    nodes[old_leader].process_network();
+    for index in &survivors {
+        nodes[*index].process_network();
+        nodes[*index].process_network();
+    }
+
+    // Sequence 2 commits on old leader + future candidate while the other
+    // survivor remains one record behind.
+    nodes[old_leader]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([ids[lagging]]));
+    nodes[old_leader]
+        .fabric_stream_replicated_append("auto-failover-push", 0, 3, b"candidate-ahead")
+        .unwrap();
+    nodes[candidate].process_network();
+    nodes[old_leader].process_network();
+    nodes[candidate].process_network();
+    nodes[old_leader]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+
+    assert_eq!(
+        nodes[candidate]
+            .fabric_stream_info("auto-failover-push")
+            .unwrap()
+            .last_sequence,
+        Some(2)
+    );
+    assert_eq!(
+        nodes[lagging]
+            .fabric_stream_info("auto-failover-push")
+            .unwrap()
+            .last_sequence,
+        Some(1)
+    );
+
+    // Both survivors receive confirmed goodbye. Candidate starts failover;
+    // lagging survivor rejects the first prepare with tail 1.
+    for index in &survivors {
+        nodes[old_leader]
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
+            .send(
+                ids[*index],
+                addrs[*index],
+                Packet::NodeGoodbye {
+                    node_id: ids[old_leader],
+                    durable: Vec::new(),
+                },
+            );
+    }
+    nodes[candidate].process_network();
+    nodes[lagging].process_network();
+    nodes[candidate].process_network();
+
+    assert_eq!(
+        nodes[candidate]
+            .fabric_stream_epoch("auto-failover-push")
+            .unwrap(),
+        Some(1)
+    );
+
+    // First failover retry automatically chooses push repair.
+    nodes[candidate].advance_time(Duration::from_millis(500));
+    nodes[candidate].process_network();
+    nodes[lagging].process_network();
+    nodes[candidate].process_network();
+    nodes[lagging].process_network();
+
+    for index in &survivors {
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_epoch("auto-failover-push")
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_committed_sequence("auto-failover-push")
+                .unwrap(),
+            2
+        );
+    }
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn automatic_failover_pulls_ahead_survivor_and_supersedes_term() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addrs: Vec<SocketAddr> = ["127.0.0.1:35401", "127.0.0.1:35402", "127.0.0.1:35403"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
+    let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
+    let mut nodes: Vec<Runtime> = addrs
+        .iter()
+        .copied()
+        .map(|addr| runtime(addr, bus.clone()))
+        .collect();
+
+    for i in 0..nodes.len() {
+        for j in 0..nodes.len() {
+            if i == j {
+                continue;
+            }
+            nodes[i]
+                .distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(ids[j], addrs[j]);
+        }
+    }
+
+    let initial = nodes[0]
+        .fabric_stream_placement("auto-failover-pull", 0, 3)
+        .unwrap();
+    let old_leader = ids.iter().position(|node| *node == initial.leader).unwrap();
+    let survivors: Vec<usize> = (0..3).filter(|index| *index != old_leader).collect();
+
+    let scratch_local = survivors[0];
+    let mut scratch = Runtime::new();
+    scratch.distributed.enabled = true;
+    scratch.distributed.node_id = Some(ids[scratch_local]);
+    let mut scratch_cluster = ClusterState::new(ids[scratch_local], addrs[scratch_local]);
+    let scratch_peer = survivors[1];
+    scratch_cluster.handle_heartbeat(ids[scratch_peer], addrs[scratch_peer]);
+    scratch.distributed.cluster = Some(scratch_cluster);
+    let reduced = scratch
+        .fabric_stream_placement("auto-failover-pull", 0, 2)
+        .unwrap();
+    let candidate = survivors
+        .iter()
+        .copied()
+        .find(|index| ids[*index] == reduced.leader)
+        .unwrap();
+    let ahead = survivors
+        .iter()
+        .copied()
+        .find(|index| *index != candidate)
+        .unwrap();
+
+    let roots: Vec<PathBuf> = (0..3)
+        .map(|index| temp_dir(&format!("auto-failover-pull-{index}")))
+        .collect();
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+    nodes[old_leader]
+        .fabric_stream_create("auto-failover-pull", FabricStreamConfig::default())
+        .unwrap();
+
+    nodes[old_leader]
+        .fabric_stream_replicated_append("auto-failover-pull", 0, 3, b"common")
+        .unwrap();
+    for index in &survivors {
+        nodes[*index].process_network();
+    }
+    nodes[old_leader].process_network();
+    nodes[old_leader].process_network();
+    for index in &survivors {
+        nodes[*index].process_network();
+        nodes[*index].process_network();
+    }
+
+    // Sequence 2 commits on old leader + non-candidate survivor. The future
+    // deterministic RF=2 leader is behind by one record.
+    nodes[old_leader]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([ids[candidate]]));
+    nodes[old_leader]
+        .fabric_stream_replicated_append("auto-failover-pull", 0, 3, b"survivor-ahead")
+        .unwrap();
+    nodes[ahead].process_network();
+    nodes[old_leader].process_network();
+    nodes[ahead].process_network();
+    nodes[old_leader]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+
+    assert_eq!(
+        nodes[candidate]
+            .fabric_stream_info("auto-failover-pull")
+            .unwrap()
+            .last_sequence,
+        Some(1)
+    );
+    assert_eq!(
+        nodes[ahead]
+            .fabric_stream_info("auto-failover-pull")
+            .unwrap()
+            .last_sequence,
+        Some(2)
+    );
+
+    for index in &survivors {
+        nodes[old_leader]
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
+            .send(
+                ids[*index],
+                addrs[*index],
+                Packet::NodeGoodbye {
+                    node_id: ids[old_leader],
+                    durable: Vec::new(),
+                },
+            );
+    }
+    nodes[candidate].process_network();
+    nodes[ahead].process_network();
+    nodes[candidate].process_network();
+
+    // First retry sees the rejected ahead vote and automatically pulls.
+    nodes[candidate].advance_time(Duration::from_millis(500));
+    nodes[candidate].process_network();
+    nodes[ahead].process_network();
+    nodes[candidate].process_network();
+
+    assert_eq!(
+        nodes[candidate]
+            .fabric_stream_info("auto-failover-pull")
+            .unwrap()
+            .last_sequence,
+        Some(2)
+    );
+    assert_eq!(
+        nodes[candidate]
+            .fabric_stream_epoch("auto-failover-pull")
+            .unwrap(),
+        Some(1)
+    );
+
+    // Pulling changed the proposal-bound candidate tail. The next scheduled
+    // retry automatically starts the higher term and drives it to quorum.
+    nodes[candidate].advance_time(Duration::from_secs(1));
+    nodes[candidate].process_network();
+    nodes[ahead].process_network();
+    nodes[candidate].process_network();
+    nodes[ahead].process_network();
+
+    for index in &survivors {
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_epoch("auto-failover-pull")
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_committed_sequence("auto-failover-pull")
+                .unwrap(),
+            2
+        );
+    }
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
