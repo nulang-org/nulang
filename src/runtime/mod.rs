@@ -20,6 +20,7 @@ pub use heap_serialize::*;
 mod cluster;
 mod distributed;
 mod distributed_context;
+mod fabric_stream;
 mod grain;
 mod network;
 mod object_store;
@@ -28,6 +29,9 @@ mod supervision;
 mod supervisor;
 pub use distributed_context::{
     DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot, FabricPublishReport,
+};
+pub use fabric_stream::{
+    FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
 };
 #[cfg(feature = "ai-runtime")]
 mod agent;
