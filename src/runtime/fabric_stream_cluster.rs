@@ -2136,6 +2136,110 @@ mod tests {
     }
 
     #[test]
+    fn carried_policy_bootstraps_follower_after_membership_changes() {
+        let a_addr = addr(33351);
+        let b_addr = addr(33352);
+        let a_id = NodeId::new(&a_addr);
+        let b_id = NodeId::new(&b_addr);
+
+        let mut a = runtime_with_members(a_addr, &[b_addr]);
+        let mut b = runtime_with_members(b_addr, &[a_addr]);
+        let initial = a.fabric_stream_placement("bootstrap-policy", 0, 2).unwrap();
+        assert_eq!(
+            initial,
+            b.fabric_stream_placement("bootstrap-policy", 0, 2).unwrap()
+        );
+
+        let root_a = test_dir("bootstrap-policy-a");
+        let root_b = test_dir("bootstrap-policy-b");
+        a.fabric_stream_open(&root_a).unwrap();
+        b.fabric_stream_open(&root_b).unwrap();
+        a.fabric_stream_create("bootstrap-policy", FabricStreamConfig::default())
+            .unwrap();
+        b.fabric_stream_create("bootstrap-policy", FabricStreamConfig::default())
+            .unwrap();
+
+        let (leader, follower) = if initial.leader == a_id {
+            (&mut a, &mut b)
+        } else {
+            assert_eq!(initial.leader, b_id);
+            (&mut b, &mut a)
+        };
+
+        // Leader establishes epoch-1 policy and produces the first append,
+        // including the complete ordered replica set.
+        let (_, append) = leader
+            .fabric_stream_prepare_replica_append("bootstrap-policy", 0, 2, b"first")
+            .unwrap();
+        assert_eq!(append.replicas, initial.replicas);
+        assert_eq!(
+            leader.fabric_stream_epoch("bootstrap-policy").unwrap(),
+            Some(FABRIC_STREAM_INITIAL_EPOCH)
+        );
+        assert_eq!(follower.fabric_stream_epoch("bootstrap-policy").unwrap(), None);
+
+        // Before first contact, change only the follower's cluster view until
+        // legacy rendezvous would disagree with the leader-established policy.
+        let mut dynamic_changed = false;
+        for port in 33360..33450 {
+            let peer = addr(port);
+            let peer_id = NodeId::new(&peer);
+            if peer_id == a_id || peer_id == b_id {
+                continue;
+            }
+            follower
+                .distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(peer_id, peer);
+            let dynamic = follower
+                .fabric_stream_placement("bootstrap-policy", 0, 2)
+                .unwrap();
+            if dynamic.replicas != initial.replicas
+                || dynamic.membership_fingerprint != initial.membership_fingerprint
+            {
+                dynamic_changed = true;
+                break;
+            }
+        }
+        assert!(
+            dynamic_changed,
+            "test must make follower rendezvous differ before first policy bootstrap"
+        );
+
+        // Carried policy, not the follower's changed global membership view,
+        // authenticates first contact and becomes the durable local policy.
+        assert!(follower.fabric_stream_apply_replica(&append).unwrap());
+        assert_eq!(
+            follower.fabric_stream_epoch("bootstrap-policy").unwrap(),
+            Some(FABRIC_STREAM_INITIAL_EPOCH)
+        );
+        let policy = follower
+            .fabric_stream_replication_policy("bootstrap-policy")
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.leader, initial.leader.0);
+        assert_eq!(
+            policy.replicas,
+            initial.replicas.iter().map(|node| node.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            policy.membership_fingerprint,
+            initial.membership_fingerprint
+        );
+
+        let records = follower
+            .fabric_stream_read("bootstrap-policy", 1, 10)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].payload, b"first");
+
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[test]
     fn installed_policy_stays_stable_when_new_members_change_rendezvous() {
         let a_addr = addr(33401);
         let b_addr = addr(33402);
@@ -2370,6 +2474,25 @@ mod tests {
         let bytes = append.to_wire_bytes().unwrap();
         let decoded = FabricStreamReplicaAppend::from_wire_bytes(&bytes).unwrap();
         assert_eq!(decoded, append);
+
+        // Older experimental senders did not include the additive ordered
+        // replica list. Decoding remains compatible and marks that condition
+        // with an empty list so receivers can use the legacy bootstrap path.
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        legacy
+            .as_object_mut()
+            .expect("replica envelope serializes as an object")
+            .remove("replicas");
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        let decoded_legacy =
+            FabricStreamReplicaAppend::from_wire_bytes(&legacy_bytes).unwrap();
+        assert!(decoded_legacy.replicas.is_empty());
+        assert_eq!(decoded_legacy.stream, append.stream);
+        assert_eq!(decoded_legacy.leader, append.leader);
+        assert_eq!(
+            decoded_legacy.membership_fingerprint,
+            append.membership_fingerprint
+        );
     }
 
     #[test]
