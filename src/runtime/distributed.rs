@@ -1494,6 +1494,7 @@ pub fn process_network_packets(
                                         partition: append.partition,
                                         leader: append.leader,
                                         membership_fingerprint: append.membership_fingerprint,
+                                        replication_factor: append.replication_factor,
                                         sequence: append.sequence,
                                         replica,
                                         accepted: apply.is_ok(),
