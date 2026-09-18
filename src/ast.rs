@@ -1,5 +1,6 @@
 //! Abstract Syntax Tree definitions for Nulang.
 
+use crate::authority::AuthorityGrant;
 use crate::types::{Capability, EffectRow, Span, Type, TypeVar};
 use serde::{Deserialize, Serialize};
 
@@ -192,10 +193,10 @@ pub enum Expr {
         register_as: Option<String>,
         /// Remote target: `spawn@node_expr Foo(...)`.
         target_node: Option<Box<Expr>>,
-        /// Spawn-time capability grants: `spawn Foo() with [Net::TcpOut("h:p")]`.
-        /// Each entry is a canonical capability token string (e.g.
-        /// `Net::TcpOut(api.stripe.com:443)`); empty = no grants.
-        capabilities: Vec<String>,
+        /// Spawn-time external authority grants: `spawn Foo() with [Net::TcpOut("h:p")]`.
+        /// Authority is structural in the semantic pipeline; canonical string
+        /// tokens are produced only at stable artifact/runtime boundaries.
+        capabilities: Vec<AuthorityGrant>,
         span: Span,
     },
     /// Message send: actor ! behavior(args)
