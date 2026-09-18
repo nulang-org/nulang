@@ -176,6 +176,74 @@ impl FileFabricStreamStore {
 
     pub fn append(&mut self, name: &str, payload: &[u8]) -> io::Result<u64> {
         self.ensure_state(name)?;
+        let sequence = self
+            .states
+            .get(name)
+            .expect("stream state must exist after ensure_state")
+            .next_sequence;
+        self.append_exact(name, sequence, payload)?;
+        Ok(sequence)
+    }
+
+    /// Apply a replicated record at an exact sequence.
+    ///
+    /// Returns `Ok(true)` when a new record was appended and `Ok(false)`
+    /// when the same sequence+payload was already present (idempotent retry).
+    /// Sequence gaps and conflicting duplicates fail closed.
+    pub fn append_replica(
+        &mut self,
+        name: &str,
+        sequence: u64,
+        payload: &[u8],
+    ) -> io::Result<bool> {
+        self.ensure_state(name)?;
+        let next_sequence = self
+            .states
+            .get(name)
+            .expect("stream state must exist after ensure_state")
+            .next_sequence;
+
+        if sequence < next_sequence {
+            let existing = self.read_from(name, sequence, 1)?;
+            return match existing.first() {
+                Some(record) if record.sequence == sequence && record.payload == payload => Ok(false),
+                Some(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Fabric replica conflict at sequence {sequence}: existing payload differs"
+                    ),
+                )),
+                None => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Fabric replica sequence {sequence} is below next sequence {next_sequence} but missing from the log"
+                    ),
+                )),
+            };
+        }
+        if sequence > next_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric replica sequence gap: got {sequence}, expected {next_sequence}"
+                ),
+            ));
+        }
+
+        self.append_exact(name, sequence, payload)?;
+        Ok(true)
+    }
+
+    pub fn stream_config(&mut self, name: &str) -> io::Result<FabricStreamConfig> {
+        self.ensure_state(name)?;
+        Ok(self
+            .states
+            .get(name)
+            .expect("stream state must exist after ensure_state")
+            .config)
+    }
+
+    fn append_exact(&mut self, name: &str, sequence: u64, payload: &[u8]) -> io::Result<()> {
         if payload.len() > u32::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -183,13 +251,21 @@ impl FileFabricStreamStore {
             ));
         }
 
-        let (sequence, config, mut segment_base, mut segment_len) = {
+        let (config, mut segment_base, mut segment_len) = {
             let state = self
                 .states
                 .get(name)
-                .expect("stream state must exist after ensure_state");
+                .expect("stream state must exist before append_exact");
+            if state.next_sequence != sequence {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Fabric append sequence mismatch: got {sequence}, expected {}",
+                        state.next_sequence
+                    ),
+                ));
+            }
             (
-                state.next_sequence,
                 state.config,
                 state.current_segment_base,
                 state.current_segment_len,
@@ -243,7 +319,7 @@ impl FileFabricStreamStore {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Fabric sequence overflow"))?;
         state.current_segment_base = segment_base;
         state.current_segment_len = segment_len + frame.len() as u64;
-        Ok(sequence)
+        Ok(())
     }
 
     pub fn read_from(
@@ -408,6 +484,10 @@ impl Runtime {
 
     pub fn fabric_stream_info(&mut self, name: &str) -> io::Result<FabricStreamInfo> {
         self.fabric_stream_store_mut()?.stream_info(name)
+    }
+
+    pub fn fabric_stream_config(&mut self, name: &str) -> io::Result<FabricStreamConfig> {
+        self.fabric_stream_store_mut()?.stream_config(name)
     }
 
     fn fabric_stream_store_mut(&mut self) -> io::Result<&mut FileFabricStreamStore> {
@@ -860,6 +940,28 @@ mod tests {
             .expect_err("checksum corruption must fail closed");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("checksum mismatch"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replica_append_is_exact_and_idempotent() {
+        let root = test_dir("replica");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+
+        assert!(store.append_replica("events", 1, b"a").unwrap());
+        assert!(!store.append_replica("events", 1, b"a").unwrap());
+        assert!(store.append_replica("events", 1, b"different").is_err());
+        assert!(store.append_replica("events", 3, b"gap").is_err());
+        assert!(store.append_replica("events", 2, b"b").unwrap());
+
+        let records = store.read_from("events", 1, 10).unwrap();
+        assert_eq!(
+            records.iter().map(|record| record.sequence).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         let _ = fs::remove_dir_all(root);
     }
 
