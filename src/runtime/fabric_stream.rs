@@ -279,6 +279,26 @@ impl FileFabricStreamStore {
         Ok(())
     }
 
+    pub fn stream_names(&self) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() || !entry.path().join("meta.json").is_file() {
+                continue;
+            }
+            let name = entry.file_name().into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric stream directory name is not valid UTF-8",
+                )
+            })?;
+            validate_name("stream", &name)?;
+            names.push(name);
+        }
+        names.sort();
+        Ok(names)
+    }
+
     pub fn stream_info(&mut self, name: &str) -> io::Result<FabricStreamInfo> {
         self.ensure_state(name)?;
         let state = self
@@ -1149,6 +1169,10 @@ impl Runtime {
 
     pub fn fabric_stream_info(&mut self, name: &str) -> io::Result<FabricStreamInfo> {
         self.fabric_stream_store_mut()?.stream_info(name)
+    }
+
+    pub fn fabric_stream_names(&mut self) -> io::Result<Vec<String>> {
+        self.fabric_stream_store_mut()?.stream_names()
     }
 
     pub fn fabric_stream_committed_sequence(&mut self, name: &str) -> io::Result<u64> {
