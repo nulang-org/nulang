@@ -815,7 +815,10 @@ impl Runtime {
         }
 
         let placement = self.fabric_stream_placement(stream, partition, replication_factor)?;
-        let local = self.distributed.node_id.expect("placement validated node id");
+        let local = self
+            .distributed
+            .node_id
+            .expect("placement validated node id");
         if placement.leader != local {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -1004,7 +1007,10 @@ impl Runtime {
             ));
         }
 
-        let local = self.distributed.node_id.expect("placement validated node id");
+        let local = self
+            .distributed
+            .node_id
+            .expect("placement validated node id");
         if !placement.replicas.contains(&local) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
