@@ -14,7 +14,7 @@ use std::cmp::Reverse;
 use std::io;
 
 use crate::runtime::{
-    FabricStreamConfig, MessagePriority, NodeId, NodeStatus, Packet, Runtime,
+    ClusterState, FabricStreamConfig, MessagePriority, NodeId, NodeStatus, Packet, Runtime,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,66 +131,19 @@ impl Runtime {
         partition: u16,
         replication_factor: usize,
     ) -> io::Result<FabricStreamPlacement> {
-        if stream.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Fabric stream name cannot be empty",
-            ));
-        }
-        if replication_factor == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Fabric stream replication_factor must be at least 1",
-            ));
-        }
-
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
                 "Fabric stream placement requires distribution to be enabled",
             )
         })?;
-
-        let mut candidates: Vec<NodeId> = match self.distributed.cluster.as_ref() {
-            Some(cluster) => cluster
-                .all_members()
-                .into_iter()
-                .filter(|member| {
-                    member.status != NodeStatus::Leaving && !cluster.is_removed(member.node_id)
-                })
-                .map(|member| member.node_id)
-                .collect(),
-            None => vec![local],
-        };
-        candidates.sort_unstable();
-        candidates.dedup();
-
-        if replication_factor > candidates.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Fabric stream replication_factor {replication_factor} exceeds known membership {}",
-                    candidates.len()
-                ),
-            ));
-        }
-
-        let membership_fingerprint = membership_fingerprint(&candidates);
-        candidates.sort_by_key(|node| {
-            Reverse((rendezvous_score(stream, partition, *node), Reverse(node.0)))
-        });
-        let replicas: Vec<NodeId> = candidates.into_iter().take(replication_factor).collect();
-        let leader = *replicas
-            .first()
-            .expect("replication factor validation guarantees one replica");
-
-        Ok(FabricStreamPlacement {
-            stream: stream.to_string(),
+        compute_stream_placement(
+            local,
+            self.distributed.cluster.as_ref(),
+            stream,
             partition,
-            leader,
-            replicas,
-            membership_fingerprint,
-        })
+            replication_factor,
+        )
     }
 
     /// Commit one leader-local record and produce the exact replica envelope.
@@ -345,6 +298,40 @@ impl Runtime {
         &mut self,
         append: &FabricStreamReplicaAppend,
     ) -> io::Result<bool> {
+        let placement = self.fabric_stream_placement(
+            &append.stream,
+            append.partition,
+            append.replication_factor,
+        )?;
+        self.fabric_stream_apply_replica_with_placement(append, placement)
+    }
+
+    pub(crate) fn fabric_stream_apply_replica_from_cluster(
+        &mut self,
+        append: &FabricStreamReplicaAppend,
+        cluster: &ClusterState,
+    ) -> io::Result<bool> {
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream placement requires distribution to be enabled",
+            )
+        })?;
+        let placement = compute_stream_placement(
+            local,
+            Some(cluster),
+            &append.stream,
+            append.partition,
+            append.replication_factor,
+        )?;
+        self.fabric_stream_apply_replica_with_placement(append, placement)
+    }
+
+    fn fabric_stream_apply_replica_with_placement(
+        &mut self,
+        append: &FabricStreamReplicaAppend,
+        placement: FabricStreamPlacement,
+    ) -> io::Result<bool> {
         if append.partition != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -352,11 +339,6 @@ impl Runtime {
             ));
         }
 
-        let placement = self.fabric_stream_placement(
-            &append.stream,
-            append.partition,
-            append.replication_factor,
-        )?;
         if placement.membership_fingerprint != append.membership_fingerprint {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -405,6 +387,69 @@ impl Runtime {
 
         store.append_replica(&append.stream, append.sequence, &append.payload)
     }
+
+}
+
+fn compute_stream_placement(
+    local: NodeId,
+    cluster: Option<&ClusterState>,
+    stream: &str,
+    partition: u16,
+    replication_factor: usize,
+) -> io::Result<FabricStreamPlacement> {
+    if stream.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Fabric stream name cannot be empty",
+        ));
+    }
+    if replication_factor == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Fabric stream replication_factor must be at least 1",
+        ));
+    }
+
+    let mut candidates: Vec<NodeId> = match cluster {
+        Some(cluster) => cluster
+            .all_members()
+            .into_iter()
+            .filter(|member| {
+                member.status != NodeStatus::Leaving && !cluster.is_removed(member.node_id)
+            })
+            .map(|member| member.node_id)
+            .collect(),
+        None => vec![local],
+    };
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    if replication_factor > candidates.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Fabric stream replication_factor {replication_factor} exceeds known membership {}",
+                candidates.len()
+            ),
+        ));
+    }
+
+    let membership_fingerprint = membership_fingerprint(&candidates);
+    candidates.sort_by_key(|node| {
+        Reverse((rendezvous_score(stream, partition, *node), Reverse(node.0)))
+    });
+    let replicas: Vec<NodeId> = candidates.into_iter().take(replication_factor).collect();
+    let leader = *replicas
+        .first()
+        .expect("replication factor validation guarantees one replica");
+
+    Ok(FabricStreamPlacement {
+        stream: stream.to_string(),
+        partition,
+        leader,
+        replicas,
+        membership_fingerprint,
+    })
 }
 
 fn membership_fingerprint(nodes: &[NodeId]) -> u64 {
