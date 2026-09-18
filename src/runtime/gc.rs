@@ -610,7 +610,30 @@ impl OrcaGc {
             (header.payload_size, header.type_tag, header.actor_id)
         };
 
-        if owner == self.actor_id
+        if owner == self.actor_id && type_tag == TypeTag::ArrayBuilder {
+            // ArrayBuilder payload:
+            //   slot 0 = logical len
+            //   slot 1 = capacity
+            //   slots 2..2+capacity = element storage
+            // Only initialized element slots own counted references. Spare
+            // capacity is always nil-initialized and must not participate in
+            // retain/release accounting.
+            let slot_count = size / std::mem::size_of::<crate::vm::Value>();
+            if slot_count >= 2 {
+                let slots =
+                    std::slice::from_raw_parts(payload_ptr as *const crate::vm::Value, slot_count);
+                let len = slots[0]
+                    .as_int()
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                let initialized = len.min(slot_count.saturating_sub(2));
+                for slot in &slots[2..2 + initialized] {
+                    if let Some(child) = slot.as_ptr() {
+                        self.drop_local_ref(heap, child);
+                    }
+                }
+            }
+        } else if owner == self.actor_id
             && matches!(
                 type_tag,
                 TypeTag::Array | TypeTag::Record | TypeTag::Tuple | TypeTag::Map
