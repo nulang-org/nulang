@@ -291,13 +291,16 @@ the per-function wrappers); otherwise the whole file runs as a single test.
 nulang nula build-wasm
 ```
 
-`nula build-wasm` compiles the entry point with the WASM backend and emits
-`<name>.wasm` plus an AOT-compiled `<name>.cwasm` into `.nula/dist/`.
+`nula build-wasm` resolves the package once, then uses the same checked compilation
+unit to emit `<name>.wasm` and `<name>.behavior.json` into `.nula/dist/`. The
+Behavior Manifest is digest-bound to the exact WASM bytes and records compiler,
+source-closure, dependency-lock, inferred-effect, and requested-authority
+provenance. The command then AOT-precompiles those WASM bytes to `<name>.cwasm`.
 
 :::caution
 This requires a `nulang` binary built with the `wasm-backend` cargo feature
 (not enabled by default). Without it the command fails with
-`wasm backend not compiled in (enable 'wasm-backend' feature)`.
+`nula build-wasm requires a Nulang build with the 'wasm-backend' feature`.
 :::
 
 ## Publishing
