@@ -1446,7 +1446,7 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
                         ) =>
                     {
                         is_float[l.0 as usize] || is_float[r.0 as usize]
-                        }
+                    }
                     _ => false,
                 };
                 if result && !is_float[dst.0 as usize] {
@@ -3190,6 +3190,7 @@ mod tests {
                 name: "__main".into(),
                 type_params: vec![],
                 params: vec![],
+                param_caps: vec![],
                 dict_params: vec![],
                 ret: crate::types::Type::unit(),
                 effect: crate::types::EffectRow::empty(),
