@@ -2472,10 +2472,11 @@ fn build_perform_name_cache(module: &CodeModule) -> Vec<Option<CachedPerformName
         let Some(Constant::String(name)) = module.constants.get(idx) else {
             continue;
         };
-        if let Some(slot) = cache.get_mut(idx) {
-            if slot.is_none() {
-                *slot = Some(CachedPerformName::new(name));
-            }
+        let Some(slot) = cache.get_mut(idx) else {
+            continue;
+        };
+        if slot.is_none() {
+            *slot = Some(CachedPerformName::new(name));
         }
     }
     cache
@@ -8007,9 +8008,7 @@ mod vm_tests {
     #[test]
     fn test_perform_name_cache_tracks_only_perform_constants() {
         let mut module = CodeModule::new("test_perform_name_cache");
-        module
-            .constants
-            .push(Constant::String("Float.sqrt".to_string()));
+        module.constants.push(Constant::String("Float.sqrt".to_string()));
         module
             .constants
             .push(Constant::String("unused.constant".to_string()));
