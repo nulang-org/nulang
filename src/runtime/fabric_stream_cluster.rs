@@ -109,6 +109,7 @@ pub struct FabricStreamCatchUpReport {
 #[derive(Debug, Clone)]
 pub(crate) struct FabricStreamReplicaAckOutcome {
     pub placement: FabricStreamPlacement,
+    pub epoch: u64,
     pub committed_sequence: u64,
 }
 
@@ -385,6 +386,17 @@ impl Runtime {
         }
     }
 
+    fn fabric_stream_current_policy_for_placement(
+        &mut self,
+        placement: &FabricStreamPlacement,
+    ) -> io::Result<FabricStreamReplicationPolicy> {
+        let epoch = self
+            .fabric_stream_replication_policy(&placement.stream)?
+            .map(|policy| policy.epoch)
+            .unwrap_or(FABRIC_STREAM_INITIAL_EPOCH);
+        self.fabric_stream_policy_for_placement(placement, epoch)
+    }
+
     /// Append locally as leader, create a pending quorum ticket, and dispatch
     /// the replica envelope to reachable followers.
     pub fn fabric_stream_replicated_append(
@@ -402,8 +414,7 @@ impl Runtime {
         }
 
         let placement = self.fabric_stream_placement(stream, partition, replication_factor)?;
-        let policy =
-            self.fabric_stream_policy_for_placement(&placement, FABRIC_STREAM_INITIAL_EPOCH)?;
+        let policy = self.fabric_stream_current_policy_for_placement(&placement)?;
         let local = self
             .distributed
             .node_id
@@ -581,9 +592,11 @@ impl Runtime {
                 intent.partition,
                 intent.replication_factor,
             )?;
+            let policy = self.fabric_stream_policy_for_placement(&placement, intent.epoch)?;
             let intent_replicas: Vec<NodeId> =
                 intent.replicas.iter().copied().map(NodeId).collect();
-            if placement.leader.0 != intent.leader
+            if policy.epoch != intent.epoch
+                || placement.leader.0 != intent.leader
                 || placement.membership_fingerprint != intent.membership_fingerprint
                 || placement.replicas != intent_replicas
             {
@@ -618,6 +631,7 @@ impl Runtime {
             entries.insert(
                 intent.sequence,
                 PendingReplicaCommit {
+                    epoch: intent.epoch,
                     leader: placement.leader,
                     membership_fingerprint: placement.membership_fingerprint,
                     replicas: placement.replicas.iter().copied().collect(),
@@ -703,7 +717,9 @@ impl Runtime {
 
             let placement =
                 self.fabric_stream_placement(stream, partition, ticket.replicas.len())?;
-            if placement.leader != ticket.leader
+            let policy = self.fabric_stream_policy_for_placement(&placement, ticket.epoch)?;
+            if policy.epoch != ticket.epoch
+                || placement.leader != ticket.leader
                 || placement.membership_fingerprint != ticket.membership_fingerprint
                 || placement.replicas.iter().copied().collect::<HashSet<_>>() != ticket.replicas
             {
@@ -716,6 +732,7 @@ impl Runtime {
             let append = FabricStreamReplicaAppend {
                 stream: stream.to_string(),
                 partition,
+                epoch: ticket.epoch,
                 leader: ticket.leader,
                 membership_fingerprint: ticket.membership_fingerprint,
                 replication_factor: ticket.replicas.len(),
@@ -836,6 +853,7 @@ impl Runtime {
             ));
         }
         let placement = self.fabric_stream_placement(stream, partition, replication_factor)?;
+        let policy = self.fabric_stream_current_policy_for_placement(&placement)?;
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -887,6 +905,7 @@ impl Runtime {
                 let append = FabricStreamReplicaAppend {
                     stream: stream.to_string(),
                     partition,
+                    epoch: policy.epoch,
                     leader: placement.leader,
                     membership_fingerprint: placement.membership_fingerprint,
                     replication_factor,
@@ -969,7 +988,9 @@ impl Runtime {
             ack.partition,
             ack.replication_factor,
         )?;
-        if current.membership_fingerprint != ack.membership_fingerprint
+        let policy = self.fabric_stream_policy_for_placement(&current, ack.epoch)?;
+        if policy.epoch != ack.epoch
+            || current.membership_fingerprint != ack.membership_fingerprint
             || current.leader != ack.leader
             || !current.replicas.contains(&ack.replica)
             || ack.replica == local
@@ -988,6 +1009,7 @@ impl Runtime {
         if ack.sequence <= committed {
             return Ok(FabricStreamReplicaAckOutcome {
                 placement: current,
+                epoch: policy.epoch,
                 committed_sequence: committed,
             });
         }
@@ -1008,6 +1030,7 @@ impl Runtime {
         let committed_sequence = self.fabric_stream_committed_sequence(&current.stream)?;
         Ok(FabricStreamReplicaAckOutcome {
             placement: current,
+            epoch: policy.epoch,
             committed_sequence,
         })
     }
@@ -1056,7 +1079,8 @@ impl Runtime {
                     )
                 })?;
 
-            if ticket.leader != ack.leader
+            if ticket.epoch != ack.epoch
+                || ticket.leader != ack.leader
                 || ticket.membership_fingerprint != ack.membership_fingerprint
             {
                 return Err(io::Error::new(
@@ -1184,6 +1208,7 @@ impl Runtime {
         }
 
         let placement = self.fabric_stream_placement(stream, partition, replication_factor)?;
+        let policy = self.fabric_stream_current_policy_for_placement(&placement)?;
         let local = self
             .distributed
             .node_id
@@ -1216,6 +1241,7 @@ impl Runtime {
         let envelope = FabricStreamReplicaAppend {
             stream: stream.to_string(),
             partition,
+            epoch: policy.epoch,
             leader: local,
             membership_fingerprint: placement.membership_fingerprint,
             replication_factor,
@@ -1248,6 +1274,7 @@ impl Runtime {
             ));
         }
 
+        self.fabric_stream_policy_for_placement(placement, append.epoch)?;
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -1318,6 +1345,12 @@ impl Runtime {
         target: NodeId,
         append: &FabricStreamReplicaAppend,
     ) -> io::Result<bool> {
+        let placement = self.fabric_stream_placement(
+            &append.stream,
+            append.partition,
+            append.replication_factor,
+        )?;
+        self.fabric_stream_policy_for_placement(&placement, append.epoch)?;
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -1376,6 +1409,7 @@ impl Runtime {
         if committed_sequence == 0 {
             return Ok(false);
         }
+        let policy = self.fabric_stream_current_policy_for_placement(placement)?;
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -1402,6 +1436,7 @@ impl Runtime {
         let update = FabricStreamCommitUpdate {
             stream: placement.stream.clone(),
             partition: placement.partition,
+            epoch: policy.epoch,
             leader: placement.leader,
             membership_fingerprint: placement.membership_fingerprint,
             replication_factor: placement.replicas.len(),
@@ -1468,7 +1503,9 @@ impl Runtime {
             update.partition,
             update.replication_factor,
         )?;
-        if placement.leader != update.leader
+        let policy = self.fabric_stream_policy_for_placement(&placement, update.epoch)?;
+        if policy.epoch != update.epoch
+            || placement.leader != update.leader
             || placement.membership_fingerprint != update.membership_fingerprint
             || !placement.replicas.contains(&local)
             || local == placement.leader
@@ -1577,7 +1614,18 @@ impl Runtime {
             Err(error) => return Err(error),
         }
 
-        store.append_replica(&append.stream, append.sequence, &append.payload)
+        // Release the store borrow before validating/establishing durable
+        // epoch policy through Runtime.
+        let _ = store;
+        let policy = self.fabric_stream_policy_for_placement(&placement, append.epoch)?;
+        if policy.epoch != append.epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stale Fabric stream replica append epoch",
+            ));
+        }
+        self.fabric_stream_store_mut()?
+            .append_replica(&append.stream, append.sequence, &append.payload)
     }
 }
 
