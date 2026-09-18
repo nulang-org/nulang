@@ -49,10 +49,11 @@ use super::fabric_stream_cluster::{
     FABRIC_STREAM_REPLICA_BEHAVIOR,
 };
 use super::fabric_stream_epoch::{
-    FabricStreamEpochCommit, FabricStreamEpochPrepare, FabricStreamEpochRepairBatch,
-    FabricStreamEpochVote, FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR,
-    FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR, FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR,
-    FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
+    FabricStreamEpochCommit, FabricStreamEpochPrepare, FabricStreamEpochPullRequest,
+    FabricStreamEpochPullResponse, FabricStreamEpochRepairBatch, FabricStreamEpochVote,
+    FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR, FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR,
+    FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR, FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR,
+    FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
 };
 use super::mailbox::{Message, MessagePriority};
 use super::network::{NetworkTransport, Packet};
@@ -1770,6 +1771,117 @@ pub fn process_network_packets(
                 if let Err(error) = result {
                     warn!(
                         "nulang-fabric-stream: rejected epoch prepare from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch pull-request sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochPullRequest::from_wire_bytes(bytes)
+                            .and_then(|request| {
+                                let response = runtime
+                                    .fabric_stream_build_epoch_pull_response(
+                                        &request,
+                                        incoming.from_node,
+                                        cluster,
+                                    )?;
+                                let response_bytes = response.to_wire_bytes()?;
+                                let requester = NodeId(response.requester);
+                                let address = cluster
+                                    .get_node(requester)
+                                    .map(|info| info.address)
+                                    .or_else(|| transport.connection_addr(requester))
+                                    .ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "Fabric epoch pull requester address is unavailable",
+                                        )
+                                    })?;
+                                let local = runtime.distributed.node_id.ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "Fabric epoch pull source has no local NodeId",
+                                    )
+                                })?;
+                                transport.send(
+                                    requester,
+                                    address,
+                                    Packet::ActorMessage {
+                                        target_actor: 0,
+                                        behavior_name:
+                                            FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR.to_string(),
+                                        content_hash: None,
+                                        payload: Vec::new(),
+                                        string_table: Vec::new(),
+                                        object_table: vec![(0, response_bytes)],
+                                        sender_actor: 0,
+                                        sender_node: local,
+                                        priority: MessagePriority::System,
+                                        trace_id: None,
+                                    },
+                                );
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch pull request must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch pull request from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch pull-response sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochPullResponse::from_wire_bytes(bytes)
+                            .and_then(|response| {
+                                runtime
+                                    .fabric_stream_apply_epoch_pull_response(
+                                        &response,
+                                        incoming.from_node,
+                                        cluster,
+                                    )
+                                    .map(|_| ())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch pull response must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch pull response from {:?}: {}",
                         incoming.from_node, error
                     );
                 }
