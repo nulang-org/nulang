@@ -2169,7 +2169,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                 }
             }
             source
-        },
+        }
         Expr::Recover { body: b, .. } => lower_expr(b, body),
         Expr::Defer { expr, .. } => {
             // Defer is handled at block level; standalone defer is a no-op.
@@ -2780,11 +2780,7 @@ fn transfer(lineariso owned: Int, val shared: Int, plain: Int) -> Int {
 
         assert_eq!(
             f.param_caps,
-            vec![
-                Capability::LinearIso,
-                Capability::Val,
-                Capability::Ref,
-            ]
+            vec![Capability::LinearIso, Capability::Val, Capability::Ref,]
         );
     }
 
