@@ -563,6 +563,168 @@ pub(crate) fn strbuilder_op(
 }
 
 // ---------------------------------------------------------------------------
+// ArrayBuilder builtin — capability-safe mutable array construction buffer
+// ---------------------------------------------------------------------------
+//
+// Payload (allocated with `HeapTypeTag::ArrayBuilder` and laid out as Values):
+//   slot 0            logical len (Int)
+//   slot 1            capacity (Int)
+//   slots 2..2+cap    element storage; spare slots are always nil
+//
+// Initialized element slots own counted references exactly like canonical
+// Array slots. Growth allocates a fresh builder, copies only initialized
+// elements, and retains each copied pointer once. The old builder remains
+// valid until its owning Value is dropped, so aliases remain memory-safe.
+//
+// Builders are intentionally runtime-only. Durable continuation serialization
+// rejects them; callers must materialize with `to_array` before suspension.
+const ARRAYBUILDER_META_SLOTS: usize = 2;
+const ARRAYBUILDER_INITIAL_CAPACITY: usize = 8;
+
+fn arraybuilder_meta(ptr: *mut u8) -> Option<(usize, usize)> {
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe {
+        let header = &*ActorHeap::header_of(ptr);
+        if header.type_tag != HeapTypeTag::ArrayBuilder {
+            return None;
+        }
+        let slot_count = header.payload_size / std::mem::size_of::<Value>();
+        if slot_count < ARRAYBUILDER_META_SLOTS {
+            return None;
+        }
+        let slots = std::slice::from_raw_parts(ptr as *const Value, slot_count);
+        let len = slots[0].as_int()?.max(0) as usize;
+        let cap = slots[1].as_int()?.max(0) as usize;
+        if cap > slot_count - ARRAYBUILDER_META_SLOTS || len > cap {
+            return None;
+        }
+        Some((len, cap))
+    }
+}
+
+fn alloc_arraybuilder(
+    callbacks: &mut dyn ActorVmCallbacks,
+    capacity: usize,
+) -> Option<*mut u8> {
+    let capacity = capacity.max(1);
+    let slot_count = ARRAYBUILDER_META_SLOTS.checked_add(capacity)?;
+    let bytes = slot_count.checked_mul(std::mem::size_of::<Value>())?;
+    let ptr = callbacks.alloc(bytes, HeapTypeTag::ArrayBuilder)?;
+    unsafe {
+        let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, slot_count);
+        for slot in slots.iter_mut() {
+            *slot = Value::nil();
+        }
+        slots[0] = Value::int(0);
+        slots[1] = Value::int(capacity as i64);
+    }
+    Some(ptr)
+}
+
+pub(crate) fn arraybuilder_op(
+    callbacks: &mut dyn ActorVmCallbacks,
+    op: &str,
+    regs: &[Value],
+) -> Option<Value> {
+    match op {
+        "new" => {
+            let ptr = alloc_arraybuilder(callbacks, ARRAYBUILDER_INITIAL_CAPACITY)?;
+            Some(unsafe {
+                /* SAFETY: callbacks.alloc returned a live allocation in the current VM/actor domain. */
+                Value::ptr(ptr)
+            })
+        }
+        "push" => {
+            let builder = regs.first()?.as_ptr()?;
+            let elem = *regs.get(1)?;
+            let (len, cap) = arraybuilder_meta(builder)?;
+
+            if len < cap {
+                if let Some(child) = elem.as_ptr() {
+                    callbacks.retain_ref(child);
+                }
+                unsafe {
+                    let slots = std::slice::from_raw_parts_mut(
+                        builder as *mut Value,
+                        ARRAYBUILDER_META_SLOTS + cap,
+                    );
+                    slots[ARRAYBUILDER_META_SLOTS + len] = elem;
+                    slots[0] = Value::int((len + 1) as i64);
+                }
+                return Some(unsafe {
+                    /* SAFETY: builder was validated as a live ArrayBuilder allocation. */
+                    Value::ptr(builder)
+                });
+            }
+
+            let new_cap = cap
+                .checked_mul(2)?
+                .max(ARRAYBUILDER_INITIAL_CAPACITY)
+                .max(len.checked_add(1)?);
+            let new_builder = alloc_arraybuilder(callbacks, new_cap)?;
+            unsafe {
+                let old_slots = std::slice::from_raw_parts(
+                    builder as *const Value,
+                    ARRAYBUILDER_META_SLOTS + cap,
+                );
+                let new_slots = std::slice::from_raw_parts_mut(
+                    new_builder as *mut Value,
+                    ARRAYBUILDER_META_SLOTS + new_cap,
+                );
+                for i in 0..len {
+                    let value = old_slots[ARRAYBUILDER_META_SLOTS + i];
+                    if let Some(child) = value.as_ptr() {
+                        callbacks.retain_ref(child);
+                    }
+                    new_slots[ARRAYBUILDER_META_SLOTS + i] = value;
+                }
+                if let Some(child) = elem.as_ptr() {
+                    callbacks.retain_ref(child);
+                }
+                new_slots[ARRAYBUILDER_META_SLOTS + len] = elem;
+                new_slots[0] = Value::int((len + 1) as i64);
+            }
+            Some(unsafe {
+                /* SAFETY: alloc_arraybuilder returned a live allocation in the current domain. */
+                Value::ptr(new_builder)
+            })
+        }
+        "len" => {
+            let builder = regs.first()?.as_ptr()?;
+            let (len, _) = arraybuilder_meta(builder)?;
+            Some(Value::int(len as i64))
+        }
+        "to_array" => {
+            let builder = regs.first()?.as_ptr()?;
+            let (len, cap) = arraybuilder_meta(builder)?;
+            let bytes = len.checked_mul(std::mem::size_of::<Value>())?;
+            let array_ptr = callbacks.alloc(bytes, HeapTypeTag::Array)?;
+            unsafe {
+                let old_slots = std::slice::from_raw_parts(
+                    builder as *const Value,
+                    ARRAYBUILDER_META_SLOTS + cap,
+                );
+                let new_slots = std::slice::from_raw_parts_mut(array_ptr as *mut Value, len);
+                for i in 0..len {
+                    let value = old_slots[ARRAYBUILDER_META_SLOTS + i];
+                    if let Some(child) = value.as_ptr() {
+                        callbacks.retain_ref(child);
+                    }
+                    new_slots[i] = value;
+                }
+            }
+            Some(unsafe {
+                /* SAFETY: callbacks.alloc returned a live canonical Array allocation. */
+                Value::ptr(array_ptr)
+            })
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Map builtin — mutable hash map, open addressing over Value slots
 // ---------------------------------------------------------------------------
 //
@@ -1535,6 +1697,9 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
         }
         if effect_name == "StrBuilder" {
             return strbuilder_op(self, constants, op_name.unwrap_or(""), regs);
+        }
+        if effect_name == "ArrayBuilder" {
+            return arraybuilder_op(self, op_name.unwrap_or(""), regs);
         }
         if effect_name == "Map" {
             return hashmap_op(self, constants, op_name.unwrap_or(""), regs);
@@ -7921,6 +8086,54 @@ mod vm_tests {
             Some(42),
             "outer handler resumes with 42"
         );
+    }
+
+    #[test]
+    fn test_arraybuilder_growth_and_materialization() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let mut builder = arraybuilder_op(&mut callbacks, "new", &[]).expect("builder");
+
+        for i in 0..32 {
+            builder = arraybuilder_op(&mut callbacks, "push", &[builder, Value::int(i)])
+                .expect("push");
+        }
+
+        let len = arraybuilder_op(&mut callbacks, "len", &[builder]).expect("len");
+        assert_eq!(len.as_int(), Some(32));
+
+        let array = arraybuilder_op(&mut callbacks, "to_array", &[builder]).expect("array");
+        let array_ptr = array.as_ptr().expect("array ptr");
+        assert_eq!(callbacks.array_len(array_ptr), Some(32));
+        unsafe {
+            let slots = std::slice::from_raw_parts(array_ptr as *const Value, 32);
+            for (i, value) in slots.iter().enumerate() {
+                assert_eq!(value.as_int(), Some(i as i64));
+            }
+        }
+    }
+
+    #[test]
+    fn test_arraybuilder_balances_pointer_retain_on_drop() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let child = callbacks.alloc_string("child");
+        let child_ptr = child.as_ptr().expect("child ptr");
+        let builder = arraybuilder_op(&mut callbacks, "new", &[]).expect("builder");
+        let builder = arraybuilder_op(&mut callbacks, "push", &[builder, child]).expect("push");
+
+        unsafe {
+            assert_eq!((*ActorHeap::header_of(child_ptr)).ref_count, 2);
+        }
+
+        callbacks.drop_ref(builder.as_ptr().expect("builder ptr"));
+
+        unsafe {
+            assert_eq!(
+                (*ActorHeap::header_of(child_ptr)).ref_count,
+                1,
+                "dropping the builder must release its initialized element exactly once"
+            );
+        }
+        callbacks.drop_ref(child_ptr);
     }
 
     /// Regression: `perform IO.print` in a standalone script (no handler on
