@@ -6130,6 +6130,80 @@ mod vm_tests {
     use super::*;
     use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
 
+    fn host_sink_test_module() -> crate::bytecode::CodeModule {
+        let mut b = crate::mir::FunctionBuilder::new("take", Some(crate::types::Type::int()));
+        let param = b.add_param_with_cap(
+            "p",
+            crate::types::Type::unit(),
+            crate::types::Capability::LinearIso,
+        );
+        let len = b.add_temp(crate::types::Type::int());
+        b.assign(len, crate::mir::RValue::ArrayLen(param));
+        b.terminate(crate::mir::Terminator::Return(Some(len)));
+
+        let mut module = crate::mir::Module::new("host_sink");
+        module.functions.push(b.build());
+        crate::mir_codegen::compile_mir(&mut module, "host_sink").expect("compile host sink")
+    }
+
+    #[test]
+    fn test_call_function_retains_host_pointer_for_linear_sink() {
+        let module = host_sink_test_module();
+        let offset = module.function_table[0];
+        assert_eq!(
+            module
+                .debug_functions
+                .iter()
+                .find(|info| info.code_offset == offset)
+                .map(|info| info.sink_mask),
+            Some(1),
+            "compiled linear parameter must publish sink metadata"
+        );
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let (ptr, value) = vm
+            .actor_callbacks
+            .alloc_value(std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("host array allocation");
+
+        let result = vm
+            .call_function(0, offset, &[value])
+            .expect("host call into linear sink");
+        assert_eq!(result.as_int(), Some(1));
+        assert_eq!(
+            vm.actor_callbacks.array_len(ptr),
+            Some(1),
+            "callee Drop must consume only the retained sink reference, leaving the host owner live"
+        );
+
+        vm.actor_callbacks.drop_ref(ptr);
+    }
+
+    #[test]
+    fn test_call_function_rejects_pointer_when_ownership_metadata_missing() {
+        let mut module = host_sink_test_module();
+        let offset = module.function_table[0];
+        module.debug_functions.clear();
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let (ptr, value) = vm
+            .actor_callbacks
+            .alloc_value(std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("host array allocation");
+
+        let err = vm
+            .call_function(0, offset, &[value])
+            .expect_err("pointer host call without ownership metadata must fail closed");
+        assert!(
+            err.to_string().contains("ownership metadata"),
+            "unexpected host-call error: {err}"
+        );
+        assert_eq!(vm.actor_callbacks.array_len(ptr), Some(1));
+        vm.actor_callbacks.drop_ref(ptr);
+    }
+
     /// A NULL C string return (nil from cstr_to_value) must pass through
     /// instead of erroring on the missing pointer.
     #[test]
