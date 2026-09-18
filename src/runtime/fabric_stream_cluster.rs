@@ -1674,18 +1674,33 @@ impl Runtime {
         &mut self,
         append: &FabricStreamReplicaAppend,
     ) -> io::Result<bool> {
-        let placement = self.fabric_stream_placement(
-            &append.stream,
-            append.partition,
-            append.replication_factor,
-        )?;
+        let existing_policy = match self.fabric_stream_replication_policy(&append.stream) {
+            Ok(policy) => policy,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let placement = if existing_policy.is_some() {
+            self.fabric_stream_validate_installed_policy(
+                &append.stream,
+                append.partition,
+                append.replication_factor,
+                append.epoch,
+            )?
+            .0
+        } else {
+            self.fabric_stream_placement(
+                &append.stream,
+                append.partition,
+                append.replication_factor,
+            )?
+        };
         self.fabric_stream_apply_replica_with_placement(append, placement)
     }
 
     pub(crate) fn fabric_stream_apply_commit_update_from_cluster(
         &mut self,
         update: &FabricStreamCommitUpdate,
-        cluster: &ClusterState,
+        _cluster: &ClusterState,
     ) -> io::Result<()> {
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
@@ -1693,14 +1708,12 @@ impl Runtime {
                 "Fabric stream commit update requires distribution",
             )
         })?;
-        let placement = compute_stream_placement(
-            local,
-            Some(cluster),
+        let (placement, policy) = self.fabric_stream_validate_installed_policy(
             &update.stream,
             update.partition,
             update.replication_factor,
+            update.epoch,
         )?;
-        let policy = self.fabric_stream_policy_for_placement(&placement, update.epoch)?;
         if policy.epoch != update.epoch
             || placement.leader != update.leader
             || placement.membership_fingerprint != update.membership_fingerprint
@@ -1734,19 +1747,34 @@ impl Runtime {
         append: &FabricStreamReplicaAppend,
         cluster: &ClusterState,
     ) -> io::Result<bool> {
-        let local = self.distributed.node_id.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "Fabric stream placement requires distribution to be enabled",
-            )
-        })?;
-        let placement = compute_stream_placement(
-            local,
-            Some(cluster),
-            &append.stream,
-            append.partition,
-            append.replication_factor,
-        )?;
+        let existing_policy = match self.fabric_stream_replication_policy(&append.stream) {
+            Ok(policy) => policy,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let placement = if existing_policy.is_some() {
+            self.fabric_stream_validate_installed_policy(
+                &append.stream,
+                append.partition,
+                append.replication_factor,
+                append.epoch,
+            )?
+            .0
+        } else {
+            let local = self.distributed.node_id.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "Fabric stream placement requires distribution to be enabled",
+                )
+            })?;
+            compute_stream_placement(
+                local,
+                Some(cluster),
+                &append.stream,
+                append.partition,
+                append.replication_factor,
+            )?
+        };
         self.fabric_stream_apply_replica_with_placement(append, placement)
     }
 
