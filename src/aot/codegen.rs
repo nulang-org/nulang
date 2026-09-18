@@ -2911,14 +2911,9 @@ fn compile_rvalue(
                 let name_val = builder.ins().iconst(types::I64, name_idx);
                 call_void_helper(builder, helpers, "nulang_aot_spawn_push", &[name_val, val])?;
             }
-            let manifest = crate::authority::AuthorityManifest::from_tokens(
-                capabilities.iter().map(String::as_str),
-            )
-            .map_err(|err| {
-                AotCompileError::Internal(format!(
-                    "invalid spawn authority grant in native backend: {err}"
-                ))
-            })?;
+            let manifest = crate::authority::AuthorityManifest::from_grants(
+                capabilities.iter().cloned(),
+            );
             for token in manifest.canonical_tokens() {
                 let token_val = compile_const(
                     builder,
