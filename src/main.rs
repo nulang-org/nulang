@@ -1613,10 +1613,22 @@ fn run_effects_cmd(args: &[String]) -> NuResult<()> {
         let rows: Vec<_> = report
             .iter()
             .map(|row| {
+                let origins: Vec<_> = row
+                    .origins
+                    .iter()
+                    .map(|origin| {
+                        serde_json::json!({
+                            "effect": origin.effect.to_string(),
+                            "path": &origin.path,
+                            "kind": origin.kind.to_string(),
+                        })
+                    })
+                    .collect();
                 serde_json::json!({
                     "function": &row.name,
                     "effects": row.row.to_string(),
                     "declared": row.declared,
+                    "origins": origins,
                 })
             })
             .collect();
@@ -1637,6 +1649,14 @@ fn run_effects_cmd(args: &[String]) -> NuResult<()> {
                 row.row,
                 if row.declared { "declared" } else { "inferred" }
             );
+            for origin in row.origins {
+                println!(
+                    "  {} <- {} [{}]",
+                    origin.effect,
+                    origin.path.join(" -> "),
+                    origin.kind
+                );
+            }
         }
     }
 
