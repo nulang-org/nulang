@@ -7,6 +7,7 @@
 // replacing those values with mathematical constants would change test semantics.
 #![cfg_attr(test, allow(clippy::approx_constant))]
 
+mod actor_protocol;
 pub mod agent;
 #[cfg(feature = "native-codegen")]
 pub mod aot;
@@ -82,7 +83,10 @@ pub mod stress_tests;
 pub mod tool_schema;
 pub mod type_ir;
 pub mod type_metadata;
+#[path = "typechecker_facade.rs"]
 pub mod typechecker;
+#[path = "typechecker.rs"]
+pub(crate) mod typechecker_base;
 pub mod types;
 pub mod value_layout;
 pub mod vm;
