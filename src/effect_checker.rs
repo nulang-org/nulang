@@ -4766,6 +4766,63 @@ mod tests {
     }
 
     #[test]
+    fn test_direct_lineariso_sink_accepts_matching_lineariso_argument() {
+        let ast = parse_module(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main(lineariso y: Int) -> Int { take(y) }",
+        );
+        let mut analyzer = CapabilityAnalyzer::new();
+        assert!(
+            analyzer.check_module(&ast.decls).is_ok(),
+            "matching lineariso argument should satisfy a lineariso sink"
+        );
+    }
+
+    #[test]
+    fn test_direct_lineariso_sink_rejects_reusable_ref_argument() {
+        let ast = parse_module(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main(y: Int) -> Int { take(y) }",
+        );
+        let mut analyzer = CapabilityAnalyzer::new();
+        let err = analyzer
+            .check_module(&ast.decls)
+            .expect_err("ref argument must not satisfy lineariso sink");
+        let msg = err.to_string();
+        assert!(msg.contains("ownership sink"), "unexpected error: {msg}");
+        assert!(msg.contains("lineariso"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_direct_sink_requires_same_linear_kind() {
+        let ast = parse_module(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main(linear y: Int) -> Int { take(y) }",
+        );
+        let mut analyzer = CapabilityAnalyzer::new();
+        let err = analyzer
+            .check_module(&ast.decls)
+            .expect_err("linear must not silently satisfy lineariso ownership");
+        assert!(
+            err.to_string().contains("requiring lineariso"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shadowed_module_sink_name_uses_local_call_contract() {
+        let ast = parse_module(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main(y: Int) -> Int { let take = fn(x) { x } in take(y) }",
+        );
+        let mut analyzer = CapabilityAnalyzer::new();
+        assert!(
+            analyzer.check_module(&ast.decls).is_ok(),
+            "lexically shadowed call target must not inherit module sink signature"
+        );
+    }
+
+    #[test]
     fn test_flatten_decls_recurses_into_modules() {
         let ast = parse_module("module M { module N { fn f() 1 } }");
         let flat = flatten_decls(&ast.decls);
