@@ -401,12 +401,13 @@ impl Runtime {
                     quorum,
                 },
             );
+        let retry_at = self.now() + FABRIC_STREAM_RETRY_INITIAL;
         self.distributed
             .fabric_stream_replication
             .retry_schedules
             .entry(key)
-            .or_insert_with(|| FabricStreamRetrySchedule {
-                next_attempt: self.now() + FABRIC_STREAM_RETRY_INITIAL,
+            .or_insert(FabricStreamRetrySchedule {
+                next_attempt: retry_at,
                 backoff: FABRIC_STREAM_RETRY_INITIAL,
             });
 
@@ -558,12 +559,13 @@ impl Runtime {
             .pending
             .contains_key(&(stream.to_string(), 0))
         {
+            let retry_now = self.now();
             self.distributed
                 .fabric_stream_replication
                 .retry_schedules
                 .entry((stream.to_string(), 0))
-                .or_insert_with(|| FabricStreamRetrySchedule {
-                    next_attempt: self.now(),
+                .or_insert(FabricStreamRetrySchedule {
+                    next_attempt: retry_now,
                     backoff: FABRIC_STREAM_RETRY_INITIAL,
                 });
         }
@@ -676,15 +678,11 @@ impl Runtime {
                 });
         }
 
+        let pending_key_set: HashSet<(String, u16)> = pending_keys.iter().cloned().collect();
         self.distributed
             .fabric_stream_replication
             .retry_schedules
-            .retain(|key, _| {
-                self.distributed
-                    .fabric_stream_replication
-                    .pending
-                    .contains_key(key)
-            });
+            .retain(|key, _| pending_key_set.contains(key));
 
         let due: Vec<(String, u16)> = self
             .distributed
