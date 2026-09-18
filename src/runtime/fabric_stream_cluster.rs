@@ -1839,6 +1839,10 @@ mod tests {
         assert!(follower.fabric_stream_apply_replica(&append).unwrap());
         assert!(!follower.fabric_stream_apply_replica(&append).unwrap());
 
+        let mut stale_epoch = append.clone();
+        stale_epoch.epoch = append.epoch + 1;
+        assert!(follower.fabric_stream_apply_replica(&stale_epoch).is_err());
+
         let records = follower.fabric_stream_read("events", 1, 10).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].sequence, 1);
