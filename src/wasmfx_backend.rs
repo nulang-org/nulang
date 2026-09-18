@@ -1125,7 +1125,8 @@ mod tests {
         )
         .expect_err("WasmFX must not erase ownership-sink source invalidation");
         assert!(
-            err.to_string().contains("ownership-sink calls are not supported yet"),
+            err.to_string()
+                .contains("ownership-sink calls are not supported yet"),
             "unexpected WasmFX sink error: {err}"
         );
     }
