@@ -430,9 +430,11 @@ runtime = replace_once(
     runtime,
     """        let msg = Message {
             behavior_id,
+            payload: Arc::new(payload),
 """,
     resolution + """        let msg = Message {
             behavior_id,
+            payload: Arc::new(payload),
 """,
     "cross-shard name resolution before mailbox",
 )
