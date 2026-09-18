@@ -1,0 +1,15 @@
+fn main() {
+    var b = perform ArrayBuilder.new();
+    var i = 0;
+    while i < 20 {
+        b = perform ArrayBuilder.push(b, i);
+        i = i + 1
+    };
+
+    perform IO.print(perform ArrayBuilder.len(b));
+    let xs = perform ArrayBuilder.to_array(b);
+    perform IO.print(perform Array.length(xs));
+    perform IO.print(xs[0]);
+    perform IO.print(xs[7]);
+    perform IO.print(xs[19])
+}
