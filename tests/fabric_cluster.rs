@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nulang::runtime::{
-    Actor, DeterministicNetworkTransport, FabricAdvertisement, FabricAdvertisementSnapshot,
-    NodeId, Packet, Runtime,
+    Actor, DeterministicNetworkTransport, FabricAdvertisement, FabricAdvertisementSnapshot, NodeId,
+    Packet, Runtime,
 };
 use nulang::vm::Value;
 
@@ -107,7 +107,6 @@ fn fabric_gossip_converges_routes_and_reuses_distributed_actor_transport() {
     a.process_network();
     assert_eq!(a.fabric_remote_subscription_count(), 1);
 }
-
 
 #[test]
 fn fabric_gossip_reordering_keeps_newest_snapshot_generation() {
