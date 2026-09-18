@@ -108,3 +108,65 @@ must add:
 
 The architectural boundary is intentional: the append log should remain usable
 for embedded/single-node Nulang even when cluster replication is disabled.
+
+
+## Deterministic replica placement
+
+The replication stack adds deterministic rendezvous placement over the cluster's
+stable known-membership set.
+
+For a `(stream, partition)` pair, every node independently computes the same
+ordered replica set from:
+
+- stream name,
+- partition id,
+- each known node's stable `NodeId`.
+
+The first replica is the leader. The current physical storage implementation is
+still one partition per stream, so replicated appends accept `partition = 0`
+only. The placement type already carries a partition id so later physical
+multi-partition logs do not need a new ownership contract.
+
+### Split-brain safety
+
+Placement intentionally includes `Suspicious` and `Failed` members until
+cluster membership confirms them removed. A transient network partition
+therefore does **not** move leadership just because one side stopped hearing the
+current leader.
+
+If the designated leader is unavailable, another node does not self-elect and
+write. The append fails closed. Leadership can change after confirmed removal,
+which is already guarded by the cluster's removal/quorum machinery when a
+split-brain resolver is configured.
+
+This is deliberately stricter than an availability-first broker. An explicit
+monotonic stream epoch / lease protocol is required before automatic failover
+can safely be added.
+
+### Replica append envelope
+
+A leader-local append can produce a `FabricStreamReplicaAppend` containing:
+
+- stream + partition,
+- leader NodeId,
+- stable-membership fingerprint,
+- replication factor,
+- exact leader-assigned sequence,
+- stream storage configuration,
+- payload.
+
+A receiving replica recomputes placement before accepting the envelope. It
+rejects:
+
+- stale membership fingerprints,
+- a leader that no longer matches deterministic placement,
+- delivery to a node outside the replica set,
+- sequence gaps,
+- conflicting duplicate sequences,
+- storage-configuration mismatch.
+
+Identical duplicate delivery is idempotent.
+
+This is the replica **data contract**, not yet the network/quorum protocol.
+Remote transport, ACK collection, and commit-quorum semantics remain follow-up
+work.
