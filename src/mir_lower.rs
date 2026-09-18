@@ -2616,7 +2616,7 @@ fn rvalue_use_locals(op: &mir::RValue, out: &mut Vec<mir::LocalId>) {
             out.push(*l);
             out.push(*r);
         }
-        Call { func, args } => {
+        Call { func, args, .. } => {
             if let mir::FuncRef::Local(f) = func {
                 out.push(*f);
             }
