@@ -3259,13 +3259,7 @@ impl VM {
                         .map(|f| f.regs[0])
                         .unwrap_or(Value::unit()));
                 }
-                Err(NuError::VMError { msg, span }) => {
-                    return Err(NuError::VMError {
-                        msg: self.enrich_error(msg),
-                        span,
-                    })
-                }
-                Err(e) => return Err(e),
+                Err(e) => return Err(self.finalize_execution_error(e)),
             }
         }
     }
@@ -3335,13 +3329,7 @@ impl VM {
                         .map(|f| f.regs[0])
                         .unwrap_or(Value::unit()));
                 }
-                Err(NuError::VMError { msg, span }) => {
-                    return Err(NuError::VMError {
-                        msg: self.enrich_error(msg),
-                        span,
-                    })
-                }
-                Err(e) => return Err(e),
+                Err(e) => return Err(self.finalize_execution_error(e)),
             }
         }
     }
@@ -3426,13 +3414,7 @@ impl VM {
                         .map(|f| f.regs[0])
                         .unwrap_or(Value::unit()));
                 }
-                Err(NuError::VMError { msg, span }) => {
-                    return Err(NuError::VMError {
-                        msg: self.enrich_error(msg),
-                        span,
-                    })
-                }
-                Err(e) => return Err(e),
+                Err(e) => return Err(self.finalize_execution_error(e)),
             }
         }
     }
@@ -4758,6 +4740,84 @@ impl VM {
             }
         }
         Ok(())
+    }
+    /// Find cleanup metadata for the function containing a frame's current
+    /// program counter. Runtime errors usually observe pc one past the
+    /// failing instruction, so both pc and pc-1 are accepted.
+    fn frame_cleanup_slots(&self, frame_idx: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+        let frame = self.frames.get(frame_idx)?;
+        let module = self.modules.get(frame.module_idx)?;
+        let contains = |info: &crate::bytecode::DebugFunctionInfo, pc: usize| {
+            pc >= info.code_offset && pc < info.code_offset.saturating_add(info.code_len)
+        };
+        let info = module
+            .debug_functions
+            .iter()
+            .find(|info| contains(info, frame.pc))
+            .or_else(|| {
+                frame.pc.checked_sub(1).and_then(|pc| {
+                    module.debug_functions.iter().find(|info| contains(info, pc))
+                })
+            })?;
+        Some((info.cleanup_regs.clone(), info.cleanup_spills.clone()))
+    }
+
+    /// Reclaim compiler-proven owning slots from frames permanently abandoned
+    /// by a true runtime error. Slots are cleared before the decrement,
+    /// matching OpCode::Drop and making already-dropped values harmless.
+    fn cleanup_abandoned_frames(&mut self) {
+        let cleanup: Vec<_> = (0..self.frames.len())
+            .filter_map(|frame_idx| {
+                self.frame_cleanup_slots(frame_idx)
+                    .map(|(regs, spills)| (frame_idx, regs, spills))
+            })
+            .collect();
+
+        let mut ptrs = Vec::new();
+        for (frame_idx, regs, spills) in cleanup {
+            for reg_idx in regs {
+                if let Some(reg) = self.frames[frame_idx].regs.get_mut(reg_idx) {
+                    let value = std::mem::replace(reg, Value::nil());
+                    if let Some(ptr) = value.as_ptr() {
+                        ptrs.push(ptr);
+                    }
+                }
+            }
+            for spill_idx in spills {
+                if let Some(slot) = self.frames[frame_idx].spilled.get_mut(spill_idx) {
+                    let value = std::mem::replace(slot, Value::nil());
+                    if let Some(ptr) = value.as_ptr() {
+                        ptrs.push(ptr);
+                    }
+                }
+            }
+        }
+
+        for ptr in ptrs {
+            self.actor_callbacks.drop_ref(ptr);
+        }
+
+        self.frames.clear();
+        self.current_frame_idx = None;
+        self.handler_stack.clear();
+    }
+
+    /// Preserve resumable control flow. For a real failure, capture the stack
+    /// trace while frames still exist, then reclaim and discard the frames.
+    fn finalize_execution_error(&mut self, err: NuError) -> NuError {
+        if matches!(err, NuError::Suspended(_)) || is_debug_pause(&err) {
+            return err;
+        }
+
+        let err = match err {
+            NuError::VMError { msg, span } => NuError::VMError {
+                msg: self.enrich_error(msg),
+                span,
+            },
+            other => other,
+        };
+        self.cleanup_abandoned_frames();
+        err
     }
     fn enrich_error(&self, msg: String) -> String {
         let mut e = msg;
@@ -6086,6 +6146,100 @@ mod vm_tests {
     use super::*;
     use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
 
+    #[derive(Debug)]
+    struct CountingDropCallbacks {
+        drops: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl ActorVmCallbacks for CountingDropCallbacks {
+        fn alloc(&mut self, _size: usize, _type_tag: HeapTypeTag) -> Option<*mut u8> {
+            None
+        }
+
+        fn drop_ref(&mut self, _ptr: *mut u8) {
+            self.drops.set(self.drops.get() + 1);
+        }
+
+        fn retain_ref(&mut self, _ptr: *mut u8) {}
+
+        fn array_len(&self, _ptr: *mut u8) -> Option<usize> {
+            None
+        }
+
+        fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+    }
+
+    fn cleanup_test_module() -> CodeModule {
+        let mut module = CodeModule::new("cleanup_test");
+        module.emit(Instruction::new0(OpCode::Panic));
+        module.entry_point = Some(0);
+        module.debug_functions.push(crate::bytecode::DebugFunctionInfo {
+            name: "main".to_string(),
+            code_offset: 0,
+            code_len: 1,
+            params: vec![],
+            locals: vec![],
+            cleanup_regs: vec![16],
+            cleanup_spills: vec![0],
+        });
+        module
+    }
+
+    #[test]
+    fn test_true_runtime_error_reclaims_register_and_spill_owners() {
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut vm = VM::new();
+        vm.load_module(cleanup_test_module());
+        vm.set_actor_callbacks(Box::new(CountingDropCallbacks {
+            drops: drops.clone(),
+        }));
+
+        let reg_ptr = Box::into_raw(Box::new(1u8));
+        let spill_ptr = Box::into_raw(Box::new(2u8));
+        let mut frame = Frame::new(None, 0);
+        frame.regs[16] = unsafe { Value::ptr(reg_ptr) };
+        frame.spilled.push(unsafe { Value::ptr(spill_ptr) });
+        vm.set_current_frame(frame);
+
+        let err = vm.run_from(0, 0).expect_err("panic must abandon the frame");
+        assert_eq!(drops.get(), 2, "both proven owner slots must be released");
+        assert!(vm.frames().is_empty(), "abandoned frames must be discarded");
+        assert_eq!(vm.current_frame_index(), None);
+        assert!(
+            err.to_string().contains("Stack trace:"),
+            "error must be enriched before cleanup removes the frames"
+        );
+
+        unsafe {
+            drop(Box::from_raw(reg_ptr));
+            drop(Box::from_raw(spill_ptr));
+        }
+    }
+
+    #[test]
+    fn test_suspension_preserves_owner_slots_and_frame_state() {
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut vm = VM::new();
+        vm.load_module(cleanup_test_module());
+        vm.set_actor_callbacks(Box::new(CountingDropCallbacks {
+            drops: drops.clone(),
+        }));
+
+        let reg_ptr = Box::into_raw(Box::new(3u8));
+        let mut frame = Frame::new(None, 0);
+        frame.regs[16] = unsafe { Value::ptr(reg_ptr) };
+        vm.set_current_frame(frame);
+
+        let err = vm.finalize_execution_error(NuError::Suspended(VmSuspension::SignalWait));
+        assert!(matches!(err, NuError::Suspended(VmSuspension::SignalWait)));
+        assert_eq!(drops.get(), 0, "suspension must not release resumable owners");
+        assert_eq!(vm.frames().len(), 1, "suspension must preserve the frame");
+        assert_eq!(vm.frames()[0].regs[16].as_ptr(), Some(reg_ptr));
+
+        unsafe {
+            drop(Box::from_raw(reg_ptr));
+        }
+    }
     /// A NULL C string return (nil from cstr_to_value) must pass through
     /// instead of erroring on the missing pointer.
     #[test]

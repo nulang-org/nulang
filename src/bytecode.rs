@@ -656,6 +656,19 @@ pub struct DebugFunctionInfo {
     pub params: Vec<usize>,
     /// `(register index, optional local name)` for every local.
     pub locals: Vec<(usize, Option<String>)>,
+    /// Register slots that may hold a compiler-proven owning reference while
+    /// this function is active. Used only when abandoning a frame after a
+    /// true runtime error; normal control flow still follows explicit Drop
+    /// instructions emitted by MIR Drop planning.
+    ///
+    /// Additive metadata: older NBC artifacts deserialize this as empty and
+    /// therefore keep their historical no-cleanup-on-error behavior.
+    #[serde(default)]
+    pub cleanup_regs: Vec<usize>,
+    /// Spill slots corresponding to compiler-proven owners that do not fit in
+    /// the register file. Same compatibility behavior as `cleanup_regs`.
+    #[serde(default)]
+    pub cleanup_spills: Vec<usize>,
 }
 
 /// Export table entry for library distribution.
@@ -1041,6 +1054,19 @@ mod tests {
     // CodeModule operations
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn test_debug_function_cleanup_metadata_defaults_for_old_artifacts() {
+        let json = r#"{
+            "name":"old_fn",
+            "code_offset":3,
+            "code_len":7,
+            "params":[16],
+            "locals":[[16,"x"]]
+        }"#;
+        let info: DebugFunctionInfo = serde_json::from_str(json).expect("old debug metadata");
+        assert!(info.cleanup_regs.is_empty());
+        assert!(info.cleanup_spills.is_empty());
+    }
     #[test]
     fn test_code_module_emit_and_patch() {
         let mut modl = CodeModule::new("test");
