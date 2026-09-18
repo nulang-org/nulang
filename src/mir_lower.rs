@@ -52,6 +52,7 @@ pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
 
     let mut module = ctx.finish()?;
     crate::mir_inline::inline_local_closures(&mut module);
+    crate::mir_ownership::infer_last_use_transfers(&mut module);
     Ok(module)
 }
 
