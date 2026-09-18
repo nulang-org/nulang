@@ -184,6 +184,7 @@ impl Runtime {
 
         let state = self.fabric_stream_begin_epoch_transition_state(stream, proposal.clone())?;
         if state.finalized {
+            self.fabric_stream_complete_finalized_epoch_transition(stream, &state)?;
             self.fabric_stream_dispatch_epoch_commit(&commit_from_state(stream, &state)?)?;
             return Ok(status_from_state(&state));
         }
@@ -239,6 +240,7 @@ impl Runtime {
                 )
             })?;
         if state.finalized {
+            self.fabric_stream_complete_finalized_epoch_transition(stream, &state)?;
             let commit = commit_from_state(stream, &state)?;
             self.fabric_stream_dispatch_epoch_commit(&commit)?;
             return Ok(status_from_state(&state));
@@ -372,6 +374,7 @@ impl Runtime {
 
         let state = self.fabric_stream_record_epoch_vote(&vote.stream, vote.vote)?;
         if state.finalized {
+            self.fabric_stream_complete_finalized_epoch_transition(&vote.stream, &state)?;
             return Ok(FabricStreamEpochVoteOutcome {
                 status: status_from_state(&state),
                 commit: Some(commit_from_state(&vote.stream, &state)?),
@@ -416,26 +419,41 @@ impl Runtime {
             quorum_committed,
         )?;
 
-        self.fabric_stream_install_epoch_policy(
-            &vote.stream,
-            &finalized.proposal.from_policy,
-            &finalized.proposal.to_policy,
-            &finalized.proposal.proposal_hash,
-        )?;
-        if quorum_committed > current_committed {
-            self.fabric_stream_commit_through(&vote.stream, quorum_committed)?;
-        }
-        self.fabric_stream_retire_old_epoch_pending(
-            &vote.stream,
-            finalized.proposal.from_policy.partition,
-            quorum_committed,
-        )?;
+        self.fabric_stream_complete_finalized_epoch_transition(&vote.stream, &finalized)?;
 
         let commit = commit_from_state(&vote.stream, &finalized)?;
         Ok(FabricStreamEpochVoteOutcome {
             status: status_from_state(&finalized),
             commit: Some(commit),
         })
+    }
+
+    fn fabric_stream_complete_finalized_epoch_transition(
+        &mut self,
+        stream: &str,
+        state: &FabricStreamEpochTransitionState,
+    ) -> io::Result<()> {
+        if !state.finalized {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Fabric epoch transition is not finalized",
+            ));
+        }
+        self.fabric_stream_install_epoch_policy(
+            stream,
+            &state.proposal.from_policy,
+            &state.proposal.to_policy,
+            &state.proposal.proposal_hash,
+        )?;
+        let current_committed = self.fabric_stream_committed_sequence(stream)?;
+        if state.quorum_committed_sequence > current_committed {
+            self.fabric_stream_commit_through(stream, state.quorum_committed_sequence)?;
+        }
+        self.fabric_stream_retire_old_epoch_pending(
+            stream,
+            state.proposal.from_policy.partition,
+            state.quorum_committed_sequence,
+        )
     }
 
     pub(crate) fn fabric_stream_apply_epoch_commit_from_cluster(
