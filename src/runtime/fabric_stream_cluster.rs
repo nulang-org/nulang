@@ -2062,6 +2062,108 @@ mod tests {
     }
 
     #[test]
+    fn installed_policy_stays_stable_when_new_members_change_rendezvous() {
+        let a_addr = addr(33401);
+        let b_addr = addr(33402);
+        let a_id = NodeId::new(&a_addr);
+        let b_id = NodeId::new(&b_addr);
+
+        let mut a = runtime_with_members(a_addr, &[b_addr]);
+        let mut b = runtime_with_members(b_addr, &[a_addr]);
+        let initial = a.fabric_stream_placement("stable", 0, 2).unwrap();
+        assert_eq!(
+            initial,
+            b.fabric_stream_placement("stable", 0, 2).unwrap()
+        );
+
+        let root_a = test_dir("stable-a");
+        let root_b = test_dir("stable-b");
+        a.fabric_stream_open(&root_a).unwrap();
+        b.fabric_stream_open(&root_b).unwrap();
+        a.fabric_stream_create("stable", FabricStreamConfig::default())
+            .unwrap();
+        b.fabric_stream_create("stable", FabricStreamConfig::default())
+            .unwrap();
+
+        let first = if initial.leader == a_id {
+            a.fabric_stream_prepare_replica_append("stable", 0, 2, b"one")
+                .unwrap()
+                .1
+        } else {
+            assert_eq!(initial.leader, b_id);
+            b.fabric_stream_prepare_replica_append("stable", 0, 2, b"one")
+                .unwrap()
+                .1
+        };
+        if initial.leader == a_id {
+            assert!(b.fabric_stream_apply_replica(&first).unwrap());
+        } else {
+            assert!(a.fabric_stream_apply_replica(&first).unwrap());
+        }
+
+        // Grow the cluster until raw rendezvous placement would choose a
+        // different RF2 placement. Installed stream policy must not follow it.
+        let mut dynamic_changed = false;
+        for port in 33410..33500 {
+            let peer = addr(port);
+            let peer_id = NodeId::new(&peer);
+            if peer_id == a_id || peer_id == b_id {
+                continue;
+            }
+            a.distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(peer_id, peer);
+            b.distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(peer_id, peer);
+
+            let dynamic = a.fabric_stream_placement("stable", 0, 2).unwrap();
+            if dynamic.replicas != initial.replicas
+                || dynamic.membership_fingerprint != initial.membership_fingerprint
+            {
+                dynamic_changed = true;
+                break;
+            }
+        }
+        assert!(
+            dynamic_changed,
+            "test must create membership that changes raw rendezvous placement"
+        );
+
+        let (active, second) = if initial.leader == a_id {
+            a.fabric_stream_prepare_replica_append("stable", 0, 2, b"two")
+                .unwrap()
+        } else {
+            b.fabric_stream_prepare_replica_append("stable", 0, 2, b"two")
+                .unwrap()
+        };
+        assert_eq!(active, initial);
+        assert_eq!(second.membership_fingerprint, initial.membership_fingerprint);
+        assert_eq!(second.leader, initial.leader);
+
+        if initial.leader == a_id {
+            assert!(b.fabric_stream_apply_replica(&second).unwrap());
+        } else {
+            assert!(a.fabric_stream_apply_replica(&second).unwrap());
+        }
+
+        let follower_records = if initial.leader == a_id {
+            b.fabric_stream_read("stable", 1, 10).unwrap()
+        } else {
+            a.fabric_stream_read("stable", 1, 10).unwrap()
+        };
+        assert_eq!(follower_records.len(), 2);
+        assert_eq!(follower_records[1].payload, b"two");
+
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[test]
     fn recovery_removes_intent_reserved_before_missing_append() {
         let local_addr = addr(33501);
         let local = NodeId::new(&local_addr);
