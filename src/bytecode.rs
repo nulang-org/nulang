@@ -1055,6 +1055,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_debug_function_cleanup_metadata_defaults_for_old_artifacts() {
+        let json = r#"{
+            "name":"old_fn",
+            "code_offset":3,
+            "code_len":7,
+            "params":[16],
+            "locals":[[16,"x"]]
+        }"#;
+        let info: DebugFunctionInfo = serde_json::from_str(json).expect("old debug metadata");
+        assert!(info.cleanup_regs.is_empty());
+        assert!(info.cleanup_spills.is_empty());
+    }
+    #[test]
     fn test_code_module_emit_and_patch() {
         let mut modl = CodeModule::new("test");
         assert!(modl.instructions.is_empty());
