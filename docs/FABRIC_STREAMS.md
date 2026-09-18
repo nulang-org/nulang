@@ -170,3 +170,35 @@ Identical duplicate delivery is idempotent.
 This is the replica **data contract**, not yet the network/quorum protocol.
 Remote transport, ACK collection, and commit-quorum semantics remain follow-up
 work.
+
+
+## Replica transport over NUL0 v1
+
+Replica data now has a backward-compatible transport path without adding a new
+NUL0 packet discriminant.
+
+Fabric reserves actor id `0` (already not a user actor) plus the internal
+behavior name `__nulang_fabric_stream_replica_v1`. A replica envelope is
+serialized into one object-table entry of the existing `Packet::ActorMessage`
+wire shape and sent at System priority.
+
+The receiver intercepts this reserved system message before ordinary actor
+lookup and validates:
+
+- the packet's declared sender NodeId equals the transport-authenticated peer,
+- the envelope leader equals that peer,
+- exactly one object-table entry with id 0 is present,
+- the envelope decodes within the configured size bound,
+- current deterministic placement still accepts the leader/replica set,
+- exact-sequence durable application succeeds.
+
+This keeps `WIRE_VERSION = 1` and packet discriminants unchanged.
+
+`FabricStreamReplicaDispatchReport` distinguishes intended remote replicas,
+packets dispatched to reachable members, and currently unavailable replicas.
+
+**Dispatch is not commit.** The existing NUL0 packet ACK only confirms packet
+processing at the transport layer. It is not an application-level replica fsync
+acknowledgement and is not counted as quorum durability. The next layer must add
+application ACKs and a committed sequence/index before Fabric Streams can expose
+quorum-committed records.
