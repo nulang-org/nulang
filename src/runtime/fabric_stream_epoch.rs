@@ -30,6 +30,8 @@ pub(crate) const FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR: &str =
 pub(crate) const FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR: &str = "__nulang_fabric_stream_epoch_vote_v1";
 pub(crate) const FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR: &str =
     "__nulang_fabric_stream_epoch_commit_v1";
+pub(crate) const FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR: &str =
+    "__nulang_fabric_stream_epoch_repair_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FabricStreamEpochTransitionStatus {
@@ -40,6 +42,28 @@ pub struct FabricStreamEpochTransitionStatus {
     pub quorum: usize,
     pub finalized: bool,
     pub committed_sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FabricStreamEpochRepairReport {
+    pub replicas_examined: usize,
+    pub records_dispatched: usize,
+    pub unavailable_replicas: usize,
+    pub ahead_replicas: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricStreamEpochRepairRecord {
+    pub sequence: u64,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricStreamEpochRepairBatch {
+    pub stream: String,
+    pub proposal: FabricStreamEpochProposalState,
+    pub target: u64,
+    pub records: Vec<FabricStreamEpochRepairRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +90,16 @@ pub(crate) struct FabricStreamEpochCommit {
 pub(crate) struct FabricStreamEpochVoteOutcome {
     pub status: FabricStreamEpochTransitionStatus,
     pub commit: Option<FabricStreamEpochCommit>,
+}
+
+impl FabricStreamEpochRepairBatch {
+    pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(json_error)
+    }
+
+    pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
+        serde_json::from_slice(bytes).map_err(json_error)
+    }
 }
 
 impl FabricStreamEpochPrepare {
@@ -269,6 +303,252 @@ impl Runtime {
             proposal: state.proposal,
         })?;
         Ok(outcome.status)
+    }
+
+    /// Push a bounded set of proposal-scoped records to rejected new-policy
+    /// replicas that are behind the prospective leader.
+    ///
+    /// Replicas ahead of the candidate are reported but never modified; they
+    /// require a future pull/reconciliation layer and a superseding term.
+    pub fn fabric_stream_repair_epoch_transition(
+        &mut self,
+        stream: &str,
+        max_records_per_replica: usize,
+    ) -> io::Result<FabricStreamEpochRepairReport> {
+        if max_records_per_replica == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric epoch repair bound must be greater than zero",
+            ));
+        }
+
+        let state = self
+            .fabric_stream_epoch_transition_state(stream)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Fabric epoch transition is not in progress",
+                )
+            })?;
+        if state.finalized {
+            return Ok(FabricStreamEpochRepairReport::default());
+        }
+
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch repair requires distribution",
+            )
+        })?;
+        if state.proposal.to_policy.leader != local.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "only the proposed Fabric leader may repair transition voters",
+            ));
+        }
+
+        let current_tail = self.fabric_stream_info(stream)?.last_sequence.unwrap_or(0);
+        if current_tail != state.proposal.candidate_tail {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Fabric candidate tail changed; start a higher-term proposal before repair",
+            ));
+        }
+
+        let mut report = FabricStreamEpochRepairReport::default();
+        let mut batches = Vec::new();
+        for replica in &state.proposal.to_policy.replicas {
+            if *replica == local.0 {
+                continue;
+            }
+            let Some(vote) = state.votes.get(replica) else {
+                continue;
+            };
+            if vote.accepted {
+                continue;
+            }
+            report.replicas_examined += 1;
+            if vote.tail > state.proposal.candidate_tail {
+                report.ahead_replicas += 1;
+                continue;
+            }
+            if vote.tail == state.proposal.candidate_tail {
+                continue;
+            }
+
+            let records = self.fabric_stream_read(
+                stream,
+                vote.tail.saturating_add(1),
+                max_records_per_replica,
+            )?;
+            let records: Vec<FabricStreamEpochRepairRecord> = records
+                .into_iter()
+                .take_while(|record| record.sequence <= state.proposal.candidate_tail)
+                .map(|record| FabricStreamEpochRepairRecord {
+                    sequence: record.sequence,
+                    payload: record.payload,
+                })
+                .collect();
+            if records.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric epoch repair could not find the candidate's missing durable records",
+                ));
+            }
+            batches.push((
+                NodeId(*replica),
+                FabricStreamEpochRepairBatch {
+                    stream: stream.to_string(),
+                    proposal: state.proposal.clone(),
+                    target: *replica,
+                    records,
+                },
+            ));
+        }
+
+        let cluster = self.distributed.cluster.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch repair requires cluster membership",
+            )
+        })?;
+        let mut dispatches = Vec::new();
+        for (target, batch) in batches {
+            if cluster.is_removed(target) {
+                report.unavailable_replicas += 1;
+                continue;
+            }
+            let Some(address) = cluster
+                .get_node(target)
+                .filter(|info| matches!(info.status, NodeStatus::Healthy | NodeStatus::Joining))
+                .map(|info| info.address)
+            else {
+                report.unavailable_replicas += 1;
+                continue;
+            };
+            report.records_dispatched += batch.records.len();
+            dispatches.push((target, address, batch.to_wire_bytes()?));
+        }
+
+        let transport = self.distributed.transport.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch repair requires network transport",
+            )
+        })?;
+        for (target, address, bytes) in dispatches {
+            transport.send(
+                target,
+                address,
+                system_packet(FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, local, bytes),
+            );
+        }
+        Ok(report)
+    }
+
+    pub(crate) fn fabric_stream_apply_epoch_repair_from_cluster(
+        &mut self,
+        batch: &FabricStreamEpochRepairBatch,
+        sender: NodeId,
+        cluster: &ClusterState,
+    ) -> io::Result<FabricStreamEpochVoteState> {
+        validate_proposal_shape(&batch.stream, &batch.proposal)?;
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch repair requires distribution",
+            )
+        })?;
+        if sender.0 != batch.proposal.to_policy.leader
+            || batch.target != local.0
+            || !batch.proposal.to_policy.replicas.contains(&local.0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unauthorized Fabric epoch repair batch",
+            ));
+        }
+
+        let current = self
+            .fabric_stream_replication_policy(&batch.stream)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Fabric stream replication policy is not established",
+                )
+            })?;
+        if current != batch.proposal.from_policy {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch repair source policy differs from local durable policy",
+            ));
+        }
+
+        let placement = compute_stream_placement(
+            local,
+            Some(cluster),
+            &batch.stream,
+            batch.proposal.to_policy.partition,
+            batch.proposal.to_policy.replication_factor,
+        )?;
+        if policy_from_placement(&placement, batch.proposal.to_policy.epoch)
+            != batch.proposal.to_policy
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch repair no longer matches current placement",
+            ));
+        }
+
+        if let Some(promise) = self.fabric_stream_epoch_promise(&batch.stream)? {
+            if promise.epoch > batch.proposal.to_policy.epoch
+                || (promise.epoch == batch.proposal.to_policy.epoch
+                    && promise.proposal_hash != batch.proposal.proposal_hash)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Fabric epoch repair is fenced by a newer or conflicting promise",
+                ));
+            }
+        }
+
+        let local_tail = self.fabric_stream_info(&batch.stream)?.last_sequence.unwrap_or(0);
+        if batch.records.is_empty()
+            || batch.records[0].sequence != local_tail.saturating_add(1)
+            || batch
+                .records
+                .last()
+                .map(|record| record.sequence > batch.proposal.candidate_tail)
+                .unwrap_or(true)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch repair batch is not the next candidate prefix",
+            ));
+        }
+
+        let mut expected = local_tail.saturating_add(1);
+        for record in &batch.records {
+            if record.sequence != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric epoch repair batch contains a sequence gap",
+                ));
+            }
+            self.fabric_stream_apply_transition_repair_record(
+                &batch.stream,
+                record.sequence,
+                &record.payload,
+            )?;
+            expected = expected.saturating_add(1);
+        }
+
+        self.fabric_stream_evaluate_epoch_prepare(
+            &batch.stream,
+            &batch.proposal,
+            sender,
+            cluster,
+        )
     }
 
     pub(crate) fn fabric_stream_evaluate_epoch_prepare(
