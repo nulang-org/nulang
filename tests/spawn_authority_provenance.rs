@@ -270,7 +270,7 @@ fn vm_uses_exact_spawn_pc_even_for_same_target_behavior() {
         .borrow()
         .actors
         .values()
-        .map(|actor| actor.authority_manifest().unwrap().canonical_tokens())
+        .map(|actor| actor.authority_manifest().canonical_tokens())
         .collect();
     manifests.sort();
     assert_eq!(
@@ -318,7 +318,7 @@ fn sorted_actor_manifests(rt: &Runtime) -> Vec<Vec<String>> {
     let mut manifests: Vec<Vec<String>> = rt
         .actors
         .values()
-        .map(|actor| actor.authority_manifest().unwrap().canonical_tokens())
+        .map(|actor| actor.authority_manifest().canonical_tokens())
         .collect();
     manifests.sort();
     manifests
