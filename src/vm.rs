@@ -3370,22 +3370,21 @@ impl VM {
                 .map(|info| (info.sink_mask, info.sink_metadata_present))
         });
 
-        // Safe host invocation borrows its input slice. A linear sink callee
-        // is allowed to consume one local ownership reference, so retain an
-        // additional reference for pointer-valued sink arguments before
-        // entering the function. The callee's Drop (or an ownership transfer
-        // into its return/another sink) consumes that retained reference while
-        // the host's original Value remains valid.
+        // Safe host invocation borrows its input slice. A pointer-valued
+        // argument cannot enter a linear ownership sink through this API:
+        // retaining it would preserve memory safety but violate lineariso
+        // uniqueness by leaving the host with a live alias, while transferring
+        // it would contradict the borrowed &[Value] contract.
         //
-        // New compiler artifacts always publish sink metadata. If metadata is
-        // unavailable (e.g. a stripped/foreign artifact), pointer arguments
-        // are rejected rather than guessing whether the callee will Drop them.
+        // Fresh compiler artifacts publish authoritative runtime-only sink
+        // metadata. Without that metadata (e.g. a deserialized/stripped
+        // artifact), any pointer host call fails closed because the VM cannot
+        // prove that no parameter will consume the pointer.
         let has_pointer_args = args.iter().any(|v| v.as_ptr().is_some());
-        if has_pointer_args
-            && !sink_info
-                .map(|(_, present)| present)
-                .unwrap_or(false)
-        {
+        let metadata_present = sink_info
+            .map(|(_, present)| present)
+            .unwrap_or(false);
+        if has_pointer_args && !metadata_present {
             return Err(NuError::VMError {
                 msg: "call_function: pointer arguments require authoritative function ownership metadata"
                     .to_string(),
@@ -3394,10 +3393,17 @@ impl VM {
         }
         let sink_mask = sink_info.map(|(mask, _)| mask).unwrap_or(0);
         for (i, arg) in args.iter().enumerate() {
-            if i < u16::BITS as usize && (sink_mask & (1u16 << i)) != 0 {
-                if let Some(ptr) = arg.as_ptr() {
-                    self.actor_callbacks.retain_ref(ptr);
-                }
+            if arg.as_ptr().is_some()
+                && i < u16::BITS as usize
+                && (sink_mask & (1u16 << i)) != 0
+            {
+                return Err(NuError::VMError {
+                    msg: format!(
+                        "call_function: pointer argument {} targets a linear ownership sink; borrowed host calls cannot transfer unique ownership",
+                        i + 1
+                    ),
+                    span: Span::default(),
+                });
             }
         }
 
@@ -6149,7 +6155,7 @@ mod vm_tests {
     }
 
     #[test]
-    fn test_call_function_retains_host_pointer_for_linear_sink() {
+    fn test_call_function_rejects_borrowed_pointer_for_linear_sink() {
         let module = host_sink_test_module();
         let offset = module.function_table[0];
         let sink_info = module
@@ -6173,16 +6179,18 @@ mod vm_tests {
             .alloc_value(std::mem::size_of::<Value>(), HeapTypeTag::Array)
             .expect("host array allocation");
 
-        let result = vm
+        let err = vm
             .call_function(0, offset, &[value])
-            .expect("host call into linear sink");
-        assert_eq!(result.as_int(), Some(1));
+            .expect_err("borrowed host pointer must not enter a linear sink");
+        assert!(
+            err.to_string().contains("cannot transfer unique ownership"),
+            "unexpected host sink error: {err}"
+        );
         assert_eq!(
             vm.actor_callbacks.array_len(ptr),
             Some(1),
-            "callee Drop must consume only the retained sink reference, leaving the host owner live"
+            "rejected host sink call must leave the host-owned pointer live"
         );
-
         vm.actor_callbacks.drop_ref(ptr);
     }
 
