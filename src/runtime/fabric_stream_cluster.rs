@@ -141,10 +141,7 @@ impl FabricStreamCommitUpdate {
     pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
         let wire: FabricStreamCommitUpdateWire = serde_json::from_slice(bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if wire.stream.is_empty()
-            || wire.replication_factor == 0
-            || wire.committed_sequence == 0
-        {
+        if wire.stream.is_empty() || wire.replication_factor == 0 || wire.committed_sequence == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid Fabric stream commit update",
@@ -777,15 +774,16 @@ impl Runtime {
         }
         let stream_config = self.fabric_stream_config(stream)?;
 
-        for replica in placement.replicas.iter().copied().filter(|node| *node != local) {
+        for replica in placement
+            .replicas
+            .iter()
+            .copied()
+            .filter(|node| *node != local)
+        {
             report.replicas_examined += 1;
             let progress = self.fabric_stream_replica_progress(stream, replica.0)?;
             if progress >= committed {
-                if self.fabric_stream_dispatch_commit_update_to(
-                    replica,
-                    &placement,
-                    committed,
-                )? {
+                if self.fabric_stream_dispatch_commit_update_to(replica, &placement, committed)? {
                     report.commit_updates_dispatched += 1;
                 } else {
                     report.unavailable_replicas += 1;
@@ -901,11 +899,7 @@ impl Runtime {
         }
 
         if ack.accepted {
-            self.fabric_stream_record_replica_progress(
-                &ack.stream,
-                ack.replica.0,
-                ack.sequence,
-            )?;
+            self.fabric_stream_record_replica_progress(&ack.stream, ack.replica.0, ack.sequence)?;
         }
 
         let committed = self.fabric_stream_committed_sequence(&ack.stream)?;
