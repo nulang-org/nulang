@@ -39,8 +39,7 @@ pub(crate) const FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR: &str =
 
 const FABRIC_STREAM_FAILOVER_RETRY_INITIAL: std::time::Duration =
     std::time::Duration::from_millis(500);
-const FABRIC_STREAM_FAILOVER_RETRY_MAX: std::time::Duration =
-    std::time::Duration::from_secs(30);
+const FABRIC_STREAM_FAILOVER_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FabricStreamEpochTransitionStatus {
@@ -373,7 +372,9 @@ impl Runtime {
                 _ => continue,
             };
             if state.finalized || state.proposal.to_policy.leader != local.0 {
-                self.distributed.fabric_stream_failover_retry.remove(&stream);
+                self.distributed
+                    .fabric_stream_failover_retry
+                    .remove(&stream);
                 continue;
             }
             self.distributed
@@ -394,7 +395,9 @@ impl Runtime {
             let result = self.fabric_stream_resume_epoch_transition(&stream);
             match result {
                 Ok(status) if status.finalized => {
-                    self.distributed.fabric_stream_failover_retry.remove(&stream);
+                    self.distributed
+                    .fabric_stream_failover_retry
+                    .remove(&stream);
                 }
                 Ok(_) | Err(_) => {
                     let now = self.now();
