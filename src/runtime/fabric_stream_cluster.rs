@@ -474,6 +474,29 @@ impl Runtime {
         Ok((placement, policy))
     }
 
+    fn fabric_stream_current_installed_policy_placement(
+        &mut self,
+        stream: &str,
+        partition: u16,
+        replication_factor: usize,
+    ) -> io::Result<(FabricStreamPlacement, FabricStreamReplicationPolicy)> {
+        let policy = self
+            .fabric_stream_replication_policy(stream)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Fabric stream replication policy is not established",
+                )
+            })?;
+        let epoch = policy.epoch;
+        self.fabric_stream_validate_installed_policy(
+            stream,
+            partition,
+            replication_factor,
+            epoch,
+        )
+    }
+
     fn fabric_stream_current_or_bootstrap_policy_placement(
         &mut self,
         stream: &str,
@@ -955,8 +978,11 @@ impl Runtime {
                 "Fabric catch-up max_records_per_replica must be greater than zero",
             ));
         }
-        let placement = self.fabric_stream_placement(stream, partition, replication_factor)?;
-        let policy = self.fabric_stream_current_policy_for_placement(&placement)?;
+        let (placement, policy) = self.fabric_stream_current_installed_policy_placement(
+            stream,
+            partition,
+            replication_factor,
+        )?;
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -1347,8 +1373,11 @@ impl Runtime {
             ));
         }
 
-        let placement = self.fabric_stream_placement(stream, partition, replication_factor)?;
-        let policy = self.fabric_stream_current_policy_for_placement(&placement)?;
+        let (placement, policy) = self.fabric_stream_current_or_bootstrap_policy_placement(
+            stream,
+            partition,
+            replication_factor,
+        )?;
         let local = self
             .distributed
             .node_id
