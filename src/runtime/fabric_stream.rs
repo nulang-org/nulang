@@ -544,11 +544,13 @@ impl FileFabricStreamStore {
 
     pub(crate) fn replica_progress(&mut self, name: &str, replica: u64) -> io::Result<u64> {
         self.ensure_state(name)?;
-        Ok(read_replica_progress(&self.stream_dir(name).join("replica_progress.json"))?
-            .replicas
-            .get(&replica)
-            .copied()
-            .unwrap_or(0))
+        Ok(
+            read_replica_progress(&self.stream_dir(name).join("replica_progress.json"))?
+                .replicas
+                .get(&replica)
+                .copied()
+                .unwrap_or(0),
+        )
     }
 
     pub(crate) fn record_replica_progress(
@@ -790,7 +792,8 @@ impl Runtime {
         name: &str,
         replica: u64,
     ) -> io::Result<u64> {
-        self.fabric_stream_store_mut()?.replica_progress(name, replica)
+        self.fabric_stream_store_mut()?
+            .replica_progress(name, replica)
     }
 
     pub(crate) fn fabric_stream_record_replica_progress(
