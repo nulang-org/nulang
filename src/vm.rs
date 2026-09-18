@@ -2431,6 +2431,56 @@ pub struct SuspendedVmState {
     pub step_count: usize,
 }
 
+#[derive(Debug, Clone)]
+struct CachedPerformName {
+    qualified: std::sync::Arc<str>,
+    dot: Option<usize>,
+}
+
+impl CachedPerformName {
+    fn new(name: &str) -> Self {
+        Self {
+            qualified: std::sync::Arc::from(name),
+            dot: name.find('.'),
+        }
+    }
+
+    #[inline(always)]
+    fn parts(&self) -> (&str, Option<&str>) {
+        let qualified = self.qualified.as_ref();
+        match self.dot {
+            Some(dot) => (&qualified[..dot], Some(&qualified[dot + 1..])),
+            None => (qualified, None),
+        }
+    }
+}
+
+/// Build the allocation-free name cache for generic `Perform` sites.
+///
+/// The bytecode format remains unchanged: the cache is reconstructed from the
+/// module's existing constant pool and instructions whenever a module loads.
+/// Runtime strings may extend the constant pool after load, so only constants
+/// referenced by `Perform` instructions are cached and missing entries always
+/// fall back to the generic constant-resolution path.
+fn build_perform_name_cache(module: &CodeModule) -> Vec<Option<CachedPerformName>> {
+    let mut cache = vec![None; module.constants.len()];
+    for instr in &module.instructions {
+        if instr.opcode != OpCode::Perform {
+            continue;
+        }
+        let idx = instr.imm16() as usize;
+        let Some(Constant::String(name)) = module.constants.get(idx) else {
+            continue;
+        };
+        if let Some(slot) = cache.get_mut(idx) {
+            if slot.is_none() {
+                *slot = Some(CachedPerformName::new(name));
+            }
+        }
+    }
+    cache
+}
+
 /// Register-based bytecode virtual machine.
 ///
 /// Executes Nulang bytecode modules with:
@@ -2441,6 +2491,12 @@ pub struct SuspendedVmState {
 pub struct VM {
     /// Loaded bytecode modules.
     pub modules: Vec<CodeModule>,
+    /// Parsed names for constants referenced by generic `Perform` sites.
+    ///
+    /// Indexed by module and then constant-pool index. The cache is built at
+    /// module load and intentionally does not grow when runtime strings are
+    /// appended to a module's constant pool.
+    perform_name_cache: Vec<Vec<Option<CachedPerformName>>>,
     /// Flat stack of activation frames.  The active frame is at
     /// `current_frame_idx`; earlier entries are callers.
     frames: Vec<Frame>,
@@ -2642,6 +2698,7 @@ impl VM {
     fn new_with_jit(enable_jit: bool) -> Self {
         VM {
             modules: Vec::new(),
+            perform_name_cache: Vec::new(),
             frames: Vec::with_capacity(64),
             current_frame_idx: None,
             handler_stack: Vec::new(),
@@ -2945,8 +3002,10 @@ impl VM {
     /// Load a bytecode module into the VM.
     pub fn load_module(&mut self, module: CodeModule) {
         let bits = constants_to_jit_bits(&module.constants);
+        let perform_names = build_perform_name_cache(&module);
         self.modules.push(module);
         self.jit_constants.push(bits);
+        self.perform_name_cache.push(perform_names);
     }
 
     /// Number of hot regions compiled through the type-directed JIT path
@@ -3779,20 +3838,42 @@ impl VM {
         frame_idx: usize,
         module_idx: usize,
     ) -> NuResult<()> {
-        let eff_name_idx = instr.imm16();
+        let eff_name_idx = instr.imm16() as usize;
         let dst_reg = instr.op3;
-        let qualified_name = self.module_const_string(module_idx, eff_name_idx as usize);
-        // The MIR pipeline encodes the performed operation as
-        // "Effect.op" (e.g. "IO.print"); hand-built modules may
-        // carry a bare name with no operation.
-        let (effect_name, op_name) = match qualified_name.split_once('.') {
-            Some((effect, op)) => (effect.to_string(), Some(op.to_string())),
-            None => (qualified_name.clone(), None),
+
+        // The MIR pipeline encodes the performed operation as "Effect.op"
+        // (e.g. "IO.print"). Resolve that stable identity from the module-load
+        // cache so hot Perform sites do not clone/split/allocate owned Strings
+        // on every execution. Hand-built or malformed modules retain the old
+        // generic constant-resolution fallback.
+        let cached_name = self
+            .perform_name_cache
+            .get(module_idx)
+            .and_then(|module_cache| module_cache.get(eff_name_idx))
+            .cloned()
+            .flatten();
+        let fallback_name = if cached_name.is_none() {
+            Some(self.module_const_string(module_idx, eff_name_idx))
+        } else {
+            None
+        };
+        let qualified_name = match cached_name.as_ref() {
+            Some(cached) => cached.qualified.as_ref(),
+            None => fallback_name
+                .as_deref()
+                .expect("fallback Perform name must be present"),
+        };
+        let (effect_name, op_name) = match cached_name.as_ref() {
+            Some(cached) => cached.parts(),
+            None => match qualified_name.split_once('.') {
+                Some((effect, op)) => (effect, Some(op)),
+                None => (qualified_name, None),
+            },
         };
         // ---- Test effect: assertion primitives ----
         // Handled inline so assertion failures produce RuntimeError.
         if effect_name == "Test" {
-            match op_name.as_deref() {
+            match op_name {
                 Some("assert") => {
                     let cond = self.frames[frame_idx]
                         .regs
@@ -3868,14 +3949,14 @@ impl VM {
         if self.handler_stack.is_empty() {
             let result = match self.modules.get(module_idx) {
                 Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     module,
                     &self.frames[frame_idx].regs,
                 ),
                 None => self.actor_callbacks.perform_builtin_effect(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     &[],
                     &self.frames[frame_idx].regs,
                 ),
@@ -3949,14 +4030,14 @@ impl VM {
             // performing module's constant pool.
             let result = match self.modules.get(module_idx) {
                 Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     module,
                     &self.frames[frame_idx].regs,
                 ),
                 None => self.actor_callbacks.perform_builtin_effect(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     &[],
                     &self.frames[frame_idx].regs,
                 ),
@@ -7921,6 +8002,41 @@ mod vm_tests {
             Some(42),
             "outer handler resumes with 42"
         );
+    }
+
+    #[test]
+    fn test_perform_name_cache_tracks_only_perform_constants() {
+        let mut module = CodeModule::new("test_perform_name_cache");
+        module
+            .constants
+            .push(Constant::String("Float.sqrt".to_string()));
+        module
+            .constants
+            .push(Constant::String("unused.constant".to_string()));
+        module.emit(Instruction::new3(OpCode::Perform, 0, 0, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+
+        assert_eq!(vm.perform_name_cache.len(), 1);
+        assert_eq!(vm.perform_name_cache[0].len(), 2);
+        let cached = vm.perform_name_cache[0][0]
+            .as_ref()
+            .expect("Perform constant must be cached");
+        assert_eq!(cached.qualified.as_ref(), "Float.sqrt");
+        assert_eq!(cached.parts(), ("Float", Some("sqrt")));
+        assert!(
+            vm.perform_name_cache[0][1].is_none(),
+            "unreferenced constants must not be cached"
+        );
+
+        let cache_len = vm.perform_name_cache[0].len();
+        let old_constant_len = vm.modules[0].constants.len();
+        let _ = vm.add_runtime_string(0, "runtime-only".to_string());
+        assert_eq!(vm.perform_name_cache[0].len(), cache_len);
+        assert_eq!(vm.modules[0].constants.len(), old_constant_len + 1);
     }
 
     /// Regression: `perform IO.print` in a standalone script (no handler on
