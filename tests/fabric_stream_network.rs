@@ -1821,3 +1821,120 @@ fn automatic_failover_pulls_ahead_survivor_and_supersedes_term() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+
+#[test]
+fn installed_policy_ignores_unrelated_cluster_growth_during_quorum_commit() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:35501".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:35502".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut nodes = vec![runtime(addr_a, bus.clone()), runtime(addr_b, bus)];
+    nodes[0]
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    nodes[1]
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let initial = nodes[0]
+        .fabric_stream_placement("stable-policy-growth", 0, 2)
+        .unwrap();
+    assert_eq!(
+        initial,
+        nodes[1]
+            .fabric_stream_placement("stable-policy-growth", 0, 2)
+            .unwrap()
+    );
+    let leader = if initial.leader == node_a { 0 } else { 1 };
+    let follower = 1 - leader;
+
+    let roots = vec![temp_dir("stable-policy-a"), temp_dir("stable-policy-b")];
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+    nodes[leader]
+        .fabric_stream_create("stable-policy-growth", FabricStreamConfig::default())
+        .unwrap();
+
+    nodes[leader]
+        .fabric_stream_replicated_append("stable-policy-growth", 0, 2, b"one")
+        .unwrap();
+    nodes[follower].process_network();
+    nodes[leader].process_network();
+    nodes[follower].process_network();
+    assert_eq!(
+        nodes[leader]
+            .fabric_stream_committed_sequence("stable-policy-growth")
+            .unwrap(),
+        1
+    );
+
+    // Add healthy non-replica members until raw rendezvous would select a
+    // different RF2 set. They deliberately have no transport endpoints.
+    let mut dynamic_changed = false;
+    for port in 35510..35600 {
+        let address: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let node_id = NodeId::new(&address);
+        if node_id == node_a || node_id == node_b {
+            continue;
+        }
+        for node in &mut nodes {
+            node.distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(node_id, address);
+        }
+        let dynamic = nodes[0]
+            .fabric_stream_placement("stable-policy-growth", 0, 2)
+            .unwrap();
+        if dynamic.replicas != initial.replicas
+            || dynamic.membership_fingerprint != initial.membership_fingerprint
+        {
+            dynamic_changed = true;
+            break;
+        }
+    }
+    assert!(
+        dynamic_changed,
+        "test must make raw rendezvous differ from installed stream policy"
+    );
+
+    let second = nodes[leader]
+        .fabric_stream_replicated_append("stable-policy-growth", 0, 2, b"two")
+        .unwrap();
+    assert_eq!(second.dispatch.intended_remote, 1);
+    assert_eq!(second.dispatch.dispatched, 1);
+    assert!(!second.status.committed);
+
+    nodes[follower].process_network();
+    nodes[leader].process_network();
+    nodes[follower].process_network();
+
+    for node in &mut nodes {
+        assert_eq!(
+            node.fabric_stream_committed_sequence("stable-policy-growth")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            node.fabric_stream_read_committed("stable-policy-growth", 1, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
