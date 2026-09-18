@@ -1,0 +1,11 @@
+// stdlib fast-path regression coverage: public helpers must keep their
+// observable behavior when routed through existing VM primitives.
+import stdlib::math
+import stdlib::list
+
+fn main() {
+    perform IO.print(pow(2, 10))
+    perform IO.print(perform Float.to_int(sqrt(16.0)))
+    perform IO.print(perform Float.to_int(sqrt(-4.0)))
+    perform IO.print(length([1, 2, 3, 4, 5]))
+}
