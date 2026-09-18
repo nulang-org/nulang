@@ -59,6 +59,19 @@ two major versions.*
   Deterministic tests cover positive-goodbye automatic RF3->RF2 failover and
   delayed peer removal followed by retry.
 
+### Fabric stable installed placement — 2026-09-18
+- **Durable policy is authoritative after stream bootstrap** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`). Established stream append, retry,
+  crash recovery, application ACK validation, committed catch-up, replica
+  application and commit propagation now derive leader/replica/fingerprint
+  state from the installed `replication_policy.json` rather than recomputing
+  rendezvous over the entire current cluster. Unrelated node joins and rejoins
+  therefore cannot implicitly rebalance a live stream or invalidate current
+  quorum traffic; membership still controls reachability and explicit epoch
+  transitions remain the only ownership-change path. Epoch-1 follower bootstrap
+  continues to use current rendezvous when no local policy exists, leaving a
+  documented first-contact race for a future explicit policy-bootstrap message.
+
 ### Fabric automatic failover reconciliation — 2026-09-18
 - **Bounded push/pull repair during confirmed-removal failover** (Experimental,
   `src/runtime/fabric_stream_epoch.rs`). The automatic failover logical-clock
