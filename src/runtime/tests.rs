@@ -297,8 +297,14 @@ fn test_run_scheduler_processes_all_actors() {
     let mut rt = Runtime::new();
     let a1 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
     let a2 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
-    rt.actors.get_mut(&a1).unwrap().register_behavior("add", |_actor, _args| {});
-    rt.actors.get_mut(&a2).unwrap().register_behavior("add", |_actor, _args| {});
+    rt.actors
+        .get_mut(&a1)
+        .unwrap()
+        .register_behavior("add", |_actor, _args| {});
+    rt.actors
+        .get_mut(&a2)
+        .unwrap()
+        .register_behavior("add", |_actor, _args| {});
     rt.send_message(a1, "add", &[Value::int(10)]);
     rt.send_message(a2, "add", &[Value::int(20)]);
     rt.run_scheduler();
@@ -374,8 +380,14 @@ fn test_actor_set_priority_changes_scheduling() {
     let mut rt = Runtime::new();
     let a = rt.spawn_actor(Box::new(|| vec![]));
     let b = rt.spawn_actor(Box::new(|| vec![]));
-    rt.actors.get_mut(&a).unwrap().register_behavior("noop", |_actor, _args| {});
-    rt.actors.get_mut(&b).unwrap().register_behavior("noop", |_actor, _args| {});
+    rt.actors
+        .get_mut(&a)
+        .unwrap()
+        .register_behavior("noop", |_actor, _args| {});
+    rt.actors
+        .get_mut(&b)
+        .unwrap()
+        .register_behavior("noop", |_actor, _args| {});
     // Drain the spawn-time queue entries (both enqueued at Normal).
     assert_eq!(rt.scheduler.dequeue(), Some(a));
     assert_eq!(rt.scheduler.dequeue(), Some(b));
@@ -5966,8 +5978,7 @@ fn test_remote_ref_local_collision_prefers_local() {
     // Local actor (id from the global counter — never assume a value;
     // `fresh_actor_id` is process-global, so later tests see higher ids).
     let local_id = rt_a.spawn_actor(Box::new(|| vec![]));
-    rt_a
-        .actors
+    rt_a.actors
         .get_mut(&local_id)
         .unwrap()
         .register_behavior("whatever", |_actor, _args| {});
