@@ -1470,7 +1470,6 @@ fn automatic_failover_retries_until_survivor_confirms_removal() {
     }
 }
 
-
 #[test]
 fn automatic_failover_pushes_lagging_survivor_before_transition() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
