@@ -420,7 +420,8 @@ pub fn analyze_call_ownership(module: &mir::Module) -> Vec<FunctionOwnershipCand
         .enumerate()
         .map(|(idx, func)| {
             let sites = &call_sites[idx];
-            let function_blockers = function_level_blockers(func, dynamic_callable[idx], sites.len());
+            let function_blockers =
+                function_level_blockers(func, dynamic_callable[idx], sites.len());
             let params = func
                 .params
                 .iter()
@@ -656,7 +657,11 @@ fn counted_owning_definition(op: &mir::RValue, ty: &Type) -> bool {
 fn definitely_counted_heap_type(ty: &Type) -> bool {
     match ty {
         Type::Primitive(PrimitiveType::String) => true,
-        Type::Tuple(_) | Type::Record(_) | Type::Array(_) | Type::Variant(_) | Type::App { .. } => true,
+        Type::Tuple(_)
+        | Type::Record(_)
+        | Type::Array(_)
+        | Type::Variant(_)
+        | Type::App { .. } => true,
         Type::Nominal { underlying, .. } => definitely_counted_heap_type(underlying),
         Type::Reference { inner, .. } => definitely_counted_heap_type(inner),
         _ => false,
@@ -706,6 +711,7 @@ fn analyze_return_candidate(
         ReturnOwnershipCandidate::BorrowedOrImmediate
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,7 +753,11 @@ mod tests {
         module.functions.push(caller.build());
         let report = analyze_call_ownership(&module);
         let p = &report[0].params[0];
-        assert!(p.candidate_owned, "fresh single-use owner should be a candidate: {:?}", p.blockers);
+        assert!(
+            p.candidate_owned,
+            "fresh single-use owner should be a candidate: {:?}",
+            p.blockers
+        );
         assert!(!p.requires_upstream_owned_param);
         assert_eq!(report[0].direct_call_sites, 1);
     }
