@@ -54,6 +54,7 @@ use super::crdt_manager::{CrdtDeltaOp, CrdtOp};
 use super::supervision::RemoteLink;
 use super::MessagePriority;
 use super::NodeId;
+use crate::authority::AuthorityManifest;
 use crate::vm::Value;
 
 #[cfg(feature = "tcp")]
@@ -531,6 +532,9 @@ const TYPE_CRDT_OP: u8 = 13;
 const TYPE_MIGRATE_ACTOR: u8 = 14;
 const TYPE_NODE_GOODBYE: u8 = 15;
 const TYPE_SHADOW_REPLICATE: u8 = 16;
+/// Additive NUL0 v1 extension: authority-aware remote spawn. The legacy
+/// type-3 SpawnRequest layout remains byte-for-byte unchanged.
+const TYPE_SPAWN_REQUEST_AUTH: u8 = 17;
 
 // ---------------------------------------------------------------------------
 // NodeId
@@ -600,6 +604,20 @@ pub enum Packet {
         content_hash: Option<[u8; 32]>,
         initial_state: Vec<(String, Value)>,
         bytecode: Option<Vec<u8>>,
+    },
+
+    /// Authority-aware remote spawn request.
+    ///
+    /// This uses a distinct packet discriminant so NUL0 v1's existing
+    /// `SpawnRequest` layout remains frozen. The manifest is structural in
+    /// memory and canonicalized only while encoding this packet.
+    SpawnRequestAuth {
+        request_id: u64,
+        behavior_name: String,
+        content_hash: Option<[u8; 32]>,
+        initial_state: Vec<(String, Value)>,
+        bytecode: Option<Vec<u8>>,
+        authority: AuthorityManifest,
     },
 
     /// Response to a spawn request.
@@ -759,6 +777,7 @@ impl Packet {
             TYPE_MIGRATE_ACTOR => Self::read_migrate_actor(payload)?,
             TYPE_ACK => Self::read_ack(payload)?,
             TYPE_SPAWN_REQUEST => Self::read_spawn_request(payload)?,
+            TYPE_SPAWN_REQUEST_AUTH => Self::read_spawn_request_auth(payload)?,
             TYPE_SPAWN_RESPONSE => Self::read_spawn_response(payload)?,
             TYPE_CRDT_SYNC => Self::read_crdt_sync(payload)?,
             TYPE_CRDT_DELTA_SYNC => Self::read_crdt_delta_sync(payload)?,
@@ -859,6 +878,7 @@ impl Packet {
             Packet::Heartbeat { .. } => TYPE_HEARTBEAT,
             Packet::Ack { .. } => TYPE_ACK,
             Packet::SpawnRequest { .. } => TYPE_SPAWN_REQUEST,
+            Packet::SpawnRequestAuth { .. } => TYPE_SPAWN_REQUEST_AUTH,
             Packet::SpawnResponse { .. } => TYPE_SPAWN_RESPONSE,
             Packet::CrdtSync { .. } => TYPE_CRDT_SYNC,
             Packet::CrdtDeltaSync { .. } => TYPE_CRDT_DELTA_SYNC,
@@ -953,6 +973,37 @@ impl Packet {
                     None => {
                         buf.extend_from_slice(&0u32.to_be_bytes());
                     }
+                }
+            }
+            Packet::SpawnRequestAuth {
+                request_id,
+                behavior_name,
+                content_hash,
+                initial_state,
+                bytecode,
+                authority,
+            } => {
+                buf.extend_from_slice(&request_id.to_be_bytes());
+                write_string(buf, behavior_name);
+                write_optional_hash(buf, content_hash);
+                buf.extend_from_slice(&(initial_state.len() as u32).to_be_bytes());
+                for (k, v) in initial_state {
+                    write_string(buf, k);
+                    write_value(buf, v);
+                }
+                match bytecode {
+                    Some(bytes) => {
+                        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                        buf.extend_from_slice(bytes);
+                    }
+                    None => {
+                        buf.extend_from_slice(&0u32.to_be_bytes());
+                    }
+                }
+                let authority_tokens = authority.canonical_tokens();
+                buf.extend_from_slice(&(authority_tokens.len() as u32).to_be_bytes());
+                for token in authority_tokens {
+                    write_string(buf, &token);
                 }
             }
             Packet::SpawnResponse {
