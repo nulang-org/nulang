@@ -401,9 +401,7 @@ fn lower_function_def(ctx: &mut ModuleCtx, f: &hir::FunctionDef) -> NuResult<mir
         ));
     }
     for ((name, ty), cap) in f.params.iter().zip(&f.param_caps) {
-        let id = lowerer
-            .b
-            .add_param_with_cap(name.clone(), ty.clone(), *cap);
+        let id = lowerer.b.add_param_with_cap(name.clone(), ty.clone(), *cap);
         lowerer.bind(name, id);
     }
     lowerer.lower_body_top(&f.body)?;
