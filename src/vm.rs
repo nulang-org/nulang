@@ -6228,6 +6228,59 @@ mod vm_tests {
     }
 
     #[test]
+    fn test_cleanup_frame_owner_range_preserves_caller_owner() {
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut module = CodeModule::new("range_cleanup");
+        module.emit(Instruction::new0(OpCode::Nop));
+        module.emit(Instruction::new0(OpCode::Panic));
+        module.debug_functions.push(crate::bytecode::DebugFunctionInfo {
+            name: "caller".to_string(),
+            code_offset: 0,
+            code_len: 1,
+            params: vec![],
+            locals: vec![],
+            cleanup_regs: vec![16],
+            cleanup_spills: vec![],
+        });
+        module.debug_functions.push(crate::bytecode::DebugFunctionInfo {
+            name: "callee".to_string(),
+            code_offset: 1,
+            code_len: 1,
+            params: vec![],
+            locals: vec![],
+            cleanup_regs: vec![16],
+            cleanup_spills: vec![],
+        });
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(CountingDropCallbacks {
+            drops: drops.clone(),
+        }));
+
+        let caller_ptr = Box::into_raw(Box::new(4u8));
+        let callee_ptr = Box::into_raw(Box::new(5u8));
+        let mut caller = Frame::new(None, 0);
+        caller.pc = 0;
+        caller.regs[16] = unsafe { Value::ptr(caller_ptr) };
+        let mut callee = Frame::new(Some(0), 0);
+        callee.pc = 1;
+        callee.regs[16] = unsafe { Value::ptr(callee_ptr) };
+        vm.frames = vec![caller, callee];
+        vm.current_frame_idx = Some(1);
+
+        vm.cleanup_frame_owner_range(1);
+
+        assert_eq!(drops.get(), 1, "only the abandoned callee owner is released");
+        assert_eq!(vm.frames[0].regs[16].as_ptr(), Some(caller_ptr));
+        assert!(vm.frames[1].regs[16].is_nil());
+
+        unsafe {
+            drop(Box::from_raw(caller_ptr));
+            drop(Box::from_raw(callee_ptr));
+        }
+    }
+    #[test]
     fn test_suspension_preserves_owner_slots_and_frame_state() {
         let drops = std::rc::Rc::new(std::cell::Cell::new(0));
         let mut vm = VM::new();
