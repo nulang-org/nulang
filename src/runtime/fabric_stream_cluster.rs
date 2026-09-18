@@ -15,7 +15,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant};
 
-use crate::runtime::fabric_stream::FabricStreamPendingIntent;
+use crate::runtime::fabric_stream::{
+    FabricStreamPendingIntent, FabricStreamReplicationPolicy, FABRIC_STREAM_INITIAL_EPOCH,
+};
 use crate::runtime::{
     ClusterState, FabricStreamConfig, MessagePriority, NodeId, NodeStatus, Packet, Runtime,
 };
@@ -37,6 +39,7 @@ pub struct FabricStreamPlacement {
 pub struct FabricStreamReplicaAppend {
     pub stream: String,
     pub partition: u16,
+    pub epoch: u64,
     pub leader: NodeId,
     pub membership_fingerprint: u64,
     pub replication_factor: usize,
@@ -52,6 +55,10 @@ pub(crate) const FABRIC_STREAM_COMMIT_BEHAVIOR: &str = "__nulang_fabric_stream_c
 
 const FABRIC_STREAM_RETRY_INITIAL: Duration = Duration::from_millis(500);
 const FABRIC_STREAM_RETRY_MAX: Duration = Duration::from_secs(30);
+
+fn initial_stream_epoch() -> u64 {
+    FABRIC_STREAM_INITIAL_EPOCH
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FabricStreamReplicaDispatchReport {
@@ -109,6 +116,7 @@ pub(crate) struct FabricStreamReplicaAckOutcome {
 pub(crate) struct FabricStreamCommitUpdate {
     pub stream: String,
     pub partition: u16,
+    pub epoch: u64,
     pub leader: NodeId,
     pub membership_fingerprint: u64,
     pub replication_factor: usize,
@@ -119,6 +127,8 @@ pub(crate) struct FabricStreamCommitUpdate {
 struct FabricStreamCommitUpdateWire {
     stream: String,
     partition: u16,
+    #[serde(default = "initial_stream_epoch")]
+    epoch: u64,
     leader: u64,
     membership_fingerprint: u64,
     replication_factor: usize,
@@ -130,6 +140,7 @@ impl FabricStreamCommitUpdate {
         serde_json::to_vec(&FabricStreamCommitUpdateWire {
             stream: self.stream.clone(),
             partition: self.partition,
+            epoch: self.epoch,
             leader: self.leader.0,
             membership_fingerprint: self.membership_fingerprint,
             replication_factor: self.replication_factor,
@@ -141,7 +152,11 @@ impl FabricStreamCommitUpdate {
     pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
         let wire: FabricStreamCommitUpdateWire = serde_json::from_slice(bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if wire.stream.is_empty() || wire.replication_factor == 0 || wire.committed_sequence == 0 {
+        if wire.stream.is_empty()
+            || wire.epoch == 0
+            || wire.replication_factor == 0
+            || wire.committed_sequence == 0
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid Fabric stream commit update",
@@ -150,6 +165,7 @@ impl FabricStreamCommitUpdate {
         Ok(Self {
             stream: wire.stream,
             partition: wire.partition,
+            epoch: wire.epoch,
             leader: NodeId(wire.leader),
             membership_fingerprint: wire.membership_fingerprint,
             replication_factor: wire.replication_factor,
@@ -160,6 +176,7 @@ impl FabricStreamCommitUpdate {
 
 #[derive(Debug, Clone)]
 struct PendingReplicaCommit {
+    epoch: u64,
     leader: NodeId,
     membership_fingerprint: u64,
     replicas: HashSet<NodeId>,
@@ -184,6 +201,7 @@ pub(crate) struct FabricStreamReplicationState {
 pub(crate) struct FabricStreamReplicaAck {
     pub stream: String,
     pub partition: u16,
+    pub epoch: u64,
     pub leader: NodeId,
     pub membership_fingerprint: u64,
     pub replication_factor: usize,
@@ -196,6 +214,8 @@ pub(crate) struct FabricStreamReplicaAck {
 struct FabricStreamReplicaAckWire {
     stream: String,
     partition: u16,
+    #[serde(default = "initial_stream_epoch")]
+    epoch: u64,
     leader: u64,
     membership_fingerprint: u64,
     replication_factor: usize,
@@ -209,6 +229,7 @@ impl FabricStreamReplicaAck {
         serde_json::to_vec(&FabricStreamReplicaAckWire {
             stream: self.stream.clone(),
             partition: self.partition,
+            epoch: self.epoch,
             leader: self.leader.0,
             membership_fingerprint: self.membership_fingerprint,
             replication_factor: self.replication_factor,
@@ -222,7 +243,11 @@ impl FabricStreamReplicaAck {
     pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
         let wire: FabricStreamReplicaAckWire = serde_json::from_slice(bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if wire.stream.is_empty() || wire.replication_factor == 0 || wire.sequence == 0 {
+        if wire.stream.is_empty()
+            || wire.epoch == 0
+            || wire.replication_factor == 0
+            || wire.sequence == 0
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid Fabric stream replica ACK",
@@ -231,6 +256,7 @@ impl FabricStreamReplicaAck {
         Ok(Self {
             stream: wire.stream,
             partition: wire.partition,
+            epoch: wire.epoch,
             leader: NodeId(wire.leader),
             membership_fingerprint: wire.membership_fingerprint,
             replication_factor: wire.replication_factor,
@@ -245,6 +271,8 @@ impl FabricStreamReplicaAck {
 struct FabricStreamReplicaAppendWire {
     stream: String,
     partition: u16,
+    #[serde(default = "initial_stream_epoch")]
+    epoch: u64,
     leader: u64,
     membership_fingerprint: u64,
     replication_factor: usize,
@@ -258,6 +286,7 @@ impl FabricStreamReplicaAppend {
         let wire = FabricStreamReplicaAppendWire {
             stream: self.stream.clone(),
             partition: self.partition,
+            epoch: self.epoch,
             leader: self.leader.0,
             membership_fingerprint: self.membership_fingerprint,
             replication_factor: self.replication_factor,
@@ -288,7 +317,11 @@ impl FabricStreamReplicaAppend {
         }
         let wire: FabricStreamReplicaAppendWire = serde_json::from_slice(bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if wire.stream.is_empty() || wire.replication_factor == 0 || wire.sequence == 0 {
+        if wire.stream.is_empty()
+            || wire.epoch == 0
+            || wire.replication_factor == 0
+            || wire.sequence == 0
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid Fabric stream replica envelope",
@@ -297,6 +330,7 @@ impl FabricStreamReplicaAppend {
         Ok(Self {
             stream: wire.stream,
             partition: wire.partition,
+            epoch: wire.epoch,
             leader: NodeId(wire.leader),
             membership_fingerprint: wire.membership_fingerprint,
             replication_factor: wire.replication_factor,
@@ -308,6 +342,49 @@ impl FabricStreamReplicaAppend {
 }
 
 impl Runtime {
+    fn fabric_stream_policy_for_placement(
+        &mut self,
+        placement: &FabricStreamPlacement,
+        epoch: u64,
+    ) -> io::Result<FabricStreamReplicationPolicy> {
+        if epoch == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric stream epoch must be non-zero",
+            ));
+        }
+
+        let proposed = FabricStreamReplicationPolicy {
+            partition: placement.partition,
+            epoch,
+            leader: placement.leader.0,
+            membership_fingerprint: placement.membership_fingerprint,
+            replication_factor: placement.replicas.len(),
+            replicas: placement.replicas.iter().map(|node| node.0).collect(),
+        };
+
+        match self.fabric_stream_replication_policy(&placement.stream)? {
+            Some(existing) if existing == proposed => Ok(existing),
+            Some(existing) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric stream epoch/policy mismatch: durable epoch {} leader {} cannot accept epoch {} leader {}",
+                    existing.epoch, existing.leader, proposed.epoch, proposed.leader
+                ),
+            )),
+            None if epoch == FABRIC_STREAM_INITIAL_EPOCH => {
+                self.fabric_stream_establish_replication_policy(&placement.stream, proposed)
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric stream cannot bootstrap directly into epoch {epoch}; establish epoch {} first",
+                    FABRIC_STREAM_INITIAL_EPOCH
+                ),
+            )),
+        }
+    }
+
     /// Append locally as leader, create a pending quorum ticket, and dispatch
     /// the replica envelope to reachable followers.
     pub fn fabric_stream_replicated_append(
@@ -325,6 +402,8 @@ impl Runtime {
         }
 
         let placement = self.fabric_stream_placement(stream, partition, replication_factor)?;
+        let policy =
+            self.fabric_stream_policy_for_placement(&placement, FABRIC_STREAM_INITIAL_EPOCH)?;
         let local = self
             .distributed
             .node_id
@@ -355,6 +434,7 @@ impl Runtime {
         let sequence = self.fabric_stream_info(stream)?.next_sequence;
         let intent = FabricStreamPendingIntent {
             partition,
+            epoch: policy.epoch,
             leader: placement.leader.0,
             membership_fingerprint: placement.membership_fingerprint,
             replication_factor,
@@ -370,6 +450,7 @@ impl Runtime {
         let append = FabricStreamReplicaAppend {
             stream: stream.to_string(),
             partition,
+            epoch: policy.epoch,
             leader: placement.leader,
             membership_fingerprint: placement.membership_fingerprint,
             replication_factor,
@@ -390,6 +471,7 @@ impl Runtime {
             .insert(
                 sequence,
                 PendingReplicaCommit {
+                    epoch: policy.epoch,
                     leader: placement.leader,
                     membership_fingerprint: placement.membership_fingerprint,
                     replicas: placement.replicas.iter().copied().collect(),
