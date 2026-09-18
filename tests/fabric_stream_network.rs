@@ -1174,18 +1174,13 @@ fn epoch_pull_reconciles_candidate_behind_a_survivor() {
     }
 }
 
-
 #[test]
 fn confirmed_goodbye_automatically_transitions_stream_leadership() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-    let addrs: Vec<SocketAddr> = [
-        "127.0.0.1:35101",
-        "127.0.0.1:35102",
-        "127.0.0.1:35103",
-    ]
-    .into_iter()
-    .map(|addr| addr.parse().unwrap())
-    .collect();
+    let addrs: Vec<SocketAddr> = ["127.0.0.1:35101", "127.0.0.1:35102", "127.0.0.1:35103"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
     let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
     let mut nodes: Vec<Runtime> = addrs
         .iter()
@@ -1210,10 +1205,7 @@ fn confirmed_goodbye_automatically_transitions_stream_leadership() {
     let initial = nodes[0]
         .fabric_stream_placement("auto-failover", 0, 3)
         .unwrap();
-    let old_leader = ids
-        .iter()
-        .position(|node| *node == initial.leader)
-        .unwrap();
+    let old_leader = ids.iter().position(|node| *node == initial.leader).unwrap();
     let survivors: Vec<usize> = (0..3).filter(|index| *index != old_leader).collect();
 
     let roots: Vec<PathBuf> = (0..3)
@@ -1308,9 +1300,7 @@ fn confirmed_goodbye_automatically_transitions_stream_leadership() {
 
     for index in &survivors {
         assert_eq!(
-            nodes[*index]
-                .fabric_stream_epoch("auto-failover")
-                .unwrap(),
+            nodes[*index].fabric_stream_epoch("auto-failover").unwrap(),
             Some(2)
         );
         assert_eq!(
@@ -1326,18 +1316,13 @@ fn confirmed_goodbye_automatically_transitions_stream_leadership() {
     }
 }
 
-
 #[test]
 fn automatic_failover_retries_until_survivor_confirms_removal() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-    let addrs: Vec<SocketAddr> = [
-        "127.0.0.1:35201",
-        "127.0.0.1:35202",
-        "127.0.0.1:35203",
-    ]
-    .into_iter()
-    .map(|addr| addr.parse().unwrap())
-    .collect();
+    let addrs: Vec<SocketAddr> = ["127.0.0.1:35201", "127.0.0.1:35202", "127.0.0.1:35203"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
     let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
     let mut nodes: Vec<Runtime> = addrs
         .iter()
@@ -1362,10 +1347,7 @@ fn automatic_failover_retries_until_survivor_confirms_removal() {
     let initial = nodes[0]
         .fabric_stream_placement("auto-failover-retry", 0, 3)
         .unwrap();
-    let old_leader = ids
-        .iter()
-        .position(|node| *node == initial.leader)
-        .unwrap();
+    let old_leader = ids.iter().position(|node| *node == initial.leader).unwrap();
     let survivors: Vec<usize> = (0..3).filter(|index| *index != old_leader).collect();
 
     let roots: Vec<PathBuf> = (0..3)
