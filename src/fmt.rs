@@ -104,25 +104,58 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
     match decl {
         Decl::Function {
             name,
+            type_params,
             params,
+            default_values,
+            using_params,
             ret_type,
             body,
             effect,
+            public,
             ..
         } => {
-            out.push_str(&format!("{}fn {}(", sp, name));
+            out.push_str(&sp);
+            if *public {
+                out.push_str("pub ");
+            }
+            out.push_str(&format!("fn {}", name));
+            if !type_params.is_empty() {
+                out.push_str(&format!("[{}]", type_params.join(", ")));
+            }
+            out.push('(');
             for (i, p) in params.iter().enumerate() {
-                let pn = &p.name;
-                let pty = &p.ty;
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(pn);
-                if let Some(t) = pty {
+                if let Some(cap) = p.cap {
+                    out.push_str(&format!("{} ", cap));
+                }
+                out.push_str(&p.name);
+                if let Some(t) = &p.ty {
                     out.push_str(&format!(": {}", fmt_type(t)));
+                }
+                if let Some(Some(default)) = default_values.get(i) {
+                    out.push_str(" = ");
+                    fmt_expr(out, default, indent, had_unhandled);
                 }
             }
             out.push(')');
+            if !using_params.is_empty() {
+                out.push_str(" using (");
+                for (i, p) in using_params.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    if let Some(cap) = p.cap {
+                        out.push_str(&format!("{} ", cap));
+                    }
+                    out.push_str(&p.name);
+                    if let Some(t) = &p.ty {
+                        out.push_str(&format!(": {}", fmt_type(t)));
+                    }
+                }
+                out.push(')');
+            }
             if let Some(r) = ret_type {
                 out.push_str(&format!(" -> {}", fmt_type(r)));
             }
@@ -159,9 +192,20 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             type_params,
             body,
+            opaque,
+            public,
             ..
         } => {
-            out.push_str(&format!("{}type {}", sp, name));
+            out.push_str(&sp);
+            if *public {
+                out.push_str("pub ");
+            }
+            if *opaque {
+                out.push_str("opaque type ");
+            } else {
+                out.push_str("type ");
+            }
+            out.push_str(name);
             if !type_params.is_empty() {
                 out.push_str(&format!("[{}]", type_params.join(", ")));
             }
@@ -1225,6 +1269,39 @@ mod tests {
             once, twice,
             "formatting must be idempotent\n--- once ---\n{once}\n--- twice ---\n{twice}"
         );
+    }
+
+    #[test]
+    fn test_fmt_preserves_opaque_type() {
+        let src = "pub opaque type UserId = Int\n";
+        let out = format_source(src).expect("opaque type formats");
+        assert!(
+            out.contains("pub opaque type UserId = Int"),
+            "opaque/public modifiers lost: {out}"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_preserves_using_type_params_caps_and_defaults() {
+        let src = r#"pub fn fetch[T](lineariso id: Int = 1) using (ctx: String) -> Int {
+    id
+}
+"#;
+        let out = format_source(src).expect("function with using params formats");
+        assert!(
+            out.contains("pub fn fetch[T]("),
+            "pub/type params lost: {out}"
+        );
+        assert!(
+            out.contains("lineariso id: Int = 1"),
+            "capability/default lost: {out}"
+        );
+        assert!(
+            out.contains("using (ctx: String)"),
+            "using parameters lost: {out}"
+        );
+        assert_idempotent(src);
     }
 
     #[test]
