@@ -10,11 +10,7 @@
 // primitives (added 2026-07-30).
 /// Number of elements in the array.
 pub fn length(xs) -> Int {
-    var n = 0;
-    for _x in xs {
-        n = n + 1
-    };
-    n
+    perform Array.length(xs)
 }
 
 /// Sum of all elements.
