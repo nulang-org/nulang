@@ -3201,6 +3201,19 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_moveout_transfers_value_and_clears_source() {
+        let moved = run_source("let x = 42 in consume x").expect("run moved value");
+        assert_eq!(moved.as_int(), Some(42));
+
+        // Capability analysis normally rejects this read, but backend tests
+        // intentionally observe the physical invalidation contract.
+        let source_after =
+            run_source("let x = 42 in { let y = consume x; x }").expect("run source read");
+        assert!(source_after.is_nil(), "MoveOut source local must be nil");
+    }
+
     // ── Guest-side actor emulation ──────────────────────────────────
 
     #[test]
