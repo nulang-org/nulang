@@ -1683,15 +1683,24 @@ impl CapContext {
         ctx
     }
 
-    /// Bind explicitly annotated capabilities of function-like parameters.
+    /// Bind function-like parameters with their runtime capability contract.
+    /// Unannotated parameters are `ref`, matching HIR/MIR lowering.
     pub fn with_params(&self, params: &[Param]) -> Self {
         let mut ctx = self.clone();
         for param in params {
-            if let Some(cap) = param.cap {
-                ctx.bindings.push((param.name.clone(), cap));
-            }
+            ctx.bindings.push((
+                param.name.clone(),
+                param.cap.unwrap_or(Capability::Ref),
+            ));
         }
         ctx
+    }
+
+    /// Whether a name is lexically bound in this capability context.
+    /// Module-level function signatures apply only when a call target is not
+    /// shadowed by a local binding.
+    pub fn is_bound(&self, name: &str) -> bool {
+        self.bindings.iter().rev().any(|(n, _)| n == name)
     }
 }
 
@@ -1799,6 +1808,10 @@ pub struct CapabilityAnalyzer {
     /// binding is used a second time, the error message includes both
     /// the first-use location (from this map) and the second-use location.
     pub first_consumed: FxHashMap<String, Span>,
+    /// Source-level parameter capability signatures for directly callable
+    /// module functions. Used to enforce ownership sinks before MIR/codegen
+    /// is allowed to transfer caller slots.
+    fn_param_caps: FxHashMap<String, Vec<Capability>>,
 }
 
 impl CapabilityAnalyzer {
@@ -1808,7 +1821,101 @@ impl CapabilityAnalyzer {
             diagnostics: Vec::new(),
             consumed_spans: Vec::new(),
             first_consumed: FxHashMap::default(),
+            fn_param_caps: FxHashMap::default(),
         }
+    }
+
+    /// Register direct module-function parameter capability contracts.
+    ///
+    /// Ordinary parameters participate in source calls. Linear contextual
+    /// (`using`) parameters are rejected for now: HIR can inject them
+    /// implicitly, but source capability analysis has no explicit ownership
+    /// transfer site to discharge.
+    pub fn register_function_param_caps(&mut self, decls: &[Decl]) -> NuResult<()> {
+        self.fn_param_caps.clear();
+        for decl in flatten_decls(decls) {
+            if let Decl::Function {
+                name,
+                params,
+                using_params,
+                span,
+                ..
+            } = decl
+            {
+                for p in using_params {
+                    if p.cap.is_some_and(Capability::is_linear) {
+                        return Err(NuError::cap_error_explained(
+                            format!(
+                                "function `{}` uses linear capability on contextual parameter `{}`",
+                                name, p.name
+                            ),
+                            *span,
+                            "linear `using` parameters are not ownership sinks yet; make the parameter explicit so the transfer is visible at the call site",
+                        ));
+                    }
+                }
+                self.fn_param_caps.insert(
+                    name.clone(),
+                    params
+                        .iter()
+                        .map(|p| p.cap.unwrap_or(Capability::Ref))
+                        .collect(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Run capability analysis for every executable body in a module using
+    /// one shared direct-call signature registry.
+    pub fn check_module(&mut self, decls: &[Decl]) -> NuResult<()> {
+        self.register_function_param_caps(decls)?;
+        for decl in flatten_decls(decls) {
+            match decl {
+                Decl::Function { body, params, .. } => {
+                    let ctx = CapContext::new().with_params(params);
+                    self.infer_cap(&ctx, body)?;
+                }
+                Decl::Actor {
+                    behaviors,
+                    state_fields,
+                    init,
+                    ..
+                } => {
+                    for behavior in behaviors {
+                        let ctx = CapContext::new().with_params(&behavior.params);
+                        self.infer_cap(&ctx, &behavior.body)?;
+                    }
+                    for (_, _, _, default) in state_fields {
+                        self.infer_cap(&CapContext::new(), default)?;
+                    }
+                    for (_, expr) in init {
+                        self.infer_cap(&CapContext::new(), expr)?;
+                    }
+                }
+                Decl::Workflow {
+                    items, compensate, ..
+                } => {
+                    for item in items {
+                        let steps: &[crate::ast::WorkflowStep] = match item {
+                            crate::ast::WorkflowItem::Step(step) => std::slice::from_ref(step),
+                            crate::ast::WorkflowItem::Parallel(steps) => steps,
+                        };
+                        for step in steps {
+                            self.infer_cap(&CapContext::new(), &step.body)?;
+                            if let Some(comp) = &step.compensate {
+                                self.infer_cap(&CapContext::new(), comp)?;
+                            }
+                        }
+                    }
+                    if let Some(comp) = compensate {
+                        self.infer_cap(&CapContext::new(), comp)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Infer the capability of an expression's result.
@@ -2022,11 +2129,44 @@ impl CapabilityAnalyzer {
             }
 
             // Application: conservative join of function capability and all
-            // argument capabilities.
+            // argument capabilities. Direct, unshadowed module calls also
+            // enforce parameter capability sinks before codegen is allowed to
+            // transfer ownership at the ABI.
             Expr::App { func, args, .. } => {
                 let mut cap = self.infer_cap_tracked(ctx, func, consumed)?;
+                let mut arg_caps = Vec::with_capacity(args.len());
                 for arg in args {
-                    cap = cap.join(self.infer_cap_tracked(ctx, arg, consumed)?);
+                    let arg_cap = self.infer_cap_tracked(ctx, arg, consumed)?;
+                    cap = cap.join(arg_cap);
+                    arg_caps.push(arg_cap);
+                }
+
+                if let Expr::Var(name, _) = func.as_ref() {
+                    if !ctx.is_bound(name) {
+                        if let Some(expected_caps) = self.fn_param_caps.get(name) {
+                            for (idx, (actual, expected)) in
+                                arg_caps.iter().zip(expected_caps).enumerate()
+                            {
+                                if expected.is_linear() && actual != expected {
+                                    let span = expr_span(&args[idx]);
+                                    let msg = format!(
+                                        "argument {} to `{}` has capability {}, but parameter {} is an ownership sink requiring {}",
+                                        idx + 1,
+                                        name,
+                                        actual,
+                                        idx + 1,
+                                        expected
+                                    );
+                                    self.diagnostics.push(msg.clone());
+                                    return Err(NuError::cap_error_explained(
+                                        msg,
+                                        span,
+                                        "linear/lineariso sink calls transfer the caller's counted ownership slot; pass a value with the same linear capability",
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(cap)
             }
@@ -3685,14 +3825,16 @@ mod tests {
     }
 
     #[test]
-    fn test_cap_context_with_params_preserves_only_annotations() {
+    fn test_cap_context_with_params_matches_hir_defaults() {
         let params = vec![
             Param::new("plain", None),
             Param::new("owned", None).with_cap(Capability::LinearIso),
         ];
         let ctx = CapContext::new().with_params(&params);
-        assert_eq!(ctx.lookup("plain"), Capability::Val);
+        assert_eq!(ctx.lookup("plain"), Capability::Ref);
         assert_eq!(ctx.lookup("owned"), Capability::LinearIso);
+        assert!(ctx.is_bound("plain"));
+        assert!(!ctx.is_bound("missing"));
     }
 
     #[test]
