@@ -24,6 +24,7 @@ pub enum Lifecycle {
 pub enum Architecture {
     X86_64,
     Arm64,
+    Riscv64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -284,6 +285,27 @@ mod tests {
             restart_overhead_seconds: 15.0,
             data_egress_gib: 0.0,
         }
+    }
+
+    #[test]
+    fn architecture_serializes_riscv64_stably() {
+        let encoded = serde_json::to_string(&Architecture::Riscv64).unwrap();
+        assert_eq!(encoded, "\"riscv64\"");
+        let decoded: Architecture = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, Architecture::Riscv64);
+    }
+
+    #[test]
+    fn riscv64_architecture_is_a_hard_placement_constraint() {
+        let mut riscv = offer("riscv", Lifecycle::OnDemand, 0.50);
+        riscv.architecture = Architecture::Riscv64;
+        let x86 = offer("x86", Lifecycle::OnDemand, 0.25);
+        let mut workload = job(WorkloadClass::Ephemeral, 60.0);
+        workload.architecture = Some(Architecture::Riscv64);
+        let offers = [x86, riscv];
+        let ranked = rank_offers(&workload, &offers, ScoreWeights::default()).unwrap();
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].offer.offer_id, "riscv");
     }
 
     #[test]

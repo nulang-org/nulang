@@ -1,0 +1,118 @@
+name: RISC-V 64
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: riscv64-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
+  CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+  CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
+  AR_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-ar
+  TARGET_CC: riscv64-linux-gnu-gcc
+  TARGET_AR: riscv64-linux-gnu-ar
+  CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUNNER: qemu-riscv64 -L /usr/riscv64-linux-gnu
+
+jobs:
+  riscv64:
+    name: Build & smoke test (riscv64gc Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install RISC-V toolchain and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-riscv64-linux-gnu \
+            binutils-riscv64-linux-gnu \
+            libc6-dev-riscv64-cross \
+            qemu-user
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: riscv64gc-unknown-linux-gnu
+
+      # Keep this profile intentionally independent of Python/SQLite/AI.
+      # It validates the portable language runtime plus Cranelift's riscv64
+      # tiered-JIT/AOT code generation without requiring target-architecture
+      # Python packages. Release mode catches optimization/LTO-sensitive bugs.
+      - name: Cross-build Nulang with native codegen (release)
+        run: |
+          cargo build \
+            --release \
+            --target riscv64gc-unknown-linux-gnu \
+            --no-default-features \
+            --features native-codegen \
+            --bin nulang
+
+      - name: Verify ELF architecture
+        run: |
+          riscv64-linux-gnu-readelf -h \
+            target/riscv64gc-unknown-linux-gnu/release/nulang \
+            | grep -E 'Machine:[[:space:]]+RISC-V'
+
+      - name: Verify heap pointers fit the Value payload under RISC-V
+        run: |
+          cargo test \
+            --release \
+            --target riscv64gc-unknown-linux-gnu \
+            --no-default-features \
+            --features native-codegen \
+            --test pointer_payload
+
+      - name: Run bytecode VM smoke test under QEMU
+        run: |
+          qemu-riscv64 -L /usr/riscv64-linux-gnu \
+            target/riscv64gc-unknown-linux-gnu/release/nulang \
+            examples/01_hello.nula
+
+      # The focused integration test forces a hot loop past HOT_THRESHOLD and
+      # asserts jit_compiled_count() > 0. Cargo's target runner executes the
+      # RISC-V test binary through qemu-riscv64, proving target-ISA JIT code
+      # generation and execution without compiling unrelated unit-test code.
+      - name: Exercise tiered JIT under QEMU
+        run: |
+          cargo test \
+            --release \
+            --target riscv64gc-unknown-linux-gnu \
+            --no-default-features \
+            --features native-codegen \
+            --test riscv_jit
+
+      # This separately exercises the AOT/native backend. The CLI prints the
+      # pure program result, so require the generated RISC-V code to compute
+      # the expected value instead of treating a zero exit status as enough.
+      - name: Run AOT native backend smoke test under QEMU
+        run: |
+          printf '%s\n' \
+            'fn add(a: Int, b: Int) -> Int {' \
+            '    a + b' \
+            '}' \
+            'add(20, 22)' > /tmp/riscv-native.nula
+          output="$(qemu-riscv64 -L /usr/riscv64-linux-gnu \
+            target/riscv64gc-unknown-linux-gnu/release/nulang \
+            --backend native /tmp/riscv-native.nula)"
+          printf 'AOT result: %s\n' "$output"
+          test "$output" = "42"
+
+      - name: Cross-check capacity crate
+        run: |
+          cargo test -p nulang-capacity \
+            --release \
+            --target riscv64gc-unknown-linux-gnu
