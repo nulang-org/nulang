@@ -183,8 +183,13 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                 .iter()
                 .map(|p| (p.name.clone(), resolve_type(&p.ty)))
                 .collect();
+            let mut all_param_caps: Vec<Capability> = params
+                .iter()
+                .map(|p| p.cap.unwrap_or(Capability::Ref))
+                .collect();
             for p in using_params {
                 all_params.push((p.name.clone(), resolve_type(&p.ty)));
+                all_param_caps.push(p.cap.unwrap_or(Capability::Ref));
             }
             // Build implicit dictionary parameters from typeclass constraints.
             let dict_param_names: Vec<String> = type_param_constraints
@@ -193,6 +198,9 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                 .collect();
             for dn in &dict_param_names {
                 all_params.push((dn.clone(), Type::unit()));
+                // Typeclass dictionaries are shared compiler-generated
+                // context values, never ownership-transfer parameters.
+                all_param_caps.push(Capability::Ref);
             }
             // Build param map for typeclass resolution during body lowering.
             let mut param_map: FxHashMap<String, Type> = FxHashMap::default();
@@ -229,6 +237,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                 name: name.clone(),
                 type_params: type_params.clone(),
                 params: all_params,
+                param_caps: all_param_caps,
                 dict_params: dict_param_names
                     .into_iter()
                     .map(|n| (n, Type::unit()))
@@ -2756,6 +2765,37 @@ mod tests {
                     if name.starts_with("__tmp")
             ),
             "consume expression must yield the moved temporary"
+        );
+    }
+
+    #[test]
+    fn test_function_param_capabilities_survive_hir_lowering() {
+        let src = r#"
+fn transfer(lineariso owned: Int, val shared: Int, plain: Int) -> Int {
+    owned
+}
+"#;
+        let mut lexer = crate::lexer::Lexer::new(src);
+        let tokens = lexer.lex().expect("lex");
+        let mut parser = crate::parser::Parser::new(tokens);
+        let ast = parser.parse_module().expect("parse");
+        let hir = lower_module(&ast, &FxHashMap::default());
+        let f = hir
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                hir::Decl::Function(f) if f.name == "transfer" => Some(f),
+                _ => None,
+            })
+            .expect("transfer function");
+
+        assert_eq!(
+            f.param_caps,
+            vec![
+                Capability::LinearIso,
+                Capability::Val,
+                Capability::Ref,
+            ]
         );
     }
 

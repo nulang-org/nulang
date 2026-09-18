@@ -406,7 +406,16 @@ impl FunctionBuilder {
     }
 
     pub fn add_param(&mut self, name: impl Into<String>, ty: Type) -> LocalId {
-        let id = self.add_local(name, ty);
+        self.add_param_with_cap(name, ty, Capability::Tag)
+    }
+
+    pub fn add_param_with_cap(
+        &mut self,
+        name: impl Into<String>,
+        ty: Type,
+        cap: Capability,
+    ) -> LocalId {
+        let id = self.add_local_with_cap(name, ty, cap);
         self.params.push(id);
         id
     }

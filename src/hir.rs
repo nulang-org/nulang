@@ -100,6 +100,10 @@ pub struct FunctionDef {
     pub name: String,
     pub type_params: Vec<String>,
     pub params: Vec<(String, Type)>,
+    /// Capability of each entry in `params`, in the same order. Keeping this
+    /// separate avoids widening every HIR operand while preserving the
+    /// ownership contract needed by MIR/drop analysis.
+    pub param_caps: Vec<Capability>,
     pub dict_params: Vec<(String, Type)>,
     pub ret: Type,
     pub effect: EffectRow,
