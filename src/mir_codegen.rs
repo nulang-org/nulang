@@ -1126,15 +1126,9 @@ impl MirCodegen {
                     ));
                     self.emit(Instruction::new2(OpCode::Move, node_reg, dst));
                 } else {
-                    let authority_manifest = crate::authority::AuthorityManifest::from_tokens(
-                        capabilities.iter().map(String::as_str),
-                    )
-                    .map_err(|err| {
-                        compile_err(
-                            format!("invalid spawn authority grant: {err}"),
-                            Span::default(),
-                        )
-                    })?;
+                    let authority_manifest = crate::authority::AuthorityManifest::from_grants(
+                        capabilities.iter().cloned(),
+                    );
                     let pc = self.current_offset();
                     self.emit(Instruction::new3(
                         OpCode::Spawn,
