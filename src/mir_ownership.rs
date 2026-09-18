@@ -5,8 +5,9 @@
 //!
 //! - source must be a compiler temporary (anonymous or `__*`);
 //! - source must have one owning definition;
-//! - source must have exactly one read in the whole function;
+//! - source must have exactly one static read in the whole function;
 //! - that read must be `dst = Load(src)`;
+//! - neither the owning definition nor transfer site may execute in a CFG cycle;
 //! - params/captures/handler params are excluded;
 //! - only pointer-capable types are considered.
 //!
@@ -53,6 +54,12 @@ fn infer_function_round(func: &mut mir::Function) -> usize {
         return 0;
     }
 
+    // A syntactically single definition/read can execute many times when its
+    // block participates in a loop. Clearing the source after such a read is
+    // not a proven dynamic last use, so last-use inference is restricted to
+    // acyclic definition and transfer sites.
+    let cyclic_blocks = cyclic_blocks(func);
+
     let transfers: FxHashSet<(LocalId, LocalId)> = func
         .ownership_transfers
         .iter()
@@ -69,6 +76,7 @@ fn infer_function_round(func: &mut mir::Function) -> usize {
     }
 
     let mut def_count = vec![0usize; nlocals];
+    let mut def_block: Vec<Option<usize>> = vec![None; nlocals];
     let mut owning_def = vec![false; nlocals];
     let mut use_count = vec![0usize; nlocals];
     let mut load_site: Vec<Option<(usize, usize, LocalId)>> = vec![None; nlocals];
@@ -79,6 +87,7 @@ fn infer_function_round(func: &mut mir::Function) -> usize {
                 let d = dst.0 as usize;
                 def_count[d] += 1;
                 if def_count[d] == 1 {
+                    def_block[d] = Some(bi);
                     owning_def[d] = rvalue_is_owning(op)
                         || matches!(
                             op,
@@ -134,6 +143,11 @@ fn infer_function_round(func: &mut mir::Function) -> usize {
             continue;
         };
         if src == dst
+            || cyclic_blocks.get(bi).copied().unwrap_or(true)
+            || def_block[i]
+                .and_then(|def_bi| cyclic_blocks.get(def_bi))
+                .copied()
+                .unwrap_or(true)
             || external.contains(&dst)
             || def_count[dst.0 as usize] != 1
             || transfers.contains(&(src, dst))
@@ -141,8 +155,9 @@ fn infer_function_round(func: &mut mir::Function) -> usize {
             continue;
         }
 
-        // The unique read guarantee means this Load is the source's last
-        // semantic observation on every path represented by this MIR local.
+        // Static uniqueness is sufficient only after excluding cyclic sites:
+        // the transfer statement and owning definition can each execute at
+        // most once along a single traversal of the acyclic CFG region.
         inferred.push((bi, si, src, dst));
     }
 
@@ -187,6 +202,49 @@ fn infer_function_round(func: &mut mir::Function) -> usize {
     }
 
     inferred.len()
+}
+
+fn terminator_successors(term: &mir::Terminator) -> Vec<usize> {
+    match term {
+        mir::Terminator::Jump(target) => vec![target.0 as usize],
+        mir::Terminator::Branch { then_, else_, .. } => {
+            vec![then_.0 as usize, else_.0 as usize]
+        }
+        mir::Terminator::Return(_)
+        | mir::Terminator::Resume(_)
+        | mir::Terminator::Unterminated => Vec::new(),
+    }
+}
+
+/// Mark blocks that belong to any CFG cycle.
+///
+/// This deliberately favors soundness over optimization density. A later pass
+/// can recover loop transfers with iteration-aware ownership/phi proofs.
+fn cyclic_blocks(func: &mir::Function) -> Vec<bool> {
+    let nblocks = func.blocks.len();
+    let mut cyclic = vec![false; nblocks];
+
+    for start in 0..nblocks {
+        let Some(block) = func.blocks.get(start) else {
+            continue;
+        };
+        let mut stack = terminator_successors(&block.terminator);
+        let mut visited = vec![false; nblocks];
+
+        while let Some(next) = stack.pop() {
+            if next == start {
+                cyclic[start] = true;
+                break;
+            }
+            if next >= nblocks || visited[next] {
+                continue;
+            }
+            visited[next] = true;
+            stack.extend(terminator_successors(&func.blocks[next].terminator));
+        }
+    }
+
+    cyclic
 }
 
 fn may_hold_heap_ptr(ty: &Type) -> bool {
@@ -358,6 +416,25 @@ mod tests {
                 op: mir::RValue::Const(Constant::Nil)
             }) if *d == src
         ));
+    }
+
+    #[test]
+    fn does_not_infer_static_single_use_inside_cfg_cycle() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("looping", None);
+        let src = b.add_temp(array_ty.clone());
+        let dst = b.add_temp(array_ty);
+        b.assign(src, mir::RValue::ArrayLit(vec![]));
+        b.assign(dst, mir::RValue::Load(src));
+        b.terminate(mir::Terminator::Jump(mir::BlockId(0)));
+
+        let mut module = single_function_module(b.build());
+        assert_eq!(
+            infer_last_use_transfers(&mut module),
+            0,
+            "one static read in a loop is not a proven dynamic last use"
+        );
+        assert!(module.functions[0].ownership_transfers.is_empty());
     }
 
     #[test]
