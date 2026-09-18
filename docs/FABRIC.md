@@ -196,7 +196,7 @@ semantics that later cluster and stream layers can reuse.
 - [x] Application replica ACK/NACK and majority quorum commit index.
 - [x] Persist/reconstruct pending replication intent across leader restart.
 - [x] Explicit idempotent retry for recovered uncommitted sequences.
-- [ ] Automatic retry scheduling / backoff.
+- [x] Automatic pending-quorum retry scheduling with exponential backoff.
 - [ ] Leader epoch/lease and automatic failover.
 - [x] Durable per-replica progress for application ACKs.
 - [x] Bounded lagging committed-replica catch-up.
