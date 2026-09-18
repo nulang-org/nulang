@@ -33,7 +33,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+use crate::effect_checker::{CapabilityAnalyzer, EffectChecker};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::repl::type_to_string;
@@ -1525,8 +1525,7 @@ impl NulangLanguageServer {
     /// Run the capability analysis pass and return the byte ranges of
     /// consumed linear/lineariso variable references.
     fn find_consumed_spans(&self, source: &str) -> Vec<(usize, usize)> {
-        use crate::ast::Decl;
-        use crate::effect_checker::{flatten_decls, CapContext, CapabilityAnalyzer};
+        use crate::effect_checker::CapabilityAnalyzer;
 
         let mut lexer = crate::lexer::Lexer::new(source);
         let tokens = match lexer.lex() {
@@ -1544,30 +1543,8 @@ impl NulangLanguageServer {
             return vec![];
         }
 
-        let flat_decls = flatten_decls(&ast.decls);
         let mut cap_analyzer = CapabilityAnalyzer::new();
-        let cap_ctx = CapContext::new();
-        for decl in &flat_decls {
-            if let Decl::Function { body, params, .. } = decl {
-                let mut ctx = cap_ctx.clone();
-                for p in params {
-                    if let Some(c) = p.cap {
-                        ctx = ctx.with_binding(&p.name, c);
-                    }
-                }
-                let _ = cap_analyzer.infer_cap(&ctx, body);
-            } else if let Decl::Actor { behaviors, .. } = decl {
-                for b in behaviors {
-                    let mut ctx = cap_ctx.clone();
-                    for p in &b.params {
-                        if let Some(c) = p.cap {
-                            ctx = ctx.with_binding(&p.name, c);
-                        }
-                    }
-                    let _ = cap_analyzer.infer_cap(&ctx, &b.body);
-                }
-            }
-        }
+        let _ = cap_analyzer.check_module(&ast.decls);
 
         cap_analyzer
             .consumed_spans
@@ -1875,30 +1852,14 @@ impl NulangLanguageServer {
         }
         let function_rows = effect_checker.function_rows();
 
-        // Capability analysis over the flattened declaration list, so
-        // functions nested in `module {}` blocks are checked like top-level
-        // ones (mirroring the CLI frontend).
+        // Capability analysis uses the same module-level driver as the CLI,
+        // including direct function sink signatures and Ref defaults for
+        // unannotated parameters.
         let mut cap_analyzer = CapabilityAnalyzer::new();
-        let cap_ctx = CapContext::new();
-        for decl in crate::effect_checker::flatten_decls(&ast.decls) {
-            match decl {
-                crate::ast::Decl::Function { body, params, .. } => {
-                    let ctx = cap_ctx.with_params(params);
-                    if let Err(e) = cap_analyzer.infer_cap(&ctx, body) {
-                        diagnostics.extend(nu_error_to_diagnostic(e));
-                    }
-                }
-                crate::ast::Decl::Actor { behaviors, .. } => {
-                    for behavior in behaviors {
-                        let ctx = cap_ctx.with_params(&behavior.params);
-                        if let Err(e) = cap_analyzer.infer_cap(&ctx, &behavior.body) {
-                            diagnostics.extend(nu_error_to_diagnostic(e));
-                        }
-                    }
-                }
-                _ => {}
-            }
+        if let Err(e) = cap_analyzer.check_module(&ast.decls) {
+            diagnostics.extend(nu_error_to_diagnostic(e));
         }
+
         for msg in &cap_analyzer.diagnostics {
             diagnostics.push(Diagnostic {
                 range: Range::new(Position::new(0, 0), Position::new(0, 0)),
