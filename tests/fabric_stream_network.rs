@@ -343,7 +343,6 @@ fn replica_nack_does_not_advance_quorum_commit() {
     let _ = std::fs::remove_dir_all(root_b);
 }
 
-
 #[test]
 fn leader_restart_recovers_pending_ticket_and_retries_replica() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -366,14 +365,10 @@ fn leader_restart_recovers_pending_ticket_and_retries_replica() {
         .unwrap()
         .handle_heartbeat(node_a, addr_a);
 
-    let placement = nodes[0]
-        .fabric_stream_placement("recovery", 0, 2)
-        .unwrap();
+    let placement = nodes[0].fabric_stream_placement("recovery", 0, 2).unwrap();
     assert_eq!(
         placement,
-        nodes[1]
-            .fabric_stream_placement("recovery", 0, 2)
-            .unwrap()
+        nodes[1].fabric_stream_placement("recovery", 0, 2).unwrap()
     );
 
     let roots = vec![temp_dir("recovery-a"), temp_dir("recovery-b")];
