@@ -416,12 +416,7 @@ impl Runtime {
             })
             .map(|vote| (vote.voter, vote.tail))
             .collect();
-        ahead.sort_by(|left, right| {
-            right
-                .1
-                .cmp(&left.1)
-                .then_with(|| left.0.cmp(&right.0))
-        });
+        ahead.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
 
         let mut report = FabricStreamEpochPullReport {
             ahead_replicas: ahead.len(),
@@ -494,8 +489,7 @@ impl Runtime {
             || request.source != local.0
             || !request.proposal.to_policy.replicas.contains(&local.0)
             || request.max_records == 0
-            || request.start_sequence
-                != request.proposal.candidate_tail.saturating_add(1)
+            || request.start_sequence != request.proposal.candidate_tail.saturating_add(1)
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -557,11 +551,7 @@ impl Runtime {
         }
 
         let records = self
-            .fabric_stream_read(
-                &request.stream,
-                request.start_sequence,
-                request.max_records,
-            )?
+            .fabric_stream_read(&request.stream, request.start_sequence, request.max_records)?
             .into_iter()
             .map(|record| FabricStreamEpochRepairRecord {
                 sequence: record.sequence,
