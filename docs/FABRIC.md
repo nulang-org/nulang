@@ -197,7 +197,9 @@ semantics that later cluster and stream layers can reuse.
 - [x] Persist/reconstruct pending replication intent across leader restart.
 - [x] Explicit idempotent retry for recovered uncommitted sequences.
 - [x] Automatic pending-quorum retry scheduling with exponential backoff.
-- [ ] Leader epoch/lease and automatic failover.
+- [x] Durable replication policy and epoch-1 fencing.
+- [ ] Quorum-backed epoch transition.
+- [ ] Leader lease / automatic failover.
 - [x] Durable per-replica progress for application ACKs.
 - [x] Bounded lagging committed-replica catch-up.
 - [x] Committed-index propagation to followers.
