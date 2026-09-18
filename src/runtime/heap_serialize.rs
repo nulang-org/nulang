@@ -965,6 +965,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_arraybuilder_rejected_at_durable_boundary() {
+        let mut vm = VM::new_without_jit();
+        vm.load_module(crate::bytecode::CodeModule::new("arraybuilder_serialize"));
+        let ptr = vm
+            .alloc_on_heap(
+                2 * std::mem::size_of::<Value>(),
+                TypeTag::ArrayBuilder,
+            )
+            .expect("builder allocation");
+        let value = unsafe {
+            /* SAFETY: alloc_on_heap returned a live allocation owned by this VM. */
+            Value::ptr(ptr)
+        };
+
+        let mut ctx = SerializeCtx {
+            obj_ids: HashMap::new(),
+            string_table: Vec::new(),
+            string_ids: HashMap::new(),
+            string_value_to_idx: HashMap::new(),
+            objects: Vec::new(),
+            closures: Vec::new(),
+            frames: Vec::new(),
+            handlers: Vec::new(),
+        };
+        let err = walk_value(&mut ctx, value, &vm, 0).expect_err("builder must be rejected");
+        assert!(
+            err.contains("ArrayBuilder cannot cross a durable continuation boundary"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_format_constants() {
         assert_eq!(MAGIC, *b"NLCS");
         assert_eq!(VERSION, 1);
