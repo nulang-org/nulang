@@ -107,6 +107,7 @@ pub(crate) struct FabricStreamReplicaAck {
     pub partition: u16,
     pub leader: NodeId,
     pub membership_fingerprint: u64,
+    pub replication_factor: usize,
     pub sequence: u64,
     pub replica: NodeId,
     pub accepted: bool,
@@ -118,6 +119,7 @@ struct FabricStreamReplicaAckWire {
     partition: u16,
     leader: u64,
     membership_fingerprint: u64,
+    replication_factor: usize,
     sequence: u64,
     replica: u64,
     accepted: bool,
@@ -130,6 +132,7 @@ impl FabricStreamReplicaAck {
             partition: self.partition,
             leader: self.leader.0,
             membership_fingerprint: self.membership_fingerprint,
+            replication_factor: self.replication_factor,
             sequence: self.sequence,
             replica: self.replica.0,
             accepted: self.accepted,
@@ -140,7 +143,7 @@ impl FabricStreamReplicaAck {
     pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
         let wire: FabricStreamReplicaAckWire = serde_json::from_slice(bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if wire.stream.is_empty() || wire.sequence == 0 {
+        if wire.stream.is_empty() || wire.replication_factor == 0 || wire.sequence == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid Fabric stream replica ACK",
@@ -151,6 +154,7 @@ impl FabricStreamReplicaAck {
             partition: wire.partition,
             leader: NodeId(wire.leader),
             membership_fingerprint: wire.membership_fingerprint,
+            replication_factor: wire.replication_factor,
             sequence: wire.sequence,
             replica: NodeId(wire.replica),
             accepted: wire.accepted,
@@ -589,9 +593,47 @@ impl Runtime {
         ack: FabricStreamReplicaAck,
         cluster: &ClusterState,
     ) -> io::Result<FabricStreamReplicationStatus> {
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream replica ACK requires distribution",
+            )
+        })?;
+        let current = compute_stream_placement(
+            local,
+            Some(cluster),
+            &ack.stream,
+            ack.partition,
+            ack.replication_factor,
+        )?;
+        if current.membership_fingerprint != ack.membership_fingerprint
+            || current.leader != ack.leader
+            || !current.replicas.contains(&ack.replica)
+            || ack.replica == local
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stale or unauthorized Fabric stream replica ACK",
+            ));
+        }
+
+        if ack.accepted {
+            self.fabric_stream_record_replica_progress(
+                &ack.stream,
+                ack.replica.0,
+                ack.sequence,
+            )?;
+        }
+
         let committed = self.fabric_stream_committed_sequence(&ack.stream)?;
         if ack.sequence <= committed {
-            return self.fabric_stream_record_replica_ack(ack);
+            return Ok(FabricStreamReplicationStatus {
+                sequence: ack.sequence,
+                quorum: ack.replication_factor / 2 + 1,
+                acknowledgements: 0,
+                rejections: 0,
+                committed: true,
+            });
         }
 
         let key = (ack.stream.clone(), ack.partition);
@@ -604,41 +646,6 @@ impl Runtime {
             .is_none()
         {
             self.fabric_stream_recover_pending_from_cluster(&ack.stream, cluster)?;
-        }
-        let replication_factor = self
-            .distributed
-            .fabric_stream_replication
-            .pending
-            .get(&key)
-            .and_then(|entries| entries.get(&ack.sequence))
-            .map(|ticket| ticket.replicas.len())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "Fabric stream replica ACK has no pending ticket",
-                )
-            })?;
-
-        let local = self.distributed.node_id.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "Fabric stream replica ACK requires distribution",
-            )
-        })?;
-        let current = compute_stream_placement(
-            local,
-            Some(cluster),
-            &ack.stream,
-            ack.partition,
-            replication_factor,
-        )?;
-        if current.membership_fingerprint != ack.membership_fingerprint
-            || current.leader != ack.leader
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "stale Fabric stream replica ACK after membership change",
-            ));
         }
 
         self.fabric_stream_record_replica_ack(ack)
@@ -1337,6 +1344,7 @@ mod tests {
             partition: 0,
             leader: NodeId(10),
             membership_fingerprint: 44,
+            replication_factor: 3,
             sequence: 3,
             replica: NodeId(11),
             accepted: true,
