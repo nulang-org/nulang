@@ -1688,10 +1688,8 @@ impl CapContext {
     pub fn with_params(&self, params: &[Param]) -> Self {
         let mut ctx = self.clone();
         for param in params {
-            ctx.bindings.push((
-                param.name.clone(),
-                param.cap.unwrap_or(Capability::Ref),
-            ));
+            ctx.bindings
+                .push((param.name.clone(), param.cap.unwrap_or(Capability::Ref)));
         }
         ctx
     }
@@ -2155,8 +2153,7 @@ impl CapabilityAnalyzer {
                                     // linear parameter. MIR still gives the
                                     // literal a temporary local and the sink
                                     // ABI consumes that temporary.
-                                    let ephemeral_literal =
-                                        matches!(&args[idx], Expr::Literal(..));
+                                    let ephemeral_literal = matches!(&args[idx], Expr::Literal(..));
                                     if ephemeral_literal {
                                         continue;
                                     }
@@ -4424,7 +4421,10 @@ mod tests {
             span: s(),
         };
         let result = analyzer.infer_cap(&ctx, &expr);
-        assert!(result.is_err(), "consume x must invalidate x for every capability");
+        assert!(
+            result.is_err(),
+            "consume x must invalidate x for every capability"
+        );
     }
 
     #[test]
