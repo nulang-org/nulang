@@ -45,6 +45,13 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Nula build-wasm capability forwarding — 2026-09-18
+- **Package capability grants now reach the WASM compiler invocation**
+  (`src/package/commands.rs`). `nula build-wasm` preserves manifest-derived
+  `--with` capability arguments when invoking the compiler, matching the
+  package's declared authority instead of silently compiling without those
+  grants.
+
 ### Runtime backend parity — 2026-09-17
 - **WASM guest-heap negation error parity** (`src/wasm_runtime.rs`,
   `src/mir_wasm.rs`): unary negation of a guest heap value now reports the
