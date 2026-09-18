@@ -294,11 +294,13 @@ fn rvalue_reads(rv: &mir::RValue, out: &mut Vec<LocalId>) {
         RValue::Spawn {
             init, target_node, ..
         } => {
+            // Local spawn codegen ignores non-constant initializer MIR.
+            // Remote spawn evaluates every initializer before RSpawn.
             if let Some(id) = target_node {
                 out.push(*id);
-            }
-            for (_, rv) in init {
-                rvalue_reads(rv, out);
+                for (_, rv) in init {
+                    rvalue_reads(rv, out);
+                }
             }
         }
         RValue::Send { actor, args, .. } | RValue::Ask { actor, args, .. } => {
@@ -635,9 +637,13 @@ fn collect_rvalue_calls(
                 *dynamic = true;
             }
         }
-        mir::RValue::Spawn { init, .. } => {
-            for (_, nested) in init {
-                collect_rvalue_calls(nested, caller, call_sites, dynamic_callable);
+        mir::RValue::Spawn {
+            init, target_node, ..
+        } => {
+            if target_node.is_some() {
+                for (_, nested) in init {
+                    collect_rvalue_calls(nested, caller, call_sites, dynamic_callable);
+                }
             }
         }
         _ => {}
@@ -844,6 +850,53 @@ mod tests {
         );
         assert!(!p.requires_upstream_owned_param);
         assert_eq!(report[0].direct_call_sites, 1);
+    }
+
+    #[test]
+    fn call_ownership_candidate_rejects_duplicate_argument_owner() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+
+        let mut callee = mir::FunctionBuilder::new("pair", None);
+        let _a = callee.add_param_with_cap(
+            "a",
+            array_ty.clone(),
+            Capability::LinearIso,
+        );
+        let _b = callee.add_param_with_cap(
+            "b",
+            array_ty.clone(),
+            Capability::LinearIso,
+        );
+        callee.terminate(mir::Terminator::Return(None));
+
+        let mut caller = mir::FunctionBuilder::new("caller", None);
+        let arg = caller.add_temp(array_ty);
+        let result = caller.add_temp(Type::unit());
+        caller.assign(arg, mir::RValue::ArrayLit(vec![]));
+        caller.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![arg, arg],
+            },
+        );
+        caller.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(callee.build());
+        module.functions.push(caller.build());
+
+        let report = analyze_call_ownership(&module);
+        assert!(
+            report[0].params.iter().all(|p| !p.candidate_owned),
+            "one counted reference must never satisfy two owned parameters"
+        );
+        assert!(
+            report[0].params.iter().all(|p| {
+                p.blockers
+                    .contains(&CallOwnershipBlocker::UntransferableCallArgument)
+            })
+        );
     }
 
     #[test]
