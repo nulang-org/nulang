@@ -201,7 +201,7 @@ semantics that later cluster and stream layers can reuse.
 - [x] Quorum-backed sequential epoch transition among old replicas.
 - [x] Durable one-proposal-per-epoch promises that fence the old epoch.
 - [x] Proposal-scoped push repair for a lagging new-policy voter.
-- [ ] Proposal-scoped pull repair when the prospective leader is behind.
+- [x] Proposal-scoped pull reconciliation when the prospective leader is behind.
 - [ ] Replica-set expansion/bootstrap during reconfiguration.
 - [ ] Leader lease / automatic failover.
 - [x] Durable per-replica progress for application ACKs.
