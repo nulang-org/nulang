@@ -2176,7 +2176,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                 }
             }
             source
-        },
+        }
         Expr::Recover { body: b, .. } => lower_expr(b, body),
         Expr::Defer { expr, .. } => {
             // Defer is handled at block level; standalone defer is a no-op.
@@ -2732,8 +2732,7 @@ mod tests {
                 matches!(
                     stmt,
                     hir::Stmt::Let {
-                        value:
-                            hir::RValue::Use(hir::Operand::Var(name, _)),
+                        value: hir::RValue::Use(hir::Operand::Var(name, _)),
                         ..
                     } if name == "x"
                 )
