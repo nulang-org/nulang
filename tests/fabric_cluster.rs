@@ -79,6 +79,10 @@ fn fabric_gossip_converges_routes_and_reuses_distributed_actor_transport() {
     );
     b.process_network();
     assert_eq!(b.actors.get(&target).unwrap().mailbox.len(), 1);
+    // Drain B's heartbeat/gossip emitted during that turn while both nodes
+    // still share the same virtual timestamp. No later packet from B should
+    // refresh A's liveness clock during the simulated outage below.
+    a.process_network();
 
     // Failure detection removes the learned route immediately rather than
     // leaving a dead consumer selectable until the 60-second removal window.
