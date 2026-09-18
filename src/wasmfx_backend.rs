@@ -193,6 +193,25 @@ impl WasmFxBackend {
                                 span: crate::types::Span::default(),
                             });
                         }
+                        if let mir::RValue::Call {
+                            args, sink_args, ..
+                        } = op
+                        {
+                            if args.len() != sink_args.len() {
+                                return Err(crate::types::NuError::VMError {
+                                    msg: "MIR call sink mask length does not match argument count"
+                                        .into(),
+                                    span: crate::types::Span::default(),
+                                });
+                            }
+                            if sink_args.iter().any(|sink| *sink) {
+                                return Err(crate::types::NuError::VMError {
+                                    msg: "WasmFX backend restricted profile: ownership-sink calls are not supported yet because CIR cannot encode caller-source invalidation; use the bytecode, WASM, or native backend"
+                                        .into(),
+                                    span: crate::types::Span::default(),
+                                });
+                            }
+                        }
                     }
                 }
             }
