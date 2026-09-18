@@ -360,6 +360,57 @@ pub fn lookup_host_operation_by_identity(
         .find(|operation| operation.effect_id == effect_id && operation.operation_id == operation_id)
 }
 
+/// Build the compiler-owned external ABI descriptor consumed by conformance
+/// tooling and, eventually, Cloud admission/runtime adapters.
+///
+/// The descriptor intentionally omits source operation spellings such as
+/// `Storage.write`. Consumers receive only canonical host identity plus the
+/// compiler-produced request/response/authority/replay contract.
+pub fn host_effect_abi_descriptor() -> Result<serde_json::Value, serde_json::Error> {
+    let mut operations = Vec::with_capacity(HOST_OPERATIONS.len());
+
+    for operation in HOST_OPERATIONS {
+        let template: serde_json::Value =
+            serde_json::from_str(operation.request.template_json)?;
+        let response = match operation.response {
+            HostResponseProjection::Passthrough => serde_json::json!({
+                "kind": "passthrough"
+            }),
+            HostResponseProjection::Field(field) => serde_json::json!({
+                "kind": "field",
+                "field": field
+            }),
+            HostResponseProjection::Discard => serde_json::json!({
+                "kind": "discard"
+            }),
+        };
+        let authority = match operation.authority {
+            HostAuthorityRequirement::CheckedEffectRow(effect) => serde_json::json!({
+                "kind": "checked-effect-row",
+                "effect": effect
+            }),
+        };
+
+        operations.push(serde_json::json!({
+            "canonical_id": operation.canonical_id(),
+            "effect_id": operation.effect_id,
+            "operation_id": operation.operation_id,
+            "request": {
+                "arity": operation.request.arity,
+                "template": template
+            },
+            "response": response,
+            "authority": authority,
+            "replay_class": operation.replay.manifest_class()
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "schema": HOST_EFFECT_ABI_SCHEMA,
+        "operations": operations
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +531,19 @@ mod tests {
             HostReplayClass::ExternalNonreplayable.manifest_class(),
             "external-nonreplayable"
         );
+    }
+
+    #[test]
+    fn checked_in_descriptor_fixture_matches_compiler_contract() {
+        let actual: serde_json::Value =
+            serde_json::from_str(include_str!("../spec/host-effects/v0alpha1.json")).unwrap();
+        let expected = host_effect_abi_descriptor().unwrap();
+        assert_eq!(actual, expected);
+
+        let fixture = include_str!("../spec/host-effects/v0alpha1.json");
+        assert!(!fixture.contains("Storage.write"));
+        assert!(!fixture.contains("Queue.push"));
+        assert!(!fixture.contains("Inference.ask"));
     }
 
     #[test]
