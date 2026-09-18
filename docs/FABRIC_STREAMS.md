@@ -558,3 +558,136 @@ The next ownership layer must implement a quorum-backed epoch transition that
 proves the prospective leader has the committed prefix before atomically
 installing a higher epoch. Automatic failover remains disabled until that
 protocol exists.
+
+
+## Quorum-backed epoch transition
+
+Fabric now has an explicit transition protocol for moving a stream from epoch
+`N` to `N+1` without allowing the old epoch to continue forming commits.
+
+The public entry points are:
+
+- `fabric_stream_begin_epoch_transition(stream, partition, new_replication_factor)`
+- `fabric_stream_resume_epoch_transition(stream)`
+
+The first transition protocol is deliberately conservative.
+
+### Durable promise
+
+Before a replica casts an affirmative epoch vote it fsyncs
+`epoch_promise.json` containing:
+
+- promised epoch,
+- deterministic proposal hash.
+
+A promise for epoch `N+1` immediately fences normal stream traffic from epoch
+`N` on that node. Repeating the same proposal is idempotent. A conflicting
+proposal for the same epoch is rejected.
+
+After the durable policy itself advances, the next transition may replace the
+older promise with a promise for the next sequential epoch.
+
+This creates the key failover invariant:
+
+> once an old-policy majority promises the next epoch, the old leader can no
+> longer obtain an old-epoch commit quorum.
+
+### Proposal
+
+A transition proposal binds, through a BLAKE3 proposal hash:
+
+- stream name,
+- complete old policy,
+- complete proposed policy,
+- candidate durable tail.
+
+The prospective leader must be:
+
+- the current deterministic leader of the proposed placement,
+- a member of the old replica set.
+
+For this first protocol, every proposed new replica must also be a member of the
+old replica set. The protocol therefore supports safe shrink/leadership changes
+among existing replicas, such as RF=3 -> RF=2 after one confirmed loss, but does
+not yet introduce a replacement node.
+
+### Exact-prefix vote
+
+An old-policy replica votes yes only when its local durable tail is **exactly**
+the candidate's durable tail.
+
+A shorter replica votes no and does not create a promise. That rejection can be
+replaced by a yes vote later after the replica is repaired to the same proposal
+tail. An affirmative vote is immutable.
+
+Requiring equal tails avoids carrying an uncommitted hole across the ownership
+boundary.
+
+### Finalization
+
+The candidate finalizes only when:
+
+1. affirmative votes are at least a majority of the old replica set,
+2. every member of the proposed new replica set is among those affirmative
+   voters,
+3. those votes all certify the exact candidate tail.
+
+The full candidate tail is then quorum-durable under the old policy and becomes
+the committed boundary of the new epoch.
+
+Finalization order is crash-safe:
+
+1. persist finalized transition state and quorum-certified boundary,
+2. install the new durable policy,
+3. advance the durable committed boundary,
+4. retire old-epoch pending intents/tickets,
+5. send epoch-commit messages to the new replica set.
+
+If the candidate crashes after step 1, `fabric_stream_resume_epoch_transition`
+idempotently completes the remaining local steps and re-sends the commit.
+
+### Epoch commit
+
+A new replica accepts the transition commit only when:
+
+- sender is the proposed new leader,
+- it belongs to the proposed new replica set,
+- current deterministic placement still equals the proposed policy,
+- the voter set is unique, belongs to the old replica set, and reaches old
+  quorum,
+- every new replica appears in that affirmative voter set,
+- the local durable promise matches the proposal,
+- the local durable tail exactly equals the quorum-certified tail.
+
+It then installs epoch `N+1` and persists that committed boundary.
+
+### Sequential transitions
+
+A finalized transition file can be replaced only by a proposal whose
+`from_policy` is exactly the previous transition's installed `to_policy`.
+Epochs therefore cannot be skipped by the local transition state machine.
+
+### NUL0 compatibility
+
+Prepare, vote, and commit use three reserved system behavior names carried by
+the existing NUL0 v1 `ActorMessage` envelope:
+
+- `__nulang_fabric_stream_epoch_prepare_v1`
+- `__nulang_fabric_stream_epoch_vote_v1`
+- `__nulang_fabric_stream_epoch_commit_v1`
+
+No packet discriminant or `WIRE_VERSION` change is required.
+
+### Threat model
+
+This protocol provides crash/partition fencing for the current Nulang cluster
+model. It is not Byzantine consensus: the runtime-generated commit certificate
+contains transport-authenticated voter identities but no cryptographic
+signatures.
+
+### Remaining ownership work
+
+Automatic leader failover is still disabled. The next layer can use this
+protocol to trigger transitions after confirmed failure, but it must preserve
+the exact-tail requirement and avoid repeatedly shrinking replication factor
+without explicit policy.
