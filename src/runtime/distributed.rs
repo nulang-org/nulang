@@ -1007,13 +1007,32 @@ pub fn process_network_packets(
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
-            Packet::Gossip { members, directory } => {
+            Packet::Gossip {
+                members,
+                directory,
+                fabric,
+            } => {
                 cluster.merge_membership_from_sender(members, incoming.from_node);
                 if !directory.is_empty() {
                     cluster.merge_directory(directory);
                     // A re-joined node may have been replaced while away:
                     // demote any local actor whose directory epoch is newer.
                     runtime.self_demote_superseded();
+                }
+                if let Some(snapshot) = fabric {
+                    if snapshot.node_id != incoming.from_node {
+                        warn!(
+                            "nulang-fabric: rejecting gossip snapshot for {:?} sent by {:?}",
+                            snapshot.node_id, incoming.from_node
+                        );
+                    } else if let Err(error) =
+                        runtime.fabric_replace_remote_advertisements(snapshot)
+                    {
+                        warn!(
+                            "nulang-fabric: rejecting gossip snapshot from {:?}: {}",
+                            incoming.from_node, error
+                        );
+                    }
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
