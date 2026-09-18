@@ -573,6 +573,9 @@ impl Runtime {
             if node == local {
                 continue;
             }
+            if cluster.is_removed(node) {
+                continue;
+            }
             if let Some(info) = cluster.get_node(node) {
                 if matches!(info.status, NodeStatus::Healthy | NodeStatus::Joining) {
                     targets.push((node, info.address));
