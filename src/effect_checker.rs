@@ -2803,6 +2803,7 @@ fn rvalue_is_single_shot(rv: &crate::hir::RValue) -> bool {
     match rv {
         // Straight-line leaf values are fine.
         crate::hir::RValue::Use(_)
+        | crate::hir::RValue::MoveOut(_)
         | crate::hir::RValue::Literal(..)
         | crate::hir::RValue::Binary(..)
         | crate::hir::RValue::Unary(..)
