@@ -56,9 +56,12 @@ two major versions.*
   that majority-shared tail to the new committed boundary. Finalized transition
   state is restart-resumable, old pending tickets are retired, and prepare,
   vote, and commit messages reuse reserved NUL0-v1 ActorMessage behaviors.
-  The first version supports shrink/leadership transition within the old replica
-  set (for example RF3 -> RF2 after confirmed loss); adding a replacement
-  replica and automatic failover remain follow-up work.
+  Higher election terms may supersede an abandoned lower proposal without
+  requiring the old durable policy to advance first, preventing a stale vote
+  from permanently wedging the stream. The first version supports
+  shrink/leadership transition within the old replica set (for example RF3 ->
+  RF2 after confirmed loss); adding a replacement replica and automatic
+  failover remain follow-up work.
 
 ### Fabric stream epoch fencing — 2026-09-18
 - **Durable replication policy + epoch-1 fencing** (Experimental,
