@@ -186,6 +186,9 @@ pub enum RValue {
     /// Runtime panic with a message (contract violations). Diverges.
     Panic(String),
     Load(LocalId),
+    /// Transfer the source local's counted ownership into the assignment
+    /// destination and invalidate the source without retain/release.
+    MoveOut(LocalId),
     /// Read a named record field (module-wide field id resolved by codegen).
     LoadFieldNamed {
         obj: LocalId,
@@ -628,6 +631,7 @@ mod tests {
         // Construct every RValue variant to confirm they compile.
         let _ = RValue::Const(Constant::Int(42));
         let _ = RValue::Load(LocalId(0));
+        let _ = RValue::MoveOut(LocalId(0));
         let _ = RValue::LoadFieldNamed {
             obj: LocalId(0),
             field: "x".into(),

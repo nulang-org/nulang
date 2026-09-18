@@ -1112,6 +1112,15 @@ impl WasmBackend {
             RValue::Load(l) => {
                 body.instruction(&Instruction::LocalGet(self.mir_local(l, func)));
             }
+            RValue::MoveOut(l) => {
+                let src = self.mir_local(l, func);
+                // Leave the transferred value on the operand stack for the
+                // enclosing assignment, then invalidate the reusable source
+                // local without releasing it.
+                body.instruction(&Instruction::LocalGet(src));
+                body.instruction(&Instruction::I64Const(value_layout::TAG_NIL as i64));
+                body.instruction(&Instruction::LocalSet(src));
+            }
             RValue::Binary(op, a, b) => {
                 body.instruction(&Instruction::LocalGet(self.mir_local(a, func)));
                 body.instruction(&Instruction::LocalGet(self.mir_local(b, func)));
@@ -3190,6 +3199,19 @@ mod tests {
             err.to_string().contains("at most 16"),
             "compile error must explain the arg cap: {err}"
         );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_moveout_transfers_value_and_clears_source() {
+        let moved = run_source("let x = 42 in consume x").expect("run moved value");
+        assert_eq!(moved.as_int(), Some(42));
+
+        // Capability analysis normally rejects this read, but backend tests
+        // intentionally observe the physical invalidation contract.
+        let source_after =
+            run_source("let x = 42 in { let y = consume x; x }").expect("run source read");
+        assert!(source_after.is_nil(), "MoveOut source local must be nil");
     }
 
     // ── Guest-side actor emulation ──────────────────────────────────

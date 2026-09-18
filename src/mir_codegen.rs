@@ -769,6 +769,16 @@ impl MirCodegen {
                     self.emit(Instruction::new2(OpCode::Move, src, dst));
                 }
             }
+            mir::RValue::MoveOut(id) => {
+                let src = self.local_reg(*id);
+                if src != dst {
+                    self.emit(Instruction::new2(OpCode::Move, src, dst));
+                    // MoveOut transfers the counted slot; invalidating the
+                    // source must not release it. Reuse the existing constant
+                    // load so the serialized bytecode format stays unchanged.
+                    self.load_constant(src, &Constant::Nil);
+                }
+            }
             mir::RValue::LoadFieldNamed { obj, field } => {
                 let fid = self.field_id(field)?;
                 let _robj = self.local_reg(*obj);
@@ -1432,7 +1442,9 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
                 };
                 let result = match op {
                     mir::RValue::Const(Constant::Float(_)) => true,
-                    mir::RValue::Load(src) => is_float[src.0 as usize],
+                    mir::RValue::Load(src) | mir::RValue::MoveOut(src) => {
+                        is_float[src.0 as usize]
+                    }
                     mir::RValue::Unary(crate::ast::UnOp::Neg, src) => is_float[src.0 as usize],
                     mir::RValue::Binary(op, l, r)
                         if matches!(
@@ -1581,6 +1593,9 @@ fn fold_rvalue(
     use Constant::{Bool, Float, Int, Nil, String as CString};
 
     match op {
+        // MoveOut is not ordinary copying: folding it to a constant would
+        // erase the required source invalidation.
+        RValue::MoveOut(local) => RValue::MoveOut(local),
         RValue::Load(local) => match const_locals.get(&local) {
             Some(c) => RValue::Const(c.clone()),
             None => RValue::Load(local),
@@ -1945,6 +1960,7 @@ fn rvalue_side_effecting(rv: &mir::RValue) -> bool {
             | mir::RValue::Send { .. }
             | mir::RValue::Resume(..)
             | mir::RValue::Ask { .. }
+            | mir::RValue::MoveOut(..)
     )
 }
 
@@ -2001,6 +2017,7 @@ fn rvalue_reads(rv: &mir::RValue, out: &mut HashSet<mir::LocalId>) {
         | RValue::Panic(_)
         | RValue::StateGet { .. } => {}
         RValue::Load(x)
+        | RValue::MoveOut(x)
         | RValue::ArrayLen(x)
         | RValue::Unary(_, x)
         | RValue::Resume(x)
@@ -2206,7 +2223,10 @@ fn rvalue_uses(op: &mir::RValue) -> Vec<(usize, UseKind)> {
         // The timeout value is staged into r0 with a plain Move — an
         // uncounted copy channel like call/effect argument staging.
         ReceiveWait { timeout, .. } => cp(&mut out, *timeout),
-        Load(x) => cp(&mut out, *x),
+        // Phase 1 models MoveOut explicitly but does not yet establish a
+        // transferable drop token. Keep it in the conservative copy class
+        // until #402 phase 2 teaches the planner ownership propagation.
+        Load(x) | MoveOut(x) => cp(&mut out, *x),
         LoadFieldNamed { obj, .. } | LoadFieldPos { obj, .. } => ro(&mut out, *obj),
         ArrayLoad { arr, idx } => {
             ro(&mut out, *arr);
@@ -2566,6 +2586,23 @@ mod tests {
         let mut vm = VM::new();
         vm.load_module(module);
         vm.run()
+    }
+
+    #[test]
+    fn test_mir_codegen_moveout_transfers_value_and_clears_source() {
+        let moved = run_mir_source("let x = 42 in consume x").unwrap();
+        assert_eq!(moved.as_int(), Some(42));
+
+        // This helper intentionally exercises MIR/codegen directly rather than
+        // the capability checker. Reading the source after MoveOut lets the
+        // backend test observe the physical invalidation contract: the source
+        // register must contain nil after the transfer.
+        let source_after =
+            run_mir_source("let x = 42 in { let y = consume x; x }").unwrap();
+        assert!(
+            source_after.is_nil(),
+            "MoveOut must invalidate the source register without releasing the transferred value"
+        );
     }
 
     #[test]

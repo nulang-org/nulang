@@ -380,7 +380,7 @@ fn stmt_uses_local(stmt: &Stmt, local: LocalId) -> bool {
 /// Check whether `rv` references `local` in any position.
 fn rvalue_uses_local(rv: &RValue, local: LocalId) -> bool {
     match rv {
-        RValue::Load(id) => *id == local,
+        RValue::Load(id) | RValue::MoveOut(id) => *id == local,
         RValue::Panic(_) => false,
         RValue::Closure { func: _, captures } => captures.iter().any(|c| *c == local),
         RValue::Call { func, args } => {
@@ -623,6 +623,7 @@ fn remap_locals(ids: &[LocalId], remap: &FxHashMap<LocalId, LocalId>) -> Vec<Loc
 fn remap_rvalue(rv: &RValue, remap: &FxHashMap<LocalId, LocalId>) -> RValue {
     match rv {
         RValue::Load(id) => RValue::Load(remap_local(*id, remap)),
+        RValue::MoveOut(id) => RValue::MoveOut(remap_local(*id, remap)),
         RValue::Panic(m) => RValue::Panic(m.clone()),
         RValue::Closure { func, captures } => RValue::Closure {
             func: *func,
