@@ -2160,6 +2160,10 @@ enum UseKind {
     /// Copied through a channel that takes no counted reference (Move/Load,
     /// call staging, send, capture, return, actor state).
     Copy,
+    /// Explicit ownership transfer: the source slot is invalidated as part
+    /// of the operation, so this is not an aliasing copy. The destination is
+    /// ownership-proven only when the source itself has a proven owned token.
+    Transfer,
 }
 
 /// Locals of these types can hold NaN-boxed heap pointers at runtime. MIR
@@ -2223,10 +2227,8 @@ fn rvalue_uses(op: &mir::RValue) -> Vec<(usize, UseKind)> {
         // The timeout value is staged into r0 with a plain Move — an
         // uncounted copy channel like call/effect argument staging.
         ReceiveWait { timeout, .. } => cp(&mut out, *timeout),
-        // Phase 1 models MoveOut explicitly but does not yet establish a
-        // transferable drop token. Keep it in the conservative copy class
-        // until #402 phase 2 teaches the planner ownership propagation.
-        Load(x) | MoveOut(x) => cp(&mut out, *x),
+        Load(x) => cp(&mut out, *x),
+        MoveOut(x) => out.push((x.0 as usize, UseKind::Transfer)),
         LoadFieldNamed { obj, .. } | LoadFieldPos { obj, .. } => ro(&mut out, *obj),
         ArrayLoad { arr, idx } => {
             ro(&mut out, *arr);
@@ -2387,7 +2389,12 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
 
     // Scan defs and uses for the whole function.
     let mut has_def = vec![false; nlocals];
-    let mut defs_owning = vec![true; nlocals];
+    // Every definition of a candidate must either create a fresh owned value
+    // or transfer one from another ownership-proven local. Any ordinary
+    // borrowed/copied definition permanently disqualifies the destination.
+    let mut defs_supported = vec![true; nlocals];
+    let mut transfer_sources: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
+    let mut transfer_edges: Vec<(usize, usize)> = Vec::new(); // (dst, src)
     let mut no_copy_use = vec![true; nlocals];
     let mut block_defs: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
     let mut block_uses: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
@@ -2406,9 +2413,22 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
                 let d = dst.0 as usize;
                 has_def[d] = true;
                 block_defs[bi].insert(d);
-                if !rvalue_is_owning(op) || rvalue_uses(op).iter().any(|(u, _)| *u == d) {
-                    defs_owning[d] = false;
+
+                match op {
+                    mir::RValue::MoveOut(src) if src.0 as usize != d => {
+                        let s = src.0 as usize;
+                        transfer_sources[d].push(s);
+                        transfer_edges.push((d, s));
+                    }
+                    _ if rvalue_is_owning(op)
+                        && !rvalue_uses(op).iter().any(|(u, _)| *u == d) => {}
+                    _ => {
+                        // Ordinary Load/call/field access/etc. does not prove
+                        // a unique counted owner for the destination.
+                        defs_supported[d] = false;
+                    }
                 }
+
                 match op {
                     mir::RValue::LoadFieldNamed { obj, .. }
                     | mir::RValue::LoadFieldPos { obj, .. } => loads.push((d, obj.0 as usize)),
@@ -2425,23 +2445,68 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
     }
 
-    let candidate: Vec<bool> = (0..nlocals)
-        .map(|i| ptr_ty[i] && !excluded[i] && has_def[i] && defs_owning[i] && no_copy_use[i])
-        .collect();
+    // Least fixed point of ownership provenance. Fresh owning definitions
+    // seed the graph; MoveOut destinations become owners only after every
+    // transfer source is itself proven. Starting false deliberately rejects
+    // transfer-only cycles with no fresh root.
+    let mut candidate = vec![false; nlocals];
+    loop {
+        let mut changed = false;
+        for i in 0..nlocals {
+            if candidate[i] {
+                continue;
+            }
+            let structurally_eligible =
+                ptr_ty[i] && !excluded[i] && has_def[i] && defs_supported[i] && no_copy_use[i];
+            if structurally_eligible && transfer_sources[i].iter().all(|src| candidate[*src]) {
+                candidate[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 
-    // Escapees: locals defined by field/element loads from a candidate or
-    // another escapee (transitively).
+    // MoveOut changes which local owns an object without changing the object.
+    // Build undirected ownership-lineage components so an uncounted field/
+    // element alias loaded before a transfer still blocks dropping the later
+    // owner (and vice versa).
+    let mut owner_adj: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
+    for &(dst, src) in &transfer_edges {
+        if candidate[dst] && candidate[src] {
+            owner_adj[dst].push(src);
+            owner_adj[src].push(dst);
+        }
+    }
+
+    // Escapees: locals defined by field/element loads from any owner in the
+    // same MoveOut lineage, followed transitively through further loads.
     let mut escapees: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
     for c in 0..nlocals {
         if !candidate[c] {
             continue;
         }
+
+        let mut owners = HashSet::new();
+        let mut owner_frontier = vec![c];
+        while let Some(x) = owner_frontier.pop() {
+            if !owners.insert(x) {
+                continue;
+            }
+            for &next in &owner_adj[x] {
+                owner_frontier.push(next);
+            }
+        }
+
         let mut seen = HashSet::new();
-        let mut frontier = vec![c];
+        let mut frontier: Vec<usize> = owners.iter().copied().collect();
         while let Some(x) = frontier.pop() {
             for &(dst, base) in &loads {
                 if base == x && ptr_ty[dst] && seen.insert(dst) {
-                    escapees[c].push(dst);
+                    if !owners.contains(&dst) {
+                        escapees[c].push(dst);
+                    }
                     frontier.push(dst);
                 }
             }
