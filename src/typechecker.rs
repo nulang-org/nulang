@@ -905,6 +905,12 @@ pub struct TypeChecker {
     pub collect_errors: bool,
     /// Errors collected when `collect_errors` is set (empty otherwise).
     pub collected_errors: Vec<crate::types::NuError>,
+    /// Lexical depth of effect-handler clauses whose continuation is live.
+    ///
+    /// This is deliberately not inherited by lambda bodies: continuations are
+    /// affine control resources, not ambient capabilities that closures may
+    /// capture implicitly.
+    resume_scope_depth: usize,
 }
 
 /// Pre-computed class and instance tables extracted from an AST module.
@@ -986,6 +992,7 @@ impl TypeChecker {
             rigid_vars: FxHashSet::default(),
             collect_errors: false,
             collected_errors: Vec::new(),
+            resume_scope_depth: 0,
         }
     }
 
@@ -2053,7 +2060,17 @@ impl TypeChecker {
                 scoped.seal_except(names);
                 self.infer_expr(&scoped, body)
             }
-            Expr::Resume { .. } => Ok((vec![], Type::unit())),
+            Expr::Resume { value, span } => {
+                if self.resume_scope_depth == 0 {
+                    return Err(NuError::type_error(
+                        "`resume(...)` is only valid inside an effect-handler clause with a live continuation"
+                            .to_string(),
+                        *span,
+                    ));
+                }
+                let (subst, _value_ty) = self.infer_expr(ctx, value)?;
+                Ok((subst, Type::unit()))
+            }
         }
     }
 
@@ -2113,7 +2130,14 @@ impl TypeChecker {
             param_types.push(pty);
         }
 
-        let (s, ret_ty) = self.infer_expr(&new_ctx, body)?;
+        // A lambda is a new lexical control scope. Allowing it to inherit a
+        // handler continuation would let an affine continuation escape and be
+        // invoked after the handler activation has ended.
+        let saved_resume_scope = self.resume_scope_depth;
+        self.resume_scope_depth = 0;
+        let body_result = self.infer_expr(&new_ctx, body);
+        self.resume_scope_depth = saved_resume_scope;
+        let (s, ret_ty) = body_result?;
 
         let param_ty = if param_types.len() == 1 {
             apply_subst(&param_types[0], &s)
@@ -3513,7 +3537,13 @@ impl TypeChecker {
                     false,
                 );
             }
-            let (s, handler_ty) = self.infer_expr(&handler_ctx, &h.body)?;
+            // Every handler clause receives one live affine continuation,
+            // whether it resumes implicitly via the arm's `resume` marker or
+            // explicitly via `resume(expr)`.
+            self.resume_scope_depth += 1;
+            let handler_result = self.infer_expr(&handler_ctx, &h.body);
+            self.resume_scope_depth -= 1;
+            let (s, handler_ty) = handler_result?;
             let handler_ty_subst = apply_subst(&handler_ty, &s);
             let body_ty_subst = apply_subst(&body_ty, &compose_subst(&s, &subst));
             let s_unify = mgu(&handler_ty_subst, &body_ty_subst, Span::default())?;
