@@ -416,6 +416,86 @@ impl Runtime {
         self.fabric_stream_policy_for_placement(placement, epoch)
     }
 
+    fn fabric_stream_placement_from_policy(
+        stream: &str,
+        policy: &FabricStreamReplicationPolicy,
+    ) -> FabricStreamPlacement {
+        FabricStreamPlacement {
+            stream: stream.to_string(),
+            partition: policy.partition,
+            leader: NodeId(policy.leader),
+            replicas: policy.replicas.iter().copied().map(NodeId).collect(),
+            membership_fingerprint: policy.membership_fingerprint,
+        }
+    }
+
+    fn fabric_stream_validate_installed_policy(
+        &mut self,
+        stream: &str,
+        partition: u16,
+        replication_factor: usize,
+        epoch: u64,
+    ) -> io::Result<(FabricStreamPlacement, FabricStreamReplicationPolicy)> {
+        if epoch == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric stream epoch must be non-zero",
+            ));
+        }
+        let policy = self
+            .fabric_stream_replication_policy(stream)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Fabric stream replication policy is not established",
+                )
+            })?;
+        if policy.epoch != epoch
+            || policy.partition != partition
+            || policy.replication_factor != replication_factor
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric stream traffic does not match the installed replication policy",
+            ));
+        }
+        if let Some(promise) = self.fabric_stream_epoch_promise(stream)? {
+            if promise.epoch > epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "Fabric stream epoch {epoch} is fenced by durable promise for epoch {}",
+                        promise.epoch
+                    ),
+                ));
+            }
+        }
+        let placement = Self::fabric_stream_placement_from_policy(stream, &policy);
+        Ok((placement, policy))
+    }
+
+    fn fabric_stream_current_or_bootstrap_policy_placement(
+        &mut self,
+        stream: &str,
+        partition: u16,
+        replication_factor: usize,
+    ) -> io::Result<(FabricStreamPlacement, FabricStreamReplicationPolicy)> {
+        if let Some(policy) = self.fabric_stream_replication_policy(stream)? {
+            let epoch = policy.epoch;
+            return self.fabric_stream_validate_installed_policy(
+                stream,
+                partition,
+                replication_factor,
+                epoch,
+            );
+        }
+
+        let placement = self.fabric_stream_placement(stream, partition, replication_factor)?;
+        let policy =
+            self.fabric_stream_policy_for_placement(&placement, FABRIC_STREAM_INITIAL_EPOCH)?;
+        Ok((placement, policy))
+    }
+
     /// Append locally as leader, create a pending quorum ticket, and dispatch
     /// the replica envelope to reachable followers.
     pub fn fabric_stream_replicated_append(
@@ -432,8 +512,11 @@ impl Runtime {
             ));
         }
 
-        let placement = self.fabric_stream_placement(stream, partition, replication_factor)?;
-        let policy = self.fabric_stream_current_policy_for_placement(&placement)?;
+        let (placement, policy) = self.fabric_stream_current_or_bootstrap_policy_placement(
+            stream,
+            partition,
+            replication_factor,
+        )?;
         let local = self
             .distributed
             .node_id
