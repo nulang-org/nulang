@@ -2571,6 +2571,26 @@ mod migration_authority_tests {
         let tokens = migration_authority_tokens(&actor);
         assert_eq!(tokens, manifest.canonical_token_set());
     }
+}
+
+#[cfg(test)]
+mod host_authority_tests {
+    use super::{authorize_actor_host_effect, http_outbound_authority, required_host_authority};
+    use crate::authority::{AuthorityGrant, AuthorityManifest};
+    use crate::bytecode::Constant;
+    use crate::runtime::{Actor, Runtime};
+    use crate::vm::Value;
+
+    fn string_args(values: &[&str]) -> (Vec<Constant>, Vec<Value>) {
+        let constants: Vec<_> = values
+            .iter()
+            .map(|value| Constant::String((*value).to_string()))
+            .collect();
+        let regs = (0..values.len())
+            .map(|idx| Value::string(idx as u32))
+            .collect();
+        (constants, regs)
+    }
 
     #[test]
     fn http_authority_uses_exact_host_and_effective_port() {
