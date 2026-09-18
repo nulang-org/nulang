@@ -4098,7 +4098,7 @@ mod tests {
         // discharges x's own must-use obligation, and `a` itself (a
         // transparent alias, never separately referenced) is exempt from
         // carrying a second, independent obligation for the same value.
-        // Mirrors conformance/behavior/cap_13_lineariso_branch_merge_one_side_ok.nula.
+        // Mirrors conformance/behavior/cap_13_lineariso_branch_merge_one_side_then_use_reject.nula.
         let mut analyzer = CapabilityAnalyzer::new();
         let ctx = CapContext::new();
         let expr = let_expr(
