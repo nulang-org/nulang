@@ -3363,6 +3363,42 @@ impl VM {
                 span: Span::default(),
             });
         }
+        let sink_mask = self
+            .modules
+            .get(module_idx)
+            .and_then(|m| {
+                m.debug_functions
+                    .iter()
+                    .find(|info| info.code_offset == code_offset)
+                    .map(|info| info.sink_mask)
+            });
+
+        // Safe host invocation borrows its input slice. A linear sink callee
+        // is allowed to consume one local ownership reference, so retain an
+        // additional reference for pointer-valued sink arguments before
+        // entering the function. The callee's Drop (or an ownership transfer
+        // into its return/another sink) consumes that retained reference while
+        // the host's original Value remains valid.
+        //
+        // New compiler artifacts always publish sink metadata. If metadata is
+        // unavailable (e.g. a stripped/foreign artifact), pointer arguments
+        // are rejected rather than guessing whether the callee will Drop them.
+        if sink_mask.is_none() && args.iter().any(|v| v.as_ptr().is_some()) {
+            return Err(NuError::VMError {
+                msg: "call_function: pointer arguments require function ownership metadata"
+                    .to_string(),
+                span: Span::default(),
+            });
+        }
+        let sink_mask = sink_mask.unwrap_or(0);
+        for (i, arg) in args.iter().enumerate() {
+            if i < u16::BITS as usize && (sink_mask & (1u16 << i)) != 0 {
+                if let Some(ptr) = arg.as_ptr() {
+                    self.actor_callbacks.retain_ref(ptr);
+                }
+            }
+        }
+
         self.yield_pending = false;
         self.frames.clear();
         self.current_frame_idx = Some(0);
