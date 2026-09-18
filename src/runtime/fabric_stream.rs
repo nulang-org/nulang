@@ -695,10 +695,16 @@ impl FileFabricStreamStore {
             if existing.proposal == proposal {
                 return Ok(existing);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "a different Fabric epoch transition is already in progress",
-            ));
+            if !existing.finalized
+                || existing.proposal.to_policy != proposal.from_policy
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "a different Fabric epoch transition is already in progress",
+                ));
+            }
+            // A finalized transition may be replaced only by the immediately
+            // following proposal whose source is the installed policy.
         }
 
         let state = FabricStreamEpochTransitionState {
