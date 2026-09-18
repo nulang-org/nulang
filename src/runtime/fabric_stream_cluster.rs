@@ -211,7 +211,6 @@ impl FabricStreamReplicaAppend {
     }
 }
 
-
 impl Runtime {
     /// Append locally as leader, create a pending quorum ticket, and dispatch
     /// the replica envelope to reachable followers.
@@ -252,12 +251,20 @@ impl Runtime {
             );
 
         // Replication factor one is committed by the leader's own fsync.
-        if quorum == 1 {
+        let status = if quorum == 1 {
             self.fabric_stream_advance_commits(stream, partition)?;
-        }
+            FabricStreamReplicationStatus {
+                sequence: append.sequence,
+                quorum: 1,
+                acknowledgements: 1,
+                rejections: 0,
+                committed: true,
+            }
+        } else {
+            self.fabric_stream_replication_status(stream, partition, append.sequence)?
+        };
 
         let dispatch = self.fabric_stream_dispatch_replica_append(&placement, &append)?;
-        let status = self.fabric_stream_replication_status(stream, partition, append.sequence)?;
         Ok(FabricStreamReplicatedAppendResult {
             sequence: append.sequence,
             status,
@@ -324,7 +331,19 @@ impl Runtime {
             ));
         }
 
+        let committed_before = self.fabric_stream_committed_sequence(&ack.stream)?;
+        if ack.sequence <= committed_before {
+            return Ok(FabricStreamReplicationStatus {
+                sequence: ack.sequence,
+                quorum: 0,
+                acknowledgements: 0,
+                rejections: 0,
+                committed: true,
+            });
+        }
+
         let key = (ack.stream.clone(), ack.partition);
+        let status_before_commit;
         {
             let ticket = self
                 .distributed
@@ -360,23 +379,20 @@ impl Runtime {
             } else if !ticket.acknowledgements.contains(&ack.replica) {
                 ticket.rejections.insert(ack.replica);
             }
+            status_before_commit = FabricStreamReplicationStatus {
+                sequence: ack.sequence,
+                quorum: ticket.quorum,
+                acknowledgements: ticket.acknowledgements.len(),
+                rejections: ticket.rejections.len(),
+                committed: false,
+            };
         }
 
-        self.fabric_stream_advance_commits(&ack.stream, ack.partition)?;
-        self.fabric_stream_replication_status(&ack.stream, ack.partition, ack.sequence)
-            .or_else(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    Ok(FabricStreamReplicationStatus {
-                        sequence: ack.sequence,
-                        quorum: 0,
-                        acknowledgements: 0,
-                        rejections: 0,
-                        committed: true,
-                    })
-                } else {
-                    Err(error)
-                }
-            })
+        let committed_after = self.fabric_stream_advance_commits(&ack.stream, ack.partition)?;
+        Ok(FabricStreamReplicationStatus {
+            committed: ack.sequence <= committed_after,
+            ..status_before_commit
+        })
     }
 
     fn fabric_stream_advance_commits(
