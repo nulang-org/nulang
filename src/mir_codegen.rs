@@ -90,6 +90,10 @@ pub struct MirCodegen {
     /// Built at the start of compile_function.  SpillLoad/SpillStore are
     /// emitted inline during codegen via local_reg / local_dst / spill_write_done.
     spill_map: FxHashMap<u32, u16>,
+    /// Resolved per-function owned-parameter masks for the experimental
+    /// internal direct-call ABI. Public/dynamic/entry functions remain all
+    /// false. Indexed by MIR function-table index.
+    owned_param_masks: Vec<Vec<bool>>,
     /// Round-robin counter for spilled-read temp register selection.
     /// Cycles through SPILL_TEMP (12), SPILL_TEMP2 (13), SPILL_TEMP3 (14)
     /// so that consecutive spilled reads don't clobber each other.
@@ -105,6 +109,7 @@ impl MirCodegen {
             state_field_constants: FxHashMap::default(),
             float_locals: Vec::new(),
             spill_map: FxHashMap::default(),
+            owned_param_masks: Vec::new(),
             spill_read_cycle: 0,
         }
     }
@@ -236,6 +241,17 @@ impl MirCodegen {
             optimize_function(func, &mut module_consts);
         }
 
+        // Resolve the experimental internal ownership-call ABI only after
+        // MIR optimization, so call/use counts describe the exact MIR that
+        // this backend is about to compile.
+        let ownership = crate::mir_ownership::resolve_call_ownership(mir);
+        self.owned_param_masks = vec![Vec::new(); mir.functions.len()];
+        for function in ownership {
+            if let Some(mask) = self.owned_param_masks.get_mut(function.function_idx) {
+                *mask = function.owned_params;
+            }
+        }
+
         // Register foreign functions first so FFICall indices line up.
         for ff in &mir.foreign_functions {
             let params = ff
@@ -280,7 +296,12 @@ impl MirCodegen {
         let mut main_idx = None;
         let mut user_main_idx = None;
         for (idx, func) in mir.functions.iter().enumerate() {
-            let offset = self.compile_function(func)?;
+            let owned_params = self
+                .owned_param_masks
+                .get(idx)
+                .cloned()
+                .unwrap_or_default();
+            let offset = self.compile_function(func, &owned_params)?;
             self.module.function_table[idx] = offset;
             self.module.function_local_counts[idx] = LOCAL_BASE as usize + func.locals.len();
             if func.name == "__main" {
@@ -302,7 +323,7 @@ impl MirCodegen {
         // behaviors compile in this order, so this loop must not be
         // reordered or interleaved with function compilation.
         for func in &mir.behaviors {
-            let offset = self.compile_function(func)?;
+            let offset = self.compile_function(func, &[])?;
             let end = self.module.instructions.len();
 
             // Compute BLAKE3 content hash from the compiled bytecode slice +
@@ -434,7 +455,11 @@ impl MirCodegen {
         Ok(&self.module)
     }
 
-    fn compile_function(&mut self, func: &mir::Function) -> NuResult<usize> {
+    fn compile_function(
+        &mut self,
+        func: &mir::Function,
+        owned_params: &[bool],
+    ) -> NuResult<usize> {
         // Isolate this function's bytecode so block offsets are relative to
         // the function start while still allowing forward jump resolution.
         let mut saved_instructions = Vec::new();
@@ -517,7 +542,7 @@ impl MirCodegen {
 
         // Conservative liveness-based placement of `Drop` instructions (see
         // the module docs and `plan_drops`).
-        let drop_plan = plan_drops(func);
+        let drop_plan = plan_drops(func, owned_params, &self.owned_param_masks);
 
         // Source-line map: `(block id, statement index) -> line`, translated
         // to bytecode PCs below so the debugger can place breakpoints and
