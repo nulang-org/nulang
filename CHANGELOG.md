@@ -59,6 +59,18 @@ two major versions.*
   Deterministic tests cover positive-goodbye automatic RF3->RF2 failover and
   delayed peer removal followed by retry.
 
+### Fabric carried policy bootstrap — 2026-09-18
+- **Ordered replica policy in first replica append** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`). Replica envelopes now carry the
+  leader-established ordered replica set in addition to epoch, leader,
+  replication factor and membership fingerprint. A follower with no durable
+  policy can establish epoch 1 directly from that transport-authenticated
+  carried policy even if its current cluster membership changed before first
+  contact. Established receivers require any carried replica list to match
+  their installed policy exactly. The additive field remains backward-readable:
+  older experimental envelopes decode with an empty list and retain the legacy
+  rendezvous bootstrap path.
+
 ### Fabric stable installed placement — 2026-09-18
 - **Durable policy is authoritative after stream bootstrap** (Experimental,
   `src/runtime/fabric_stream_cluster.rs`). Established stream append, retry,
