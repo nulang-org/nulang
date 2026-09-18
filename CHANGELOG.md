@@ -126,7 +126,11 @@ two major versions.*
   the source SSA binding after the call, and WasmFX rejects sink calls until
   CIR can represent source invalidation. Sink-bearing functions are
   direct-call-only until first-class function values carry parameter
-  capability signatures. No opcode or NBC format change is required.
+  capability signatures. Safe host invocation retains pointer arguments only
+  at sink positions using authoritative runtime-only function metadata;
+  deserialized/stripped artifacts fail closed for pointer host calls because
+  that metadata is deliberately not serialized. No opcode or NBC v1 format
+  change is required.
 
 - **Path-sensitive move safety** (`src/effect_checker.rs`,
   `conformance/behavior/cap_13_*`): capability analysis now keeps
