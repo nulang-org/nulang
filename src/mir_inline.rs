@@ -66,6 +66,7 @@ struct CalleeSnapshot {
     locals: Vec<crate::mir::Local>,
     params: Vec<LocalId>,
     captures: Vec<LocalId>,
+    ownership_transfers: Vec<crate::mir::OwnershipTransfer>,
     /// Handler tables; non-empty means the callee uses effect handlers
     /// and cannot be inlined without remapping handler-table indices.
     has_handlers: bool,
@@ -125,6 +126,7 @@ fn discover_candidates(funcs: &[Function], behaviors: &[Function]) -> Vec<Candid
                         locals: callee.locals.clone(),
                         params: callee.params.clone(),
                         captures: callee.captures.clone(),
+                        ownership_transfers: callee.ownership_transfers.clone(),
                         has_handlers: hh,
                         is_recursive: rec,
                     }
@@ -152,6 +154,7 @@ fn discover_candidates(funcs: &[Function], behaviors: &[Function]) -> Vec<Candid
                         locals: callee.locals.clone(),
                         params: callee.params.clone(),
                         captures: callee.captures.clone(),
+                        ownership_transfers: callee.ownership_transfers.clone(),
                         has_handlers: hh,
                         is_recursive: rec,
                     }
@@ -256,6 +259,7 @@ fn apply_candidates(
                 &c.callee.locals,
                 &c.callee.params,
                 &c.callee.captures,
+                &c.callee.ownership_transfers,
                 &c.captures,
             );
             modified_blocks.insert((c.container, site.block), ());
@@ -455,6 +459,7 @@ fn inline_one_call(
     callee_locals: &[crate::mir::Local],
     callee_params: &[LocalId],
     callee_captures: &[LocalId],
+    callee_transfers: &[crate::mir::OwnershipTransfer],
     closure_captures: &[LocalId],
 ) {
     // Build the local-ID remapping: callee local → caller local.
@@ -485,6 +490,19 @@ fn inline_one_call(
             });
         }
     }
+
+    // Transfer edges are semantic metadata, so clone and remap them together
+    // with the statements they describe. Without this, an inlined `consume`
+    // would degrade back into an aliasing Load + nil clear for Drop planning.
+    for transfer in callee_transfers {
+        caller
+            .ownership_transfers
+            .push(crate::mir::OwnershipTransfer {
+                src: remap_local(transfer.src, &remap),
+                dst: remap_local(transfer.dst, &remap),
+            });
+    }
+
     // Validate call-site index is still valid (block may have been modified
     // by a previous candidate's inlining despite our cross-candidate guard).
     let block_stmts = &caller.blocks[call_block.0 as usize].stmts;
