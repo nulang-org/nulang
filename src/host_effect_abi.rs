@@ -345,8 +345,7 @@ pub fn lookup_host_operation(
     source_operation: &str,
 ) -> Option<&'static HostOperationDescriptor> {
     HOST_OPERATIONS.iter().find(|operation| {
-        operation.source_effect == source_effect
-            && operation.source_operation == source_operation
+        operation.source_effect == source_effect && operation.source_operation == source_operation
     })
 }
 
@@ -355,9 +354,9 @@ pub fn lookup_host_operation_by_identity(
     effect_id: &str,
     operation_id: &str,
 ) -> Option<&'static HostOperationDescriptor> {
-    HOST_OPERATIONS
-        .iter()
-        .find(|operation| operation.effect_id == effect_id && operation.operation_id == operation_id)
+    HOST_OPERATIONS.iter().find(|operation| {
+        operation.effect_id == effect_id && operation.operation_id == operation_id
+    })
 }
 
 /// Build the compiler-owned external ABI descriptor consumed by conformance
@@ -370,8 +369,7 @@ pub fn host_effect_abi_descriptor() -> Result<serde_json::Value, serde_json::Err
     let mut operations = Vec::with_capacity(HOST_OPERATIONS.len());
 
     for operation in HOST_OPERATIONS {
-        let template: serde_json::Value =
-            serde_json::from_str(operation.request.template_json)?;
+        let template: serde_json::Value = serde_json::from_str(operation.request.template_json)?;
         let response = match operation.response {
             HostResponseProjection::Passthrough => serde_json::json!({
                 "kind": "passthrough"
@@ -445,7 +443,9 @@ mod tests {
     fn request_contracts_have_valid_json_and_declared_arg_bounds() {
         fn visit(value: &serde_json::Value, arity: u8) {
             match value {
-                serde_json::Value::Object(fields) if fields.len() == 1 && fields.contains_key("$arg") => {
+                serde_json::Value::Object(fields)
+                    if fields.len() == 1 && fields.contains_key("$arg") =>
+                {
                     let index = fields["$arg"]
                         .as_u64()
                         .expect("$arg marker must contain a non-negative integer");
