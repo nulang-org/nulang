@@ -43,6 +43,8 @@ pub struct FabricStreamReplicaAppend {
     pub leader: NodeId,
     pub membership_fingerprint: u64,
     pub replication_factor: usize,
+    /// Ordered replica set from the durable stream policy. The leader is first.
+    pub replicas: Vec<NodeId>,
     pub stream_config: FabricStreamConfig,
     pub sequence: u64,
     pub payload: Vec<u8>,
@@ -277,6 +279,10 @@ struct FabricStreamReplicaAppendWire {
     leader: u64,
     membership_fingerprint: u64,
     replication_factor: usize,
+    /// Additive field. Empty means an older sender that predates explicit
+    /// policy bootstrap and requires the legacy rendezvous bootstrap path.
+    #[serde(default)]
+    replicas: Vec<u64>,
     stream_config: FabricStreamConfig,
     sequence: u64,
     payload: Vec<u8>,
@@ -291,6 +297,7 @@ impl FabricStreamReplicaAppend {
             leader: self.leader.0,
             membership_fingerprint: self.membership_fingerprint,
             replication_factor: self.replication_factor,
+            replicas: self.replicas.iter().map(|node| node.0).collect(),
             stream_config: self.stream_config,
             sequence: self.sequence,
             payload: self.payload.clone(),
@@ -322,6 +329,11 @@ impl FabricStreamReplicaAppend {
             || wire.epoch == 0
             || wire.replication_factor == 0
             || wire.sequence == 0
+            || (!wire.replicas.is_empty()
+                && (wire.replicas.len() != wire.replication_factor
+                    || wire.replicas.first().copied() != Some(wire.leader)
+                    || wire.replicas.iter().copied().collect::<HashSet<_>>().len()
+                        != wire.replicas.len()))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -335,6 +347,7 @@ impl FabricStreamReplicaAppend {
             leader: NodeId(wire.leader),
             membership_fingerprint: wire.membership_fingerprint,
             replication_factor: wire.replication_factor,
+            replicas: wire.replicas.into_iter().map(NodeId).collect(),
             stream_config: wire.stream_config,
             sequence: wire.sequence,
             payload: wire.payload,
