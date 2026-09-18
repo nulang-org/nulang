@@ -923,21 +923,11 @@ impl Runtime {
                 "Fabric epoch pull source policy differs from local durable policy",
             ));
         }
-        let placement = compute_stream_placement(
-            local,
-            Some(cluster),
+        self.fabric_stream_validate_transition_placement(
             &request.stream,
-            request.proposal.to_policy.partition,
-            request.proposal.to_policy.replication_factor,
+            &request.proposal,
+            cluster,
         )?;
-        if policy_from_placement(&placement, request.proposal.to_policy.epoch)
-            != request.proposal.to_policy
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Fabric epoch pull no longer matches current placement",
-            ));
-        }
 
         if let Some(promise) = self.fabric_stream_epoch_promise(&request.stream)? {
             if promise.epoch > request.proposal.to_policy.epoch
@@ -1036,21 +1026,11 @@ impl Runtime {
                 "Fabric epoch pull candidate policy changed",
             ));
         }
-        let placement = compute_stream_placement(
-            local,
-            Some(cluster),
+        self.fabric_stream_validate_transition_placement(
             &response.stream,
-            response.proposal.to_policy.partition,
-            response.proposal.to_policy.replication_factor,
+            &response.proposal,
+            cluster,
         )?;
-        if policy_from_placement(&placement, response.proposal.to_policy.epoch)
-            != response.proposal.to_policy
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Fabric epoch pull response no longer matches current placement",
-            ));
-        }
 
         let local_tail = self
             .fabric_stream_info(&response.stream)?
@@ -1283,21 +1263,11 @@ impl Runtime {
             ));
         }
 
-        let placement = compute_stream_placement(
-            local,
-            Some(cluster),
+        self.fabric_stream_validate_transition_placement(
             &batch.stream,
-            batch.proposal.to_policy.partition,
-            batch.proposal.to_policy.replication_factor,
+            &batch.proposal,
+            cluster,
         )?;
-        if policy_from_placement(&placement, batch.proposal.to_policy.epoch)
-            != batch.proposal.to_policy
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Fabric epoch repair no longer matches current placement",
-            ));
-        }
 
         if let Some(promise) = self.fabric_stream_epoch_promise(&batch.stream)? {
             if promise.epoch > batch.proposal.to_policy.epoch
@@ -1416,19 +1386,7 @@ impl Runtime {
             ));
         }
 
-        let placement = compute_stream_placement(
-            local,
-            Some(cluster),
-            stream,
-            proposal.to_policy.partition,
-            proposal.to_policy.replication_factor,
-        )?;
-        if policy_from_placement(&placement, proposal.to_policy.epoch) != proposal.to_policy {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Fabric epoch prepare does not match current deterministic placement",
-            ));
-        }
+        self.fabric_stream_validate_transition_placement(stream, proposal, cluster)?;
 
         let info = self.fabric_stream_info(stream)?;
         let local_tail = info.last_sequence.unwrap_or(0);
@@ -1590,21 +1548,11 @@ impl Runtime {
             ));
         }
 
-        let placement = compute_stream_placement(
-            local,
-            Some(cluster),
+        self.fabric_stream_validate_transition_placement(
             &commit.stream,
-            commit.proposal.to_policy.partition,
-            commit.proposal.to_policy.replication_factor,
+            &commit.proposal,
+            cluster,
         )?;
-        if policy_from_placement(&placement, commit.proposal.to_policy.epoch)
-            != commit.proposal.to_policy
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Fabric epoch commit no longer matches current placement",
-            ));
-        }
 
         let promise = self
             .fabric_stream_epoch_promise(&commit.stream)?
