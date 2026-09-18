@@ -21,7 +21,7 @@
 use crate::ast::Pattern;
 use crate::hir;
 use crate::mir;
-use crate::types::{NuError, NuResult, Span, Type};
+use crate::types::{Capability, NuError, NuResult, Span, Type};
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
@@ -79,6 +79,9 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
             }
             let idx = ctx.reserve_function(&f.name);
             ctx.func_map.insert(f.name.clone(), idx);
+            if f.param_caps.iter().any(|cap| cap.is_linear()) {
+                ctx.sink_functions.insert(f.name.clone());
+            }
         }
         hir::Decl::ExternBlock { library, funcs, .. } => {
             for f in funcs {
@@ -264,6 +267,10 @@ struct ModuleCtx {
     name: String,
     functions: Vec<Option<mir::Function>>,
     func_map: FxHashMap<String, usize>,
+    /// Module functions with at least one linear/lineariso parameter. Until
+    /// function values carry parameter-capability signatures, these functions
+    /// are direct-call-only so the caller-side sink transfer cannot be lost.
+    sink_functions: HashSet<String>,
     extern_map: FxHashMap<String, usize>,
     foreign: Vec<mir::ForeignFunction>,
     /// Actor behaviors, reserved (with their fully-qualified "Actor.behavior"
@@ -289,6 +296,7 @@ impl ModuleCtx {
             name: name.to_string(),
             functions: Vec::new(),
             func_map: FxHashMap::default(),
+            sink_functions: HashSet::new(),
             extern_map: FxHashMap::default(),
             foreign: Vec::new(),
             behaviors: Vec::new(),
@@ -777,6 +785,15 @@ impl<'c> FnLowerer<'c> {
                     return Ok(id);
                 }
                 if let Some(&idx) = self.ctx.func_map.get(name) {
+                    if self.ctx.sink_functions.contains(name) {
+                        return Err(compile_err(
+                            format!(
+                                "function '{}' has linear ownership-sink parameters and cannot be used as a first-class value yet",
+                                name
+                            ),
+                            Span::default(),
+                        ));
+                    }
                     // Reference to a top-level function used as a value.
                     let id = self.b.add_temp(Type::unit());
                     self.b.assign(
@@ -2921,6 +2938,43 @@ mod tests {
         assert_eq!(
             f.locals[p.0 as usize].cap,
             crate::types::Capability::LinearIso
+        );
+    }
+
+    #[test]
+    fn test_sink_function_cannot_be_lowered_as_first_class_value() {
+        let result = lower_source(
+            "fn take(lineariso x: Int) -> Int { x }\nlet f = take in 0",
+        );
+        let err = result.expect_err("sink-bearing function value must be rejected");
+        assert!(
+            err.to_string().contains("cannot be used as a first-class value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_sink_function_direct_call_still_lowers() {
+        let module = lower_source(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main(lineariso y: Int) -> Int { take(y) }",
+        )
+        .expect("direct sink call should lower");
+        let main = find_fn(&module, "main");
+        assert!(
+            main.blocks.iter().flat_map(|b| &b.stmts).any(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::Call {
+                            func: mir::FuncRef::Index(_),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            }),
+            "direct sink call should remain a statically-resolved MIR call"
         );
     }
 
