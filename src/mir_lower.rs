@@ -388,11 +388,17 @@ impl ModuleCtx {
 fn lower_function_def(ctx: &mut ModuleCtx, f: &hir::FunctionDef) -> NuResult<mir::Function> {
     let mut lowerer = FnLowerer::new(ctx, &f.name, Some(f.ret.clone()));
     lowerer.b.set_placement(f.placement);
-    debug_assert_eq!(
-        f.params.len(),
-        f.param_caps.len(),
-        "HIR function parameter/capability vectors must stay aligned"
-    );
+    if f.params.len() != f.param_caps.len() {
+        return Err(compile_err(
+            format!(
+                "internal: function '{}' has {} parameters but {} parameter capabilities",
+                f.name,
+                f.params.len(),
+                f.param_caps.len()
+            ),
+            f.span,
+        ));
+    }
     for ((name, ty), cap) in f.params.iter().zip(&f.param_caps) {
         let id = lowerer
             .b
