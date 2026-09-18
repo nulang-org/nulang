@@ -456,11 +456,11 @@ impl Runtime {
             ));
         }
         if cluster.is_some_and(|cluster| {
-            append.replicas.iter().any(|node| {
-                cluster
-                    .get_node(*node)
-                    .is_some_and(|info| matches!(info.status, NodeStatus::Removed))
-            })
+            append
+                .replicas
+                .iter()
+                .copied()
+                .any(|node| cluster.is_removed(node))
         }) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
