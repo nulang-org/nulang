@@ -917,3 +917,60 @@ higher epoch installed
 If survivor tails differ, the transition remains safely pending. The
 proposal-scoped push and pull APIs can repair/reconcile the mismatch; automatic
 selection of those repair actions is a separate orchestration layer.
+
+
+## Automatic divergence repair during confirmed-removal failover
+
+Automatic failover now drives proposal-scoped reconciliation instead of
+stalling when the surviving replicas have different durable tails.
+
+The existing logical-clock failover retry loop examines the durable active
+transition and chooses exactly one bounded action per due retry:
+
+1. **candidate tail changed** — start a strictly higher election term whose
+   proposal hash binds the new local tail,
+2. **a proposed voter is ahead** — issue one bounded proposal-scoped pull,
+3. **a proposed voter is behind** — issue one bounded proposal-scoped push
+   repair,
+4. **no known tail divergence** — resend the durable prepare proposal.
+
+Automatic repair uses at most 256 records per stream per retry tick. It never
+loops synchronously inside `process_network()`; normal logical-clock backoff
+still controls the next action:
+
+- 500 ms,
+- 1 s,
+- 2 s,
+- 4 s,
+- capped at 30 s.
+
+### Candidate ahead
+
+When the deterministic failover candidate has the longer durable tail, a
+rejected survivor reports a lower tail. The scheduler invokes
+`fabric_stream_repair_epoch_transition` automatically. The survivor applies
+the exact proposal-scoped suffix and immediately re-votes. If the batch reaches
+the candidate tail, the existing quorum transition can finalize without a new
+term.
+
+### Candidate behind
+
+When a rejected survivor reports a higher tail, the scheduler invokes
+`fabric_stream_pull_epoch_transition` automatically. The candidate applies
+the exact suffix but does not finalize the stale proposal. On the next due retry
+the scheduler sees that local tail no longer equals the proposal-bound
+candidate tail and starts a higher term automatically.
+
+The higher proposal then binds the reconciled tail and proceeds through normal
+prepare/vote/quorum finalization.
+
+### Bounded convergence
+
+If more than 256 records are missing, the same mechanism converges across
+multiple retry ticks. Push repair advances the rejected voter's reported tail;
+pull reconciliation advances the candidate tail and therefore intentionally
+uses a higher term for the next proposal.
+
+This keeps failover recovery bounded, deterministic, and observable while
+preserving the invariant that a proposal hash always identifies one exact
+candidate log prefix.
