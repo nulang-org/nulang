@@ -1,16 +1,10 @@
-//! Runtime bridge from the actor's legacy canonical-token set to typed authority.
+//! Typed external-authority enforcement for actors and spawn boundaries.
 //!
-//! The actor runtime currently persists spawn authority as `BTreeSet<String>`.
-//! That representation remains a compatibility boundary, but host operations
-//! must not make authorization decisions by matching ad-hoc strings. These
-//! helpers parse the complete set into [`AuthorityManifest`] first, so one
-//! malformed persisted token invalidates the manifest and therefore fails
-//! authorization closed.
-//!
-//! This module is a migration boundary, not proof that spawn authority is
-//! end-to-end wired. Parser, MIR-codegen metadata emission, VM spawn callback
-//! plumbing, and host-boundary enforcement must all preserve/use the manifest
-//! before source-level grants are security-effective.
+//! Actors hold [`AuthorityManifest`] directly. Canonical string tokens exist
+//! only at compatibility boundaries such as bytecode metadata, persistence,
+//! and wire formats; those inputs are fully validated before becoming actor
+//! state. Host operations therefore authorize against structural grants rather
+//! than reparsing or matching ad-hoc strings.
 
 use crate::authority::{AuthorityGrant, AuthorityManifest, AuthorityParseError};
 use crate::bytecode::CodeModule;
@@ -96,36 +90,24 @@ pub fn spawn_authority_manifest(
 }
 
 impl Actor {
-    /// Parse this actor's compatibility token set into the typed authority
-    /// representation. Invalid persisted/runtime authority fails closed.
-    pub fn authority_manifest(&self) -> Result<AuthorityManifest, AuthorityParseError> {
-        AuthorityManifest::from_token_set(&self.capabilities)
+    /// Borrow this actor's typed external-authority manifest.
+    pub fn authority_manifest(&self) -> &AuthorityManifest {
+        &self.authority
     }
 
-    /// Replace this actor's compatibility token set from a validated typed
-    /// manifest. Raw token insertion should stay confined to serialization and
-    /// migration code; semantic runtime code should install manifests here.
+    /// Replace this actor's authority from an already validated manifest.
     pub fn install_authority_manifest(&mut self, manifest: &AuthorityManifest) {
-        self.capabilities = manifest.canonical_token_set();
+        self.authority = manifest.clone();
     }
 
     /// Return whether this actor holds an exact typed grant.
-    ///
-    /// This returns an error, rather than `false`, for malformed manifests so
-    /// callers cannot accidentally hide corrupted or attacker-controlled
-    /// authority metadata behind an ordinary denial.
-    pub fn allows_authority(&self, grant: &AuthorityGrant) -> Result<bool, AuthorityParseError> {
-        Ok(self.authority_manifest()?.allows(grant))
+    pub fn allows_authority(&self, grant: &AuthorityGrant) -> bool {
+        self.authority.allows(grant)
     }
 
     /// Require an exact typed grant for a host-boundary action.
-    ///
-    /// Host integrations should prefer this method to direct access to
-    /// `Actor::capabilities`: it parses the complete manifest first and only
-    /// then performs the typed exact-match authorization decision.
     pub fn require_authority(&self, grant: &AuthorityGrant) -> Result<(), RuntimeAuthorityError> {
-        let manifest = self.authority_manifest()?;
-        if manifest.allows(grant) {
+        if self.authority.allows(grant) {
             Ok(())
         } else {
             Err(RuntimeAuthorityError::Denied(grant.clone()))
@@ -143,25 +125,18 @@ impl Actor {
     /// Validate a child/delegated manifest against this actor's authority.
     ///
     /// Delegation is monotonic: the child may receive equal or less exact
-    /// authority, never a grant the parent does not already hold. Returning an
-    /// error for the first missing grant makes accidental privilege escalation
-    /// observable instead of silently intersecting the request.
+    /// authority, never a grant the parent does not already hold.
     pub fn delegate_authority(
         &self,
         requested: &AuthorityManifest,
     ) -> Result<AuthorityManifest, RuntimeAuthorityError> {
-        let parent = self.authority_manifest()?;
-        if let Some(missing) = requested.iter().find(|grant| !parent.allows(grant)) {
+        if let Some(missing) = requested.iter().find(|grant| !self.authority.allows(grant)) {
             return Err(RuntimeAuthorityError::Denied(missing.clone()));
         }
         Ok(requested.clone())
     }
 
     /// Validate and install a requested manifest on a child actor.
-    ///
-    /// This is the runtime spawn primitive: the caller does not touch the
-    /// child's raw token set, and installation only happens after monotonic
-    /// delegation succeeds in full.
     pub fn delegate_authority_to(
         &self,
         child: &mut Actor,
