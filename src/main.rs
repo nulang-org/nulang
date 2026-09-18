@@ -1590,17 +1590,22 @@ fn run_effects_cmd(args: &[String]) -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    let mut lexer = Lexer::new(&source);
-    let tokens = lexer.lex()?;
-    let mut parser = Parser::new(tokens);
-    let ast = parser.parse_module()?;
-
-    // Keep effect reports aligned with normal compilation: type errors are
-    // rejected before effect inference.
-    let mut type_checker = TypeChecker::new();
-    type_checker.check_module(&ast)?;
+    // Reuse the normal frontend so imports, prelude types, type checking,
+    // effect validation, and capability validation behave exactly like a
+    // regular compile. Grant all resource categories here: this command is
+    // introspective and must be able to *report* FS/Net/OS effects without
+    // requiring execution permissions.
+    let report_grants = vec!["fs".to_string(), "net".to_string(), "os".to_string()];
+    let (ast, _) = run_frontend(
+        &source,
+        Some(file),
+        false,
+        &report_grants,
+        false,
+    )?;
 
     let mut checker = EffectChecker::new();
+    checker.set_resource_grants(&report_grants);
     checker.check_module(&ast.decls)?;
     let report = checker.function_effect_report(&ast.decls);
 
