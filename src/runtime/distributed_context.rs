@@ -10,7 +10,9 @@ use std::sync::{mpsc, Arc};
 
 use crate::runtime::cluster::{ClusterState, NodeId};
 use crate::runtime::network::NetworkTransport;
-use crate::runtime::{ActorAddress, AddressResolver, MessageAdmission, Runtime};
+use crate::runtime::{
+    ActorAddress, AddressResolver, FileFabricStreamStore, MessageAdmission, Runtime,
+};
 use crate::vm::Value;
 
 /// Cluster advertisement for one ephemeral Fabric subscription.
@@ -502,6 +504,9 @@ pub struct DistributedContext {
     // avoids divergent generations when subscriptions are registered from
     // different shards.
     fabric_generation: Option<Arc<AtomicU64>>,
+    /// Optional durable local stream store. Stream replication is layered on
+    /// top later; this first slice owns the append log and replay cursors.
+    pub(crate) fabric_streams: Option<FileFabricStreamStore>,
 }
 
 impl DistributedContext {
