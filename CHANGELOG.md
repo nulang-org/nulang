@@ -88,6 +88,19 @@ two major versions.*
 ### Added since 1.0.0-frozen — 2026-09-13 (mobile runtime boundary)
 - **Interpreter-only mobile runtime profile** (`Cargo.toml`, `src/runtime/`, `src/backends/`, `src/vm.rs`): native Cranelift/AOT code generation is now owned by the optional `native-codegen` feature while remaining enabled in default builds. The `mobile-runtime` profile excludes executable-code-generation and dynamic-loader dependencies, gates native backend wiring and benchmarks, and keeps Wasm support independently selectable. `scripts/check_mobile_runtime_profile.sh` provides the release gate for dependency-graph isolation and interpreter-only correctness.
 
+### Ownership soundness — 2026-09-17
+- **Path-sensitive move safety** (`src/effect_checker.rs`,
+  `conformance/behavior/cap_13_*`): capability analysis now keeps
+  must-use/definite-consumption separate from may-have-moved state. Definite
+  consumption intersects at `if`/`match`/`receive` joins, while
+  may-have-moved state unions, so a binding moved on only one branch cannot
+  be read after the join. This closes the gap exposed by runtime `consume`
+  move-out semantics, where such a read could otherwise observe a cleared
+  source slot. Explicit `consume x` now makes `x` unavailable regardless
+  of reference capability, handler/pattern/loop shadowing preserves both
+  flow facts, and loop bodies reject any outer binding that may be moved more
+  than once.
+
 ### Runtime soundness — 2026-09-12
 - **NaN-box pointer width safety** (`src/vm.rs`): `Value::ptr` now rejects host
   addresses that do not fit the 48-bit payload instead of silently masking high
