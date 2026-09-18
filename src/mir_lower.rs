@@ -388,8 +388,15 @@ impl ModuleCtx {
 fn lower_function_def(ctx: &mut ModuleCtx, f: &hir::FunctionDef) -> NuResult<mir::Function> {
     let mut lowerer = FnLowerer::new(ctx, &f.name, Some(f.ret.clone()));
     lowerer.b.set_placement(f.placement);
-    for (name, ty) in &f.params {
-        let id = lowerer.b.add_param(name.clone(), ty.clone());
+    debug_assert_eq!(
+        f.params.len(),
+        f.param_caps.len(),
+        "HIR function parameter/capability vectors must stay aligned"
+    );
+    for ((name, ty), cap) in f.params.iter().zip(&f.param_caps) {
+        let id = lowerer
+            .b
+            .add_param_with_cap(name.clone(), ty.clone(), *cap);
         lowerer.bind(name, id);
     }
     lowerer.lower_body_top(&f.body)?;
@@ -2870,6 +2877,40 @@ mod tests {
             .iter()
             .find(|f| f.name == name)
             .unwrap_or_else(|| panic!("function '{}' not lowered", name))
+    }
+
+    #[test]
+    fn test_mir_preserves_function_parameter_capability() {
+        let hir = hir::Module {
+            name: "test".to_string(),
+            decls: vec![hir::Decl::Function(hir::FunctionDef {
+                name: "take".to_string(),
+                type_params: vec![],
+                params: vec![("x".to_string(), Type::int())],
+                param_caps: vec![crate::types::Capability::LinearIso],
+                dict_params: vec![],
+                ret: Type::int(),
+                effect: crate::types::EffectRow::empty(),
+                cap: crate::types::Capability::Ref,
+                body: hir::Body {
+                    stmts: vec![],
+                    terminator: hir::Terminator::FnReturn(Some(hir::Operand::Var(
+                        "x".to_string(),
+                        Type::int(),
+                    ))),
+                },
+                public: false,
+                placement: None,
+                span: Span::default(),
+            })],
+        };
+        let mir = lower_module(&hir).expect("lower");
+        let f = &mir.functions[0];
+        let p = f.params[0];
+        assert_eq!(
+            f.locals[p.0 as usize].cap,
+            crate::types::Capability::LinearIso
+        );
     }
 
     #[test]
