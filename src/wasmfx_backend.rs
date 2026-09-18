@@ -1115,6 +1115,22 @@ mod tests {
     }
 
     #[test]
+    fn test_wasmfx_fails_closed_on_ownership_sink_call() {
+        let err = compile_source_to_wasmfx(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main() -> Int {\n\
+                 let y = 42 :cap lineariso\n\
+                 take(y)\n\
+             }",
+        )
+        .expect_err("WasmFX must not erase ownership-sink source invalidation");
+        assert!(
+            err.to_string().contains("ownership-sink calls are not supported yet"),
+            "unexpected WasmFX sink error: {err}"
+        );
+    }
+
+    #[test]
     fn test_compile_block_expr() {
         let wasm = compile_source_to_wasmfx("{ 1; 2; 3 }").expect("compile");
         assert_eq!(&wasm[0..4], b"\0asm", "not valid WASM magic");
