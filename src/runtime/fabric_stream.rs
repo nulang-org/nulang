@@ -617,14 +617,13 @@ impl FileFabricStreamStore {
                 "Fabric replication policy is not established",
             )
         })?;
-        let expected = policy
-            .epoch
-            .checked_add(1)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow"))?;
-        if epoch != expected {
+        if epoch <= policy.epoch {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Fabric epoch promise must target next epoch {expected}, got {epoch}"),
+                format!(
+                    "Fabric epoch promise {epoch} must be greater than installed epoch {}",
+                    policy.epoch
+                ),
             ));
         }
 
@@ -642,9 +641,8 @@ impl FileFabricStreamStore {
                     ),
                 ));
             }
-            // A lower promise may be replaced only after the durable policy
-            // itself has advanced to that promised epoch. The expected=policy+1
-            // check above enforces that sequencing.
+            // A strictly higher term supersedes an abandoned lower promise.
+            // The higher promise fences every older term immediately.
         }
 
         let promise = FabricStreamEpochPromise {
@@ -669,10 +667,7 @@ impl FileFabricStreamStore {
     ) -> io::Result<FabricStreamEpochTransitionState> {
         self.ensure_state(name)?;
         if proposal.proposal_hash.is_empty()
-            || proposal.to_policy.epoch
-                != proposal.from_policy.epoch.checked_add(1).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow")
-                })?
+            || proposal.to_policy.epoch <= proposal.from_policy.epoch
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -697,14 +692,19 @@ impl FileFabricStreamStore {
             if existing.proposal == proposal {
                 return Ok(existing);
             }
-            if !existing.finalized || existing.proposal.to_policy != proposal.from_policy {
+            let supersedes_abandoned = !existing.finalized
+                && existing.proposal.from_policy == proposal.from_policy
+                && proposal.to_policy.epoch > existing.proposal.to_policy.epoch;
+            let follows_finalized = existing.finalized
+                && existing.proposal.to_policy == proposal.from_policy;
+            if !supersedes_abandoned && !follows_finalized {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    "a different Fabric epoch transition is already in progress",
+                    "a different Fabric epoch transition cannot be superseded by this proposal",
                 ));
             }
-            // A finalized transition may be replaced only by the immediately
-            // following proposal whose source is the installed policy.
+            // Higher terms may supersede an abandoned proposal; finalized
+            // transitions roll forward only from the installed to_policy.
         }
 
         let state = FabricStreamEpochTransitionState {
@@ -840,14 +840,10 @@ impl FileFabricStreamStore {
         proposal_hash: &str,
     ) -> io::Result<()> {
         self.ensure_state(name)?;
-        if to_policy.epoch
-            != from_policy.epoch.checked_add(1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow")
-            })?
-        {
+        if to_policy.epoch <= from_policy.epoch {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Fabric epoch policy must advance by exactly one",
+                "Fabric epoch policy must advance to a higher term",
             ));
         }
 
