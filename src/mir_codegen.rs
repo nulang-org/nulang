@@ -3128,6 +3128,123 @@ mod tests {
         );
     }
     #[test]
+    fn test_spawn_reads_only_remote_initializer_mir() {
+        let source = mir::LocalId(0);
+        let node = mir::LocalId(1);
+
+        let local_spawn = mir::RValue::Spawn {
+            behavior_idx: 0,
+            init: vec![("value".into(), mir::RValue::Load(source))],
+            target_node: None,
+            capabilities: vec![],
+        };
+        let mut local_reads = std::collections::HashSet::new();
+        rvalue_reads(&local_spawn, &mut local_reads);
+        assert!(
+            !local_reads.contains(&source),
+            "local spawn must not invent a read for non-evaluated initializer MIR"
+        );
+
+        let remote_spawn = mir::RValue::Spawn {
+            behavior_idx: 0,
+            init: vec![("value".into(), mir::RValue::Load(source))],
+            target_node: Some(node),
+            capabilities: vec![],
+        };
+        let mut remote_reads = std::collections::HashSet::new();
+        rvalue_reads(&remote_spawn, &mut remote_reads);
+        assert!(remote_reads.contains(&source));
+        assert!(remote_reads.contains(&node));
+    }
+
+    #[test]
+    fn test_remote_spawn_nested_owned_call_preserves_transfer_kind() {
+        let source = mir::LocalId(0);
+        let node = mir::LocalId(1);
+        let spawn = mir::RValue::Spawn {
+            behavior_idx: 0,
+            init: vec![(
+                "value".into(),
+                mir::RValue::Call {
+                    func: mir::FuncRef::Index(0),
+                    args: vec![source],
+                },
+            )],
+            target_node: Some(node),
+            capabilities: vec![],
+        };
+
+        let uses = rvalue_uses_for_drop(&spawn, &[vec![true]]);
+        assert!(uses.contains(&(node.0 as usize, UseKind::ReadOnly)));
+        assert!(
+            uses.contains(&(source.0 as usize, UseKind::Transfer)),
+            "nested direct call must inherit the callee owned-parameter mask"
+        );
+    }
+
+    #[test]
+    fn test_owned_param_body_flow_rejects_remote_spawn_copy_escape() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("spawn_copy", None);
+        let param =
+            b.add_param_with_cap("x", array_ty, crate::types::Capability::LinearIso);
+        let node = b.add_temp(Type::int());
+        let spawned = b.add_temp(Type::unit());
+        b.assign(node, mir::RValue::Const(Constant::Int(1)));
+        b.assign(
+            spawned,
+            mir::RValue::Spawn {
+                behavior_idx: 0,
+                init: vec![("value".into(), mir::RValue::Load(param))],
+                target_node: Some(node),
+                capabilities: vec![],
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("spawn_copy");
+        module.functions.push(b.build());
+        let mut masks = vec![vec![true]];
+        prune_owned_param_masks_for_body_flow(&module, &mut masks);
+        assert_eq!(
+            masks[0],
+            vec![false],
+            "remote spawn's uncounted initializer copy must block owned-param activation"
+        );
+    }
+
+    #[test]
+    fn test_owned_param_body_flow_allows_remote_spawn_read_only_use() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("spawn_read", None);
+        let param =
+            b.add_param_with_cap("x", array_ty, crate::types::Capability::LinearIso);
+        let node = b.add_temp(Type::int());
+        let spawned = b.add_temp(Type::unit());
+        b.assign(node, mir::RValue::Const(Constant::Int(1)));
+        b.assign(
+            spawned,
+            mir::RValue::Spawn {
+                behavior_idx: 0,
+                init: vec![("length".into(), mir::RValue::ArrayLen(param))],
+                target_node: Some(node),
+                capabilities: vec![],
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("spawn_read");
+        module.functions.push(b.build());
+        let mut masks = vec![vec![true]];
+        prune_owned_param_masks_for_body_flow(&module, &mut masks);
+        assert_eq!(
+            masks[0],
+            vec![true],
+            "read-only remote initializer computation must preserve callee ownership"
+        );
+    }
+
+    #[test]
     fn test_drop_plan_owned_param_reclaimed_after_last_use() {
         let array_ty = Type::Array(Box::new(Type::int()));
         let mut b = mir::FunctionBuilder::new("owned_param", Some(Type::int()));
