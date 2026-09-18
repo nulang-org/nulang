@@ -158,8 +158,12 @@ impl Runtime {
             ));
         }
 
-        let to_epoch = from_policy
-            .epoch
+        let highest_seen = self
+            .fabric_stream_epoch_promise(stream)?
+            .map(|promise| promise.epoch)
+            .unwrap_or(from_policy.epoch)
+            .max(from_policy.epoch);
+        let to_epoch = highest_seen
             .checked_add(1)
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow"))?;
         let to_policy = policy_from_placement(&placement, to_epoch);
@@ -644,10 +648,7 @@ fn validate_proposal_shape(
 ) -> io::Result<()> {
     if stream.is_empty()
         || proposal.proposal_hash.is_empty()
-        || proposal.to_policy.epoch
-            != proposal.from_policy.epoch.checked_add(1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow")
-            })?
+        || proposal.to_policy.epoch <= proposal.from_policy.epoch
         || proposal.to_policy.partition != proposal.from_policy.partition
         || proposal.to_policy.replication_factor == 0
         || proposal.to_policy.replicas.len() != proposal.to_policy.replication_factor
