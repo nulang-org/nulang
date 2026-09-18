@@ -116,6 +116,10 @@ pub(crate) struct FabricStreamEpochProposalState {
     pub from_policy: FabricStreamReplicationPolicy,
     pub to_policy: FabricStreamReplicationPolicy,
     pub candidate_tail: u64,
+    /// Old-policy replicas explicitly excluded by a failure-triggered
+    /// transition. Empty for ordinary/manual reconfiguration.
+    #[serde(default)]
+    pub excluded_unavailable_replicas: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
