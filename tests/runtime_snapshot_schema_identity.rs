@@ -155,3 +155,59 @@ fn grain_hydration_rejects_a_different_valid_module_schema() {
         .expect_err("Counter must reject an Other snapshot");
     assert!(error.to_string().contains("does not match expected schema"));
 }
+
+
+#[test]
+fn migration_uses_persisted_workflow_schema_for_role_and_compensation_layout() {
+    let module = compile(
+        r#"
+        workflow FirstFlow {
+            step first { nil } compensate { nil }
+        }
+
+        workflow SecondFlow {
+            step alpha { nil }
+            step beta { nil } compensate { nil }
+        }
+        "#,
+    );
+    let second = module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == "SecondFlow")
+        .expect("SecondFlow metadata");
+    let expected_compensation: Vec<Option<usize>> = second
+        .behavior_indices
+        .iter()
+        .map(|&i| module.behaviors[i].compensate_offset.map(|offset| offset as usize))
+        .collect();
+    let first_len = module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == "FirstFlow")
+        .expect("FirstFlow metadata")
+        .behavior_indices
+        .len();
+    assert_ne!(
+        first_len,
+        expected_compensation.len(),
+        "fixture must distinguish first-workflow fallback from selected schema"
+    );
+
+    let actor_id = 7004;
+    let snapshot = ActorSnapshot {
+        actor_id,
+        schema_name: Some("SecondFlow".to_string()),
+        ..Default::default()
+    };
+    let snapshot_json = serde_json::to_vec(&snapshot).expect("snapshot json");
+    let nbc = module.to_nbc(None).expect("nbc");
+
+    let mut rt = Runtime::new();
+    assert!(rt.receive_migrated_actor(actor_id, nbc, snapshot_json));
+
+    let actor = &rt.actors[&actor_id];
+    assert_eq!(actor.name, "SecondFlow");
+    assert!(actor.is_workflow);
+    assert_eq!(actor.compensation_offsets, expected_compensation);
+}
