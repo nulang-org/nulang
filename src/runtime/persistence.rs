@@ -144,6 +144,11 @@ pub struct ActorSnapshot {
     /// and `perform Crdt.*` keeps working after a restart.
     #[serde(default)]
     pub crdt_field_map: Option<HashMap<String, u64>>,
+    /// Canonical declared actor schema (`ActorMeta.name`) represented by
+    /// this snapshot. Missing on legacy snapshots is accepted only when the
+    /// loaded module contains exactly one unambiguous actor schema.
+    #[serde(default)]
+    pub schema_name: Option<String>,
     /// Canonical external-authority tokens held by the actor at the time
     /// of the snapshot. Missing on pre-authority snapshots means empty
     /// authority (deny by default). Values are reparsed as a complete
@@ -1055,6 +1060,7 @@ impl PersistenceStore for LibsqlStore {
                 waiting_signal,
                 crdt_snapshot,
                 crdt_field_map,
+                schema_name: None,
                 authority_tokens,
             })
         })
@@ -1737,6 +1743,7 @@ impl PersistenceStore for PostgresStore {
             waiting_signal,
             crdt_snapshot,
             crdt_field_map,
+            schema_name: None,
             authority_tokens,
         })
     }
@@ -2030,6 +2037,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2092,6 +2100,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2121,6 +2130,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2157,6 +2167,7 @@ mod json_file_store_tests {
                     waiting_signal: None,
                     crdt_snapshot: None,
                     crdt_field_map: None,
+                    schema_name: None,
                     authority_tokens: Default::default(),
                 })
                 .unwrap();
@@ -2196,6 +2207,7 @@ mod json_file_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2317,6 +2329,7 @@ mod rocksdb_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2373,6 +2386,7 @@ mod rocksdb_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2402,6 +2416,7 @@ mod rocksdb_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2438,6 +2453,7 @@ mod rocksdb_store_tests {
                     waiting_signal: None,
                     crdt_snapshot: None,
                     crdt_field_map: None,
+                    schema_name: None,
                     authority_tokens: Default::default(),
                 })
                 .unwrap();
@@ -2509,6 +2525,7 @@ mod postgres_store_tests {
                 waiting_signal: Some("signal".to_string()),
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2574,6 +2591,7 @@ mod postgres_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2607,6 +2625,7 @@ mod postgres_store_tests {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
