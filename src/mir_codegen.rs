@@ -2724,6 +2724,75 @@ mod tests {
             plan_contains(&plan.after_stmt, (0, 2), moved),
             "the transferred owner must be released after its last read-only use"
         );
+        assert!(
+            !plan_contains(&plan.after_stmt, (0, 1), source),
+            "MoveOut transfers ownership; the source must not be released at the transfer"
+        );
+    }
+
+    #[test]
+    fn test_codegen_moveout_clears_spilled_source_slot() {
+        let mut b = mir::FunctionBuilder::new("main", Some(Type::unit()));
+        let moved = b.add_temp(Type::unit());
+
+        // Locals with id >= FUNC_VALUE_REG - LOCAL_BASE are spilled.
+        let spilled_threshold = FUNC_VALUE_REG as u32 - LOCAL_BASE;
+        for _ in 1..spilled_threshold {
+            let _ = b.add_temp(Type::int());
+        }
+        let source = b.add_temp(Type::unit());
+        assert!(source.0 >= spilled_threshold);
+
+        b.assign(source, mir::RValue::ArrayLit(Vec::new()));
+        b.assign(moved, mir::RValue::MoveOut(source));
+        // Deliberately bypass normal capability safety and observe the
+        // physical source slot after the move. A correct spilled MoveOut
+        // must return nil here, not the transferred array pointer.
+        b.terminate(mir::Terminator::Return(Some(source)));
+
+        let mut module = mir::Module::new("spill_moveout_source");
+        module.functions.push(b.build());
+        let code = compile_mir(&mut module, "spill_moveout_source").expect("compile");
+        let mut vm = VM::new();
+        vm.load_module(code);
+        let value = vm.run().expect("run");
+
+        assert!(
+            value.is_nil(),
+            "MoveOut must write nil back to the spilled source slot"
+        );
+    }
+
+    #[test]
+    fn test_codegen_moveout_between_two_spilled_locals_preserves_value() {
+        let mut b = mir::FunctionBuilder::new("main", Some(Type::int()));
+        let spilled_threshold = FUNC_VALUE_REG as u32 - LOCAL_BASE;
+        for _ in 0..spilled_threshold {
+            let _ = b.add_temp(Type::int());
+        }
+
+        let source = b.add_temp(Type::unit());
+        let moved = b.add_temp(Type::unit());
+        let len = b.add_temp(Type::int());
+        assert!(source.0 >= spilled_threshold && moved.0 >= spilled_threshold);
+
+        b.assign(source, mir::RValue::ArrayLit(Vec::new()));
+        b.assign(moved, mir::RValue::MoveOut(source));
+        b.assign(len, mir::RValue::ArrayLen(moved));
+        b.terminate(mir::Terminator::Return(Some(len)));
+
+        let mut module = mir::Module::new("spill_moveout_both");
+        module.functions.push(b.build());
+        let code = compile_mir(&mut module, "spill_moveout_both").expect("compile");
+        let mut vm = VM::new();
+        vm.load_module(code);
+        let value = vm.run().expect("run");
+
+        assert_eq!(
+            value.as_int(),
+            Some(0),
+            "clearing the spilled source must not clobber the spilled destination"
+        );
     }
 
     #[test]
