@@ -12,6 +12,7 @@ use crate::types::*;
 // Fast hashing for compiler-internal maps (keys are not attacker-controlled).
 type FxHashMap<K, V> = rustc_hash::FxHashMap<K, V>;
 type FxHashSet<T> = rustc_hash::FxHashSet<T>;
+use std::collections::{BTreeSet, VecDeque};
 
 // ---------------------------------------------------------------------------
 // Effect Row Operations
@@ -468,6 +469,37 @@ impl EffectContext {
 // Effect Checker
 // ---------------------------------------------------------------------------
 
+/// Why an effect appears in a function's transitive effect row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectOriginKind {
+    /// The effect is performed directly in the function body (including
+    /// effectful argument expressions and nested expression bodies).
+    Body,
+    /// No direct performing body was found in the module call graph; the
+    /// effect is present because an explicit function effect contract
+    /// declares it.
+    Declared,
+}
+
+impl std::fmt::Display for EffectOriginKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EffectOriginKind::Body => write!(f, "body"),
+            EffectOriginKind::Declared => write!(f, "declared"),
+        }
+    }
+}
+
+/// Shortest known provenance path for one transitive effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectOrigin {
+    pub effect: Effect,
+    /// Module-level function path from the reported function to the origin.
+    /// A direct effect therefore has a one-element path.
+    pub path: Vec<String>,
+    pub kind: EffectOriginKind,
+}
+
 /// Stable per-function effect report returned after module checking.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionEffectReport {
@@ -478,6 +510,9 @@ pub struct FunctionEffectReport {
     /// True when the function explicitly declared an effect row; false when
     /// the row was inferred.
     pub declared: bool,
+    /// One shortest deterministic origin path for each distinct concrete
+    /// effect in `row`.
+    pub origins: Vec<EffectOrigin>,
 }
 
 /// Stateful effect checker.
@@ -491,6 +526,16 @@ pub struct EffectChecker {
     /// so that a direct call site (`Expr::App` on a `Var`) propagates the
     /// callee's declared or inferred row (SPEC2 §4.9).
     fn_rows: FxHashMap<String, EffectRow>,
+    /// Per-function effects with module-level direct-call rows suppressed.
+    /// This distinguishes a function's own effects from effects inherited
+    /// through calls without maintaining a second inference implementation.
+    direct_fn_rows: FxHashMap<String, EffectRow>,
+    /// Direct module-level call edges discovered under the same shadowing
+    /// rules used by effect inference.
+    call_edges: FxHashMap<String, FxHashSet<String>>,
+    /// Module-level function whose body is currently being scanned while
+    /// building the direct call graph.
+    current_function: Option<String>,
     /// Names currently bound by local constructs (let bindings, lambda
     /// parameters, pattern variables, ...). A locally-bound name shadows a
     /// same-named module function, so calls through it are not charged the
@@ -510,6 +555,18 @@ impl EffectChecker {
     /// transitive rows used at call sites.
     pub fn function_effect_report(&self, decls: &[Decl]) -> Vec<FunctionEffectReport> {
         let flat = flatten_decls(decls);
+        let mut declared_rows: FxHashMap<String, EffectRow> = FxHashMap::default();
+        for decl in &flat {
+            if let Decl::Function {
+                name,
+                effect: Some(row),
+                ..
+            } = decl
+            {
+                declared_rows.insert(name.clone(), row.clone());
+            }
+        }
+
         let mut report: Vec<FunctionEffectReport> = flat
             .into_iter()
             .filter_map(|decl| match decl {
@@ -517,16 +574,99 @@ impl EffectChecker {
                     name,
                     effect,
                     ..
-                } => self.fn_rows.get(name).cloned().map(|row| FunctionEffectReport {
-                    name: name.clone(),
-                    row,
-                    declared: effect.is_some(),
+                } => self.fn_rows.get(name).cloned().map(|row| {
+                    let unique_effects: BTreeSet<Effect> =
+                        row.effects().iter().cloned().collect();
+                    let origins = unique_effects
+                        .into_iter()
+                        .filter_map(|eff| {
+                            self.effect_origin(name, &eff, &declared_rows)
+                        })
+                        .collect();
+                    FunctionEffectReport {
+                        name: name.clone(),
+                        row,
+                        declared: effect.is_some(),
+                        origins,
+                    }
                 }),
                 _ => None,
             })
             .collect();
         report.sort_by(|a, b| a.name.cmp(&b.name));
         report
+    }
+
+    /// Find a deterministic shortest module-level call path explaining why
+    /// `effect` appears in `function`'s transitive row. Direct body
+    /// evidence is preferred over a declaration-only contract, so an
+    /// annotated wrapper that calls a real effectful leaf still points at the
+    /// leaf when the call graph can explain the effect.
+    fn effect_origin(
+        &self,
+        function: &str,
+        effect: &Effect,
+        declared_rows: &FxHashMap<String, EffectRow>,
+    ) -> Option<EffectOrigin> {
+        let mut queue: VecDeque<(String, Vec<String>)> =
+            VecDeque::from([(function.to_string(), vec![function.to_string()])]);
+        let mut visited: FxHashSet<String> = FxHashSet::default();
+        let mut declared_fallback: Option<EffectOrigin> = None;
+
+        while let Some((name, path)) = queue.pop_front() {
+            if !visited.insert(name.clone()) {
+                continue;
+            }
+
+            if self
+                .direct_fn_rows
+                .get(&name)
+                .is_some_and(|row| row.contains(effect))
+            {
+                return Some(EffectOrigin {
+                    effect: effect.clone(),
+                    path,
+                    kind: EffectOriginKind::Body,
+                });
+            }
+
+            if declared_fallback.is_none()
+                && declared_rows
+                    .get(&name)
+                    .is_some_and(|row| row.contains(effect))
+            {
+                declared_fallback = Some(EffectOrigin {
+                    effect: effect.clone(),
+                    path: path.clone(),
+                    kind: EffectOriginKind::Declared,
+                });
+            }
+
+            let mut callees: Vec<String> = self
+                .call_edges
+                .get(&name)
+                .into_iter()
+                .flat_map(|set| set.iter())
+                .filter(|callee| {
+                    self.fn_rows
+                        .get(*callee)
+                        .is_some_and(|row| row.contains(effect))
+                })
+                .cloned()
+                .collect();
+            callees.sort();
+            callees.dedup();
+
+            for callee in callees {
+                if !visited.contains(&callee) {
+                    let mut next_path = path.clone();
+                    next_path.push(callee.clone());
+                    queue.push_back((callee, next_path));
+                }
+            }
+        }
+
+        declared_fallback
     }
 
     /// Look up the inferred effect row of a module-level function.
@@ -545,6 +685,9 @@ impl EffectChecker {
         EffectChecker {
             diagnostics: Vec::new(),
             fn_rows: FxHashMap::default(),
+            direct_fn_rows: FxHashMap::default(),
+            call_edges: FxHashMap::default(),
+            current_function: None,
             shadowed: Vec::new(),
             resource_grants: None,
         }
@@ -622,7 +765,13 @@ impl EffectChecker {
                     row = effect_row_union(&row, &self.infer_effects(ctx, arg)?);
                 }
                 if let Expr::Var(name, _) = func.as_ref() {
-                    if !self.shadowed.contains(name) {
+                    if !self.shadowed.contains(name) && self.fn_rows.contains_key(name) {
+                        if let Some(current) = self.current_function.clone() {
+                            self.call_edges
+                                .entry(current)
+                                .or_default()
+                                .insert(name.clone());
+                        }
                         if let Some(callee_row) = self.fn_rows.get(name) {
                             row = effect_row_union(&row, callee_row);
                         }
@@ -1063,12 +1212,37 @@ impl EffectChecker {
     /// direct call sites (`Expr::App` on a `Var`).
     pub fn register_function_rows(&mut self, decls: &[&Decl]) -> NuResult<()> {
         let ctx = EffectContext::empty();
+        self.fn_rows.clear();
+        self.direct_fn_rows.clear();
+        self.call_edges.clear();
+        self.current_function = None;
+
         for decl in decls {
             if let Decl::Function { name, effect, .. } = decl {
                 let row = effect.clone().unwrap_or_else(EffectRow::empty);
                 self.fn_rows.insert(name.clone(), row);
             }
         }
+
+        // Derive each body's direct effects and its module-level call edges
+        // using the normal inference implementation with all known callee rows
+        // temporarily set to empty. This preserves handler/shadowing semantics
+        // while suppressing transitive call effects.
+        let seeded_rows = self.fn_rows.clone();
+        for row in self.fn_rows.values_mut() {
+            *row = EffectRow::empty();
+        }
+        for decl in decls {
+            if let Decl::Function { name, body, .. } = decl {
+                self.current_function = Some(name.clone());
+                let direct = self.infer_effects(&ctx, body)?;
+                self.direct_fn_rows.insert(name.clone(), direct);
+            }
+        }
+        self.current_function = None;
+        self.shadowed.clear();
+        self.fn_rows = seeded_rows;
+
         for _ in 0..self.fn_rows.len() {
             let mut changed = false;
             for decl in decls {
