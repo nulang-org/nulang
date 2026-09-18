@@ -489,3 +489,72 @@ This scheduler targets **pending quorum work** only. Repairing followers that
 missed records already committed by a majority remains the bounded
 `fabric_stream_catch_up_committed` path, because bulk catch-up needs separate
 workload/rate controls.
+
+
+## Durable replication policy and epoch fencing
+
+Every replicated Fabric Stream now has a durable `replication_policy.json`
+record. The initial policy is established atomically as **epoch 1** before the
+first replicated leader append.
+
+The policy records:
+
+- partition,
+- monotonic epoch,
+- leader NodeId,
+- membership fingerprint,
+- replication factor,
+- ordered replica set.
+
+The current cluster membership still computes a deterministic placement, but
+that placement is no longer treated as authority by itself. Stream operations
+must satisfy both conditions:
+
+1. current deterministic placement matches the operation,
+2. that placement exactly matches the durable policy for the supplied epoch.
+
+If membership changes such that deterministic placement differs from the
+persisted policy, append, retry, ACK handling, catch-up, and commit propagation
+fail closed. This prevents confirmed membership change from silently creating a
+new stream leader before an explicit epoch transition protocol exists.
+
+### Epoch-carrying protocol
+
+The following internal messages/state now carry an epoch:
+
+- durable pending replication intent,
+- replica append envelope,
+- follower application ACK/NACK,
+- quorum pending ticket,
+- committed-index update.
+
+Epoch fields are additive JSON fields inside the existing reserved NUL0 v1
+`ActorMessage` envelopes. Missing epoch fields deserialize as epoch 1 for
+compatibility with the immediately preceding experimental stream stack. Epoch 0
+is always invalid.
+
+A follower may bootstrap a missing policy only for epoch 1 and only when the
+local stream has no durable history. A stream with existing records but no
+policy is rejected and requires explicit migration; ownership is never inferred
+retroactively from today's membership.
+
+### Stale traffic fencing
+
+Once epoch 1 is persisted, an otherwise valid append, ACK, or commit update with
+epoch 2 is rejected. The inverse will apply after future transitions: once a
+higher durable epoch is installed, delayed traffic from an older term will be
+rejected before it can affect progress or committed visibility.
+
+### Introspection
+
+`fabric_stream_epoch(name)` returns the currently persisted epoch, or `None`
+before replication policy has been established.
+
+### Deliberate limitation
+
+This layer does **not** increment epochs and does not move leadership.
+
+The next ownership layer must implement a quorum-backed epoch transition that
+proves the prospective leader has the committed prefix before atomically
+installing a higher epoch. Automatic failover remains disabled until that
+protocol exists.
