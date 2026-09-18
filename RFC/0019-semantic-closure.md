@@ -204,7 +204,7 @@ The migration sequence is:
 6. have runtime host functions call the typed actor authorization boundary before external access;
 7. remove ad-hoc string matching from security-sensitive checks.
 
-Current plumbing gaps are explicit: the parser still initializes spawn capabilities to an empty vector; MIR codegen currently destructures `capabilities: _`, so it drops even programmatically constructed grants instead of filling `CodeModule::spawn_capability_grants`; and the current `spawn_actor` callback API carries no spawn-PC/grant argument for installing those grants on the child. The existence of AST/HIR/MIR fields or bytecode metadata therefore must not be treated as end-to-end enforcement yet.
+Current status: source grants are parsed into typed `AuthorityGrant` values and remain structural through AST → HIR → MIR. Bytecode/native codegen canonicalizes them only at stable artifact/runtime compatibility boundaries; bytecode spawn metadata is bound to the exact spawn PC and the VM installs the selected manifest on the child actor. Runtime host authorization reparses legacy persisted/token metadata through `AuthorityManifest` and fails closed on malformed data. Remaining migration work is to replace the actor runtime's compatibility `BTreeSet<String>` storage with `AuthorityManifest` directly and to extend the distributed spawn protocol so remote authority delegation can be represented structurally rather than rejected.
 
 ## Contract 5 — Protocol-typed actor references
 
