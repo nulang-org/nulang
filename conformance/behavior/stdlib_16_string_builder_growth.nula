@@ -1,0 +1,14 @@
+// Regression coverage for stdlib string functions after routing repeated
+// assembly through StrBuilder. The payloads exceed the builder's initial
+// 32-byte capacity so growth/rebinding is exercised, not just in-place push.
+import stdlib::string
+
+fn main() {
+    let repeated = repeat("abcdefgh", 8)
+    perform IO.print(perform String.length(repeated))
+    perform IO.print(reverse("abcdefghijklmnopqrstuvwxyz0123456789"))
+    perform IO.print(join(["abcdefghij", "klmnopqrst", "uvwxyz0123", "456789"], "|"))
+    perform IO.print(replace("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "a", "bc"))
+    perform IO.print(to_upper("abcdefghijklmnopqrstuvwxyz0123456789"))
+    perform IO.print(perform String.length(trim(" \n\t\r ")))
+}
