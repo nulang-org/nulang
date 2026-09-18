@@ -18,18 +18,22 @@ resolved handler table and binding by index. Stage 1 therefore optimizes
 - `Int.to_float`
 - `Array.length`
 - `String.length`
-- a custom handled effect
+The generic `Perform` group covers the four builtin operations above. A
+separate `vm/perform_direct/custom_handler` control benchmark exercises a
+statically resolved user handler; source-level known handlers lower to
+`PerformDirect`, so that result must not be mixed into the Stage 1 generic
+`Perform` speedup calculation.
 
-Run with:
+Run the generic cache baselines with:
 
 ```sh
 cargo bench --bench vm_bench -- 'vm/perform/'
 ```
 
 The builtin benchmark sources intentionally execute the same generic
-`perform Effect.op(...)` site repeatedly so parsing, allocation, handler
-lookup, and builtin fallback remain visible in the result. The custom-handler
-case protects handler-dispatch behavior.
+`perform Effect.op(...)` site repeatedly so parsing, allocation, and builtin
+fallback remain visible in the result. Handler semantics are protected
+separately by the conformance case and the `PerformDirect` control benchmark.
 
 ## Semantic gate
 
