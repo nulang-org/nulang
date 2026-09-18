@@ -824,6 +824,7 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(last).unwrap();
         file.write_all(&[0xAA, 0xBB, 0xCC]).unwrap();
         file.sync_all().unwrap();
+        drop(file);
         drop(store);
 
         let mut reopened = FileFabricStreamStore::open(&root).unwrap();
@@ -833,6 +834,32 @@ mod tests {
             all.iter().map(|record| record.sequence).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_rejects_checksum_corruption() {
+        let root = test_dir("checksum");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        store.append("events", b"original").unwrap();
+        drop(store);
+
+        let segments = list_segments(&root.join("events")).unwrap();
+        let path = &segments[0].1;
+        let mut bytes = fs::read(path).unwrap();
+        let payload_offset = SEGMENT_HEADER_LEN + RECORD_HEADER_LEN;
+        bytes[payload_offset] ^= 0xFF;
+        fs::write(path, bytes).unwrap();
+
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        let error = reopened
+            .read_from("events", 1, 10)
+            .expect_err("checksum corruption must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum mismatch"));
         let _ = fs::remove_dir_all(root);
     }
 
