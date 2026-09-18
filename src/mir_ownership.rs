@@ -392,6 +392,65 @@ mod tests {
     }
 
     #[test]
+    fn infers_multi_hop_temp_copy_chain_to_fixed_point() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("f", None);
+        let src = b.add_temp(array_ty.clone());
+        let mid = b.add_temp(array_ty.clone());
+        let dst = b.add_local("result", array_ty);
+        b.assign(src, mir::RValue::ArrayLit(vec![]));
+        b.assign(mid, mir::RValue::Load(src));
+        b.assign(dst, mir::RValue::Load(mid));
+        b.terminate(mir::Terminator::Return(None));
+
+        let mut module = single_function_module(b.build());
+        assert_eq!(infer_last_use_transfers(&mut module), 2);
+        let transfers = &module.functions[0].ownership_transfers;
+        assert!(transfers.iter().any(|t| t.src == src && t.dst == mid));
+        assert!(transfers.iter().any(|t| t.src == mid && t.dst == dst));
+    }
+
+    #[test]
+    fn synthetic_clears_preserve_existing_source_line_indices() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("f", None);
+        let src = b.add_temp(array_ty.clone());
+        let dst = b.add_local("result", array_ty);
+        let len = b.add_temp(Type::int());
+
+        b.set_line(10);
+        b.assign(src, mir::RValue::ArrayLit(vec![]));
+        b.set_line(20);
+        b.assign(dst, mir::RValue::Load(src));
+        b.set_line(30);
+        b.assign(len, mir::RValue::ArrayLen(dst));
+        b.terminate(mir::Terminator::Return(None));
+
+        let mut module = single_function_module(b.build());
+        assert_eq!(infer_last_use_transfers(&mut module), 1);
+        let f = &module.functions[0];
+
+        let line_20 = f
+            .line_table
+            .iter()
+            .find(|(_, line)| *line == 20)
+            .map(|((_, si), _)| *si)
+            .expect("line 20 mapping");
+        let line_30 = f
+            .line_table
+            .iter()
+            .find(|(_, line)| *line == 30)
+            .map(|((_, si), _)| *si)
+            .expect("line 30 mapping");
+
+        assert_eq!(line_20, 1, "the transfer statement keeps its index");
+        assert_eq!(
+            line_30, 3,
+            "the following source statement shifts past the synthetic clear"
+        );
+    }
+
+    #[test]
     fn inferred_transfer_can_continue_an_explicit_transfer_chain() {
         let array_ty = Type::Array(Box::new(Type::int()));
         let mut b = mir::FunctionBuilder::new("f", None);
