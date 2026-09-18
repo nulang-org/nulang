@@ -8113,6 +8113,48 @@ mod vm_tests {
     }
 
     #[test]
+    fn test_arraybuilder_growth_balances_pointer_elements() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let child = callbacks.alloc_string("child");
+        let child_ptr = child.as_ptr().expect("child ptr");
+        let mut builder = arraybuilder_op(&mut callbacks, "new", &[]).expect("builder");
+
+        builder = arraybuilder_op(&mut callbacks, "push", &[builder, child]).expect("push child");
+        for i in 1..ARRAYBUILDER_INITIAL_CAPACITY {
+            builder =
+                arraybuilder_op(&mut callbacks, "push", &[builder, Value::int(i as i64)])
+                    .expect("fill builder");
+        }
+
+        let old_builder = builder;
+        let grown = arraybuilder_op(
+            &mut callbacks,
+            "push",
+            &[old_builder, Value::int(ARRAYBUILDER_INITIAL_CAPACITY as i64)],
+        )
+        .expect("grow builder");
+
+        unsafe {
+            assert_eq!(
+                (*ActorHeap::header_of(child_ptr)).ref_count,
+                3,
+                "child is owned by its original binding plus old and grown builders"
+            );
+        }
+
+        callbacks.drop_ref(old_builder.as_ptr().expect("old builder ptr"));
+        unsafe {
+            assert_eq!((*ActorHeap::header_of(child_ptr)).ref_count, 2);
+        }
+
+        callbacks.drop_ref(grown.as_ptr().expect("grown builder ptr"));
+        unsafe {
+            assert_eq!((*ActorHeap::header_of(child_ptr)).ref_count, 1);
+        }
+        callbacks.drop_ref(child_ptr);
+    }
+
+    #[test]
     fn test_arraybuilder_balances_pointer_retain_on_drop() {
         let mut callbacks = StandaloneVmCallbacks::new();
         let child = callbacks.alloc_string("child");
