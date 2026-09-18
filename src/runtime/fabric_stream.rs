@@ -632,13 +632,18 @@ impl FileFabricStreamStore {
             if existing.epoch == epoch && existing.proposal_hash == proposal_hash {
                 return Ok(existing);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "Fabric stream already promised epoch {} to a different proposal",
-                    existing.epoch
-                ),
-            ));
+            if existing.epoch >= epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "Fabric stream already promised epoch {} to a different or newer proposal",
+                        existing.epoch
+                    ),
+                ));
+            }
+            // A lower promise may be replaced only after the durable policy
+            // itself has advanced to that promised epoch. The expected=policy+1
+            // check above enforces that sequencing.
         }
 
         let promise = FabricStreamEpochPromise {
