@@ -831,3 +831,89 @@ old-policy majority can hold that exact tail and certify it in the higher term.
 Fabric stream records do not yet persist per-record origin term metadata. A
 future log-format upgrade can strengthen provenance validation before expanding
 the threat model beyond trusted cluster replicas.
+
+
+## Automatic failover after confirmed leader removal
+
+Fabric can now automatically initiate a safe ownership transition when the
+cluster marks the durable stream leader **confirmed removed**.
+
+The trigger is deliberately attached to the same confirmed-gone boundary used
+for durable actor respawn. A merely `Failed`/suspected/partitioned node never
+starts stream failover.
+
+Confirmed removals are queued while network packet processing may temporarily
+own `ClusterState` outside `Runtime`. The queue is drained only at the end of
+`process_network()`, after runtime-owned transport and cluster state are
+restored.
+
+### Eligibility
+
+For every durable stream whose installed policy names the removed node as
+leader, automatic orchestration requires:
+
+1. surviving members of the old replica set still reach the **old-policy
+   majority quorum**,
+2. the reduced replication factor equals the number of surviving old replicas,
+3. current deterministic placement for that reduced factor contains exactly
+   those surviving old replicas,
+4. the local node is the deterministic leader of that placement.
+
+If current placement would introduce a node outside the old replica set,
+automatic failover skips the stream. Replica-set expansion remains a separate
+reconfiguration protocol.
+
+Likewise, RF=2 with one removed replica cannot auto-fail over because the single
+survivor does not constitute the old RF=2 quorum.
+
+### Stream discovery
+
+The file-backed store now exposes `fabric_stream_names()`, discovered from
+durable stream directories containing `meta.json`. This lets failover
+orchestration recover its scope after process restart rather than depending on
+an in-memory stream registry.
+
+### Automatic prepare retry
+
+Confirmed-removal observations are not guaranteed to become visible on every
+survivor in the same scheduler turn.
+
+A candidate may therefore send an epoch prepare before another survivor has
+locally removed the old leader. That peer correctly rejects the proposal because
+its deterministic placement still differs.
+
+Active candidate transitions now retry the same durable proposal using
+`Runtime::now()`:
+
+- first retry after 500 ms,
+- then 1 s,
+- 2 s,
+- 4 s,
+- exponential backoff capped at 30 s.
+
+The schedule is in-memory, while durable transition state is the restart source
+of truth. After restart, a local candidate reconstructs an immediate retry entry
+from the transition file.
+
+### Current automatic scope
+
+When survivors already share the exact durable tail, the full path is now
+automatic:
+
+```text
+leader confirmed removed
+        ↓
+old quorum still survives
+        ↓
+deterministic surviving candidate
+        ↓
+prepare / durable promises / votes
+        ↓
+old-policy quorum certificate
+        ↓
+higher epoch installed
+```
+
+If survivor tails differ, the transition remains safely pending. The
+proposal-scoped push and pull APIs can repair/reconcile the mismatch; automatic
+selection of those repair actions is a separate orchestration layer.
