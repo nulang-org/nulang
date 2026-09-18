@@ -3355,8 +3355,7 @@ mod tests {
             .take_last_dispatch()
             .expect("dispatch must have been called");
         assert_eq!(
-            tag,
-            b"nulang.host-effects/v0alpha1:nulang:inference/inference#chat",
+            tag, b"nulang.host-effects/v0alpha1:nulang:inference/inference#chat",
             "compiler-owned canonical host id"
         );
         assert_eq!(payload, br#"["hi there"]"#, "positional argv array");
@@ -3381,8 +3380,7 @@ mod tests {
         .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
         assert_eq!(
-            tag,
-            b"nulang.host-effects/v0alpha1:nulang:storage/string#Read",
+            tag, b"nulang.host-effects/v0alpha1:nulang:storage/string#Read",
             "compiler-owned canonical host id"
         );
         assert_eq!(payload, br#"["greeting"]"#, "positional argv array");
@@ -3402,8 +3400,7 @@ mod tests {
                 .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
         assert_eq!(
-            tag,
-            b"nulang.host-effects/v0alpha1:nulang:storage/string#Write",
+            tag, b"nulang.host-effects/v0alpha1:nulang:storage/string#Write",
             "compiler-owned canonical host id"
         );
         assert_eq!(payload, br#"["greeting","hello"]"#, "positional argv array");
@@ -3418,8 +3415,7 @@ mod tests {
                 .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
         assert_eq!(
-            tag,
-            b"nulang.host-effects/v0alpha1:nulang:queue/string#Receive",
+            tag, b"nulang.host-effects/v0alpha1:nulang:queue/string#Receive",
             "compiler-owned canonical host id"
         );
         assert_eq!(payload, br#"["orders"]"#, "positional argv array");
@@ -3437,8 +3433,7 @@ mod tests {
                 .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
         assert_eq!(
-            tag,
-            b"nulang.host-effects/v0alpha1:nulang:queue/string#Send",
+            tag, b"nulang.host-effects/v0alpha1:nulang:queue/string#Send",
             "compiler-owned canonical host id"
         );
         assert_eq!(payload, br#"["orders","hello"]"#, "positional argv array");
@@ -3455,8 +3450,7 @@ mod tests {
         .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
         assert_eq!(
-            tag,
-            b"nulang.host-effects/v0alpha1:nulang:http/string#GET",
+            tag, b"nulang.host-effects/v0alpha1:nulang:http/string#GET",
             "compiler-owned canonical host id"
         );
         assert_eq!(
@@ -3478,8 +3472,7 @@ mod tests {
             run_source_with_dispatch(r#"perform Timer.sleep(1000)"#, None).expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
         assert_eq!(
-            tag,
-            b"nulang.host-effects/v0alpha1:nulang:timer/timer#sleep",
+            tag, b"nulang.host-effects/v0alpha1:nulang:timer/timer#sleep",
             "compiler-owned canonical host id"
         );
         assert_eq!(payload, br#"[1000]"#, "positional argv array");
