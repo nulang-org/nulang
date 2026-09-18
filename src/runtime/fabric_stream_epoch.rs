@@ -622,8 +622,23 @@ impl Runtime {
                 "Fabric epoch transition partition differs from durable policy",
             ));
         }
-
         let placement = self.fabric_stream_placement(stream, partition, new_replication_factor)?;
+        self.fabric_stream_begin_epoch_transition_with_placement(stream, from_policy, placement)
+    }
+
+    fn fabric_stream_begin_epoch_transition_with_placement(
+        &mut self,
+        stream: &str,
+        from_policy: FabricStreamReplicationPolicy,
+        placement: FabricStreamPlacement,
+    ) -> io::Result<FabricStreamEpochTransitionStatus> {
+        if placement.stream != stream || placement.partition != from_policy.partition {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric epoch transition placement differs from source policy partition",
+            ));
+        }
+
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -645,10 +660,11 @@ impl Runtime {
                 "prospective Fabric leader is not a replica in the old policy",
             ));
         }
-        if !placement
-            .replicas
-            .iter()
-            .all(|node| from_policy.replicas.contains(&node.0))
+        if placement.replicas.is_empty()
+            || !placement
+                .replicas
+                .iter()
+                .all(|node| from_policy.replicas.contains(&node.0))
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
