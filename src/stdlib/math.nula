@@ -31,12 +31,12 @@ pub fn sign(x: Int) -> Int {
 }
 
 /// Integer exponentiation (base^exp) for non-negative exp.
+///
+/// Route through the VM's specialized `IPow` fast path instead of a
+/// user-level O(exp) recursive multiply loop. The VM implements this with
+/// binary exponentiation, so valid inputs run in O(log exp).
 pub fn pow(base: Int, exp: Int) -> Int {
-    let rec loop = fn(b: Int, e: Int, acc: Int) -> Int {
-        if e == 0 then acc
-        else loop(b, e - 1, acc * b)
-    };
-    loop(base, exp, 1)
+    base ** exp
 }
 
 /// Factorial. Returns 1 for n <= 1.
@@ -70,19 +70,15 @@ pub fn is_odd(n: Int) -> Bool {
     n % 2 != 0
 }
 
-/// Square root via Newton's method. Returns -1.0 for negative input.
+/// Square root. Returns -1.0 for negative input.
+///
+/// Use the VM's native `Float.sqrt` builtin instead of running a fixed 20
+/// Newton iterations in Nulang bytecode. The explicit negative guard keeps
+/// the public stdlib behavior unchanged even though the lower-level builtin
+/// returns nil for negative inputs.
 pub fn sqrt(x: Float) -> Float {
     if x < 0.0 then -1.0
-    else if x == 0.0 then 0.0
-    else {
-        var guess = x / 2.0;
-        var i = 0;
-        while i < 20 {
-            guess = (guess + x / guess) / 2.0;
-            i = i + 1
-        };
-        guess
-    }
+    else perform Float.sqrt(x)
 }
 
 // ── Rounding ──────────────────────────────────────────────────────────────
