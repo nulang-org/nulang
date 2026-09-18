@@ -111,6 +111,50 @@ struct ReplicationPolicyFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricStreamEpochProposalState {
+    pub proposal_hash: String,
+    pub from_policy: FabricStreamReplicationPolicy,
+    pub to_policy: FabricStreamReplicationPolicy,
+    pub candidate_tail: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricStreamEpochVoteState {
+    pub voter: u64,
+    pub epoch: u64,
+    pub proposal_hash: String,
+    pub tail: u64,
+    pub committed_sequence: u64,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricStreamEpochTransitionState {
+    pub proposal: FabricStreamEpochProposalState,
+    pub votes: BTreeMap<u64, FabricStreamEpochVoteState>,
+    pub finalized: bool,
+    pub quorum_committed_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricStreamEpochPromise {
+    pub epoch: u64,
+    pub proposal_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EpochPromiseFile {
+    version: u16,
+    promise: FabricStreamEpochPromise,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EpochTransitionFile {
+    version: u16,
+    transition: FabricStreamEpochTransitionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FabricStreamPendingIntent {
     pub partition: u16,
     #[serde(default = "initial_stream_epoch")]
@@ -541,6 +585,284 @@ impl FileFabricStreamStore {
         Ok(policy)
     }
 
+    pub(crate) fn epoch_promise(
+        &mut self,
+        name: &str,
+    ) -> io::Result<Option<FabricStreamEpochPromise>> {
+        self.ensure_state(name)?;
+        read_epoch_promise(&self.stream_dir(name).join("epoch_promise.json"))
+    }
+
+    /// Durably promise not to accept an older stream epoch.
+    ///
+    /// Repeating the same proposal is idempotent. A conflicting proposal for
+    /// the same epoch, a stale epoch, or skipping directly past the next epoch
+    /// is rejected.
+    pub(crate) fn promise_epoch(
+        &mut self,
+        name: &str,
+        epoch: u64,
+        proposal_hash: &str,
+    ) -> io::Result<FabricStreamEpochPromise> {
+        self.ensure_state(name)?;
+        if proposal_hash.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric epoch proposal hash cannot be empty",
+            ));
+        }
+        let policy = self
+            .replication_policy(name)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric replication policy is not established"))?;
+        let expected = policy
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow"))?;
+        if epoch != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Fabric epoch promise must target next epoch {expected}, got {epoch}"
+                ),
+            ));
+        }
+
+        let path = self.stream_dir(name).join("epoch_promise.json");
+        if let Some(existing) = read_epoch_promise(&path)? {
+            if existing.epoch == epoch && existing.proposal_hash == proposal_hash {
+                return Ok(existing);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Fabric stream already promised epoch {} to a different proposal",
+                    existing.epoch
+                ),
+            ));
+        }
+
+        let promise = FabricStreamEpochPromise {
+            epoch,
+            proposal_hash: proposal_hash.to_string(),
+        };
+        write_json_atomic(
+            &path,
+            &EpochPromiseFile {
+                version: STREAM_FORMAT_VERSION,
+                promise: promise.clone(),
+            },
+        )?;
+        sync_dir(&self.stream_dir(name))?;
+        Ok(promise)
+    }
+
+    pub(crate) fn begin_epoch_transition(
+        &mut self,
+        name: &str,
+        proposal: FabricStreamEpochProposalState,
+    ) -> io::Result<FabricStreamEpochTransitionState> {
+        self.ensure_state(name)?;
+        if proposal.proposal_hash.is_empty()
+            || proposal.to_policy.epoch
+                != proposal
+                    .from_policy
+                    .epoch
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow"))?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Fabric epoch transition proposal",
+            ));
+        }
+        let current = self
+            .replication_policy(name)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric replication policy is not established"))?;
+        if current != proposal.from_policy {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch transition source policy does not match durable policy",
+            ));
+        }
+
+        let path = self.stream_dir(name).join("epoch_transition.json");
+        if let Some(existing) = read_epoch_transition(&path)? {
+            if existing.proposal == proposal {
+                return Ok(existing);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a different Fabric epoch transition is already in progress",
+            ));
+        }
+
+        let state = FabricStreamEpochTransitionState {
+            proposal,
+            votes: BTreeMap::new(),
+            finalized: false,
+            quorum_committed_sequence: 0,
+        };
+        write_json_atomic(
+            &path,
+            &EpochTransitionFile {
+                version: STREAM_FORMAT_VERSION,
+                transition: state.clone(),
+            },
+        )?;
+        sync_dir(&self.stream_dir(name))?;
+        Ok(state)
+    }
+
+    pub(crate) fn epoch_transition(
+        &mut self,
+        name: &str,
+    ) -> io::Result<Option<FabricStreamEpochTransitionState>> {
+        self.ensure_state(name)?;
+        read_epoch_transition(&self.stream_dir(name).join("epoch_transition.json"))
+    }
+
+    pub(crate) fn record_epoch_vote(
+        &mut self,
+        name: &str,
+        vote: FabricStreamEpochVoteState,
+    ) -> io::Result<FabricStreamEpochTransitionState> {
+        self.ensure_state(name)?;
+        let path = self.stream_dir(name).join("epoch_transition.json");
+        let mut transition = read_epoch_transition(&path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Fabric epoch transition is not in progress",
+            )
+        })?;
+        if transition.finalized {
+            return Ok(transition);
+        }
+        if vote.epoch != transition.proposal.to_policy.epoch
+            || vote.proposal_hash != transition.proposal.proposal_hash
+            || !transition
+                .proposal
+                .from_policy
+                .replicas
+                .contains(&vote.voter)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch vote does not match the active proposal",
+            ));
+        }
+        if let Some(existing) = transition.votes.get(&vote.voter) {
+            if existing == &vote {
+                return Ok(transition);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Fabric replica already recorded a different vote for this epoch",
+            ));
+        }
+        transition.votes.insert(vote.voter, vote);
+        write_json_atomic(
+            &path,
+            &EpochTransitionFile {
+                version: STREAM_FORMAT_VERSION,
+                transition: transition.clone(),
+            },
+        )?;
+        sync_dir(&self.stream_dir(name))?;
+        Ok(transition)
+    }
+
+    pub(crate) fn finalize_epoch_transition(
+        &mut self,
+        name: &str,
+        quorum_committed_sequence: u64,
+    ) -> io::Result<FabricStreamEpochTransitionState> {
+        self.ensure_state(name)?;
+        let path = self.stream_dir(name).join("epoch_transition.json");
+        let mut transition = read_epoch_transition(&path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Fabric epoch transition is not in progress",
+            )
+        })?;
+        if transition.finalized {
+            if transition.quorum_committed_sequence == quorum_committed_sequence {
+                return Ok(transition);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric finalized epoch transition has a different committed boundary",
+            ));
+        }
+        transition.finalized = true;
+        transition.quorum_committed_sequence = quorum_committed_sequence;
+        write_json_atomic(
+            &path,
+            &EpochTransitionFile {
+                version: STREAM_FORMAT_VERSION,
+                transition: transition.clone(),
+            },
+        )?;
+        sync_dir(&self.stream_dir(name))?;
+        Ok(transition)
+    }
+
+    /// Atomically replace the durable replication policy after a matching
+    /// promise has fenced the old epoch.
+    pub(crate) fn install_epoch_policy(
+        &mut self,
+        name: &str,
+        from_policy: &FabricStreamReplicationPolicy,
+        to_policy: &FabricStreamReplicationPolicy,
+        proposal_hash: &str,
+    ) -> io::Result<()> {
+        self.ensure_state(name)?;
+        if to_policy.epoch
+            != from_policy
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow"))?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric epoch policy must advance by exactly one",
+            ));
+        }
+
+        let current = self
+            .replication_policy(name)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric replication policy is not established"))?;
+        if current == *to_policy {
+            return Ok(());
+        }
+        if current != *from_policy {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch transition source policy changed",
+            ));
+        }
+        let promise = self.epoch_promise(name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Fabric epoch policy cannot advance without a durable promise",
+            )
+        })?;
+        if promise.epoch != to_policy.epoch || promise.proposal_hash != proposal_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Fabric epoch policy does not match the durable promise",
+            ));
+        }
+
+        write_json_atomic(
+            &self.stream_dir(name).join("replication_policy.json"),
+            &ReplicationPolicyFile {
+                version: STREAM_FORMAT_VERSION,
+                policy: to_policy.clone(),
+            },
+        )?;
+        sync_dir(&self.stream_dir(name))
+    }
+
     /// Persist replication intent before the matching leader append.
     ///
     /// Reserving first closes the crash window where an uncommitted durable
@@ -852,6 +1174,67 @@ impl Runtime {
     ) -> io::Result<FabricStreamReplicationPolicy> {
         self.fabric_stream_store_mut()?
             .establish_replication_policy(name, policy)
+    }
+
+    pub(crate) fn fabric_stream_epoch_promise(
+        &mut self,
+        name: &str,
+    ) -> io::Result<Option<FabricStreamEpochPromise>> {
+        self.fabric_stream_store_mut()?.epoch_promise(name)
+    }
+
+    pub(crate) fn fabric_stream_promise_epoch(
+        &mut self,
+        name: &str,
+        epoch: u64,
+        proposal_hash: &str,
+    ) -> io::Result<FabricStreamEpochPromise> {
+        self.fabric_stream_store_mut()?
+            .promise_epoch(name, epoch, proposal_hash)
+    }
+
+    pub(crate) fn fabric_stream_begin_epoch_transition_state(
+        &mut self,
+        name: &str,
+        proposal: FabricStreamEpochProposalState,
+    ) -> io::Result<FabricStreamEpochTransitionState> {
+        self.fabric_stream_store_mut()?
+            .begin_epoch_transition(name, proposal)
+    }
+
+    pub(crate) fn fabric_stream_epoch_transition_state(
+        &mut self,
+        name: &str,
+    ) -> io::Result<Option<FabricStreamEpochTransitionState>> {
+        self.fabric_stream_store_mut()?.epoch_transition(name)
+    }
+
+    pub(crate) fn fabric_stream_record_epoch_vote(
+        &mut self,
+        name: &str,
+        vote: FabricStreamEpochVoteState,
+    ) -> io::Result<FabricStreamEpochTransitionState> {
+        self.fabric_stream_store_mut()?.record_epoch_vote(name, vote)
+    }
+
+    pub(crate) fn fabric_stream_finalize_epoch_transition_state(
+        &mut self,
+        name: &str,
+        quorum_committed_sequence: u64,
+    ) -> io::Result<FabricStreamEpochTransitionState> {
+        self.fabric_stream_store_mut()?
+            .finalize_epoch_transition(name, quorum_committed_sequence)
+    }
+
+    pub(crate) fn fabric_stream_install_epoch_policy(
+        &mut self,
+        name: &str,
+        from_policy: &FabricStreamReplicationPolicy,
+        to_policy: &FabricStreamReplicationPolicy,
+        proposal_hash: &str,
+    ) -> io::Result<()> {
+        self.fabric_stream_store_mut()?
+            .install_epoch_policy(name, from_policy, to_policy, proposal_hash)
     }
 
     pub(crate) fn fabric_stream_reserve_replication_intent(
@@ -1175,6 +1558,44 @@ fn segment_path(dir: &Path, base_sequence: u64) -> PathBuf {
     dir.join(format!("{base_sequence:020}.seg"))
 }
 
+fn read_epoch_promise(path: &Path) -> io::Result<Option<FabricStreamEpochPromise>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    let file: EpochPromiseFile = serde_json::from_slice(&bytes).map_err(json_error)?;
+    if file.version != STREAM_FORMAT_VERSION
+        || file.promise.epoch == 0
+        || file.promise.proposal_hash.is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid durable Fabric epoch promise",
+        ));
+    }
+    Ok(Some(file.promise))
+}
+
+fn read_epoch_transition(
+    path: &Path,
+) -> io::Result<Option<FabricStreamEpochTransitionState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    let file: EpochTransitionFile = serde_json::from_slice(&bytes).map_err(json_error)?;
+    if file.version != STREAM_FORMAT_VERSION
+        || file.transition.proposal.proposal_hash.is_empty()
+        || file.transition.proposal.to_policy.epoch == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid durable Fabric epoch transition state",
+        ));
+    }
+    Ok(Some(file.transition))
+}
+
 fn read_replication_policy(path: &Path) -> io::Result<Option<FabricStreamReplicationPolicy>> {
     if !path.exists() {
         return Ok(None);
@@ -1491,6 +1912,42 @@ mod tests {
         store.commit_cursor("events", "worker", 2).unwrap();
         assert!(store.commit_cursor("events", "worker", 1).is_err());
         assert!(store.commit_cursor("events", "worker", 3).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn epoch_promise_is_durable_and_single_proposal_per_epoch() {
+        let root = test_dir("epoch-promise");
+        let policy = FabricStreamReplicationPolicy {
+            partition: 0,
+            epoch: FABRIC_STREAM_INITIAL_EPOCH,
+            leader: 10,
+            membership_fingerprint: 44,
+            replication_factor: 2,
+            replicas: vec![10, 11],
+        };
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream("events", FabricStreamConfig::default())
+                .unwrap();
+            store
+                .establish_replication_policy("events", policy)
+                .unwrap();
+            let promised = store.promise_epoch("events", 2, "proposal-a").unwrap();
+            assert_eq!(promised.epoch, 2);
+            assert_eq!(
+                store.promise_epoch("events", 2, "proposal-a").unwrap(),
+                promised
+            );
+            assert!(store.promise_epoch("events", 2, "proposal-b").is_err());
+        }
+
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.epoch_promise("events").unwrap().unwrap().proposal_hash,
+            "proposal-a"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
