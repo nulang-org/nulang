@@ -41,6 +41,16 @@ const FABRIC_STREAM_FAILOVER_RETRY_INITIAL: std::time::Duration =
     std::time::Duration::from_millis(500);
 const FABRIC_STREAM_FAILOVER_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
+const FABRIC_STREAM_AUTO_RECONCILE_BATCH: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FabricStreamAutoFailoverAction {
+    HigherTerm,
+    PullAheadReplica,
+    PushLaggingReplica,
+    ResumePrepare,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FabricStreamEpochTransitionStatus {
     pub from_epoch: u64,
@@ -350,7 +360,34 @@ impl Runtime {
         Ok(report)
     }
 
-    /// Retry active automatic ownership transitions with logical-clock backoff.
+    /// Wake automatic reconciliation immediately after a transition-relevant
+    /// packet changes durable vote or candidate-tail state.
+    pub(crate) fn fabric_stream_wake_auto_failover(&mut self, stream: &str) {
+        let local = match self.distributed.node_id {
+            Some(local) => local,
+            None => return,
+        };
+        let state = match self.fabric_stream_epoch_transition_state(stream) {
+            Ok(Some(state)) => state,
+            _ => return,
+        };
+        if state.finalized || state.proposal.to_policy.leader != local.0 {
+            return;
+        }
+        let now = self.now();
+        self.distributed.fabric_stream_failover_retry.insert(
+            stream.to_string(),
+            (now, FABRIC_STREAM_FAILOVER_RETRY_INITIAL),
+        );
+    }
+
+    /// Drive active automatic ownership transitions with logical-clock backoff.
+    ///
+    /// The state machine chooses one safe action per due stream:
+    /// - candidate tail changed after pull -> supersede with a higher term,
+    /// - rejected proposed replica ahead -> pull a bounded suffix,
+    /// - rejected proposed replica behind -> push a bounded repair suffix,
+    /// - otherwise -> re-send the durable prepare.
     ///
     /// Durable transition state is the restart source of truth; if the
     /// in-memory schedule is absent after restart, a local candidate rebuilds
@@ -392,14 +429,120 @@ impl Runtime {
             .collect();
 
         for stream in due {
-            let result = self.fabric_stream_resume_epoch_transition(&stream);
+            let state = match self.fabric_stream_epoch_transition_state(&stream) {
+                Ok(Some(state)) if !state.finalized => state,
+                _ => {
+                    self.distributed
+                    .fabric_stream_failover_retry
+                    .remove(&stream);
+                    continue;
+                }
+            };
+            if state.proposal.to_policy.leader != local.0 {
+                self.distributed
+                    .fabric_stream_failover_retry
+                    .remove(&stream);
+                continue;
+            }
+
+            let local_tail = match self.fabric_stream_info(&stream) {
+                Ok(info) => info.last_sequence.unwrap_or(0),
+                Err(error) => {
+                    tracing::warn!(
+                        stream = %stream,
+                        "nulang-fabric-stream: cannot inspect automatic failover tail: {}",
+                        error
+                    );
+                    continue;
+                }
+            };
+
+            let rejected_new_policy: Vec<&FabricStreamEpochVoteState> = state
+                .votes
+                .values()
+                .filter(|vote| {
+                    !vote.accepted
+                        && state.proposal.to_policy.replicas.contains(&vote.voter)
+                        && vote.voter != local.0
+                })
+                .collect();
+            let has_ahead = rejected_new_policy
+                .iter()
+                .any(|vote| vote.tail > state.proposal.candidate_tail);
+            let has_behind = rejected_new_policy
+                .iter()
+                .any(|vote| vote.tail < state.proposal.candidate_tail);
+
+            let action = if local_tail > state.proposal.candidate_tail {
+                FabricStreamAutoFailoverAction::HigherTerm
+            } else if local_tail < state.proposal.candidate_tail {
+                tracing::warn!(
+                    stream = %stream,
+                    local_tail,
+                    proposal_tail = state.proposal.candidate_tail,
+                    "nulang-fabric-stream: candidate tail regressed below durable proposal; refusing automatic reconciliation"
+                );
+                FabricStreamAutoFailoverAction::ResumePrepare
+            } else if has_ahead {
+                // Pull first when peers disagree in both directions. The
+                // candidate must adopt the highest surviving tail before
+                // pushing the reconciled prefix to lagging replicas.
+                FabricStreamAutoFailoverAction::PullAheadReplica
+            } else if has_behind {
+                FabricStreamAutoFailoverAction::PushLaggingReplica
+            } else {
+                FabricStreamAutoFailoverAction::ResumePrepare
+            };
+
+            let result: io::Result<Option<FabricStreamEpochTransitionStatus>> = match action {
+                FabricStreamAutoFailoverAction::HigherTerm => self
+                    .fabric_stream_begin_epoch_transition(
+                        &stream,
+                        state.proposal.to_policy.partition,
+                        state.proposal.to_policy.replication_factor,
+                    )
+                    .map(Some),
+                FabricStreamAutoFailoverAction::PullAheadReplica => self
+                    .fabric_stream_pull_epoch_transition(
+                        &stream,
+                        FABRIC_STREAM_AUTO_RECONCILE_BATCH,
+                    )
+                    .map(|_| None),
+                FabricStreamAutoFailoverAction::PushLaggingReplica => self
+                    .fabric_stream_repair_epoch_transition(
+                        &stream,
+                        FABRIC_STREAM_AUTO_RECONCILE_BATCH,
+                    )
+                    .map(|_| None),
+                FabricStreamAutoFailoverAction::ResumePrepare => self
+                    .fabric_stream_resume_epoch_transition(&stream)
+                    .map(Some),
+            };
+
             match result {
-                Ok(status) if status.finalized => {
+                Ok(Some(status)) if status.finalized => {
                     self.distributed
                     .fabric_stream_failover_retry
                     .remove(&stream);
                 }
-                Ok(_) | Err(_) => {
+                Ok(_) => {
+                    let now = self.now();
+                    if let Some((next_attempt, backoff)) = self
+                        .distributed
+                        .fabric_stream_failover_retry
+                        .get_mut(&stream)
+                    {
+                        if action == FabricStreamAutoFailoverAction::ResumePrepare {
+                            *backoff = backoff
+                                .saturating_mul(2)
+                                .min(FABRIC_STREAM_FAILOVER_RETRY_MAX);
+                        } else {
+                            *backoff = FABRIC_STREAM_FAILOVER_RETRY_INITIAL;
+                        }
+                        *next_attempt = now + *backoff;
+                    }
+                }
+                Err(error) => {
                     let now = self.now();
                     if let Some((next_attempt, backoff)) = self
                         .distributed
@@ -411,13 +554,12 @@ impl Runtime {
                             .min(FABRIC_STREAM_FAILOVER_RETRY_MAX);
                         *next_attempt = now + *backoff;
                     }
-                    if let Err(error) = result {
-                        tracing::warn!(
-                            stream = %stream,
-                            "nulang-fabric-stream: automatic failover retry failed: {}",
-                            error
-                        );
-                    }
+                    tracing::warn!(
+                        stream = %stream,
+                        ?action,
+                        "nulang-fabric-stream: automatic failover action failed: {}",
+                        error
+                    );
                 }
             }
         }
