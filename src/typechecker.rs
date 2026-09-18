@@ -896,6 +896,13 @@ pub struct TypeChecker {
     pub given_bindings: FxHashMap<String, (Option<Type>, Expr)>,
     /// Functions with `using` params: fn_name → using param names.
     pub fn_using_params: FxHashMap<String, Vec<String>>,
+    /// Names introduced by lexical value scopes (function/lambda params and
+    /// let bindings) that are eligible to satisfy a `using` parameter.
+    ///
+    /// Resolution order is lexical binding first, then module-level `given`.
+    /// This gives `using` Odin-style scoped override semantics without a
+    /// second context-specific binding syntax.
+    ambient_using_bindings: FxHashSet<String>,
     /// Self-referencing type variables from recursive ADT types.
     /// Must not be generalized — they must stay identical across
     /// constructor instantiations for structural unification.
@@ -983,10 +990,26 @@ impl TypeChecker {
             inferred_decl_types: FxHashMap::default(),
             given_bindings: FxHashMap::default(),
             fn_using_params: FxHashMap::default(),
+            ambient_using_bindings: FxHashSet::default(),
             rigid_vars: FxHashSet::default(),
             collect_errors: false,
             collected_errors: Vec::new(),
         }
+    }
+
+    /// Run type inference with additional lexical bindings eligible to
+    /// satisfy implicit `using` parameters. The previous set is restored
+    /// even when inference returns an error.
+    fn with_ambient_using_bindings<T>(
+        &mut self,
+        names: &[String],
+        f: impl FnOnce(&mut Self) -> NuResult<T>,
+    ) -> NuResult<T> {
+        let saved = self.ambient_using_bindings.clone();
+        self.ambient_using_bindings.extend(names.iter().cloned());
+        let result = f(self);
+        self.ambient_using_bindings = saved;
+        result
     }
 
     /// Type-check an entire module, returning the type of the last declaration.
@@ -1392,25 +1415,35 @@ impl TypeChecker {
                         }
                     }
                 }
-                let (s1, body_ty) = self.infer_expr(&new_ctx, body)?;
+                let ambient_names: Vec<String> = params
+                    .iter()
+                    .chain(using_params.iter())
+                    .map(|p| p.name.clone())
+                    .collect();
+                let (s1, body_ty) = self.with_ambient_using_bindings(&ambient_names, |this| {
+                    let (s1, body_ty) = this.infer_expr(&new_ctx, body)?;
 
-                // Contract predicates must be Bool-typed. Postconditions see
-                // `result` bound to the inferred return type.
-                for req in requires {
-                    let (_s, req_ty) = self.infer_expr(&new_ctx, req)?;
-                    let _ = mgu(&req_ty, &Type::bool(), *span)?;
-                }
-                let mut ensures_ctx = new_ctx.clone();
-                ensures_ctx.bind(
-                    "result".to_string(),
-                    body_ty.clone(),
-                    Capability::Ref,
-                    false,
-                );
-                for ens in ensures {
-                    let (_s, ens_ty) = self.infer_expr(&ensures_ctx, ens)?;
-                    let _ = mgu(&ens_ty, &Type::bool(), *span)?;
-                }
+                    // Contract predicates execute in the same lexical context
+                    // as the function body, so implicit context propagation
+                    // works consistently inside requires/ensures as well.
+                    for req in requires {
+                        let (_s, req_ty) = this.infer_expr(&new_ctx, req)?;
+                        let _ = mgu(&req_ty, &Type::bool(), *span)?;
+                    }
+                    let mut ensures_ctx = new_ctx.clone();
+                    ensures_ctx.bind(
+                        "result".to_string(),
+                        body_ty.clone(),
+                        Capability::Ref,
+                        false,
+                    );
+                    for ens in ensures {
+                        let (_s, ens_ty) = this.infer_expr(&ensures_ctx, ens)?;
+                        let _ = mgu(&ens_ty, &Type::bool(), *span)?;
+                    }
+
+                    Ok((s1, body_ty))
+                })?;
 
                 // Unify the preliminary return variable with the inferred body type
                 let s_rec = mgu(&apply_subst(&ret_var, &s1), &body_ty, *span)?;
@@ -2113,7 +2146,10 @@ impl TypeChecker {
             param_types.push(pty);
         }
 
-        let (s, ret_ty) = self.infer_expr(&new_ctx, body)?;
+        let ambient_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+        let (s, ret_ty) = self.with_ambient_using_bindings(&ambient_names, |this| {
+            this.infer_expr(&new_ctx, body)
+        })?;
 
         let param_ty = if param_types.len() == 1 {
             apply_subst(&param_types[0], &s)
@@ -2151,12 +2187,18 @@ impl TypeChecker {
             arg_types.push(apply_subst(&arg_ty, &subst));
         }
 
-        // Resolve `using` params from `given` bindings.
+        // Resolve `using` params. A lexical binding with the same name
+        // shadows the module-level `given`; otherwise fall back to `given`.
+        // The inserted variable expression is inferred normally below, so a
+        // lexical override with the wrong type is rejected rather than
+        // silently bypassed in favor of the global value.
         let mut extra_given_args: Vec<Expr> = Vec::new();
         if let Expr::Var(fn_name, _) = func {
             if let Some(using_names) = self.fn_using_params.get(fn_name) {
                 for uname in using_names {
-                    if let Some((_, val)) = self.given_bindings.get(uname) {
+                    if self.ambient_using_bindings.contains(uname) && ctx.lookup(uname).is_some() {
+                        extra_given_args.push(Expr::Var(uname.clone(), span));
+                    } else if let Some((_, val)) = self.given_bindings.get(uname) {
                         extra_given_args.push(val.clone());
                     }
                 }
@@ -2269,7 +2311,10 @@ impl TypeChecker {
             }
             let gen_ty = self.do_generalize(ctx, &apply_subst(&val_ty, &s_combined));
             let new_ctx = ctx.extend(name.to_string(), gen_ty, Capability::Ref, mutable);
-            let (s3, body_ty) = self.infer_expr(&new_ctx, body)?;
+            let ambient_name = [name.to_string()];
+            let (s3, body_ty) = self.with_ambient_using_bindings(&ambient_name, |this| {
+                this.infer_expr(&new_ctx, body)
+            })?;
             let final_subst = compose_subst(&s3, &s_combined);
             return Ok((final_subst.clone(), apply_subst(&body_ty, &final_subst)));
         }
@@ -2291,8 +2336,12 @@ impl TypeChecker {
         // Extend context with generalized type
         let new_ctx = ctx.extend(name.to_string(), gen_ty, Capability::Ref, mutable);
 
-        // Infer body with extended context
-        let (s2, body_ty) = self.infer_expr(&new_ctx, body)?;
+        // Infer body with extended context. A let binding may shadow a
+        // module-level contextual `given` of the same name.
+        let ambient_name = [name.to_string()];
+        let (s2, body_ty) = self.with_ambient_using_bindings(&ambient_name, |this| {
+            this.infer_expr(&new_ctx, body)
+        })?;
 
         let final_subst = compose_subst(&s2, &s1);
         Ok((final_subst.clone(), apply_subst(&body_ty, &final_subst)))
@@ -5264,6 +5313,50 @@ mod tests {
             bad.is_err(),
             "alias must constrain to the aliased type, got {:?}",
             bad.ok()
+        );
+    }
+
+    #[test]
+    fn test_using_prefers_function_parameter_over_global_given() {
+        let result = check_src(
+            "given ctx: String = \"global\"\n\
+             fn inner() using (ctx: Int) -> Int { ctx }\n\
+             fn outer(ctx: Int) -> Int { inner() }\n\
+             outer(7)",
+        );
+        assert!(
+            result.is_ok(),
+            "lexical parameter should satisfy using before global given: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_using_prefers_let_binding_over_global_given() {
+        let result = check_src(
+            "given ctx: String = \"global\"\n\
+             fn inner() using (ctx: Int) -> Int { ctx }\n\
+             fn outer() -> Int { let ctx = 7 in inner() }\n\
+             outer()",
+        );
+        assert!(
+            result.is_ok(),
+            "lexical let should satisfy using before global given: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_using_still_falls_back_to_global_given() {
+        let result = check_src(
+            "given ctx: Int = 9\n\
+             fn inner() using (ctx: Int) -> Int { ctx }\n\
+             inner()",
+        );
+        assert!(
+            result.is_ok(),
+            "global given fallback must remain compatible: {:?}",
+            result.err()
         );
     }
 
