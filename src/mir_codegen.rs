@@ -2476,6 +2476,10 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
     let mut has_def = vec![false; nlocals];
     let mut defs_owning = vec![true; nlocals];
     let mut no_copy_use = vec![true; nlocals];
+    // Error cleanup is safe only while a counted owner has not crossed an
+    // uncounted escape channel. A Return is the sole exception: cleanup runs
+    // only on failure, which by definition happens before that return executes.
+    let mut cleanup_safe = vec![true; nlocals];
     let mut block_defs: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
     let mut block_uses: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
     // (dst, base) pairs of field/element loads, for escapee tracking.
@@ -2487,6 +2491,7 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
                 block_uses[bi].insert(u);
                 if kind == UseKind::Copy {
                     no_copy_use[u] = false;
+                    cleanup_safe[u] = false;
                 }
             }
             if let mir::Stmt::Assign { dst, op } = stmt {
@@ -2512,12 +2517,21 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
             block_uses[bi].insert(u);
             if kind == UseKind::Copy {
                 no_copy_use[u] = false;
+                let return_transfer = matches!(
+                    &block.terminator,
+                    mir::Terminator::Return(Some(id)) if id.0 as usize == u
+                );
+                if !return_transfer {
+                    cleanup_safe[u] = false;
+                }
             }
         }
     }
 
     let cleanup_owner: Vec<bool> = (0..nlocals)
-        .map(|i| ptr_ty[i] && !excluded[i] && has_def[i] && defs_owning[i])
+        .map(|i| {
+            ptr_ty[i] && !excluded[i] && has_def[i] && defs_owning[i] && cleanup_safe[i]
+        })
         .collect();
     plan.cleanup_owned = cleanup_owner
         .iter()
@@ -2868,6 +2882,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_drop_plan_error_cleanup_excludes_uncounted_call_escape() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("escaped_owner", None);
+        let value = b.add_temp(array_ty);
+        let result = b.add_temp(Type::unit());
+        b.assign(value, mir::RValue::ArrayLit(vec![]));
+        b.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![value],
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+        let f = b.build();
+
+        let plan = plan_drops(&f);
+        assert!(
+            !plan.cleanup_owned.contains(&value),
+            "an owner copied into a call may have escaped and cannot be reclaimed on abort"
+        );
+    }
     #[test]
     fn test_mir_codegen_simple_arithmetic() {
         let value = run_mir_source("1 + 2 * 3").unwrap();
