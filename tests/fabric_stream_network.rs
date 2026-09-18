@@ -449,18 +449,13 @@ fn leader_restart_recovers_pending_ticket_and_retries_replica() {
     }
 }
 
-
 #[test]
 fn lagging_committed_replica_catches_up_and_receives_commit_boundary() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-    let addrs: Vec<SocketAddr> = [
-        "127.0.0.1:34601",
-        "127.0.0.1:34602",
-        "127.0.0.1:34603",
-    ]
-    .into_iter()
-    .map(|addr| addr.parse().unwrap())
-    .collect();
+    let addrs: Vec<SocketAddr> = ["127.0.0.1:34601", "127.0.0.1:34602", "127.0.0.1:34603"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
     let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
     let mut nodes: Vec<Runtime> = addrs
         .iter()
@@ -482,9 +477,7 @@ fn lagging_committed_replica_catches_up_and_receives_commit_boundary() {
         }
     }
 
-    let placement = nodes[0]
-        .fabric_stream_placement("catchup", 0, 3)
-        .unwrap();
+    let placement = nodes[0].fabric_stream_placement("catchup", 0, 3).unwrap();
     let leader_index = ids.iter().position(|id| *id == placement.leader).unwrap();
     let followers: Vec<usize> = (0..3).filter(|index| *index != leader_index).collect();
     let quorum_follower = followers[0];
