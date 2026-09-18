@@ -30,6 +30,14 @@ pub struct Local {
     pub cap: Capability,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnershipTransfer {
+    /// Local whose counted ownership slot is moved out.
+    pub src: LocalId,
+    /// Local receiving that ownership slot.
+    pub dst: LocalId,
+}
+
 // ---------------------------------------------------------------------------
 // Module and functions
 // ---------------------------------------------------------------------------
@@ -80,6 +88,12 @@ pub struct Function {
     /// `(block id, index-within-block)`) that carries a source line, in
     /// emission order. `mir_codegen` translates these to bytecode PCs.
     pub line_table: Vec<((BlockId, usize), u32)>,
+    /// Ownership-transfer edges emitted by explicit `consume` expressions.
+    ///
+    /// Runtime code still uses the backend-neutral `dst = Load(src); src = nil`
+    /// sequence. This metadata lets ownership analyses distinguish that pair
+    /// from alias creation without changing bytecode, WASM, or AOT ABIs.
+    pub ownership_transfers: Vec<OwnershipTransfer>,
     /// Web framework compile-time placement hint (None = infer from effect row).
     pub placement: Option<crate::types::Placement>,
 }
@@ -377,6 +391,7 @@ pub struct FunctionBuilder {
     /// next `set_line`.
     current_line: Option<u32>,
     line_table: Vec<((BlockId, usize), u32)>,
+    ownership_transfers: Vec<OwnershipTransfer>,
     placement: Option<crate::types::Placement>,
 }
 
@@ -395,6 +410,7 @@ impl FunctionBuilder {
             next_block: 0,
             current_line: None,
             line_table: Vec::new(),
+            ownership_transfers: Vec::new(),
             placement: None,
         };
         builder.create_block(); // entry block
@@ -525,6 +541,19 @@ impl FunctionBuilder {
         self.emit(Stmt::Assign { dst, op });
     }
 
+    /// Move the counted ownership slot from `src` to `dst`.
+    ///
+    /// The emitted statements deliberately stay in ordinary MIR so every
+    /// backend preserves today's runtime behavior. The side table records
+    /// that the Load is a transfer rather than an aliasing copy.
+    pub fn transfer(&mut self, dst: LocalId, src: LocalId) {
+        debug_assert_ne!(dst, src, "ownership transfer requires distinct locals");
+        self.ownership_transfers
+            .push(OwnershipTransfer { src, dst });
+        self.assign(dst, RValue::Load(src));
+        self.assign(src, RValue::Const(Constant::Nil));
+    }
+
     pub fn terminate(&mut self, term: Terminator) {
         let idx = self.current.0 as usize;
         self.blocks[idx].terminator = term;
@@ -557,6 +586,7 @@ impl FunctionBuilder {
             handler_tables: self.handler_tables,
             type_metadata,
             line_table: self.line_table,
+            ownership_transfers: self.ownership_transfers,
             placement: self.placement,
         }
     }
