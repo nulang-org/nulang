@@ -1325,3 +1325,165 @@ fn confirmed_goodbye_automatically_transitions_stream_leadership() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+
+#[test]
+fn automatic_failover_retries_until_survivor_confirms_removal() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addrs: Vec<SocketAddr> = [
+        "127.0.0.1:35201",
+        "127.0.0.1:35202",
+        "127.0.0.1:35203",
+    ]
+    .into_iter()
+    .map(|addr| addr.parse().unwrap())
+    .collect();
+    let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
+    let mut nodes: Vec<Runtime> = addrs
+        .iter()
+        .copied()
+        .map(|addr| runtime(addr, bus.clone()))
+        .collect();
+
+    for i in 0..nodes.len() {
+        for j in 0..nodes.len() {
+            if i == j {
+                continue;
+            }
+            nodes[i]
+                .distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(ids[j], addrs[j]);
+        }
+    }
+
+    let initial = nodes[0]
+        .fabric_stream_placement("auto-failover-retry", 0, 3)
+        .unwrap();
+    let old_leader = ids
+        .iter()
+        .position(|node| *node == initial.leader)
+        .unwrap();
+    let survivors: Vec<usize> = (0..3).filter(|index| *index != old_leader).collect();
+
+    let roots: Vec<PathBuf> = (0..3)
+        .map(|index| temp_dir(&format!("auto-failover-retry-{index}")))
+        .collect();
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+    nodes[old_leader]
+        .fabric_stream_create("auto-failover-retry", FabricStreamConfig::default())
+        .unwrap();
+    nodes[old_leader]
+        .fabric_stream_replicated_append("auto-failover-retry", 0, 3, b"stable")
+        .unwrap();
+
+    for index in &survivors {
+        nodes[*index].process_network();
+    }
+    nodes[old_leader].process_network();
+    nodes[old_leader].process_network();
+    for index in &survivors {
+        nodes[*index].process_network();
+        nodes[*index].process_network();
+    }
+
+    let scratch_local = survivors[0];
+    let mut scratch = Runtime::new();
+    scratch.distributed.enabled = true;
+    scratch.distributed.node_id = Some(ids[scratch_local]);
+    let mut scratch_cluster = ClusterState::new(ids[scratch_local], addrs[scratch_local]);
+    let scratch_peer = survivors[1];
+    scratch_cluster.handle_heartbeat(ids[scratch_peer], addrs[scratch_peer]);
+    scratch.distributed.cluster = Some(scratch_cluster);
+    let reduced = scratch
+        .fabric_stream_placement("auto-failover-retry", 0, 2)
+        .unwrap();
+    let candidate = survivors
+        .iter()
+        .copied()
+        .find(|index| ids[*index] == reduced.leader)
+        .unwrap();
+    let voter = survivors
+        .iter()
+        .copied()
+        .find(|index| *index != candidate)
+        .unwrap();
+
+    // Only the candidate confirms removal initially.
+    nodes[old_leader]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .send(
+            ids[candidate],
+            addrs[candidate],
+            Packet::NodeGoodbye {
+                node_id: ids[old_leader],
+                durable: Vec::new(),
+            },
+        );
+    nodes[candidate].process_network();
+
+    // The voter still sees the old 3-node membership, so the first prepare
+    // cannot validate the proposed RF=2 placement.
+    nodes[voter].process_network();
+    assert_eq!(
+        nodes[voter]
+            .fabric_stream_epoch("auto-failover-retry")
+            .unwrap(),
+        Some(1)
+    );
+
+    // Now the voter independently confirms the removal.
+    nodes[old_leader]
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .send(
+            ids[voter],
+            addrs[voter],
+            Packet::NodeGoodbye {
+                node_id: ids[old_leader],
+                durable: Vec::new(),
+            },
+        );
+    nodes[voter].process_network();
+
+    // No retry before the 500 ms logical-clock deadline.
+    nodes[candidate].advance_time(Duration::from_millis(499));
+    nodes[candidate].process_network();
+    nodes[voter].process_network();
+    assert_eq!(
+        nodes[candidate]
+            .fabric_stream_epoch("auto-failover-retry")
+            .unwrap(),
+        Some(1)
+    );
+
+    // At 500 ms the candidate re-sends the same durable proposal. The voter
+    // now has matching reduced membership and can promise/vote.
+    nodes[candidate].advance_time(Duration::from_millis(1));
+    nodes[candidate].process_network();
+    nodes[voter].process_network();
+    nodes[candidate].process_network();
+    nodes[voter].process_network();
+
+    for index in &survivors {
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_epoch("auto-failover-retry")
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
