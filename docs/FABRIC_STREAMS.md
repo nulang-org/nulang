@@ -288,3 +288,93 @@ catch-up and failover protocol.
 This ACK layer concerns **replica durability**, not consumer delivery. Consumer
 ACK/NACK, timed redelivery, dead-letter streams, and consumer groups remain
 separate future work.
+
+
+## Durable replication intent and restart recovery
+
+Fabric now persists a `replication.json` intent record for every leader
+sequence that requires replica quorum.
+
+The write ordering is deliberately:
+
+1. persist replication intent,
+2. fsync the leader's exact stream record,
+3. create the in-memory quorum ticket,
+4. dispatch replicas.
+
+That ordering closes the previous restart gap. A process can no longer leave a
+locally durable uncommitted sequence without enough metadata to reconstruct its
+replica set and quorum requirements.
+
+Each durable intent records:
+
+- partition,
+- leader NodeId,
+- membership fingerprint,
+- replication factor,
+- ordered replica set,
+- exact sequence.
+
+The payload itself is not duplicated in `replication.json`; recovery reads the
+already-checksummed stream record at the exact sequence.
+
+### Recovery rules
+
+`fabric_stream_recover_pending(stream)` reconciles durable intent with the
+stream log and committed boundary:
+
+- intent sequence <= committed boundary: remove stale intent,
+- intent at the next sequence with no durable record: treat it as a crash
+  between intent reservation and append, then remove the orphan reservation,
+- intent below the local tail with no matching record: fail closed as durable
+  corruption,
+- current leader / membership fingerprint / ordered replica set differs from
+  the persisted intent: fail closed rather than reinterpreting the write under
+  a new placement,
+- valid uncommitted record: rebuild the in-memory ticket with only the leader's
+  self-fsync ACK.
+
+Follower ACK history is intentionally not reconstructed. The leader cannot
+prove which followers persisted a sequence before the crash, so recovery
+forgets those ACKs and retries safely.
+
+### Retry
+
+`fabric_stream_retry_pending(stream, partition)` reconstructs durable tickets
+first and then redispatches every pending exact sequence to the current persisted
+replica set.
+
+Retry may resend to a follower that already has the record. Exact-sequence
+replica application makes that safe and idempotent; the follower simply ACKs
+the identical record again.
+
+The retry report exposes:
+
+- pending sequence count,
+- intended remote sends,
+- dispatched sends,
+- currently unavailable replicas.
+
+If an application ACK arrives immediately after leader restart before the user
+explicitly invokes recovery, the ACK path reconstructs the matching durable
+ticket against the active `ClusterState` before evaluating it.
+
+### Commit cleanup ordering
+
+When quorum advances:
+
+1. persist the committed sequence,
+2. remove the matching durable replication intent,
+3. retire the in-memory ticket.
+
+A crash after step 1 but before step 2 is harmless: recovery sees that the
+intent is already at or below the durable committed boundary and removes it.
+
+### Remaining recovery work
+
+This layer recovers **uncommitted leader tail**. It does not yet repair a
+replica that missed a record already committed by a majority. That requires
+per-replica progress / catch-up state and committed-index propagation.
+
+Automatic timer-based retry is also intentionally deferred; retry is currently
+explicit so failure/recovery semantics can stabilize before adding scheduling.
