@@ -190,14 +190,16 @@ semantics that later cluster and stream layers can reuse.
 
 ### Phase 3 — durable streams
 
-- [ ] Append-only segmented log.
+- [x] File-backed append-only segmented log.
 - [ ] Partition ownership and replication.
-- [ ] Durable consumer cursors.
+- [x] Durable monotonic consumer cursors.
 - [ ] ACK/NACK and redelivery.
-- [ ] Replay and seek by sequence/time.
+- [x] Replay by sequence and committed consumer cursor.
+- [ ] Seek by time.
 - [ ] Retention policies.
 - [ ] Dead-letter streams.
 - [ ] Deduplication/idempotency keys.
+- [x] Per-record checksums and torn-tail recovery.
 
 ### Phase 4 — distributed state and coordination
 
