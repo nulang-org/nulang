@@ -1,0 +1,14 @@
+// Moving x on only one branch does not satisfy must-use on every path, and
+// it also means x may be unavailable after the join. A later read must be
+// rejected rather than observing the runtime-cleared source slot.
+fn main() {
+    let x = 42 :cap lineariso
+    let r = if true then {
+        let a = x
+        1
+    } else {
+        2
+    }
+    let b = x
+    perform IO.print(r)
+}
