@@ -52,6 +52,190 @@ two major versions.*
   package's declared authority instead of silently compiling without those
   grants.
 
+### Fabric confirmed-removal automatic failover — 2026-09-18
+- **Automatic ownership transition after confirmed leader removal**
+  (Experimental, `src/runtime/fabric_stream_epoch.rs`,
+  `src/runtime/distribution.rs`). Confirmed removed nodes are queued until
+  Runtime regains cluster/transport ownership, then durable stream policies are
+  scanned. A stream transitions automatically only when surviving old replicas
+  still satisfy the old majority, reduced placement contains exactly those old
+  survivors, and the local node is the deterministic candidate. Insufficient
+  quorum or placement requiring a new replica fails closed. Candidate prepare
+  traffic retries on the logical clock at 500ms/1s/2s/... up to 30s so
+  staggered removal confirmation cannot strand an otherwise safe transition.
+  Deterministic tests cover positive-goodbye automatic RF3->RF2 failover and
+  delayed peer removal followed by retry.
+
+### Fabric stable installed placement — 2026-09-18
+- **Durable policy is authoritative after stream bootstrap** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`). Established stream append, retry,
+  crash recovery, application ACK validation, committed catch-up, replica
+  application and commit propagation now derive leader/replica/fingerprint
+  state from the installed `replication_policy.json` rather than recomputing
+  rendezvous over the entire current cluster. Unrelated node joins and rejoins
+  therefore cannot implicitly rebalance a live stream or invalidate current
+  quorum traffic; membership still controls reachability and explicit epoch
+  transitions remain the only ownership-change path. Epoch-1 follower bootstrap
+  continues to use current rendezvous when no local policy exists, leaving a
+  documented first-contact race for a future explicit policy-bootstrap message.
+
+### Fabric automatic failover reconciliation — 2026-09-18
+- **Bounded push/pull repair during confirmed-removal failover** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`). The automatic failover logical-clock
+  scheduler now inspects durable transition votes before retrying prepare: it
+  pushes a proposal-scoped suffix to lagging proposed replicas, pulls from an
+  ahead survivor when the deterministic candidate is behind, and starts a
+  strictly higher term after a pull changes the proposal-bound candidate tail.
+  Each retry performs at most one 256-record reconciliation action and retains
+  the existing 500ms -> 1s -> 2s exponential backoff capped at 30s.
+  Deterministic coverage verifies both candidate-ahead and candidate-behind
+  failover complete without manual repair API calls.
+
+### Fabric epoch candidate reconciliation — 2026-09-18
+- **Proposal-scoped pull from an ahead surviving replica** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/distributed.rs`).
+  A prospective leader that is behind another proposed survivor can now request
+  a bounded exact durable suffix under the active proposal. The source validates
+  old policy, proposed placement, requester identity and promise fencing; the
+  candidate validates the recorded rejected-vote tail and exact next sequence
+  before appending. Because pulling changes the proposal-bound candidate tail,
+  the old proposal is never finalized: the caller starts a strictly higher
+  election term whose hash binds the reconciled tail. Deterministic coverage
+  exercises installed epoch 1 -> rejected term 2 -> pull sequence 2 -> successful
+  term 3 RF=2 transition.
+
+### Fabric epoch voter repair — 2026-09-18
+- **Proposal-scoped repair for lagging transition voters** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/distributed.rs`).
+  A prospective leader can now send a bounded exact suffix to a rejected
+  new-policy voter whose durable tail is behind the proposal tail, without
+  reopening normal traffic from the fenced old epoch. Repair batches validate
+  the active proposal and old durable policy, are idempotent across duplicate
+  delivery, append only the missing exact-sequence suffix, and immediately
+  re-evaluate/send the voter's proposal vote. Multi-round repair advances via
+  updated rejected-tail votes. Replicas ahead of the candidate are reported but
+  left untouched pending a separate pull/reconciliation protocol.
+
+### Fabric quorum-backed epoch transition — 2026-09-18
+- **Durable prepare/vote/commit ownership transition** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/fabric_stream.rs`,
+  `src/runtime/distributed.rs`). Existing replicas can now move a stream from
+  epoch N to N+1 after an old-policy majority fsyncs a single-proposal promise.
+  A higher promise immediately fences normal traffic from the old epoch.
+  Affirmative voters must hold the candidate's exact durable tail, every new
+  replica must be an affirmative old-policy voter, and finalization promotes
+  that majority-shared tail to the new committed boundary. Finalized transition
+  state is restart-resumable, old pending tickets are retired, and prepare,
+  vote, and commit messages reuse reserved NUL0-v1 ActorMessage behaviors.
+  Higher election terms may supersede an abandoned lower proposal without
+  requiring the old durable policy to advance first, preventing a stale vote
+  from permanently wedging the stream. The first version supports
+  shrink/leadership transition within the old replica set (for example RF3 ->
+  RF2 after confirmed loss); adding a replacement replica and automatic
+  failover remain follow-up work.
+
+### Fabric stream epoch fencing — 2026-09-18
+- **Durable replication policy + epoch-1 fencing** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`,
+  `src/runtime/distributed.rs`). Replicated streams now atomically persist
+  leader, ordered replica set, replication factor, membership fingerprint and a
+  non-zero epoch before the first replicated append. Pending intents, replica
+  appends, application ACK/NACKs, quorum tickets and commit updates carry the
+  epoch and must match both current deterministic placement and durable policy.
+  Existing durable history without policy fails closed instead of inferring
+  ownership from current membership. Additive wire fields default to epoch 1
+  for compatibility with the preceding experimental stack; epoch 0 is rejected.
+  No epoch transition or automatic failover is enabled yet.
+
+### Fabric automatic quorum retry — 2026-09-18
+- **Logical-clock pending replication retry** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distribution.rs`).
+  Pending uncommitted stream sequences now retry from the runtime network loop
+  after 500 ms, then with exponential 1s/2s/4s backoff capped at 30 seconds.
+  Scheduling uses `Runtime::now()`, preserving virtual-clock determinism in
+  DST. Retries reuse exact-sequence idempotent replica application and never
+  count transport dispatch as quorum durability. Commit removes the associated
+  retry schedule immediately; recovered durable intents install an immediate
+  schedule after ticket reconstruction. Majority-committed lagging-replica
+  repair remains separately bounded by the catch-up API.
+
+### Fabric committed-replica catch-up — 2026-09-18
+- **Durable follower progress + committed-prefix repair** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`,
+  `src/runtime/distributed.rs`). Leaders now persist each follower's highest
+  application-ACKed sequence, can replay a bounded set of missing
+  quorum-committed records to a lagging replica, and propagate committed
+  visibility through a reserved NUL0-v1-compatible system ActorMessage.
+  Commit updates are sent only when durable ACK progress proves the follower
+  already stores the committed prefix; followers validate current placement
+  and local tail before advancing their own durable commit boundary. This
+  repairs replicas after partitions without introducing automatic leader
+  failover.
+
+### Fabric stream crash recovery — 2026-09-18
+- **Durable replication intent + explicit retry** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`).
+  Leaders now fsync a versioned replication intent before appending an
+  uncommitted replicated sequence. Restart recovery reconciles intent with the
+  committed boundary and exact local log, removes stale committed intents and
+  orphan pre-append reservations, reconstructs pending quorum tickets with the
+  leader self-ACK only, and fails closed if current placement differs from the
+  persisted leader/fingerprint/replica set. Explicit retry redispatches exact
+  pending sequences idempotently; an ACK arriving immediately after restart can
+  trigger ticket reconstruction automatically. Commit cleanup persists the
+  committed boundary before deleting intent, so crash ordering cannot promote
+  local durability to quorum durability.
+
+### Fabric stream quorum commit — 2026-09-17
+- **Application-level replica ACK/NACK and quorum visibility** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distributed.rs`,
+  `src/runtime/fabric_stream.rs`). Replicated appends now create leader-local
+  pending tickets, count the leader's fsynced append as the first ACK, and
+  require a majority of the configured replica set before advancing a durable
+  contiguous commit index. Followers send a reserved application ACK/NACK only
+  after exact-sequence durable application; transport ACKs are never counted as
+  quorum durability. The committed boundary is persisted atomically and powers
+  committed-only reads, while raw local reads may expose uncommitted tails.
+  Duplicate ACKs are idempotent and pending ACKs are fenced to the current
+  membership fingerprint. Pending tickets remain volatile across restart;
+  uncommitted durable tails stay uncommitted until future retry/catch-up work.
+
+### Fabric stream replica transport — 2026-09-17
+- **NUL0-v1-compatible Fabric stream replication transport** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distributed.rs`).
+  Leader-produced replica envelopes can now be dispatched through the existing
+  `Packet::ActorMessage` shape using reserved system actor 0 plus an internal
+  behavior name; no packet discriminant or wire-version change is required.
+  Receivers verify transport sender identity, envelope leader, placement, and
+  exact-sequence durable application before accepting data. Duplicate network
+  retry remains idempotent. Dispatch reporting distinguishes reachable sends
+  from unavailable replicas. Transport ACKs are explicitly not treated as
+  replica fsync/quorum ACKs; application-level quorum commit remains follow-up.
+
+### Fabric stream replica placement — 2026-09-17
+- **Deterministic Fabric stream ownership** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/fabric_stream.rs`).
+  Adds rendezvous-hash replica placement over the stable known-membership set,
+  exact-sequence idempotent replica application, leader-produced replica
+  envelopes, and stale-membership/leader/configuration rejection. Failed and
+  suspicious nodes remain in placement until confirmed removed so transient
+  partitions cannot silently elect a second writer. The current physical store
+  remains partition 0 only; remote transport, quorum ACKs, automatic failover,
+  and physical multi-partition logs remain follow-up work.
+
+### Fabric durable stream storage — 2026-09-17
+- **File-backed Fabric stream log** (Experimental, `src/runtime/fabric_stream.rs`).
+  Adds a dedicated append-only segmented log for Fabric Streams rather than
+  overloading actor journals. Records receive monotonic sequence numbers and a
+  BLAKE3 integrity checksum; successful appends flush and `sync_data` before
+  acknowledgement. Stream recovery verifies segment continuity/checksums and
+  truncates only an incomplete final frame after a torn write. Persisted
+  consumer cursors are monotonic, atomically replaced, and support replay from
+  the first uncommitted sequence. New Runtime APIs open/create streams,
+  append/read records, inspect stream metadata, and commit/read consumer
+  cursors. Distributed replication, retention, ACK/NACK redelivery, DLQs, and
+  deduplication remain follow-up work.
+
 ### Runtime backend parity — 2026-09-17
 - **WASM guest-heap negation error parity** (`src/wasm_runtime.rs`,
   `src/mir_wasm.rs`): unary negation of a guest heap value now reports the
