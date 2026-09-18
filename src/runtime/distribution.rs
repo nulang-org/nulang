@@ -413,6 +413,7 @@ pub(crate) fn process_network(rt: &mut Runtime) {
             );
         }
     }
+    rt.fabric_stream_tick_auto_failover();
 
     // Retry pending durable stream replication only after packet processing
     // and cluster actions have restored the runtime-owned distribution state.
