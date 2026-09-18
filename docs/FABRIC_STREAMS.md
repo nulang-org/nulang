@@ -506,17 +506,29 @@ The policy records:
 - replication factor,
 - ordered replica set.
 
-The current cluster membership still computes a deterministic placement, but
-that placement is no longer treated as authority by itself. Stream operations
-must satisfy both conditions:
+Once established, the durable policy is the authority for the normal stream
+data plane. Append, retry, recovery, replica ACK validation, committed catch-up,
+replica application, and committed-index propagation use the policy's exact:
 
-1. current deterministic placement matches the operation,
-2. that placement exactly matches the durable policy for the supplied epoch.
+- epoch,
+- leader,
+- ordered replica set,
+- replication factor,
+- membership fingerprint.
 
-If membership changes such that deterministic placement differs from the
-persisted policy, append, retry, ACK handling, catch-up, and commit propagation
-fail closed. This prevents confirmed membership change from silently creating a
-new stream leader before an explicit epoch transition protocol exists.
+Current cluster-wide rendezvous placement is **not** recomputed for those
+operations. Consequently, an unrelated node joining the cluster, a previously
+excluded node rejoining, or other membership growth cannot implicitly rebalance
+an established stream or invalidate otherwise-current ACK/commit traffic.
+
+Current cluster membership still matters for **reachability**: an installed
+replica that is unavailable cannot be dispatched to and quorum may therefore be
+unavailable. Changing stream ownership or replica membership, however, requires
+an explicit higher-term transition that installs a new durable policy.
+
+Rendezvous over current membership is now a candidate-selection mechanism used
+for first epoch-1 bootstrap and explicit reconfiguration/failover, not the
+ongoing source of truth for an already-established stream.
 
 ### Epoch-carrying protocol
 
@@ -534,9 +546,19 @@ compatibility with the immediately preceding experimental stream stack. Epoch 0
 is always invalid.
 
 A follower may bootstrap a missing policy only for epoch 1 and only when the
-local stream has no durable history. A stream with existing records but no
-policy is rejected and requires explicit migration; ownership is never inferred
-retroactively from today's membership.
+local stream has no durable history. During that first bootstrap only, the
+follower still computes current rendezvous placement to authenticate the
+incoming leader/replica assignment. After policy establishment, membership
+growth no longer changes the active placement.
+
+This leaves one deliberate bootstrap race: a never-bootstrapped follower can
+reject its first replica append if cluster membership changes between leader
+policy creation and that follower's first policy establishment. A future policy
+bootstrap message should carry the complete ordered replica policy so first
+contact does not depend on the follower's contemporaneous global membership.
+
+A stream with existing records but no policy is rejected and requires explicit
+migration; ownership is never inferred retroactively from today's membership.
 
 ### Stale traffic fencing
 
@@ -562,8 +584,9 @@ protocol exists.
 
 ## Quorum-backed epoch transition
 
-Fabric now has an explicit transition protocol for moving a stream from epoch
-`N` to `N+1` without allowing the old epoch to continue forming commits.
+Fabric now has an explicit transition protocol for moving a stream from an
+installed epoch to a strictly higher election term without allowing the old
+epoch to continue forming commits.
 
 The public entry points are:
 
