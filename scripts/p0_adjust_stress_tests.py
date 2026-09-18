@@ -171,4 +171,20 @@ replace_once(
     "ping pong handler",
 )
 
+
+replace_once(
+    """        let id = rt.spawn_actor(Box::new(move || {
+            vec![("name".into(), Value::int(1700 + i as i64))]
+        }));
+        actors.push(id);
+""",
+    """        let id = rt.spawn_actor(Box::new(move || {
+            vec![("name".into(), Value::int(1700 + i as i64))]
+        }));
+        p0_register_noop(&mut rt, id, "__p0_numeric_noop");
+        actors.push(id);
+""",
+    "GC cycle-detector numeric handler",
+)
+
 path.write_text(text)
