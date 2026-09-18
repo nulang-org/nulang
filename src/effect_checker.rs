@@ -471,6 +471,17 @@ impl EffectContext {
 /// Stateful effect checker.
 ///
 /// Accumulates error messages so that multiple violations can be reported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionEffectReport {
+    pub name: String,
+    /// Transitive effect row after module-level call propagation reaches its
+    /// fixed point.
+    pub row: EffectRow,
+    /// True when the function explicitly declared an effect row; false when
+    /// the row was inferred.
+    pub declared: bool,
+}
+
 pub struct EffectChecker {
     /// Accumulated diagnostics (errors + warnings).
     pub diagnostics: Vec<String>,
@@ -493,6 +504,30 @@ pub struct EffectChecker {
 }
 
 impl EffectChecker {
+    /// Produce a stable, name-sorted report of module-level function effect
+    /// rows. Call `check_module` first so `fn_rows` contains the fixed-point
+    /// transitive rows used at call sites.
+    pub fn function_effect_report(&self, decls: &[Decl]) -> Vec<FunctionEffectReport> {
+        let flat = flatten_decls(decls);
+        let mut report: Vec<FunctionEffectReport> = flat
+            .into_iter()
+            .filter_map(|decl| match decl {
+                Decl::Function {
+                    name,
+                    effect,
+                    ..
+                } => self.fn_rows.get(name).cloned().map(|row| FunctionEffectReport {
+                    name: name.clone(),
+                    row,
+                    declared: effect.is_some(),
+                }),
+                _ => None,
+            })
+            .collect();
+        report.sort_by(|a, b| a.name.cmp(&b.name));
+        report
+    }
+
     /// Look up the inferred effect row of a module-level function.
     pub fn function_row(&self, name: &str) -> Option<&EffectRow> {
         self.fn_rows.get(name)
@@ -2889,6 +2924,46 @@ mod tests {
     // -----------------------------------------------------------------------
     // Effect row operation tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_function_effect_report_is_sorted_transitive_and_marks_declared_rows() {
+        let src = r#"
+fn leaf() ! { IO } {
+    perform IO.print(1)
+}
+fn caller() {
+    leaf()
+}
+fn declared() ! { IO } {
+    caller()
+}
+"#;
+        let mut lexer = crate::lexer::Lexer::new(src);
+        let tokens = lexer.lex().expect("lex");
+        let mut parser = crate::parser::Parser::new(tokens);
+        let ast = parser.parse_module().expect("parse");
+
+        let mut checker = EffectChecker::new();
+        checker.check_module(&ast.decls).expect("effect check");
+        let report = checker.function_effect_report(&ast.decls);
+
+        assert_eq!(
+            report.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["caller", "declared", "leaf"]
+        );
+
+        let caller = report.iter().find(|r| r.name == "caller").unwrap();
+        assert!(
+            caller.row.effects().contains(&Effect::IO),
+            "caller must include transitive IO from leaf: {}",
+            caller.row
+        );
+        assert!(!caller.declared);
+
+        let declared = report.iter().find(|r| r.name == "declared").unwrap();
+        assert!(declared.declared);
+        assert!(declared.row.effects().contains(&Effect::IO));
+    }
 
     #[test]
     fn test_effect_row_subset_closed() {
