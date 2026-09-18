@@ -43,6 +43,48 @@ helper = """    /// Return whether `behavior_id` names a real native or bytecode
 if "fn actor_has_behavior_id(&self" in runtime:
     raise SystemExit("actor_has_behavior_id already present")
 runtime = replace_once(runtime, anchor, helper + anchor, "behavior helper anchor")
+runtime = replace_once(
+    runtime,
+    """    fn deliver_local_message(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+        out_trace: Option<String>,
+    ) {
+        let msg = Message {
+""",
+    """    fn deliver_local_message(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+        out_trace: Option<String>,
+    ) {
+        if self.actors.contains_key(&target_id)
+            && !self.actor_has_behavior_id(target_id, behavior_id)
+        {
+            warn!(
+                "nulang-runtime: rejecting message to actor {}: unknown behavior id {}",
+                target_id, behavior_id
+            );
+            self.route_to_dlq(
+                &Message {
+                    behavior_id,
+                    payload: Arc::new(args.to_vec()),
+                    sender: self.current_actor.unwrap_or(0),
+                    priority: MessagePriority::System,
+                    trace_id: out_trace.clone(),
+                },
+                "unknown behavior id",
+            );
+            return;
+        }
+        let msg = Message {
+""",
+    "local numeric delivery guard",
+)
+
 runtime_path.write_text(runtime)
 
 
@@ -160,6 +202,64 @@ fn p0_unknown_numeric_ask_is_rejected_without_running_behavior_zero() {
             .and_then(|v| v.as_int()),
         Some(0),
         "invalid numeric ask must not execute behavior 0"
+    );
+
+    rt.ask_actor_sync(actor_id, 0, &[])
+        .expect("declared numeric behavior 0 must remain valid");
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1),
+        "declared behavior 0 must execute normally"
+    );
+}
+
+#[test]
+fn p0_unknown_numeric_send_is_rejected_without_running_behavior_zero() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let n = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(n + 1));
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", increment);
+
+    rt.send_message_by_id(actor_id, u16::MAX, &[]);
+    assert!(
+        rt.actors.get(&actor_id).unwrap().mailbox.is_empty(),
+        "invalid numeric send must be rejected before mailbox admission"
+    );
+    rt.run_scheduler();
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(0),
+        "invalid numeric send must not execute behavior 0"
+    );
+
+    rt.send_message_by_id(actor_id, 0, &[]);
+    rt.run_scheduler();
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1),
+        "real numeric behavior 0 must remain valid"
     );
 }
 '''
@@ -424,6 +524,24 @@ resolution = r'''
                 return;
             }
         };
+
+        if !self.actor_has_behavior_id(target_id, behavior_id) {
+            warn!(
+                "nulang-shard: rejecting message to actor {}: unknown behavior id {}",
+                target_id, behavior_id
+            );
+            self.route_to_dlq(
+                &Message {
+                    behavior_id,
+                    payload: Arc::new(Vec::new()),
+                    sender,
+                    priority: MessagePriority::System,
+                    trace_id: None,
+                },
+                "unknown behavior id (cross-shard)",
+            );
+            return;
+        }
 
 '''
 runtime = replace_once(
