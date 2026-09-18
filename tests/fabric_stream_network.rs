@@ -808,18 +808,13 @@ fn quorum_epoch_transition_fences_removed_old_leader() {
     }
 }
 
-
 #[test]
 fn epoch_repair_brings_lagging_survivor_to_proposal_tail() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-    let addrs: Vec<SocketAddr> = [
-        "127.0.0.1:34901",
-        "127.0.0.1:34902",
-        "127.0.0.1:34903",
-    ]
-    .into_iter()
-    .map(|addr| addr.parse().unwrap())
-    .collect();
+    let addrs: Vec<SocketAddr> = ["127.0.0.1:34901", "127.0.0.1:34902", "127.0.0.1:34903"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
     let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
     let mut nodes: Vec<Runtime> = addrs
         .iter()
@@ -844,10 +839,7 @@ fn epoch_repair_brings_lagging_survivor_to_proposal_tail() {
     let initial = nodes[0]
         .fabric_stream_placement("epoch-repair", 0, 3)
         .unwrap();
-    let old_leader = ids
-        .iter()
-        .position(|node| *node == initial.leader)
-        .unwrap();
+    let old_leader = ids.iter().position(|node| *node == initial.leader).unwrap();
     let survivors: Vec<usize> = (0..3).filter(|index| *index != old_leader).collect();
 
     // Determine which survivor will be the RF=2 leader after the old leader is
