@@ -2681,7 +2681,7 @@ fn walk_hir_operand(op: &hir::Operand, acc: &mut HashSet<String>) {
 
 fn walk_hir_rvalue(rv: &hir::RValue, acc: &mut HashSet<String>) {
     match rv {
-        hir::RValue::Use(op) => walk_hir_operand(op, acc),
+        hir::RValue::Use(op) | hir::RValue::MoveOut(op) => walk_hir_operand(op, acc),
         hir::RValue::Literal(_, _) | hir::RValue::SelfRef(_) | hir::RValue::Panic(_) => {}
         hir::RValue::Block(body) => walk_hir_body(body, acc),
         hir::RValue::Binary(_, l, r, _) => {
@@ -2921,6 +2921,59 @@ mod tests {
         assert_eq!(
             f.locals[p.0 as usize].cap,
             crate::types::Capability::LinearIso
+        );
+    }
+
+    #[test]
+    fn test_moveout_survives_hir_to_mir_lowering() {
+        let span = Span::default();
+        let hir = hir::Module {
+            name: "test".to_string(),
+            decls: vec![hir::Decl::Function(hir::FunctionDef {
+                name: "take".to_string(),
+                type_params: vec![],
+                params: vec![("x".to_string(), Type::int())],
+                param_caps: vec![crate::types::Capability::Ref],
+                dict_params: vec![],
+                ret: Type::int(),
+                effect: crate::types::EffectRow::empty(),
+                cap: crate::types::Capability::Ref,
+                body: hir::Body {
+                    stmts: vec![hir::Stmt::Let {
+                        name: "moved".to_string(),
+                        ty: Type::int(),
+                        value: hir::RValue::MoveOut(hir::Operand::Var(
+                            "x".to_string(),
+                            Type::int(),
+                        )),
+                        span,
+                    }],
+                    terminator: hir::Terminator::FnReturn(Some(hir::Operand::Var(
+                        "moved".to_string(),
+                        Type::int(),
+                    ))),
+                },
+                public: false,
+                placement: None,
+                span,
+            })],
+        };
+
+        let mir = lower_module(&hir).expect("lower MoveOut");
+        let f = &mir.functions[0];
+        let source = f.params[0];
+        assert!(
+            f.blocks.iter().flat_map(|b| &b.stmts).any(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::MoveOut(src),
+                        ..
+                    } if *src == source
+                )
+            }),
+            "ownership transfer must remain explicit in MIR: {:?}",
+            f.blocks
         );
     }
 
