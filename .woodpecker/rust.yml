@@ -1,0 +1,29 @@
+labels:
+  platform: linux/amd64
+  pool: bootstrap-ci
+
+when:
+  - event: pull_request
+    branch: main
+  - event: push
+    branch:
+      - main
+      - fix/p0-fail-closed-unknown-behavior-main
+
+steps:
+  - name: rust-validation
+    image: rust:1.95-bookworm
+    commands:
+      - set -eux
+      - echo "validating commit $(git rev-parse HEAD)"
+      - test -z "${CI_COMMIT_SHA:-}" || test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA"
+      - apt-get update
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev pkg-config
+      - rustup component add rustfmt clippy
+      - cargo fmt --all -- --check
+      - cargo check --all-targets --no-default-features
+      - cargo check --all-targets
+      - cargo clippy --all-targets --no-default-features -- -D clippy::correctness
+      - cargo test --no-default-features
+      - cargo test
+      - git diff --check
