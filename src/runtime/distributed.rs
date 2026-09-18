@@ -1865,13 +1865,14 @@ pub fn process_network_packets(
                     match object_table.as_slice() {
                         [(0, bytes)] => FabricStreamEpochPullResponse::from_wire_bytes(bytes)
                             .and_then(|response| {
-                                runtime
-                                    .fabric_stream_apply_epoch_pull_response(
-                                        &response,
-                                        incoming.from_node,
-                                        cluster,
-                                    )
-                                    .map(|_| ())
+                                let stream = response.stream.clone();
+                                runtime.fabric_stream_apply_epoch_pull_response(
+                                    &response,
+                                    incoming.from_node,
+                                    cluster,
+                                )?;
+                                runtime.fabric_stream_wake_auto_failover(&stream);
+                                Ok(())
                             }),
                         _ => Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -1979,11 +1980,16 @@ pub fn process_network_packets(
                     match object_table.as_slice() {
                         [(0, bytes)] => FabricStreamEpochVote::from_wire_bytes(bytes)
                             .and_then(|vote| {
+                                let wake_reconcile = !vote.vote.accepted;
+                                let stream = vote.stream.clone();
                                 let outcome = runtime
                                     .fabric_stream_record_epoch_vote_from_cluster(
                                         vote,
                                         incoming.from_node,
                                     )?;
+                                if wake_reconcile && outcome.commit.is_none() {
+                                    runtime.fabric_stream_wake_auto_failover(&stream);
+                                }
                                 if let Some(commit) = outcome.commit {
                                     let commit_bytes = commit.to_wire_bytes()?;
                                     let local = runtime.distributed.node_id.ok_or_else(|| {
