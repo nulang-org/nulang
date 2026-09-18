@@ -45,6 +45,19 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric stream epoch fencing — 2026-09-18
+- **Durable replication policy + epoch-1 fencing** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`,
+  `src/runtime/distributed.rs`). Replicated streams now atomically persist
+  leader, ordered replica set, replication factor, membership fingerprint and a
+  non-zero epoch before the first replicated append. Pending intents, replica
+  appends, application ACK/NACKs, quorum tickets and commit updates carry the
+  epoch and must match both current deterministic placement and durable policy.
+  Existing durable history without policy fails closed instead of inferring
+  ownership from current membership. Additive wire fields default to epoch 1
+  for compatibility with the preceding experimental stack; epoch 0 is rejected.
+  No epoch transition or automatic failover is enabled yet.
+
 ### Fabric automatic quorum retry — 2026-09-18
 - **Logical-clock pending replication retry** (Experimental,
   `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distribution.rs`).
