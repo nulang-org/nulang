@@ -389,6 +389,7 @@ impl ModuleCtx {
 fn lower_function_def(ctx: &mut ModuleCtx, f: &hir::FunctionDef) -> NuResult<mir::Function> {
     let mut lowerer = FnLowerer::new(ctx, &f.name, Some(f.ret.clone()));
     lowerer.b.set_placement(f.placement);
+    lowerer.b.set_public(f.public);
     if f.params.len() != f.param_caps.len() {
         return Err(compile_err(
             format!(
@@ -2889,6 +2890,31 @@ mod tests {
             .unwrap_or_else(|| panic!("function '{}' not lowered", name))
     }
 
+    #[test]
+    fn test_mir_preserves_public_function_visibility() {
+        let src = "pub fn exposed(x: Int) -> Int { x }\nfn internal(x: Int) -> Int { x }";
+        let mut lexer = crate::lexer::Lexer::new(src);
+        let tokens = lexer.lex().expect("lex");
+        let mut parser = crate::parser::Parser::new(tokens);
+        let ast = parser.parse_module().expect("parse");
+        let mut checker = crate::typechecker::TypeChecker::new();
+        checker.check_module(&ast).expect("typecheck");
+        let hir = crate::hir_lower::lower_module(&ast, &checker.inferred_decl_types);
+        let mir = lower_module(&hir).expect("mir lower");
+
+        let exposed = mir
+            .functions
+            .iter()
+            .find(|f| f.name == "exposed")
+            .expect("exposed function");
+        let internal = mir
+            .functions
+            .iter()
+            .find(|f| f.name == "internal")
+            .expect("internal function");
+        assert!(exposed.public);
+        assert!(!internal.public);
+    }
     #[test]
     fn test_mir_preserves_function_parameter_capability() {
         let hir = hir::Module {

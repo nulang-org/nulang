@@ -16,7 +16,7 @@
 
 use crate::bytecode::Constant;
 use crate::mir::{self, LocalId};
-use crate::types::{PrimitiveType, Type};
+use crate::types::{Capability, PrimitiveType, Type};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Infer safe last-use ownership transfers in every function and behavior.
@@ -308,6 +308,494 @@ fn rvalue_reads(rv: &mir::RValue, out: &mut Vec<LocalId>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ownership-aware direct-call candidate analysis
+// ---------------------------------------------------------------------------
+
+/// Why a parameter cannot yet become an owned call parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOwnershipBlocker {
+    PublicFunction,
+    Entrypoint,
+    DynamicCallable,
+    NoDirectCallers,
+    NonLinearParameter,
+    UntransferableCallArgument,
+}
+
+/// Evidence available for one direct-call argument at the current MIR stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgTransferEvidence {
+    /// Single-use compiler temporary with a counted owning definition.
+    OwnedTemporary,
+    /// Exactly-once parameter used only at this call. This becomes transferable
+    /// only if the caller itself eventually receives that parameter as owned.
+    LinearForward,
+    NotTransferable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamOwnershipDependency {
+    pub function_idx: usize,
+    pub param_idx: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamOwnershipCandidate {
+    pub param: LocalId,
+    pub cap: Capability,
+    pub candidate_owned: bool,
+    pub requires_upstream_owned_param: bool,
+    pub dependencies: Vec<ParamOwnershipDependency>,
+    pub blockers: Vec<CallOwnershipBlocker>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnOwnershipCandidate {
+    BorrowedOrImmediate,
+    /// Every value-return path returns a locally-created counted owner.
+    OwnedLocal,
+    /// Every value-return path returns an exactly-once parameter. Activation
+    /// requires that parameter to be promoted to owned first.
+    OwnedFromLinearParam,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionOwnershipCandidate {
+    pub function_idx: usize,
+    pub name: String,
+    pub direct_call_sites: usize,
+    pub public: bool,
+    pub dynamic_callable: bool,
+    pub params: Vec<ParamOwnershipCandidate>,
+    pub return_ownership: ReturnOwnershipCandidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFunctionOwnership {
+    pub function_idx: usize,
+    pub name: String,
+    pub owned_params: Vec<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CallerRef {
+    Function(usize),
+    Behavior(usize),
+}
+
+#[derive(Debug, Clone)]
+struct DirectCallSite {
+    caller: CallerRef,
+    args: Vec<LocalId>,
+}
+
+#[derive(Debug, Clone)]
+struct CallLocalFacts {
+    def_count: Vec<usize>,
+    owning_def: Vec<bool>,
+    use_count: Vec<usize>,
+}
+
+/// Analyze which direct-call ownership contracts are locally plausible.
+///
+/// This is intentionally diagnostic metadata only. It does not alter MIR,
+/// bytecode, parameter Drop roots, or the VM calling convention.
+pub fn analyze_call_ownership(module: &mir::Module) -> Vec<FunctionOwnershipCandidate> {
+    let mut call_sites: Vec<Vec<DirectCallSite>> =
+        (0..module.functions.len()).map(|_| Vec::new()).collect();
+    let mut dynamic_callable = vec![false; module.functions.len()];
+
+    for (idx, func) in module.functions.iter().enumerate() {
+        collect_function_calls(
+            func,
+            CallerRef::Function(idx),
+            &mut call_sites,
+            &mut dynamic_callable,
+        );
+    }
+    for (idx, func) in module.behaviors.iter().enumerate() {
+        collect_function_calls(
+            func,
+            CallerRef::Behavior(idx),
+            &mut call_sites,
+            &mut dynamic_callable,
+        );
+    }
+
+    let function_facts: Vec<CallLocalFacts> =
+        module.functions.iter().map(call_local_facts).collect();
+    let behavior_facts: Vec<CallLocalFacts> =
+        module.behaviors.iter().map(call_local_facts).collect();
+
+    module
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(idx, func)| {
+            let sites = &call_sites[idx];
+            let function_blockers =
+                function_level_blockers(func, dynamic_callable[idx], sites.len());
+            let params = func
+                .params
+                .iter()
+                .enumerate()
+                .map(|(param_idx, param)| {
+                    let cap = func.locals[param.0 as usize].cap;
+                    let mut blockers = function_blockers.clone();
+                    let linear = matches!(cap, Capability::LinearIso | Capability::Linear);
+                    if !linear {
+                        blockers.push(CallOwnershipBlocker::NonLinearParameter);
+                    }
+
+                    let mut dependencies = Vec::new();
+                    if linear {
+                        for site in sites {
+                            let Some(arg) = site.args.get(param_idx).copied() else {
+                                blockers.push(CallOwnershipBlocker::UntransferableCallArgument);
+                                continue;
+                            };
+                            match site.caller {
+                                CallerRef::Function(caller_idx) => {
+                                    match arg_transfer_evidence(
+                                        &module.functions[caller_idx],
+                                        &function_facts[caller_idx],
+                                        arg,
+                                    ) {
+                                        ArgTransferEvidence::OwnedTemporary => {}
+                                        ArgTransferEvidence::LinearForward => {
+                                            let caller = &module.functions[caller_idx];
+                                            if let Some(caller_param_idx) =
+                                                caller.params.iter().position(|p| *p == arg)
+                                            {
+                                                dependencies.push(ParamOwnershipDependency {
+                                                    function_idx: caller_idx,
+                                                    param_idx: caller_param_idx,
+                                                });
+                                            } else {
+                                                blockers.push(
+                                                    CallOwnershipBlocker::UntransferableCallArgument,
+                                                );
+                                            }
+                                        }
+                                        ArgTransferEvidence::NotTransferable => blockers.push(
+                                            CallOwnershipBlocker::UntransferableCallArgument,
+                                        ),
+                                    }
+                                }
+                                CallerRef::Behavior(caller_idx) => {
+                                    match arg_transfer_evidence(
+                                        &module.behaviors[caller_idx],
+                                        &behavior_facts[caller_idx],
+                                        arg,
+                                    ) {
+                                        ArgTransferEvidence::OwnedTemporary => {}
+                                        ArgTransferEvidence::LinearForward
+                                        | ArgTransferEvidence::NotTransferable => blockers.push(
+                                            CallOwnershipBlocker::UntransferableCallArgument,
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    blockers.sort_by_key(|b| *b as u8);
+                    blockers.dedup();
+                    dependencies.sort_by_key(|d| (d.function_idx, d.param_idx));
+                    dependencies.dedup();
+
+                    ParamOwnershipCandidate {
+                        param: *param,
+                        cap,
+                        candidate_owned: blockers.is_empty(),
+                        requires_upstream_owned_param: !dependencies.is_empty(),
+                        dependencies,
+                        blockers,
+                    }
+                })
+                .collect();
+
+            FunctionOwnershipCandidate {
+                function_idx: idx,
+                name: func.name.clone(),
+                direct_call_sites: sites.len(),
+                public: func.public,
+                dynamic_callable: dynamic_callable[idx],
+                params,
+                return_ownership: analyze_return_candidate(func, &function_facts[idx]),
+            }
+        })
+        .collect()
+}
+
+/// Resolve locally-valid parameter candidates through their forwarding
+/// dependencies. Starting from all candidates and pruning invalid
+/// dependencies computes the greatest fixed point, so mutually-recursive
+/// internal components remain eligible when every incoming edge satisfies
+/// the same ownership contract.
+pub fn resolve_call_ownership(module: &mir::Module) -> Vec<ResolvedFunctionOwnership> {
+    let candidates = analyze_call_ownership(module);
+    let mut active: Vec<Vec<bool>> = candidates
+        .iter()
+        .map(|f| f.params.iter().map(|p| p.candidate_owned).collect())
+        .collect();
+
+    loop {
+        let snapshot = active.clone();
+        let mut changed = false;
+        for (function_idx, function) in candidates.iter().enumerate() {
+            for (param_idx, param) in function.params.iter().enumerate() {
+                if !snapshot[function_idx][param_idx] {
+                    continue;
+                }
+                let deps_hold = param.dependencies.iter().all(|dep| {
+                    snapshot
+                        .get(dep.function_idx)
+                        .and_then(|params| params.get(dep.param_idx))
+                        .copied()
+                        .unwrap_or(false)
+                });
+                if !deps_hold {
+                    active[function_idx][param_idx] = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    candidates
+        .into_iter()
+        .enumerate()
+        .map(|(idx, function)| ResolvedFunctionOwnership {
+            function_idx: function.function_idx,
+            name: function.name,
+            owned_params: active[idx].clone(),
+        })
+        .collect()
+}
+fn function_level_blockers(
+    func: &mir::Function,
+    dynamic_callable: bool,
+    direct_call_sites: usize,
+) -> Vec<CallOwnershipBlocker> {
+    let mut blockers = Vec::new();
+    if func.public {
+        blockers.push(CallOwnershipBlocker::PublicFunction);
+    }
+    if matches!(func.name.as_str(), "main" | "__main") {
+        blockers.push(CallOwnershipBlocker::Entrypoint);
+    }
+    if dynamic_callable {
+        blockers.push(CallOwnershipBlocker::DynamicCallable);
+    }
+    if direct_call_sites == 0 {
+        blockers.push(CallOwnershipBlocker::NoDirectCallers);
+    }
+    blockers
+}
+
+fn collect_function_calls(
+    func: &mir::Function,
+    caller: CallerRef,
+    call_sites: &mut [Vec<DirectCallSite>],
+    dynamic_callable: &mut [bool],
+) {
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            if let mir::Stmt::Assign { op, .. } = stmt {
+                collect_rvalue_calls(op, caller, call_sites, dynamic_callable);
+            }
+        }
+    }
+}
+
+fn collect_rvalue_calls(
+    rv: &mir::RValue,
+    caller: CallerRef,
+    call_sites: &mut [Vec<DirectCallSite>],
+    dynamic_callable: &mut [bool],
+) {
+    match rv {
+        mir::RValue::Call {
+            func: mir::FuncRef::Index(target),
+            args,
+        } => {
+            if let Some(sites) = call_sites.get_mut(*target) {
+                sites.push(DirectCallSite {
+                    caller,
+                    args: args.clone(),
+                });
+            }
+        }
+        mir::RValue::Closure { func, .. } => {
+            if let Some(dynamic) = dynamic_callable.get_mut(*func) {
+                *dynamic = true;
+            }
+        }
+        mir::RValue::Spawn { init, .. } => {
+            for (_, nested) in init {
+                collect_rvalue_calls(nested, caller, call_sites, dynamic_callable);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn call_local_facts(func: &mir::Function) -> CallLocalFacts {
+    let nlocals = func.locals.len();
+    let transfers: FxHashSet<(LocalId, LocalId)> = func
+        .ownership_transfers
+        .iter()
+        .map(|t| (t.src, t.dst))
+        .collect();
+    let mut def_count = vec![0usize; nlocals];
+    let mut owning_def = vec![false; nlocals];
+    let mut use_count = vec![0usize; nlocals];
+
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            if let mir::Stmt::Assign { dst, op } = stmt {
+                let d = dst.0 as usize;
+                def_count[d] += 1;
+                if def_count[d] == 1 {
+                    owning_def[d] = counted_owning_definition(op, &func.locals[d].ty)
+                        || matches!(
+                            op,
+                            mir::RValue::Load(src)
+                                if transfers.contains(&(*src, *dst))
+                        );
+                } else {
+                    owning_def[d] = false;
+                }
+            }
+            let mut reads = Vec::new();
+            stmt_reads(stmt, &mut reads);
+            for id in reads {
+                use_count[id.0 as usize] += 1;
+            }
+        }
+        let mut reads = Vec::new();
+        terminator_reads(&block.terminator, &mut reads);
+        for id in reads {
+            use_count[id.0 as usize] += 1;
+        }
+    }
+
+    CallLocalFacts {
+        def_count,
+        owning_def,
+        use_count,
+    }
+}
+
+fn arg_transfer_evidence(
+    caller: &mir::Function,
+    facts: &CallLocalFacts,
+    arg: LocalId,
+) -> ArgTransferEvidence {
+    let i = arg.0 as usize;
+    if facts.use_count.get(i).copied() != Some(1) {
+        return ArgTransferEvidence::NotTransferable;
+    }
+    let Some(local) = caller.locals.get(i) else {
+        return ArgTransferEvidence::NotTransferable;
+    };
+
+    let compiler_temp = local
+        .name
+        .as_deref()
+        .map(|n| n.starts_with("__"))
+        .unwrap_or(true);
+    if compiler_temp
+        && facts.def_count.get(i).copied() == Some(1)
+        && facts.owning_def.get(i).copied() == Some(true)
+    {
+        return ArgTransferEvidence::OwnedTemporary;
+    }
+
+    if caller.params.contains(&arg)
+        && matches!(local.cap, Capability::LinearIso | Capability::Linear)
+    {
+        return ArgTransferEvidence::LinearForward;
+    }
+
+    ArgTransferEvidence::NotTransferable
+}
+
+fn counted_owning_definition(op: &mir::RValue, ty: &Type) -> bool {
+    if !definitely_counted_heap_type(ty) {
+        return false;
+    }
+    matches!(
+        op,
+        mir::RValue::Tuple(_)
+            | mir::RValue::Record(_)
+            | mir::RValue::RecordUpdate { .. }
+            | mir::RValue::ArrayLit(_)
+    )
+}
+
+fn definitely_counted_heap_type(ty: &Type) -> bool {
+    match ty {
+        Type::Primitive(PrimitiveType::String) => true,
+        Type::Tuple(_)
+        | Type::Record(_)
+        | Type::Array(_)
+        | Type::Variant(_)
+        | Type::App { .. } => true,
+        Type::Nominal { underlying, .. } => definitely_counted_heap_type(underlying),
+        Type::Reference { inner, .. } => definitely_counted_heap_type(inner),
+        _ => false,
+    }
+}
+
+fn analyze_return_candidate(
+    func: &mir::Function,
+    facts: &CallLocalFacts,
+) -> ReturnOwnershipCandidate {
+    let mut saw_value_return = false;
+    let mut saw_local_owner = false;
+    let mut saw_linear_param = false;
+
+    for block in &func.blocks {
+        let mir::Terminator::Return(Some(id)) = &block.terminator else {
+            continue;
+        };
+        saw_value_return = true;
+        let i = id.0 as usize;
+        let local_owner = facts.def_count.get(i).copied() == Some(1)
+            && facts.owning_def.get(i).copied() == Some(true);
+        if local_owner {
+            saw_local_owner = true;
+            continue;
+        }
+        let linear_param = func.params.contains(id)
+            && func
+                .locals
+                .get(i)
+                .map(|l| matches!(l.cap, Capability::LinearIso | Capability::Linear))
+                .unwrap_or(false);
+        if linear_param {
+            saw_linear_param = true;
+            continue;
+        }
+        return ReturnOwnershipCandidate::BorrowedOrImmediate;
+    }
+
+    if !saw_value_return {
+        ReturnOwnershipCandidate::BorrowedOrImmediate
+    } else if saw_linear_param {
+        ReturnOwnershipCandidate::OwnedFromLinearParam
+    } else if saw_local_owner {
+        ReturnOwnershipCandidate::OwnedLocal
+    } else {
+        ReturnOwnershipCandidate::BorrowedOrImmediate
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +806,250 @@ mod tests {
         module
     }
 
+    fn linear_array_callee(public: bool) -> mir::Function {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("consume_array", None);
+        b.set_public(public);
+        let _p = b.add_param_with_cap("x", array_ty, Capability::LinearIso);
+        b.terminate(mir::Terminator::Return(None));
+        b.build()
+    }
+
+    #[test]
+    fn call_ownership_candidate_accepts_single_use_owned_temp() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let callee = linear_array_callee(false);
+        let mut caller = mir::FunctionBuilder::new("caller", None);
+        let arg = caller.add_temp(array_ty);
+        let result = caller.add_temp(Type::unit());
+        caller.assign(arg, mir::RValue::ArrayLit(vec![]));
+        caller.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![arg],
+            },
+        );
+        caller.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(callee);
+        module.functions.push(caller.build());
+        let report = analyze_call_ownership(&module);
+        let p = &report[0].params[0];
+        assert!(
+            p.candidate_owned,
+            "fresh single-use owner should be a candidate: {:?}",
+            p.blockers
+        );
+        assert!(!p.requires_upstream_owned_param);
+        assert_eq!(report[0].direct_call_sites, 1);
+    }
+
+    #[test]
+    fn call_ownership_candidate_blocks_public_function() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let callee = linear_array_callee(true);
+        let mut caller = mir::FunctionBuilder::new("caller", None);
+        let arg = caller.add_temp(array_ty);
+        let result = caller.add_temp(Type::unit());
+        caller.assign(arg, mir::RValue::ArrayLit(vec![]));
+        caller.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![arg],
+            },
+        );
+        caller.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(callee);
+        module.functions.push(caller.build());
+        let report = analyze_call_ownership(&module);
+        let p = &report[0].params[0];
+        assert!(!p.candidate_owned);
+        assert!(p.blockers.contains(&CallOwnershipBlocker::PublicFunction));
+    }
+
+    #[test]
+    fn call_ownership_candidate_blocks_dynamic_closure_target() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let callee = linear_array_callee(false);
+        let mut caller = mir::FunctionBuilder::new("caller", None);
+        let arg = caller.add_temp(array_ty);
+        let clos = caller.add_temp(Type::unit());
+        let result = caller.add_temp(Type::unit());
+        caller.assign(arg, mir::RValue::ArrayLit(vec![]));
+        caller.assign(
+            clos,
+            mir::RValue::Closure {
+                func: 0,
+                captures: vec![],
+            },
+        );
+        caller.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![arg],
+            },
+        );
+        caller.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(callee);
+        module.functions.push(caller.build());
+        let report = analyze_call_ownership(&module);
+        assert!(report[0].dynamic_callable);
+        assert!(report[0].params[0]
+            .blockers
+            .contains(&CallOwnershipBlocker::DynamicCallable));
+    }
+
+    #[test]
+    fn call_ownership_candidate_marks_linear_forward_dependency() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let callee = linear_array_callee(false);
+        let mut caller = mir::FunctionBuilder::new("forwarder", None);
+        let arg = caller.add_param_with_cap("x", array_ty, Capability::LinearIso);
+        let result = caller.add_temp(Type::unit());
+        caller.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![arg],
+            },
+        );
+        caller.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(callee);
+        module.functions.push(caller.build());
+        let report = analyze_call_ownership(&module);
+        assert!(report[0].params[0].candidate_owned);
+        assert!(report[0].params[0].requires_upstream_owned_param);
+    }
+
+    #[test]
+    fn call_ownership_resolution_propagates_fresh_owner_through_forwarder() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let target = linear_array_callee(false);
+
+        let mut forwarder = mir::FunctionBuilder::new("forwarder", None);
+        let forwarded =
+            forwarder.add_param_with_cap("x", array_ty.clone(), Capability::LinearIso);
+        let forwarded_result = forwarder.add_temp(Type::unit());
+        forwarder.assign(
+            forwarded_result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![forwarded],
+            },
+        );
+        forwarder.terminate(mir::Terminator::Return(None));
+
+        let mut root = mir::FunctionBuilder::new("root", None);
+        let owned = root.add_temp(array_ty);
+        let root_result = root.add_temp(Type::unit());
+        root.assign(owned, mir::RValue::ArrayLit(vec![]));
+        root.assign(
+            root_result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(1),
+                args: vec![owned],
+            },
+        );
+        root.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(target);
+        module.functions.push(forwarder.build());
+        module.functions.push(root.build());
+
+        let candidates = analyze_call_ownership(&module);
+        assert_eq!(
+            candidates[0].params[0].dependencies,
+            vec![ParamOwnershipDependency {
+                function_idx: 1,
+                param_idx: 0,
+            }]
+        );
+        assert!(candidates[1].params[0].dependencies.is_empty());
+
+        let resolved = resolve_call_ownership(&module);
+        assert_eq!(resolved[0].owned_params, vec![true]);
+        assert_eq!(resolved[1].owned_params, vec![true]);
+    }
+
+    #[test]
+    fn call_ownership_resolution_prunes_dependency_on_public_forwarder() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let target = linear_array_callee(false);
+
+        let mut forwarder = mir::FunctionBuilder::new("forwarder", None);
+        forwarder.set_public(true);
+        let forwarded =
+            forwarder.add_param_with_cap("x", array_ty.clone(), Capability::LinearIso);
+        let forwarded_result = forwarder.add_temp(Type::unit());
+        forwarder.assign(
+            forwarded_result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![forwarded],
+            },
+        );
+        forwarder.terminate(mir::Terminator::Return(None));
+
+        let mut root = mir::FunctionBuilder::new("root", None);
+        let owned = root.add_temp(array_ty);
+        let root_result = root.add_temp(Type::unit());
+        root.assign(owned, mir::RValue::ArrayLit(vec![]));
+        root.assign(
+            root_result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(1),
+                args: vec![owned],
+            },
+        );
+        root.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(target);
+        module.functions.push(forwarder.build());
+        module.functions.push(root.build());
+
+        let resolved = resolve_call_ownership(&module);
+        assert_eq!(resolved[1].owned_params, vec![false]);
+        assert_eq!(
+            resolved[0].owned_params,
+            vec![false],
+            "downstream ownership must be pruned when its forwarding source is not owned"
+        );
+    }
+    #[test]
+    fn return_ownership_candidates_distinguish_local_and_linear_param() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+
+        let mut fresh = mir::FunctionBuilder::new("fresh", Some(array_ty.clone()));
+        let value = fresh.add_temp(array_ty.clone());
+        fresh.assign(value, mir::RValue::ArrayLit(vec![]));
+        fresh.terminate(mir::Terminator::Return(Some(value)));
+
+        let mut forwarding = mir::FunctionBuilder::new("forward", Some(array_ty.clone()));
+        let param = forwarding.add_param_with_cap("x", array_ty, Capability::LinearIso);
+        forwarding.terminate(mir::Terminator::Return(Some(param)));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(fresh.build());
+        module.functions.push(forwarding.build());
+        let report = analyze_call_ownership(&module);
+        assert_eq!(report[0].return_ownership, ReturnOwnershipCandidate::OwnedLocal);
+        assert_eq!(
+            report[1].return_ownership,
+            ReturnOwnershipCandidate::OwnedFromLinearParam
+        );
+    }
     #[test]
     fn infers_transfer_for_single_use_owning_temp() {
         let array_ty = Type::Array(Box::new(Type::int()));
