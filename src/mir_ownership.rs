@@ -89,10 +89,10 @@ fn infer_function_round(func: &mut mir::Function) -> usize {
                     owning_def[d] = false;
                 }
 
-                if let mir::RValue::Load(src) = op
-                    && *src != *dst
-                {
-                    load_site[src.0 as usize] = Some((bi, si, *dst));
+                if let mir::RValue::Load(src) = op {
+                    if *src != *dst {
+                        load_site[src.0 as usize] = Some((bi, si, *dst));
+                    }
                 }
             }
 
