@@ -979,18 +979,13 @@ fn epoch_repair_brings_lagging_survivor_to_proposal_tail() {
     }
 }
 
-
 #[test]
 fn epoch_pull_reconciles_candidate_behind_a_survivor() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-    let addrs: Vec<SocketAddr> = [
-        "127.0.0.1:35001",
-        "127.0.0.1:35002",
-        "127.0.0.1:35003",
-    ]
-    .into_iter()
-    .map(|addr| addr.parse().unwrap())
-    .collect();
+    let addrs: Vec<SocketAddr> = ["127.0.0.1:35001", "127.0.0.1:35002", "127.0.0.1:35003"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
     let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
     let mut nodes: Vec<Runtime> = addrs
         .iter()
@@ -1015,10 +1010,7 @@ fn epoch_pull_reconciles_candidate_behind_a_survivor() {
     let initial = nodes[0]
         .fabric_stream_placement("epoch-pull", 0, 3)
         .unwrap();
-    let old_leader = ids
-        .iter()
-        .position(|node| *node == initial.leader)
-        .unwrap();
+    let old_leader = ids.iter().position(|node| *node == initial.leader).unwrap();
     let survivors: Vec<usize> = (0..3).filter(|index| *index != old_leader).collect();
 
     // Determine the future RF=2 leader after the old leader is removed.
