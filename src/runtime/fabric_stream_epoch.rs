@@ -32,6 +32,10 @@ pub(crate) const FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR: &str =
     "__nulang_fabric_stream_epoch_commit_v1";
 pub(crate) const FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR: &str =
     "__nulang_fabric_stream_epoch_repair_v1";
+pub(crate) const FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR: &str =
+    "__nulang_fabric_stream_epoch_pull_request_v1";
+pub(crate) const FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR: &str =
+    "__nulang_fabric_stream_epoch_pull_response_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FabricStreamEpochTransitionStatus {
@@ -50,6 +54,34 @@ pub struct FabricStreamEpochRepairReport {
     pub records_dispatched: usize,
     pub unavailable_replicas: usize,
     pub ahead_replicas: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FabricStreamEpochPullReport {
+    pub ahead_replicas: usize,
+    pub requests_dispatched: usize,
+    pub unavailable_replicas: usize,
+    pub source_tail: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricStreamEpochPullRequest {
+    pub stream: String,
+    pub proposal: FabricStreamEpochProposalState,
+    pub requester: u64,
+    pub source: u64,
+    pub start_sequence: u64,
+    pub max_records: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricStreamEpochPullResponse {
+    pub stream: String,
+    pub proposal: FabricStreamEpochProposalState,
+    pub requester: u64,
+    pub source: u64,
+    pub source_tail: u64,
+    pub records: Vec<FabricStreamEpochRepairRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +122,26 @@ pub(crate) struct FabricStreamEpochCommit {
 pub(crate) struct FabricStreamEpochVoteOutcome {
     pub status: FabricStreamEpochTransitionStatus,
     pub commit: Option<FabricStreamEpochCommit>,
+}
+
+impl FabricStreamEpochPullRequest {
+    pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(json_error)
+    }
+
+    pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
+        serde_json::from_slice(bytes).map_err(json_error)
+    }
+}
+
+impl FabricStreamEpochPullResponse {
+    pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(json_error)
+    }
+
+    pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
+        serde_json::from_slice(bytes).map_err(json_error)
+    }
 }
 
 impl FabricStreamEpochRepairBatch {
@@ -303,6 +355,350 @@ impl Runtime {
             proposal: state.proposal,
         })?;
         Ok(outcome.status)
+    }
+
+    /// Ask one ahead proposed replica for a bounded exact suffix.
+    ///
+    /// Applying a response changes the candidate tail and therefore invalidates
+    /// the current proposal. The response handler immediately starts a strictly
+    /// higher election term whose hash binds the new tail.
+    pub fn fabric_stream_pull_epoch_transition(
+        &mut self,
+        stream: &str,
+        max_records: usize,
+    ) -> io::Result<FabricStreamEpochPullReport> {
+        if max_records == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric epoch pull bound must be greater than zero",
+            ));
+        }
+        let state = self
+            .fabric_stream_epoch_transition_state(stream)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Fabric epoch transition is not in progress",
+                )
+            })?;
+        if state.finalized {
+            return Ok(FabricStreamEpochPullReport::default());
+        }
+
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch pull requires distribution",
+            )
+        })?;
+        if state.proposal.to_policy.leader != local.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "only the proposed Fabric leader may pull transition data",
+            ));
+        }
+
+        let local_tail = self.fabric_stream_info(stream)?.last_sequence.unwrap_or(0);
+        if local_tail != state.proposal.candidate_tail {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Fabric candidate tail already changed; begin a higher term first",
+            ));
+        }
+
+        let mut ahead: Vec<(u64, u64)> = state
+            .votes
+            .values()
+            .filter(|vote| {
+                !vote.accepted
+                    && vote.tail > local_tail
+                    && state.proposal.to_policy.replicas.contains(&vote.voter)
+            })
+            .map(|vote| (vote.voter, vote.tail))
+            .collect();
+        ahead.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+
+        let mut report = FabricStreamEpochPullReport {
+            ahead_replicas: ahead.len(),
+            ..FabricStreamEpochPullReport::default()
+        };
+        let Some((source_raw, source_tail)) = ahead.first().copied() else {
+            return Ok(report);
+        };
+        report.source_tail = source_tail;
+        let source = NodeId(source_raw);
+
+        let cluster = self.distributed.cluster.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch pull requires cluster membership",
+            )
+        })?;
+        if cluster.is_removed(source) {
+            report.unavailable_replicas = 1;
+            return Ok(report);
+        }
+        let Some(address) = cluster
+            .get_node(source)
+            .filter(|info| matches!(info.status, NodeStatus::Healthy | NodeStatus::Joining))
+            .map(|info| info.address)
+        else {
+            report.unavailable_replicas = 1;
+            return Ok(report);
+        };
+
+        let request = FabricStreamEpochPullRequest {
+            stream: stream.to_string(),
+            proposal: state.proposal,
+            requester: local.0,
+            source: source.0,
+            start_sequence: local_tail.saturating_add(1),
+            max_records,
+        };
+        let bytes = request.to_wire_bytes()?;
+        let transport = self.distributed.transport.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch pull requires network transport",
+            )
+        })?;
+        transport.send(
+            source,
+            address,
+            system_packet(FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR, local, bytes),
+        );
+        report.requests_dispatched = 1;
+        Ok(report)
+    }
+
+    pub(crate) fn fabric_stream_build_epoch_pull_response(
+        &mut self,
+        request: &FabricStreamEpochPullRequest,
+        sender: NodeId,
+        cluster: &ClusterState,
+    ) -> io::Result<FabricStreamEpochPullResponse> {
+        validate_proposal_shape(&request.stream, &request.proposal)?;
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch pull response requires distribution",
+            )
+        })?;
+        if request.requester != sender.0
+            || request.requester != request.proposal.to_policy.leader
+            || request.source != local.0
+            || !request.proposal.to_policy.replicas.contains(&local.0)
+            || request.max_records == 0
+            || request.start_sequence == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unauthorized Fabric epoch pull request",
+            ));
+        }
+
+        let current = self
+            .fabric_stream_replication_policy(&request.stream)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Fabric stream replication policy is not established",
+                )
+            })?;
+        if current != request.proposal.from_policy {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch pull source policy differs from local durable policy",
+            ));
+        }
+        let placement = compute_stream_placement(
+            local,
+            Some(cluster),
+            &request.stream,
+            request.proposal.to_policy.partition,
+            request.proposal.to_policy.replication_factor,
+        )?;
+        if policy_from_placement(&placement, request.proposal.to_policy.epoch)
+            != request.proposal.to_policy
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch pull no longer matches current placement",
+            ));
+        }
+
+        if let Some(promise) = self.fabric_stream_epoch_promise(&request.stream)? {
+            if promise.epoch > request.proposal.to_policy.epoch
+                || (promise.epoch == request.proposal.to_policy.epoch
+                    && promise.proposal_hash != request.proposal.proposal_hash)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Fabric epoch pull request is fenced by a newer or conflicting promise",
+                ));
+            }
+        }
+
+        let source_tail = self
+            .fabric_stream_info(&request.stream)?
+            .last_sequence
+            .unwrap_or(0);
+        if request.start_sequence > source_tail {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric epoch pull starts beyond source durable tail",
+            ));
+        }
+
+        let records = self
+            .fabric_stream_read(
+                &request.stream,
+                request.start_sequence,
+                request.max_records,
+            )?
+            .into_iter()
+            .map(|record| FabricStreamEpochRepairRecord {
+                sequence: record.sequence,
+                payload: record.payload,
+            })
+            .collect();
+        Ok(FabricStreamEpochPullResponse {
+            stream: request.stream.clone(),
+            proposal: request.proposal.clone(),
+            requester: request.requester,
+            source: local.0,
+            source_tail,
+            records,
+        })
+    }
+
+    /// Apply a pull response to the candidate and return the replication factor
+    /// for the higher-term proposal that must immediately replace it.
+    pub(crate) fn fabric_stream_apply_epoch_pull_response(
+        &mut self,
+        response: &FabricStreamEpochPullResponse,
+        sender: NodeId,
+        cluster: &ClusterState,
+    ) -> io::Result<usize> {
+        validate_proposal_shape(&response.stream, &response.proposal)?;
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch pull apply requires distribution",
+            )
+        })?;
+        if response.requester != local.0
+            || response.requester != response.proposal.to_policy.leader
+            || response.source != sender.0
+            || !response.proposal.to_policy.replicas.contains(&sender.0)
+            || response.records.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unauthorized Fabric epoch pull response",
+            ));
+        }
+
+        let state = self
+            .fabric_stream_epoch_transition_state(&response.stream)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Fabric epoch transition is not in progress",
+                )
+            })?;
+        if state.finalized || state.proposal != response.proposal {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch pull response does not match the active proposal",
+            ));
+        }
+
+        let current = self
+            .fabric_stream_replication_policy(&response.stream)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Fabric stream replication policy is not established",
+                )
+            })?;
+        if current != response.proposal.from_policy {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch pull candidate policy changed",
+            ));
+        }
+        let placement = compute_stream_placement(
+            local,
+            Some(cluster),
+            &response.stream,
+            response.proposal.to_policy.partition,
+            response.proposal.to_policy.replication_factor,
+        )?;
+        if policy_from_placement(&placement, response.proposal.to_policy.epoch)
+            != response.proposal.to_policy
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch pull response no longer matches current placement",
+            ));
+        }
+
+        let local_tail = self
+            .fabric_stream_info(&response.stream)?
+            .last_sequence
+            .unwrap_or(0);
+        if local_tail != response.proposal.candidate_tail
+            || response.records[0].sequence != local_tail.saturating_add(1)
+            || response
+                .records
+                .last()
+                .map(|record| record.sequence > response.source_tail)
+                .unwrap_or(true)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch pull response is not the next candidate suffix",
+            ));
+        }
+
+        let source_vote = state.votes.get(&response.source).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch pull source has no recorded transition vote",
+            )
+        })?;
+        if source_vote.tail != response.source_tail
+            || source_vote.tail <= response.proposal.candidate_tail
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric epoch pull source tail differs from its recorded vote",
+            ));
+        }
+
+        let mut expected = local_tail.saturating_add(1);
+        for record in &response.records {
+            if record.sequence != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric epoch pull response contains a sequence gap",
+                ));
+            }
+            self.fabric_stream_apply_transition_repair_record(
+                &response.stream,
+                record.sequence,
+                &record.payload,
+            )?;
+            expected = expected.saturating_add(1);
+        }
+
+        Ok(response.proposal.to_policy.replication_factor)
     }
 
     /// Push a bounded set of proposal-scoped records to rejected new-policy
