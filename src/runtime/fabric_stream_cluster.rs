@@ -14,6 +14,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 
+use crate::runtime::fabric_stream::FabricStreamPendingIntent;
 use crate::runtime::{
     ClusterState, FabricStreamConfig, MessagePriority, NodeId, NodeStatus, Packet, Runtime,
 };
@@ -218,18 +219,68 @@ impl Runtime {
         replication_factor: usize,
         payload: &[u8],
     ) -> io::Result<FabricStreamReplicatedAppendResult> {
-        let (placement, append) = self.fabric_stream_prepare_replica_append(
-            stream,
-            partition,
-            replication_factor,
-            payload,
-        )?;
-        let quorum = replication_factor / 2 + 1;
+        if partition != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "physical Fabric stream partition logs are not implemented yet; use partition 0",
+            ));
+        }
+
+        let placement = self.fabric_stream_placement(stream, partition, replication_factor)?;
         let local = self
             .distributed
             .node_id
             .expect("placement validated node id");
+        if placement.leader != local {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric stream partition leader is {:?}, local node is {:?}",
+                    placement.leader, local
+                ),
+            ));
+        }
+        if let Some(cluster) = self.distributed.cluster.as_ref() {
+            let local_status = cluster.get_node(local).map(|member| member.status);
+            if !matches!(
+                local_status,
+                Some(NodeStatus::Healthy | NodeStatus::Joining)
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "local Fabric stream leader is not healthy",
+                ));
+            }
+        }
 
+        let stream_config = self.fabric_stream_config(stream)?;
+        let sequence = self.fabric_stream_info(stream)?.next_sequence;
+        let intent = FabricStreamPendingIntent {
+            partition,
+            leader: placement.leader.0,
+            membership_fingerprint: placement.membership_fingerprint,
+            replication_factor,
+            replicas: placement.replicas.iter().map(|node| node.0).collect(),
+            sequence,
+        };
+
+        // Persist intent before the record so a crash can never leave an
+        // uncommitted durable tail without reconstructible replication state.
+        self.fabric_stream_reserve_replication_intent(stream, intent)?;
+        self.fabric_stream_append_reserved_replica(stream, sequence, payload)?;
+
+        let append = FabricStreamReplicaAppend {
+            stream: stream.to_string(),
+            partition,
+            leader: placement.leader,
+            membership_fingerprint: placement.membership_fingerprint,
+            replication_factor,
+            stream_config,
+            sequence,
+            payload: payload.to_vec(),
+        };
+
+        let quorum = replication_factor / 2 + 1;
         let key = (stream.to_string(), partition);
         let mut acknowledgements = HashSet::new();
         acknowledgements.insert(local);
@@ -239,7 +290,7 @@ impl Runtime {
             .entry(key)
             .or_default()
             .insert(
-                append.sequence,
+                sequence,
                 PendingReplicaCommit {
                     leader: placement.leader,
                     membership_fingerprint: placement.membership_fingerprint,
@@ -254,19 +305,19 @@ impl Runtime {
         let status = if quorum == 1 {
             self.fabric_stream_advance_commits(stream, partition)?;
             FabricStreamReplicationStatus {
-                sequence: append.sequence,
+                sequence,
                 quorum: 1,
                 acknowledgements: 1,
                 rejections: 0,
                 committed: true,
             }
         } else {
-            self.fabric_stream_replication_status(stream, partition, append.sequence)?
+            self.fabric_stream_replication_status(stream, partition, sequence)?
         };
 
         let dispatch = self.fabric_stream_dispatch_replica_append(&placement, &append)?;
         Ok(FabricStreamReplicatedAppendResult {
-            sequence: append.sequence,
+            sequence,
             status,
             dispatch,
         })
@@ -464,6 +515,7 @@ impl Runtime {
             }
 
             self.fabric_stream_commit_through(stream, next)?;
+            self.fabric_stream_remove_replication_intent(stream, next)?;
             let remove_partition = if let Some(entries) = self
                 .distributed
                 .fabric_stream_replication
