@@ -2357,7 +2357,6 @@ fn rvalue_uses(op: &mir::RValue) -> Vec<(usize, UseKind)> {
         | Receive
         | ReceiveMatch { .. }
         | ReceiveCommit
-        | Spawn { .. }
         | SelfRef
         | Panic(_)
         | StateGet { .. }
@@ -2365,6 +2364,21 @@ fn rvalue_uses(op: &mir::RValue) -> Vec<(usize, UseKind)> {
         // The timeout value is staged into r0 with a plain Move — an
         // uncounted copy channel like call/effect argument staging.
         ReceiveWait { timeout, .. } => cp(&mut out, *timeout),
+        Spawn {
+            init, target_node, ..
+        } => {
+            // Local Spawn consumes only constant overrides from metadata and
+            // therefore does not evaluate non-constant initializer MIR.
+            // Remote spawn is different: codegen evaluates every initializer
+            // into r0..rN before RSpawn, so preserve each nested rvalue's
+            // exact ownership use kind. The node selector is only inspected.
+            if let Some(node) = target_node {
+                ro(&mut out, *node);
+                for (_, init_rv) in init {
+                    out.extend(rvalue_uses(init_rv));
+                }
+            }
+        }
         Load(x) => cp(&mut out, *x),
         LoadFieldNamed { obj, .. } | LoadFieldPos { obj, .. } => ro(&mut out, *obj),
         ArrayLoad { arr, idx } => {
