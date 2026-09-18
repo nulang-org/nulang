@@ -611,9 +611,12 @@ impl FileFabricStreamStore {
                 "Fabric epoch proposal hash cannot be empty",
             ));
         }
-        let policy = self
-            .replication_policy(name)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric replication policy is not established"))?;
+        let policy = self.replication_policy(name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Fabric replication policy is not established",
+            )
+        })?;
         let expected = policy
             .epoch
             .checked_add(1)
@@ -621,9 +624,7 @@ impl FileFabricStreamStore {
         if epoch != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "Fabric epoch promise must target next epoch {expected}, got {epoch}"
-                ),
+                format!("Fabric epoch promise must target next epoch {expected}, got {epoch}"),
             ));
         }
 
@@ -669,20 +670,21 @@ impl FileFabricStreamStore {
         self.ensure_state(name)?;
         if proposal.proposal_hash.is_empty()
             || proposal.to_policy.epoch
-                != proposal
-                    .from_policy
-                    .epoch
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow"))?
+                != proposal.from_policy.epoch.checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow")
+                })?
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid Fabric epoch transition proposal",
             ));
         }
-        let current = self
-            .replication_policy(name)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric replication policy is not established"))?;
+        let current = self.replication_policy(name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Fabric replication policy is not established",
+            )
+        })?;
         if current != proposal.from_policy {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -695,9 +697,7 @@ impl FileFabricStreamStore {
             if existing.proposal == proposal {
                 return Ok(existing);
             }
-            if !existing.finalized
-                || existing.proposal.to_policy != proposal.from_policy
-            {
+            if !existing.finalized || existing.proposal.to_policy != proposal.from_policy {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "a different Fabric epoch transition is already in progress",
@@ -841,10 +841,9 @@ impl FileFabricStreamStore {
     ) -> io::Result<()> {
         self.ensure_state(name)?;
         if to_policy.epoch
-            != from_policy
-                .epoch
-                .checked_add(1)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow"))?
+            != from_policy.epoch.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow")
+            })?
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1238,7 +1237,8 @@ impl Runtime {
         name: &str,
         vote: FabricStreamEpochVoteState,
     ) -> io::Result<FabricStreamEpochTransitionState> {
-        self.fabric_stream_store_mut()?.record_epoch_vote(name, vote)
+        self.fabric_stream_store_mut()?
+            .record_epoch_vote(name, vote)
     }
 
     pub(crate) fn fabric_stream_finalize_epoch_transition_state(
@@ -1257,8 +1257,12 @@ impl Runtime {
         to_policy: &FabricStreamReplicationPolicy,
         proposal_hash: &str,
     ) -> io::Result<()> {
-        self.fabric_stream_store_mut()?
-            .install_epoch_policy(name, from_policy, to_policy, proposal_hash)
+        self.fabric_stream_store_mut()?.install_epoch_policy(
+            name,
+            from_policy,
+            to_policy,
+            proposal_hash,
+        )
     }
 
     pub(crate) fn fabric_stream_reserve_replication_intent(
@@ -1600,9 +1604,7 @@ fn read_epoch_promise(path: &Path) -> io::Result<Option<FabricStreamEpochPromise
     Ok(Some(file.promise))
 }
 
-fn read_epoch_transition(
-    path: &Path,
-) -> io::Result<Option<FabricStreamEpochTransitionState>> {
+fn read_epoch_transition(path: &Path) -> io::Result<Option<FabricStreamEpochTransitionState>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -1969,7 +1971,11 @@ mod tests {
 
         let mut reopened = FileFabricStreamStore::open(&root).unwrap();
         assert_eq!(
-            reopened.epoch_promise("events").unwrap().unwrap().proposal_hash,
+            reopened
+                .epoch_promise("events")
+                .unwrap()
+                .unwrap()
+                .proposal_hash,
             "proposal-a"
         );
         let _ = fs::remove_dir_all(root);
