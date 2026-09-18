@@ -1209,6 +1209,55 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
     })
 }
 
+fn build_wasm_compiler_args(
+    wasm_path: &str,
+    entry: &str,
+    capabilities: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "--backend".to_string(),
+        "wasm-aot".to_string(),
+        "--out".to_string(),
+        wasm_path.to_string(),
+        entry.to_string(),
+    ];
+    args.extend(capabilities.iter().cloned());
+    args
+}
+
+#[cfg(test)]
+mod build_wasm_capability_tests {
+    use super::build_wasm_compiler_args;
+
+    #[test]
+    fn compiler_args_preserve_manifest_capability_grants() {
+        let args = build_wasm_compiler_args(
+            ".nula/dist/demo.wasm",
+            "src/main.nula",
+            &[
+                "--with".to_string(),
+                "net".to_string(),
+                "--with".to_string(),
+                "storage".to_string(),
+            ],
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--backend",
+                "wasm-aot",
+                "--out",
+                ".nula/dist/demo.wasm",
+                "src/main.nula",
+                "--with",
+                "net",
+                "--with",
+                "storage",
+            ]
+        );
+    }
+}
+
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
 fn cmd_build_wasm() -> NuResult<()> {
@@ -1234,7 +1283,10 @@ fn cmd_build_wasm() -> NuResult<()> {
 
     eprintln!("Building {} (WASM AOT)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+    let caps = capability_args();
+    let args = build_wasm_compiler_args(&wasm_path_str, &entry_str, &caps);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    nulang_exe(&arg_refs)?;
     println!("WASM AOT build succeeded.");
     Ok(())
 }
