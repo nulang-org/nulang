@@ -60,6 +60,10 @@ if count != 1:
     raise SystemExit(f"priority fixture: expected one exact match, found {count}")
 text = text.replace(old, new, 1)
 
+fn_marker = "fn test_runtime_scheduler_stats() {\n"
+fn_start = text.index(fn_marker)
+fn_end = text.index("\n#[test]\n", fn_start + len(fn_marker))
+segment = text[fn_start:fn_end]
 old = '''    let a1 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
     let a2 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
     rt.send_message(a1, "add", &[Value::int(10)]);
@@ -72,10 +76,11 @@ new = '''    fn noop(_actor: &mut Actor, _args: &[Value]) {}
     rt.actors.get_mut(&a2).unwrap().register_behavior("add", noop);
     rt.send_message(a1, "add", &[Value::int(10)]);
 '''
-count = text.count(old)
+count = segment.count(old)
 if count != 1:
-    raise SystemExit(f"scheduler stats fixture: expected one exact match, found {count}")
-text = text.replace(old, new, 1)
+    raise SystemExit(f"scheduler stats fixture: expected one exact match in target function, found {count}")
+segment = segment.replace(old, new, 1)
+text = text[:fn_start] + segment + text[fn_end:]
 
 if "fn p0_cross_shard_named_send_resolves_on_owner_and_unknown_fails_closed()" in text:
     raise SystemExit("cross-shard P0 test already present")
