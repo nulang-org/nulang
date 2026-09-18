@@ -54,7 +54,6 @@ pub struct FabricPublishReport {
     pub forwarded_remote: usize,
 }
 
-
 /// One ephemeral Fabric subscription.
 ///
 /// `node_id == None` denotes a subscription owned by this runtime process.
