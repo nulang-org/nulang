@@ -1209,11 +1209,7 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
     })
 }
 
-fn build_wasm_compiler_args(
-    wasm_path: &str,
-    entry: &str,
-    capabilities: &[String],
-) -> Vec<String> {
+fn build_wasm_compiler_args(wasm_path: &str, entry: &str, capabilities: &[String]) -> Vec<String> {
     let mut args = vec![
         "--backend".to_string(),
         "wasm-aot".to_string(),
