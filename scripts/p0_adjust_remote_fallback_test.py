@@ -38,7 +38,7 @@ count = text.count(old)
 if count != 1:
     raise SystemExit(f"remote fallback fixture: expected one exact match, found {count}")
 
-path.write_text(text.replace(old, new, 1))
+text = text.replace(old, new, 1)
 
 
 # Scheduler/statistics fixtures must name real handlers instead of relying on
