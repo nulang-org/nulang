@@ -374,6 +374,13 @@ impl Runtime {
                 ),
             )),
             None if epoch == FABRIC_STREAM_INITIAL_EPOCH => {
+                let info = self.fabric_stream_info(&placement.stream)?;
+                if info.last_sequence.is_some() || info.committed_sequence > 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Fabric stream has durable history but no replication policy; explicit migration is required",
+                    ));
+                }
                 self.fabric_stream_establish_replication_policy(&placement.stream, proposed)
             }
             None => Err(io::Error::new(
@@ -1858,6 +1865,7 @@ mod tests {
                 "events",
                 FabricStreamPendingIntent {
                     partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
                     leader: local.0,
                     membership_fingerprint: placement.membership_fingerprint,
                     replication_factor: 1,
@@ -1894,6 +1902,7 @@ mod tests {
                 "events",
                 FabricStreamPendingIntent {
                     partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
                     leader: local.0,
                     membership_fingerprint: placement.membership_fingerprint,
                     replication_factor: 1,
@@ -1922,6 +1931,7 @@ mod tests {
         let update = FabricStreamCommitUpdate {
             stream: "orders".into(),
             partition: 0,
+            epoch: FABRIC_STREAM_INITIAL_EPOCH,
             leader: NodeId(10),
             membership_fingerprint: 44,
             replication_factor: 3,
@@ -1939,6 +1949,7 @@ mod tests {
         let ack = FabricStreamReplicaAck {
             stream: "orders".into(),
             partition: 0,
+            epoch: FABRIC_STREAM_INITIAL_EPOCH,
             leader: NodeId(10),
             membership_fingerprint: 44,
             replication_factor: 3,
@@ -1958,6 +1969,7 @@ mod tests {
         let append = FabricStreamReplicaAppend {
             stream: "events".into(),
             partition: 0,
+            epoch: FABRIC_STREAM_INITIAL_EPOCH,
             leader: NodeId(42),
             membership_fingerprint: 99,
             replication_factor: 3,
