@@ -322,6 +322,18 @@ impl WasmBackend {
                                 span: crate::types::Span::default(),
                             });
                         }
+                        if let RValue::Call {
+                            args, sink_args, ..
+                        } = op
+                        {
+                            if args.len() != sink_args.len() {
+                                return Err(crate::types::NuError::VMError {
+                                    msg: "MIR call sink mask length does not match argument count"
+                                        .into(),
+                                    span: crate::types::Span::default(),
+                                });
+                            }
+                        }
                         // Reject RValues the standalone WASM runtime has no
                         // machinery for — they previously silently compiled
                         // to nil. Fail loudly at compile time instead.
@@ -1180,8 +1192,12 @@ impl WasmBackend {
                 body.instruction(&Instruction::LocalGet(self.mir_local(b, func)));
                 body.instruction(&Instruction::Call(IMPORT_STR_EQ));
             }
-            RValue::Call { func: fr, args } => {
-                self.compile_call(body, fr, args, func);
+            RValue::Call {
+                func: fr,
+                args,
+                sink_args,
+            } => {
+                self.compile_call(body, fr, args, sink_args, func);
             }
             RValue::Perform {
                 effect, op, args, ..
@@ -2183,12 +2199,20 @@ impl WasmBackend {
         body: &mut Function,
         fr: &FuncRef,
         args: &[LocalId],
+        sink_args: &[bool],
         func: &mir::Function,
     ) {
         match fr {
             FuncRef::Index(idx) => {
-                for a in args {
-                    body.instruction(&Instruction::LocalGet(self.mir_local(a, func)));
+                for (arg, sink) in args.iter().zip(sink_args) {
+                    let local = self.mir_local(arg, func);
+                    body.instruction(&Instruction::LocalGet(local));
+                    if *sink {
+                        // The argument value remains on the operand stack for
+                        // the call while the reusable caller local is cleared.
+                        body.instruction(&Instruction::I64Const(value_layout::TAG_NIL as i64));
+                        body.instruction(&Instruction::LocalSet(local));
+                    }
                 }
                 let wi = self.func_index_map.get(idx).copied().unwrap_or(0);
                 body.instruction(&Instruction::Call(wi));
@@ -3198,6 +3222,44 @@ mod tests {
         assert!(
             err.to_string().contains("at most 16"),
             "compile error must explain the arg cap: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_direct_sink_call_delivers_value() {
+        let value = run_source(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main() -> Int {\n\
+                 let y = 42 :cap lineariso\n\
+                 take(y)\n\
+             }",
+        )
+        .expect("run sink call");
+        assert_eq!(
+            value.as_int(),
+            Some(42),
+            "WASM sink call must pass the value before clearing the caller local"
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_direct_sink_call_clears_caller_source() {
+        // Capability analysis normally rejects the final read. The WASM test
+        // intentionally bypasses that pass to observe the physical ABI.
+        let value = run_source(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main() {\n\
+                 let y = 42 :cap lineariso\n\
+                 let z = take(y)\n\
+                 y\n\
+             }",
+        )
+        .expect("run post-sink source read");
+        assert!(
+            value.is_nil(),
+            "WASM sink call must invalidate the caller source local"
         );
     }
 

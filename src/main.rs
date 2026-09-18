@@ -40,7 +40,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 const VERSION: &str = "0.1.0";
-use nulang::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+use nulang::effect_checker::{CapabilityAnalyzer, EffectChecker};
 use nulang::lexer::Lexer;
 use nulang::parser::Parser;
 use nulang::repl::Repl;
@@ -1632,9 +1632,7 @@ fn run_frontend(
     // name -> EffectRow map (declared rows where present, fixpoint-inferred
     // otherwise) so that call sites propagate callee effects, then enforce
     // declared rows. Bodies without a declared row are inference-only.
-    // Nested `module {}` decls are flattened first (mirroring the
-    // typechecker's flatten_decls).
-    let flat_decls = nulang::effect_checker::flatten_decls(&ast.decls);
+    // Nested `module {}` decls are flattened by the checker itself.
     let mut effect_checker = EffectChecker::new();
     effect_checker.set_resource_grants(with_capabilities);
     effect_checker.check_module(&ast.decls)?;
@@ -1662,70 +1660,11 @@ fn run_frontend(
         });
     }
 
-    // 5. Capability analysis over the same body set.
+    // 5. Capability analysis. The analyzer registers module-level function
+    // parameter capability signatures before walking bodies, so direct calls
+    // can enforce linear ownership sinks consistently across the whole module.
     let mut cap_analyzer = CapabilityAnalyzer::new();
-    let cap_body = |analyzer: &mut CapabilityAnalyzer,
-                    ctx: &CapContext,
-                    body: &nulang::ast::Expr|
-     -> NuResult<()> { analyzer.infer_cap(ctx, body).map(|_| ()) };
-    let seed_from_params = |ctx: &mut CapContext, params: &[nulang::ast::Param]| {
-        for p in params {
-            if let Some(c) = p.cap {
-                *ctx = ctx.clone().with_binding(&p.name, c);
-            }
-        }
-    };
-    for decl in flat_decls.iter().copied() {
-        match decl {
-            nulang::ast::Decl::Function { body, params, .. } => {
-                let mut ctx = CapContext::new();
-                seed_from_params(&mut ctx, params);
-                cap_body(&mut cap_analyzer, &ctx, body)?;
-            }
-            nulang::ast::Decl::Actor {
-                behaviors,
-                state_fields,
-                init,
-                ..
-            } => {
-                for b in behaviors {
-                    let mut ctx = CapContext::new();
-                    seed_from_params(&mut ctx, &b.params);
-                    cap_body(&mut cap_analyzer, &ctx, &b.body)?;
-                }
-                for (_, _, _, default) in state_fields {
-                    let ctx = CapContext::new();
-                    cap_body(&mut cap_analyzer, &ctx, default)?;
-                }
-                for (_, expr) in init {
-                    let ctx = CapContext::new();
-                    cap_body(&mut cap_analyzer, &ctx, expr)?;
-                }
-            }
-            nulang::ast::Decl::Workflow {
-                items, compensate, ..
-            } => {
-                for item in items {
-                    let steps: &[nulang::ast::WorkflowStep] = match item {
-                        nulang::ast::WorkflowItem::Step(s) => std::slice::from_ref(s),
-                        nulang::ast::WorkflowItem::Parallel(steps) => steps,
-                    };
-                    for step in steps {
-                        let ctx = CapContext::new();
-                        cap_body(&mut cap_analyzer, &ctx, &step.body)?;
-                        if let Some(comp) = &step.compensate {
-                            cap_body(&mut cap_analyzer, &ctx, comp)?;
-                        }
-                    }
-                }
-                if let Some(comp) = compensate {
-                    let ctx = CapContext::new();
-                    cap_body(&mut cap_analyzer, &ctx, comp)?;
-                }
-            }
-            _ => {}
-        }
-    }
+    cap_analyzer.check_module(&ast.decls)?;
 
     Ok((ast, type_checker))
 }

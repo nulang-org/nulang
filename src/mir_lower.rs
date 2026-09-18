@@ -21,7 +21,7 @@
 use crate::ast::Pattern;
 use crate::hir;
 use crate::mir;
-use crate::types::{NuError, NuResult, Span, Type};
+use crate::types::{Capability, NuError, NuResult, Span, Type};
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
@@ -79,6 +79,10 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
             }
             let idx = ctx.reserve_function(&f.name);
             ctx.func_map.insert(f.name.clone(), idx);
+            ctx.func_param_caps.insert(idx, f.param_caps.clone());
+            if f.param_caps.iter().any(|cap| cap.is_linear()) {
+                ctx.sink_functions.insert(f.name.clone());
+            }
         }
         hir::Decl::ExternBlock { library, funcs, .. } => {
             for f in funcs {
@@ -264,6 +268,13 @@ struct ModuleCtx {
     name: String,
     functions: Vec<Option<mir::Function>>,
     func_map: FxHashMap<String, usize>,
+    /// Module functions with at least one linear/lineariso parameter. Until
+    /// function values carry parameter-capability signatures, these functions
+    /// are direct-call-only so the caller-side sink transfer cannot be lost.
+    sink_functions: HashSet<String>,
+    /// Parameter capabilities by reserved top-level function index. This is
+    /// available before bodies are lowered, including forward references.
+    func_param_caps: FxHashMap<usize, Vec<Capability>>,
     extern_map: FxHashMap<String, usize>,
     foreign: Vec<mir::ForeignFunction>,
     /// Actor behaviors, reserved (with their fully-qualified "Actor.behavior"
@@ -289,6 +300,8 @@ impl ModuleCtx {
             name: name.to_string(),
             functions: Vec::new(),
             func_map: FxHashMap::default(),
+            sink_functions: HashSet::new(),
+            func_param_caps: FxHashMap::default(),
             extern_map: FxHashMap::default(),
             foreign: Vec::new(),
             behaviors: Vec::new(),
@@ -400,9 +413,7 @@ fn lower_function_def(ctx: &mut ModuleCtx, f: &hir::FunctionDef) -> NuResult<mir
         ));
     }
     for ((name, ty), cap) in f.params.iter().zip(&f.param_caps) {
-        let id = lowerer
-            .b
-            .add_param_with_cap(name.clone(), ty.clone(), *cap);
+        let id = lowerer.b.add_param_with_cap(name.clone(), ty.clone(), *cap);
         lowerer.bind(name, id);
     }
     lowerer.lower_body_top(&f.body)?;
@@ -777,6 +788,15 @@ impl<'c> FnLowerer<'c> {
                     return Ok(id);
                 }
                 if let Some(&idx) = self.ctx.func_map.get(name) {
+                    if self.ctx.sink_functions.contains(name) {
+                        return Err(compile_err(
+                            format!(
+                                "function '{}' has linear ownership-sink parameters and cannot be used as a first-class value yet",
+                                name
+                            ),
+                            Span::default(),
+                        ));
+                    }
                     // Reference to a top-level function used as a value.
                     let id = self.b.add_temp(Type::unit());
                     self.b.assign(
@@ -1015,12 +1035,22 @@ impl<'c> FnLowerer<'c> {
                 for a in args {
                     aids.push(self.lower_operand(a)?);
                 }
-                let func_ref = match func {
+                let (func_ref, sink_args) = match func {
                     hir::Operand::Var(name, _) => {
                         if let Some(id) = self.lookup(name) {
-                            mir::FuncRef::Local(id)
+                            (mir::FuncRef::Local(id), vec![false; aids.len()])
                         } else if let Some(&idx) = self.ctx.func_map.get(name) {
-                            mir::FuncRef::Index(idx)
+                            let mut sinks = self
+                                .ctx
+                                .func_param_caps
+                                .get(&idx)
+                                .map(|caps| {
+                                    caps.iter().map(|cap| cap.is_linear()).collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            sinks.resize(aids.len(), false);
+                            sinks.truncate(aids.len());
+                            (mir::FuncRef::Index(idx), sinks)
                         } else if let Some(&eidx) = self.ctx.extern_map.get(name) {
                             self.b.assign(
                                 dst,
@@ -1031,10 +1061,6 @@ impl<'c> FnLowerer<'c> {
                             );
                             return Ok(());
                         } else if let Some(&has_payload) = self.ctx.ctor_map.get(name) {
-                            // Declared variant constructor call. Locals,
-                            // top-level functions and externs shadow
-                            // constructors (resolved above), so a user
-                            // `fn Some(...)` wins over the ctor.
                             return self.lower_ctor_call(dst, name, has_payload, aids);
                         } else {
                             return Err(compile_err(
@@ -1045,7 +1071,7 @@ impl<'c> FnLowerer<'c> {
                     }
                     _ => {
                         let id = self.lower_operand(func)?;
-                        mir::FuncRef::Local(id)
+                        (mir::FuncRef::Local(id), vec![false; aids.len()])
                     }
                 };
                 self.b.assign(
@@ -1053,6 +1079,7 @@ impl<'c> FnLowerer<'c> {
                     mir::RValue::Call {
                         func: func_ref,
                         args: aids,
+                        sink_args,
                     },
                 );
                 Ok(())
@@ -2577,7 +2604,9 @@ fn rvalue_use_locals(op: &mir::RValue, out: &mut Vec<mir::LocalId>) {
         | StateGet { .. } => {}
         mir::RValue::Resume(x) => out.push(*x),
         ReceiveWait { timeout, .. } => out.push(*timeout),
-        Load(x) | ArrayLen(x) | Unary(_, x) | CapabilityCheck { val: x } => out.push(*x),
+        Load(x) | MoveOut(x) | ArrayLen(x) | Unary(_, x) | CapabilityCheck { val: x } => {
+            out.push(*x)
+        }
         PerformAsync { args, .. } => out.extend(args.iter().copied()),
         LoadFieldNamed { obj, .. } | LoadFieldPos { obj, .. } => out.push(*obj),
         ArrayLoad { arr, idx } => {
@@ -2589,7 +2618,7 @@ fn rvalue_use_locals(op: &mir::RValue, out: &mut Vec<mir::LocalId>) {
             out.push(*l);
             out.push(*r);
         }
-        Call { func, args } => {
+        Call { func, args, .. } => {
             if let mir::FuncRef::Local(f) = func {
                 out.push(*f);
             }
@@ -2921,6 +2950,43 @@ mod tests {
         assert_eq!(
             f.locals[p.0 as usize].cap,
             crate::types::Capability::LinearIso
+        );
+    }
+
+    #[test]
+    fn test_sink_function_cannot_be_lowered_as_first_class_value() {
+        let result = lower_source("fn take(lineariso x: Int) -> Int { x }\nlet f = take in 0");
+        let err = result.expect_err("sink-bearing function value must be rejected");
+        assert!(
+            err.to_string()
+                .contains("cannot be used as a first-class value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_sink_function_direct_call_still_lowers() {
+        let module = lower_source(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main(lineariso y: Int) -> Int { take(y) }",
+        )
+        .expect("direct sink call should lower");
+        let main = find_fn(&module, "main");
+        assert!(
+            main.blocks.iter().flat_map(|b| &b.stmts).any(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::Call {
+                            func: mir::FuncRef::Index(_),
+                            sink_args,
+                            ..
+                        },
+                        ..
+                    } if sink_args == &vec![true]
+                )
+            }),
+            "direct sink call should remain statically resolved and carry its ownership-transfer mask"
         );
     }
 

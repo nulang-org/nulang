@@ -43,7 +43,7 @@
 pub mod rewind;
 
 use crate::bytecode::{CodeModule, OpCode};
-use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+use crate::effect_checker::{CapabilityAnalyzer, EffectChecker};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::runtime::PersistenceStore;
@@ -264,71 +264,9 @@ fn compile_source(source: &str, file_path: Option<&str>, name: &str) -> NuResult
     let mut effect_checker = EffectChecker::new();
     effect_checker.check_module(&ast.decls)?;
 
-    // 5. Capability analysis (mirrors main.rs's loop over bodies).
-    let flat_decls = crate::effect_checker::flatten_decls(&ast.decls);
+    // 5. Capability analysis: same canonical module pass as CLI/LSP.
     let mut cap_analyzer = CapabilityAnalyzer::new();
-    let cap_body = |analyzer: &mut CapabilityAnalyzer,
-                    ctx: &CapContext,
-                    body: &crate::ast::Expr|
-     -> NuResult<()> { analyzer.infer_cap(ctx, body).map(|_| ()) };
-    let seed_from_params = |ctx: &mut CapContext, params: &[crate::ast::Param]| {
-        for p in params {
-            if let Some(c) = p.cap {
-                *ctx = ctx.clone().with_binding(&p.name, c);
-            }
-        }
-    };
-    for decl in flat_decls.iter().copied() {
-        match decl {
-            crate::ast::Decl::Function { body, params, .. } => {
-                let mut ctx = CapContext::new();
-                seed_from_params(&mut ctx, params);
-                cap_body(&mut cap_analyzer, &ctx, body)?;
-            }
-            crate::ast::Decl::Actor {
-                behaviors,
-                state_fields,
-                init,
-                ..
-            } => {
-                for b in behaviors {
-                    let mut ctx = CapContext::new();
-                    seed_from_params(&mut ctx, &b.params);
-                    cap_body(&mut cap_analyzer, &ctx, &b.body)?;
-                }
-                for (_, _, _, default) in state_fields {
-                    let ctx = CapContext::new();
-                    cap_body(&mut cap_analyzer, &ctx, default)?;
-                }
-                for (_, expr) in init {
-                    let ctx = CapContext::new();
-                    cap_body(&mut cap_analyzer, &ctx, expr)?;
-                }
-            }
-            crate::ast::Decl::Workflow {
-                items, compensate, ..
-            } => {
-                for item in items {
-                    let steps: &[crate::ast::WorkflowStep] = match item {
-                        crate::ast::WorkflowItem::Step(s) => std::slice::from_ref(s),
-                        crate::ast::WorkflowItem::Parallel(steps) => steps,
-                    };
-                    for step in steps {
-                        let ctx = CapContext::new();
-                        cap_body(&mut cap_analyzer, &ctx, &step.body)?;
-                        if let Some(comp) = &step.compensate {
-                            cap_body(&mut cap_analyzer, &ctx, comp)?;
-                        }
-                    }
-                }
-                if let Some(comp) = compensate {
-                    let ctx = CapContext::new();
-                    cap_body(&mut cap_analyzer, &ctx, comp)?;
-                }
-            }
-            _ => {}
-        }
-    }
+    cap_analyzer.check_module(&ast.decls)?;
 
     // 6. Lower and compile.
     let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);

@@ -3363,6 +3363,45 @@ impl VM {
                 span: Span::default(),
             });
         }
+        let sink_info = self.modules.get(module_idx).and_then(|m| {
+            m.debug_functions
+                .iter()
+                .find(|info| info.code_offset == code_offset)
+                .map(|info| (info.sink_mask, info.sink_metadata_present))
+        });
+
+        // Safe host invocation borrows its input slice. A pointer-valued
+        // argument cannot enter a linear ownership sink through this API:
+        // retaining it would preserve memory safety but violate lineariso
+        // uniqueness by leaving the host with a live alias, while transferring
+        // it would contradict the borrowed &[Value] contract.
+        //
+        // Fresh compiler artifacts publish authoritative runtime-only sink
+        // metadata. Without that metadata (e.g. a deserialized/stripped
+        // artifact), any pointer host call fails closed because the VM cannot
+        // prove that no parameter will consume the pointer.
+        let has_pointer_args = args.iter().any(|v| v.as_ptr().is_some());
+        let metadata_present = sink_info.map(|(_, present)| present).unwrap_or(false);
+        if has_pointer_args && !metadata_present {
+            return Err(NuError::VMError {
+                msg: "call_function: pointer arguments require authoritative function ownership metadata"
+                    .to_string(),
+                span: Span::default(),
+            });
+        }
+        let sink_mask = sink_info.map(|(mask, _)| mask).unwrap_or(0);
+        for (i, arg) in args.iter().enumerate() {
+            if arg.as_ptr().is_some() && i < u16::BITS as usize && (sink_mask & (1u16 << i)) != 0 {
+                return Err(NuError::VMError {
+                    msg: format!(
+                        "call_function: pointer argument {} targets a linear ownership sink; borrowed host calls cannot transfer unique ownership",
+                        i + 1
+                    ),
+                    span: Span::default(),
+                });
+            }
+        }
+
         self.yield_pending = false;
         self.frames.clear();
         self.current_frame_idx = Some(0);
@@ -4893,6 +4932,14 @@ impl VM {
                 let mut new_frame = Frame::new(Some(frame_idx), module_idx);
                 new_frame.pc = code_offset;
                 new_frame.regs[..argc as usize].copy_from_slice(&frame.regs[..argc as usize]);
+                // r0..rN are transient call staging slots. Once copied into
+                // the callee frame they must not remain stale pointer roots
+                // in the suspended caller. Sink calls additionally clear
+                // their source locals during staging; ordinary calls keep
+                // their source locals and lose only these scratch duplicates.
+                for reg in &mut frame.regs[..argc as usize] {
+                    *reg = Value::nil();
+                }
                 new_frame.return_dst = dst;
                 new_frame.closure_env = closure_env;
                 self.frames.push(new_frame);
@@ -6085,6 +6132,86 @@ fn module_with_handler_table(bindings: Vec<crate::bytecode::HandlerBinding>) -> 
 mod vm_tests {
     use super::*;
     use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
+
+    fn host_sink_test_module() -> crate::bytecode::CodeModule {
+        let mut b = crate::mir::FunctionBuilder::new("take", Some(crate::types::Type::int()));
+        let param = b.add_param_with_cap(
+            "p",
+            crate::types::Type::unit(),
+            crate::types::Capability::LinearIso,
+        );
+        let len = b.add_temp(crate::types::Type::int());
+        b.assign(len, crate::mir::RValue::ArrayLen(param));
+        b.terminate(crate::mir::Terminator::Return(Some(len)));
+
+        let mut module = crate::mir::Module::new("host_sink");
+        module.functions.push(b.build());
+        crate::mir_codegen::compile_mir(&mut module, "host_sink").expect("compile host sink")
+    }
+
+    #[test]
+    fn test_call_function_rejects_borrowed_pointer_for_linear_sink() {
+        let module = host_sink_test_module();
+        let offset = module.function_table[0];
+        let sink_info = module
+            .debug_functions
+            .iter()
+            .find(|info| info.code_offset == offset)
+            .expect("compiled function debug info");
+        assert_eq!(
+            sink_info.sink_mask, 1,
+            "compiled linear parameter must publish its sink bit"
+        );
+        assert!(
+            sink_info.sink_metadata_present,
+            "freshly compiled modules must mark sink metadata authoritative"
+        );
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let (ptr, value) = vm
+            .actor_callbacks
+            .alloc_value(std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("host array allocation");
+
+        let err = vm
+            .call_function(0, offset, &[value])
+            .expect_err("borrowed host pointer must not enter a linear sink");
+        assert!(
+            err.to_string().contains("cannot transfer unique ownership"),
+            "unexpected host sink error: {err}"
+        );
+        assert_eq!(
+            vm.actor_callbacks.array_len(ptr),
+            Some(1),
+            "rejected host sink call must leave the host-owned pointer live"
+        );
+        vm.actor_callbacks.drop_ref(ptr);
+    }
+
+    #[test]
+    fn test_call_function_rejects_pointer_when_ownership_metadata_missing() {
+        let mut module = host_sink_test_module();
+        let offset = module.function_table[0];
+        module.debug_functions.clear();
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let (ptr, value) = vm
+            .actor_callbacks
+            .alloc_value(std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("host array allocation");
+
+        let err = vm
+            .call_function(0, offset, &[value])
+            .expect_err("pointer host call without ownership metadata must fail closed");
+        assert!(
+            err.to_string().contains("ownership metadata"),
+            "unexpected host-call error: {err}"
+        );
+        assert_eq!(vm.actor_callbacks.array_len(ptr), Some(1));
+        vm.actor_callbacks.drop_ref(ptr);
+    }
 
     /// A NULL C string return (nil from cstr_to_value) must pass through
     /// instead of erroring on the missing pointer.

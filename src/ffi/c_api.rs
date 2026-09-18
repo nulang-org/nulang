@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 
-use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+use crate::effect_checker::{CapabilityAnalyzer, EffectChecker};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::typechecker::TypeChecker;
@@ -228,22 +228,7 @@ fn compile_source(source: &str) -> Result<crate::bytecode::CodeModule, NuError> 
     effect_checker.check_module(&ast.decls)?;
 
     let mut cap_analyzer = CapabilityAnalyzer::new();
-    let cap_ctx = CapContext::new();
-    for decl in crate::effect_checker::flatten_decls(&ast.decls) {
-        match decl {
-            crate::ast::Decl::Function { body, params, .. } => {
-                let ctx = cap_ctx.with_params(params);
-                cap_analyzer.infer_cap(&ctx, body)?;
-            }
-            crate::ast::Decl::Actor { behaviors, .. } => {
-                for behavior in behaviors {
-                    let ctx = cap_ctx.with_params(&behavior.params);
-                    cap_analyzer.infer_cap(&ctx, &behavior.body)?;
-                }
-            }
-            _ => {}
-        }
-    }
+    cap_analyzer.check_module(&ast.decls)?;
 
     let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
     let mut mir = crate::mir_lower::lower_module(&hir)?;

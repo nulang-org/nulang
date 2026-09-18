@@ -341,6 +341,7 @@ fn all_uses_are_calls(func: &Function, local: LocalId, calls: &mut Vec<CallSite>
                         RValue::Call {
                             func: FuncRef::Local(f),
                             args,
+                            ..
                         },
                 } if *f == local => {
                     calls.push(CallSite {
@@ -383,7 +384,7 @@ fn rvalue_uses_local(rv: &RValue, local: LocalId) -> bool {
         RValue::Load(id) | RValue::MoveOut(id) => *id == local,
         RValue::Panic(_) => false,
         RValue::Closure { func: _, captures } => captures.iter().any(|c| *c == local),
-        RValue::Call { func, args } => {
+        RValue::Call { func, args, .. } => {
             (match func {
                 FuncRef::Local(id) => *id == local,
                 FuncRef::Index(_) => false,
@@ -629,9 +630,14 @@ fn remap_rvalue(rv: &RValue, remap: &FxHashMap<LocalId, LocalId>) -> RValue {
             func: *func,
             captures: remap_locals(captures, remap),
         },
-        RValue::Call { func, args } => RValue::Call {
+        RValue::Call {
+            func,
+            args,
+            sink_args,
+        } => RValue::Call {
             func: remap_funcref(func, remap),
             args: remap_locals(args, remap),
+            sink_args: sink_args.clone(),
         },
         RValue::Tuple(vals) => RValue::Tuple(remap_locals(vals, remap)),
         RValue::ArrayLit(vals) => RValue::ArrayLit(remap_locals(vals, remap)),
@@ -851,6 +857,7 @@ mod tests {
             RValue::Call {
                 func: FuncRef::Local(clos),
                 args: vec![c5],
+                sink_args: vec![false],
             },
         );
         caller.terminate(Terminator::Return(Some(result)));
@@ -994,6 +1001,7 @@ mod tests {
             RValue::Call {
                 func: FuncRef::Local(clos),
                 args: vec![c2],
+                sink_args: vec![false],
             },
         );
         caller.terminate(Terminator::Return(Some(result)));

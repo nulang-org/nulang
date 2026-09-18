@@ -112,6 +112,27 @@ two major versions.*
   site. Regression coverage includes register↔spill and spill↔spill transfer
   semantics plus non-owning ABI parameters.
 
+- **Linear sink call ABI** (`src/effect_checker.rs`, `src/mir.rs`,
+  `src/mir_lower.rs`, `src/mir_codegen.rs`, `src/vm.rs`,
+  `src/mir_wasm.rs`, `src/aot/`): direct calls now carry an explicit
+  non-serialized `sink_args` mask in MIR. A `lineariso`/`linear`
+  parameter is an ownership sink: reusable caller bindings must have the
+  same linear capability, while ephemeral literals may be consumed directly
+  for compatibility with the existing conformance contract. Bytecode stages
+  sink arguments by moving and invalidating the caller slot (including spill
+  slots), clears transient call-staging registers after frame transfer, and
+  lets ordinary callees treat linear parameters as owned drop candidates.
+  WASM clears the caller local after pushing the argument, native AOT removes
+  the source SSA binding after the call, and WasmFX rejects sink calls until
+  CIR can represent source invalidation. Sink-bearing functions are
+  direct-call-only until first-class function values carry parameter
+  capability signatures. Borrowing host invocation uses authoritative
+  runtime-only function metadata: pointer-valued arguments are rejected at
+  linear sink positions because a borrowed `&[Value]` call cannot transfer
+  unique ownership, while deserialized/stripped artifacts fail closed for all
+  pointer host calls because their sink metadata is deliberately not serialized.
+  No opcode or NBC v1 format change is required.
+
 - **Path-sensitive move safety** (`src/effect_checker.rs`,
   `conformance/behavior/cap_13_*`): capability analysis now keeps
   must-use/definite-consumption separate from may-have-moved state. Definite

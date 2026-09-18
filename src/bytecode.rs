@@ -654,6 +654,16 @@ pub struct DebugFunctionInfo {
     pub code_len: usize,
     /// Register indices of the function parameters.
     pub params: Vec<usize>,
+    /// Bit i is set when parameter i is a linear/lineariso ownership sink.
+    /// Runtime-only: preserving Frozen NBC v1 means this metadata is not
+    /// serialized. Deserialized artifacts therefore fail closed for pointer
+    /// host calls instead of guessing ownership.
+    #[serde(skip)]
+    pub sink_mask: u16,
+    /// True only for modules compiled in this process with authoritative
+    /// sink metadata. Serde leaves this false on deserialization.
+    #[serde(skip)]
+    pub sink_metadata_present: bool,
     /// `(register index, optional local name)` for every local.
     pub locals: Vec<(usize, Option<String>)>,
 }

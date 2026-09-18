@@ -216,6 +216,9 @@ pub enum RValue {
     Call {
         func: FuncRef,
         args: Vec<LocalId>,
+        /// Positions whose argument local transfers its counted ownership
+        /// into the callee. Length always matches `args`.
+        sink_args: Vec<bool>,
     },
     /// Create a closure over module function `func` capturing `captures`.
     Closure {
@@ -648,6 +651,7 @@ mod tests {
         let _ = RValue::Call {
             func: FuncRef::Index(0),
             args: vec![LocalId(0)],
+            sink_args: vec![false],
         };
         let _ = RValue::Closure {
             func: 0,

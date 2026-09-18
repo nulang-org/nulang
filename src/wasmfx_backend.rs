@@ -193,6 +193,25 @@ impl WasmFxBackend {
                                 span: crate::types::Span::default(),
                             });
                         }
+                        if let mir::RValue::Call {
+                            args, sink_args, ..
+                        } = op
+                        {
+                            if args.len() != sink_args.len() {
+                                return Err(crate::types::NuError::VMError {
+                                    msg: "MIR call sink mask length does not match argument count"
+                                        .into(),
+                                    span: crate::types::Span::default(),
+                                });
+                            }
+                            if sink_args.iter().any(|sink| *sink) {
+                                return Err(crate::types::NuError::VMError {
+                                    msg: "WasmFX backend restricted profile: ownership-sink calls are not supported yet because CIR cannot encode caller-source invalidation; use the bytecode, WASM, or native backend"
+                                        .into(),
+                                    span: crate::types::Span::default(),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -1093,6 +1112,23 @@ mod tests {
         assert_eq!(&wasm[0..4], b"\0asm", "not valid WASM magic");
         // Should contain i64.sub (0x7D)
         assert!(wasm.contains(&0x7Du8), "missing i64.sub");
+    }
+
+    #[test]
+    fn test_wasmfx_fails_closed_on_ownership_sink_call() {
+        let err = compile_source_to_wasmfx(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main() -> Int {\n\
+                 let y = 42 :cap lineariso\n\
+                 take(y)\n\
+             }",
+        )
+        .expect_err("WasmFX must not erase ownership-sink source invalidation");
+        assert!(
+            err.to_string()
+                .contains("ownership-sink calls are not supported yet"),
+            "unexpected WasmFX sink error: {err}"
+        );
     }
 
     #[test]

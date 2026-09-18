@@ -2131,6 +2131,29 @@ fn compile_stmt(
                     captured_closure_locals.insert(reg);
                 }
             }
+            if let mir::RValue::Call {
+                func: mir::FuncRef::Local(_),
+                sink_args,
+                ..
+            } = op
+            {
+                if sink_args.iter().any(|sink| *sink) {
+                    return Err(AotCompileError::Internal(
+                        "dynamic/closure calls cannot carry ownership-sink arguments".into(),
+                    ));
+                }
+            }
+            if let mir::RValue::Call {
+                args, sink_args, ..
+            } = op
+            {
+                if args.len() != sink_args.len() {
+                    return Err(AotCompileError::Internal(
+                        "call sink mask length does not match argument count".into(),
+                    ));
+                }
+            }
+
             let val = compile_rvalue(
                 builder,
                 op,
@@ -2146,11 +2169,27 @@ fn compile_stmt(
                 foreign_functions,
             )?;
             let reg = mir::FunctionBuilder::LOCAL_BASE + dst.0;
-            if let mir::RValue::MoveOut(src) = op {
-                // Cranelift locals are SSA values in this map. Removing the
-                // source models MoveOut invalidation; the destination below
-                // receives the exact value without retain/release.
-                local_vals.remove(&(mir::FunctionBuilder::LOCAL_BASE + src.0));
+            match op {
+                mir::RValue::MoveOut(src) => {
+                    // Cranelift locals are SSA values in this map. Removing
+                    // the source models MoveOut invalidation; the destination
+                    // below receives the exact value without retain/release.
+                    local_vals.remove(&(mir::FunctionBuilder::LOCAL_BASE + src.0));
+                }
+                mir::RValue::Call {
+                    args, sink_args, ..
+                } => {
+                    // The call has already consumed the argument SSA values.
+                    // Sink positions transfer ownership, so those source
+                    // bindings are unavailable in the caller immediately
+                    // after the call.
+                    for (arg, sink) in args.iter().zip(sink_args) {
+                        if *sink {
+                            local_vals.remove(&(mir::FunctionBuilder::LOCAL_BASE + arg.0));
+                        }
+                    }
+                }
+                _ => {}
             }
             local_vals.insert(reg, val);
             Ok(())
@@ -2298,7 +2337,7 @@ fn compile_rvalue(
             compile_unary(builder, *op, *operand, type_meta, helpers, local_vals, mode)
         }
 
-        mir::RValue::Call { func, args } => {
+        mir::RValue::Call { func, args, .. } => {
             let callee_ref = match func {
                 mir::FuncRef::Index(n) => call_targets.get(n).copied().ok_or_else(|| {
                     AotCompileError::Internal(format!("call target fn {} not compiled yet", n))

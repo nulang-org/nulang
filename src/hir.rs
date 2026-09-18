@@ -629,6 +629,7 @@ mod tests {
             name: "f".into(),
             type_params: vec![],
             params: vec![],
+            param_caps: vec![],
             dict_params: vec![],
             ret: Type::unit(),
             effect: EffectRow::empty(),

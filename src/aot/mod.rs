@@ -1910,6 +1910,53 @@ fn collect_rvalue_field_and_consts(
 
 #[cfg(test)]
 mod tests {
+    fn compile_aot_source(source: &str) -> Result<super::AotModule, crate::types::NuError> {
+        let tokens = crate::lexer::Lexer::new(source).lex()?;
+        let ast = crate::parser::Parser::new(tokens).parse_module()?;
+        let mut tc = crate::typechecker::TypeChecker::new();
+        tc.check_module(&ast)?;
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mir = crate::mir_lower::lower_module(&hir)?;
+        super::AotModule::compile(&mir)
+    }
+
+    #[test]
+    fn test_aot_direct_sink_call_delivers_value() {
+        let aot = compile_aot_source(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main() -> Int {\n\
+                 let y = 42 :cap lineariso\n\
+                 take(y)\n\
+             }",
+        )
+        .expect("AOT sink call compile");
+        let raw = aot.run().expect("AOT sink call run");
+        assert_eq!(
+            unsafe { crate::vm::Value::from_raw(raw) }.as_int(),
+            Some(42),
+            "native sink call must deliver the transferred value"
+        );
+    }
+
+    #[test]
+    fn test_aot_direct_sink_call_invalidates_source_ssa() {
+        let result = compile_aot_source(
+            "fn take(lineariso x: Int) -> Int { x }\n\
+             fn main() {\n\
+                 let y = 42 :cap lineariso\n\
+                 let z = take(y)\n\
+                 y\n\
+             }",
+        );
+        let err = result.expect_err(
+            "native compilation must reject a post-sink read after the source SSA binding is removed",
+        );
+        assert!(
+            err.to_string().contains("uninitialized local"),
+            "unexpected AOT ownership error: {err}"
+        );
+    }
+
     /// End-to-end: `"hello" + 2 + 3` must concatenate with coercion ("hello23"),
     /// not fall through to integer arithmetic on the string's tag bits. Replicates
     /// `AotModule::run`'s heap + constants setup but keeps the heap alive so the

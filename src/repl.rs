@@ -596,12 +596,11 @@ impl Repl {
         let mut effect_checker = EffectChecker::new();
         effect_checker.check_module(&combined_module.decls)?;
 
-        // Capability analysis
+        // Capability analysis over the full accumulated + current module.
+        // This keeps REPL calls to previously-defined sink functions aligned
+        // with the CLI/LSP ownership contract.
         let mut cap_analyzer = CapabilityAnalyzer::new();
-        let cap_ctx = CapContext::new();
-        if let Some(ref expr) = main_expr {
-            let _cap = cap_analyzer.infer_cap(&cap_ctx, expr)?;
-        }
+        cap_analyzer.check_module(&combined_module.decls)?;
 
         // Compile the combined module via the HIR/MIR pipeline.
         let code_module = compile_with_new_pipeline(&combined_module, "repl", &self.type_checker)?;
@@ -1001,8 +1000,10 @@ impl Repl {
         let ast = parse_source(&wrapped)?;
         let expr = extract_main_expr(&ast)?;
         let mut cap_analyzer = CapabilityAnalyzer::new();
-        let cap_ctx = CapContext::new();
-        let cap = cap_analyzer.infer_cap(&cap_ctx, &expr)?;
+        let mut signature_decls = self.accumulated_decls.clone();
+        signature_decls.extend(ast.decls.clone());
+        cap_analyzer.register_function_param_caps(&signature_decls)?;
+        let cap = cap_analyzer.infer_cap(&CapContext::new(), &expr)?;
         println!("Capability: {:?}", cap);
         Ok(())
     }
