@@ -811,6 +811,14 @@ impl Runtime {
         self.fabric_stream_store_mut()?.committed_sequence(name)
     }
 
+    /// Return the durable replication epoch, if replication policy has been established.
+    pub fn fabric_stream_epoch(&mut self, name: &str) -> io::Result<Option<u64>> {
+        Ok(self
+            .fabric_stream_store_mut()?
+            .replication_policy(name)?
+            .map(|policy| policy.epoch))
+    }
+
     pub fn fabric_stream_read_committed(
         &mut self,
         name: &str,
