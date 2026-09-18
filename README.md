@@ -154,6 +154,7 @@ Nulang ships with `nula`, a package manager invoked as `nulang nula <subcommand>
 nulang nula new my-app       # scaffold a new package
 nulang nula init             # initialize a package in the current directory
 nulang nula build            # resolve dependencies + type-check
+nulang nula build-wasm       # emit WASM + Behavior Manifest + AOT artifact
 nulang nula run              # build and run the entry point
 nulang nula test             # discover and run tests/ directory
 nulang nula add <name>       # add a dependency (--path, --git, --version)
