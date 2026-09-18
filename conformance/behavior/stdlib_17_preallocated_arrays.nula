@@ -1,0 +1,31 @@
+// Regression coverage for Int/tuple-of-Int stdlib array producers after
+// replacing repeated copy-on-append construction with safe preallocation.
+import stdlib::list
+
+fn main() {
+    let ranged = range(5)
+    perform IO.print(ranged[4])
+    perform IO.print(length(range(-2)))
+
+    let appended = append([1, 2], [3, 4])
+    perform IO.print(appended[0])
+    perform IO.print(appended[3])
+
+    let zipped = zip([1, 2], [10, 20, 30])
+    perform IO.print(length(zipped))
+    perform IO.print(zipped[1].0)
+    perform IO.print(zipped[1].1)
+
+    let enumerated = enumerate([7, 8])
+    perform IO.print(enumerated[1].0)
+    perform IO.print(enumerated[1].1)
+
+    let unique = uniq([1, 2, 1, 3, 2])
+    perform IO.print(length(unique))
+    perform IO.print(unique[0])
+    perform IO.print(unique[2])
+
+    let sorted = sort([4, 1, 3, 2])
+    perform IO.print(sorted[0])
+    perform IO.print(sorted[3])
+}
