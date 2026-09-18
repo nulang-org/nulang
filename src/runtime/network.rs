@@ -1669,7 +1669,8 @@ fn packet_payload_wire_safe(packet: &Packet) -> bool {
                 && v.as_object_id()
                     .map_or(true, |id| (id as usize) < object_table.len())
         }),
-        Packet::SpawnRequest { initial_state, .. } => initial_state
+        Packet::SpawnRequest { initial_state, .. }
+        | Packet::SpawnRequestAuth { initial_state, .. } => initial_state
             .iter()
             .all(|(_, v)| value_is_wire_safe(v, false)),
         _ => true,
