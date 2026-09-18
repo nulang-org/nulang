@@ -343,7 +343,7 @@ impl FabricStreamReplicaAppend {
 }
 
 impl Runtime {
-    fn fabric_stream_policy_for_placement(
+    pub(crate) fn fabric_stream_policy_for_placement(
         &mut self,
         placement: &FabricStreamPlacement,
         epoch: u64,
@@ -363,6 +363,18 @@ impl Runtime {
             replication_factor: placement.replicas.len(),
             replicas: placement.replicas.iter().map(|node| node.0).collect(),
         };
+
+        if let Some(promise) = self.fabric_stream_epoch_promise(&placement.stream)? {
+            if promise.epoch > epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "Fabric stream epoch {epoch} is fenced by durable promise for epoch {}",
+                        promise.epoch
+                    ),
+                ));
+            }
+        }
 
         match self.fabric_stream_replication_policy(&placement.stream)? {
             Some(existing) if existing == proposed => Ok(existing),
@@ -1638,7 +1650,7 @@ impl Runtime {
     }
 }
 
-fn compute_stream_placement(
+pub(crate) fn compute_stream_placement(
     local: NodeId,
     cluster: Option<&ClusterState>,
     stream: &str,
