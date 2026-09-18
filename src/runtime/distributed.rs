@@ -44,7 +44,8 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 
 use super::fabric_stream_cluster::{
-    FabricStreamReplicaAppend, FABRIC_STREAM_REPLICA_BEHAVIOR,
+    FabricStreamReplicaAck, FabricStreamReplicaAppend, FABRIC_STREAM_REPLICA_ACK_BEHAVIOR,
+    FABRIC_STREAM_REPLICA_BEHAVIOR,
 };
 use super::mailbox::{Message, MessagePriority};
 use super::network::{NetworkTransport, Packet};
@@ -1469,6 +1470,7 @@ pub fn process_network_packets(
                 sender_node,
                 ..
             } if behavior_name == FABRIC_STREAM_REPLICA_BEHAVIOR => {
+                let mut application_ack = None;
                 let result = if sender_node != incoming.from_node {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
@@ -1484,7 +1486,20 @@ pub fn process_network_packets(
                                         "Fabric stream replica envelope leader does not match transport peer",
                                     ));
                                 }
-                                runtime.fabric_stream_apply_replica_from_cluster(&append, cluster)
+                                let apply =
+                                    runtime.fabric_stream_apply_replica_from_cluster(&append, cluster);
+                                if let Some(replica) = runtime.distributed.node_id {
+                                    application_ack = Some(FabricStreamReplicaAck {
+                                        stream: append.stream.clone(),
+                                        partition: append.partition,
+                                        leader: append.leader,
+                                        membership_fingerprint: append.membership_fingerprint,
+                                        sequence: append.sequence,
+                                        replica,
+                                        accepted: apply.is_ok(),
+                                    });
+                                }
+                                apply
                             }),
                         _ => Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -1493,14 +1508,82 @@ pub fn process_network_packets(
                     }
                 };
 
-                if let Err(error) = result {
+                if let Err(error) = &result {
                     warn!(
                         "nulang-fabric-stream: rejected replica append from {:?}: {}",
                         incoming.from_node, error
                     );
                 }
-                // This is only the existing transport-level receipt ACK. It
-                // deliberately does not mean the stream record reached quorum.
+
+                // Application-level ACK/NACK is separate from the transport
+                // ACK below. It is emitted only after the follower has tried
+                // exact-sequence durable application.
+                if let Some(application_ack) = application_ack {
+                    if let Ok(bytes) = application_ack.to_wire_bytes() {
+                        let address = cluster
+                            .get_node(application_ack.leader)
+                            .map(|info| info.address)
+                            .or_else(|| transport.connection_addr(application_ack.leader));
+                        if let Some(address) = address {
+                            let packet = Packet::ActorMessage {
+                                target_actor: 0,
+                                behavior_name: FABRIC_STREAM_REPLICA_ACK_BEHAVIOR.to_string(),
+                                content_hash: None,
+                                payload: Vec::new(),
+                                string_table: Vec::new(),
+                                object_table: vec![(0, bytes)],
+                                sender_actor: 0,
+                                sender_node: application_ack.replica,
+                                priority: MessagePriority::System,
+                                trace_id: None,
+                            };
+                            transport.send(application_ack.leader, address, packet);
+                        }
+                    }
+                }
+
+                // Existing transport-level receipt acknowledgement. Quorum
+                // logic never counts this packet.
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_REPLICA_ACK_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric stream replica ACK sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamReplicaAck::from_wire_bytes(bytes)
+                            .and_then(|ack| {
+                                if ack.replica != incoming.from_node {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "Fabric stream replica ACK identity mismatch",
+                                    ));
+                                }
+                                runtime
+                                    .fabric_stream_record_replica_ack(ack)
+                                    .map(|_| ())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric stream replica ACK must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected replica ACK from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             _ => {
