@@ -57,6 +57,18 @@ git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
 ```
+
+The default source build intentionally keeps the compiler/runtime lean. It includes
+the full bytecode language runtime, TLS, TCP/package operations, and native FFI,
+while leaving the Cranelift native backend, Python integration, libSQL/SQLite,
+LSP server, and AI runtime opt-in. To build the previous batteries-included
+developer profile, use:
+
+```bash
+cargo build --release --features extended
+```
+
+Individual integrations can also be enabled directly with `--features <name>`.
 Requires Rust 1.95.0 (pinned by `rust-toolchain.toml`), Linux or macOS. Windows is not supported yet — use [WSL](https://learn.microsoft.com/windows/wsl/) and build inside a Linux environment.
 
 
