@@ -217,6 +217,16 @@ enum CrossShardMsg {
         trace_id: Option<String>,
         grain_id: Option<GrainId>,
     },
+    /// Name-based delivery to an actor owned by another shard. The owning
+    /// shard resolves the name against the target actor's own behavior table;
+    /// the source shard must never guess an id (especially behavior 0).
+    DeliverNamedMessage {
+        target_id: u64,
+        behavior_name: String,
+        payload: Vec<Value>,
+        sender: u64,
+        trace_id: Option<String>,
+    },
     /// Deliver a message whose payload contains object-store refs.  The bytes
     /// are copied because each shard owns a separate `ObjectStore`.
     DeliverMessageWithObjects {
@@ -228,6 +238,15 @@ enum CrossShardMsg {
         sender: u64,
         trace_id: Option<String>,
         grain_id: Option<GrainId>,
+    },
+    /// Name-based delivery with copied object-store refs.
+    DeliverNamedMessageWithObjects {
+        target_id: u64,
+        behavior_name: String,
+        payload: Vec<Value>,
+        objects: Vec<(crate::runtime::object_store::ObjectId, Vec<u8>)>,
+        sender: u64,
+        trace_id: Option<String>,
     },
     /// Enqueue an actor on the target shard (wake from idle/waiting).
     EnqueueActor {
@@ -1366,6 +1385,29 @@ impl Runtime {
                         grain_id,
                     );
                 }
+                CrossShardMsg::DeliverNamedMessage {
+                    target_id,
+                    behavior_name,
+                    payload,
+                    sender,
+                    trace_id,
+                } => {
+                    let Some(behavior_id) = self.behavior_id_for(target_id, &behavior_name) else {
+                        warn!(
+                            "nulang-shard: rejecting named message to actor {}: unknown behavior '{}'",
+                            target_id, behavior_name
+                        );
+                        continue;
+                    };
+                    self.deliver_cross_shard_message(
+                        target_id,
+                        behavior_id,
+                        payload,
+                        sender,
+                        trace_id,
+                        None,
+                    );
+                }
                 CrossShardMsg::DeliverMessageWithObjects {
                     target_id,
                     behavior_id,
@@ -1399,6 +1441,45 @@ impl Runtime {
                         sender,
                         trace_id,
                         grain_id,
+                    );
+                }
+                CrossShardMsg::DeliverNamedMessageWithObjects {
+                    target_id,
+                    behavior_name,
+                    mut payload,
+                    objects,
+                    sender,
+                    trace_id,
+                } => {
+                    let mut id_map: std::collections::HashMap<
+                        crate::runtime::object_store::ObjectId,
+                        crate::runtime::object_store::ObjectId,
+                    > = std::collections::HashMap::with_capacity(objects.len());
+                    for (original_id, bytes) in objects {
+                        let local_id = self.object_store.put(bytes.into_boxed_slice());
+                        id_map.insert(original_id, local_id);
+                    }
+                    for value in &mut payload {
+                        if let Some(id) = value.as_object_id() {
+                            if let Some(&local_id) = id_map.get(&id) {
+                                *value = Value::object(local_id);
+                            }
+                        }
+                    }
+                    let Some(behavior_id) = self.behavior_id_for(target_id, &behavior_name) else {
+                        warn!(
+                            "nulang-shard: rejecting named object message to actor {}: unknown behavior '{}'",
+                            target_id, behavior_name
+                        );
+                        continue;
+                    };
+                    self.deliver_cross_shard_message(
+                        target_id,
+                        behavior_id,
+                        payload,
+                        sender,
+                        trace_id,
+                        None,
                     );
                 }
                 CrossShardMsg::EnqueueActor { actor_id, priority } => {
@@ -1573,6 +1654,22 @@ impl Runtime {
         if !self.actors.contains_key(&target_id) {
             if let Some(node) = self.remote_refs.get(&target_id).copied() {
                 self.route_ref_send(target_id, node, behavior, args);
+                return;
+            }
+        }
+        // A name-based cross-shard send must be resolved by the owning shard.
+        // The source shard often has no target actor/schema metadata, so resolving
+        // here would either reject a valid send or tempt a fail-open id fallback.
+        if self.shard_count > 1 {
+            let target_shard = (target_id % self.shard_count as u64) as u16;
+            if target_shard != self.shard_idx {
+                let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
+                self.send_cross_shard_named_message(
+                    target_id,
+                    behavior,
+                    args.to_vec(),
+                    out_trace,
+                );
                 return;
             }
         }
@@ -2019,6 +2116,59 @@ impl Runtime {
                 trace_id: out_trace,
                 grain_id,
             });
+        }
+        true
+    }
+
+    /// Route a name-based message to the target's owning shard. Resolution is
+    /// intentionally deferred to the destination so an absent source-side actor
+    /// cannot turn a valid name into behavior id 0 (or reject it prematurely).
+    fn send_cross_shard_named_message(
+        &mut self,
+        target_id: u64,
+        behavior_name: &str,
+        args: Vec<Value>,
+        out_trace: Option<String>,
+    ) -> bool {
+        let target_shard = (target_id % self.shard_count as u64) as u16;
+        for arg in &args {
+            if arg.is_ptr() || arg.is_actor_ref() || arg.is_closure() {
+                warn!(
+                    "nulang-shard: dropping named cross-shard message to actor {}: \
+                     payload contains heap pointer / actor ref / closure",
+                    target_id
+                );
+                return false;
+            }
+        }
+        let tx = self.cross_shard_tx.as_ref().unwrap();
+        let object_refs: Vec<crate::runtime::object_store::ObjectId> =
+            args.iter().filter_map(|v| v.as_object_id()).collect();
+        if object_refs.is_empty() {
+            let _ = tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessage {
+                target_id,
+                behavior_name: behavior_name.to_string(),
+                payload: args,
+                sender: self.current_actor.unwrap_or(0),
+                trace_id: out_trace,
+            });
+        } else {
+            let mut objects = Vec::with_capacity(object_refs.len());
+            for id in object_refs {
+                if let Some(entry) = self.object_store.get(id) {
+                    objects.push((id, entry.as_bytes().to_vec()));
+                }
+            }
+            let _ = tx[target_shard as usize].try_send(
+                CrossShardMsg::DeliverNamedMessageWithObjects {
+                    target_id,
+                    behavior_name: behavior_name.to_string(),
+                    payload: args,
+                    objects,
+                    sender: self.current_actor.unwrap_or(0),
+                    trace_id: out_trace,
+                },
+            );
         }
         true
     }
