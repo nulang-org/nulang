@@ -116,7 +116,6 @@ fn stream_replica_dispatch_uses_existing_actor_message_transport() {
     let _ = std::fs::remove_dir_all(root_b);
 }
 
-
 #[test]
 fn stream_quorum_commit_waits_for_application_ack() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -140,7 +139,10 @@ fn stream_quorum_commit_waits_for_application_ack() {
         .handle_heartbeat(node_a, addr_a);
 
     let placement = a.fabric_stream_placement("quorum", 0, 2).unwrap();
-    assert_eq!(placement, b.fabric_stream_placement("quorum", 0, 2).unwrap());
+    assert_eq!(
+        placement,
+        b.fabric_stream_placement("quorum", 0, 2).unwrap()
+    );
 
     let root_a = temp_dir("quorum-a");
     let root_b = temp_dir("quorum-b");
@@ -162,10 +164,7 @@ fn stream_quorum_commit_waits_for_application_ack() {
     assert_eq!(result.status.quorum, 2);
     assert_eq!(result.status.acknowledgements, 1);
     assert!(!result.status.committed);
-    assert_eq!(
-        leader.fabric_stream_read("quorum", 1, 10).unwrap().len(),
-        1
-    );
+    assert_eq!(leader.fabric_stream_read("quorum", 1, 10).unwrap().len(), 1);
     assert!(leader
         .fabric_stream_read_committed("quorum", 1, 10)
         .unwrap()
@@ -226,9 +225,7 @@ fn three_replica_stream_commits_on_majority() {
         }
     }
 
-    let placement = nodes[0]
-        .fabric_stream_placement("majority", 0, 3)
-        .unwrap();
+    let placement = nodes[0].fabric_stream_placement("majority", 0, 3).unwrap();
     for node in &nodes[1..] {
         assert_eq!(
             node.fabric_stream_placement("majority", 0, 3).unwrap(),
@@ -243,10 +240,7 @@ fn three_replica_stream_commits_on_majority() {
         node.fabric_stream_open(root).unwrap();
     }
 
-    let leader_index = ids
-        .iter()
-        .position(|id| *id == placement.leader)
-        .unwrap();
+    let leader_index = ids.iter().position(|id| *id == placement.leader).unwrap();
     nodes[leader_index]
         .fabric_stream_create("majority", FabricStreamConfig::default())
         .unwrap();
@@ -281,7 +275,6 @@ fn three_replica_stream_commits_on_majority() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
-
 
 #[test]
 fn replica_nack_does_not_advance_quorum_commit() {
