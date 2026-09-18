@@ -1182,6 +1182,43 @@ impl Runtime {
         Ok(committed)
     }
 
+    pub(crate) fn fabric_stream_retire_old_epoch_pending(
+        &mut self,
+        stream: &str,
+        partition: u16,
+        through_sequence: u64,
+    ) -> io::Result<()> {
+        for intent in self.fabric_stream_pending_replication_intents(stream)? {
+            if intent.sequence <= through_sequence {
+                self.fabric_stream_remove_replication_intent(stream, intent.sequence)?;
+            }
+        }
+
+        let key = (stream.to_string(), partition);
+        let remove_partition = if let Some(entries) = self
+            .distributed
+            .fabric_stream_replication
+            .pending
+            .get_mut(&key)
+        {
+            entries.retain(|sequence, _| *sequence > through_sequence);
+            entries.is_empty()
+        } else {
+            false
+        };
+        if remove_partition {
+            self.distributed
+                .fabric_stream_replication
+                .pending
+                .remove(&key);
+            self.distributed
+                .fabric_stream_replication
+                .retry_schedules
+                .remove(&key);
+        }
+        Ok(())
+    }
+
     /// Compute deterministic rendezvous placement for a stream partition.
     ///
     /// Failed/Suspicious members remain candidates until confirmed removed, so
