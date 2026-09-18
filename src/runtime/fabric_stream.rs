@@ -565,7 +565,8 @@ impl FileFabricStreamStore {
                 ),
             ));
         }
-        if intent.replication_factor == 0
+        if intent.epoch == 0
+            || intent.replication_factor == 0
             || intent.replicas.len() != intent.replication_factor
             || !intent.replicas.contains(&intent.leader)
         {
