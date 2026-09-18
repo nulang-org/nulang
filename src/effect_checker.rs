@@ -2286,9 +2286,7 @@ impl CapabilityAnalyzer {
                         );
                         if unique {
                             if let Expr::Var(name, var_span) = e.as_ref() {
-                                // Mark consumed regardless of capability —
-                                // mirror `consume x`'s at-most-once rule.
-                                self.consume_linear(name, *var_span, consumed)?;
+                                self.consume_explicit(name, *var_span, consumed)?;
                             } else {
                                 let _ = self.infer_cap_tracked(ctx, e, consumed)?;
                             }
@@ -2509,7 +2507,15 @@ impl CapabilityAnalyzer {
                             .map(|p| (p.clone(), Capability::Ref))
                             .collect::<Vec<_>>(),
                     );
+                    let hidden_params: Vec<(String, HiddenConsumption)> = h
+                        .params
+                        .iter()
+                        .map(|name| (name.clone(), arm_consumed.hide_binding(name)))
+                        .collect();
                     self.infer_cap_tracked(&arm_ctx, &h.body, &mut arm_consumed)?;
+                    for (name, hidden) in hidden_params {
+                        arm_consumed.restore_binding(&name, hidden);
+                    }
                     consumed.union_from(&arm_consumed);
                 }
                 self.infer_cap_tracked(ctx, body, consumed)
@@ -4225,10 +4231,10 @@ mod tests {
     }
 
     #[test]
-    fn test_lineariso_consumed_on_one_branch_then_used_ok() {
-        // Conservative merge: a binding is consumed after an if only if ALL
-        // fall-through paths consume it. The else branch here does not, so
-        // the later use is fine.
+    fn test_lineariso_moved_on_one_branch_then_used_errors() {
+        // Must-use and move-safety have different joins. The else path does
+        // not consume x, so x is not *definitely* consumed after the if; but
+        // the then path may have moved it, so a post-join read is unsafe.
         let mut analyzer = CapabilityAnalyzer::new();
         let ctx = CapContext::new().with_binding("x", Capability::LinearIso);
         let expr = Expr::Block {
@@ -4243,7 +4249,42 @@ mod tests {
             ],
             span: s(),
         };
-        assert!(analyzer.infer_cap(&ctx, &expr).is_ok());
+        let result = analyzer.infer_cap(&ctx, &expr);
+        assert!(result.is_err(), "post-join use must reject maybe-moved x");
+    }
+
+    #[test]
+    fn test_explicit_consume_non_linear_then_use_errors() {
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new().with_binding("x", Capability::Ref);
+        let expr = Expr::Block {
+            exprs: vec![
+                Expr::Consume {
+                    expr: Box::new(lvar("x")),
+                    span: s(),
+                },
+                lvar("x"),
+            ],
+            span: s(),
+        };
+        let result = analyzer.infer_cap(&ctx, &expr);
+        assert!(result.is_err(), "consume x must invalidate x for every capability");
+    }
+
+    #[test]
+    fn test_branch_siblings_do_not_poison_each_other_but_join_is_moved() {
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new().with_binding("x", Capability::LinearIso);
+        let expr = Expr::If {
+            cond: Box::new(Expr::Literal(Literal::Bool(true), s())),
+            then_branch: Box::new(call1("f", lvar("x"))),
+            else_branch: Some(Box::new(call1("g", lvar("x")))),
+            span: s(),
+        };
+        assert!(
+            analyzer.infer_cap(&ctx, &expr).is_ok(),
+            "exclusive sibling moves are individually valid and satisfy must-use"
+        );
     }
 
     #[test]
