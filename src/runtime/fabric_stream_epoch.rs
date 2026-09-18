@@ -487,10 +487,24 @@ impl Runtime {
                 new_candidate_tail = local_tail,
                 "nulang-fabric-stream: automatic failover candidate tail changed; superseding with higher term"
             );
-            return self.fabric_stream_begin_epoch_transition(
+            let placement = FabricStreamPlacement {
+                stream: stream.to_string(),
+                partition: state.proposal.to_policy.partition,
+                leader: NodeId(state.proposal.to_policy.leader),
+                replicas: state
+                    .proposal
+                    .to_policy
+                    .replicas
+                    .iter()
+                    .copied()
+                    .map(NodeId)
+                    .collect(),
+                membership_fingerprint: state.proposal.to_policy.membership_fingerprint,
+            };
+            return self.fabric_stream_begin_epoch_transition_with_placement(
                 stream,
-                state.proposal.to_policy.partition,
-                state.proposal.to_policy.replication_factor,
+                state.proposal.from_policy.clone(),
+                placement,
             );
         }
 
