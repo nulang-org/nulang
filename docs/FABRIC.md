@@ -205,7 +205,7 @@ semantics that later cluster and stream layers can reuse.
 - [ ] Replica-set expansion/bootstrap during reconfiguration.
 - [x] Confirmed-removal automatic leader transition when old quorum survives.
 - [x] Logical-clock retry for staggered removal confirmation.
-- [ ] Automatic mismatch repair/pull orchestration during failover.
+- [x] Automatic mismatch repair/pull orchestration during failover.
 - [ ] Lease-based failover before confirmed removal.
 - [x] Durable per-replica progress for application ACKs.
 - [x] Bounded lagging committed-replica catch-up.
