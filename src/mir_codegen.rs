@@ -2649,6 +2649,25 @@ fn plan_drops(func: &mir::Function, allow_owned_params: bool) -> DropPlan {
         }
     }
 
+    // An ownership-transferred parameter has no MIR assignment definition.
+    // If it is never live at the entry block, release it immediately after
+    // the ABI prologue has moved staging into the parameter local.
+    let entry_idx = func.entry.0 as usize;
+    if entry_idx < nblocks {
+        for i in 0..nlocals {
+            if incoming_owned[i]
+                && candidate[i]
+                && !live_in[entry_idx].contains(&i)
+                && esc_clear(i, &live_in[entry_idx])
+            {
+                plan.block_entry
+                    .entry(entry_idx)
+                    .or_default()
+                    .push(func.locals[i].id);
+            }
+        }
+    }
+
     // Walk each block backward, emitting drops where a candidate's value
     // dies.
     for (bi, block) in func.blocks.iter().enumerate() {
