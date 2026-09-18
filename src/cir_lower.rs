@@ -279,6 +279,7 @@ fn translate_rvalue(op: &RValue, _func: &mir::Function, pc: u32) -> CirExpr {
         RValue::Call {
             func: mir::FuncRef::Index(idx),
             args,
+            ..
         } => CirExpr::Call {
             func_idx: WASM_FUNC_IMPORT_COUNT + *idx as u32,
             args: args.iter().map(|a| CirExpr::Var(var(a, pc))).collect(),
