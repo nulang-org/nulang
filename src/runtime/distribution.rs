@@ -398,6 +398,10 @@ pub(crate) fn process_network(rt: &mut Runtime) {
             }
         }
     }
+
+    // Retry pending durable stream replication only after packet processing
+    // and cluster actions have restored the runtime-owned distribution state.
+    rt.fabric_stream_tick_retries();
 }
 
 /// React to a peer node being declared `Failed` by the failure detector:
