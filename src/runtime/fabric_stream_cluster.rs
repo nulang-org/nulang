@@ -402,16 +402,19 @@ impl Runtime {
             }
 
             self.fabric_stream_commit_through(stream, next)?;
-            if let Some(entries) = self
+            let remove_partition = if let Some(entries) = self
                 .distributed
                 .fabric_stream_replication
                 .pending
                 .get_mut(&key)
             {
                 entries.remove(&next);
-                if entries.is_empty() {
-                    self.distributed.fabric_stream_replication.pending.remove(&key);
-                }
+                entries.is_empty()
+            } else {
+                false
+            };
+            if remove_partition {
+                self.distributed.fabric_stream_replication.pending.remove(&key);
             }
             committed = next;
         }
