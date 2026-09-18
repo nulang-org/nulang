@@ -89,6 +89,17 @@ two major versions.*
 - **Interpreter-only mobile runtime profile** (`Cargo.toml`, `src/runtime/`, `src/backends/`, `src/vm.rs`): native Cranelift/AOT code generation is now owned by the optional `native-codegen` feature while remaining enabled in default builds. The `mobile-runtime` profile excludes executable-code-generation and dynamic-loader dependencies, gates native backend wiring and benchmarks, and keeps Wasm support independently selectable. `scripts/check_mobile_runtime_profile.sh` provides the release gate for dependency-graph isolation and interpreter-only correctness.
 
 ### Ownership soundness — 2026-09-17
+- **Explicit ownership transfer IR** (`src/hir.rs`, `src/mir.rs`,
+  `src/hir_lower.rs`, `src/mir_lower.rs`): `consume x` now lowers through
+  an explicit non-serialized `MoveOut` operation rather than relying on the
+  optimizer/backend to recognize an ordinary copy followed by `x = nil`.
+  Register-based bytecode and WASM lower the transfer using existing
+  instructions and clear the source without retain/release; native AOT removes
+  the moved source from its SSA local map. The bytecode/NBC format is
+  unchanged. Drop planning remains deliberately conservative until ownership
+  tokens are propagated through `MoveOut` in #402 phase 2; function
+  parameters likewise remain non-owning until a sink/call ABI is defined.
+
 - **Path-sensitive move safety** (`src/effect_checker.rs`,
   `conformance/behavior/cap_13_*`): capability analysis now keeps
   must-use/definite-consumption separate from may-have-moved state. Definite
