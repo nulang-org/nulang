@@ -2156,17 +2156,18 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             {
                 if source_name == resolved_name {
                     let temp = fresh_temp_name();
+                    let moved_ty = source_ty.clone();
                     body.push(hir::Stmt::Let {
                         name: temp.clone(),
-                        ty: source_ty.clone(),
+                        ty: moved_ty.clone(),
                         value: hir::RValue::MoveOut(source),
                         span: *span,
                     });
-                    return hir::Operand::Var(temp, source_ty.clone());
+                    return hir::Operand::Var(temp, moved_ty);
                 }
             }
             source
-        },
+        }
         Expr::Recover { body: b, .. } => lower_expr(b, body),
         Expr::Defer { expr, .. } => {
             // Defer is handled at block level; standalone defer is a no-op.
@@ -2765,11 +2766,7 @@ fn transfer(lineariso owned: Int, val shared: Int, plain: Int) -> Int {
 
         assert_eq!(
             f.param_caps,
-            vec![
-                Capability::LinearIso,
-                Capability::Val,
-                Capability::Ref,
-            ]
+            vec![Capability::LinearIso, Capability::Val, Capability::Ref,]
         );
     }
 
