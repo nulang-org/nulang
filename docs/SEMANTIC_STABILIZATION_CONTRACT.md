@@ -190,6 +190,32 @@ compile
 
 Run this through deterministic simulation and destructive process-kill tests across supported persistence/runtime paths.
 
+## External validation gate
+
+Internal conformance is necessary but not sufficient to stabilize a language surface. Before Nulang expands the Stable/Frozen surface or resumes broad feature expansion, the project should obtain evidence from independently authored applications.
+
+The initial validation cohort should exercise the runtime rather than merely the syntax. Target at least five non-maintainer applications, with coverage across several of these workloads:
+
+- HTTP/service application;
+- durable workflow or scheduled job;
+- stateful actor/entity application;
+- queue/stream consumer or distributed worker;
+- AI/tool-calling agent using ordinary actor/effect semantics;
+- CLI or embedded-runtime application.
+
+The purpose is not an adoption vanity metric. The cohort exists to expose semantic ambiguity, diagnostics failures, package/tooling friction, runtime surprises, and missing operational primitives that maintainer-authored examples are unlikely to reveal.
+
+For each application, record at minimum:
+
+- the first point where the author required maintainer assistance;
+- compiler/runtime behavior that surprised the author;
+- workarounds added outside Nulang for retries, durability, messaging, or state;
+- missing diagnostics or observability needed to debug failures;
+- source-language changes the author would have preferred;
+- whether the application survived the relevant fault/replay tests.
+
+A language surface should not become permanently Frozen merely because it has existed for a certain period. External use, migration experience, and evidence that the semantics are understood in practice should inform any future freezing RFC.
+
 ## Frozen-core review
 
 The current repository describes the language as alpha and pre-external-user while also carrying a `1.0.0-frozen` compatibility contract. That tension should be reviewed explicitly rather than resolved ad hoc through implementation patches.
