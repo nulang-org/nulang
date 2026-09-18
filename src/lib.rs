@@ -19,6 +19,7 @@ pub use authority_runtime::RuntimeAuthorityError;
 pub mod backends;
 #[cfg(test)]
 pub mod benchmarks;
+pub mod branching;
 pub mod bytecode;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir;
