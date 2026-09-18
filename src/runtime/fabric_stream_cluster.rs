@@ -13,6 +13,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
+use std::time::{Duration, Instant};
 
 use crate::runtime::fabric_stream::FabricStreamPendingIntent;
 use crate::runtime::{
@@ -48,6 +49,9 @@ pub(crate) const FABRIC_STREAM_REPLICA_BEHAVIOR: &str = "__nulang_fabric_stream_
 const MAX_REPLICA_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const FABRIC_STREAM_REPLICA_ACK_BEHAVIOR: &str = "__nulang_fabric_stream_replica_ack_v1";
 pub(crate) const FABRIC_STREAM_COMMIT_BEHAVIOR: &str = "__nulang_fabric_stream_commit_v1";
+
+const FABRIC_STREAM_RETRY_INITIAL: Duration = Duration::from_millis(500);
+const FABRIC_STREAM_RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FabricStreamReplicaDispatchReport {
@@ -167,9 +171,16 @@ struct PendingReplicaCommit {
     quorum: usize,
 }
 
+#[derive(Debug, Clone)]
+struct FabricStreamRetrySchedule {
+    next_attempt: Instant,
+    backoff: Duration,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct FabricStreamReplicationState {
     pending: HashMap<(String, u16), BTreeMap<u64, PendingReplicaCommit>>,
+    retry_schedules: HashMap<(String, u16), FabricStreamRetrySchedule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,7 +388,7 @@ impl Runtime {
         self.distributed
             .fabric_stream_replication
             .pending
-            .entry(key)
+            .entry(key.clone())
             .or_default()
             .insert(
                 sequence,
@@ -390,6 +401,14 @@ impl Runtime {
                     quorum,
                 },
             );
+        self.distributed
+            .fabric_stream_replication
+            .retry_schedules
+            .entry(key)
+            .or_insert_with(|| FabricStreamRetrySchedule {
+                next_attempt: self.now() + FABRIC_STREAM_RETRY_INITIAL,
+                backoff: FABRIC_STREAM_RETRY_INITIAL,
+            });
 
         // Replication factor one is committed by the leader's own fsync.
         let status = if quorum == 1 {
@@ -533,6 +552,21 @@ impl Runtime {
         // Handles RF=1 recovery and any contiguous tickets that already meet
         // quorum after reconstruction.
         self.fabric_stream_advance_commits(stream, 0)?;
+        if self
+            .distributed
+            .fabric_stream_replication
+            .pending
+            .contains_key(&(stream.to_string(), 0))
+        {
+            self.distributed
+                .fabric_stream_replication
+                .retry_schedules
+                .entry((stream.to_string(), 0))
+                .or_insert_with(|| FabricStreamRetrySchedule {
+                    next_attempt: self.now(),
+                    backoff: FABRIC_STREAM_RETRY_INITIAL,
+                });
+        }
         Ok(report)
     }
 
@@ -615,6 +649,96 @@ impl Runtime {
         }
 
         Ok(report)
+    }
+
+    /// Run due pending-quorum retries using the runtime's logical clock.
+    ///
+    /// Retry state is intentionally in-memory; durable replication intent is
+    /// the restart source of truth and recreates an immediate schedule.
+    pub(crate) fn fabric_stream_tick_retries(&mut self) {
+        let now = self.now();
+        let pending_keys: Vec<(String, u16)> = self
+            .distributed
+            .fabric_stream_replication
+            .pending
+            .keys()
+            .cloned()
+            .collect();
+
+        for key in &pending_keys {
+            self.distributed
+                .fabric_stream_replication
+                .retry_schedules
+                .entry(key.clone())
+                .or_insert_with(|| FabricStreamRetrySchedule {
+                    next_attempt: now,
+                    backoff: FABRIC_STREAM_RETRY_INITIAL,
+                });
+        }
+
+        self.distributed
+            .fabric_stream_replication
+            .retry_schedules
+            .retain(|key, _| {
+                self.distributed
+                    .fabric_stream_replication
+                    .pending
+                    .contains_key(key)
+            });
+
+        let due: Vec<(String, u16)> = self
+            .distributed
+            .fabric_stream_replication
+            .retry_schedules
+            .iter()
+            .filter(|(key, schedule)| {
+                schedule.next_attempt <= now
+                    && self
+                        .distributed
+                        .fabric_stream_replication
+                        .pending
+                        .contains_key(*key)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for (stream, partition) in due {
+            let result = self.fabric_stream_retry_pending(&stream, partition);
+            let still_pending = self
+                .distributed
+                .fabric_stream_replication
+                .pending
+                .contains_key(&(stream.clone(), partition));
+            if !still_pending {
+                self.distributed
+                    .fabric_stream_replication
+                    .retry_schedules
+                    .remove(&(stream, partition));
+                continue;
+            }
+
+            let now = self.now();
+            if let Some(schedule) = self
+                .distributed
+                .fabric_stream_replication
+                .retry_schedules
+                .get_mut(&(stream.clone(), partition))
+            {
+                schedule.next_attempt = now + schedule.backoff;
+                schedule.backoff = schedule
+                    .backoff
+                    .saturating_mul(2)
+                    .min(FABRIC_STREAM_RETRY_MAX);
+            }
+            if let Err(error) = result {
+                tracing::warn!(
+                    "nulang-fabric-stream: retry for {} partition {} failed: {}",
+                    stream,
+                    partition,
+                    error
+                );
+            }
+        }
     }
 
     /// Repair lagging replicas using only records already committed by quorum.
@@ -930,6 +1054,10 @@ impl Runtime {
                 self.distributed
                     .fabric_stream_replication
                     .pending
+                    .remove(&key);
+                self.distributed
+                    .fabric_stream_replication
+                    .retry_schedules
                     .remove(&key);
             }
             committed = next;
