@@ -43,6 +43,18 @@ use std::time::{Duration, Instant};
 // Imports from sibling modules in the runtime
 // ---------------------------------------------------------------------------
 
+use super::fabric_stream_cluster::{
+    FabricStreamCommitUpdate, FabricStreamReplicaAck, FabricStreamReplicaAppend,
+    FABRIC_STREAM_COMMIT_BEHAVIOR, FABRIC_STREAM_REPLICA_ACK_BEHAVIOR,
+    FABRIC_STREAM_REPLICA_BEHAVIOR,
+};
+use super::fabric_stream_epoch::{
+    FabricStreamEpochCommit, FabricStreamEpochPrepare, FabricStreamEpochPullRequest,
+    FabricStreamEpochPullResponse, FabricStreamEpochRepairBatch, FabricStreamEpochVote,
+    FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR, FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR,
+    FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR, FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR,
+    FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
+};
 use super::mailbox::{Message, MessagePriority};
 use super::network::{NetworkTransport, Packet};
 use super::{ClusterState, NodeId, NodeStatus};
@@ -1007,13 +1019,32 @@ pub fn process_network_packets(
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
-            Packet::Gossip { members, directory } => {
+            Packet::Gossip {
+                members,
+                directory,
+                fabric,
+            } => {
                 cluster.merge_membership_from_sender(members, incoming.from_node);
                 if !directory.is_empty() {
                     cluster.merge_directory(directory);
                     // A re-joined node may have been replaced while away:
                     // demote any local actor whose directory epoch is newer.
                     runtime.self_demote_superseded();
+                }
+                if let Some(snapshot) = fabric {
+                    if snapshot.node_id != incoming.from_node {
+                        warn!(
+                            "nulang-fabric: rejecting gossip snapshot for {:?} sent by {:?}",
+                            snapshot.node_id, incoming.from_node
+                        );
+                    } else if let Err(error) =
+                        runtime.fabric_replace_remote_advertisements(snapshot)
+                    {
+                        warn!(
+                            "nulang-fabric: rejecting gossip snapshot from {:?}: {}",
+                            incoming.from_node, error
+                        );
+                    }
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
@@ -1438,6 +1469,619 @@ pub fn process_network_packets(
                 // RFC 0014 §3: store the replica, do NOT instantiate it.
                 // The shadow re-spawns from it only on confirmed removal.
                 runtime.store_shadow_replica(actor_id, nbc_bytes, snapshot_json, epoch);
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_REPLICA_BEHAVIOR => {
+                let mut application_ack = None;
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric stream replica sender identity does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamReplicaAppend::from_wire_bytes(bytes)
+                            .and_then(|append| {
+                                if append.leader != incoming.from_node {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "Fabric stream replica envelope leader does not match transport peer",
+                                    ));
+                                }
+                                let apply =
+                                    runtime.fabric_stream_apply_replica_from_cluster(&append, cluster);
+                                if let Some(replica) = runtime.distributed.node_id {
+                                    application_ack = Some(FabricStreamReplicaAck {
+                                        stream: append.stream.clone(),
+                                        partition: append.partition,
+                                        epoch: append.epoch,
+                                        leader: append.leader,
+                                        membership_fingerprint: append.membership_fingerprint,
+                                        replication_factor: append.replication_factor,
+                                        sequence: append.sequence,
+                                        replica,
+                                        accepted: apply.is_ok(),
+                                    });
+                                }
+                                apply
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric stream replica system message must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+
+                if let Err(error) = &result {
+                    warn!(
+                        "nulang-fabric-stream: rejected replica append from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+
+                // Application-level ACK/NACK is separate from the transport
+                // ACK below. It is emitted only after the follower has tried
+                // exact-sequence durable application.
+                if let Some(application_ack) = application_ack {
+                    if let Ok(bytes) = application_ack.to_wire_bytes() {
+                        let address = cluster
+                            .get_node(application_ack.leader)
+                            .map(|info| info.address)
+                            .or_else(|| transport.connection_addr(application_ack.leader));
+                        if let Some(address) = address {
+                            let packet = Packet::ActorMessage {
+                                target_actor: 0,
+                                behavior_name: FABRIC_STREAM_REPLICA_ACK_BEHAVIOR.to_string(),
+                                content_hash: None,
+                                payload: Vec::new(),
+                                string_table: Vec::new(),
+                                object_table: vec![(0, bytes)],
+                                sender_actor: 0,
+                                sender_node: application_ack.replica,
+                                priority: MessagePriority::System,
+                                trace_id: None,
+                            };
+                            transport.send(application_ack.leader, address, packet);
+                        }
+                    }
+                }
+
+                // Existing transport-level receipt acknowledgement. Quorum
+                // logic never counts this packet.
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_REPLICA_ACK_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric stream replica ACK sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamReplicaAck::from_wire_bytes(bytes)
+                            .and_then(|ack| {
+                                if ack.replica != incoming.from_node {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "Fabric stream replica ACK identity mismatch",
+                                    ));
+                                }
+
+                                let accepted = ack.accepted;
+                                let stream = ack.stream.clone();
+                                let outcome =
+                                    runtime.fabric_stream_record_replica_ack_from_cluster(
+                                        ack, cluster,
+                                    )?;
+
+                                if accepted && outcome.committed_sequence > 0 {
+                                    for replica in outcome
+                                        .placement
+                                        .replicas
+                                        .iter()
+                                        .copied()
+                                        .filter(|node| *node != outcome.placement.leader)
+                                    {
+                                        let progress = runtime
+                                            .fabric_stream_replica_progress(&stream, replica.0)?;
+                                        if progress < outcome.committed_sequence {
+                                            continue;
+                                        }
+                                        let address = cluster
+                                            .get_node(replica)
+                                            .filter(|info| {
+                                                matches!(
+                                                    info.status,
+                                                    NodeStatus::Healthy | NodeStatus::Joining
+                                                )
+                                            })
+                                            .map(|info| info.address);
+                                        let Some(address) = address else {
+                                            continue;
+                                        };
+                                        let update = FabricStreamCommitUpdate {
+                                            stream: outcome.placement.stream.clone(),
+                                            partition: outcome.placement.partition,
+                                            epoch: outcome.epoch,
+                                            leader: outcome.placement.leader,
+                                            membership_fingerprint: outcome
+                                                .placement
+                                                .membership_fingerprint,
+                                            replication_factor: outcome.placement.replicas.len(),
+                                            committed_sequence: outcome.committed_sequence,
+                                        };
+                                        let update_bytes = update.to_wire_bytes()?;
+                                        transport.send(
+                                            replica,
+                                            address,
+                                            Packet::ActorMessage {
+                                                target_actor: 0,
+                                                behavior_name:
+                                                    FABRIC_STREAM_COMMIT_BEHAVIOR.to_string(),
+                                                content_hash: None,
+                                                payload: Vec::new(),
+                                                string_table: Vec::new(),
+                                                object_table: vec![(0, update_bytes)],
+                                                sender_actor: 0,
+                                                sender_node: outcome.placement.leader,
+                                                priority: MessagePriority::System,
+                                                trace_id: None,
+                                            },
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric stream replica ACK must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected replica ACK from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_COMMIT_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric stream commit-update sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamCommitUpdate::from_wire_bytes(bytes)
+                            .and_then(|update| {
+                                if update.leader != incoming.from_node {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "Fabric stream commit-update leader does not match transport peer",
+                                    ));
+                                }
+                                runtime
+                                    .fabric_stream_apply_commit_update_from_cluster(
+                                        &update, cluster,
+                                    )
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric stream commit update must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected commit update from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch prepare sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochPrepare::from_wire_bytes(bytes)
+                            .and_then(|prepare| {
+                                let vote = runtime.fabric_stream_evaluate_epoch_prepare(
+                                    &prepare.stream,
+                                    &prepare.proposal,
+                                    incoming.from_node,
+                                    cluster,
+                                )?;
+                                let response = FabricStreamEpochVote {
+                                    stream: prepare.stream,
+                                    vote,
+                                };
+                                let response_bytes = response.to_wire_bytes()?;
+                                let candidate = NodeId(prepare.proposal.to_policy.leader);
+                                let address = cluster
+                                    .get_node(candidate)
+                                    .map(|info| info.address)
+                                    .or_else(|| transport.connection_addr(candidate))
+                                    .ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "Fabric epoch candidate address is unavailable",
+                                        )
+                                    })?;
+                                let local = runtime.distributed.node_id.ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "Fabric epoch voter has no local NodeId",
+                                    )
+                                })?;
+                                transport.send(
+                                    candidate,
+                                    address,
+                                    Packet::ActorMessage {
+                                        target_actor: 0,
+                                        behavior_name:
+                                            FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
+                                        content_hash: None,
+                                        payload: Vec::new(),
+                                        string_table: Vec::new(),
+                                        object_table: vec![(0, response_bytes)],
+                                        sender_actor: 0,
+                                        sender_node: local,
+                                        priority: MessagePriority::System,
+                                        trace_id: None,
+                                    },
+                                );
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch prepare must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch prepare from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch pull-request sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochPullRequest::from_wire_bytes(bytes)
+                            .and_then(|request| {
+                                let response = runtime
+                                    .fabric_stream_build_epoch_pull_response(
+                                        &request,
+                                        incoming.from_node,
+                                        cluster,
+                                    )?;
+                                let response_bytes = response.to_wire_bytes()?;
+                                let requester = NodeId(response.requester);
+                                let address = cluster
+                                    .get_node(requester)
+                                    .map(|info| info.address)
+                                    .or_else(|| transport.connection_addr(requester))
+                                    .ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "Fabric epoch pull requester address is unavailable",
+                                        )
+                                    })?;
+                                let local = runtime.distributed.node_id.ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "Fabric epoch pull source has no local NodeId",
+                                    )
+                                })?;
+                                transport.send(
+                                    requester,
+                                    address,
+                                    Packet::ActorMessage {
+                                        target_actor: 0,
+                                        behavior_name:
+                                            FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR.to_string(),
+                                        content_hash: None,
+                                        payload: Vec::new(),
+                                        string_table: Vec::new(),
+                                        object_table: vec![(0, response_bytes)],
+                                        sender_actor: 0,
+                                        sender_node: local,
+                                        priority: MessagePriority::System,
+                                        trace_id: None,
+                                    },
+                                );
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch pull request must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch pull request from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch pull-response sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochPullResponse::from_wire_bytes(bytes)
+                            .and_then(|response| {
+                                runtime
+                                    .fabric_stream_apply_epoch_pull_response(
+                                        &response,
+                                        incoming.from_node,
+                                        cluster,
+                                    )
+                                    .map(|_| ())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch pull response must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch pull response from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch repair sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochRepairBatch::from_wire_bytes(bytes)
+                            .and_then(|batch| {
+                                let vote = runtime.fabric_stream_apply_epoch_repair_from_cluster(
+                                    &batch,
+                                    incoming.from_node,
+                                    cluster,
+                                )?;
+                                let response = FabricStreamEpochVote {
+                                    stream: batch.stream,
+                                    vote,
+                                };
+                                let response_bytes = response.to_wire_bytes()?;
+                                let candidate = NodeId(batch.proposal.to_policy.leader);
+                                let address = cluster
+                                    .get_node(candidate)
+                                    .map(|info| info.address)
+                                    .or_else(|| transport.connection_addr(candidate))
+                                    .ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "Fabric epoch candidate address is unavailable",
+                                        )
+                                    })?;
+                                let local = runtime.distributed.node_id.ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "Fabric epoch repair target has no local NodeId",
+                                    )
+                                })?;
+                                transport.send(
+                                    candidate,
+                                    address,
+                                    Packet::ActorMessage {
+                                        target_actor: 0,
+                                        behavior_name:
+                                            FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
+                                        content_hash: None,
+                                        payload: Vec::new(),
+                                        string_table: Vec::new(),
+                                        object_table: vec![(0, response_bytes)],
+                                        sender_actor: 0,
+                                        sender_node: local,
+                                        priority: MessagePriority::System,
+                                        trace_id: None,
+                                    },
+                                );
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch repair must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch repair from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch vote sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochVote::from_wire_bytes(bytes)
+                            .and_then(|vote| {
+                                let outcome = runtime
+                                    .fabric_stream_record_epoch_vote_from_cluster(
+                                        vote,
+                                        incoming.from_node,
+                                    )?;
+                                if let Some(commit) = outcome.commit {
+                                    let commit_bytes = commit.to_wire_bytes()?;
+                                    let local = runtime.distributed.node_id.ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "Fabric epoch candidate has no local NodeId",
+                                        )
+                                    })?;
+                                    for replica in &commit.proposal.to_policy.replicas {
+                                        let replica = NodeId(*replica);
+                                        if replica == local {
+                                            continue;
+                                        }
+                                        let Some(address) = cluster
+                                            .get_node(replica)
+                                            .filter(|info| {
+                                                matches!(
+                                                    info.status,
+                                                    NodeStatus::Healthy | NodeStatus::Joining
+                                                )
+                                            })
+                                            .map(|info| info.address)
+                                        else {
+                                            continue;
+                                        };
+                                        transport.send(
+                                            replica,
+                                            address,
+                                            Packet::ActorMessage {
+                                                target_actor: 0,
+                                                behavior_name:
+                                                    FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR
+                                                        .to_string(),
+                                                content_hash: None,
+                                                payload: Vec::new(),
+                                                string_table: Vec::new(),
+                                                object_table: vec![(
+                                                    0,
+                                                    commit_bytes.clone(),
+                                                )],
+                                                sender_actor: 0,
+                                                sender_node: local,
+                                                priority: MessagePriority::System,
+                                                trace_id: None,
+                                            },
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch vote must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch vote from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch commit sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochCommit::from_wire_bytes(bytes)
+                            .and_then(|commit| {
+                                runtime.fabric_stream_apply_epoch_commit_from_cluster(
+                                    &commit,
+                                    incoming.from_node,
+                                    cluster,
+                                )
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch commit must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch commit from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             _ => {

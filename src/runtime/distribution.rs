@@ -328,8 +328,14 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                     let net_node_id = NodeId(node.0);
                     transport.disconnect(net_node_id);
                 }
+                rt.fabric_remove_remote_node(NodeId(node.0));
             }
             ClusterAction::SendGossip { targets } => {
+                // Fabric snapshots are authoritative only when complete.
+                // An oversized local routing set therefore omits the Fabric
+                // extension for this round instead of advertising a partial
+                // replacement that would delete live remote routes.
+                let fabric = rt.fabric_advertisements(GOSSIP_PAYLOAD_MAX_ENTRIES).ok();
                 if let (Some(transport), Some(cluster)) =
                     (&mut rt.distributed.transport, &rt.distributed.cluster)
                 {
@@ -339,8 +345,12 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                     } else {
                         Vec::new()
                     };
-                    if !members.is_empty() || !directory.is_empty() {
-                        let packet = Packet::Gossip { members, directory };
+                    if !members.is_empty() || !directory.is_empty() || fabric.is_some() {
+                        let packet = Packet::Gossip {
+                            members,
+                            directory,
+                            fabric,
+                        };
                         for (to, addr) in targets {
                             transport.send(NodeId(to.0), addr, packet.clone());
                         }
@@ -388,6 +398,25 @@ pub(crate) fn process_network(rt: &mut Runtime) {
             }
         }
     }
+
+    // Confirmed removals can be observed while packet processing temporarily
+    // owns ClusterState outside Runtime. Drain them only now, after the
+    // runtime-owned transport/cluster state has been restored.
+    let removed_nodes = std::mem::take(&mut rt.distributed.fabric_stream_removed_nodes_pending);
+    for removed in removed_nodes {
+        if let Err(error) = rt.fabric_stream_failover_confirmed_removed(removed) {
+            tracing::warn!(
+                removed = removed.0,
+                "nulang-fabric-stream: confirmed-removal failover orchestration failed: {}",
+                error
+            );
+        }
+    }
+    rt.fabric_stream_tick_auto_failover();
+
+    // Retry pending durable stream replication only after packet processing
+    // and cluster actions have restored the runtime-owned distribution state.
+    rt.fabric_stream_tick_retries();
 }
 
 /// React to a peer node being declared `Failed` by the failure detector:
@@ -403,6 +432,11 @@ pub(crate) fn process_network(rt: &mut Runtime) {
 /// requires the confirmed-gone gate of [`handle_node_removed`], so a merely
 /// partitioned node is never raced by a re-spawn of its own actors.
 pub(crate) fn handle_node_failed(rt: &mut Runtime, node: NodeId) {
+    // Stop selecting subscribers on an unroutable node immediately. This
+    // also forgets the remote snapshot generation, allowing a genuinely
+    // healed/restarted peer to repopulate the directory from its next gossip.
+    rt.fabric_remove_remote_node(node);
+
     // (1) Invalidate cached remote actors on the failed node.
     if let Some(resolver) = rt.distributed.resolver.as_mut() {
         resolver.invalidate_node(node);
@@ -431,6 +465,13 @@ pub(crate) fn handle_node_failed(rt: &mut Runtime, node: NodeId) {
 /// holds the replica (the deterministic shadow), so exactly one survivor
 /// re-spawns each actor and no two live copies can exist.
 pub(crate) fn handle_node_removed(rt: &mut Runtime, node: NodeId) {
+    // Fabric ownership transitions are deferred until process_network restores
+    // runtime-owned cluster/transport state. HashSet semantics deduplicate
+    // graceful-goodbye and failure-detector confirmation of the same node.
+    rt.distributed
+        .fabric_stream_removed_nodes_pending
+        .insert(node);
+
     handle_node_failed(rt, node);
 
     // Which actors lived on the removed node, and am I their shadow?

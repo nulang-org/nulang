@@ -20,13 +20,30 @@ pub use heap_serialize::*;
 mod cluster;
 mod distributed;
 mod distributed_context;
+mod fabric_stream;
+mod fabric_stream_cluster;
+mod fabric_stream_epoch;
 mod grain;
 mod network;
 mod object_store;
 mod orca_cycle;
 mod supervision;
 mod supervisor;
-use distributed_context::DistributedContext;
+pub use distributed_context::{
+    DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot, FabricPublishReport,
+};
+pub use fabric_stream::{
+    FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
+};
+pub use fabric_stream_cluster::{
+    FabricStreamCatchUpReport, FabricStreamPlacement, FabricStreamRecoveryReport,
+    FabricStreamReplicaAppend, FabricStreamReplicaDispatchReport,
+    FabricStreamReplicatedAppendResult, FabricStreamReplicationStatus, FabricStreamRetryReport,
+};
+pub use fabric_stream_epoch::{
+    FabricStreamAutoFailoverReport, FabricStreamEpochPullReport, FabricStreamEpochRepairReport,
+    FabricStreamEpochTransitionStatus,
+};
 #[cfg(feature = "ai-runtime")]
 mod agent;
 #[cfg(feature = "ai-runtime")]
@@ -234,6 +251,17 @@ enum CrossShardMsg {
         actor_id: u64,
         priority: ActorPriority,
     },
+}
+
+/// Admission result for a local-process actor delivery.
+///
+/// Fabric uses this to distinguish successful mailbox/channel admission from
+/// bounded-capacity backpressure without changing the public actor-send API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageAdmission {
+    Accepted,
+    Backpressured,
+    Rejected,
 }
 
 pub struct Runtime {
@@ -1958,9 +1986,8 @@ impl Runtime {
 
     /// Send a message to an actor owned by another shard. Validates that the
     /// payload contains only value types (object-store refs are copied to the
-    /// target shard's store). Returns `true` if the message was accepted for
-    /// delivery, `false` if it was dropped because the payload contained a heap
-    /// pointer, actor ref, or closure.
+    /// target shard's store). Returns the admission outcome so callers can
+    /// distinguish bounded-channel backpressure from invalid payload rejection.
     fn send_cross_shard_message(
         &mut self,
         target_id: u64,
@@ -1968,7 +1995,7 @@ impl Runtime {
         args: Vec<Value>,
         out_trace: Option<String>,
         grain_id: Option<GrainId>,
-    ) -> bool {
+    ) -> MessageAdmission {
         let target_shard = (target_id % self.shard_count as u64) as u16;
         for arg in &args {
             if arg.is_ptr() || arg.is_actor_ref() || arg.is_closure() {
@@ -1977,21 +2004,21 @@ impl Runtime {
                      payload contains heap pointer / actor ref / closure",
                     target_id
                 );
-                return false;
+                return MessageAdmission::Rejected;
             }
         }
         let tx = self.cross_shard_tx.as_ref().unwrap();
         let object_refs: Vec<crate::runtime::object_store::ObjectId> =
             args.iter().filter_map(|v| v.as_object_id()).collect();
-        if object_refs.is_empty() {
-            let _ = tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
+        let result = if object_refs.is_empty() {
+            tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
                 target_id,
                 behavior_id,
                 payload: args,
                 sender: self.current_actor.unwrap_or(0),
                 trace_id: out_trace,
                 grain_id,
-            });
+            })
         } else {
             let mut objects = Vec::with_capacity(object_refs.len());
             for id in object_refs {
@@ -1999,7 +2026,7 @@ impl Runtime {
                     objects.push((id, entry.as_bytes().to_vec()));
                 }
             }
-            let _ = tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessageWithObjects {
+            tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessageWithObjects {
                 target_id,
                 behavior_id,
                 payload: args,
@@ -2007,9 +2034,56 @@ impl Runtime {
                 sender: self.current_actor.unwrap_or(0),
                 trace_id: out_trace,
                 grain_id,
-            });
+            })
+        };
+
+        match result {
+            Ok(()) => MessageAdmission::Accepted,
+            Err(mpsc::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    "nulang-shard: backpressure sending to actor {} on shard {}",
+                    target_id,
+                    target_shard
+                );
+                MessageAdmission::Backpressured
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!(
+                    "nulang-shard: dropping message to actor {}: shard {} disconnected",
+                    target_id,
+                    target_shard
+                );
+                MessageAdmission::Rejected
+            }
         }
-        true
+    }
+
+    /// Admit one Fabric delivery to an actor owned by this runtime process.
+    ///
+    /// Same-shard targets report bounded mailbox admission directly.
+    /// Cross-shard targets report admission to the bounded shard channel; the
+    /// destination mailbox may still apply its own capacity when that channel
+    /// is drained.
+    pub(crate) fn fabric_admit_local(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+    ) -> MessageAdmission {
+        let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
+        if self.shard_count > 1 {
+            let target_shard = (target_id % self.shard_count as u64) as u16;
+            if target_shard != self.shard_idx {
+                return self.send_cross_shard_message(
+                    target_id,
+                    behavior_id,
+                    args.to_vec(),
+                    out_trace,
+                    None,
+                );
+            }
+        }
+        self.deliver_local_message(target_id, behavior_id, args, out_trace)
     }
 
     /// Send a message to a virtual actor (grain) identified by its stable
@@ -2271,7 +2345,7 @@ impl Runtime {
         behavior_id: u16,
         args: &[Value],
         out_trace: Option<String>,
-    ) {
+    ) -> MessageAdmission {
         let msg = Message {
             behavior_id,
             payload: Arc::new(args.to_vec()),
@@ -2279,13 +2353,14 @@ impl Runtime {
             priority: MessagePriority::Normal,
             trace_id: out_trace.clone(),
         };
-        if let Some(actor) = self.actors.get_mut(&target_id) {
+        let admission = if let Some(actor) = self.actors.get_mut(&target_id) {
             actor
                 .flight_recorder
                 .record(self.current_actor.unwrap_or(0), behavior_id, args);
             if actor.mailbox.push_local(msg).is_ok() {
                 // Activity resets the dehydration idle timer.
                 actor.idle_ms = 0;
+                MessageAdmission::Accepted
             } else {
                 // Mailbox is full (capacity > 0). Route to DLQ with a simple notification.
                 self.route_to_dlq(
@@ -2298,6 +2373,7 @@ impl Runtime {
                     },
                     "mailbox full",
                 );
+                MessageAdmission::Backpressured
             }
         } else {
             self.route_to_dlq(
@@ -2310,7 +2386,13 @@ impl Runtime {
                 },
                 "target actor not found",
             );
+            MessageAdmission::Rejected
+        };
+
+        if admission != MessageAdmission::Accepted {
+            return admission;
         }
+
         for arg in args {
             if let Some(ptr) = arg.as_ptr() {
                 if ptr.is_null() {
@@ -2394,6 +2476,7 @@ impl Runtime {
                 self.resume_suspended_receive_wait(target_id);
             }
         }
+        MessageAdmission::Accepted
     }
 
     #[tracing::instrument(level = "trace", skip(self))]

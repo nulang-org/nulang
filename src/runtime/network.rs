@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 
 use super::cluster::{DurableDirectoryEntry, NodeGossip, NodeStatus};
 use super::crdt_manager::{CrdtDeltaOp, CrdtOp};
+use super::distributed_context::{FabricAdvertisement, FabricAdvertisementSnapshot};
 use super::supervision::RemoteLink;
 use super::MessagePriority;
 use super::NodeId;
@@ -639,6 +640,10 @@ pub enum Packet {
         /// piggybacked on the membership gossip round. Additive: older
         /// peers that predate this field ignore the trailing bytes.
         directory: Vec<DurableDirectoryEntry>,
+        /// Complete ephemeral Fabric subscription snapshot owned by the
+        /// gossip sender. Encoded as an optional additive tail; `None`
+        /// preserves the pre-Fabric gossip bytes exactly.
+        fabric: Option<FabricAdvertisementSnapshot>,
     },
 
     /// Request bytecode for a behavior identified by its BLAKE3 content hash.
@@ -979,7 +984,11 @@ impl Packet {
             Packet::CrdtOp { op } => {
                 buf.extend_from_slice(&op.to_bytes());
             }
-            Packet::Gossip { members, directory } => {
+            Packet::Gossip {
+                members,
+                directory,
+                fabric,
+            } => {
                 buf.extend_from_slice(&(members.len() as u32).to_be_bytes());
                 for m in members {
                     buf.extend_from_slice(&m.node_id.0.to_be_bytes());
@@ -995,6 +1004,28 @@ impl Packet {
                     buf.extend_from_slice(&e.actor_id.to_be_bytes());
                     buf.extend_from_slice(&e.node_id.0.to_be_bytes());
                     buf.extend_from_slice(&e.epoch.to_be_bytes());
+                }
+
+                // Fabric metadata is an additive, self-identifying tail.
+                // Omitting it preserves the historical Gossip byte layout.
+                if let Some(snapshot) = fabric {
+                    buf.extend_from_slice(b"FAB0");
+                    buf.extend_from_slice(&snapshot.node_id.0.to_be_bytes());
+                    buf.extend_from_slice(&snapshot.generation.to_be_bytes());
+                    buf.extend_from_slice(&(snapshot.subscriptions.len() as u32).to_be_bytes());
+                    for subscription in &snapshot.subscriptions {
+                        buf.extend_from_slice(&subscription.node_id.0.to_be_bytes());
+                        write_string(buf, &subscription.pattern);
+                        buf.extend_from_slice(&subscription.actor_id.to_be_bytes());
+                        write_string(buf, &subscription.behavior);
+                        match &subscription.group {
+                            Some(group) => {
+                                buf.push(1);
+                                write_string(buf, group);
+                            }
+                            None => buf.push(0),
+                        }
+                    }
                 }
             }
             Packet::FetchBehaviorRequest { content_hash } => {
@@ -1317,8 +1348,11 @@ impl Packet {
         let mut directory = Vec::new();
         if offset + 4 <= payload.len() {
             let dcount = read_u32(payload, offset)? as usize;
+            if dcount > 4096 {
+                return None;
+            }
             offset += 4;
-            for _ in 0..dcount.min(4096) {
+            for _ in 0..dcount {
                 if offset + 24 > payload.len() {
                     return None;
                 }
@@ -1333,7 +1367,67 @@ impl Packet {
                 });
             }
         }
-        Some(Packet::Gossip { members, directory })
+
+        // New runtimes recognize the optional FAB0 tail. Older runtimes
+        // ignore all trailing bytes after the directory, so adding this
+        // section does not require a new packet discriminant or wire version.
+        let mut fabric = None;
+        if offset + 4 <= payload.len() && &payload[offset..offset + 4] == b"FAB0" {
+            offset += 4;
+            let node_id = NodeId(read_u64(payload, offset)?);
+            offset += 8;
+            let generation = read_u64(payload, offset)?;
+            offset += 8;
+            let fcount = read_u32(payload, offset)? as usize;
+            offset += 4;
+            if fcount > 4096 {
+                return None;
+            }
+
+            let mut subscriptions = Vec::with_capacity(fcount.min(256));
+            for _ in 0..fcount {
+                let entry_node_id = NodeId(read_u64(payload, offset)?);
+                offset += 8;
+                let (pattern, pattern_len) = read_string(payload, offset)?;
+                offset = offset.checked_add(pattern_len)?;
+                let actor_id = read_u64(payload, offset)?;
+                offset += 8;
+                let (behavior, behavior_len) = read_string(payload, offset)?;
+                offset = offset.checked_add(behavior_len)?;
+                let group = match *payload.get(offset)? {
+                    0 => {
+                        offset += 1;
+                        None
+                    }
+                    1 => {
+                        offset += 1;
+                        let (group, group_len) = read_string(payload, offset)?;
+                        offset = offset.checked_add(group_len)?;
+                        Some(group)
+                    }
+                    _ => return None,
+                };
+                subscriptions.push(FabricAdvertisement {
+                    node_id: entry_node_id,
+                    pattern,
+                    actor_id,
+                    behavior,
+                    group,
+                });
+            }
+
+            fabric = Some(FabricAdvertisementSnapshot {
+                node_id,
+                generation,
+                subscriptions,
+            });
+        }
+
+        Some(Packet::Gossip {
+            members,
+            directory,
+            fabric,
+        })
     }
 
     fn read_node_goodbye(payload: &[u8]) -> Option<Self> {
@@ -2737,6 +2831,7 @@ mod tests {
                     epoch: 3,
                 },
             ],
+            fabric: None,
         };
 
         let bytes = packet.to_bytes(99);
@@ -2744,6 +2839,34 @@ mod tests {
 
         assert_eq!(seq, 99);
         assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_gossip_fabric_snapshot_roundtrip() {
+        let packet = Packet::Gossip {
+            members: vec![],
+            directory: vec![],
+            fabric: Some(FabricAdvertisementSnapshot {
+                node_id: NodeId(0xABCD),
+                generation: 7,
+                subscriptions: vec![FabricAdvertisement {
+                    node_id: NodeId(0xABCD),
+                    pattern: "orders.*".into(),
+                    actor_id: 42,
+                    behavior: "handle".into(),
+                    group: Some("workers".into()),
+                }],
+            }),
+        };
+
+        let bytes = packet.to_bytes(101);
+        let (seq, decoded) =
+            Packet::from_bytes(&bytes).expect("Fabric gossip deserialization failed");
+        assert_eq!(seq, 101);
+        assert_eq!(decoded, packet);
+
+        let truncated = &bytes[..bytes.len() - 2];
+        assert!(Packet::from_bytes(truncated).is_none());
     }
 
     #[test]
@@ -2758,6 +2881,7 @@ mod tests {
                 incarnation: 3,
             }],
             directory: vec![],
+            fabric: None,
         };
         let bytes = packet.to_bytes(1);
         // Keep the header + count, chop the entry in half.
