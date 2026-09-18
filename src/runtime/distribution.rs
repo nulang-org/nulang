@@ -328,8 +328,16 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                     let net_node_id = NodeId(node.0);
                     transport.disconnect(net_node_id);
                 }
+                rt.fabric_remove_remote_node(NodeId(node.0));
             }
             ClusterAction::SendGossip { targets } => {
+                // Fabric snapshots are authoritative only when complete.
+                // An oversized local routing set therefore omits the Fabric
+                // extension for this round instead of advertising a partial
+                // replacement that would delete live remote routes.
+                let fabric = rt
+                    .fabric_advertisements(GOSSIP_PAYLOAD_MAX_ENTRIES)
+                    .ok();
                 if let (Some(transport), Some(cluster)) =
                     (&mut rt.distributed.transport, &rt.distributed.cluster)
                 {
@@ -339,8 +347,12 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                     } else {
                         Vec::new()
                     };
-                    if !members.is_empty() || !directory.is_empty() {
-                        let packet = Packet::Gossip { members, directory };
+                    if !members.is_empty() || !directory.is_empty() || fabric.is_some() {
+                        let packet = Packet::Gossip {
+                            members,
+                            directory,
+                            fabric,
+                        };
                         for (to, addr) in targets {
                             transport.send(NodeId(to.0), addr, packet.clone());
                         }
@@ -403,6 +415,11 @@ pub(crate) fn process_network(rt: &mut Runtime) {
 /// requires the confirmed-gone gate of [`handle_node_removed`], so a merely
 /// partitioned node is never raced by a re-spawn of its own actors.
 pub(crate) fn handle_node_failed(rt: &mut Runtime, node: NodeId) {
+    // Stop selecting subscribers on an unroutable node immediately. This
+    // also forgets the remote snapshot generation, allowing a genuinely
+    // healed/restarted peer to repopulate the directory from its next gossip.
+    rt.fabric_remove_remote_node(node);
+
     // (1) Invalidate cached remote actors on the failed node.
     if let Some(resolver) = rt.distributed.resolver.as_mut() {
         resolver.invalidate_node(node);
