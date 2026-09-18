@@ -1971,9 +1971,8 @@ impl Runtime {
 
     /// Send a message to an actor owned by another shard. Validates that the
     /// payload contains only value types (object-store refs are copied to the
-    /// target shard's store). Returns `true` if the message was accepted for
-    /// delivery, `false` if it was dropped because the payload contained a heap
-    /// pointer, actor ref, or closure.
+    /// target shard's store). Returns the admission outcome so callers can
+    /// distinguish bounded-channel backpressure from invalid payload rejection.
     fn send_cross_shard_message(
         &mut self,
         target_id: u64,
