@@ -3363,15 +3363,12 @@ impl VM {
                 span: Span::default(),
             });
         }
-        let sink_mask = self
-            .modules
-            .get(module_idx)
-            .and_then(|m| {
-                m.debug_functions
-                    .iter()
-                    .find(|info| info.code_offset == code_offset)
-                    .map(|info| info.sink_mask)
-            });
+        let sink_info = self.modules.get(module_idx).and_then(|m| {
+            m.debug_functions
+                .iter()
+                .find(|info| info.code_offset == code_offset)
+                .map(|info| (info.sink_mask, info.sink_metadata_present))
+        });
 
         // Safe host invocation borrows its input slice. A linear sink callee
         // is allowed to consume one local ownership reference, so retain an
@@ -3383,14 +3380,19 @@ impl VM {
         // New compiler artifacts always publish sink metadata. If metadata is
         // unavailable (e.g. a stripped/foreign artifact), pointer arguments
         // are rejected rather than guessing whether the callee will Drop them.
-        if sink_mask.is_none() && args.iter().any(|v| v.as_ptr().is_some()) {
+        let has_pointer_args = args.iter().any(|v| v.as_ptr().is_some());
+        if has_pointer_args
+            && !sink_info
+                .map(|(_, present)| present)
+                .unwrap_or(false)
+        {
             return Err(NuError::VMError {
-                msg: "call_function: pointer arguments require function ownership metadata"
+                msg: "call_function: pointer arguments require authoritative function ownership metadata"
                     .to_string(),
                 span: Span::default(),
             });
         }
-        let sink_mask = sink_mask.unwrap_or(0);
+        let sink_mask = sink_info.map(|(mask, _)| mask).unwrap_or(0);
         for (i, arg) in args.iter().enumerate() {
             if i < u16::BITS as usize && (sink_mask & (1u16 << i)) != 0 {
                 if let Some(ptr) = arg.as_ptr() {
