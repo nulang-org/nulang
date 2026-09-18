@@ -34,9 +34,11 @@ Runtime APIs:
 - `Runtime::fabric_subscription_count()` — subscription gauge for the local
   routing view.
 - `Runtime::fabric_remote_subscription_count()` — remote-subscription gauge.
-- `Runtime::fabric_publish(topic, args)` — publish to matching local, cross-shard,
-  or already-known remote subscribers. The return value is the number of routes
-  selected, not transport acknowledgements.
+- `Runtime::fabric_publish(topic, args)` — compatibility API returning the
+  number of routes selected.
+- `Runtime::fabric_publish_report(topic, args)` — publish with admission
+  accounting: selected routes, same-process admissions, bounded-mailbox/channel
+  backpressure, local rejection, and remote forwards.
 
 Subject patterns use NATS-style token matching:
 
@@ -146,7 +148,8 @@ semantics that later cluster and stream layers can reuse.
 - [x] Behavior existence validation and safe numeric delivery.
 - [x] Cross-shard subscription replication and payload routing.
 - [x] Queue-group cursors scoped by topic and group.
-- [ ] Publish/backpressure result accounting on top of bounded actor mailboxes.
+- [x] Publish/backpressure result accounting on top of bounded actor mailboxes
+  and bounded cross-shard channels.
 - [ ] Placement-aware queue-group selection across publishing shards.
 
 ### Phase 2 — cluster-wide topics
