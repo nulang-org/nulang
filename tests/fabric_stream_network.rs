@@ -281,3 +281,71 @@ fn three_replica_stream_commits_on_majority() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+
+#[test]
+fn replica_nack_does_not_advance_quorum_commit() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:34401".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:34402".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut a = runtime(addr_a, bus.clone());
+    let mut b = runtime(addr_b, bus);
+
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    b.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let placement = a.fabric_stream_placement("nack", 0, 2).unwrap();
+    let root_a = temp_dir("nack-a");
+    let root_b = temp_dir("nack-b");
+    a.fabric_stream_open(&root_a).unwrap();
+    b.fabric_stream_open(&root_b).unwrap();
+
+    let (leader, follower) = if placement.leader == node_a {
+        (&mut a, &mut b)
+    } else {
+        (&mut b, &mut a)
+    };
+
+    leader
+        .fabric_stream_create("nack", FabricStreamConfig::default())
+        .unwrap();
+    follower
+        .fabric_stream_create(
+            "nack",
+            FabricStreamConfig {
+                segment_max_bytes: 128 * 1024,
+            },
+        )
+        .unwrap();
+
+    let result = leader
+        .fabric_stream_replicated_append("nack", 0, 2, b"will-reject")
+        .unwrap();
+    assert_eq!(result.status.acknowledgements, 1);
+    assert_eq!(result.status.rejections, 0);
+
+    follower.process_network();
+    leader.process_network();
+
+    let status = leader
+        .fabric_stream_replication_status("nack", 0, result.sequence)
+        .unwrap();
+    assert_eq!(status.acknowledgements, 1);
+    assert_eq!(status.rejections, 1);
+    assert!(!status.committed);
+    assert_eq!(leader.fabric_stream_committed_sequence("nack").unwrap(), 0);
+
+    let _ = std::fs::remove_dir_all(root_a);
+    let _ = std::fs::remove_dir_all(root_b);
+}
