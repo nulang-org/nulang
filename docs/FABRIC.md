@@ -84,9 +84,11 @@ snapshot.
 
 Node-loss cleanup removes both the node's routes and its remembered generation,
 which permits a restarted node with the same stable NodeId to start a fresh
-snapshot sequence. The remaining Phase 2 wire step is to carry complete
-snapshots as a backward-compatible additive tail on existing cluster gossip;
-Fabric does not need a new payload transport or new broker connection.
+snapshot sequence. Complete snapshots now ride as a backward-compatible
+self-identifying `FAB0` tail on existing cluster gossip. If the full local
+subscription set exceeds the gossip cap, the sender omits the Fabric extension
+for that round rather than emitting a destructive partial replacement. Fabric
+does not need a new payload transport or new broker connection.
 
 `tests/fabric_cluster.rs` already exercises the intended split directly: it
 exchanges a complete Fabric snapshot between two deterministic distributed
@@ -156,11 +158,12 @@ semantics that later cluster and stream layers can reuse.
 - [x] Node-scoped remote route + generation cleanup primitive.
 - [x] Remote routing path reuses `Runtime::send_distributed`.
 - [x] Deterministic two-node remote-publish coverage with manual snapshot exchange.
-- [ ] Carry complete subscription snapshots as an additive NUL0 gossip tail.
-- [ ] Invoke node cleanup from cluster failure/removal handling.
-- [ ] Multi-node automatic subscription convergence.
+- [x] Carry complete subscription snapshots as an additive NUL0 gossip tail.
+- [x] Invoke node cleanup from cluster failure/removal handling.
+- [x] Two-node automatic subscription convergence over deterministic transport.
+- [x] Deterministic node-failure cleanup and same-NodeId rejoin coverage.
 - [ ] Placement-aware consumer selection using mailbox pressure and locality.
-- [ ] Deterministic partition/reorder/rejoin coverage for automatic gossip.
+- [ ] Deterministic partition/reorder coverage for automatic gossip.
 
 ### Phase 3 — durable streams
 
