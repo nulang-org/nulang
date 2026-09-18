@@ -2145,34 +2145,25 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             hir::Operand::Unit
         }
         Expr::Consume { expr, span } => {
-            // `consume x` is a real move-out, not just a static capability
-            // marker. Copy the value into a fresh temporary, then clear the
-            // source binding to nil WITHOUT dropping it. The raw register copy
-            // transfers the source's counted ownership slot to the temporary;
-            // clearing the source prevents a later scope drop/debugger read
-            // from observing a second live owner.
-            //
-            // For non-binding expressions (or compile-time inlined values such
-            // as signals), there is no reusable source slot to invalidate, so
-            // consuming is just evaluation of that expression.
+            // Preserve ownership transfer as an explicit HIR operation rather
+            // than encoding it as an ordinary copy plus assignment. MIR still
+            // emits the same runtime copy+nil sequence, but can now attach
+            // transfer metadata so Drop planning does not confuse the move
+            // with alias creation.
             let source = lower_expr(expr, body);
             if let (Expr::Var(source_name, _), hir::Operand::Var(resolved_name, source_ty)) =
                 (expr.as_ref(), &source)
             {
                 if source_name == resolved_name {
                     let temp = fresh_temp_name();
+                    let moved_ty = source_ty.clone();
                     body.push(hir::Stmt::Let {
                         name: temp.clone(),
-                        ty: source_ty.clone(),
-                        value: hir::RValue::Use(source.clone()),
+                        ty: moved_ty.clone(),
+                        value: hir::RValue::MoveOut(source),
                         span: *span,
                     });
-                    body.push(hir::Stmt::Assign {
-                        target: hir::Place::Var(source_name.clone(), source_ty.clone()),
-                        value: hir::RValue::Literal(Literal::Nil, Type::nil()),
-                        span: *span,
-                    });
-                    return hir::Operand::Var(temp, source_ty.clone());
+                    return hir::Operand::Var(temp, moved_ty);
                 }
             }
             source
@@ -2694,7 +2685,7 @@ mod tests {
     }
 
     #[test]
-    fn test_consume_moves_value_and_clears_source_binding() {
+    fn test_consume_lowers_to_explicit_move_out() {
         let span = Span::default();
         let expr = Expr::Let {
             name: "x".to_string(),
@@ -2725,24 +2716,20 @@ mod tests {
             })
             .expect("let-in should lower to a scoped HIR block");
 
-        let move_idx = scoped
-            .stmts
-            .iter()
-            .position(|stmt| {
+        assert!(
+            scoped.stmts.iter().any(|stmt| {
                 matches!(
                     stmt,
                     hir::Stmt::Let {
-                        value: hir::RValue::Use(hir::Operand::Var(name, _)),
+                        value: hir::RValue::MoveOut(hir::Operand::Var(name, _)),
                         ..
                     } if name == "x"
                 )
-            })
-            .expect("consume should copy x into a move-result temporary");
-
-        let clear_idx = scoped
-            .stmts
-            .iter()
-            .position(|stmt| {
+            }),
+            "consume should preserve an explicit ownership-transfer rvalue"
+        );
+        assert!(
+            !scoped.stmts.iter().any(|stmt| {
                 matches!(
                     stmt,
                     hir::Stmt::Assign {
@@ -2751,20 +2738,8 @@ mod tests {
                         ..
                     } if name == "x"
                 )
-            })
-            .expect("consume should clear the source binding");
-
-        assert!(
-            move_idx < clear_idx,
-            "move result must be captured before source is invalidated"
-        );
-        assert!(
-            matches!(
-                &scoped.terminator,
-                hir::Terminator::Yield(hir::Operand::Var(name, _))
-                    if name.starts_with("__tmp")
-            ),
-            "consume expression must yield the moved temporary"
+            }),
+            "HIR should not encode move-out as an ordinary user assignment"
         );
     }
 
@@ -2791,11 +2766,7 @@ fn transfer(lineariso owned: Int, val shared: Int, plain: Int) -> Int {
 
         assert_eq!(
             f.param_caps,
-            vec![
-                Capability::LinearIso,
-                Capability::Val,
-                Capability::Ref,
-            ]
+            vec![Capability::LinearIso, Capability::Val, Capability::Ref,]
         );
     }
 
