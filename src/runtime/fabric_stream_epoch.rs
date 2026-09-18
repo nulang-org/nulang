@@ -49,6 +49,7 @@ pub struct FabricStreamEpochTransitionStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FabricStreamEpochPrepare {
+    pub stream: String,
     pub proposal: FabricStreamEpochProposalState,
 }
 
@@ -172,7 +173,8 @@ impl Runtime {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Fabric stream epoch overflow"))?;
         let to_policy = policy_from_placement(&placement, to_epoch);
         let candidate_tail = self.fabric_stream_info(stream)?.last_sequence.unwrap_or(0);
-        let proposal_hash = epoch_proposal_hash(&from_policy, &to_policy, candidate_tail);
+        let proposal_hash =
+            epoch_proposal_hash(stream, &from_policy, &to_policy, candidate_tail);
         let proposal = FabricStreamEpochProposalState {
             proposal_hash,
             from_policy,
@@ -216,6 +218,7 @@ impl Runtime {
         }
 
         self.fabric_stream_dispatch_epoch_prepare(FabricStreamEpochPrepare {
+            stream: stream.to_string(),
             proposal,
         })?;
         Ok(outcome.status)
@@ -240,10 +243,40 @@ impl Runtime {
             self.fabric_stream_dispatch_epoch_commit(&commit)?;
             return Ok(status_from_state(&state));
         }
-        self.fabric_stream_dispatch_epoch_prepare(FabricStreamEpochPrepare {
-            proposal: state.proposal.clone(),
+
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch transition requires distribution",
+            )
         })?;
-        Ok(status_from_state(&state))
+        let cluster = self.distributed.cluster.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric epoch transition requires cluster membership",
+            )
+        })?;
+        let own_vote =
+            self.fabric_stream_evaluate_epoch_prepare(stream, &state.proposal, local, &cluster);
+        self.distributed.cluster = Some(cluster);
+        let own_vote = own_vote?;
+        let outcome = self.fabric_stream_record_epoch_vote_from_cluster(
+            FabricStreamEpochVote {
+                stream: stream.to_string(),
+                vote: own_vote,
+            },
+            local,
+        )?;
+        if let Some(commit) = outcome.commit {
+            self.fabric_stream_dispatch_epoch_commit(&commit)?;
+            return Ok(outcome.status);
+        }
+
+        self.fabric_stream_dispatch_epoch_prepare(FabricStreamEpochPrepare {
+            stream: stream.to_string(),
+            proposal: state.proposal,
+        })?;
+        Ok(outcome.status)
     }
 
     pub(crate) fn fabric_stream_evaluate_epoch_prepare(
@@ -524,6 +557,12 @@ impl Runtime {
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "distribution is not enabled")
         })?;
+        if prepare.stream.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric epoch prepare stream cannot be empty",
+            ));
+        }
         let bytes = prepare.to_wire_bytes()?;
         let cluster = self.distributed.cluster.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "cluster membership is unavailable")
@@ -629,6 +668,7 @@ fn validate_proposal_shape(
         ));
     }
     let expected = epoch_proposal_hash(
+        stream,
         &proposal.from_policy,
         &proposal.to_policy,
         proposal.candidate_tail,
@@ -657,12 +697,15 @@ fn policy_from_placement(
 }
 
 fn epoch_proposal_hash(
+    stream: &str,
     from: &FabricStreamReplicationPolicy,
     to: &FabricStreamReplicationPolicy,
     candidate_tail: u64,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"nulang-fabric-stream-epoch-transition-v1");
+    hasher.update(&(stream.len() as u64).to_be_bytes());
+    hasher.update(stream.as_bytes());
     hash_policy(&mut hasher, from);
     hash_policy(&mut hasher, to);
     hasher.update(&candidate_tail.to_be_bytes());
