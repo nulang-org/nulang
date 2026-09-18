@@ -1569,7 +1569,7 @@ pub fn process_network_packets(
                                     ));
                                 }
                                 runtime
-                                    .fabric_stream_record_replica_ack(ack)
+                                    .fabric_stream_record_replica_ack_from_cluster(ack, cluster)
                                     .map(|_| ())
                             }),
                         _ => Err(std::io::Error::new(
