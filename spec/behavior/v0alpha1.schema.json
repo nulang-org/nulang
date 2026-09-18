@@ -73,7 +73,7 @@
   "$defs": {
     "digest": {
       "type": "string",
-      "pattern": "^(blake3|sha256):[0-9a-f]{32,128}$"
+      "pattern": "^(blake3|sha256):[0-9a-f]{64}$"
     },
     "name": {
       "type": "string",
