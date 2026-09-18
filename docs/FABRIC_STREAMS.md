@@ -917,3 +917,90 @@ higher epoch installed
 If survivor tails differ, the transition remains safely pending. The
 proposal-scoped push and pull APIs can repair/reconcile the mismatch; automatic
 selection of those repair actions is a separate orchestration layer.
+
+
+## Automatic failover reconciliation state machine
+
+Active local candidate transitions now automatically choose the next safe
+reconciliation action from durable transition state and rejected vote tails.
+
+The orchestration runs at the end of `process_network()`, after packet
+processing and confirmed-removal handling restore runtime-owned cluster and
+transport state.
+
+### Action selection
+
+For each due candidate transition:
+
+1. **candidate tail > proposal tail**  
+   A pull changed the candidate log. The proposal hash is stale, so the
+   candidate automatically starts a strictly higher election term using the
+   same proposed replica factor.
+
+2. **a proposed replica reports tail > candidate tail**  
+   The candidate invokes bounded proposal-scoped pull reconciliation.
+
+3. **no replica is ahead, but a proposed replica reports tail < candidate
+   tail**  
+   The candidate invokes bounded proposal-scoped push repair.
+
+4. **no durable tail mismatch is known**  
+   The candidate re-sends the existing prepare proposal.
+
+Pull is deliberately prioritized when peers disagree in both directions. The
+candidate first adopts the highest known surviving tail under a higher term;
+only then are lagging replicas pushed toward the reconciled prefix.
+
+Automatic reconciliation uses a 256-record batch per action. Partial push/pull
+repair therefore remains bounded and progresses across network turns.
+
+### Event-driven wakeups
+
+Backoff is still used for silent peers and membership-confirmation skew, but
+known durable progress does not wait for the timer:
+
+- a rejected epoch vote wakes reconciliation immediately,
+- a successful pull response wakes reconciliation immediately.
+
+A pull response changes the candidate tail, so the same network turn can reach
+the post-processing state machine and start the superseding higher term without
+an explicit API call.
+
+### End-to-end automatic mismatch recovery
+
+The confirmed-removal failover path can now complete automatically for all
+currently supported old-replica-set cases:
+
+```text
+shared tails
+  -> prepare / vote / commit
+
+candidate ahead
+  -> rejected lower-tail vote
+  -> push repair
+  -> re-vote
+  -> commit
+
+candidate behind
+  -> rejected higher-tail vote
+  -> pull suffix
+  -> higher election term
+  -> re-vote
+  -> commit
+```
+
+No application call to the push, pull, resume, or begin-transition APIs is
+required after the confirmed removal trigger in these deterministic scenarios.
+
+### Remaining automatic-failover boundaries
+
+Automatic orchestration still refuses to:
+
+- continue without an old-policy majority,
+- introduce a brand-new replica,
+- truncate or overwrite a conflicting local durable prefix,
+- fail over on mere failure suspicion,
+- infer per-record provenance beyond the trusted old-replica model.
+
+Replica-set expansion and stronger per-record term provenance remain separate
+protocol work.
