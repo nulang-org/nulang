@@ -45,6 +45,19 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric committed-replica catch-up — 2026-09-18
+- **Durable follower progress + committed-prefix repair** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`,
+  `src/runtime/distributed.rs`). Leaders now persist each follower's highest
+  application-ACKed sequence, can replay a bounded set of missing
+  quorum-committed records to a lagging replica, and propagate committed
+  visibility through a reserved NUL0-v1-compatible system ActorMessage.
+  Commit updates are sent only when durable ACK progress proves the follower
+  already stores the committed prefix; followers validate current placement
+  and local tail before advancing their own durable commit boundary. This
+  repairs replicas after partitions without introducing automatic leader
+  failover.
+
 ### Fabric stream crash recovery — 2026-09-18
 - **Durable replication intent + explicit retry** (Experimental,
   `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`).
