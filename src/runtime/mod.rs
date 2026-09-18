@@ -22,6 +22,7 @@ mod distributed;
 mod distributed_context;
 mod fabric_stream;
 mod fabric_stream_cluster;
+mod fabric_stream_epoch;
 mod grain;
 mod network;
 mod object_store;
@@ -39,6 +40,7 @@ pub use fabric_stream_cluster::{
     FabricStreamReplicaAppend, FabricStreamReplicaDispatchReport,
     FabricStreamReplicatedAppendResult, FabricStreamReplicationStatus, FabricStreamRetryReport,
 };
+pub use fabric_stream_epoch::FabricStreamEpochTransitionStatus;
 #[cfg(feature = "ai-runtime")]
 mod agent;
 #[cfg(feature = "ai-runtime")]
