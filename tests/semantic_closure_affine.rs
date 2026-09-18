@@ -5,8 +5,30 @@
 //! must fail closed when no continuation remains.
 
 use nulang::bytecode::{CodeModule, Constant, HandlerBinding, HandlerTable, Instruction, OpCode};
+use nulang::lexer::Lexer;
+use nulang::parser::Parser;
+use nulang::typechecker::TypeChecker;
 use nulang::types::NuError;
 use nulang::vm::VM;
+
+fn typecheck_source(source: &str) -> Result<(), NuError> {
+    let tokens = Lexer::new(source).lex()?;
+    let ast = Parser::new(tokens).parse_module()?;
+    let mut checker = TypeChecker::new();
+    checker.check_module(&ast).map(|_| ())
+}
+
+fn assert_type_error_contains(err: NuError, needle: &str) {
+    match err {
+        NuError::TypeError { msg, .. } => {
+            assert!(
+                msg.contains(needle),
+                "expected type error containing {needle:?}, got: {msg}"
+            );
+        }
+        other => panic!("expected TypeError, got {other:?}"),
+    }
+}
 
 fn assert_missing_continuation(err: NuError) {
     match err {
@@ -91,4 +113,74 @@ fn second_resume_after_successful_resume_traps() {
         .run()
         .expect_err("a consumed continuation must not be resumable twice");
     assert_missing_continuation(err);
+}
+
+
+#[test]
+fn explicit_resume_inside_handler_clause_typechecks() {
+    typecheck_source(
+        r#"
+effect E { op: -> Int }
+
+fn main() {
+    handle { perform E.op() } {
+        | E.op() => resume(1)
+    }
+}
+"#,
+    )
+    .expect("a handler clause owns a live continuation");
+}
+
+#[test]
+fn resume_outside_handler_clause_is_rejected_statically() {
+    let err = typecheck_source(
+        r#"
+fn main() {
+    resume(1)
+}
+"#,
+    )
+    .expect_err("resume outside a handler clause must be rejected by the frontend");
+
+    assert_type_error_contains(err, "only valid inside an effect-handler clause");
+}
+
+#[test]
+fn resume_argument_is_typechecked() {
+    let err = typecheck_source(
+        r#"
+effect E { op: -> Int }
+
+fn main() {
+    handle { perform E.op() } {
+        | E.op() => resume(missing_value)
+    }
+}
+"#,
+    )
+    .expect_err("the resume argument must participate in normal type/name inference");
+
+    assert_type_error_contains(err, "Unbound variable: 'missing_value'");
+}
+
+#[test]
+fn handled_body_cannot_resume_the_handlers_continuation() {
+    let err = typecheck_source(
+        r#"
+effect E { op: -> Int }
+
+fn main() {
+    handle {
+        perform E.op()
+        resume(2)
+    } {
+        | E.op() resume => 1
+    }
+}
+"#,
+    )
+    .expect_err("the handled body does not lexically own a handler continuation");
+
+    assert_type_error_contains(err, "only valid inside an effect-handler clause");
 }
