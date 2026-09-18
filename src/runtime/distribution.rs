@@ -399,6 +399,21 @@ pub(crate) fn process_network(rt: &mut Runtime) {
         }
     }
 
+    // Confirmed removals can be observed while packet processing temporarily
+    // owns ClusterState outside Runtime. Drain them only now, after the
+    // runtime-owned transport/cluster state has been restored.
+    let removed_nodes =
+        std::mem::take(&mut rt.distributed.fabric_stream_removed_nodes_pending);
+    for removed in removed_nodes {
+        if let Err(error) = rt.fabric_stream_failover_confirmed_removed(removed) {
+            tracing::warn!(
+                removed = removed.0,
+                "nulang-fabric-stream: confirmed-removal failover orchestration failed: {}",
+                error
+            );
+        }
+    }
+
     // Retry pending durable stream replication only after packet processing
     // and cluster actions have restored the runtime-owned distribution state.
     rt.fabric_stream_tick_retries();
@@ -450,6 +465,13 @@ pub(crate) fn handle_node_failed(rt: &mut Runtime, node: NodeId) {
 /// holds the replica (the deterministic shadow), so exactly one survivor
 /// re-spawns each actor and no two live copies can exist.
 pub(crate) fn handle_node_removed(rt: &mut Runtime, node: NodeId) {
+    // Fabric ownership transitions are deferred until process_network restores
+    // runtime-owned cluster/transport state. HashSet semantics deduplicate
+    // graceful-goodbye and failure-detector confirmation of the same node.
+    rt.distributed
+        .fabric_stream_removed_nodes_pending
+        .insert(node);
+
     handle_node_failed(rt, node);
 
     // Which actors lived on the removed node, and am I their shadow?
