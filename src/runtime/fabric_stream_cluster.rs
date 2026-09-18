@@ -71,6 +71,21 @@ pub struct FabricStreamReplicatedAppendResult {
     pub dispatch: FabricStreamReplicaDispatchReport,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FabricStreamRecoveryReport {
+    pub recovered: usize,
+    pub removed_committed: usize,
+    pub removed_orphan_reservations: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FabricStreamRetryReport {
+    pub pending_sequences: usize,
+    pub intended_remote: usize,
+    pub dispatched: usize,
+    pub unavailable: usize,
+}
+
 #[derive(Debug, Clone)]
 struct PendingReplicaCommit {
     leader: NodeId,
@@ -323,6 +338,213 @@ impl Runtime {
         })
     }
 
+    /// Reconstruct in-memory quorum tickets from durable replication intent.
+    ///
+    /// ACK sets are intentionally rebuilt with only the leader's own fsync.
+    /// Retrying followers is safe because replica application is idempotent.
+    pub fn fabric_stream_recover_pending(
+        &mut self,
+        stream: &str,
+    ) -> io::Result<FabricStreamRecoveryReport> {
+        let cluster = self.distributed.cluster.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream recovery requires cluster membership",
+            )
+        })?;
+        let result = self.fabric_stream_recover_pending_from_cluster(stream, &cluster);
+        self.distributed.cluster = Some(cluster);
+        result
+    }
+
+    pub(crate) fn fabric_stream_recover_pending_from_cluster(
+        &mut self,
+        stream: &str,
+        cluster: &ClusterState,
+    ) -> io::Result<FabricStreamRecoveryReport> {
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric stream recovery requires distribution",
+            )
+        })?;
+        let committed = self.fabric_stream_committed_sequence(stream)?;
+        let info = self.fabric_stream_info(stream)?;
+        let intents = self.fabric_stream_pending_replication_intents(stream)?;
+        let mut report = FabricStreamRecoveryReport::default();
+
+        for intent in intents {
+            if intent.sequence <= committed {
+                self.fabric_stream_remove_replication_intent(stream, intent.sequence)?;
+                report.removed_committed += 1;
+                continue;
+            }
+
+            let record = self
+                .fabric_stream_read(stream, intent.sequence, 1)?
+                .into_iter()
+                .next()
+                .filter(|record| record.sequence == intent.sequence);
+            if record.is_none() {
+                if intent.sequence == info.next_sequence {
+                    self.fabric_stream_remove_replication_intent(stream, intent.sequence)?;
+                    report.removed_orphan_reservations += 1;
+                    continue;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Fabric replication intent for sequence {} has no matching durable record",
+                        intent.sequence
+                    ),
+                ));
+            }
+
+            let placement = compute_stream_placement(
+                local,
+                Some(cluster),
+                stream,
+                intent.partition,
+                intent.replication_factor,
+            )?;
+            let intent_replicas: Vec<NodeId> =
+                intent.replicas.iter().copied().map(NodeId).collect();
+            if placement.leader.0 != intent.leader
+                || placement.membership_fingerprint != intent.membership_fingerprint
+                || placement.replicas != intent_replicas
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Fabric replication intent for sequence {} no longer matches current placement",
+                        intent.sequence
+                    ),
+                ));
+            }
+            if placement.leader != local {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "local node is no longer the persisted Fabric stream leader",
+                ));
+            }
+
+            let key = (stream.to_string(), intent.partition);
+            let entries = self
+                .distributed
+                .fabric_stream_replication
+                .pending
+                .entry(key)
+                .or_default();
+            if entries.contains_key(&intent.sequence) {
+                continue;
+            }
+
+            let mut acknowledgements = HashSet::new();
+            acknowledgements.insert(local);
+            entries.insert(
+                intent.sequence,
+                PendingReplicaCommit {
+                    leader: placement.leader,
+                    membership_fingerprint: placement.membership_fingerprint,
+                    replicas: placement.replicas.iter().copied().collect(),
+                    acknowledgements,
+                    rejections: HashSet::new(),
+                    quorum: intent.replication_factor / 2 + 1,
+                },
+            );
+            report.recovered += 1;
+        }
+
+        // Handles RF=1 recovery and any contiguous tickets that already meet
+        // quorum after reconstruction.
+        self.fabric_stream_advance_commits(stream, 0)?;
+        Ok(report)
+    }
+
+    /// Re-dispatch every pending exact sequence to the configured replica set.
+    ///
+    /// The retry is intentionally duplicate-tolerant. After restart the leader
+    /// has forgotten follower ACK sets, so sending to all remote replicas is
+    /// safer than guessing which followers already persisted a sequence.
+    pub fn fabric_stream_retry_pending(
+        &mut self,
+        stream: &str,
+        partition: u16,
+    ) -> io::Result<FabricStreamRetryReport> {
+        self.fabric_stream_recover_pending(stream)?;
+
+        let key = (stream.to_string(), partition);
+        let tickets: Vec<(u64, PendingReplicaCommit)> = self
+            .distributed
+            .fabric_stream_replication
+            .pending
+            .get(&key)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(&sequence, ticket)| (sequence, ticket.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut report = FabricStreamRetryReport {
+            pending_sequences: tickets.len(),
+            ..FabricStreamRetryReport::default()
+        };
+        if tickets.is_empty() {
+            return Ok(report);
+        }
+
+        let stream_config = self.fabric_stream_config(stream)?;
+        for (sequence, ticket) in tickets {
+            let record = self
+                .fabric_stream_read(stream, sequence, 1)?
+                .into_iter()
+                .next()
+                .filter(|record| record.sequence == sequence)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "pending Fabric replication sequence {sequence} is missing locally"
+                        ),
+                    )
+                })?;
+
+            let placement = self.fabric_stream_placement(
+                stream,
+                partition,
+                ticket.replicas.len(),
+            )?;
+            if placement.leader != ticket.leader
+                || placement.membership_fingerprint != ticket.membership_fingerprint
+                || placement.replicas.iter().copied().collect::<HashSet<_>>() != ticket.replicas
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pending Fabric replication ticket no longer matches current placement",
+                ));
+            }
+
+            let append = FabricStreamReplicaAppend {
+                stream: stream.to_string(),
+                partition,
+                leader: ticket.leader,
+                membership_fingerprint: ticket.membership_fingerprint,
+                replication_factor: ticket.replicas.len(),
+                stream_config,
+                sequence,
+                payload: record.payload,
+            };
+            let dispatch = self.fabric_stream_dispatch_replica_append(&placement, &append)?;
+            report.intended_remote += dispatch.intended_remote;
+            report.dispatched += dispatch.dispatched;
+            report.unavailable += dispatch.unavailable;
+        }
+
+        Ok(report)
+    }
+
     pub fn fabric_stream_replication_status(
         &mut self,
         stream: &str,
@@ -376,6 +598,16 @@ impl Runtime {
         }
 
         let key = (ack.stream.clone(), ack.partition);
+        if self
+            .distributed
+            .fabric_stream_replication
+            .pending
+            .get(&key)
+            .and_then(|entries| entries.get(&ack.sequence))
+            .is_none()
+        {
+            self.fabric_stream_recover_pending_from_cluster(&ack.stream, cluster)?;
+        }
         let replication_factor = self
             .distributed
             .fabric_stream_replication
