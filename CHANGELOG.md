@@ -100,6 +100,18 @@ two major versions.*
   tokens are propagated through `MoveOut` in #402 phase 2; function
   parameters likewise remain non-owning until a sink/call ABI is defined.
 
+- **MoveOut ownership-token propagation** (`src/mir_codegen.rs`): the drop
+  planner now distinguishes explicit ownership transfer from ordinary
+  uncounted copies. Fresh owned definitions seed a least-fixed-point
+  provenance graph; `MoveOut` destinations inherit a drop token only from
+  already-proven owners, so parameters, captures, borrowed values, and
+  transfer-only cycles cannot manufacture ownership. Escapee aliases are
+  tracked across the whole transfer lineage. Spilled MoveOut sources are
+  invalidated in their spill slots rather than only in transient scratch
+  registers, and transfer sources are not redundantly released at the move
+  site. Regression coverage includes register↔spill and spill↔spill transfer
+  semantics plus non-owning ABI parameters.
+
 - **Path-sensitive move safety** (`src/effect_checker.rs`,
   `conformance/behavior/cap_13_*`): capability analysis now keeps
   must-use/definite-consumption separate from may-have-moved state. Definite

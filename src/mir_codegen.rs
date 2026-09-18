@@ -677,6 +677,15 @@ impl MirCodegen {
         handle_patches: &mut Vec<(usize, usize)>,
     ) -> NuResult<()> {
         match stmt {
+            mir::Stmt::Assign {
+                dst,
+                op: mir::RValue::MoveOut(src),
+            } if dst == src => {
+                return Err(compile_err(
+                    "internal: MoveOut source and destination must be distinct locals",
+                    Span::default(),
+                ));
+            }
             mir::Stmt::Assign { dst, op } => {
                 let _spill_dst = self.local_dst(*dst);
                 self.compile_rvalue(_spill_dst, op)?;
@@ -770,8 +779,45 @@ impl MirCodegen {
                 }
             }
             mir::RValue::MoveOut(id) => {
-                let src = self.local_reg(*id);
-                if src != dst {
+                if let Some(slot) = self.spill_map.get(&id.0).copied() {
+                    // A spilled source does not live in the scratch register
+                    // returned by local_reg(): that register is only a cache
+                    // of the spill slot. MoveOut must invalidate the spill
+                    // slot itself or both source and destination would retain
+                    // the same counted ownership.
+                    //
+                    // Use a scratch distinct from dst so a spilled destination
+                    // (SPILL_TEMP) or another scratch-directed lowering cannot
+                    // be clobbered while the source slot is cleared.
+                    let scratch = if dst != SPILL_TEMP2 {
+                        SPILL_TEMP2
+                    } else {
+                        SPILL_TEMP3
+                    };
+                    self.emit(Instruction::new3(
+                        OpCode::SpillLoad,
+                        (slot >> 8) as u8,
+                        (slot & 0xFF) as u8,
+                        scratch,
+                    ));
+                    if scratch != dst {
+                        self.emit(Instruction::new2(OpCode::Move, scratch, dst));
+                    }
+                    self.load_constant(scratch, &Constant::Nil);
+                    self.emit(Instruction::new3(
+                        OpCode::SpillStore,
+                        scratch,
+                        (slot >> 8) as u8,
+                        (slot & 0xFF) as u8,
+                    ));
+                } else {
+                    let src = (LOCAL_BASE + id.0) as u8;
+                    if src == dst {
+                        return Err(compile_err(
+                            "internal: MoveOut source and destination must be distinct locals",
+                            Span::default(),
+                        ));
+                    }
                     self.emit(Instruction::new2(OpCode::Move, src, dst));
                     // MoveOut transfers the counted slot; invalidating the
                     // source must not release it. Reuse the existing constant
@@ -2160,6 +2206,10 @@ enum UseKind {
     /// Copied through a channel that takes no counted reference (Move/Load,
     /// call staging, send, capture, return, actor state).
     Copy,
+    /// Explicit ownership transfer: the source slot is invalidated as part
+    /// of the operation, so this is not an aliasing copy. The destination is
+    /// ownership-proven only when the source itself has a proven owned token.
+    Transfer,
 }
 
 /// Locals of these types can hold NaN-boxed heap pointers at runtime. MIR
@@ -2223,10 +2273,8 @@ fn rvalue_uses(op: &mir::RValue) -> Vec<(usize, UseKind)> {
         // The timeout value is staged into r0 with a plain Move — an
         // uncounted copy channel like call/effect argument staging.
         ReceiveWait { timeout, .. } => cp(&mut out, *timeout),
-        // Phase 1 models MoveOut explicitly but does not yet establish a
-        // transferable drop token. Keep it in the conservative copy class
-        // until #402 phase 2 teaches the planner ownership propagation.
-        Load(x) | MoveOut(x) => cp(&mut out, *x),
+        Load(x) => cp(&mut out, *x),
+        MoveOut(x) => out.push((x.0 as usize, UseKind::Transfer)),
         LoadFieldNamed { obj, .. } | LoadFieldPos { obj, .. } => ro(&mut out, *obj),
         ArrayLoad { arr, idx } => {
             ro(&mut out, *arr);
@@ -2387,7 +2435,12 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
 
     // Scan defs and uses for the whole function.
     let mut has_def = vec![false; nlocals];
-    let mut defs_owning = vec![true; nlocals];
+    // Every definition of a candidate must either create a fresh owned value
+    // or transfer one from another ownership-proven local. Any ordinary
+    // borrowed/copied definition permanently disqualifies the destination.
+    let mut defs_supported = vec![true; nlocals];
+    let mut transfer_sources: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
+    let mut transfer_edges: Vec<(usize, usize)> = Vec::new(); // (dst, src)
     let mut no_copy_use = vec![true; nlocals];
     let mut block_defs: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
     let mut block_uses: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
@@ -2406,9 +2459,22 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
                 let d = dst.0 as usize;
                 has_def[d] = true;
                 block_defs[bi].insert(d);
-                if !rvalue_is_owning(op) || rvalue_uses(op).iter().any(|(u, _)| *u == d) {
-                    defs_owning[d] = false;
+
+                match op {
+                    mir::RValue::MoveOut(src) if src.0 as usize != d => {
+                        let s = src.0 as usize;
+                        transfer_sources[d].push(s);
+                        transfer_edges.push((d, s));
+                    }
+                    _ if rvalue_is_owning(op)
+                        && !rvalue_uses(op).iter().any(|(u, _)| *u == d) => {}
+                    _ => {
+                        // Ordinary Load/call/field access/etc. does not prove
+                        // a unique counted owner for the destination.
+                        defs_supported[d] = false;
+                    }
                 }
+
                 match op {
                     mir::RValue::LoadFieldNamed { obj, .. }
                     | mir::RValue::LoadFieldPos { obj, .. } => loads.push((d, obj.0 as usize)),
@@ -2425,23 +2491,68 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
     }
 
-    let candidate: Vec<bool> = (0..nlocals)
-        .map(|i| ptr_ty[i] && !excluded[i] && has_def[i] && defs_owning[i] && no_copy_use[i])
-        .collect();
+    // Least fixed point of ownership provenance. Fresh owning definitions
+    // seed the graph; MoveOut destinations become owners only after every
+    // transfer source is itself proven. Starting false deliberately rejects
+    // transfer-only cycles with no fresh root.
+    let mut candidate = vec![false; nlocals];
+    loop {
+        let mut changed = false;
+        for i in 0..nlocals {
+            if candidate[i] {
+                continue;
+            }
+            let structurally_eligible =
+                ptr_ty[i] && !excluded[i] && has_def[i] && defs_supported[i] && no_copy_use[i];
+            if structurally_eligible && transfer_sources[i].iter().all(|src| candidate[*src]) {
+                candidate[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 
-    // Escapees: locals defined by field/element loads from a candidate or
-    // another escapee (transitively).
+    // MoveOut changes which local owns an object without changing the object.
+    // Build undirected ownership-lineage components so an uncounted field/
+    // element alias loaded before a transfer still blocks dropping the later
+    // owner (and vice versa).
+    let mut owner_adj: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
+    for &(dst, src) in &transfer_edges {
+        if candidate[dst] && candidate[src] {
+            owner_adj[dst].push(src);
+            owner_adj[src].push(dst);
+        }
+    }
+
+    // Escapees: locals defined by field/element loads from any owner in the
+    // same MoveOut lineage, followed transitively through further loads.
     let mut escapees: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
     for c in 0..nlocals {
         if !candidate[c] {
             continue;
         }
+
+        let mut owners = HashSet::new();
+        let mut owner_frontier = vec![c];
+        while let Some(x) = owner_frontier.pop() {
+            if !owners.insert(x) {
+                continue;
+            }
+            for &next in &owner_adj[x] {
+                owner_frontier.push(next);
+            }
+        }
+
         let mut seen = HashSet::new();
-        let mut frontier = vec![c];
+        let mut frontier: Vec<usize> = owners.iter().copied().collect();
         while let Some(x) = frontier.pop() {
             for &(dst, base) in &loads {
                 if base == x && ptr_ty[dst] && seen.insert(dst) {
-                    escapees[c].push(dst);
+                    if !owners.contains(&dst) {
+                        escapees[c].push(dst);
+                    }
                     frontier.push(dst);
                 }
             }
@@ -2488,9 +2599,15 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
         for (si, stmt) in block.stmts.iter().enumerate().rev() {
             let uses = stmt_uses(stmt);
-            // Last-use drops for candidates this statement reads.
-            for (u, _) in &uses {
-                if candidate[*u] && !live.contains(u) && esc_clear(*u, &live) {
+            // Last-use drops for candidates this statement reads. Transfer is
+            // different: MoveOut invalidates the source without releasing it,
+            // and the counted ownership continues in the destination.
+            for (u, kind) in &uses {
+                if *kind != UseKind::Transfer
+                    && candidate[*u]
+                    && !live.contains(u)
+                    && esc_clear(*u, &live)
+                {
                     plan.after_stmt
                         .entry((bi, si))
                         .or_default()
@@ -2586,6 +2703,185 @@ mod tests {
         let mut vm = VM::new();
         vm.load_module(module);
         vm.run()
+    }
+
+    fn plan_contains(
+        map: &FxHashMap<(usize, usize), Vec<mir::LocalId>>,
+        point: (usize, usize),
+        id: mir::LocalId,
+    ) -> bool {
+        map.get(&point)
+            .is_some_and(|ids| ids.iter().any(|candidate| *candidate == id))
+    }
+
+    #[test]
+    fn test_drop_plan_transfers_owned_token_through_moveout() {
+        let mut b = mir::FunctionBuilder::new("transfer", Some(Type::int()));
+        let source = b.add_temp(Type::unit());
+        let moved = b.add_temp(Type::unit());
+        let len = b.add_temp(Type::int());
+
+        b.assign(source, mir::RValue::ArrayLit(Vec::new()));
+        b.assign(moved, mir::RValue::MoveOut(source));
+        b.assign(len, mir::RValue::ArrayLen(moved));
+        b.terminate(mir::Terminator::Return(Some(len)));
+
+        let func = b.build();
+        let plan = plan_drops(&func);
+
+        assert!(
+            plan_contains(&plan.after_stmt, (0, 2), moved),
+            "the transferred owner must be released after its last read-only use"
+        );
+        assert!(
+            !plan_contains(&plan.after_stmt, (0, 1), source),
+            "MoveOut transfers ownership; the source must not be released at the transfer"
+        );
+    }
+
+    #[test]
+    fn test_codegen_rejects_moveout_to_same_local() {
+        let mut b = mir::FunctionBuilder::new("main", Some(Type::unit()));
+        let x = b.add_temp(Type::unit());
+        b.assign(x, mir::RValue::ArrayLit(Vec::new()));
+        b.assign(x, mir::RValue::MoveOut(x));
+        b.terminate(mir::Terminator::Return(Some(x)));
+
+        let mut module = mir::Module::new("self_moveout");
+        module.functions.push(b.build());
+        let err = compile_mir(&mut module, "self_moveout")
+            .expect_err("MoveOut to the same local must be rejected");
+        assert!(
+            err.to_string().contains("source and destination must be distinct"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_moveout_clears_spilled_source_slot() {
+        let mut b = mir::FunctionBuilder::new("main", Some(Type::unit()));
+        let moved = b.add_temp(Type::unit());
+
+        // Locals with id >= FUNC_VALUE_REG - LOCAL_BASE are spilled.
+        let spilled_threshold = FUNC_VALUE_REG as u32 - LOCAL_BASE;
+        for _ in 1..spilled_threshold {
+            let _ = b.add_temp(Type::int());
+        }
+        let source = b.add_temp(Type::unit());
+        assert!(source.0 >= spilled_threshold);
+
+        b.assign(source, mir::RValue::ArrayLit(Vec::new()));
+        b.assign(moved, mir::RValue::MoveOut(source));
+        // Deliberately bypass normal capability safety and observe the
+        // physical source slot after the move. A correct spilled MoveOut
+        // must return nil here, not the transferred array pointer.
+        b.terminate(mir::Terminator::Return(Some(source)));
+
+        let mut module = mir::Module::new("spill_moveout_source");
+        module.functions.push(b.build());
+        let code = compile_mir(&mut module, "spill_moveout_source").expect("compile");
+        let mut vm = VM::new();
+        vm.load_module(code);
+        let value = vm.run().expect("run");
+
+        assert!(
+            value.is_nil(),
+            "MoveOut must write nil back to the spilled source slot"
+        );
+    }
+
+    #[test]
+    fn test_codegen_moveout_between_two_spilled_locals_preserves_value() {
+        let mut b = mir::FunctionBuilder::new("main", Some(Type::int()));
+        let spilled_threshold = FUNC_VALUE_REG as u32 - LOCAL_BASE;
+        for _ in 0..spilled_threshold {
+            let _ = b.add_temp(Type::int());
+        }
+
+        let source = b.add_temp(Type::unit());
+        let moved = b.add_temp(Type::unit());
+        let len = b.add_temp(Type::int());
+        assert!(source.0 >= spilled_threshold && moved.0 >= spilled_threshold);
+
+        b.assign(source, mir::RValue::ArrayLit(Vec::new()));
+        b.assign(moved, mir::RValue::MoveOut(source));
+        b.assign(len, mir::RValue::ArrayLen(moved));
+        b.terminate(mir::Terminator::Return(Some(len)));
+
+        let mut module = mir::Module::new("spill_moveout_both");
+        module.functions.push(b.build());
+        let code = compile_mir(&mut module, "spill_moveout_both").expect("compile");
+        let mut vm = VM::new();
+        vm.load_module(code);
+        let value = vm.run().expect("run");
+
+        assert_eq!(
+            value.as_int(),
+            Some(0),
+            "clearing the spilled source must not clobber the spilled destination"
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_does_not_invent_ownership_for_moved_parameter() {
+        let mut b = mir::FunctionBuilder::new("borrowed_param", Some(Type::int()));
+        let param = b.add_param("p", Type::unit());
+        let moved = b.add_temp(Type::unit());
+        let len = b.add_temp(Type::int());
+
+        b.assign(moved, mir::RValue::MoveOut(param));
+        b.assign(len, mir::RValue::ArrayLen(moved));
+        b.terminate(mir::Terminator::Return(Some(len)));
+
+        let func = b.build();
+        let plan = plan_drops(&func);
+        let appears = plan
+            .block_entry
+            .values()
+            .chain(plan.before_stmt.values())
+            .chain(plan.after_stmt.values())
+            .any(|ids| ids.iter().any(|id| *id == moved));
+
+        assert!(
+            !appears,
+            "MoveOut from an ABI parameter must stay non-owning until a sink ABI transfers ownership"
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_preserves_escapees_across_moveout_lineage() {
+        let mut b = mir::FunctionBuilder::new("escapee", Some(Type::unit()));
+        let payload = b.add_temp(Type::unit());
+        let source = b.add_temp(Type::unit());
+        let borrowed_field = b.add_temp(Type::unit());
+        let moved = b.add_temp(Type::unit());
+        let len = b.add_temp(Type::int());
+
+        b.assign(payload, mir::RValue::ArrayLit(Vec::new()));
+        b.assign(
+            source,
+            mir::RValue::Record(vec![("field".to_string(), payload)]),
+        );
+        b.assign(
+            borrowed_field,
+            mir::RValue::LoadFieldNamed {
+                obj: source,
+                field: "field".to_string(),
+            },
+        );
+        b.assign(moved, mir::RValue::MoveOut(source));
+        b.assign(len, mir::RValue::ArrayLen(moved));
+        // The uncounted field alias escapes through the return. The moved
+        // record owner must therefore not be released at its last direct use.
+        b.terminate(mir::Terminator::Return(Some(borrowed_field)));
+
+        let func = b.build();
+        let plan = plan_drops(&func);
+
+        assert!(
+            !plan_contains(&plan.after_stmt, (0, 4), moved),
+            "an alias borrowed before MoveOut must remain an escapee of the new owner"
+        );
     }
 
     #[test]
