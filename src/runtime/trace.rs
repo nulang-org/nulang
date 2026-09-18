@@ -21,6 +21,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::primitives::{DeliverySemantics, EffectBoundary};
+
 /// Thread-safe stateless PRNG for trace / span id generation.
 ///
 /// A monotonically incremented counter fed through splitmix64. Deterministic
@@ -197,6 +199,71 @@ impl TraceContext {
         }
         Some(self.tracing_span(actor_id, behavior_idx).entered())
     }
+
+    /// Build a `tracing` span for one effect invocation as a child of this
+    /// context.
+    ///
+    /// The effect boundary and delivery semantics are explicit inputs rather
+    /// than being guessed from `effect_name`: the same effect can have
+    /// different durability guarantees depending on the installed handler or
+    /// backend. `operation_id` should contain a stable replay/idempotency key
+    /// when one exists; callers must leave it absent rather than manufacture a
+    /// value when the effect has no stable operation identity.
+    ///
+    /// Like [`tracing_span`](TraceContext::tracing_span), this eagerly formats
+    /// W3C ids. Hot paths should normally call
+    /// [`enter_effect_span`](TraceContext::enter_effect_span), which checks
+    /// whether TRACE spans are enabled first.
+    pub fn tracing_effect_span(
+        &self,
+        actor_id: Option<u64>,
+        effect_name: &str,
+        boundary: EffectBoundary,
+        delivery: DeliverySemantics,
+        operation_id: Option<&str>,
+    ) -> tracing::Span {
+        let effect_ctx = self.child();
+        let trace = format!("{:032x}", effect_ctx.trace_id);
+        let span = format!("{:016x}", effect_ctx.span_id);
+        let parent = format!("{:016x}", effect_ctx.parent_span_id);
+        let boundary_name = boundary.as_str();
+        let delivery_name = delivery.as_str();
+        let operation_id = operation_id.unwrap_or("");
+        tracing::span!(
+            parent: None,
+            tracing::Level::TRACE,
+            "effect",
+            actor_id = ?actor_id,
+            effect_name = %effect_name,
+            effect_boundary = %boundary_name,
+            delivery_semantics = %delivery_name,
+            operation_id = %operation_id,
+            trace_id = %trace,
+            span_id = %span,
+            parent_span_id = %parent,
+        )
+    }
+
+    /// Enter an effect span if TRACE-level tracing is enabled.
+    ///
+    /// Returns `None` when no TRACE subscriber is attached, matching message
+    /// dispatch behavior and keeping the default hot path allocation-free.
+    pub fn enter_effect_span(
+        &self,
+        actor_id: Option<u64>,
+        effect_name: &str,
+        boundary: EffectBoundary,
+        delivery: DeliverySemantics,
+        operation_id: Option<&str>,
+    ) -> Option<tracing::span::EnteredSpan> {
+        if !tracing::enabled!(tracing::Level::TRACE) {
+            return None;
+        }
+        Some(
+            self.tracing_effect_span(actor_id, effect_name, boundary, delivery, operation_id)
+                .entered(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -261,5 +328,24 @@ mod tests {
         assert_ne!(a.trace_id(), 0);
         assert_ne!(a.span_id(), 0);
         assert_ne!(a.trace_id(), b.trace_id());
+    }
+
+    #[test]
+    fn test_effect_span_accepts_explicit_boundary_metadata() {
+        let ctx = TraceContext::root();
+        let _span = ctx.tracing_effect_span(
+            Some(42),
+            "Http.post",
+            EffectBoundary::External,
+            DeliverySemantics::AtLeastOnce,
+            Some("effect-42-7"),
+        );
+        let _runtime_span = ctx.tracing_effect_span(
+            None,
+            "Timer.sleep",
+            EffectBoundary::RuntimeOwned,
+            DeliverySemantics::EffectivelyOnceWithDeduplication,
+            None,
+        );
     }
 }
