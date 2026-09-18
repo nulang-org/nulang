@@ -1826,14 +1826,13 @@ fn collect_rvalue_field_and_consts(
         mir::RValue::Spawn {
             init, capabilities, ..
         } => {
-            if let Ok(manifest) = crate::authority::AuthorityManifest::from_tokens(
-                capabilities.iter().map(String::as_str),
-            ) {
-                for token in manifest.canonical_tokens() {
-                    let c = crate::bytecode::Constant::String(token);
-                    if !constants.contains(&c) {
-                        constants.push(c);
-                    }
+            let manifest = crate::authority::AuthorityManifest::from_grants(
+                capabilities.iter().cloned(),
+            );
+            for token in manifest.canonical_tokens() {
+                let c = crate::bytecode::Constant::String(token);
+                if !constants.contains(&c) {
+                    constants.push(c);
                 }
             }
             for (name, rv) in init {
