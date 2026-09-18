@@ -3715,7 +3715,9 @@ impl VM {
         };
 
         // Build the callee frame with args copied from the region's regs
-        // buffer.
+        // buffer. Remember the handler depth so a failing re-entrant callee
+        // cannot leave effect handlers from abandoned frames installed.
+        let handler_depth = self.handler_stack.len();
         let mut frame = Frame::new(Some(caller_idx), module_idx);
         frame.pc = code_offset;
         let argc = argc.min(256);
@@ -3738,9 +3740,13 @@ impl VM {
                     break 0;
                 }
                 Err(e) => {
-                    // Callee raised. Unwind any nested frames back to the
-                    // caller so the outer region resumes on the correct frame.
+                    // Callee raised. Reclaim owners from every abandoned
+                    // callee/nested frame before truncating them, and restore
+                    // the handler stack to its pre-call depth. The caller is
+                    // deliberately preserved for the outer region/error path.
+                    self.cleanup_frame_owner_range(caller_idx + 1);
                     self.frames.truncate(caller_idx + 1);
+                    self.handler_stack.truncate(handler_depth);
                     self.current_frame_idx = Some(caller_idx);
                     crate::jit::runtime::set_jit_pending_vm_error(e.to_string());
                     break 1;
@@ -4762,11 +4768,11 @@ impl VM {
         Some((info.cleanup_regs.clone(), info.cleanup_spills.clone()))
     }
 
-    /// Reclaim compiler-proven owning slots from frames permanently abandoned
-    /// by a true runtime error. Slots are cleared before the decrement,
-    /// matching OpCode::Drop and making already-dropped values harmless.
-    fn cleanup_abandoned_frames(&mut self) {
-        let cleanup: Vec<_> = (0..self.frames.len())
+    /// Reclaim compiler-proven owning slots from a suffix of the frame stack.
+    /// Slots are cleared before the decrement, matching OpCode::Drop and
+    /// making already-dropped values harmless.
+    fn cleanup_frame_owner_range(&mut self, start_frame: usize) {
+        let cleanup: Vec<_> = (start_frame..self.frames.len())
             .filter_map(|frame_idx| {
                 self.frame_cleanup_slots(frame_idx)
                     .map(|(regs, spills)| (frame_idx, regs, spills))
@@ -4796,7 +4802,12 @@ impl VM {
         for ptr in ptrs {
             self.actor_callbacks.drop_ref(ptr);
         }
+    }
 
+    /// Reclaim compiler-proven owning slots from all frames permanently
+    /// abandoned by a true runtime error.
+    fn cleanup_abandoned_frames(&mut self) {
+        self.cleanup_frame_owner_range(0);
         self.frames.clear();
         self.current_frame_idx = None;
         self.handler_stack.clear();
