@@ -154,7 +154,8 @@ mod tests {
 
     fn actor_with(tokens: &[&str]) -> Actor {
         let mut actor = Actor::new(7, "authority-test", 16);
-        actor.capabilities = tokens.iter().map(|token| (*token).to_string()).collect();
+        let manifest = AuthorityManifest::from_tokens(tokens.iter().copied()).unwrap();
+        actor.install_authority_manifest(&manifest);
         actor
     }
 
@@ -244,19 +245,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_actor_manifest_fails_closed_before_authorization() {
-        let actor = actor_with(&["Net::TcpOut(api.stripe.com:443)", "Net::TcpOut(malformed)"]);
-
-        // Even though the exact requested grant is also present, the malformed
-        // sibling token invalidates the manifest. Partial parsing must never
-        // turn corrupt authority state into permission.
-        assert!(matches!(
-            actor.require_tcp_out("api.stripe.com", 443),
-            Err(RuntimeAuthorityError::InvalidManifest(_))
-        ));
-    }
-
-    #[test]
     fn generic_actor_authority_check_uses_typed_grants() {
         let actor = actor_with(&["Secret::Read(STRIPE_KEY)"]);
         let allowed = AuthorityGrant::SecretRead {
@@ -265,8 +253,8 @@ mod tests {
         let denied = AuthorityGrant::SecretRead {
             name: "OTHER_KEY".into(),
         };
-        assert!(actor.allows_authority(&allowed).unwrap());
-        assert!(!actor.allows_authority(&denied).unwrap());
+        assert!(actor.allows_authority(&allowed));
+        assert!(!actor.allows_authority(&denied));
     }
 
     #[test]
@@ -304,30 +292,13 @@ mod tests {
         parent
             .delegate_authority_to(&mut child, &requested)
             .unwrap();
-        assert_eq!(child.authority_manifest().unwrap(), requested);
-        assert_eq!(
-            child.capabilities,
-            std::collections::BTreeSet::from(["Secret::Read(STRIPE_KEY)".to_string()])
-        );
+        assert_eq!(child.authority_manifest(), &requested);
 
-        let before = child.capabilities.clone();
+        let before = child.authority.clone();
         assert!(matches!(
             parent.delegate_authority_to(&mut child, &escalation),
             Err(RuntimeAuthorityError::Denied(_))
         ));
-        assert_eq!(child.capabilities, before);
-    }
-
-    #[test]
-    fn malformed_parent_cannot_delegate_even_an_exact_present_grant() {
-        let parent = actor_with(&["Secret::Read(STRIPE_KEY)", "Net::TcpOut(malformed)"]);
-        let requested = AuthorityManifest::from_tokens(["Secret::Read(STRIPE_KEY)"]).unwrap();
-        let mut child = Actor::new(8, "child", 16);
-
-        assert!(matches!(
-            parent.delegate_authority_to(&mut child, &requested),
-            Err(RuntimeAuthorityError::InvalidManifest(_))
-        ));
-        assert!(child.capabilities.is_empty());
+        assert_eq!(child.authority, before);
     }
 }
