@@ -1705,6 +1705,89 @@ impl Default for CapContext {
 // Capability Analyzer
 // ---------------------------------------------------------------------------
 
+/// Flow-sensitive ownership state.
+///
+/// `definite` tracks the must-use fact: a binding is present only when every
+/// path reaching this point has consumed it. `maybe_moved` tracks safety: a
+/// binding is present when any reaching path may already have moved it.
+///
+/// Their joins intentionally differ: definite uses intersection, maybe_moved
+/// uses union.
+#[derive(Debug, Clone, Default)]
+struct ConsumptionState {
+    definite: FxHashSet<String>,
+    maybe_moved: FxHashMap<String, Span>,
+}
+
+#[derive(Debug, Clone)]
+struct HiddenConsumption {
+    definite: bool,
+    maybe_moved: Option<Span>,
+}
+
+impl std::ops::Deref for ConsumptionState {
+    type Target = FxHashSet<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.definite
+    }
+}
+
+impl std::ops::DerefMut for ConsumptionState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.definite
+    }
+}
+
+impl ConsumptionState {
+    fn merge_alternatives(left: &Self, right: &Self) -> Self {
+        let definite = left
+            .definite
+            .intersection(&right.definite)
+            .cloned()
+            .collect();
+        let mut maybe_moved = left.maybe_moved.clone();
+        for (name, span) in &right.maybe_moved {
+            maybe_moved.entry(name.clone()).or_insert(*span);
+        }
+        Self {
+            definite,
+            maybe_moved,
+        }
+    }
+
+    fn union_from(&mut self, other: &Self) {
+        self.definite.extend(other.definite.iter().cloned());
+        for (name, span) in &other.maybe_moved {
+            self.maybe_moved.entry(name.clone()).or_insert(*span);
+        }
+    }
+
+    fn hide_binding(&mut self, name: &str) -> HiddenConsumption {
+        HiddenConsumption {
+            definite: self.definite.remove(name),
+            maybe_moved: self.maybe_moved.remove(name),
+        }
+    }
+
+    fn restore_binding(&mut self, name: &str, hidden: HiddenConsumption) {
+        self.definite.remove(name);
+        self.maybe_moved.remove(name);
+        if hidden.definite {
+            self.definite.insert(name.to_string());
+        }
+        if let Some(span) = hidden.maybe_moved {
+            self.maybe_moved.insert(name.to_string(), span);
+        }
+    }
+
+    fn newly_moved_since<'a>(&'a self, base: &'a Self) -> Option<&'a String> {
+        self.maybe_moved
+            .keys()
+            .find(|name| !base.maybe_moved.contains_key(*name))
+    }
+}
+
 /// Stateful capability analyzer.
 pub struct CapabilityAnalyzer {
     /// Accumulated diagnostics.
@@ -1737,7 +1820,7 @@ impl CapabilityAnalyzer {
     /// linear-consumption set, so consumption state never leaks between
     /// top-level calls (the frontend reuses one analyzer across declarations).
     pub fn infer_cap(&mut self, ctx: &CapContext, expr: &Expr) -> NuResult<Capability> {
-        let mut consumed = FxHashSet::default();
+        let mut consumed = ConsumptionState::default();
         let cap = self.infer_cap_tracked(ctx, expr, &mut consumed)?;
 
         // Ensure all linear bindings in the initial context were consumed.
@@ -1772,7 +1855,7 @@ impl CapabilityAnalyzer {
         &mut self,
         name: &str,
         span: Span,
-        consumed: &mut FxHashSet<String>,
+        consumed: &mut ConsumptionState,
     ) -> NuResult<()> {
         // Record the span for LSP visualization regardless of error.
         self.consumed_spans.push(span);
@@ -1810,7 +1893,7 @@ impl CapabilityAnalyzer {
         &mut self,
         name: &str,
         span: Span,
-        consumed: &mut FxHashSet<String>,
+        consumed: &mut ConsumptionState,
     ) -> NuResult<()> {
         self.consumed_spans.push(span);
         if !consumed.insert(name.to_string()) {
@@ -1852,7 +1935,7 @@ impl CapabilityAnalyzer {
         &mut self,
         ctx: &CapContext,
         expr: &Expr,
-        consumed: &mut FxHashSet<String>,
+        consumed: &mut ConsumptionState,
     ) -> NuResult<Capability> {
         match expr {
             // Literals are immutable values.
