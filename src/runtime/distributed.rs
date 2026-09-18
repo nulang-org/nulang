@@ -49,8 +49,9 @@ use super::fabric_stream_cluster::{
     FABRIC_STREAM_REPLICA_BEHAVIOR,
 };
 use super::fabric_stream_epoch::{
-    FabricStreamEpochCommit, FabricStreamEpochPrepare, FabricStreamEpochVote,
-    FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR, FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR,
+    FabricStreamEpochCommit, FabricStreamEpochPrepare, FabricStreamEpochRepairBatch,
+    FabricStreamEpochVote, FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR,
+    FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR, FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR,
     FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
 };
 use super::mailbox::{Message, MessagePriority};
@@ -1769,6 +1770,82 @@ pub fn process_network_packets(
                 if let Err(error) = result {
                     warn!(
                         "nulang-fabric-stream: rejected epoch prepare from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch repair sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochRepairBatch::from_wire_bytes(bytes)
+                            .and_then(|batch| {
+                                let vote = runtime.fabric_stream_apply_epoch_repair_from_cluster(
+                                    &batch,
+                                    incoming.from_node,
+                                    cluster,
+                                )?;
+                                let response = FabricStreamEpochVote {
+                                    stream: batch.stream,
+                                    vote,
+                                };
+                                let response_bytes = response.to_wire_bytes()?;
+                                let candidate = NodeId(batch.proposal.to_policy.leader);
+                                let address = cluster
+                                    .get_node(candidate)
+                                    .map(|info| info.address)
+                                    .or_else(|| transport.connection_addr(candidate))
+                                    .ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "Fabric epoch candidate address is unavailable",
+                                        )
+                                    })?;
+                                let local = runtime.distributed.node_id.ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "Fabric epoch repair target has no local NodeId",
+                                    )
+                                })?;
+                                transport.send(
+                                    candidate,
+                                    address,
+                                    Packet::ActorMessage {
+                                        target_actor: 0,
+                                        behavior_name:
+                                            FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
+                                        content_hash: None,
+                                        payload: Vec::new(),
+                                        string_table: Vec::new(),
+                                        object_table: vec![(0, response_bytes)],
+                                        sender_actor: 0,
+                                        sender_node: local,
+                                        priority: MessagePriority::System,
+                                        trace_id: None,
+                                    },
+                                );
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch repair must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch repair from {:?}: {}",
                         incoming.from_node, error
                     );
                 }
