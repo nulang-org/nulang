@@ -5071,7 +5071,14 @@ impl Runtime {
                 .map_err(|err| err.to_string())?;
         let is_workflow = meta.is_workflow;
         let is_agent = meta.is_agent;
-        let offsets: Vec<usize> = crate::runtime::spawn::bytecode_offsets_for(module, is_workflow);
+        let offsets: Vec<usize> = if is_workflow {
+            meta.behavior_indices
+                .iter()
+                .map(|&i| module.behaviors[i].code_offset)
+                .collect()
+        } else {
+            module.behaviors.iter().map(|behavior| behavior.code_offset).collect()
+        };
         let compensation_offsets: Vec<Option<usize>> = if is_workflow {
             meta.behavior_indices
                 .iter()
