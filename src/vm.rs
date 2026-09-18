@@ -6152,14 +6152,18 @@ mod vm_tests {
     fn test_call_function_retains_host_pointer_for_linear_sink() {
         let module = host_sink_test_module();
         let offset = module.function_table[0];
+        let sink_info = module
+            .debug_functions
+            .iter()
+            .find(|info| info.code_offset == offset)
+            .expect("compiled function debug info");
         assert_eq!(
-            module
-                .debug_functions
-                .iter()
-                .find(|info| info.code_offset == offset)
-                .map(|info| info.sink_mask),
-            Some(1),
-            "compiled linear parameter must publish sink metadata"
+            sink_info.sink_mask, 1,
+            "compiled linear parameter must publish its sink bit"
+        );
+        assert!(
+            sink_info.sink_metadata_present,
+            "freshly compiled modules must mark sink metadata authoritative"
         );
 
         let mut vm = VM::new();
