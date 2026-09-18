@@ -935,6 +935,11 @@ impl<'c> FnLowerer<'c> {
                 self.b.assign(dst, mir::RValue::Load(id));
                 Ok(())
             }
+            hir::RValue::MoveOut(op) => {
+                let id = self.lower_operand(op)?;
+                self.b.transfer(dst, id);
+                Ok(())
+            }
             hir::RValue::Panic(msg) => {
                 self.b.assign(dst, mir::RValue::Panic(msg.clone()));
                 Ok(())
@@ -2676,7 +2681,7 @@ fn walk_hir_operand(op: &hir::Operand, acc: &mut HashSet<String>) {
 
 fn walk_hir_rvalue(rv: &hir::RValue, acc: &mut HashSet<String>) {
     match rv {
-        hir::RValue::Use(op) => walk_hir_operand(op, acc),
+        hir::RValue::Use(op) | hir::RValue::MoveOut(op) => walk_hir_operand(op, acc),
         hir::RValue::Literal(_, _) | hir::RValue::SelfRef(_) | hir::RValue::Panic(_) => {}
         hir::RValue::Block(body) => walk_hir_body(body, acc),
         hir::RValue::Binary(_, l, r, _) => {
