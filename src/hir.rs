@@ -8,6 +8,7 @@
 //!   - patterns are preserved with type annotations.
 
 use crate::ast::{BinOp, CrdtType, Expr, Literal, Pattern, StateModel, UnOp};
+use crate::authority::AuthorityGrant;
 use crate::types::{Capability, EffectRow, Span, Type};
 
 // Re-exported AST types used in HIR declarations
@@ -329,8 +330,8 @@ pub enum RValue {
         init: Vec<(String, Operand)>,
         /// Remote spawn target (`spawn@node_expr Foo(...)`); `None` = local.
         target_node: Option<Operand>,
-        /// Spawn-time capability grant tokens (e.g. `Net::TcpOut(h:p)`).
-        capabilities: Vec<String>,
+        /// Typed spawn-time external authority grants.
+        capabilities: Vec<AuthorityGrant>,
         ty: Type,
     },
     Send {
