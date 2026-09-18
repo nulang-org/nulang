@@ -175,7 +175,11 @@ impl MirCodegen {
     /// by clearing the spill slot itself, not merely a transient scratch.
     fn transfer_local_to_reg(&mut self, id: mir::LocalId, dst: u8) -> NuResult<()> {
         if let Some(slot) = self.spill_map.get(&id.0).copied() {
-            let scratch = if dst != SPILL_TEMP2 { SPILL_TEMP2 } else { SPILL_TEMP3 };
+            let scratch = if dst != SPILL_TEMP2 {
+                SPILL_TEMP2
+            } else {
+                SPILL_TEMP3
+            };
             self.emit(Instruction::new3(
                 OpCode::SpillLoad,
                 (slot >> 8) as u8,
@@ -706,18 +710,13 @@ impl MirCodegen {
                 .map(|p| LOCAL_BASE as usize + p.0 as usize)
                 .collect(),
             sink_mask: if allow_owned_params {
-                func.params
-                    .iter()
-                    .enumerate()
-                    .fold(0u16, |mask, (idx, p)| {
-                        if idx < u16::BITS as usize
-                            && func.locals[p.0 as usize].cap.is_linear()
-                        {
-                            mask | (1u16 << idx)
-                        } else {
-                            mask
-                        }
-                    })
+                func.params.iter().enumerate().fold(0u16, |mask, (idx, p)| {
+                    if idx < u16::BITS as usize && func.locals[p.0 as usize].cap.is_linear() {
+                        mask | (1u16 << idx)
+                    } else {
+                        mask
+                    }
+                })
             } else {
                 0
             },
@@ -826,11 +825,7 @@ impl MirCodegen {
 
     /// Stage a function call, transferring source ownership only at declared
     /// sink positions. Non-sink positions remain ordinary uncounted copies.
-    fn stage_call_args(
-        &mut self,
-        args: &[mir::LocalId],
-        sink_args: &[bool],
-    ) -> NuResult<()> {
+    fn stage_call_args(&mut self, args: &[mir::LocalId], sink_args: &[bool]) -> NuResult<()> {
         if args.len() != sink_args.len() {
             return Err(compile_err(
                 "internal: call sink mask length does not match argument count",
@@ -1546,9 +1541,7 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
                 };
                 let result = match op {
                     mir::RValue::Const(Constant::Float(_)) => true,
-                    mir::RValue::Load(src) | mir::RValue::MoveOut(src) => {
-                        is_float[src.0 as usize]
-                    }
+                    mir::RValue::Load(src) | mir::RValue::MoveOut(src) => is_float[src.0 as usize],
                     mir::RValue::Unary(crate::ast::UnOp::Neg, src) => is_float[src.0 as usize],
                     mir::RValue::Binary(op, l, r)
                         if matches!(
@@ -2542,8 +2535,7 @@ fn plan_drops(func: &mir::Function, allow_owned_params: bool) -> DropPlan {
                         transfer_sources[d].push(s);
                         transfer_edges.push((d, s));
                     }
-                    _ if rvalue_is_owning(op)
-                        && !rvalue_uses(op).iter().any(|(u, _)| *u == d) => {}
+                    _ if rvalue_is_owning(op) && !rvalue_uses(op).iter().any(|(u, _)| *u == d) => {}
                     _ => {
                         // Ordinary Load/call/field access/etc. does not prove
                         // a unique counted owner for the destination.
@@ -2837,11 +2829,7 @@ mod tests {
     #[test]
     fn test_drop_plan_treats_linear_param_as_owned_only_for_sink_abi() {
         let mut b = mir::FunctionBuilder::new("take", Some(Type::int()));
-        let param = b.add_param_with_cap(
-            "p",
-            Type::unit(),
-            crate::types::Capability::LinearIso,
-        );
+        let param = b.add_param_with_cap("p", Type::unit(), crate::types::Capability::LinearIso);
         let len = b.add_temp(Type::int());
         b.assign(len, mir::RValue::ArrayLen(param));
         b.terminate(mir::Terminator::Return(Some(len)));
@@ -2869,11 +2857,7 @@ mod tests {
     #[test]
     fn test_drop_plan_releases_unused_linear_sink_param_at_entry() {
         let mut b = mir::FunctionBuilder::new("ignore", Some(Type::int()));
-        let param = b.add_param_with_cap(
-            "p",
-            Type::unit(),
-            crate::types::Capability::LinearIso,
-        );
+        let param = b.add_param_with_cap("p", Type::unit(), crate::types::Capability::LinearIso);
         let result = b.add_temp(Type::int());
         b.assign(result, mir::RValue::Const(Constant::Int(7)));
         b.terminate(mir::Terminator::Return(Some(result)));
@@ -2890,11 +2874,8 @@ mod tests {
 
     fn sink_call_module(return_source_after_call: bool, spill_source: bool) -> mir::Module {
         let mut callee = mir::FunctionBuilder::new("take", Some(Type::int()));
-        let param = callee.add_param_with_cap(
-            "p",
-            Type::unit(),
-            crate::types::Capability::LinearIso,
-        );
+        let param =
+            callee.add_param_with_cap("p", Type::unit(), crate::types::Capability::LinearIso);
         let len = callee.add_temp(Type::int());
         callee.assign(len, mir::RValue::ArrayLen(param));
         callee.terminate(mir::Terminator::Return(Some(len)));
@@ -2991,7 +2972,8 @@ mod tests {
         let err = compile_mir(&mut module, "self_moveout")
             .expect_err("MoveOut to the same local must be rejected");
         assert!(
-            err.to_string().contains("source and destination must be distinct"),
+            err.to_string()
+                .contains("source and destination must be distinct"),
             "unexpected error: {err}"
         );
     }
@@ -3132,8 +3114,7 @@ mod tests {
         // the capability checker. Reading the source after MoveOut lets the
         // backend test observe the physical invalidation contract: the source
         // register must contain nil after the transfer.
-        let source_after =
-            run_mir_source("let x = 42 in { let y = consume x; x }").unwrap();
+        let source_after = run_mir_source("let x = 42 in { let y = consume x; x }").unwrap();
         assert!(
             source_after.is_nil(),
             "MoveOut must invalidate the source register without releasing the transferred value"
