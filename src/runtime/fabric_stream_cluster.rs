@@ -1594,29 +1594,28 @@ impl Runtime {
 
         // A follower can bootstrap the local physical stream from the leader's
         // persisted configuration. Existing streams must already match.
-        let store = self.distributed.fabric_streams.as_mut().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "Fabric stream storage is not open; call fabric_stream_open first",
-            )
-        })?;
-        match store.stream_config(&append.stream) {
-            Ok(existing) if existing != append.stream_config => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Fabric replica stream configuration differs from leader",
-                ));
+        {
+            let store = self.distributed.fabric_streams.as_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "Fabric stream storage is not open; call fabric_stream_open first",
+                )
+            })?;
+            match store.stream_config(&append.stream) {
+                Ok(existing) if existing != append.stream_config => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Fabric replica stream configuration differs from leader",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    store.create_stream(&append.stream, append.stream_config)?;
+                }
+                Err(error) => return Err(error),
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                store.create_stream(&append.stream, append.stream_config)?;
-            }
-            Err(error) => return Err(error),
         }
 
-        // Release the store borrow before validating/establishing durable
-        // epoch policy through Runtime.
-        let _ = store;
         let policy = self.fabric_stream_policy_for_placement(&placement, append.epoch)?;
         if policy.epoch != append.epoch {
             return Err(io::Error::new(
@@ -1624,7 +1623,10 @@ impl Runtime {
                 "stale Fabric stream replica append epoch",
             ));
         }
-        self.fabric_stream_store_mut()?
+        self.distributed
+            .fabric_streams
+            .as_mut()
+            .expect("Fabric stream storage was validated above")
             .append_replica(&append.stream, append.sequence, &append.payload)
     }
 }
