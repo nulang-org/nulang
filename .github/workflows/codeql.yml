@@ -10,12 +10,18 @@ on:
       - ".github/workflows/codeql.yml"
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
     paths:
       - "**.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - ".github/workflows/codeql.yml"
   schedule:
     - cron: "0 12 * * 1" # Weekly on Monday at 12:00 UTC
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   security-events: write
@@ -25,6 +31,10 @@ permissions:
 jobs:
   analyze:
     name: Analyze (Rust)
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false ||
+      contains(github.event.pull_request.labels.*.name, 'P0')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

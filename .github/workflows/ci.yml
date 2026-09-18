@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
 
 # A newer push to the same PR/branch supersedes the previous run. Without
 # this, every push queues a full ~6h run set (including Release Build) and
@@ -16,11 +17,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # During the P0 stabilization gate, ordinary draft feature PRs should not
+  # consume scarce hosted-runner capacity. Ready PRs and drafts explicitly
+  # labeled P0 still receive the full production gate. The pull_request event
+  # types above retrigger this workflow when draft/readiness or P0 labeling
+  # changes.
+
   # -----------------------------------------------------------------------
   # Primary build & test (default features)
   # -----------------------------------------------------------------------
   test:
     name: Build & Test
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.draft == false ||
+      contains(github.event.pull_request.labels.*.name, 'P0')
     runs-on: ubuntu-latest
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
@@ -66,6 +77,10 @@ jobs:
   # -----------------------------------------------------------------------
   release:
     name: Release Build
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.draft == false ||
+      contains(github.event.pull_request.labels.*.name, 'P0')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -130,6 +145,10 @@ jobs:
   # -----------------------------------------------------------------------
   minimal-build:
     name: Build without optional features
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.draft == false ||
+      contains(github.event.pull_request.labels.*.name, 'P0')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -156,6 +175,10 @@ jobs:
   # -----------------------------------------------------------------------
   wasm-backend:
     name: Build & Test (wasm-backend feature)
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.draft == false ||
+      contains(github.event.pull_request.labels.*.name, 'P0')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -180,6 +203,10 @@ jobs:
   # -----------------------------------------------------------------------
   lint:
     name: Format, Clippy & Audit
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.draft == false ||
+      contains(github.event.pull_request.labels.*.name, 'P0')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -238,6 +265,10 @@ jobs:
   # -----------------------------------------------------------------------
   lean:
     name: Lean Formalization
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.draft == false ||
+      contains(github.event.pull_request.labels.*.name, 'P0')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
