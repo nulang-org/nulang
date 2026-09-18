@@ -75,28 +75,25 @@ fn infer_function_round(func: &mut mir::Function) -> usize {
 
     for (bi, block) in func.blocks.iter().enumerate() {
         for (si, stmt) in block.stmts.iter().enumerate() {
-            match stmt {
-                mir::Stmt::Assign { dst, op } => {
-                    let d = dst.0 as usize;
-                    def_count[d] += 1;
-                    if def_count[d] == 1 {
-                        owning_def[d] = rvalue_is_owning(op)
-                            || matches!(
-                                op,
-                                mir::RValue::Load(src)
-                                    if transfers.contains(&(*src, *dst))
-                            );
-                    } else {
-                        owning_def[d] = false;
-                    }
-
-                    if let mir::RValue::Load(src) = op {
-                        if *src != *dst {
-                            load_site[src.0 as usize] = Some((bi, si, *dst));
-                        }
-                    }
+            if let mir::Stmt::Assign { dst, op } = stmt {
+                let d = dst.0 as usize;
+                def_count[d] += 1;
+                if def_count[d] == 1 {
+                    owning_def[d] = rvalue_is_owning(op)
+                        || matches!(
+                            op,
+                            mir::RValue::Load(src)
+                                if transfers.contains(&(*src, *dst))
+                        );
+                } else {
+                    owning_def[d] = false;
                 }
-                _ => {}
+
+                if let mir::RValue::Load(src) = op
+                    && *src != *dst
+                {
+                    load_site[src.0 as usize] = Some((bi, si, *dst));
+                }
             }
 
             let mut reads = Vec::new();
