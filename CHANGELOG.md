@@ -45,6 +45,18 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fabric automatic failover reconciliation — 2026-09-18
+- **Automatic push/pull/higher-term orchestration for mismatched survivors**
+  (Experimental, `src/runtime/fabric_stream_epoch.rs`,
+  `src/runtime/distributed.rs`). Active candidate transitions now inspect
+  rejected vote tails and automatically pull from an ahead proposed replica,
+  push bounded repair to a lagging replica, supersede a proposal with a higher
+  election term after candidate pull changes the tail, or re-send prepare when
+  no mismatch is known. Rejected votes and successful pull responses wake the
+  state machine immediately; silent peers still use logical-clock exponential
+  backoff. Deterministic coverage verifies fully automatic confirmed-removal
+  recovery for both candidate-ahead and candidate-behind RF3->RF2 cases.
+
 ### Fabric confirmed-removal automatic failover — 2026-09-18
 - **Automatic ownership transition after confirmed leader removal**
   (Experimental, `src/runtime/fabric_stream_epoch.rs`,
