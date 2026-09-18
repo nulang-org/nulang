@@ -2499,19 +2499,38 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         .collect();
 
     // Escapees: locals defined by field/element loads from a candidate or
-    // another escapee (transitively).
+    // another escapee (transitively). A moved owner also inherits borrows
+    // created from the source before the transfer: dst owns the same object,
+    // so walk ownership transfers in reverse (dst -> src) while discovering
+    // borrowed aliases.
+    let transfer_bases: Vec<(usize, usize)> = func
+        .ownership_transfers
+        .iter()
+        .map(|t| (t.dst.0 as usize, t.src.0 as usize))
+        .collect();
     let mut escapees: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
     for c in 0..nlocals {
         if !candidate[c] {
             continue;
         }
-        let mut seen = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut borrowed_seen = HashSet::new();
+        visited.insert(c);
         let mut frontier = vec![c];
         while let Some(x) = frontier.pop() {
+            for &(moved_dst, moved_src) in &transfer_bases {
+                if moved_dst == x && visited.insert(moved_src) {
+                    frontier.push(moved_src);
+                }
+            }
             for &(dst, base) in &loads {
-                if base == x && ptr_ty[dst] && seen.insert(dst) {
-                    escapees[c].push(dst);
-                    frontier.push(dst);
+                if base == x && ptr_ty[dst] {
+                    if borrowed_seen.insert(dst) {
+                        escapees[c].push(dst);
+                    }
+                    if visited.insert(dst) {
+                        frontier.push(dst);
+                    }
                 }
             }
         }
@@ -2745,6 +2764,54 @@ mod tests {
                 .get(&(0, len_si))
                 .is_some_and(|ids| ids.contains(&dst)),
             "destination should be reclaimable after its last read-only use"
+        );
+    }
+
+    #[test]
+    fn test_transfer_destination_inherits_source_escapees() {
+        let mut b = mir::FunctionBuilder::new("move_escapee_test", None);
+        let inner_ty = Type::Array(Box::new(Type::int()));
+        let outer_ty = Type::Array(Box::new(inner_ty.clone()));
+
+        let inner = b.add_temp(inner_ty.clone());
+        let src = b.add_temp(outer_ty.clone());
+        let idx = b.add_temp(Type::int());
+        let borrowed = b.add_temp(inner_ty);
+        let dst = b.add_temp(outer_ty);
+        let dst_len = b.add_temp(Type::int());
+        let borrowed_len = b.add_temp(Type::int());
+
+        b.assign(inner, mir::RValue::ArrayLit(vec![]));
+        b.assign(src, mir::RValue::ArrayLit(vec![inner]));
+        b.assign(idx, mir::RValue::Const(Constant::Int(0)));
+        b.assign(borrowed, mir::RValue::ArrayLoad { arr: src, idx });
+        b.transfer(dst, src);
+        b.assign(dst_len, mir::RValue::ArrayLen(dst));
+        b.assign(borrowed_len, mir::RValue::ArrayLen(borrowed));
+        b.terminate(mir::Terminator::Return(None));
+        let f = b.build();
+
+        let plan = plan_drops(&f);
+        let dst_use_si = f.blocks[0]
+            .stmts
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    mir::Stmt::Assign {
+                        dst: d,
+                        op: mir::RValue::ArrayLen(x)
+                    } if *d == dst_len && *x == dst
+                )
+            })
+            .expect("destination length use");
+
+        assert!(
+            !plan
+                .after_stmt
+                .get(&(0, dst_use_si))
+                .is_some_and(|ids| ids.contains(&dst)),
+            "borrow created from source before transfer keeps moved destination alive"
         );
     }
 
