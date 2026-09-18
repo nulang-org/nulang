@@ -174,12 +174,13 @@ fn bench_perform_string_length(c: &mut Criterion) {
     });
 }
 
-/// Keep a handled effect in the same benchmark suite so a dispatch-cache
-/// optimization cannot look good by accidentally bypassing handler lookup.
-fn bench_perform_custom_handler(c: &mut Criterion) {
+/// Control benchmark for the statically resolved handler path. The compiler
+/// lowers this known handler to PerformDirect, so it is intentionally kept
+/// separate from the generic Perform cache measurements above.
+fn bench_perform_direct_custom_handler(c: &mut Criterion) {
     let source = "let result = handle { var sum = 0; var i = 0; while i < 500 { sum = sum + perform Counter.ask(); i = i + 1; }; sum } { | Counter.ask() resume => 1 }; result";
     let module = compile(source);
-    c.bench_function("vm/perform/custom_handler", |b| {
+    c.bench_function("vm/perform_direct/custom_handler", |b| {
         b.iter_batched(
             || fresh_vm(&module),
             |mut vm| black_box(vm.run().unwrap()),
@@ -200,5 +201,5 @@ criterion_group!(
     bench_perform_int_to_float,
     bench_perform_array_length,
     bench_perform_string_length,
-    bench_perform_custom_handler,
+    bench_perform_direct_custom_handler,
 );
