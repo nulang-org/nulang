@@ -27,7 +27,7 @@ mod orca_cycle;
 mod supervision;
 mod supervisor;
 pub use distributed_context::{
-    DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot,
+    DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot, FabricPublishReport,
 };
 #[cfg(feature = "ai-runtime")]
 mod agent;
