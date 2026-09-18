@@ -251,6 +251,11 @@ pub enum Place {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RValue {
     Use(Operand),
+    /// Ownership-transfer read. Semantically copies the value into the
+    /// destination and invalidates the source binding without releasing it.
+    /// Produced by `consume x`; MIR lowers this to the ordinary copy+nil
+    /// instruction sequence plus transfer metadata for ownership analysis.
+    MoveOut(Operand),
     /// Runtime panic with a message (contract violations).
     Panic(String),
     Literal(Literal, Type),
@@ -496,7 +501,7 @@ impl Place {
 impl RValue {
     pub fn ty(&self) -> Type {
         match self {
-            RValue::Use(op) => op.ty(),
+            RValue::Use(op) | RValue::MoveOut(op) => op.ty(),
             RValue::Panic(_) => Type::unit(),
             RValue::Literal(_, ty) => ty.clone(),
             RValue::Binary(_, _, _, ty) => ty.clone(),
@@ -626,6 +631,7 @@ mod tests {
             name: "f".into(),
             type_params: vec![],
             params: vec![],
+            param_caps: vec![],
             dict_params: vec![],
             ret: Type::unit(),
             effect: EffectRow::empty(),
