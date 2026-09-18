@@ -44,7 +44,8 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 
 use super::fabric_stream_cluster::{
-    FabricStreamReplicaAck, FabricStreamReplicaAppend, FABRIC_STREAM_REPLICA_ACK_BEHAVIOR,
+    FabricStreamCommitUpdate, FabricStreamReplicaAck, FabricStreamReplicaAppend,
+    FABRIC_STREAM_COMMIT_BEHAVIOR, FABRIC_STREAM_REPLICA_ACK_BEHAVIOR,
     FABRIC_STREAM_REPLICA_BEHAVIOR,
 };
 use super::mailbox::{Message, MessagePriority};
@@ -1569,9 +1570,70 @@ pub fn process_network_packets(
                                         "Fabric stream replica ACK identity mismatch",
                                     ));
                                 }
-                                runtime
-                                    .fabric_stream_record_replica_ack_from_cluster(ack, cluster)
-                                    .map(|_| ())
+
+                                let accepted = ack.accepted;
+                                let stream = ack.stream.clone();
+                                let outcome =
+                                    runtime.fabric_stream_record_replica_ack_from_cluster(
+                                        ack, cluster,
+                                    )?;
+
+                                if accepted && outcome.committed_sequence > 0 {
+                                    for replica in outcome
+                                        .placement
+                                        .replicas
+                                        .iter()
+                                        .copied()
+                                        .filter(|node| *node != outcome.placement.leader)
+                                    {
+                                        let progress = runtime
+                                            .fabric_stream_replica_progress(&stream, replica.0)?;
+                                        if progress < outcome.committed_sequence {
+                                            continue;
+                                        }
+                                        let address = cluster
+                                            .get_node(replica)
+                                            .filter(|info| {
+                                                matches!(
+                                                    info.status,
+                                                    NodeStatus::Healthy | NodeStatus::Joining
+                                                )
+                                            })
+                                            .map(|info| info.address);
+                                        let Some(address) = address else {
+                                            continue;
+                                        };
+                                        let update = FabricStreamCommitUpdate {
+                                            stream: outcome.placement.stream.clone(),
+                                            partition: outcome.placement.partition,
+                                            leader: outcome.placement.leader,
+                                            membership_fingerprint: outcome
+                                                .placement
+                                                .membership_fingerprint,
+                                            replication_factor: outcome.placement.replicas.len(),
+                                            committed_sequence: outcome.committed_sequence,
+                                        };
+                                        let update_bytes = update.to_wire_bytes()?;
+                                        transport.send(
+                                            replica,
+                                            address,
+                                            Packet::ActorMessage {
+                                                target_actor: 0,
+                                                behavior_name:
+                                                    FABRIC_STREAM_COMMIT_BEHAVIOR.to_string(),
+                                                content_hash: None,
+                                                payload: Vec::new(),
+                                                string_table: Vec::new(),
+                                                object_table: vec![(0, update_bytes)],
+                                                sender_actor: 0,
+                                                sender_node: outcome.placement.leader,
+                                                priority: MessagePriority::System,
+                                                trace_id: None,
+                                            },
+                                        );
+                                    }
+                                }
+                                Ok(())
                             }),
                         _ => Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -1582,6 +1644,47 @@ pub fn process_network_packets(
                 if let Err(error) = result {
                     warn!(
                         "nulang-fabric-stream: rejected replica ACK from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_COMMIT_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric stream commit-update sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamCommitUpdate::from_wire_bytes(bytes)
+                            .and_then(|update| {
+                                if update.leader != incoming.from_node {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "Fabric stream commit-update leader does not match transport peer",
+                                    ));
+                                }
+                                runtime
+                                    .fabric_stream_apply_commit_update_from_cluster(
+                                        &update, cluster,
+                                    )
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric stream commit update must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected commit update from {:?}: {}",
                         incoming.from_node, error
                     );
                 }
