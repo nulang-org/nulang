@@ -1822,7 +1822,6 @@ fn automatic_failover_pulls_ahead_survivor_and_supersedes_term() {
     }
 }
 
-
 #[test]
 fn installed_policy_ignores_unrelated_cluster_growth_during_quorum_commit() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
