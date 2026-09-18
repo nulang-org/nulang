@@ -3245,6 +3245,101 @@ mod tests {
     }
 
     #[test]
+    fn test_remote_spawn_initializer_classifies_nested_owner_copy() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("spawn_user", None);
+        let param = b.add_param_with_cap(
+            "x",
+            array_ty,
+            crate::types::Capability::LinearIso,
+        );
+        let node = b.add_local("node", Type::int());
+        let rv = mir::RValue::Spawn {
+            behavior_idx: 0,
+            init: vec![("payload".to_string(), mir::RValue::Load(param))],
+            target_node: Some(node),
+            capabilities: vec![],
+        };
+
+        let uses = rvalue_uses(&rv);
+        assert!(uses.contains(&(node.0 as usize, UseKind::ReadOnly)));
+        assert!(uses.contains(&(param.0 as usize, UseKind::Copy)));
+    }
+
+    #[test]
+    fn test_local_spawn_constant_override_has_no_local_owner_use() {
+        let rv = mir::RValue::Spawn {
+            behavior_idx: 0,
+            init: vec![(
+                "answer".to_string(),
+                mir::RValue::Const(Constant::Int(42)),
+            )],
+            target_node: None,
+            capabilities: vec![],
+        };
+        assert!(rvalue_uses(&rv).is_empty());
+    }
+
+    #[test]
+    fn test_owned_param_body_gate_rejects_remote_spawn_copy_escape() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("spawn_forward", None);
+        let param = b.add_param_with_cap(
+            "x",
+            array_ty,
+            crate::types::Capability::LinearIso,
+        );
+        let node = b.add_local("node", Type::int());
+        let spawned = b.add_temp(Type::unit());
+        b.assign(node, mir::RValue::Const(Constant::Int(1)));
+        b.assign(
+            spawned,
+            mir::RValue::Spawn {
+                behavior_idx: 0,
+                init: vec![("payload".to_string(), mir::RValue::Load(param))],
+                target_node: Some(node),
+                capabilities: vec![],
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(b.build());
+        let mut masks = vec![vec![true]];
+        prune_owned_param_masks_for_body_flow(&module, &mut masks);
+        assert_eq!(masks, vec![vec![false]]);
+    }
+
+    #[test]
+    fn test_owned_param_body_gate_allows_remote_spawn_read_only_derivation() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("spawn_len", None);
+        let param = b.add_param_with_cap(
+            "x",
+            array_ty,
+            crate::types::Capability::LinearIso,
+        );
+        let node = b.add_local("node", Type::int());
+        let spawned = b.add_temp(Type::unit());
+        b.assign(node, mir::RValue::Const(Constant::Int(1)));
+        b.assign(
+            spawned,
+            mir::RValue::Spawn {
+                behavior_idx: 0,
+                init: vec![("length".to_string(), mir::RValue::ArrayLen(param))],
+                target_node: Some(node),
+                capabilities: vec![],
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("test");
+        module.functions.push(b.build());
+        let mut masks = vec![vec![true]];
+        prune_owned_param_masks_for_body_flow(&module, &mut masks);
+        assert_eq!(masks, vec![vec![true]]);
+    }
+    #[test]
     fn test_drop_plan_owned_param_reclaimed_after_last_use() {
         let array_ty = Type::Array(Box::new(Type::int()));
         let mut b = mir::FunctionBuilder::new("owned_param", Some(Type::int()));
