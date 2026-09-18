@@ -1110,14 +1110,12 @@ impl Runtime {
                 "Fabric stream replica ACK requires distribution",
             )
         })?;
-        let current = compute_stream_placement(
-            local,
-            Some(cluster),
+        let (current, policy) = self.fabric_stream_validate_installed_policy(
             &ack.stream,
             ack.partition,
             ack.replication_factor,
+            ack.epoch,
         )?;
-        let policy = self.fabric_stream_policy_for_placement(&current, ack.epoch)?;
         if policy.epoch != ack.epoch
             || current.membership_fingerprint != ack.membership_fingerprint
             || current.leader != ack.leader
@@ -1443,7 +1441,18 @@ impl Runtime {
             ));
         }
 
-        self.fabric_stream_policy_for_placement(placement, append.epoch)?;
+        let (installed, _) = self.fabric_stream_validate_installed_policy(
+            &append.stream,
+            append.partition,
+            append.replication_factor,
+            append.epoch,
+        )?;
+        if installed != *placement {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric stream dispatch placement differs from installed policy",
+            ));
+        }
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -1514,12 +1523,21 @@ impl Runtime {
         target: NodeId,
         append: &FabricStreamReplicaAppend,
     ) -> io::Result<bool> {
-        let placement = self.fabric_stream_placement(
+        let (placement, _) = self.fabric_stream_validate_installed_policy(
             &append.stream,
             append.partition,
             append.replication_factor,
+            append.epoch,
         )?;
-        self.fabric_stream_policy_for_placement(&placement, append.epoch)?;
+        if placement.leader != append.leader
+            || placement.membership_fingerprint != append.membership_fingerprint
+            || !placement.replicas.contains(&target)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Fabric targeted replica dispatch does not match installed policy",
+            ));
+        }
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -1578,7 +1596,17 @@ impl Runtime {
         if committed_sequence == 0 {
             return Ok(false);
         }
-        let policy = self.fabric_stream_current_policy_for_placement(placement)?;
+        let (installed, policy) = self.fabric_stream_current_installed_policy_placement(
+            &placement.stream,
+            placement.partition,
+            placement.replicas.len(),
+        )?;
+        if installed != *placement {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric commit-update placement differs from installed policy",
+            ));
+        }
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
