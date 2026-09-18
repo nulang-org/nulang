@@ -5728,6 +5728,128 @@ fn test_remote_spawn_request_delivery() {
 }
 
 #[cfg(feature = "tcp")]
+#[test]
+fn test_remote_spawn_authority_is_delegated_exactly() {
+    let mut rt_a = start_distributed_node();
+    let mut rt_b = start_distributed_node();
+
+    let addr_b = rt_b.distributed.transport.as_ref().unwrap().listen_addr();
+    let node_b = rt_b.distributed.node_id.unwrap();
+    rt_b.register_spawnable_behavior("store", remote_spawn_store_handler);
+
+    rt_a.join_cluster(addr_b);
+    pump_until_converged(&mut [&mut rt_a, &mut rt_b], 2, Duration::from_secs(30));
+
+    let parent_id = rt_a.spawn_actor(Box::new(Vec::new));
+    let parent_authority = crate::authority::AuthorityManifest::from_tokens([
+        "Secret::Read(PAYMENTS_KEY)",
+        "Net::TcpOut(api.example.com:443)",
+    ])
+    .unwrap();
+    rt_a
+        .actors
+        .get_mut(&parent_id)
+        .unwrap()
+        .install_authority_manifest(&parent_authority);
+    rt_a.current_actor = Some(parent_id);
+
+    let requested =
+        crate::authority::AuthorityManifest::from_tokens(["Secret::Read(PAYMENTS_KEY)"]).unwrap();
+
+    let request_id = {
+        let mut transport = rt_a.distributed.transport.take().unwrap();
+        let cluster = rt_a.distributed.cluster.take().unwrap();
+        let resolver = rt_a.distributed.resolver.take().unwrap();
+        let placeholder = spawn_on_node_with_authority(
+            &mut rt_a,
+            &mut transport,
+            &cluster,
+            &resolver,
+            node_b,
+            "store",
+            vec![("received".to_string(), Value::int(0))],
+            &requested,
+        )
+        .expect("parent holds requested authority");
+        rt_a.distributed.transport = Some(transport);
+        rt_a.distributed.cluster = Some(cluster);
+        rt_a.distributed.resolver = Some(resolver);
+        placeholder.actor_id()
+    };
+    rt_a.current_actor = None;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let remote_actor = loop {
+        rt_a.process_network();
+        rt_b.process_network();
+        if let Some(result) = rt_a.take_spawn_response(request_id) {
+            break result.expect("authority-aware remote spawn rejected");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no SpawnResponse received for authority-aware spawn"
+        );
+        sleep(Duration::from_millis(50));
+    };
+
+    assert_eq!(
+        rt_b
+            .actors
+            .get(&remote_actor)
+            .expect("remote actor")
+            .authority_manifest(),
+        &requested,
+        "receiver must install exactly the delegated manifest"
+    );
+
+    // A child may not manufacture authority that the executing parent lacks.
+    rt_a.current_actor = Some(parent_id);
+    let escalation =
+        crate::authority::AuthorityManifest::from_tokens(["Secret::Read(OTHER_KEY)"]).unwrap();
+    let placeholders_before = rt_a.spawn_placeholders.len();
+    let remote_actors_before = rt_b.actors.len();
+    let result = {
+        let mut transport = rt_a.distributed.transport.take().unwrap();
+        let cluster = rt_a.distributed.cluster.take().unwrap();
+        let resolver = rt_a.distributed.resolver.take().unwrap();
+        let result = spawn_on_node_with_authority(
+            &mut rt_a,
+            &mut transport,
+            &cluster,
+            &resolver,
+            node_b,
+            "store",
+            vec![],
+            &escalation,
+        );
+        rt_a.distributed.transport = Some(transport);
+        rt_a.distributed.cluster = Some(cluster);
+        rt_a.distributed.resolver = Some(resolver);
+        result
+    };
+    rt_a.current_actor = None;
+
+    assert_eq!(
+        result,
+        Err(crate::authority_runtime::RuntimeAuthorityError::Denied(
+            crate::authority::AuthorityGrant::SecretRead {
+                name: "OTHER_KEY".into(),
+            }
+        ))
+    );
+    assert_eq!(
+        rt_a.spawn_placeholders.len(),
+        placeholders_before,
+        "denied delegation must not create a pending remote spawn"
+    );
+    // No request was emitted, so the remote node cannot have created a child.
+    rt_b.process_network();
+    assert_eq!(rt_b.actors.len(), remote_actors_before);
+
+    shutdown_nodes(&mut [&mut rt_a, &mut rt_b]);
+}
+
+#[cfg(feature = "tcp")]
 /// RFC-0007 cross-node routing by BARE actor-ref value: after a remote
 /// spawn, `send`/`ask` addressing the spawned actor by its plain id (the
 /// only thing an actor-ref Value carries) must route over the wire —

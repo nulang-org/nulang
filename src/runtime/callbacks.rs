@@ -18,7 +18,7 @@
 #[cfg(feature = "ai-runtime")]
 use super::agent;
 use super::cluster::NodeId;
-use super::distributed::{send_distributed, spawn_on_node, ActorAddress};
+use super::distributed::{send_distributed, spawn_on_node_with_authority, ActorAddress};
 use super::http_server::HttpServerState;
 use super::Runtime;
 use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
@@ -2506,6 +2506,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
         target_node: u64,
         behavior: &str,
         init: &[(String, crate::vm::Value)],
+        authority: &crate::authority::AuthorityManifest,
     ) -> crate::vm::Value {
         unsafe {
             let rt = &mut *self.runtime;
@@ -2516,8 +2517,27 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
             let result = if let (Some(ref mut t), Some(ref c), Some(ref mut r)) =
                 (&mut transport, &cluster, &mut resolver)
             {
-                let addr = spawn_on_node(rt, t, c, r, node, behavior, init.to_vec());
-                crate::vm::Value::actor_ref(addr.actor_id())
+                match spawn_on_node_with_authority(
+                    rt,
+                    t,
+                    c,
+                    r,
+                    node,
+                    behavior,
+                    init.to_vec(),
+                    authority,
+                ) {
+                    Ok(addr) => crate::vm::Value::actor_ref(addr.actor_id()),
+                    Err(error) => {
+                        tracing::warn!(
+                            target_node,
+                            behavior,
+                            %error,
+                            "refusing remote spawn whose authority is not delegated by the parent"
+                        );
+                        crate::vm::Value::actor_ref(0)
+                    }
+                }
             } else {
                 crate::vm::Value::actor_ref(0)
             };

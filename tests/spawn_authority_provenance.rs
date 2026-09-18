@@ -236,7 +236,7 @@ fn main() {
 }
 
 #[test]
-fn privileged_remote_spawn_is_rejected_explicitly() {
+fn privileged_remote_spawn_records_exact_site_authority() {
     let mut mir = lower(
         r#"
 actor Child { behavior ping() { 1 } }
@@ -247,10 +247,13 @@ fn main() {
 "#,
     );
     set_spawn_grants(&mut mir, 0, &["Secret::Read(KEY)"]);
-    let error = compile_mir(&mut mir, "authority-remote").unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("distributed spawn protocol carries typed authority"));
+    let module = compile_mir(&mut mir, "authority-remote").unwrap();
+    let pc = module
+        .instructions
+        .iter()
+        .position(|instr| instr.opcode == OpCode::RSpawn)
+        .expect("RSpawn instruction");
+    assert_eq!(spawn_grants(&module, pc), vec!["Secret::Read(KEY)"]);
 }
 
 #[test]

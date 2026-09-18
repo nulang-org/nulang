@@ -54,6 +54,7 @@ use super::crdt_manager::{CrdtDeltaOp, CrdtOp};
 use super::supervision::RemoteLink;
 use super::MessagePriority;
 use super::NodeId;
+use crate::authority::AuthorityManifest;
 use crate::vm::Value;
 
 #[cfg(feature = "tcp")]
@@ -531,6 +532,9 @@ const TYPE_CRDT_OP: u8 = 13;
 const TYPE_MIGRATE_ACTOR: u8 = 14;
 const TYPE_NODE_GOODBYE: u8 = 15;
 const TYPE_SHADOW_REPLICATE: u8 = 16;
+/// Additive NUL0 v1 extension: authority-aware remote spawn. The legacy
+/// type-3 SpawnRequest layout remains byte-for-byte unchanged.
+const TYPE_SPAWN_REQUEST_AUTH: u8 = 17;
 
 // ---------------------------------------------------------------------------
 // NodeId
@@ -600,6 +604,20 @@ pub enum Packet {
         content_hash: Option<[u8; 32]>,
         initial_state: Vec<(String, Value)>,
         bytecode: Option<Vec<u8>>,
+    },
+
+    /// Authority-aware remote spawn request.
+    ///
+    /// This uses a distinct packet discriminant so NUL0 v1's existing
+    /// `SpawnRequest` layout remains frozen. The manifest is structural in
+    /// memory and canonicalized only while encoding this packet.
+    SpawnRequestAuth {
+        request_id: u64,
+        behavior_name: String,
+        content_hash: Option<[u8; 32]>,
+        initial_state: Vec<(String, Value)>,
+        bytecode: Option<Vec<u8>>,
+        authority: AuthorityManifest,
     },
 
     /// Response to a spawn request.
@@ -759,6 +777,7 @@ impl Packet {
             TYPE_MIGRATE_ACTOR => Self::read_migrate_actor(payload)?,
             TYPE_ACK => Self::read_ack(payload)?,
             TYPE_SPAWN_REQUEST => Self::read_spawn_request(payload)?,
+            TYPE_SPAWN_REQUEST_AUTH => Self::read_spawn_request_auth(payload)?,
             TYPE_SPAWN_RESPONSE => Self::read_spawn_response(payload)?,
             TYPE_CRDT_SYNC => Self::read_crdt_sync(payload)?,
             TYPE_CRDT_DELTA_SYNC => Self::read_crdt_delta_sync(payload)?,
@@ -859,6 +878,7 @@ impl Packet {
             Packet::Heartbeat { .. } => TYPE_HEARTBEAT,
             Packet::Ack { .. } => TYPE_ACK,
             Packet::SpawnRequest { .. } => TYPE_SPAWN_REQUEST,
+            Packet::SpawnRequestAuth { .. } => TYPE_SPAWN_REQUEST_AUTH,
             Packet::SpawnResponse { .. } => TYPE_SPAWN_RESPONSE,
             Packet::CrdtSync { .. } => TYPE_CRDT_SYNC,
             Packet::CrdtDeltaSync { .. } => TYPE_CRDT_DELTA_SYNC,
@@ -953,6 +973,37 @@ impl Packet {
                     None => {
                         buf.extend_from_slice(&0u32.to_be_bytes());
                     }
+                }
+            }
+            Packet::SpawnRequestAuth {
+                request_id,
+                behavior_name,
+                content_hash,
+                initial_state,
+                bytecode,
+                authority,
+            } => {
+                buf.extend_from_slice(&request_id.to_be_bytes());
+                write_string(buf, behavior_name);
+                write_optional_hash(buf, content_hash);
+                buf.extend_from_slice(&(initial_state.len() as u32).to_be_bytes());
+                for (k, v) in initial_state {
+                    write_string(buf, k);
+                    write_value(buf, v);
+                }
+                match bytecode {
+                    Some(bytes) => {
+                        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                        buf.extend_from_slice(bytes);
+                    }
+                    None => {
+                        buf.extend_from_slice(&0u32.to_be_bytes());
+                    }
+                }
+                let authority_tokens = authority.canonical_tokens();
+                buf.extend_from_slice(&(authority_tokens.len() as u32).to_be_bytes());
+                for token in authority_tokens {
+                    write_string(buf, &token);
                 }
             }
             Packet::SpawnResponse {
@@ -1205,6 +1256,73 @@ impl Packet {
             bytecode,
         })
     }
+    fn read_spawn_request_auth(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 8 {
+            return None;
+        }
+        let request_id = read_u64(payload, 0)?;
+        let (behavior_name, consumed) = read_string(payload, 8)?;
+        let mut offset = 8 + consumed;
+        let (content_hash, hash_consumed) = read_optional_hash(payload, offset)?;
+        offset = offset.checked_add(hash_consumed)?;
+        let count = read_u32(payload, offset)? as usize;
+        offset = offset.checked_add(4)?;
+        let mut initial_state = Vec::with_capacity(count.min(256));
+        for _ in 0..count {
+            let (key, consumed_key) = read_string(payload, offset)?;
+            offset = offset.checked_add(consumed_key)?;
+            let (value, consumed_val) = read_value(payload, offset)?;
+            offset = offset.checked_add(consumed_val)?;
+            initial_state.push((key, value));
+        }
+
+        let bytecode_len = read_u32(payload, offset)? as usize;
+        offset = offset.checked_add(4)?;
+        let bytecode = if bytecode_len > 0 {
+            let end = offset.checked_add(bytecode_len)?;
+            if end > payload.len() {
+                return None;
+            }
+            let bytes = payload[offset..end].to_vec();
+            offset = end;
+            Some(bytes)
+        } else {
+            None
+        };
+
+        let authority_count = read_u32(payload, offset)? as usize;
+        offset = offset.checked_add(4)?;
+        if authority_count > 1024 {
+            return None;
+        }
+        let mut authority_tokens = Vec::with_capacity(authority_count);
+        for _ in 0..authority_count {
+            let (token, consumed) = read_string(payload, offset)?;
+            offset = offset.checked_add(consumed)?;
+            authority_tokens.push(token);
+        }
+        if offset != payload.len() {
+            return None;
+        }
+
+        let authority = AuthorityManifest::from_tokens(
+            authority_tokens.iter().map(String::as_str),
+        )
+        .ok()?;
+        if authority.canonical_tokens() != authority_tokens {
+            return None;
+        }
+
+        Some(Packet::SpawnRequestAuth {
+            request_id,
+            behavior_name,
+            content_hash,
+            initial_state,
+            bytecode,
+            authority,
+        })
+    }
+
     fn read_spawn_response(payload: &[u8]) -> Option<Self> {
         if payload.len() < 17 {
             return None;
@@ -1551,7 +1669,8 @@ fn packet_payload_wire_safe(packet: &Packet) -> bool {
                 && v.as_object_id()
                     .map_or(true, |id| (id as usize) < object_table.len())
         }),
-        Packet::SpawnRequest { initial_state, .. } => initial_state
+        Packet::SpawnRequest { initial_state, .. }
+        | Packet::SpawnRequestAuth { initial_state, .. } => initial_state
             .iter()
             .all(|(_, v)| value_is_wire_safe(v, false)),
         _ => true,
@@ -2820,6 +2939,56 @@ mod tests {
     // 3c. Spawn request/response roundtrips
     // ------------------------------------------------------------------
     #[test]
+    fn test_packet_serialize_deserialize_spawn_request_auth() {
+        let authority = AuthorityManifest::from_tokens([
+            "Secret::Read(STRIPE_KEY)",
+            "Net::TcpOut(api.example.com:443)",
+        ])
+        .unwrap();
+        let packet = Packet::SpawnRequestAuth {
+            request_id: 0xA11C_E001,
+            behavior_name: "store".to_string(),
+            content_hash: Some([0xAB; 32]),
+            initial_state: vec![("count".to_string(), Value::int(7))],
+            bytecode: None,
+            authority,
+        };
+        let bytes = packet.to_bytes(17);
+        // Type 17 is additive; the legacy type-3 SpawnRequest layout is untouched.
+        assert_eq!(bytes[4], TYPE_SPAWN_REQUEST_AUTH);
+        let (seq, decoded) = Packet::from_bytes(&bytes).expect("authority spawn decode");
+        assert_eq!(seq, 17);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_spawn_request_auth_rejects_malformed_authority() {
+        let authority =
+            AuthorityManifest::from_tokens(["Net::TcpOut(api.example.com:443)"]).unwrap();
+        let packet = Packet::SpawnRequestAuth {
+            request_id: 7,
+            behavior_name: "store".to_string(),
+            content_hash: None,
+            initial_state: vec![],
+            bytecode: None,
+            authority,
+        };
+        let mut bytes = packet.to_bytes(1);
+        let valid = b"Net::TcpOut(api.example.com:443)";
+        let malformed = b"Net::TcpOut(api.example.com-443)";
+        assert_eq!(valid.len(), malformed.len());
+        let pos = bytes
+            .windows(valid.len())
+            .position(|window| window == valid)
+            .expect("encoded authority token");
+        bytes[pos..pos + valid.len()].copy_from_slice(malformed);
+        assert!(
+            Packet::from_bytes(&bytes).is_none(),
+            "malformed authority must fail at the wire decode boundary"
+        );
+    }
+
+    #[test]
     fn test_packet_serialize_deserialize_spawn_response() {
         let packet = Packet::SpawnResponse {
             request_id: 0xDEAD_BEEF,
@@ -3148,6 +3317,19 @@ mod tests {
             bytecode: None,
         };
         assert!(!packet_payload_wire_safe(&spawn));
+
+        let auth_spawn = Packet::SpawnRequestAuth {
+            request_id: 2,
+            behavior_name: "Counter".into(),
+            content_hash: None,
+            initial_state: vec![("name".into(), Value::string(1))],
+            bytecode: None,
+            authority: AuthorityManifest::from_tokens(["Secret::Read(KEY)"]).unwrap(),
+        };
+        assert!(
+            !packet_payload_wire_safe(&auth_spawn),
+            "authority-aware spawn must enforce the same payload safety as legacy spawn"
+        );
 
         assert!(packet_payload_wire_safe(&Packet::Heartbeat {
             node_id: NodeId(1),

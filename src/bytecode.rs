@@ -697,11 +697,10 @@ pub struct CodeModule {
     /// Populated by MIR codegen; consumed by the VM's `step_spawn`.
     #[serde(default)]
     pub spawn_init_overrides: Vec<(usize, Vec<(String, Constant)>)>,
-    /// Spawn-time capability grants.  Maps `Spawn` instruction byte-offset to
-    /// the capability token strings (e.g. `Net::TcpOut(host:port)`) granted to
-    /// the actor spawned by that instruction.  Populated by MIR codegen from
-    /// `spawn Foo() with [...]`; consumed by the VM's `step_spawn`, which
-    /// installs the set on the new actor for runtime enforcement.
+    /// Spawn-time external-authority grants. Maps `Spawn`/`RSpawn` instruction
+    /// byte-offset to canonical authority tokens (e.g. `Net::TcpOut(host:port)`).
+    /// Populated by MIR codegen from `spawn ... with [...]`; local and remote VM
+    /// spawn paths decode the selected site into a typed `AuthorityManifest`.
     #[serde(default)]
     pub spawn_capability_grants: Vec<(usize, Vec<String>)>,
     #[serde(default)]

@@ -93,6 +93,7 @@ pub trait DistributedVmCallbacks: std::any::Any + std::fmt::Debug {
         _target_node: u64,
         _behavior: &str,
         _init: &[(String, Value)],
+        _authority: &crate::authority::AuthorityManifest,
     ) -> Value {
         Value::actor_ref(0)
     }
@@ -4550,6 +4551,36 @@ impl VM {
             .enumerate()
             .map(|(i, n)| (n.clone(), self.frames[frame_idx].regs[i]))
             .collect();
+        let authority = {
+            let mut matches = self
+                .modules
+                .get(module_idx)
+                .into_iter()
+                .flat_map(|m| m.spawn_capability_grants.iter())
+                .filter(|(pc, _)| *pc == spawn_pc);
+            let manifest = match matches.next() {
+                Some((_, tokens)) => crate::authority::AuthorityManifest::from_tokens(
+                    tokens.iter().map(String::as_str),
+                )
+                .map_err(|err| NuError::VMError {
+                    msg: format!(
+                        "invalid remote-spawn authority metadata at bytecode pc {spawn_pc}: {err}"
+                    ),
+                    span: Span::default(),
+                })?,
+                None => crate::authority::AuthorityManifest::new(),
+            };
+            if matches.next().is_some() {
+                return Err(NuError::VMError {
+                    msg: format!(
+                        "ambiguous remote-spawn authority metadata at bytecode pc {spawn_pc}"
+                    ),
+                    span: Span::default(),
+                });
+            }
+            manifest
+        };
+
         let result = if self.distributed_callbacks.is_some() && node_id != self.node_id {
             let behavior_name = self
                 .modules
@@ -4558,7 +4589,7 @@ impl VM {
                 .map(|b| b.name.clone())
                 .unwrap_or_default();
             if let Some(cb) = &mut self.distributed_callbacks {
-                cb.remote_spawn(node_id, &behavior_name, &init)
+                cb.remote_spawn(node_id, &behavior_name, &init, &authority)
             } else {
                 Value::actor_ref(0)
             }
