@@ -3026,6 +3026,204 @@ mod tests {
         );
     }
     #[test]
+    fn test_drop_plan_owned_param_reclaimed_after_last_use() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("owned_param", Some(Type::int()));
+        let param = b.add_param_with_cap("x", array_ty, crate::types::Capability::LinearIso);
+        let len = b.add_temp(Type::int());
+        b.assign(len, mir::RValue::ArrayLen(param));
+        b.terminate(mir::Terminator::Return(Some(len)));
+        let f = b.build();
+
+        let plan = plan_drops(&f, &[true], &[]);
+        let len_si = f.blocks[0]
+            .stmts
+            .iter()
+            .position(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        dst,
+                        op: mir::RValue::ArrayLen(src)
+                    } if *dst == len && *src == param
+                )
+            })
+            .expect("array length use");
+        assert!(
+            plan.after_stmt
+                .get(&(0, len_si))
+                .is_some_and(|ids| ids.contains(&param)),
+            "owned parameter should be released after its last read-only use"
+        );
+        assert!(plan.cleanup_owned.contains(&param));
+    }
+
+    #[test]
+    fn test_drop_plan_borrowed_param_remains_unowned() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("borrowed_param", Some(Type::int()));
+        let param = b.add_param_with_cap("x", array_ty, crate::types::Capability::LinearIso);
+        let len = b.add_temp(Type::int());
+        b.assign(len, mir::RValue::ArrayLen(param));
+        b.terminate(mir::Terminator::Return(Some(len)));
+        let f = b.build();
+
+        let plan = plan_drops(&f, &[false], &[]);
+        assert!(!plan.cleanup_owned.contains(&param));
+        assert!(
+            plan.after_stmt.values().all(|ids| !ids.contains(&param))
+                && plan.before_stmt.values().all(|ids| !ids.contains(&param))
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_owned_direct_call_argument_is_transfer() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("caller", None);
+        let arg = b.add_temp(array_ty);
+        let result = b.add_temp(Type::unit());
+        b.assign(arg, mir::RValue::ArrayLit(vec![]));
+        b.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![arg],
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+        let f = b.build();
+
+        let plan = plan_drops(&f, &[], &[vec![true]]);
+        let call_si = f.blocks[0]
+            .stmts
+            .iter()
+            .position(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::Call {
+                            func: mir::FuncRef::Index(0),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .expect("direct call");
+        assert!(
+            !plan
+                .after_stmt
+                .get(&(0, call_si))
+                .is_some_and(|ids| ids.contains(&arg)),
+            "ownership transfer must not release the caller source"
+        );
+        assert!(
+            plan.cleanup_owned.contains(&arg),
+            "source remains an abort-cleanup root until bytecode clears it before Call"
+        );
+    }
+
+    #[test]
+    fn test_codegen_owned_direct_call_stages_then_clears_then_calls() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+
+        let mut target = mir::FunctionBuilder::new("target", Some(Type::int()));
+        let param = target.add_param_with_cap(
+            "x",
+            array_ty.clone(),
+            crate::types::Capability::LinearIso,
+        );
+        let len = target.add_temp(Type::int());
+        target.assign(len, mir::RValue::ArrayLen(param));
+        target.terminate(mir::Terminator::Return(Some(len)));
+
+        let mut main = mir::FunctionBuilder::new("main", None);
+        let arg = main.add_temp(array_ty);
+        let result = main.add_temp(Type::int());
+        main.assign(arg, mir::RValue::ArrayLit(vec![]));
+        main.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Index(0),
+                args: vec![arg],
+            },
+        );
+        main.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("owned_call");
+        module.functions.push(target.build());
+        module.functions.push(main.build());
+        let code = compile_mir(&mut module, "owned_call").expect("compile owned call");
+
+        let caller = code
+            .debug_functions
+            .iter()
+            .find(|f| f.name == "main")
+            .expect("main debug info");
+        let caller_code = &code.instructions
+            [caller.code_offset..caller.code_offset + caller.code_len];
+        let call_pos = caller_code
+            .iter()
+            .position(|i| i.opcode == OpCode::Call)
+            .expect("direct Call opcode");
+        assert!(call_pos >= 2, "stage and clear must precede Call");
+        let clear = caller_code[call_pos - 1];
+        assert_eq!(clear.opcode, OpCode::ConstU);
+        assert_eq!(
+            clear.op3,
+            (LOCAL_BASE + arg.0) as u8,
+            "caller ownership slot must be invalidated after staging"
+        );
+        assert!(matches!(
+            code.constants.get(clear.imm16() as usize),
+            Some(Constant::Nil)
+        ));
+        let stage = caller_code[call_pos - 2];
+        assert_eq!(stage.opcode, OpCode::Move);
+        assert_eq!(stage.op1, (LOCAL_BASE + arg.0) as u8);
+        assert_eq!(stage.op2, 0);
+
+        let callee = code
+            .debug_functions
+            .iter()
+            .find(|f| f.name == "target")
+            .expect("target debug info");
+        let callee_code =
+            &code.instructions[callee.code_offset..callee.code_offset + callee.code_len];
+        assert!(
+            callee_code.iter().any(|i| {
+                i.opcode == OpCode::Drop && i.op1 == (LOCAL_BASE + param.0) as u8
+            }),
+            "callee must release its owned parameter after the final read"
+        );
+        assert!(
+            callee.cleanup_regs.contains(&((LOCAL_BASE + param.0) as usize)),
+            "callee owned parameter must also be reclaimable on abort"
+        );
+    }
+
+    #[test]
+    fn test_clear_spilled_owner_without_drop_writes_nil_to_spill_slot() {
+        let mut codegen = MirCodegen::new("spill_clear");
+        let local = mir::LocalId(300);
+        codegen.spill_map.insert(local.0, 7);
+        codegen.clear_local_without_drop(local);
+        let module = codegen.finish();
+        assert_eq!(module.instructions.len(), 2);
+        let clear = module.instructions[0];
+        assert_eq!(clear.opcode, OpCode::ConstU);
+        assert_eq!(clear.op3, SPILL_TEMP2);
+        assert!(matches!(
+            module.constants.get(clear.imm16() as usize),
+            Some(Constant::Nil)
+        ));
+        let store = module.instructions[1];
+        assert_eq!(store.opcode, OpCode::SpillStore);
+        assert_eq!(store.op1, SPILL_TEMP2);
+        assert_eq!(store.op2, 0);
+        assert_eq!(store.op3, 7);
+    }
+    #[test]
     fn test_mir_codegen_simple_arithmetic() {
         let value = run_mir_source("1 + 2 * 3").unwrap();
         assert_eq!(value.as_int(), Some(7));
