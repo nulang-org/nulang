@@ -200,6 +200,7 @@ pub struct Actor {
     /// AOT-compiled behavior targets, parallel to `behavior_table`. `Some`
     /// means the behavior at that index dispatches through AOT native code;
     /// the scheduler arms the target before invoking `handler_fn`.
+    #[cfg(feature = "native-codegen")]
     pub aot_targets: Vec<Option<crate::aot::AotDispatchTarget>>,
     /// Bytecode behavior offsets by behavior_id. Empty entries mean no bytecode
     /// handler for that behavior (native handler or missing).
@@ -347,6 +348,7 @@ impl Actor {
             persistent: false,
             is_workflow: false,
             behavior_table: Vec::new(),
+            #[cfg(feature = "native-codegen")]
             aot_targets: Vec::new(),
             bytecode_offsets: Vec::new(),
             compensation_offsets: Vec::new(),
@@ -359,7 +361,7 @@ impl Actor {
             links: Vec::new(),
             trap_exits: false,
             priority: ActorPriority::Normal,
-            jit_safepoint_counter: crate::jit::runtime::JIT_SAFEPOINT_BUDGET,
+            jit_safepoint_counter: crate::backends::JIT_SAFEPOINT_BUDGET,
             jit_yield_pending: false,
             reduction_count: 0,
             turn_reductions: 0,
@@ -583,7 +585,10 @@ impl Actor {
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                     *ptr.add(bytes.len()) = 0;
                 }
-                Value::ptr(ptr)
+                unsafe {
+                    /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                    Value::ptr(ptr)
+                }
             }
             None => Value::nil(),
         }
@@ -603,7 +608,10 @@ impl Actor {
                         slots[i] = item;
                     }
                 }
-                Value::ptr(ptr)
+                unsafe {
+                    /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                    Value::ptr(ptr)
+                }
             }
             None => Value::nil(),
         }

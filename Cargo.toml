@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nulang-ai", "crates/nulang-ai-core", "crates/nulang-ai-protocol", "crates/nulang-ai-local", "crates/nulang-ai-director", "crates/nulang-ai-manager", "crates/nulang-ai-worker", "crates/nulang-ai-mcp", "crates/nulang-capacity"]
+members = ["crates/nulang-ai", "crates/nulang-ai-core", "crates/nulang-ai-protocol", "crates/nulang-ai-local", "crates/nulang-ai-director", "crates/nulang-ai-manager", "crates/nulang-ai-worker", "crates/nulang-ai-mcp", "crates/nulang-capacity", "crates/nulang-ui-protocol"]
 # The browser-playground crate re-uses compiler sources via #[path] includes
 # and builds only for wasm32-unknown-unknown; it is intentionally standalone
 # (its own lockfile, minimal pure-Rust dep set) and excluded from workspace
@@ -36,12 +36,25 @@ autobenches = false
 language-version = "1.0.0-frozen"
 
 [features]
-default = ["python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+default = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+# Cranelift-backed tiered JIT plus the current native/AOT backend.
+native-codegen = [
+    "dep:cranelift",
+    "dep:cranelift-jit",
+    "dep:cranelift-module",
+    "dep:cranelift-native",
+    "dep:cranelift-frontend",
+    "dep:cranelift-codegen",
+    "dep:target-lexicon",
+]
+# Marker profile for embedded mobile runtimes. Intentionally empty: the
+# bytecode interpreter and pre-registered host callbacks need no JIT.
+mobile-runtime = []
 python = ["dep:pyo3"]
 sqlite = ["dep:libsql"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
 ai-runtime = ["dep:nulang-ai", "dep:nulang-ai-local", "dep:uuid", "dep:reqwest", "dep:tokio"]
-wasm-backend = ["dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
+wasm-backend = ["native-codegen", "dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
 # WasmFX stack-switching backend: depends on wasm-backend, and additionally
 # enables wasmtime's GC support (required for exception tags, which carry
 # `suspend` payloads).
@@ -68,7 +81,7 @@ rocksdb = ["dep:rocksdb"]
 # PostgreSQL persistence backend (production-grade relational storage).
 postgres = ["dep:postgres"]
 # Differential fuzzing driver binary (src/bin/nula_difffuzz.rs).
-difffuzz = []
+difffuzz = ["native-codegen"]
 
 [dependencies]
 # Memory & concurrency
@@ -99,12 +112,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # REPL line editing, history, and completion
 rustyline = { version = "15", default-features = false, features = ["with-file-history"] }
 # Cranelift JIT backend
-cranelift = "0.132"
-cranelift-jit = "0.132"
-cranelift-module = "0.132"
-cranelift-native = "0.132"
-cranelift-frontend = "0.132"
-cranelift-codegen = { version = "0.132", features = ["riscv64"] }
+cranelift = { version = "0.132", optional = true }
+cranelift-jit = { version = "0.132", optional = true }
+cranelift-module = { version = "0.132", optional = true }
+cranelift-native = { version = "0.132", optional = true }
+cranelift-frontend = { version = "0.132", optional = true }
+cranelift-codegen = { version = "0.132", features = ["riscv64"], optional = true }
 
 # LSP server (optional, see [features])
 tower-lsp = { version = "0.20", optional = true }
@@ -149,12 +162,12 @@ borsh = { version = "1.5", optional = true, features = ["derive"] }
 wasmtime = { version = "46", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
 wat = { version = "1.254", optional = true }
 blake3 = "1.8"
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "ring", "logging"] }
 rustls-pemfile = { version = "2" }
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 hex = "0.4.3"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
-target-lexicon = "0.13"
+target-lexicon = { version = "0.13", optional = true }
 
 flate2 = "1"
 tar = "0.4"

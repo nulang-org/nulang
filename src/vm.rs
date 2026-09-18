@@ -26,7 +26,9 @@
 
 use std::ffi::{c_char, CStr, CString};
 
-use crate::backends::{create_default_jit, JitBackend, TieredAction};
+#[cfg(feature = "native-codegen")]
+use crate::backends::TieredAction;
+use crate::backends::{create_default_jit, JitBackend};
 use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
 use crate::ffi::{call_native, CType, Signature, FFI_REGISTRY};
 use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
@@ -138,6 +140,22 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// `type_tag` tells the heap what kind of object is being allocated.
     /// Returns a pointer to the payload region, or `None` if allocation fails.
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8>;
+
+    /// Allocate actor/VM-owned storage and return both its writable payload
+    /// pointer and the pointer-tagged `Value` carrying the same provenance.
+    ///
+    /// This is the preferred safe construction path for new runtime heap
+    /// pointers: callers cannot supply an arbitrary raw pointer, and the
+    /// `alloc` contract guarantees that the returned pointer is live storage
+    /// owned by the current VM/actor allocation domain.
+    fn alloc_value(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<(*mut u8, Value)> {
+        let ptr = self.alloc(size, type_tag)?;
+        // SAFETY: `alloc` just returned this pointer as a live allocation in
+        // the current VM/actor allocation domain. The returned Value follows
+        // that domain's normal retain/drop ownership rules.
+        let value = unsafe { Value::ptr(ptr) };
+        Some((ptr, value))
+    }
     /// Allocate `size` bytes on the current actor's iso arena.
     ///
     /// Default: no arena support (falls back to `None`); actor callbacks
@@ -176,11 +194,13 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// with a working `alloc`; callers may override for specialization.
     fn alloc_string(&mut self, s: &str) -> Value {
         let bytes = s.as_bytes();
-        match self.alloc(bytes.len() + 1, HeapTypeTag::String) {
-            Some(ptr) => unsafe {
+        match self.alloc_value(bytes.len() + 1, HeapTypeTag::String) {
+            Some((ptr, value)) => unsafe {
+                // SAFETY: `alloc_value` returned a live writable allocation of
+                // exactly bytes.len() + 1 bytes in the current allocation domain.
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                 *ptr.add(bytes.len()) = 0;
-                Value::ptr(ptr)
+                value
             },
             None => Value::nil(),
         }
@@ -194,6 +214,7 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     fn spawn_actor(
         &mut self,
         module: &CodeModule,
+        spawn_pc: usize,
         behavior_idx: usize,
         init: Vec<(String, Value)>,
     ) -> Value;
@@ -218,6 +239,14 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
 
     /// Emit an event in the current actor.  Default is a no-op.
     fn emit_event(&mut self, _event: &str, _args: &[Value]) {}
+
+    /// Authorize one foreign-function call before any library is loaded or
+    /// symbol resolved. Standalone callbacks retain the historic ambient
+    /// behavior; runtime-backed actor callbacks override this and require an
+    /// exact typed `FFI::Call("library::symbol")` authority grant.
+    fn authorize_ffi(&mut self, _library: &str, _symbol: &str) -> bool {
+        true
+    }
 
     /// Handle a built-in effect performed without an explicit handler.
     ///
@@ -455,7 +484,10 @@ pub(crate) fn strbuilder_op(
                 *(ptr as *mut u64) = 0; // len
                 *((ptr as *mut u64).add(1)) = cap as u64;
             }
-            Some(Value::ptr(ptr))
+            Some(unsafe {
+                /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                Value::ptr(ptr)
+            })
         }
         "push" | "append" => {
             let b = regs.first()?.as_ptr()?;
@@ -472,7 +504,10 @@ pub(crate) fn strbuilder_op(
                     );
                     *(b as *mut u64) = needed as u64;
                 }
-                Some(Value::ptr(b))
+                Some(unsafe {
+                    /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                    Value::ptr(b)
+                })
             } else {
                 let new_cap = (cap * 2).max(needed);
                 let new_ptr = callbacks.alloc(STRBUILDER_HDR + new_cap, HeapTypeTag::Raw)?;
@@ -490,7 +525,10 @@ pub(crate) fn strbuilder_op(
                     *(new_ptr as *mut u64) = needed as u64;
                     *((new_ptr as *mut u64).add(1)) = new_cap as u64;
                 }
-                Some(Value::ptr(new_ptr))
+                Some(unsafe {
+                    /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                    Value::ptr(new_ptr)
+                })
             }
         }
         "to_string" => {
@@ -501,7 +539,10 @@ pub(crate) fn strbuilder_op(
                 std::ptr::copy_nonoverlapping(b.add(STRBUILDER_HDR), ptr, len);
                 *ptr.add(len) = 0;
             }
-            Some(Value::ptr(ptr))
+            Some(unsafe {
+                /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                Value::ptr(ptr)
+            })
         }
         "len" => {
             let b = regs.first()?.as_ptr()?;
@@ -512,7 +553,10 @@ pub(crate) fn strbuilder_op(
             unsafe {
                 *(b as *mut u64) = 0;
             }
-            Some(Value::ptr(b))
+            Some(unsafe {
+                /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                Value::ptr(b)
+            })
         }
         _ => None,
     }
@@ -672,7 +716,10 @@ fn map_grow(callbacks: &mut dyn ActorVmCallbacks, m: *mut u8, new_cap: usize) ->
         let used = map_used(m);
         *((new_ptr as *mut Value).add(1)) = Value::int(used as i64);
     }
-    Some(Value::ptr(new_ptr))
+    Some(unsafe {
+        /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+        Value::ptr(new_ptr)
+    })
 }
 
 pub(crate) fn hashmap_op(
@@ -693,7 +740,10 @@ pub(crate) fn hashmap_op(
                     *slot = Value::int(MAP_EMPTY);
                 }
             }
-            Some(Value::ptr(m))
+            Some(unsafe {
+                /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                Value::ptr(m)
+            })
         }
         "insert" => {
             let m_orig = regs.first()?.as_ptr()?;
@@ -730,7 +780,10 @@ pub(crate) fn hashmap_op(
                         }
                     }
                     map_set_used(m, used + 1);
-                    return Some(Value::ptr(m));
+                    return Some(unsafe {
+                        /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                        Value::ptr(m)
+                    });
                 }
                 if hc == MAP_TOMB {
                     if first_tomb.is_none() {
@@ -758,7 +811,10 @@ pub(crate) fn hashmap_op(
                             callbacks.retain_ref(p);
                         }
                     }
-                    return Some(Value::ptr(m));
+                    return Some(unsafe {
+                        /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                        Value::ptr(m)
+                    });
                 }
             }
             // No empty slot: reuse the first tombstone (table can't be all
@@ -778,7 +834,10 @@ pub(crate) fn hashmap_op(
                     }
                 }
                 map_set_used(m, used + 1);
-                Some(Value::ptr(m))
+                Some(unsafe {
+                    /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                    Value::ptr(m)
+                })
             } else {
                 None
             }
@@ -866,10 +925,16 @@ pub(crate) fn hashmap_op(
                         *(base as *mut Value) = Value::int(MAP_TOMB);
                     }
                     map_set_used(m, used.saturating_sub(1));
-                    return Some(Value::ptr(m));
+                    return Some(unsafe {
+                        /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                        Value::ptr(m)
+                    });
                 }
             }
-            Some(Value::ptr(m))
+            Some(unsafe {
+                /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                Value::ptr(m)
+            })
         }
         "size" => {
             let m = regs.first()?.as_ptr()?;
@@ -919,6 +984,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
     fn spawn_actor(
         &mut self,
         _module: &CodeModule,
+        _spawn_pc: usize,
         _behavior_idx: usize,
         _init: Vec<(String, Value)>,
     ) -> Value {
@@ -969,7 +1035,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe {
+                        // SAFETY: `ptr` was returned by `self.heap.alloc`
+                        // in this branch and remains owned by this VM heap.
+                        Value::ptr(ptr)
+                    });
                 }
                 None => return Some(Value::nil()),
             }
@@ -988,7 +1058,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe {
+                        // SAFETY: `ptr` was returned by `self.heap.alloc`
+                        // in this branch and remains owned by this VM heap.
+                        Value::ptr(ptr)
+                    });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1003,7 +1077,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe {
+                        // SAFETY: `ptr` was returned by `self.heap.alloc`
+                        // in this branch and remains owned by this VM heap.
+                        Value::ptr(ptr)
+                    });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1022,7 +1100,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe {
+                        // SAFETY: `ptr` was returned by `self.heap.alloc`
+                        // in this branch and remains owned by this VM heap.
+                        Value::ptr(ptr)
+                    });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1116,7 +1198,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe {
+                        // SAFETY: `ptr` was returned by `self.heap.alloc`
+                        // in this branch and remains owned by this VM heap.
+                        Value::ptr(ptr)
+                    });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1132,7 +1218,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe {
+                        // SAFETY: `ptr` was returned by `self.heap.alloc`
+                        // in this branch and remains owned by this VM heap.
+                        Value::ptr(ptr)
+                    });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1153,7 +1243,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                         *ptr.add(bytes.len()) = 0;
                     }
-                    return Some(Value::ptr(ptr));
+                    return Some(unsafe {
+                        // SAFETY: `ptr` was returned by `self.heap.alloc`
+                        // in this branch and remains owned by this VM heap.
+                        Value::ptr(ptr)
+                    });
                 }
                 None => return Some(Value::nil()),
             }
@@ -1188,7 +1282,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                         );
                                         *ptr.add(bytes.len()) = 0;
                                     }
-                                    return Some(Value::ptr(ptr));
+                                    return Some(unsafe {
+                                        // SAFETY: `ptr` was returned by `self.heap.alloc`
+                                        // in this branch and remains owned by this VM heap.
+                                        Value::ptr(ptr)
+                                    });
                                 }
                                 None => return Some(Value::nil()),
                             }
@@ -1294,7 +1392,10 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 self.gc.local_ref(&self.heap, ptr);
                             }
                         }
-                        return Some(Value::ptr(new_ptr));
+                        return Some(unsafe {
+                            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                            Value::ptr(new_ptr)
+                        });
                     }
                     return Some(Value::nil());
                 }
@@ -1316,7 +1417,10 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 }
                             }
                         }
-                        return Some(Value::ptr(new_ptr));
+                        return Some(unsafe {
+                            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                            Value::ptr(new_ptr)
+                        });
                     }
                     return Some(Value::nil());
                 }
@@ -1350,7 +1454,10 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 }
                             }
                         }
-                        return Some(Value::ptr(new_ptr));
+                        return Some(unsafe {
+                            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                            Value::ptr(new_ptr)
+                        });
                     }
                     return Some(Value::nil());
                 }
@@ -1393,7 +1500,10 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 }
                             }
                         }
-                        return Some(Value::ptr(new_ptr));
+                        return Some(unsafe {
+                            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                            Value::ptr(new_ptr)
+                        });
                     }
                     return Some(Value::nil());
                 }
@@ -1413,7 +1523,10 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 slots[i] = Value::int(start + i as i64);
                             }
                         }
-                        return Some(Value::ptr(new_ptr));
+                        return Some(unsafe {
+                            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                            Value::ptr(new_ptr)
+                        });
                     }
                     return Some(Value::nil());
                 }
@@ -1449,7 +1562,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                                 );
                                                 *ptr.add(bytes.len()) = 0;
                                             }
-                                            return Some(Value::ptr(ptr));
+                                            return Some(unsafe {
+                                                // SAFETY: `ptr` was returned by `self.heap.alloc`
+                                                // in this branch and remains owned by this VM heap.
+                                                Value::ptr(ptr)
+                                            });
                                         }
                                         None => return Some(Value::nil()),
                                     }
@@ -1469,7 +1586,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                     std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr, msg.len());
                                     *ptr.add(msg.len()) = 0;
                                 }
-                                return Some(Value::ptr(ptr));
+                                return Some(unsafe {
+                                    // SAFETY: `ptr` was returned by `self.heap.alloc`
+                                    // in this branch and remains owned by this VM heap.
+                                    Value::ptr(ptr)
+                                });
                             }
                             None => return Some(Value::nil()),
                         }
@@ -1500,7 +1621,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                                 );
                                                 *ptr.add(bytes.len()) = 0;
                                             }
-                                            return Some(Value::ptr(ptr));
+                                            return Some(unsafe {
+                                                // SAFETY: `ptr` was returned by `self.heap.alloc`
+                                                // in this branch and remains owned by this VM heap.
+                                                Value::ptr(ptr)
+                                            });
                                         }
                                         None => return Some(Value::nil()),
                                     }
@@ -1520,7 +1645,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                     std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr, msg.len());
                                     *ptr.add(msg.len()) = 0;
                                 }
-                                return Some(Value::ptr(ptr));
+                                return Some(unsafe {
+                                    // SAFETY: `ptr` was returned by `self.heap.alloc`
+                                    // in this branch and remains owned by this VM heap.
+                                    Value::ptr(ptr)
+                                });
                             }
                             None => return Some(Value::nil()),
                         }
@@ -1556,7 +1685,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                                     *ptr.add(bytes.len()) = 0;
                                 }
-                                return Some(Value::ptr(ptr));
+                                return Some(unsafe {
+                                    // SAFETY: `ptr` was returned by `self.heap.alloc`
+                                    // in this branch and remains owned by this VM heap.
+                                    Value::ptr(ptr)
+                                });
                             }
                             None => return Some(Value::nil()),
                         }
@@ -1581,7 +1714,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                                 *ptr.add(bytes.len()) = 0;
                             }
-                            return Some(Value::ptr(ptr));
+                            return Some(unsafe {
+                                // SAFETY: `ptr` was returned by `self.heap.alloc`
+                                // in this branch and remains owned by this VM heap.
+                                Value::ptr(ptr)
+                            });
                         }
                         None => return Some(Value::nil()),
                     }
@@ -1603,7 +1740,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                                 *ptr.add(bytes.len()) = 0;
                             }
-                            return Some(Value::ptr(ptr));
+                            return Some(unsafe {
+                                // SAFETY: `ptr` was returned by `self.heap.alloc`
+                                // in this branch and remains owned by this VM heap.
+                                Value::ptr(ptr)
+                            });
                         }
                         None => return Some(Value::nil()),
                     }
@@ -1686,7 +1827,10 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                             *ptr.add(bytes.len()) = 0;
                         }
-                        Some(Value::ptr(ptr))
+                        Some(unsafe {
+                            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                            Value::ptr(ptr)
+                        })
                     }
                     None => Some(Value::nil()),
                 }
@@ -1840,10 +1984,30 @@ impl Value {
         }
     }
 
-    /// Create a pointer value (for strings, lists, etc.).
-    pub fn ptr(p: *mut u8) -> Self {
+    /// Create a pointer-tagged value from a trusted live pointer.
+    ///
+    /// The legacy NaN-boxed representation has only a 48-bit payload. Never
+    /// silently truncate a wider virtual address: doing so would manufacture
+    /// a different pointer and make later dereferences undefined behavior.
+    ///
+    /// # Safety
+    /// `p` must either be null for an explicitly non-dereferenced sentinel, or
+    /// point to storage whose provenance, layout, and lifetime satisfy every
+    /// runtime path that may dereference the returned `Value`. Generic safe
+    /// code must obtain pointer values from provenance-preserving allocation
+    /// APIs such as [`ActorVmCallbacks::alloc_value`] instead.
+    ///
+    /// ```compile_fail
+    /// use nulang::vm::Value;
+    /// let _forged = Value::ptr(std::ptr::null_mut());
+    /// ```
+    pub unsafe fn ptr(p: *mut u8) -> Self {
+        assert!(
+            crate::value_layout::ptr_fits_payload(p as u64),
+            "pointer address does not fit the 48-bit Value payload"
+        );
         Value {
-            raw: TAG_PTR | (p as u64 & PAYLOAD_MASK),
+            raw: TAG_PTR | p as u64,
         }
     }
 
@@ -1952,11 +2116,14 @@ impl Value {
         self.raw
     }
 
-    /// Construct a Value from raw NaN-boxed bits.
+    /// Construct a `Value` from trusted raw NaN-boxed bits.
     ///
     /// # Safety
-    /// The caller must ensure the bits form a valid tagged value.
-    pub fn from_raw(raw: u64) -> Self {
+    /// Every tag payload must satisfy its runtime invariant. If `raw` has
+    /// `TAG_PTR`, the caller must preserve the originating pointer's provenance
+    /// and lifetime for every operation that can dereference the returned value;
+    /// externally controlled bits must use [`Value::try_from_untrusted_bits`].
+    pub unsafe fn from_raw(raw: u64) -> Self {
         Value { raw }
     }
 
@@ -1965,9 +2132,26 @@ impl Value {
         self.raw
     }
 
-    /// Construct a Value from raw NaN-boxed bits.
-    pub fn from_bits(raw: u64) -> Self {
+    /// Construct a `Value` from trusted raw NaN-boxed bits.
+    ///
+    /// # Safety
+    /// Same contract as [`Value::from_raw`]. Pointer-tagged bits must retain
+    /// their originating host provenance/lifetime for every dereference;
+    /// untrusted integer boundaries must use the validated decoder instead.
+    pub unsafe fn from_bits(raw: u64) -> Self {
         Value { raw }
+    }
+
+    /// Decode externally controlled raw bits without allowing them to mint a
+    /// process-local host heap pointer. Immediate tags and floats are safe to
+    /// transport as opaque values; `TAG_PTR` requires host provenance and is
+    /// therefore rejected at untrusted boundaries.
+    pub fn try_from_untrusted_bits(raw: u64) -> Result<Self, &'static str> {
+        if (raw & TAG_MASK) == TAG_PTR {
+            Err("pointer-tagged raw value has no Nulang host-heap provenance")
+        } else {
+            Ok(Value { raw })
+        }
     }
 
     pub fn to_string_repr(&self) -> String {
@@ -2889,7 +3073,10 @@ impl VM {
         unsafe {
             crate::ffi::marshal::free_cstr_value(value);
         }
-        Ok(Value::ptr(heap_ptr))
+        Ok(unsafe {
+            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+            Value::ptr(heap_ptr)
+        })
     }
 
     /// Get a constant string from a module's constant pool.
@@ -2978,7 +3165,10 @@ impl VM {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                 *ptr.add(bytes.len()) = 0;
             }
-            Value::ptr(ptr)
+            unsafe {
+                /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                Value::ptr(ptr)
+            }
         } else {
             Value::nil()
         }
@@ -3264,6 +3454,7 @@ impl VM {
     ///
     /// Returns `true` if the JIT executed a compiled region and advanced the
     /// PC — the caller should return `Ok(())` immediately.
+    #[cfg(feature = "native-codegen")]
     fn try_jit_execute(&mut self, frame_idx: usize) -> bool {
         let module_idx = self.frames[frame_idx].module_idx;
         let pc = self.frames[frame_idx].pc;
@@ -3327,7 +3518,7 @@ impl VM {
 
         if action != TieredAction::Interpret {
             for (i, bits) in regs.iter().enumerate() {
-                self.frames[frame_idx].regs[i] = Value::from_bits(*bits);
+                self.frames[frame_idx].regs[i] = unsafe { Value::from_bits(*bits) };
             }
 
             // A re-entrant callee raised a runtime error (e.g. step-limit
@@ -3368,6 +3559,11 @@ impl VM {
         false
     }
 
+    #[cfg(not(feature = "native-codegen"))]
+    fn try_jit_execute(&mut self, _frame_idx: usize) -> bool {
+        false
+    }
+
     /// Execute a single bytecode instruction.
     ///
     /// Execute the FFICall opcode — foreign function interface dispatch.
@@ -3401,6 +3597,16 @@ impl VM {
                 ),
                 span: Span::default(),
             });
+        }
+
+        // Actor authority is checked before parameter marshalling, dynamic
+        // library loading, symbol resolution, or the native call itself.
+        if !self
+            .actor_callbacks
+            .authorize_ffi(&def.library, &def.symbol)
+        {
+            self.frames[frame_idx].regs[dst as usize] = Value::nil();
+            return Ok(());
         }
 
         let params: Vec<CType> = def
@@ -3437,7 +3643,7 @@ impl VM {
                     msg: format!("FFI argument {} contains null byte: {}", i, e),
                     span: Span::default(),
                 })?;
-                args.push(Value::ptr(cstring.as_ptr() as *mut u8));
+                args.push(unsafe { /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */ Value::ptr(cstring.as_ptr() as *mut u8) });
                 cstrings.push(cstring);
             } else {
                 args.push(src);
@@ -3490,6 +3696,7 @@ impl VM {
     /// # Safety
     /// `regs` must point at the 256-entry register buffer of the compiled
     /// region that invoked this helper.
+    #[cfg(feature = "native-codegen")]
     pub(crate) fn jit_direct_call(
         &mut self,
         regs: *mut u64,
@@ -3533,7 +3740,7 @@ impl VM {
         for i in 0..argc {
             // SAFETY: `regs` points at the compiled region's 256-entry buffer.
             let bits = unsafe { *regs.add(i) };
-            frame.regs[i] = Value::from_bits(bits);
+            frame.regs[i] = unsafe { Value::from_bits(bits) };
         }
         frame.return_dst = dst.min(255) as u8;
         self.frames.push(frame);
@@ -4275,7 +4482,8 @@ impl VM {
             }
         }
         let result = if let Some(module) = self.modules.get(module_idx) {
-            self.actor_callbacks.spawn_actor(module, behavior_idx, init)
+            self.actor_callbacks
+                .spawn_actor(module, spawn_pc, behavior_idx, init)
         } else {
             Value::actor_ref(0)
         };
@@ -4356,7 +4564,10 @@ impl VM {
             }
         } else {
             match self.modules.get(module_idx) {
-                Some(module) => self.actor_callbacks.spawn_actor(module, behavior_idx, init),
+                Some(module) => {
+                    self.actor_callbacks
+                        .spawn_actor(module, spawn_pc, behavior_idx, init)
+                }
                 None => Value::actor_ref(0),
             }
         };
@@ -4420,7 +4631,10 @@ impl VM {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                 *ptr.add(bytes.len()) = 0;
             }
-            Value::ptr(ptr)
+            unsafe {
+                /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                Value::ptr(ptr)
+            }
         } else {
             Value::nil()
         };
@@ -4435,24 +4649,29 @@ impl VM {
         instr: Instruction,
     ) -> NuResult<()> {
         let mut input = String::new();
-        self.frames[frame_idx].regs[instr.op1 as usize] =
-            if std::io::stdin().read_line(&mut input).is_ok() {
-                let bytes = input.into_bytes();
-                if let Some(ptr) = self
-                    .actor_callbacks
-                    .alloc(bytes.len() + 1, HeapTypeTag::String)
-                {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-                        *ptr.add(bytes.len()) = 0;
-                    }
+        self.frames[frame_idx].regs[instr.op1 as usize] = if std::io::stdin()
+            .read_line(&mut input)
+            .is_ok()
+        {
+            let bytes = input.into_bytes();
+            if let Some(ptr) = self
+                .actor_callbacks
+                .alloc(bytes.len() + 1, HeapTypeTag::String)
+            {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+                    *ptr.add(bytes.len()) = 0;
+                }
+                unsafe {
+                    /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
                     Value::ptr(ptr)
-                } else {
-                    Value::nil()
                 }
             } else {
                 Value::nil()
-            };
+            }
+        } else {
+            Value::nil()
+        };
         Ok(())
     }
 
@@ -5177,18 +5396,22 @@ impl VM {
             OpCode::ArrAlloc => {
                 let len = frame.regs[instr.op1 as usize].as_int().unwrap_or(0) as usize;
                 let size = len.checked_mul(std::mem::size_of::<Value>()).unwrap_or(0);
-                frame.regs[instr.op2 as usize] =
-                    if let Some(ptr) = self.actor_callbacks.alloc(size, HeapTypeTag::Array) {
-                        unsafe {
-                            let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, len);
-                            for slot in slots.iter_mut() {
-                                *slot = Value::nil();
-                            }
+                frame.regs[instr.op2 as usize] = if let Some(ptr) =
+                    self.actor_callbacks.alloc(size, HeapTypeTag::Array)
+                {
+                    unsafe {
+                        let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, len);
+                        for slot in slots.iter_mut() {
+                            *slot = Value::nil();
                         }
+                    }
+                    unsafe {
+                        /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
                         Value::ptr(ptr)
-                    } else {
-                        Value::nil()
-                    };
+                    }
+                } else {
+                    Value::nil()
+                };
             }
             OpCode::ArrLoad => {
                 self.step_arrload(frame_idx, instr)?;
@@ -5223,7 +5446,10 @@ impl VM {
                             *slot = Value::nil();
                         }
                     }
-                    Value::ptr(ptr)
+                    unsafe {
+                        /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                        Value::ptr(ptr)
+                    }
                 } else {
                     Value::nil()
                 };
@@ -5242,18 +5468,22 @@ impl VM {
             OpCode::TupleMk => {
                 let count = instr.op1 as usize;
                 let size = count.checked_mul(std::mem::size_of::<Value>()).unwrap_or(0);
-                frame.regs[instr.op2 as usize] =
-                    if let Some(ptr) = self.actor_callbacks.alloc(size, HeapTypeTag::Tuple) {
-                        unsafe {
-                            let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, count);
-                            for slot in slots.iter_mut() {
-                                *slot = Value::nil();
-                            }
+                frame.regs[instr.op2 as usize] = if let Some(ptr) =
+                    self.actor_callbacks.alloc(size, HeapTypeTag::Tuple)
+                {
+                    unsafe {
+                        let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, count);
+                        for slot in slots.iter_mut() {
+                            *slot = Value::nil();
                         }
+                    }
+                    unsafe {
+                        /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
                         Value::ptr(ptr)
-                    } else {
-                        Value::nil()
-                    };
+                    }
+                } else {
+                    Value::nil()
+                };
             }
             OpCode::FieldS => {
                 self.step_fields(frame_idx, instr)?;
@@ -6592,6 +6822,7 @@ mod vm_tests {
     /// result. Guards the straight-line-region contract: compiled regions must
     /// not contain branches, because the VM advances pc by the full region
     /// length after a region runs.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_hot_loop_with_early_exit_branch() {
         let mut module = CodeModule::new("test_jit_early_exit");
@@ -6672,6 +6903,7 @@ mod vm_tests {
     /// back-edge, so `find_compilable_region` detects the loop and compiles
     /// it natively. Guards against silent regressions to interpreter-only
     /// arithmetic hot loops.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_source_hot_loop_tiers_up() {
         use crate::lexer::Lexer;
@@ -7399,6 +7631,7 @@ mod vm_tests {
     /// `constants_to_jit_bits` used to encode `Constant::String` as nil bits,
     /// so a hot loop loading a string constant produced nil once the region
     /// compiled, while the cold interpreter produced the string.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_hot_loop_string_constant_survives_tierup() {
         fn build_string_loop_module(limit: i64) -> CodeModule {
@@ -7471,6 +7704,7 @@ mod vm_tests {
     /// null/type/bounds checks and yield nil for out-of-bounds reads instead
     /// of dereferencing unchecked memory (a large offset used to read
     /// garbage or segfault after tier-up).
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_hot_oob_arrload_returns_nil() {
         fn build_oob_module(limit: i64) -> CodeModule {
@@ -7543,6 +7777,7 @@ mod vm_tests {
     /// Verify that a hot integer-arithmetic loop compiles through the
     /// type-directed (guard-stripped) path and produces the same result as
     /// the interpreter.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_typed_tiering_integer_loop() {
         let mut module = CodeModule::new("test_jit_typed_int_loop");
@@ -7993,6 +8228,7 @@ mod vm_tests {
     /// and panic in debug builds — 2^47 * 2^47 wraps to 0 once masked to
     /// 48 bits. The hot loop also exercises the `nulang_imul` JIT helper
     /// after tier-up.
+    #[cfg(feature = "native-codegen")]
     #[test]
     fn test_imul_boundary_value_wraps() {
         const BOUNDARY: i64 = 140737488355328; // 2^47
@@ -8204,7 +8440,14 @@ mod vm_tests {
             .actor_callbacks
             .alloc(std::mem::size_of::<Value>(), HeapTypeTag::Record)
             .expect("record allocation");
-        let result = run_scmpeq(&mut vm, Value::ptr(rec_ptr), hello);
+        let result = run_scmpeq(
+            &mut vm,
+            unsafe {
+                /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                Value::ptr(rec_ptr)
+            },
+            hello,
+        );
         assert_eq!(
             result.as_bool(),
             Some(false),
@@ -8233,7 +8476,10 @@ mod vm_tests {
             .actor_callbacks
             .alloc(2 * std::mem::size_of::<Value>(), HeapTypeTag::Array)
             .expect("array allocation");
-        let arr_value = Value::ptr(arr_ptr);
+        let arr_value = unsafe {
+            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+            Value::ptr(arr_ptr)
+        };
         // Write [int(42), string("hello")] into the array.
         unsafe {
             let slots = std::slice::from_raw_parts_mut(arr_ptr as *mut Value, 2);

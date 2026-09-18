@@ -1369,6 +1369,13 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
     let routes = vm.take_web_routes();
+    let src_root = root.join("src");
+    crate::web::dispatch::compile_runtime_routes(routes.clone(), &src_root).map_err(
+        |diagnostics| NuError::PackageError {
+            msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
+            span: Span::default(),
+        },
+    )?;
 
     eprintln!("  Rendering {} route(s)...", routes.len());
     for route in &routes {
@@ -1407,7 +1414,6 @@ fn cmd_build_web() -> NuResult<()> {
     ])?;
 
     // Generate deployment IR consumed by adapters and Nulang Cloud.
-    let src_root = root.join("src");
     let ir = crate::web::ir::generate_deployment_ir(
         &routes,
         Some(&signals_path),
@@ -1546,6 +1552,14 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
         span: Span::default(),
     })?;
     let routes = vm.take_web_routes();
+    let src_root = root.join("src");
+    let runtime_routes =
+        crate::web::dispatch::compile_runtime_routes(routes, &src_root).map_err(|diagnostics| {
+            NuError::PackageError {
+                msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
+                span: Span::default(),
+            }
+        })?;
 
     nulang_exe(&[
         "--emit-signals",
@@ -1553,7 +1567,7 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
         &entry_str,
     ])?;
 
-    if routes.is_empty() {
+    if runtime_routes.is_empty() {
         cmd_build_web()?;
         let output_dir = root.join(&manifest.web.output_dir);
         let addr = format!("127.0.0.1:{}", port);
@@ -1575,8 +1589,13 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
         }
         Ok(())
     } else {
-        let server = WebDevServer::bind(port, Some(static_dir), Some(output_dir.clone()), routes)
-            .map_err(|e| NuError::PackageError {
+        let server = WebDevServer::bind_runtime(
+            port,
+            Some(static_dir),
+            Some(output_dir.clone()),
+            runtime_routes,
+        )
+        .map_err(|e| NuError::PackageError {
             msg: format!("cannot bind dev server: {}", e),
             span: Span::default(),
         })?;

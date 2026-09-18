@@ -3034,6 +3034,17 @@ mod tests {
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_neg_heap_value_reports_type_error() {
+        let err = run_source("-(1 + 2,)").expect_err("heap tuple negation must fail");
+        assert!(
+            err.to_string()
+                .contains("type error: arithmetic `neg` requires numeric operands"),
+            "WASM must report the language type error instead of a provenance/trap error: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_array_index() {
         let value = run_source("let a = [10, 20, 30]; a[1]").expect("run");
         assert_eq!(value.as_int(), Some(20), "a[1] should be 20");

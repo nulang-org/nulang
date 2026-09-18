@@ -1081,15 +1081,20 @@ fn print_help() {
     println!("  --emit-stdlib-docs <dir>  Generate per-effect stdlib Markdown docs into <dir>");
     println!("  --lsp            Start Language Server (stdio)");
     println!("  --dap            Start Debug Adapter (stdio; program via launch request)");
-    print!("  --backend <b>    Backend: bytecode (default) | native | core-vm");
+    print!("  --backend <b>    Backend: bytecode (default) | core-vm");
+    if cfg!(feature = "native-codegen") {
+        print!(" | native");
+    }
     if cfg!(feature = "wasm-backend") {
         print!(" | wasm | wasm-run | wasm-aot");
     }
     println!();
     println!("                   core-vm: frozen Core interpreter (Stage 3 bootstrap)");
-    println!("                   native: pure-functional subset only (no effects,");
-    println!("                   actors, or FFI — errors name the unsupported");
-    println!("                   construct; use bytecode for full-language programs)");
+    if cfg!(feature = "native-codegen") {
+        println!("                   native: pure-functional subset only (no effects,");
+        println!("                   actors, or FFI — errors name the unsupported");
+        println!("                   construct; use bytecode for full-language programs)");
+    }
     if cfg!(feature = "wasm-backend") {
         println!("                   wasm*: IO.print/read only (no user-defined effect");
         println!("                   handlers, no actor mailbox)");
@@ -1098,7 +1103,11 @@ fn print_help() {
         println!("                   wasmfx*: suspending effects lower to WasmFX stack");
         println!("                   switching (LLM.ask, Signal.wait, ReceiveWait)");
     }
-    println!("  --target <t>     Target ISA for native backend: native (default) | ptx | riscv64");
+    if cfg!(feature = "native-codegen") {
+        println!(
+            "  --target <t>     Target ISA for native backend: native (default) | ptx | riscv64"
+        );
+    }
     if cfg!(feature = "wasm-backend") {
         println!("  --out <file>     Output file for WASM backends (default: out.wasm)");
     }
@@ -1872,6 +1881,7 @@ fn run_source(
             msg: "wasm backend not compiled in (enable 'wasm-backend' feature)".into(),
             span: Span::default(),
         }),
+        #[cfg(feature = "native-codegen")]
         "native" => {
             let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
             let mir = nulang::mir_lower::lower_module(&hir)?;
@@ -1960,7 +1970,11 @@ fn run_source(
             } else {
                 aot_module.run()?
             };
-            let result = nulang::vm::Value::from_raw(result_raw);
+            // SAFETY: result_raw was produced by Nulang-generated native/AOT code
+            // using the same in-process Value ABI. String payloads are materialized
+            // before the standalone AOT heap is torn down and are not dereferenced
+            // through this fallback Value afterwards.
+            let result = unsafe { nulang::vm::Value::from_raw(result_raw) };
             // Native runs materialize a string result before tearing down the
             // standalone heap (see `aot::take_aot_result_repr`); without it
             // the payload pointer dangles and string results print as raw
@@ -1972,6 +1986,11 @@ fn run_source(
             }
             Ok(())
         }
+        #[cfg(not(feature = "native-codegen"))]
+        "native" => Err(nulang::types::NuError::VMError {
+            msg: "native backend not compiled in (enable 'native-codegen' feature)".into(),
+            span: Span::default(),
+        }),
         "bytecode" => {
             // Bytecode backend (default).
             let m = compile_with_new_pipeline(&ast, "main", &type_checker)?;
@@ -2079,7 +2098,10 @@ fn run_source(
             let result_str = if let Some(s) = vm.resolve_display_string(value) {
                 s
             } else {
-                nulang::vm::Value::from_raw(value).to_string_repr()
+                // SAFETY: this raw result was returned by the in-process CoreVM ABI.
+                // resolve_display_string handled live pointer/string cases above;
+                // this fallback only formats non-dereferencing immediate/tag metadata.
+                unsafe { nulang::vm::Value::from_raw(value) }.to_string_repr()
             };
             if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
                 println!("{}", result_str);

@@ -155,9 +155,55 @@ pub trait WasmBackend: Send {
 #[cfg(feature = "wasm-backend")]
 pub struct DefaultWasmBackend;
 
+/// Enforce the semantic profile supported by the plain MIR→WASM backend.
+///
+/// The low-level emitter still contains defensive stubs for handler/resume MIR
+/// from its original MVP implementation. Those stubs return `nil`, which is
+/// not an acceptable interpretation of a resumable Nulang program. The public
+/// backend boundary therefore rejects those constructs before code generation.
+/// This keeps a restricted backend honest: unsupported syntax is a compile
+/// error rather than a different language.
+#[cfg(feature = "wasm-backend")]
+fn validate_default_wasm_semantics(module: &MirModule) -> NuResult<()> {
+    for function in module.functions.iter().chain(module.behaviors.iter()) {
+        for block in &function.blocks {
+            if matches!(&block.terminator, crate::mir::Terminator::Resume(_)) {
+                return Err(crate::types::NuError::VMError {
+                    msg: "WASM backend restricted profile: user-defined effect handlers and continuation resume are not supported; use the bytecode backend"
+                        .into(),
+                    span: crate::types::Span::default(),
+                });
+            }
+
+            for stmt in &block.stmts {
+                let unsupported = matches!(
+                    stmt,
+                    crate::mir::Stmt::EnterHandle { .. } | crate::mir::Stmt::PopHandler
+                ) || matches!(
+                    stmt,
+                    crate::mir::Stmt::Assign {
+                        op: crate::mir::RValue::Resume(..),
+                        ..
+                    }
+                );
+
+                if unsupported {
+                    return Err(crate::types::NuError::VMError {
+                        msg: "WASM backend restricted profile: user-defined effect handlers and continuation resume are not supported; use the bytecode backend"
+                            .into(),
+                        span: crate::types::Span::default(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "wasm-backend")]
 impl WasmBackend for DefaultWasmBackend {
     fn compile(&mut self, module: &MirModule, name: &str) -> NuResult<Vec<u8>> {
+        validate_default_wasm_semantics(module)?;
         crate::mir_wasm::WasmBackend::new().compile(module, name)
     }
 
@@ -537,13 +583,23 @@ impl CryptoProvider for DefaultCryptoProvider {
 // Factory functions — the only place concrete backend types are constructed
 // ---------------------------------------------------------------------------
 
-/// Create the default JIT backend (Cranelift via `JitSession`).
+/// Scheduler budget used by native-codegen safepoints.
 ///
-/// This is the **sole** call-site for `JitSession::new()` outside of tests.
-/// The VM calls this factory rather than importing `JitSession` directly,
-/// keeping the JIT implementation behind the `JitBackend` trait boundary.
+/// This lives outside `crate::jit` so interpreter-only runtimes can retain the
+/// actor bookkeeping fields without importing the Cranelift module tree.
+pub const JIT_SAFEPOINT_BUDGET: u64 = 1000;
+
+/// Create the default JIT backend when native code generation is compiled in.
+#[cfg(feature = "native-codegen")]
 pub fn create_default_jit() -> Option<Box<dyn JitBackend>> {
     crate::jit::JitSession::new().map(|j| Box::new(j) as Box<dyn JitBackend>)
+}
+
+/// Interpreter-only builds preserve the same VM trait boundary but have no
+/// native tier to instantiate.
+#[cfg(not(feature = "native-codegen"))]
+pub fn create_default_jit() -> Option<Box<dyn JitBackend>> {
+    None
 }
 #[cfg(test)]
 mod tests {
