@@ -721,6 +721,7 @@ impl MirCodegen {
             } else {
                 0
             },
+            sink_metadata_present: true,
             locals: func
                 .locals
                 .iter()
