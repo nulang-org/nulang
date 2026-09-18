@@ -651,6 +651,20 @@ impl MirCodegen {
         for (rel, line) in func_lines {
             self.module.line_table.push((function_start + rel, line));
         }
+        let mut cleanup_regs = Vec::new();
+        let mut cleanup_spills = Vec::new();
+        for id in &drop_plan.cleanup_owned {
+            if let Some(&slot) = self.spill_map.get(&id.0) {
+                cleanup_spills.push(slot as usize);
+            } else {
+                cleanup_regs.push(LOCAL_BASE as usize + id.0 as usize);
+            }
+        }
+        cleanup_regs.sort_unstable();
+        cleanup_regs.dedup();
+        cleanup_spills.sort_unstable();
+        cleanup_spills.dedup();
+
         self.module.debug_functions.push(DebugFunctionInfo {
             name: func.name.clone(),
             code_offset: function_start,
@@ -665,6 +679,8 @@ impl MirCodegen {
                 .iter()
                 .map(|l| (LOCAL_BASE as usize + l.id.0 as usize, l.name.clone()))
                 .collect(),
+            cleanup_regs,
+            cleanup_spills,
         });
 
         Ok(function_start)
@@ -2416,6 +2432,12 @@ struct DropPlan {
     block_entry: FxHashMap<usize, Vec<mir::LocalId>>,
     before_stmt: FxHashMap<(usize, usize), Vec<mir::LocalId>>,
     after_stmt: FxHashMap<(usize, usize), Vec<mir::LocalId>>,
+    /// Locals whose current value is always either nil/uninitialized or a
+    /// compiler-proven counted owner. This is broader than ordinary Drop
+    /// candidates: an owner returned from the function is intentionally not
+    /// dropped on success, but still belongs here so an aborted frame can
+    /// reclaim it before the return transfer happens.
+    cleanup_owned: Vec<mir::LocalId>,
 }
 
 /// Compute conservative `Drop` placements for one function; see the section
@@ -2494,8 +2516,17 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
     }
 
+    let cleanup_owner: Vec<bool> = (0..nlocals)
+        .map(|i| ptr_ty[i] && !excluded[i] && has_def[i] && defs_owning[i])
+        .collect();
+    plan.cleanup_owned = cleanup_owner
+        .iter()
+        .enumerate()
+        .filter_map(|(i, owns)| owns.then_some(func.locals[i].id))
+        .collect();
+
     let candidate: Vec<bool> = (0..nlocals)
-        .map(|i| ptr_ty[i] && !excluded[i] && has_def[i] && defs_owning[i] && no_copy_use[i])
+        .map(|i| cleanup_owner[i] && no_copy_use[i])
         .collect();
 
     // Escapees: locals defined by field/element loads from a candidate or
@@ -2812,6 +2843,28 @@ mod tests {
                 .get(&(0, dst_use_si))
                 .is_some_and(|ids| ids.contains(&dst)),
             "borrow created from source before transfer keeps moved destination alive"
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_cleanup_roots_include_owned_return() {
+        let array_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("owned_return", Some(array_ty.clone()));
+        let value = b.add_temp(array_ty);
+        b.assign(value, mir::RValue::ArrayLit(vec![]));
+        b.terminate(mir::Terminator::Return(Some(value)));
+        let f = b.build();
+
+        let plan = plan_drops(&f);
+        assert!(
+            plan.cleanup_owned.contains(&value),
+            "an owned value pending return must be reclaimable if the frame aborts"
+        );
+        assert!(
+            plan.before_stmt.values().all(|ids| !ids.contains(&value))
+                && plan.after_stmt.values().all(|ids| !ids.contains(&value))
+                && plan.block_entry.values().all(|ids| !ids.contains(&value)),
+            "successful return must still transfer ownership instead of dropping it"
         );
     }
 
