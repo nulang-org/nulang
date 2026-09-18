@@ -202,3 +202,89 @@ processing at the transport layer. It is not an application-level replica fsync
 acknowledgement and is not counted as quorum durability. The next layer must add
 application ACKs and a committed sequence/index before Fabric Streams can expose
 quorum-committed records.
+
+
+## Application ACKs and quorum commit
+
+Fabric Stream replication now separates three different events that must not be
+conflated:
+
+1. **transport dispatch** — the leader handed a replica packet to NUL0,
+2. **replica application ACK** — the follower validated placement and fsynced
+   the exact sequence,
+3. **quorum commit** — a majority of the configured replica set has application
+   ACKed the sequence.
+
+The leader counts its own durable local append as the first application ACK.
+For replication factor `N`, quorum is `floor(N / 2) + 1`.
+
+Followers return a reserved application-level ACK/NACK system message only
+after attempting exact-sequence durable application. NUL0's existing
+`Packet::Ack` remains transport-only and is never counted toward stream
+quorum.
+
+### Pending tickets
+
+`fabric_stream_replicated_append` creates a leader-local pending ticket with:
+
+- stream + partition + sequence,
+- leader and membership fingerprint,
+- allowed replica set,
+- majority quorum,
+- unique application ACK set,
+- unique rejection/NACK set.
+
+Duplicate follower ACKs are idempotent. A later positive ACK replaces an
+earlier rejection from the same replica. ACKs from nodes outside the replica
+set, ACKs for another leader, and ACKs from an obsolete membership fingerprint
+are rejected.
+
+A delayed ACK cannot commit a still-pending record after confirmed membership
+changes: the leader recomputes placement against the active `ClusterState`
+before accepting the ACK.
+
+### Contiguous commit index
+
+Quorum readiness is not enough to create a hole in committed history. The
+leader advances the committed boundary only through the longest contiguous
+prefix where every next sequence has quorum.
+
+The committed sequence is persisted in `commit.json` using the same atomic
+temp-file + fsync + rename discipline as cursors. It therefore survives leader
+restart independently from the in-memory pending tickets.
+
+`fabric_stream_read_committed` exposes only records at or below this durable
+boundary. The ordinary `fabric_stream_read` API remains a raw local-log read
+and can include uncommitted replica/leader tail records.
+
+### Restart model
+
+Pending replication tickets are currently in-memory only. If a leader restarts:
+
+- already committed history remains committed because `commit.json` is durable,
+- locally durable but uncommitted tail records remain in the raw log,
+- those uncommitted records are **not** promoted to committed automatically,
+- later catch-up/retry work must reconstruct or retry pending replication.
+
+This is fail-closed: restart cannot turn a locally durable write into a quorum
+commit by accident.
+
+### Follower visibility
+
+Followers durably store replica records before ACKing, but they do not yet
+receive a separate committed-index propagation message. Consequently, the
+authoritative committed boundary in this slice is leader-local.
+
+Commit-index replication / follower committed reads belong with the upcoming
+catch-up and failover protocol.
+
+### Runtime APIs
+
+- `fabric_stream_replicated_append`
+- `fabric_stream_replication_status`
+- `fabric_stream_committed_sequence`
+- `fabric_stream_read_committed`
+
+This ACK layer concerns **replica durability**, not consumer delivery. Consumer
+ACK/NACK, timed redelivery, dead-letter streams, and consumer groups remain
+separate future work.
