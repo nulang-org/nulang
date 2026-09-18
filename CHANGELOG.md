@@ -59,6 +59,18 @@ two major versions.*
   Deterministic tests cover positive-goodbye automatic RF3->RF2 failover and
   delayed peer removal followed by retry.
 
+### Fabric automatic failover reconciliation — 2026-09-18
+- **Bounded push/pull repair during confirmed-removal failover** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`). The automatic failover logical-clock
+  scheduler now inspects durable transition votes before retrying prepare: it
+  pushes a proposal-scoped suffix to lagging proposed replicas, pulls from an
+  ahead survivor when the deterministic candidate is behind, and starts a
+  strictly higher term after a pull changes the proposal-bound candidate tail.
+  Each retry performs at most one 256-record reconciliation action and retains
+  the existing 500ms -> 1s -> 2s exponential backoff capped at 30s.
+  Deterministic coverage verifies both candidate-ahead and candidate-behind
+  failover complete without manual repair API calls.
+
 ### Fabric epoch candidate reconciliation — 2026-09-18
 - **Proposal-scoped pull from an ahead surviving replica** (Experimental,
   `src/runtime/fabric_stream_epoch.rs`, `src/runtime/distributed.rs`).
