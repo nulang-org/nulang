@@ -7,6 +7,7 @@ pub mod broker;
 pub mod health;
 pub mod interruption;
 pub mod lease;
+pub mod locality;
 pub mod provider;
 pub mod providers;
 pub mod telemetry;
