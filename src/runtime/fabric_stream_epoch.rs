@@ -514,7 +514,6 @@ impl Runtime {
 
         let local_tail = self.fabric_stream_info(&batch.stream)?.last_sequence.unwrap_or(0);
         if batch.records.is_empty()
-            || batch.records[0].sequence != local_tail.saturating_add(1)
             || batch
                 .records
                 .last()
@@ -523,16 +522,43 @@ impl Runtime {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Fabric epoch repair batch is not the next candidate prefix",
+                "Fabric epoch repair batch exceeds the proposed candidate prefix",
             ));
         }
 
-        let mut expected = local_tail.saturating_add(1);
+        let mut batch_expected = batch.records[0].sequence;
         for record in &batch.records {
-            if record.sequence != expected {
+            if record.sequence != batch_expected {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Fabric epoch repair batch contains a sequence gap",
+                ));
+            }
+            batch_expected = batch_expected.saturating_add(1);
+        }
+
+        let mut expected_new = local_tail.saturating_add(1);
+        for record in &batch.records {
+            if record.sequence <= local_tail {
+                let existing = self
+                    .fabric_stream_read(&batch.stream, record.sequence, 1)?
+                    .into_iter()
+                    .next()
+                    .filter(|existing| existing.sequence == record.sequence);
+                match existing {
+                    Some(existing) if existing.payload == record.payload => continue,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Fabric epoch repair retry conflicts with local durable data",
+                        ));
+                    }
+                }
+            }
+            if record.sequence != expected_new {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric epoch repair does not begin at the next local sequence",
                 ));
             }
             self.fabric_stream_apply_transition_repair_record(
@@ -540,7 +566,7 @@ impl Runtime {
                 record.sequence,
                 &record.payload,
             )?;
-            expected = expected.saturating_add(1);
+            expected_new = expected_new.saturating_add(1);
         }
 
         self.fabric_stream_evaluate_epoch_prepare(
