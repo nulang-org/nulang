@@ -3318,6 +3318,19 @@ mod tests {
         };
         assert!(!packet_payload_wire_safe(&spawn));
 
+        let auth_spawn = Packet::SpawnRequestAuth {
+            request_id: 2,
+            behavior_name: "Counter".into(),
+            content_hash: None,
+            initial_state: vec![("name".into(), Value::string(1))],
+            bytecode: None,
+            authority: AuthorityManifest::from_tokens(["Secret::Read(KEY)"]).unwrap(),
+        };
+        assert!(
+            !packet_payload_wire_safe(&auth_spawn),
+            "authority-aware spawn must enforce the same payload safety as legacy spawn"
+        );
+
         assert!(packet_payload_wire_safe(&Packet::Heartbeat {
             node_id: NodeId(1),
             timestamp: 0,
