@@ -43,6 +43,9 @@ use std::time::{Duration, Instant};
 // Imports from sibling modules in the runtime
 // ---------------------------------------------------------------------------
 
+use super::fabric_stream_cluster::{
+    FabricStreamReplicaAppend, FABRIC_STREAM_REPLICA_BEHAVIOR,
+};
 use super::mailbox::{Message, MessagePriority};
 use super::network::{NetworkTransport, Packet};
 use super::{ClusterState, NodeId, NodeStatus};
@@ -1457,6 +1460,47 @@ pub fn process_network_packets(
                 // RFC 0014 §3: store the replica, do NOT instantiate it.
                 // The shadow re-spawns from it only on confirmed removal.
                 runtime.store_shadow_replica(actor_id, nbc_bytes, snapshot_json, epoch);
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_REPLICA_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric stream replica sender identity does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamReplicaAppend::from_wire_bytes(bytes)
+                            .and_then(|append| {
+                                if append.leader != incoming.from_node {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "Fabric stream replica envelope leader does not match transport peer",
+                                    ));
+                                }
+                                runtime.fabric_stream_apply_replica_from_cluster(&append, cluster)
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric stream replica system message must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected replica append from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                // This is only the existing transport-level receipt ACK. It
+                // deliberately does not mean the stream record reached quorum.
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             _ => {
