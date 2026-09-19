@@ -133,6 +133,17 @@ two major versions.*
   live-entry count exposes source-drain progress. INCR now advances the entry
   generation and reschedules its expiry reference so it participates correctly
   in transfer fencing without weakening TTL reclamation.
+- **Reactor-owned local slot transfer coordinator** (Experimental,
+  `src/runtime/cache_server.rs`). Each cache reactor has a bounded control
+  queue for migration-only export/import/finalize/count operations. The service
+  handle orchestrates source export -> target fenced import -> ACK -> source
+  generation-fenced finalize without sharing or locking `CacheStore` across
+  threads. Control work is batch-limited per Mio wake to avoid starving socket
+  and normal shard inbox work. Reports expose imported, replayed, conflicted,
+  stale-source, payload, cursor, and source-remaining counts. End-to-end tests
+  seed a key over RESP, migrate it between running local shards, observe `ASK`
+  and one-shot `ASKING` during transfer, commit ownership, then observe a
+  normal target read and `MOVED` from the old endpoint.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
