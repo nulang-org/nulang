@@ -45,6 +45,13 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Runtime actor schema identity preservation — 2026-09-18
+- **Module-spawned actors retain their canonical `ActorMeta.name` schema
+  identity** (`src/runtime/spawn.rs`) instead of discarding it in favor of
+  a synthetic `actor_<id>` label. Workflow and native/manual actor naming
+  semantics remain unchanged.
+- This gives later runtime ownership and durable-recovery checks a stable
+  nominal schema identity to validate against.
 ### Nominal actor behavior identity — 2026-09-18
 - **Compiler lowering now preserves statically known actor schema identity**
   through HIR/MIR dispatch resolution. Known receivers resolve only against
