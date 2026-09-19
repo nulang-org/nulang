@@ -375,11 +375,6 @@ impl CacheShardServer {
     fn handle_wake(&mut self) -> Result<(), CacheServerError> {
         self.inbox
             .drain(&mut self.store, self.config.max_inbox_batch);
-
-        let tokens: Vec<Token> = self.connections.keys().copied().collect();
-        for token in tokens {
-            self.drive_connection(token, false, false)?;
-        }
         Ok(())
     }
 
