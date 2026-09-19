@@ -3687,14 +3687,12 @@ mod tests {
         assert_eq!(expiry_source_pending.mutation_sequence, Some(5));
         assert!(expiry_source_pending.result.is_none());
         cluster.run_rounds(12);
-        let expiry_done = cluster
+        let settled_reap = cluster
             .node_mut(leader_index)
             .fabric_queue_reap_expired_replicated(source, 0, 3, 1_100)
             .unwrap();
-        assert_eq!(
-            expiry_done.result.expect("expiry terminalization must commit").status,
-            FabricQueueJobStatus::DeadLettered
-        );
+        assert_eq!(settled_reap.mutation_sequence, None);
+        assert_eq!(settled_reap.expired_sequence, None);
 
         for index in 0..3 {
             let source_info = cluster
