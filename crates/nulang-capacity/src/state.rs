@@ -132,7 +132,8 @@ impl CapacityHeartbeatBook {
         self.latest.get(provider_id).is_some_and(|heartbeat| {
             heartbeat.topology_generation == topology_generation
                 && heartbeat.status == CapacityProviderStatus::Ready
-                && now_unix_ms.saturating_sub(heartbeat.observed_at_unix_ms) <= max_age_ms
+                && heartbeat.observed_at_unix_ms <= now_unix_ms
+                && now_unix_ms - heartbeat.observed_at_unix_ms <= max_age_ms
         })
     }
 }
@@ -747,6 +748,17 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn future_heartbeat_does_not_count_as_fresh() {
+        let topology = topology();
+        let mut book = CapacityHeartbeatBook::default();
+        let mut future = heartbeat(1, CapacityProviderStatus::Ready, 0);
+        future.observed_at_unix_ms = 1_001;
+        book.apply(&topology, future).unwrap();
+
+        assert!(!book.is_schedulable("host-a", 9, 1_000, 50));
     }
 
     #[test]
