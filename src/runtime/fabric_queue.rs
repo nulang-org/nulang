@@ -2314,6 +2314,8 @@ mod tests {
                         sequence: delivery.sequence,
                         consumer: "worker".to_string(),
                         lease_token: delivery.lease_token,
+                        queue_epoch: 0,
+                        operation_id: None,
                     },
                 )
                 .unwrap();
