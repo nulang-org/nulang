@@ -45,6 +45,14 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Nominal actor behavior identity — 2026-09-18
+- **Compiler lowering now preserves statically known actor schema identity**
+  through HIR/MIR dispatch resolution. Known receivers resolve only against
+  the exact `Actor.behavior` identity instead of using the first matching
+  short-name suffix from another actor type.
+- **Dynamic local short-name dispatch is accepted only when unambiguous**;
+  unknown or multiply-defined behavior names fail closed before backend
+  lowering. Remote dispatch remains a runtime responsibility.
 ### Fail-closed actor behavior-name dispatch — 2026-09-18
 - **Unknown actor behavior names no longer alias behavior slot 0**
   (`src/runtime/mod.rs`, `src/runtime/distributed.rs`). Local sends/asks and
