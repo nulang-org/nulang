@@ -99,6 +99,14 @@ export interface NulangQueueRenewRequest extends NulangQueueLeaseRef {
   nowMs: number;
 }
 
+export interface NulangQueueRequeueRequest {
+  queue: string;
+  jobId: string;
+  expectedState: 'completed' | 'failed';
+  availableAtMs: number;
+  resetDeliveries: boolean;
+}
+
 export interface NulangQueueWaitSignal {
   member: string;
   score: number;
@@ -117,6 +125,7 @@ export interface NulangQueueClient {
   complete(request: NulangQueueCompleteRequest): Promise<void>;
   fail(request: NulangQueueFailRequest): Promise<void>;
   renew(request: NulangQueueRenewRequest): Promise<number>;
+  requeue(request: NulangQueueRequeueRequest): Promise<void>;
 
   delay(queue: string, jobId: string, availableAtMs: number): Promise<void>;
   retry(queue: string, jobId: string): Promise<void>;
