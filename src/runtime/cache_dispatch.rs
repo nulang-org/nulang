@@ -281,6 +281,10 @@ impl CacheDispatcher {
         self.local_shard
     }
 
+    pub fn shard_count(&self) -> u16 {
+        self.channels.shard_count()
+    }
+
     pub fn placement(&self) -> &CacheSlotMap {
         &self.placement
     }
