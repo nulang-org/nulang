@@ -2888,6 +2888,7 @@ mod tests {
             priority: 0,
             created_at_ms: 10,
             available_at_ms: 10,
+            max_attempts: None,
         };
         streams
             .append(
