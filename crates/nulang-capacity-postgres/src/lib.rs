@@ -24,7 +24,7 @@ WHERE provider_id = $1
 const UPDATE_PROVIDER_SQL: &str = r#"
 UPDATE nulang_capacity_provider_ledgers
 SET generation = $3,
-    snapshot = $4::jsonb,
+    snapshot = $4::text::jsonb,
     updated_at = NOW()
 WHERE provider_id = $1
   AND generation = $2
@@ -36,7 +36,7 @@ INSERT INTO nulang_capacity_provider_ledgers (
     generation,
     snapshot
 )
-VALUES ($1, $2, $3::jsonb)
+VALUES ($1, $2, $3::text::jsonb)
 ON CONFLICT (provider_id) DO NOTHING
 "#;
 
@@ -304,6 +304,12 @@ mod tests {
             encode_generation(u64::MAX),
             Err(PostgresCapacityError::GenerationTooLarge(u64::MAX))
         ));
+    }
+
+    #[test]
+    fn sql_binds_json_as_text_before_server_side_jsonb_cast() {
+        assert!(UPDATE_PROVIDER_SQL.contains("$4::text::jsonb"));
+        assert!(INSERT_PROVIDER_SQL.contains("$3::text::jsonb"));
     }
 
     #[test]
