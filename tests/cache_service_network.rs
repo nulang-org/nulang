@@ -380,3 +380,120 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
 }
+
+#[test]
+fn stale_remote_transfer_epoch_never_finalizes_source_key() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33501".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33502".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"stale-transfer-key";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let base = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53502))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, base.clone())
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53501))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut source_client = StdTcpStream::connect(service_a.local_addrs()[0]).unwrap();
+    source_client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    source_client
+        .write_all(&frame(&[b"SET", key, b"value"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
+
+    let mut migrating = base;
+    migrating
+        .begin_migration(1, slot, source, target)
+        .unwrap();
+    service_a.install_placement(migrating.clone()).unwrap();
+    service_b.install_placement(migrating.clone()).unwrap();
+    wait_epoch(&service_a, 1);
+    wait_epoch(&service_b, 1);
+
+    // Export and enqueue while both sides agree on epoch 1, but do not pump
+    // Runtime A yet, so the batch has not entered NUL0.
+    let pending = service_a
+        .send_remote_slot_batch(0, target, slot, None, 8, 9101)
+        .unwrap();
+    assert_eq!(pending.placement_epoch, 1);
+    assert_eq!(pending.batch.entries.len(), 1);
+
+    // B advances first. Its coordinator must reject the epoch-1 batch before
+    // the owning reactor can mutate storage.
+    let mut target_newer = migrating.clone();
+    target_newer.apply_epoch(2, &[]).unwrap();
+    service_b.install_placement(target_newer).unwrap();
+    wait_epoch(&service_b, 2);
+
+    let ack = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    let report = service_a
+        .complete_remote_slot_batch(&pending, &ack)
+        .unwrap();
+    assert_eq!(report.conflicts, 1);
+    assert_eq!(report.finalized_removed, 0);
+    assert_eq!(report.source_remaining, 1);
+    assert!(!report.source_drained());
+    assert!(report.restart_scan_required());
+
+    // Source still owns the only authoritative value.
+    source_client.write_all(&frame(&[b"GET", key])).unwrap();
+    let mut value = [0u8; 11];
+    source_client.read_exact(&mut value).unwrap();
+    assert_eq!(&value, b"$5\r\nvalue\r\n");
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
