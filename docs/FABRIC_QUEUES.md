@@ -376,9 +376,14 @@ Replicated worker acquisition is exposed through
   future ACK/NACK/renew operations can reject stale workers after either a
   lease turnover or queue ownership epoch change.
 
-Expired active leases are intentionally not reassigned yet. Lease expiry must
-itself become a replicated metadata mutation before another worker can acquire
-the job; local wall-clock expiry is not allowed to bypass quorum state.
+Expired active leases are transitioned by
+`fabric_queue_reap_expired_replicated`. Expiry is itself a replicated
+metadata mutation: the job remains Active until `LeaseExpired` reaches
+quorum, then becomes Waiting or terminal according to max-attempts/DLQ policy.
+A second worker therefore cannot receive an expired job until the expiry
+transition is committed. The reaper processes one deterministic due lease at a
+time and resumes an uncommitted expiry rather than appending a competing
+mutation.
 
 Replicated worker completion and lease maintenance are also quorum-gated:
 
@@ -434,12 +439,11 @@ The compatibility layers must preserve these invariants:
 
 ## Next implementation slice
 
-1. Replicate lease expiry/redelivery before a job can be reassigned.
-2. Add explicit replicated consumer-group ownership/concurrency limits on top of
+1. Add explicit replicated consumer-group ownership/concurrency limits on top of
    the serialized lease path.
-3. Implement atomic DLQ forwarding.
-4. Build the minimal BullMQ B1 backend against these APIs.
-5. Run BullMQ's adapter conformance suite and use failures to drive only the
+2. Implement atomic DLQ forwarding.
+3. Build the minimal BullMQ B1 backend against these APIs.
+4. Run BullMQ's adapter conformance suite and use failures to drive only the
    missing generally useful native queue semantics.
-6. Then build Core NATS wire compatibility; JetStream follows after replicated
+5. Then build Core NATS wire compatibility; JetStream follows after replicated
    consumer semantics are proven.
