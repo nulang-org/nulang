@@ -90,6 +90,19 @@ jobs:
       - name: Test (release)
         run: cargo test --release
 
+      - name: Stage release binary
+        run: |
+          mkdir -p ci-artifacts
+          cp /tmp/cargo-target/release/nulang ci-artifacts/nulang
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: nulang-release-${{ github.sha }}
+          path: ci-artifacts/nulang
+          if-no-files-found: error
+          retention-days: 1
+
 
   # -----------------------------------------------------------------------
   # Nula package-manager smoke test — scaffold a package and run `nula test`
@@ -107,17 +120,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-dev
+      - name: Download release binary
+        uses: actions/download-artifact@v8
+        with:
+          name: nulang-release-${{ github.sha }}
+          path: target/release
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build nulang (release)
-        run: cargo build --release --bin nulang
+      - name: Make release binary executable
+        run: chmod +x ./target/release/nulang
 
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
