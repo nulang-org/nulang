@@ -808,7 +808,8 @@ impl CodeModule {
         // after the function table ends. Verify the offset matches an entry.
         self.function_table
             .iter()
-            .position(|&off| off == info.code_offset)
+            .any(|&off| off == info.code_offset)
+            .then_some(info.code_offset)
     }
 
     pub fn add_behavior(&mut self, b: BehaviorTableEntry) -> usize {
