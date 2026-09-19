@@ -121,6 +121,18 @@ two major versions.*
   or atomic topology lookup. End-to-end coverage verifies a live source changes
   from `ASK` during migration to `MOVED` after the committed owner epoch
   without restarting the service.
+- **Generation-fenced slot key transfer primitives** (Experimental,
+  `src/runtime/cache.rs`). Migration control code can export a logical slot
+  in bounded cursor batches with remaining TTLs and opaque source
+  slot/generation tokens, import entries through a slot-scoped replay tracker,
+  and finalize the source copy only if the exported version is still current.
+  Concurrent source SET/INCR/EXPIRE operations therefore invalidate stale ACKs,
+  while target-side client mutation blocks replay of an older transfer.
+  Duplicate imports are idempotent without refreshing TTL, expired-in-transit
+  entries are not resurrected, wrong-slot payloads are rejected, and a cold
+  live-entry count exposes source-drain progress. INCR now advances the entry
+  generation and reschedules its expiry reference so it participates correctly
+  in transfer fencing without weakening TTL reclamation.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.

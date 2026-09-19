@@ -144,6 +144,36 @@ reads the mutex or shared topology object. Per-shard applied epochs remain
 observable so the control plane can detect incomplete convergence before
 advancing a migration phase.
 
+### Key transfer and fencing
+
+`CacheStore::export_slot_batch` scans a logical slot in bounded cursor batches
+and emits owned key/value payloads, remaining TTL, and an opaque source
+slot/generation token. The token is the source-side delete fence: after the
+target accepts a value, `finalize_transfer_entry` removes the source copy only
+when the key still occupies the same entry slot at the same generation. Any
+concurrent SET, INCR, or EXPIRE invalidates the token and forces a reconciliation
+pass rather than deleting newer state.
+
+The importing side uses a slot-scoped `CacheTransferImportTracker`. It records
+the target entry token created by each accepted source version. Replaying the
+same source transfer is idempotent and does not refresh TTL. A newer source
+version may replace the prior import only while the target entry is still the
+exact version installed by that migration session; if an ASKING-routed client
+has mutated or deleted the target key, the old transfer is rejected as a
+conflict instead of overwriting client state. Transfers for another logical
+slot fail closed.
+
+Relative TTL is carried as remaining milliseconds at export. An importer can
+subtract measured transfer elapsed time, and a key whose TTL is exhausted in
+transit is not resurrected. This does not claim globally synchronized clocks.
+The migration controller can use `live_entries_in_slot` plus stale-finalize
+results to decide when another source scan is required and when the source is
+fully drained.
+
+These are storage/control primitives, not yet a network protocol. A follow-up
+must drive export -> import -> ACK -> fenced finalize on the owning reactor
+threads and over the cache cluster transport for remote owners.
+
 The same cluster layer serves topology discovery without touching CacheStore:
 `CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
 topology response, and legacy `CLUSTER SLOTS` is retained for older clients.
@@ -209,13 +239,13 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add explicit key-transfer primitives and migration progress accounting so
-   ASK/ASKING can drive an end-to-end live slot move rather than only routing
-   an externally transferred key set.
-2. Add a separate transparent proxy endpoint only for non-cluster clients;
+1. Drive export -> import -> ACK -> fenced finalize through reactor-owned
+   migration control messages, then carry the same protocol over the cache
+   cluster transport for remote owners.
+2. Connect remote transparent command handoffs to that cache-specific cluster
+   transport and reject stale carried placement epochs on receipt.
+3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
-3. Connect remote transparent handoffs to a cache-specific cluster transport
-   and reject stale carried placement epochs on receipt.
 4. Allow topology publication to add/remove advertised remote endpoints without
    restarting local reactors.
 5. Promote expiration to a hierarchical timing wheel, then add packed
