@@ -2609,7 +2609,15 @@ mod tests {
         // different acquire cannot race the in-flight metadata mutation.
         let pending_lease = cluster
             .node_mut(leader_index)
-            .fabric_queue_acquire_replicated("orders", "worker-a", "acquire-1", 0, 3, 200)
+            .fabric_queue_acquire_replicated_with_lease_duration(
+                "orders",
+                "worker-a",
+                "acquire-1",
+                5_000,
+                0,
+                3,
+                200,
+            )
             .unwrap();
         assert_eq!(pending_lease.mutation_sequence, Some(2));
         assert!(pending_lease.delivery.is_none());
@@ -2617,11 +2625,33 @@ mod tests {
 
         let retry_lease = cluster
             .node_mut(leader_index)
-            .fabric_queue_acquire_replicated("orders", "worker-a", "acquire-1", 0, 3, 200)
+            .fabric_queue_acquire_replicated_with_lease_duration(
+                "orders",
+                "worker-a",
+                "acquire-1",
+                5_000,
+                0,
+                3,
+                200,
+            )
             .unwrap();
         assert_eq!(retry_lease.mutation_sequence, Some(2));
         assert!(retry_lease.resumed);
         assert!(retry_lease.delivery.is_none());
+
+        let changed_duration = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated_with_lease_duration(
+                "orders",
+                "worker-a",
+                "acquire-1",
+                6_000,
+                0,
+                3,
+                200,
+            )
+            .unwrap_err();
+        assert_eq!(changed_duration.kind(), io::ErrorKind::InvalidData);
 
         let competing = cluster
             .node_mut(leader_index)
@@ -2632,7 +2662,15 @@ mod tests {
         cluster.run_rounds(12);
         let committed_lease = cluster
             .node_mut(leader_index)
-            .fabric_queue_acquire_replicated("orders", "worker-a", "acquire-1", 0, 3, 200)
+            .fabric_queue_acquire_replicated_with_lease_duration(
+                "orders",
+                "worker-a",
+                "acquire-1",
+                5_000,
+                0,
+                3,
+                200,
+            )
             .unwrap();
         assert!(committed_lease.resumed);
         assert!(committed_lease.replication.unwrap().committed);
@@ -2646,6 +2684,7 @@ mod tests {
         assert_eq!(delivery.payload, b"payload");
         assert_eq!(delivery.deliveries, 1);
         assert_eq!(delivery.lease_token, 1);
+        assert_eq!(delivery.lease_until_ms, 5_200);
 
         for index in 0..3 {
             assert_eq!(
