@@ -12,6 +12,7 @@ use tracing::warn;
 
 mod actor;
 pub mod cache;
+pub mod cache_cluster;
 pub mod cache_dispatch;
 pub mod cache_pipeline;
 pub mod cache_routing;
@@ -86,6 +87,7 @@ mod tests;
 
 pub use actor::*;
 pub use cache::*;
+pub use cache_cluster::*;
 pub use cache_dispatch::*;
 pub use cache_pipeline::*;
 pub use cache_routing::*;
