@@ -10,6 +10,7 @@ import type {
   NulangQueueFailRequest,
   NulangQueueJob,
   NulangQueueRenewRequest,
+  NulangQueueRequeueRequest,
   NulangQueueState,
   NulangQueueWaitSignal,
 } from './client.js';
@@ -267,6 +268,44 @@ export class NulangHttpQueueClient implements NulangQueueClient {
       `renew ${request.queue}/${request.jobId}`,
     );
     return result.leaseUntilMs!;
+  }
+
+  async requeue(request: NulangQueueRequeueRequest): Promise<void> {
+    await this.ensureQueue(request.queue);
+    const operationId = `bull:requeue:${createHash('sha256')
+      .update(
+        [
+          request.queue,
+          request.jobId,
+          request.expectedState,
+          String(request.availableAtMs),
+          String(request.resetDeliveries),
+        ].join('\0'),
+      )
+      .digest('base64url')}`;
+
+    await this.retryUntil(
+      () =>
+        this.call<{
+          mutationSequence: number | null;
+          committed: boolean;
+          sequence: number | null;
+          updated: boolean;
+          resumed: boolean;
+        }>({
+          op: 'requeue',
+          queue: request.queue,
+          job_id: request.jobId,
+          operation_id: operationId,
+          expected_status: request.expectedState,
+          available_at_ms: Math.max(0, Math.trunc(request.availableAtMs)),
+          reset_deliveries: request.resetDeliveries,
+          partition: this.partition,
+          replication_factor: this.replicationFactor,
+        }),
+      value => value.committed && value.updated,
+      `requeue ${request.queue}/${request.jobId}`,
+    );
   }
 
   async delay(
