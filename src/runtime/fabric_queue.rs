@@ -199,6 +199,12 @@ pub struct FabricQueueJobInfo {
     pub result: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricQueueReadySignal {
+    pub ready: bool,
+    pub next_available_at_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct QueueEnvelope {
     pub(crate) name: String,
@@ -2218,6 +2224,44 @@ impl Runtime {
             name: group.to_string(),
             max_concurrency: config.max_concurrency,
             active,
+        })
+    }
+
+    pub fn fabric_queue_ready_replicated(
+        &mut self,
+        queue: &str,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReadySignal> {
+        if !self.fabric_queue_has_replication_policy(queue)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Fabric queue {queue:?} does not have a replication policy"),
+            ));
+        }
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        let mut ready = false;
+        let mut next_available_at_ms: Option<u64> = None;
+        for job in state.jobs.values() {
+            if job.status != FabricQueueJobStatus::Waiting
+                || job.deliveries >= effective_max_attempts(&state, job)
+            {
+                continue;
+            }
+            if job.available_at_ms <= now_ms {
+                ready = true;
+                next_available_at_ms = None;
+                break;
+            }
+            next_available_at_ms = Some(
+                next_available_at_ms
+                    .map(|current| current.min(job.available_at_ms))
+                    .unwrap_or(job.available_at_ms),
+            );
+        }
+        Ok(FabricQueueReadySignal {
+            ready,
+            next_available_at_ms,
         })
     }
 
