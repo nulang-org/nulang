@@ -161,6 +161,22 @@ two major versions.*
   placement epochs fail closed with TRYAGAIN/conflict, preserving the source
   value. Deterministic two-node tests cover command round trips, full
   ASK/ASKING migration and commit, and stale-transfer rejection.
+- **Bounded retry/correlation and duplicate suppression for remote cache work**
+  (Experimental, `src/runtime/cache_server.rs`). Outbound command requests and
+  transfer batches are tracked in a bounded pending map and retried with
+  10ms exponential backoff capped at 250ms for six attempts. Matching
+  application responses remove pending work only after the event is admitted
+  to the service queue; bridge backpressure therefore does not silently cancel
+  recovery. Exhausted commands emit an explicit timeout whose execution outcome
+  is unknown instead of fabricating a RESP failure, while exhausted transfers
+  never finalize their source copies. Targets retain up to 4,096 authenticated
+  request/transfer replay records for a 120-second safety window, fingerprinted
+  with BLAKE3. Identical retries replay the original application response/ACK
+  without re-executing INCR or re-importing a transfer; reuse of an id with a
+  different payload is rejected. If the protected replay table is saturated,
+  new operations fail closed rather than evicting still-retryable records.
+  Deterministic partition tests cover automatic recovery, terminal timeout, and
+  preservation of migration source data until a matching application ACK.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
