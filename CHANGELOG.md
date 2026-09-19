@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Live capacity heartbeat and allocation ledger — 2026-09-19
+- **Fail-closed liveness gating and reservation accounting** (Experimental, `crates/nulang-capacity/src/state.rs`). Adds topology-bound monotonic provider heartbeats, `ready`/`draining`/`unavailable` scheduling state, heartbeat freshness checks, generation-fenced idempotent resource allocations, expiry/release semantics, aggregate runtime-vs-ledger drift evidence, and an atomic compare-and-swap persistence boundary for hosted control-plane implementations. Heartbeat-observed usage never silently replaces durable reservations.
+
 ### Cloud resource-provider topology — 2026-09-19
 - **Provider-neutral topology and allocation candidates** (Experimental, `crates/nulang-capacity/src/topology.rs`). Adds hierarchical resource providers with integer inventories, required/forbidden traits, generation-tagged topology snapshots, and explicit host/rack/zone/region/provider failure domains. Hard candidate generation is kept separate from existing economic scoring, and stable rendezvous-style ordering can fail closed while spreading replicas across distinct failure domains without a central per-object placement table.
 
