@@ -80,11 +80,15 @@ A native/AOT backend (`--backend native`) compiles via Cranelift ahead-of-time.
 Other verified divergences from the target design of Layers 2–4, to keep in
 mind while reading §3–§5:
 
-- **Mailboxes are unbounded**, backed by `crossbeam::queue::SegQueue`
-  (`src/runtime/mailbox.rs`); push always succeeds — there is no 10,000-slot
-  ring buffer, no overflow policy, and no transport-level backpressure.
-  Messages carry a `MessagePriority` (`System`/`Normal`/`Bulk`) field, but the
-  queue itself is a single FIFO.
+- **Mailboxes support an optional capacity but most production spawn/recovery
+  paths currently pass `0` (unbounded)** (`src/runtime/mailbox.rs`,
+  `src/runtime/actor.rs`). Bounded mailboxes use an atomic CAS reservation so
+  concurrent `Normal`/`Bulk` producers cannot overfill the configured
+  capacity; a full bounded mailbox rejects admission as backpressure. `System`
+  messages bypass the limit so supervision/monitor signals are not starved.
+  The mailbox has separate system, scheduler-local, and normal lanes plus
+  selective-receive staging buffers. Actor-configurable overflow policies and
+  transport-level backpressure remain open work (#456).
 - **Actor identity is a bare `u64`** from a global atomic counter
   (`fresh_actor_id`, `src/runtime/mod.rs`); `spawn` is explicit — there is no
   Orleans-style string identity, no activation-on-first-message, and no
