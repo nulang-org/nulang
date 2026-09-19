@@ -19,8 +19,7 @@ use super::fabric_queue::{
     decode_queue_operation, encode_queue_created_mutation, encode_queue_envelope,
     queue_mutation_stream_name, queue_stream_name, validate_consumer_name, validate_operation_id,
     validate_queue_name, FabricQueueAddOptions, FabricQueueConfig, FabricQueueDelivery,
-    FabricQueueJobStatus, FabricQueueNackResult, FabricQueueOperation,
-    FabricQueueOperationKind,
+    FabricQueueNackResult, FabricQueueOperation, FabricQueueOperationKind,
 };
 use super::fabric_stream::{
     FabricStreamReplicationPolicy, FABRIC_STREAM_INITIAL_EPOCH,
@@ -1687,6 +1686,7 @@ mod tests {
     #[test]
     fn replicated_queue_creation_is_policy_gated_retry_safe_and_quorum_committed() {
         use crate::runtime::cluster_dst::DeterministicCluster;
+        use crate::runtime::FabricQueueJobStatus;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         let addrs = [
@@ -1771,6 +1771,12 @@ mod tests {
             .unwrap();
         assert!(created.created);
         assert!(created.replication.unwrap().committed);
+        let queue_epoch = cluster
+            .node_mut(leader_index)
+            .fabric_queue_replication_placement("orders")
+            .unwrap()
+            .expect("queue policy must be installed")
+            .epoch;
 
         let add_options = FabricQueueAddOptions {
             job_id: Some("job-1".to_string()),
@@ -1890,7 +1896,7 @@ mod tests {
         assert!(committed_lease.replication.unwrap().committed);
         let delivery = committed_lease.delivery.expect("lease must be visible after quorum");
         assert_eq!(delivery.sequence, 1);
-        assert_eq!(delivery.queue_epoch, placement.epoch);
+        assert_eq!(delivery.queue_epoch, queue_epoch);
         assert_eq!(delivery.job_id, "job-1");
         assert_eq!(delivery.name, "render");
         assert_eq!(delivery.payload, b"payload");
