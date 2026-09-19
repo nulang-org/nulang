@@ -1238,7 +1238,9 @@ impl Runtime {
         self.fabric_queue_require_committed_creation(queue)?;
         let placement = self
             .fabric_queue_replication_placement(queue)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing")
+            })?;
         let mutation_stream = queue_mutation_stream_name(queue);
         let info = self.fabric_stream_info(&mutation_stream)?;
         let tail = info.last_sequence.unwrap_or(0);
@@ -1324,8 +1326,7 @@ impl Runtime {
             });
         }
 
-        let Some(plan) =
-            self.fabric_queue_plan_committed_expiry(queue, placement.epoch, now_ms)?
+        let Some(plan) = self.fabric_queue_plan_committed_expiry(queue, placement.epoch, now_ms)?
         else {
             return Ok(FabricQueueReplicatedReapResult {
                 policy,
