@@ -253,14 +253,24 @@ enum CrossShardMsg {
     },
 }
 
-/// Admission result for a local-process actor delivery.
+/// Admission result for a same-process actor delivery.
 ///
-/// Fabric uses this to distinguish successful mailbox/channel admission from
-/// bounded-capacity backpressure without changing the public actor-send API.
+/// This is intentionally narrower than end-to-end distributed delivery:
+/// `Accepted` means the destination mailbox (same shard) or bounded
+/// cross-shard channel accepted the message. A later destination-mailbox
+/// rejection after cross-shard forwarding is still owned by the receiving
+/// shard. Cross-node transport has its own acknowledgement semantics.
+///
+/// Callers that need explicit backpressure should use
+/// [`Runtime::try_admit_local_message_by_id`] instead of the fire-and-forget
+/// actor-send API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MessageAdmission {
+pub enum MessageAdmission {
+    /// The local mailbox or cross-shard channel accepted the message.
     Accepted,
+    /// A bounded mailbox or bounded cross-shard channel was full.
     Backpressured,
+    /// The local-process delivery could not be attempted or completed.
     Rejected,
 }
 
@@ -2058,13 +2068,17 @@ impl Runtime {
         }
     }
 
-    /// Admit one Fabric delivery to an actor owned by this runtime process.
+    /// Try to admit one actor message within this runtime process and return
+    /// an explicit admission result instead of discarding backpressure.
     ///
-    /// Same-shard targets report bounded mailbox admission directly.
-    /// Cross-shard targets report admission to the bounded shard channel; the
-    /// destination mailbox may still apply its own capacity when that channel
-    /// is drained.
-    pub(crate) fn fabric_admit_local(
+    /// Same-shard targets report destination-mailbox admission. Cross-shard
+    /// targets report admission to the bounded shard channel; the receiving
+    /// shard may still reject the message later if the destination mailbox
+    /// fills before the channel is drained.
+    ///
+    /// This method deliberately does not route remote-node actor references or
+    /// migrated actors. Use the distributed send APIs for cross-node delivery.
+    pub fn try_admit_local_message_by_id(
         &mut self,
         target_id: u64,
         behavior_id: u16,
@@ -2084,6 +2098,19 @@ impl Runtime {
             }
         }
         self.deliver_local_message(target_id, behavior_id, args, out_trace)
+    }
+
+    /// Admit one Fabric delivery to an actor owned by this runtime process.
+    ///
+    /// Fabric uses the same typed local-process admission contract as other
+    /// callers instead of maintaining a parallel backpressure path.
+    pub(crate) fn fabric_admit_local(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+    ) -> MessageAdmission {
+        self.try_admit_local_message_by_id(target_id, behavior_id, args)
     }
 
     /// Send a message to a virtual actor (grain) identified by its stable
@@ -6115,11 +6142,13 @@ impl Runtime {
             .unwrap_or_default();
         let dlq = self.dlq_depth();
         let mailboxes: Vec<ActorMailboxMetric> = self
-            .mailbox_depths()
-            .into_iter()
-            .map(|(id, depth)| ActorMailboxMetric {
-                actor_id: id,
-                depth,
+            .actors
+            .iter()
+            .map(|(id, actor)| ActorMailboxMetric {
+                actor_id: *id,
+                depth: actor.mailbox.len(),
+                capacity: actor.mailbox.capacity(),
+                rejected: actor.mailbox.rejected_count(),
             })
             .collect();
 
@@ -6580,11 +6609,15 @@ pub struct MetricsSnapshot {
     pub crdt: CrdtMetric,
 }
 
-/// Per-actor mailbox depth for the metrics snapshot.
+/// Per-actor mailbox occupancy for the metrics snapshot.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ActorMailboxMetric {
     pub actor_id: u64,
     pub depth: usize,
+    /// Configured logical-message capacity. `0` means unbounded.
+    pub capacity: usize,
+    /// Cumulative bounded Normal/Bulk admissions rejected at capacity.
+    pub rejected: usize,
 }
 
 /// One supervisor in the topology snapshot.

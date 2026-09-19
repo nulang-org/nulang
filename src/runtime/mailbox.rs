@@ -66,6 +66,8 @@ pub struct Mailbox {
     local_queue: VecDeque<Message>,
     capacity: usize,
     queued_count: AtomicUsize,
+    /// Total bounded Normal/Bulk admissions rejected because capacity was full.
+    rejected_count: AtomicUsize,
     /// System messages already observed by a selective receive. They remain
     /// logically queued until a successful pattern+guard commits exactly one.
     system_skip_buffer: VecDeque<(Message, bool)>,
@@ -92,6 +94,7 @@ impl Mailbox {
             local_queue: VecDeque::new(),
             capacity,
             queued_count: AtomicUsize::new(0),
+            rejected_count: AtomicUsize::new(0),
             system_skip_buffer: VecDeque::new(),
             local_skip_buffer: VecDeque::new(),
             skip_buffer: VecDeque::new(),
@@ -113,6 +116,7 @@ impl Mailbox {
         let mut current = self.queued_count.load(Ordering::Acquire);
         loop {
             if current >= self.capacity {
+                self.rejected_count.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             match self.queued_count.compare_exchange_weak(
@@ -292,6 +296,11 @@ impl Mailbox {
         self.capacity
     }
 
+    /// Total bounded Normal/Bulk admissions rejected because the mailbox was full.
+    pub fn rejected_count(&self) -> usize {
+        self.rejected_count.load(Ordering::Relaxed)
+    }
+
     fn clear_tried_flags(&mut self) {
         for (_, tried) in self.system_skip_buffer.iter_mut() {
             *tried = false;
@@ -394,6 +403,7 @@ mod tests {
         let accepted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(accepted, 100);
         assert_eq!(mb.len(), 100);
+        assert_eq!(mb.rejected_count(), 700);
     }
 
     #[test]
