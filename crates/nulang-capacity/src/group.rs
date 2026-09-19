@@ -16,7 +16,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "strategy", content = "failure_domain")]
+#[serde(
+    rename_all = "snake_case",
+    tag = "strategy",
+    content = "failure_domain"
+)]
 pub enum PlacementGroupStrategy {
     Pack,
     Spread(FailureDomain),
@@ -206,16 +210,13 @@ fn reserve(
 ) -> Result<(), PlacementGroupError> {
     let provider_usage = usage.entry(provider.id.clone()).or_default();
     for (resource, amount) in &request.resources {
-        let current = provider_usage
-            .allocated
-            .get(resource)
-            .copied()
-            .unwrap_or(0);
-        let next = current
-            .checked_add(*amount)
-            .ok_or_else(|| PlacementGroupError::UsageOverflow {
-                provider: provider.id.clone(),
-            })?;
+        let current = provider_usage.allocated.get(resource).copied().unwrap_or(0);
+        let next =
+            current
+                .checked_add(*amount)
+                .ok_or_else(|| PlacementGroupError::UsageOverflow {
+                    provider: provider.id.clone(),
+                })?;
         provider_usage.allocated.insert(resource.clone(), next);
     }
     Ok(())
@@ -360,13 +361,10 @@ fn plan_pack(
             .map(|candidate| candidate.provider)
             .min_by_key(|provider| {
                 (
-                    std::cmp::Reverse(
-                        provider_counts
-                            .get(&provider.id)
-                            .copied()
-                            .unwrap_or(0),
-                    ),
-                    rank.get(provider.id.as_str()).copied().unwrap_or(usize::MAX),
+                    std::cmp::Reverse(provider_counts.get(&provider.id).copied().unwrap_or(0)),
+                    rank.get(provider.id.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX),
                 )
             })
             .expect("non-empty candidates");
@@ -384,7 +382,6 @@ fn plan_pack(
     assignments.sort_by(|left, right| left.bundle_id.cmp(&right.bundle_id));
     Ok(assignments)
 }
-
 
 struct StrictSpreadOptions<'a> {
     bundle: &'a PlacementBundle,
@@ -438,10 +435,7 @@ fn plan_strict_spread<'a>(
             }
         }
 
-        all_options.push(StrictSpreadOptions {
-            bundle,
-            options,
-        });
+        all_options.push(StrictSpreadOptions { bundle, options });
     }
 
     all_options.sort_by(|left, right| {
@@ -579,11 +573,10 @@ fn plan_spread(
                     .expect("filtered candidate has failure domain");
                 (
                     domain_counts.get(value).copied().unwrap_or(0),
-                    provider_counts
-                        .get(&provider.id)
+                    provider_counts.get(&provider.id).copied().unwrap_or(0),
+                    rank.get(provider.id.as_str())
                         .copied()
-                        .unwrap_or(0),
-                    rank.get(provider.id.as_str()).copied().unwrap_or(usize::MAX),
+                        .unwrap_or(usize::MAX),
                 )
             });
 
@@ -689,7 +682,10 @@ mod tests {
         }
     }
 
-    fn request(strategy: PlacementGroupStrategy, bundles: Vec<PlacementBundle>) -> PlacementGroupRequest {
+    fn request(
+        strategy: PlacementGroupStrategy,
+        bundles: Vec<PlacementBundle>,
+    ) -> PlacementGroupRequest {
         PlacementGroupRequest {
             group_id: "group-1".into(),
             placement_key: "deployment:vision-team".into(),
@@ -829,11 +825,7 @@ mod tests {
             &heartbeats(&topology),
             &request(
                 PlacementGroupStrategy::Pack,
-                vec![
-                    bundle("a", 2_000),
-                    bundle("b", 2_000),
-                    bundle("c", 2_000),
-                ],
+                vec![bundle("a", 2_000), bundle("b", 2_000), bundle("c", 2_000)],
             ),
             1_000,
             100,
