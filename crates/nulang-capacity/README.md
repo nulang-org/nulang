@@ -22,6 +22,7 @@ This crate is deliberately separated from the Nulang language/runtime and from c
 14. **Replica placement is deterministic and topology-aware.** A stable placement key can spread replicas across explicit failure domains without maintaining a central per-object placement table.
 15. **Heartbeats gate schedulability; they do not own reservations.** A fresh `Ready` heartbeat is required for live placement, while runtime-observed usage is reconciliation evidence only.
 16. **The allocation ledger is authoritative for promised capacity.** Allocation IDs are idempotent, per-provider generations avoid a fleet-wide lock, and durable implementations use atomic provider-scoped compare-and-swap to prevent scheduler replicas from overcommitting the same resource provider.
+17. **Placement groups coordinate bundles against concrete topology.** `PACK`/`SPREAD` are deterministic preferences; `STRICT_PACK` and `STRICT_SPREAD` are fail-closed guarantees. Group planning uses provisional reservations so one plan cannot overcommit a provider before durable CAS.
 
 ## Current scope
 
@@ -47,6 +48,8 @@ Implemented:
 - topology-bound monotonic capacity heartbeats with `ready` / `draining` / `unavailable` states and freshness gating
 - serializable allocation-ledger state with idempotent commits/releases, release/expiry tombstones that prevent delayed-retry resurrection, per-provider generation fencing, and a provider-neutral provider-scoped durable CAS store boundary
 - aggregate heartbeat-vs-ledger usage drift detection for reconciliation without letting observed runtime state silently rewrite reservations
+- topology-aware `PACK`, `SPREAD`, `STRICT_PACK`, and `STRICT_SPREAD` placement groups for coordinated actor/worker bundles
+- deterministic strict-spread matching across host, rack, zone, region, or provider failure domains
 - tests covering Spot economics, long-running interruption risk, egress, GPU/trust constraints, critical workload policy, cross-provider ranking, stale snapshots, provider health, interruption transitions, telemetry, and lease idempotency
 
 ## Adapter architecture
@@ -60,7 +63,6 @@ The capacity core must remain usable without any provider SDK dependency.
 - derive static node topology/traits from runtime registration metadata while reporting dynamic inventory/usage through a separate capacity heartbeat; do not bloat membership/failure-detection gossip
 - implement a production `AllocationLedgerStore` in the hosted control-plane datastore and exercise concurrent scheduler replicas against it
 - add nested request groups for host + GPU/NVMe/NIC child-resource allocation
-- add PACK/SPREAD placement groups for actor teams once concrete host topology is populated
 - add reconciliation/rebalancing loops with bounded recovery QoS so repair cannot starve foreground workloads
 - production AWS/GCP/Nebius API source and leasing clients in the Nulang Cloud control plane
 - persistent rolling telemetry keyed by provider/region/offer
