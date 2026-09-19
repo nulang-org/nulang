@@ -430,6 +430,29 @@ concurrency domains over one work queue:
 Ungrouped workers continue to use `fabric_queue_acquire_replicated`; grouped
 and ungrouped workers still compete for the same underlying jobs.
 
+Replicated dead-letter forwarding uses a crash-safe target-first handoff rather
+than claiming a cross-queue transaction:
+
+- the source queue's configured DLQ target must be explicitly prepared with
+  `fabric_queue_prepare_dead_letter_target_replicated`,
+- that target is installed with the source queue's exact epoch, leader, replica
+  set, partition, and membership fingerprint,
+- exhausted NACK and lease-expiry paths refuse to mark the source
+  `DeadLettered` unless the handoff path is used,
+- the destination payload is replicated first using deterministic job id
+  `__dlq:<source-queue>:<source-sequence>`,
+- stable job-id retries validate immutable name, payload, priority, and delay;
+  conflicting reuse fails closed,
+- only after the destination payload is quorum committed may the source append
+  its `DeadLettered` mutation,
+- a crash after destination commit but before source terminalization leaves the
+  source Active and the destination durable; retry deduplicates the destination
+  and resumes source terminalization,
+- terminal NACK and terminal lease expiry both use this same protocol.
+
+This yields lossless, retry-safe handoff without describing two independently
+replicated queues as one atomic storage transaction.
+
 Dead-letter forwarding is implemented as a crash-safe target-first handoff.
 
 Because Fabric Stream writes are leader-local, the source queue and its DLQ
