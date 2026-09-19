@@ -550,6 +550,7 @@ pub(crate) struct FabricQueueExpiryPlan {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FabricQueueDeadLetterPlan {
+    pub source_sequence: u64,
     pub target_queue: String,
     pub target_name: String,
     pub target_payload: Vec<u8>,
@@ -1785,6 +1786,7 @@ impl Runtime {
         .map_err(json_error)?;
 
         Ok(Some(FabricQueueDeadLetterPlan {
+            source_sequence: sequence,
             target_queue,
             target_name: envelope.name,
             target_payload: envelope.payload,
@@ -1986,6 +1988,7 @@ impl Runtime {
         .map_err(json_error)?;
 
         Ok(Some(FabricQueueDeadLetterPlan {
+            source_sequence: sequence,
             target_queue,
             target_name: envelope.name,
             target_payload: envelope.payload,
