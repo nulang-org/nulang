@@ -3555,6 +3555,26 @@ mod tests {
         assert_eq!(target_after_target_commit.total, 1);
         assert_eq!(target_after_target_commit.waiting, 1);
 
+        // Deterministic DLQ ids are content-fenced: a conflicting payload
+        // cannot hijack the retry identity.
+        let dlq_collision = cluster
+            .node_mut(leader_index)
+            .fabric_queue_add_replicated(
+                target,
+                "render",
+                b"different",
+                FabricQueueAddOptions {
+                    job_id: Some("__dlq:dlq-source:1".to_string()),
+                    priority: 7,
+                    delay_ms: 0,
+                },
+                0,
+                3,
+                260,
+            )
+            .unwrap_err();
+        assert_eq!(dlq_collision.kind(), io::ErrorKind::InvalidData);
+
         let source_terminal_pending = cluster
             .node_mut(leader_index)
             .fabric_queue_nack_replicated(
