@@ -410,6 +410,22 @@ impl Runtime {
         Ok(self.fabric_queue_policy_sync_status(queue)?.ready)
     }
 
+    pub(crate) fn fabric_queue_has_replication_policy(
+        &mut self,
+        queue: &str,
+    ) -> io::Result<bool> {
+        validate_queue_name(queue)?;
+        for stream in [queue_stream_name(queue), queue_mutation_stream_name(queue)] {
+            match self.fabric_stream_replication_policy(&stream) {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn fabric_queue_apply_policy_from_cluster(
         &mut self,
         install: &FabricQueuePolicyInstall,
