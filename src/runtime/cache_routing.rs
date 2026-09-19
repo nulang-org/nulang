@@ -89,6 +89,40 @@ impl CacheSlotMap {
         self.owners[redis_slot(key) as usize]
     }
 
+    /// Return contiguous logical-slot ranges in ascending slot order.
+    ///
+    /// Topology commands use this cold-path view to describe ownership
+    /// without exposing or copying the full 16,384-entry table.
+    pub fn slot_ranges(&self) -> Vec<CacheSlotRange> {
+        let mut ranges = Vec::new();
+        if self.owners.is_empty() {
+            return ranges;
+        }
+
+        let mut start = 0u16;
+        let mut owner = self.owners[0];
+
+        for slot in 1..REDIS_CLUSTER_SLOTS {
+            let next = self.owners[slot as usize];
+            if next != owner {
+                ranges.push(CacheSlotRange {
+                    start,
+                    end: slot - 1,
+                    owner,
+                });
+                start = slot;
+                owner = next;
+            }
+        }
+
+        ranges.push(CacheSlotRange {
+            start,
+            end: REDIS_CLUSTER_SLOTS - 1,
+            owner,
+        });
+        ranges
+    }
+
     pub fn route_key(&self, local_node_id: u64, key: &[u8]) -> CacheRoute {
         let slot = redis_slot(key);
         let owner = self.owners[slot as usize];
@@ -193,6 +227,53 @@ mod tests {
         assert_eq!(
             map.owner_for_key(b"tenant:{42}:profile"),
             map.owner_for_key(b"tenant:{42}:sessions")
+        );
+    }
+
+    #[test]
+    fn slot_ranges_coalesce_adjacent_owners() {
+        let mut map = CacheSlotMap::new_local(1, 1).unwrap();
+        map.apply_epoch(
+            1,
+            &[CacheSlotRange {
+                start: 100,
+                end: 199,
+                owner: CacheShardOwner {
+                    node_id: 2,
+                    shard: 7,
+                },
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            map.slot_ranges(),
+            vec![
+                CacheSlotRange {
+                    start: 0,
+                    end: 99,
+                    owner: CacheShardOwner {
+                        node_id: 1,
+                        shard: 0,
+                    },
+                },
+                CacheSlotRange {
+                    start: 100,
+                    end: 199,
+                    owner: CacheShardOwner {
+                        node_id: 2,
+                        shard: 7,
+                    },
+                },
+                CacheSlotRange {
+                    start: 200,
+                    end: REDIS_CLUSTER_SLOTS - 1,
+                    owner: CacheShardOwner {
+                        node_id: 1,
+                        shard: 0,
+                    },
+                },
+            ]
         );
     }
 
