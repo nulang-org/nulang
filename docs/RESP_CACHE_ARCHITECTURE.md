@@ -85,6 +85,15 @@ saturation is surfaced as backpressure rather than blocking the ingress thread.
 Only cross-shard or cross-node commands copy the RESP frame. The same-shard
 path remains borrowed and mailbox-free.
 
+RESP pipelining adds a second constraint: replies must remain in request order
+even when cross-shard or remote work completes later. `cache_pipeline.rs`
+keeps a bounded per-connection response queue. Direct responses flush
+immediately when no earlier async request exists; otherwise they wait behind
+that request. Local replies are polled from shard reply channels and remote
+replies are completed by request id. The sequencer emits only the longest
+contiguous completed prefix, preserving RESP ordering without serializing all
+commands through one worker.
+
 ## Durability
 
 Durability is not implicit in the cache kernel. Add it above the mutation path
@@ -117,12 +126,12 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Integrate cache inbox draining into the owning shard loop and connect remote
-   handoffs to a cache-specific cluster transport.
-2. Wire the TCP RESP endpoint to the parser, placement lookup, and dispatcher.
-3. Add hierarchical expiration and packed aggregate data structures.
-4. Add WAL/replication acknowledgement modes.
-5. Add RESP compatibility for hashes, sets, lists, sorted sets, and scripts or
-   stored functions where they align with the product boundary.
-6. Add Nulang-native coordination primitives: leases, locks, semaphores,
-   fencing tokens, durable queues, and stored functions.
+1. Build the dedicated cache shard event loop around non-blocking connections,
+   inbox draining, and ordered response flushing.
+2. Connect remote handoffs to a cache-specific cluster transport.
+3. Wire the TCP RESP listener to the shard event loops without a global store
+   lock or the actor scheduler's idle cadence.
+4. Add hierarchical expiration and packed aggregate data structures.
+5. Add WAL/replication acknowledgement modes.
+6. Add RESP compatibility and Nulang-native coordination primitives where they
+   fit the product boundary.
