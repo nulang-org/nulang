@@ -232,7 +232,7 @@ impl ExpirationWheel {
 
         if elapsed >= bucket_count {
             for bucket in &mut self.buckets {
-                out.extend(std::mem::take(bucket));
+                out.append(bucket);
             }
         } else {
             // Include the current bucket even when no full tick elapsed so
@@ -240,7 +240,7 @@ impl ExpirationWheel {
             let start = if elapsed == 0 { current } else { last + 1 };
             for tick in start..=current {
                 let idx = (tick % bucket_count) as usize;
-                out.extend(std::mem::take(&mut self.buckets[idx]));
+                out.append(&mut self.buckets[idx]);
             }
         }
         self.last_tick = Some(current);
@@ -531,12 +531,11 @@ impl CacheStore {
             .drain_candidates(now_ms, &mut self.expiry_scratch);
 
         let mut expired = 0usize;
-        let mut deferred = Vec::new();
-        let candidates = std::mem::take(&mut self.expiry_scratch);
+        let mut candidates = std::mem::take(&mut self.expiry_scratch);
 
-        for item in candidates {
+        for item in candidates.iter().copied() {
             if expired >= max_items {
-                deferred.push(item);
+                self.expiry.schedule(item, now_ms);
                 continue;
             }
             let Some(slot) = self.slots.get(item.slot as usize) else {
@@ -561,10 +560,8 @@ impl CacheStore {
             }
         }
 
-        for item in deferred {
-            self.expiry.schedule(item, now_ms);
-        }
-
+        candidates.clear();
+        self.expiry_scratch = candidates;
         expired
     }
 
