@@ -46,7 +46,7 @@ version + migration.*
 two major versions.*
 
 ### Typed mailbox admission API — 2026-09-19
-- **Same-process actor delivery now has an explicit backpressure result** (`src/runtime/mod.rs`, `src/runtime/metrics.rs`). `MessageAdmission` is public and `Runtime::try_admit_local_message_by_id` reports `Accepted`, `Backpressured`, or `Rejected` for same-shard mailboxes and bounded cross-shard channels without changing the existing fire-and-forget send surface. Fabric now reuses this contract, and runtime metrics expose per-actor mailbox capacity (`0` = unbounded) alongside depth.
+- **Same-process actor delivery now has an explicit backpressure result** (`src/runtime/mod.rs`, `src/runtime/metrics.rs`). `MessageAdmission` is public and `Runtime::try_admit_local_message_by_id` reports `Accepted`, `Backpressured`, or `Rejected` for same-shard mailboxes and bounded cross-shard channels without changing the existing fire-and-forget send surface. Fabric now reuses this contract, and runtime metrics expose per-actor mailbox capacity (`0` = unbounded), depth, and cumulative bounded-admission rejection counts.
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
 
