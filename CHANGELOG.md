@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Capacity desired-state reconciliation — 2026-09-19
+- **Exact provider allocation reports and fail-closed repair planning** (Experimental, `crates/nulang-capacity/src/reconcile.rs`). Keeps unbounded allocation identity out of high-frequency heartbeats, validates lower-frequency provider inventory reports by topology generation/sequence/freshness, and compares them with the durable allocation ledger. Reconciliation deterministically plans idempotent ensures for missing desired allocations, token-fenced stops for orphan/retired/stale-token instances, and verification-only actions for resource telemetry drift.
+
 ### Live capacity heartbeat and allocation ledger — 2026-09-19
 - **Fail-closed liveness gating and reservation accounting** (Experimental, `crates/nulang-capacity/src/state.rs`). Adds topology-bound monotonic provider heartbeats, `ready`/`draining`/`unavailable` scheduling state, heartbeat freshness checks, generation-fenced idempotent resource allocations, expiry/release semantics, aggregate runtime-vs-ledger drift evidence, and an atomic compare-and-swap persistence boundary for hosted control-plane implementations. Heartbeat-observed usage never silently replaces durable reservations.
 
