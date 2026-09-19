@@ -20,6 +20,7 @@ import {
   type NulangQueueFailRequest,
   type NulangQueueJob,
   type NulangQueueRenewRequest,
+  type NulangQueueRequeueRequest,
   type NulangQueueWaitSignal,
 } from '../src/client.js';
 import { NulangBullMQUnsupportedError } from '../src/errors.js';
@@ -59,6 +60,7 @@ class FakeClient implements NulangQueueClient {
   readonly completes: NulangQueueCompleteRequest[] = [];
   readonly failures: NulangQueueFailRequest[] = [];
   readonly renewals: NulangQueueRenewRequest[] = [];
+  readonly requeues: NulangQueueRequeueRequest[] = [];
   readonly delayed: Array<{ queue: string; jobId: string; availableAtMs: number }> = [];
   readonly retried: Array<{ queue: string; jobId: string }> = [];
   readonly promoted: Array<{ queue: string; jobId: string }> = [];
@@ -124,6 +126,10 @@ class FakeClient implements NulangQueueClient {
   async renew(request: NulangQueueRenewRequest): Promise<number> {
     this.renewals.push(request);
     return request.nowMs + request.extensionMs;
+  }
+
+  async requeue(request: NulangQueueRequeueRequest): Promise<void> {
+    this.requeues.push(request);
   }
 
   async delay(queue: string, jobId: string, availableAtMs: number): Promise<void> {
@@ -382,6 +388,42 @@ test('moveToFailed is terminal and preserves lease fencing', async () => {
   assert.equal(client.failures[0]?.fieldsToUpdate?.stacktrace, 'stack');
   assert.equal(client.failures[0]?.queueEpoch, 7);
   assert.equal(client.failures[0]?.leaseToken, 11);
+});
+
+test('requeues finished jobs and preserves explicit attempt-reset semantics', async () => {
+  const client = new FakeClient();
+  const b = backend(client, 5_000);
+
+  await b.retryFinishedJob(
+    { id: 'done-1', opts: {} } as any,
+    'completed',
+  );
+  assert.deepEqual(client.requeues[0], {
+    queue: 'paint',
+    jobId: 'done-1',
+    expectedState: 'completed',
+    availableAtMs: 5_000,
+    resetDeliveries: false,
+  });
+
+  await b.retryFinishedJob(
+    { id: 'failed-1', opts: {} } as any,
+    'failed',
+    { resetAttemptsMade: true, resetAttemptsStarted: true },
+  );
+  assert.equal(client.requeues[1]?.resetDeliveries, true);
+
+  await assert.rejects(
+    () =>
+      b.retryFinishedJob(
+        { id: 'failed-2', opts: {} } as any,
+        'failed',
+        { resetAttemptsMade: true, resetAttemptsStarted: false },
+      ),
+    (error: unknown) =>
+      error instanceof NulangBullMQUnsupportedError &&
+      error.operation === 'retryFinishedJob(asymmetric attempt reset)',
+  );
 });
 
 test('maps stalled recovery and blocking wait to native queue primitives', async () => {
