@@ -16,6 +16,8 @@ pub mod cache_cluster;
 pub mod cache_dispatch;
 pub mod cache_pipeline;
 pub mod cache_routing;
+#[cfg(feature = "cache-server")]
+pub mod cache_server;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
@@ -91,6 +93,8 @@ pub use cache_cluster::*;
 pub use cache_dispatch::*;
 pub use cache_pipeline::*;
 pub use cache_routing::*;
+#[cfg(feature = "cache-server")]
+pub use cache_server::*;
 pub use callbacks::RuntimeVmCallbacks;
 pub(crate) use callbacks::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks};
 pub use cluster::*;
