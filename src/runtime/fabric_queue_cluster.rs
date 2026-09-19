@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use super::fabric_queue::{
     decode_queue_consumer_group_config, decode_queue_created_mutation, decode_queue_envelope_bytes,
-    decode_queue_lease_mutation, decode_queue_operation, encode_queue_created_mutation,
+    decode_queue_lease_mutation, decode_queue_operation, decode_queue_requeue_mutation,
+    decode_queue_reschedule_mutation, encode_queue_created_mutation,
     encode_queue_envelope, queue_mutation_stream_name, queue_stream_name,
     validate_consumer_group_name, validate_consumer_name, validate_operation_id,
     validate_queue_name, FabricQueueAddOptions, FabricQueueConfig, FabricQueueConsumerGroupConfig,
@@ -104,6 +105,27 @@ pub struct FabricQueueReplicatedAcquireResult {
     pub mutation_sequence: Option<u64>,
     pub replication: Option<FabricStreamReplicationStatus>,
     pub delivery: Option<FabricQueueDelivery>,
+    pub resumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FabricQueueReplicatedRescheduleResult {
+    pub policy: FabricQueuePolicySyncReport,
+    pub mutation_sequence: Option<u64>,
+    pub replication: Option<FabricStreamReplicationStatus>,
+    pub sequence: Option<u64>,
+    pub available_at_ms: u64,
+    pub updated: bool,
+    pub resumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FabricQueueReplicatedRequeueResult {
+    pub policy: FabricQueuePolicySyncReport,
+    pub mutation_sequence: Option<u64>,
+    pub replication: Option<FabricStreamReplicationStatus>,
+    pub sequence: Option<u64>,
+    pub updated: bool,
     pub resumed: bool,
 }
 
@@ -611,6 +633,7 @@ impl Runtime {
                             || envelope.payload.as_slice() != payload
                             || envelope.priority != options.priority
                             || existing_delay != options.delay_ms
+                            || envelope.max_attempts != options.max_attempts
                         {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -677,6 +700,273 @@ impl Runtime {
             replication: Some(appended.status),
             deduplicated: false,
             enqueued: appended.status.committed,
+        })
+    }
+
+    /// Reschedule one Waiting job by replacing its availability timestamp.
+    ///
+    /// This is the generic native primitive used by compatibility adapters for
+    /// operations such as BullMQ changeDelay/promote. It is serialized through
+    /// the queue metadata stream and retry-safe through operation_id.
+    pub fn fabric_queue_reschedule_replicated(
+        &mut self,
+        queue: &str,
+        job_id: &str,
+        operation_id: &str,
+        available_at_ms: u64,
+        partition: u16,
+        replication_factor: usize,
+    ) -> io::Result<FabricQueueReplicatedRescheduleResult> {
+        validate_operation_id(operation_id)?;
+        let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        if !policy.ready {
+            return Ok(FabricQueueReplicatedRescheduleResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                sequence: None,
+                available_at_ms,
+                updated: false,
+                resumed: false,
+            });
+        }
+        self.fabric_queue_require_committed_creation(queue)?;
+        let job = self
+            .fabric_queue_job_replicated(queue, job_id)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Fabric queue job {job_id:?} does not exist"),
+                )
+            })?;
+        let sequence = job.sequence;
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let info = self.fabric_stream_info(&mutation_stream)?;
+
+        let mut next = 2u64;
+        let mut matching = None;
+        loop {
+            let records = self.fabric_stream_read(&mutation_stream, next, 1024)?;
+            if records.is_empty() {
+                break;
+            }
+            for record in &records {
+                if let Some(reschedule) = decode_queue_reschedule_mutation(&record.payload)? {
+                    if reschedule.operation_id.as_deref() == Some(operation_id) {
+                        if matching.is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "Fabric queue {queue:?} contains duplicate reschedule operation id {operation_id:?}"
+                                ),
+                            ));
+                        }
+                        if reschedule.sequence != sequence
+                            || reschedule.available_at_ms != available_at_ms
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Fabric queue reschedule operation id was reused with different inputs",
+                            ));
+                        }
+                        matching = Some(record.sequence);
+                    }
+                }
+                next = record.sequence.saturating_add(1);
+            }
+            if records.len() < 1024 {
+                break;
+            }
+        }
+
+        if let Some(mutation_sequence) = matching {
+            let replication = self.fabric_queue_resume_metadata_replication(
+                &mutation_stream,
+                partition,
+                mutation_sequence,
+                info.committed_sequence,
+            )?;
+            return Ok(FabricQueueReplicatedRescheduleResult {
+                policy,
+                mutation_sequence: Some(mutation_sequence),
+                replication: Some(replication),
+                sequence: Some(sequence),
+                available_at_ms,
+                updated: replication.committed,
+                resumed: true,
+            });
+        }
+
+        if info.last_sequence.unwrap_or(0) > info.committed_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue {queue:?} has an uncommitted metadata mutation; retry it before rescheduling"
+                ),
+            ));
+        }
+
+        let (planned_sequence, bytes) = self.fabric_queue_plan_committed_reschedule(
+            queue,
+            job_id,
+            operation_id,
+            available_at_ms,
+        )?;
+        if planned_sequence != sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric queue reschedule job lookup changed during planning",
+            ));
+        }
+        let appended = self.fabric_stream_replicated_append(
+            &mutation_stream,
+            partition,
+            replication_factor,
+            &bytes,
+        )?;
+        Ok(FabricQueueReplicatedRescheduleResult {
+            policy,
+            mutation_sequence: Some(appended.sequence),
+            replication: Some(appended.status),
+            sequence: Some(sequence),
+            available_at_ms,
+            updated: appended.status.committed,
+            resumed: false,
+        })
+    }
+
+    /// Move one terminal job back to Waiting through the replicated metadata log.
+    ///
+    /// Only Completed and Failed are accepted in this slice. DeadLettered jobs
+    /// require an explicit DLQ workflow rather than silently re-entering the
+    /// source queue.
+    pub fn fabric_queue_requeue_replicated(
+        &mut self,
+        queue: &str,
+        job_id: &str,
+        operation_id: &str,
+        expected_status: super::fabric_queue::FabricQueueJobStatus,
+        available_at_ms: u64,
+        reset_deliveries: bool,
+        partition: u16,
+        replication_factor: usize,
+    ) -> io::Result<FabricQueueReplicatedRequeueResult> {
+        validate_operation_id(operation_id)?;
+        let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        if !policy.ready {
+            return Ok(FabricQueueReplicatedRequeueResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                sequence: None,
+                updated: false,
+                resumed: false,
+            });
+        }
+        self.fabric_queue_require_committed_creation(queue)?;
+        let job = self
+            .fabric_queue_job_replicated(queue, job_id)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Fabric queue job {job_id:?} does not exist"),
+                )
+            })?;
+        let sequence = job.sequence;
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let info = self.fabric_stream_info(&mutation_stream)?;
+
+        let mut next = 2u64;
+        let mut matching = None;
+        loop {
+            let records = self.fabric_stream_read(&mutation_stream, next, 1024)?;
+            if records.is_empty() {
+                break;
+            }
+            for record in &records {
+                if let Some(requeue) = decode_queue_requeue_mutation(&record.payload)? {
+                    if requeue.operation_id.as_deref() == Some(operation_id) {
+                        if matching.is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "Fabric queue {queue:?} contains duplicate requeue operation id {operation_id:?}"
+                                ),
+                            ));
+                        }
+                        if requeue.sequence != sequence
+                            || requeue.expected_status != expected_status
+                            || requeue.available_at_ms != available_at_ms
+                            || requeue.reset_deliveries != reset_deliveries
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Fabric queue requeue operation id was reused with different inputs",
+                            ));
+                        }
+                        matching = Some(record.sequence);
+                    }
+                }
+                next = record.sequence.saturating_add(1);
+            }
+            if records.len() < 1024 {
+                break;
+            }
+        }
+
+        if let Some(mutation_sequence) = matching {
+            let replication = self.fabric_queue_resume_metadata_replication(
+                &mutation_stream,
+                partition,
+                mutation_sequence,
+                info.committed_sequence,
+            )?;
+            return Ok(FabricQueueReplicatedRequeueResult {
+                policy,
+                mutation_sequence: Some(mutation_sequence),
+                replication: Some(replication),
+                sequence: Some(sequence),
+                updated: replication.committed,
+                resumed: true,
+            });
+        }
+
+        if info.last_sequence.unwrap_or(0) > info.committed_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue {queue:?} has an uncommitted metadata mutation; retry it before requeueing"
+                ),
+            ));
+        }
+
+        let (planned_sequence, bytes) = self.fabric_queue_plan_committed_requeue(
+            queue,
+            job_id,
+            operation_id,
+            expected_status,
+            available_at_ms,
+            reset_deliveries,
+        )?;
+        if planned_sequence != sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric queue requeue job lookup changed during planning",
+            ));
+        }
+        let appended = self.fabric_stream_replicated_append(
+            &mutation_stream,
+            partition,
+            replication_factor,
+            &bytes,
+        )?;
+        Ok(FabricQueueReplicatedRequeueResult {
+            policy,
+            mutation_sequence: Some(appended.sequence),
+            replication: Some(appended.status),
+            sequence: Some(sequence),
+            updated: appended.status.committed,
+            resumed: false,
         })
     }
 
@@ -1195,6 +1485,29 @@ impl Runtime {
             consumer,
             None,
             operation_id,
+            None,
+            partition,
+            replication_factor,
+            now_ms,
+        )
+    }
+
+    pub fn fabric_queue_acquire_replicated_with_lease_duration(
+        &mut self,
+        queue: &str,
+        consumer: &str,
+        operation_id: &str,
+        lease_duration_ms: u64,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAcquireResult> {
+        self.fabric_queue_acquire_replicated_inner(
+            queue,
+            consumer,
+            None,
+            operation_id,
+            Some(lease_duration_ms),
             partition,
             replication_factor,
             now_ms,
@@ -1217,6 +1530,31 @@ impl Runtime {
             consumer,
             Some(group),
             operation_id,
+            None,
+            partition,
+            replication_factor,
+            now_ms,
+        )
+    }
+
+    pub fn fabric_queue_acquire_consumer_group_replicated_with_lease_duration(
+        &mut self,
+        queue: &str,
+        group: &str,
+        consumer: &str,
+        operation_id: &str,
+        lease_duration_ms: u64,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAcquireResult> {
+        validate_consumer_group_name(group)?;
+        self.fabric_queue_acquire_replicated_inner(
+            queue,
+            consumer,
+            Some(group),
+            operation_id,
+            Some(lease_duration_ms),
             partition,
             replication_factor,
             now_ms,
@@ -1229,6 +1567,7 @@ impl Runtime {
         consumer: &str,
         consumer_group: Option<&str>,
         operation_id: &str,
+        lease_duration_ms: Option<u64>,
         partition: u16,
         replication_factor: usize,
         now_ms: u64,
@@ -1285,6 +1624,8 @@ impl Runtime {
                         if lease.consumer != consumer
                             || lease.consumer_group.as_deref() != consumer_group
                             || lease.queue_epoch != placement.epoch
+                            || lease_duration_ms
+                                .is_some_and(|duration| duration != lease.lease_duration_ms)
                         {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -1352,6 +1693,7 @@ impl Runtime {
             consumer_group,
             operation_id,
             placement.epoch,
+            lease_duration_ms,
             now_ms,
         )?
         else {
@@ -1396,6 +1738,60 @@ impl Runtime {
         replication_factor: usize,
         now_ms: u64,
     ) -> io::Result<FabricQueueReplicatedAckResult> {
+        self.fabric_queue_ack_replicated_inner(
+            queue,
+            sequence,
+            consumer,
+            queue_epoch,
+            lease_token,
+            operation_id,
+            None,
+            partition,
+            replication_factor,
+            now_ms,
+        )
+    }
+
+    pub fn fabric_queue_ack_replicated_with_result(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        result: &[u8],
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAckResult> {
+        self.fabric_queue_ack_replicated_inner(
+            queue,
+            sequence,
+            consumer,
+            queue_epoch,
+            lease_token,
+            operation_id,
+            Some(result),
+            partition,
+            replication_factor,
+            now_ms,
+        )
+    }
+
+    fn fabric_queue_ack_replicated_inner(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        result: Option<&[u8]>,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAckResult> {
         validate_consumer_name(consumer)?;
         validate_operation_id(operation_id)?;
         let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
@@ -1434,6 +1830,12 @@ impl Runtime {
                 queue_epoch,
                 lease_token,
             )?;
+            if operation.result.as_deref() != result {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric queue ACK operation id was reused with a different completion result",
+                ));
+            }
             let replication = self.fabric_queue_resume_metadata_replication(
                 &mutation_stream,
                 partition,
@@ -1464,6 +1866,7 @@ impl Runtime {
             queue_epoch,
             lease_token,
             operation_id,
+            result,
             now_ms,
         )?;
         let appended = self.fabric_stream_replicated_append(
@@ -2478,6 +2881,7 @@ mod tests {
             job_id: Some("job-1".to_string()),
             priority: 7,
             delay_ms: 0,
+            max_attempts: None,
         };
         let pending_job = cluster
             .node_mut(leader_index)
@@ -2555,7 +2959,15 @@ mod tests {
         // different acquire cannot race the in-flight metadata mutation.
         let pending_lease = cluster
             .node_mut(leader_index)
-            .fabric_queue_acquire_replicated("orders", "worker-a", "acquire-1", 0, 3, 200)
+            .fabric_queue_acquire_replicated_with_lease_duration(
+                "orders",
+                "worker-a",
+                "acquire-1",
+                5_000,
+                0,
+                3,
+                200,
+            )
             .unwrap();
         assert_eq!(pending_lease.mutation_sequence, Some(2));
         assert!(pending_lease.delivery.is_none());
@@ -2563,11 +2975,33 @@ mod tests {
 
         let retry_lease = cluster
             .node_mut(leader_index)
-            .fabric_queue_acquire_replicated("orders", "worker-a", "acquire-1", 0, 3, 200)
+            .fabric_queue_acquire_replicated_with_lease_duration(
+                "orders",
+                "worker-a",
+                "acquire-1",
+                5_000,
+                0,
+                3,
+                200,
+            )
             .unwrap();
         assert_eq!(retry_lease.mutation_sequence, Some(2));
         assert!(retry_lease.resumed);
         assert!(retry_lease.delivery.is_none());
+
+        let changed_duration = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated_with_lease_duration(
+                "orders",
+                "worker-a",
+                "acquire-1",
+                6_000,
+                0,
+                3,
+                200,
+            )
+            .unwrap_err();
+        assert_eq!(changed_duration.kind(), io::ErrorKind::InvalidData);
 
         let competing = cluster
             .node_mut(leader_index)
@@ -2578,7 +3012,15 @@ mod tests {
         cluster.run_rounds(12);
         let committed_lease = cluster
             .node_mut(leader_index)
-            .fabric_queue_acquire_replicated("orders", "worker-a", "acquire-1", 0, 3, 200)
+            .fabric_queue_acquire_replicated_with_lease_duration(
+                "orders",
+                "worker-a",
+                "acquire-1",
+                5_000,
+                0,
+                3,
+                200,
+            )
             .unwrap();
         assert!(committed_lease.resumed);
         assert!(committed_lease.replication.unwrap().committed);
@@ -2592,6 +3034,7 @@ mod tests {
         assert_eq!(delivery.payload, b"payload");
         assert_eq!(delivery.deliveries, 1);
         assert_eq!(delivery.lease_token, 1);
+        assert_eq!(delivery.lease_until_ms, 5_200);
 
         for index in 0..3 {
             assert_eq!(
@@ -2814,6 +3257,7 @@ mod tests {
             job_id: Some("job-2".to_string()),
             priority: 1,
             delay_ms: 0,
+            max_attempts: None,
         };
         let pending_job2 = cluster
             .node_mut(leader_index)
@@ -3128,6 +3572,7 @@ mod tests {
                 job_id: Some(job_id.to_string()),
                 priority: 0,
                 delay_ms: 0,
+                max_attempts: None,
             };
             let pending = cluster
                 .node_mut(leader_index)
@@ -3482,6 +3927,7 @@ mod tests {
             job_id: Some("poison-1".to_string()),
             priority: 7,
             delay_ms: 0,
+            max_attempts: None,
         };
         let pending_add = cluster
             .node_mut(leader_index)
@@ -3568,6 +4014,7 @@ mod tests {
                     job_id: Some("__dlq:dlq-source:1".to_string()),
                     priority: 7,
                     delay_ms: 0,
+                    max_attempts: None,
                 },
                 0,
                 3,
@@ -3646,6 +4093,7 @@ mod tests {
             job_id: Some("poison-2".to_string()),
             priority: 3,
             delay_ms: 0,
+            max_attempts: None,
         };
         let pending_add2 = cluster
             .node_mut(leader_index)
@@ -3739,6 +4187,484 @@ mod tests {
             assert_eq!(second.job_id.as_deref(), Some("__dlq:dlq-source:2"));
             assert_eq!(second.payload, b"poison-2");
         }
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn replicated_reschedule_is_quorum_visible_and_retry_fenced() {
+        use crate::runtime::cluster_dst::DeterministicCluster;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let addrs = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39401),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39402),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39403),
+        ];
+        let mut cluster = DeterministicCluster::new(&addrs, 0x5253434844);
+        cluster.run_rounds(30);
+        assert!(cluster.active_views_converged());
+
+        let base = std::env::temp_dir().join(format!(
+            "nulang-fabric-queue-reschedule-rf3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for index in 0..3 {
+            cluster
+                .node_mut(index)
+                .fabric_stream_open(base.join(format!("node-{index}")))
+                .unwrap();
+        }
+
+        let placement = cluster
+            .node_mut(0)
+            .fabric_stream_placement(&queue_placement_key("scheduled"), 0, 3)
+            .unwrap();
+        let leader_index = (0..3)
+            .find(|&index| cluster.id(index) == placement.leader)
+            .unwrap();
+        let config = FabricQueueConfig::default();
+
+        let first = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("scheduled", config.clone(), 0, 3)
+            .unwrap();
+        assert!(!first.policy.ready);
+        cluster.run_rounds(8);
+
+        let pending_create = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("scheduled", config.clone(), 0, 3)
+            .unwrap();
+        assert_eq!(pending_create.mutation_sequence, Some(1));
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_create_replicated("scheduled", config, 0, 3)
+                .unwrap()
+                .created
+        );
+
+        let options = FabricQueueAddOptions {
+            job_id: Some("job-1".to_string()),
+            priority: 0,
+            delay_ms: 0,
+            max_attempts: Some(3),
+        };
+        let pending_add = cluster
+            .node_mut(leader_index)
+            .fabric_queue_add_replicated(
+                "scheduled",
+                "work",
+                b"payload",
+                options.clone(),
+                0,
+                3,
+                100,
+            )
+            .unwrap();
+        assert!(!pending_add.enqueued);
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_add_replicated(
+                    "scheduled",
+                    "work",
+                    b"payload",
+                    options,
+                    0,
+                    3,
+                    100,
+                )
+                .unwrap()
+                .enqueued
+        );
+
+        let pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reschedule_replicated(
+                "scheduled",
+                "job-1",
+                "delay-1",
+                1_000,
+                0,
+                3,
+            )
+            .unwrap();
+        assert_eq!(pending.mutation_sequence, Some(2));
+        assert!(!pending.updated);
+        assert_eq!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_job_replicated("scheduled", "job-1")
+                .unwrap()
+                .unwrap()
+                .available_at_ms,
+            100
+        );
+
+        let retry = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reschedule_replicated(
+                "scheduled",
+                "job-1",
+                "delay-1",
+                1_000,
+                0,
+                3,
+            )
+            .unwrap();
+        assert_eq!(retry.mutation_sequence, Some(2));
+        assert!(retry.resumed);
+        assert!(!retry.updated);
+
+        let conflict = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reschedule_replicated(
+                "scheduled",
+                "job-1",
+                "delay-1",
+                2_000,
+                0,
+                3,
+            )
+            .unwrap_err();
+        assert_eq!(conflict.kind(), io::ErrorKind::InvalidData);
+
+        cluster.run_rounds(12);
+        let committed = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reschedule_replicated(
+                "scheduled",
+                "job-1",
+                "delay-1",
+                1_000,
+                0,
+                3,
+            )
+            .unwrap();
+        assert!(committed.updated);
+        assert!(committed.resumed);
+        for index in 0..3 {
+            assert_eq!(
+                cluster
+                    .node_mut(index)
+                    .fabric_queue_job_replicated("scheduled", "job-1")
+                    .unwrap()
+                    .unwrap()
+                    .available_at_ms,
+                1_000
+            );
+        }
+
+        let promote = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reschedule_replicated(
+                "scheduled",
+                "job-1",
+                "promote-1",
+                150,
+                0,
+                3,
+            )
+            .unwrap();
+        assert_eq!(promote.mutation_sequence, Some(3));
+        assert!(!promote.updated);
+        assert_eq!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_job_replicated("scheduled", "job-1")
+                .unwrap()
+                .unwrap()
+                .available_at_ms,
+            1_000
+        );
+
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_reschedule_replicated(
+                    "scheduled",
+                    "job-1",
+                    "promote-1",
+                    150,
+                    0,
+                    3,
+                )
+                .unwrap()
+                .updated
+        );
+        for index in 0..3 {
+            assert_eq!(
+                cluster
+                    .node_mut(index)
+                    .fabric_queue_job_replicated("scheduled", "job-1")
+                    .unwrap()
+                    .unwrap()
+                    .available_at_ms,
+                150
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn replicated_requeue_is_terminal_fenced_and_quorum_visible() {
+        use crate::runtime::cluster_dst::DeterministicCluster;
+        use crate::runtime::FabricQueueJobStatus;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let addrs = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39501),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39502),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39503),
+        ];
+        let mut cluster = DeterministicCluster::new(&addrs, 0x5251515545);
+        cluster.run_rounds(30);
+        assert!(cluster.active_views_converged());
+
+        let base = std::env::temp_dir().join(format!(
+            "nulang-fabric-queue-requeue-rf3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for index in 0..3 {
+            cluster
+                .node_mut(index)
+                .fabric_stream_open(base.join(format!("node-{index}")))
+                .unwrap();
+        }
+
+        let placement = cluster
+            .node_mut(0)
+            .fabric_stream_placement(&queue_placement_key("requeue"), 0, 3)
+            .unwrap();
+        let leader_index = (0..3)
+            .find(|&index| cluster.id(index) == placement.leader)
+            .unwrap();
+
+        let config = FabricQueueConfig::default();
+        let first = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("requeue", config.clone(), 0, 3)
+            .unwrap();
+        assert!(!first.policy.ready);
+        cluster.run_rounds(8);
+        let pending_create = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("requeue", config.clone(), 0, 3)
+            .unwrap();
+        assert_eq!(pending_create.mutation_sequence, Some(1));
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_create_replicated("requeue", config, 0, 3)
+                .unwrap()
+                .created
+        );
+
+        let options = FabricQueueAddOptions {
+            job_id: Some("job-1".to_string()),
+            priority: 0,
+            delay_ms: 0,
+            max_attempts: Some(3),
+        };
+        assert!(
+            !cluster
+                .node_mut(leader_index)
+                .fabric_queue_add_replicated(
+                    "requeue",
+                    "work",
+                    b"payload",
+                    options.clone(),
+                    0,
+                    3,
+                    100,
+                )
+                .unwrap()
+                .enqueued
+        );
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_add_replicated(
+                    "requeue",
+                    "work",
+                    b"payload",
+                    options,
+                    0,
+                    3,
+                    100,
+                )
+                .unwrap()
+                .enqueued
+        );
+
+        let lease_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("requeue", "worker", "acquire-1", 0, 3, 200)
+            .unwrap();
+        assert!(lease_pending.delivery.is_none());
+        cluster.run_rounds(12);
+        let delivery = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("requeue", "worker", "acquire-1", 0, 3, 200)
+            .unwrap()
+            .delivery
+            .unwrap();
+
+        let ack_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_ack_replicated(
+                "requeue",
+                delivery.sequence,
+                "worker",
+                delivery.queue_epoch,
+                delivery.lease_token,
+                "ack-1",
+                0,
+                3,
+                300,
+            )
+            .unwrap();
+        assert!(!ack_pending.completed);
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_ack_replicated(
+                    "requeue",
+                    delivery.sequence,
+                    "worker",
+                    delivery.queue_epoch,
+                    delivery.lease_token,
+                    "ack-1",
+                    0,
+                    3,
+                    300,
+                )
+                .unwrap()
+                .completed
+        );
+
+        let pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_requeue_replicated(
+                "requeue",
+                "job-1",
+                "requeue-1",
+                FabricQueueJobStatus::Completed,
+                500,
+                true,
+                0,
+                3,
+            )
+            .unwrap();
+        assert!(!pending.updated);
+        assert_eq!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_job_replicated("requeue", "job-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            FabricQueueJobStatus::Completed
+        );
+
+        let retry = cluster
+            .node_mut(leader_index)
+            .fabric_queue_requeue_replicated(
+                "requeue",
+                "job-1",
+                "requeue-1",
+                FabricQueueJobStatus::Completed,
+                500,
+                true,
+                0,
+                3,
+            )
+            .unwrap();
+        assert!(retry.resumed);
+        assert!(!retry.updated);
+
+        let conflict = cluster
+            .node_mut(leader_index)
+            .fabric_queue_requeue_replicated(
+                "requeue",
+                "job-1",
+                "requeue-1",
+                FabricQueueJobStatus::Completed,
+                600,
+                true,
+                0,
+                3,
+            )
+            .unwrap_err();
+        assert_eq!(conflict.kind(), io::ErrorKind::InvalidData);
+
+        cluster.run_rounds(12);
+        let committed = cluster
+            .node_mut(leader_index)
+            .fabric_queue_requeue_replicated(
+                "requeue",
+                "job-1",
+                "requeue-1",
+                FabricQueueJobStatus::Completed,
+                500,
+                true,
+                0,
+                3,
+            )
+            .unwrap();
+        assert!(committed.updated);
+
+        for index in 0..3 {
+            let job = cluster
+                .node_mut(index)
+                .fabric_queue_job_replicated("requeue", "job-1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.status, FabricQueueJobStatus::Waiting);
+            assert_eq!(job.deliveries, 0);
+            assert_eq!(job.available_at_ms, 500);
+            assert!(job.result.is_none());
+        }
+
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_acquire_replicated("requeue", "worker-2", "acquire-2", 0, 3, 499)
+                .unwrap()
+                .delivery
+                .is_none()
+        );
+        let redelivery_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("requeue", "worker-2", "acquire-3", 0, 3, 500)
+            .unwrap();
+        assert!(redelivery_pending.delivery.is_none());
+        cluster.run_rounds(12);
+        let redelivery = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("requeue", "worker-2", "acquire-3", 0, 3, 500)
+            .unwrap()
+            .delivery
+            .unwrap();
+        assert_eq!(redelivery.deliveries, 1);
+        assert_eq!(redelivery.lease_token, 1);
 
         let _ = std::fs::remove_dir_all(base);
     }
