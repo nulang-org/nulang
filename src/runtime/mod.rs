@@ -23,6 +23,7 @@ pub use heap_serialize::*;
 mod cluster;
 mod distributed;
 mod distributed_context;
+mod fabric_queue;
 mod fabric_stream;
 mod fabric_stream_cluster;
 mod fabric_stream_epoch;
@@ -34,6 +35,10 @@ mod supervision;
 mod supervisor;
 pub use distributed_context::{
     DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot, FabricPublishReport,
+};
+pub use fabric_queue::{
+    FabricQueueAddOptions, FabricQueueAddResult, FabricQueueConfig, FabricQueueDelivery,
+    FabricQueueInfo, FabricQueueJobStatus, FabricQueueNackResult, FabricQueueStore,
 };
 pub use fabric_stream::{
     FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
