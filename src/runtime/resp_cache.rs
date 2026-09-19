@@ -80,12 +80,7 @@ fn execute_ping(command: RespCommand<'_>, out: &mut Vec<u8>) {
     }
 }
 
-fn execute_get(
-    store: &mut CacheStore,
-    command: RespCommand<'_>,
-    now_ms: u64,
-    out: &mut Vec<u8>,
-) {
+fn execute_get(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
     if command.argc() != 1 {
         wrong_arity(out, b"get");
         return;
@@ -95,12 +90,7 @@ fn execute_get(
     write_value(store.get(key, now_ms), out);
 }
 
-fn execute_set(
-    store: &mut CacheStore,
-    command: RespCommand<'_>,
-    now_ms: u64,
-    out: &mut Vec<u8>,
-) {
+fn execute_set(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
     if command.argc() != 2 && command.argc() != 4 {
         wrong_arity(out, b"set");
         return;
@@ -141,12 +131,7 @@ fn execute_set(
     write_simple(out, b"OK");
 }
 
-fn execute_del(
-    store: &mut CacheStore,
-    command: RespCommand<'_>,
-    now_ms: u64,
-    out: &mut Vec<u8>,
-) {
+fn execute_del(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
     if command.argc() == 0 {
         wrong_arity(out, b"del");
         return;
@@ -189,12 +174,7 @@ fn execute_exists(
     write_integer(out, count);
 }
 
-fn execute_incr(
-    store: &mut CacheStore,
-    command: RespCommand<'_>,
-    now_ms: u64,
-    out: &mut Vec<u8>,
-) {
+fn execute_incr(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
     if command.argc() != 1 {
         wrong_arity(out, b"incr");
         return;
@@ -239,12 +219,7 @@ fn execute_expire(
     write_integer(out, if changed { 1 } else { 0 });
 }
 
-fn execute_ttl(
-    store: &mut CacheStore,
-    command: RespCommand<'_>,
-    now_ms: u64,
-    out: &mut Vec<u8>,
-) {
+fn execute_ttl(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
     if command.argc() != 1 {
         wrong_arity(out, b"ttl");
         return;
@@ -259,12 +234,7 @@ fn execute_ttl(
     write_integer(out, ttl);
 }
 
-fn execute_mget(
-    store: &mut CacheStore,
-    command: RespCommand<'_>,
-    now_ms: u64,
-    out: &mut Vec<u8>,
-) {
+fn execute_mget(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
     if command.argc() == 0 {
         wrong_arity(out, b"mget");
         return;
@@ -280,12 +250,7 @@ fn execute_mget(
     }
 }
 
-fn execute_mset(
-    store: &mut CacheStore,
-    command: RespCommand<'_>,
-    now_ms: u64,
-    out: &mut Vec<u8>,
-) {
+fn execute_mset(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
     if command.argc() == 0 || command.argc() % 2 != 0 {
         wrong_arity(out, b"mset");
         return;
