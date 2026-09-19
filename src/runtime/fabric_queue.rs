@@ -464,10 +464,6 @@ pub(crate) struct FabricQueueJobSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct FabricQueueExpiryPlan {
     pub sequence: u64,
-    pub consumer: String,
-    pub lease_token: u64,
-    pub queue_epoch: u64,
-    pub operation_id: String,
     pub mutation_bytes: Vec<u8>,
     pub result: FabricQueueNackResult,
 }
@@ -1801,10 +1797,6 @@ impl Runtime {
 
         Ok(Some(FabricQueueExpiryPlan {
             sequence,
-            consumer,
-            lease_token,
-            queue_epoch,
-            operation_id,
             mutation_bytes,
             result: FabricQueueNackResult {
                 status,
