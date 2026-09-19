@@ -107,6 +107,17 @@ impl MetricsSnapshot {
             ));
         }
 
+        out.push_str(
+            "# HELP nulang_actor_mailbox_rejected_total Bounded mailbox admissions rejected at capacity\n",
+        );
+        out.push_str("# TYPE nulang_actor_mailbox_rejected_total counter\n");
+        for m in sorted.iter().take(50) {
+            out.push_str(&format!(
+                "nulang_actor_mailbox_rejected_total{{actor_id=\"{}\"}} {}\n",
+                m.actor_id, m.rejected
+            ));
+        }
+
         // Scheduler counters
         let s = &self.scheduler;
         macro_rules! counter {
