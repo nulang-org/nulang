@@ -2371,6 +2371,109 @@ mod json_file_store_tests {
         dir
     }
 
+    fn durable_effect_pair(
+        actor_id: u64,
+    ) -> (
+        DurableEffectId,
+        DurableEffectPersistenceRecord,
+        DurableEffectPersistenceRecord,
+    ) {
+        let id = DurableEffectId::derive(actor_id, "persist-test", 0, "Storage.write");
+        let spec = crate::durable_effect::DurableEffectSpec::new(
+            id,
+            "Storage.write",
+            crate::primitives::EffectBoundary::BackendOwned,
+            crate::primitives::DeliverySemantics::EffectivelyOnceWithDeduplication,
+        );
+        let prepared = DurableEffectPersistenceRecord::from_effect(
+            DurableEffectRecord::prepare(spec.clone(), b"key=orders/1"),
+        );
+        let completed = DurableEffectPersistenceRecord::from_effect(
+            DurableEffectRecord::prepare(spec, b"key=orders/1").complete(b"ok".to_vec()),
+        );
+        (id, prepared, completed)
+    }
+
+    #[test]
+    fn memory_store_folds_durable_effect_state_monotonically() {
+        let actor_id = 77;
+        let (id, prepared, completed) = durable_effect_pair(actor_id);
+        let mut store = MemoryStore::new();
+
+        store
+            .append_durable_effect_record(actor_id, prepared.clone())
+            .unwrap();
+        store
+            .append_durable_effect_record(actor_id, completed.clone())
+            .unwrap();
+        // A stale retry of the prepared append must not regress completion.
+        store
+            .append_durable_effect_record(actor_id, prepared)
+            .unwrap();
+
+        let loaded = store
+            .load_durable_effect_record(actor_id, id)
+            .unwrap()
+            .expect("effect should be persisted");
+        assert_eq!(loaded, completed);
+
+        let spec = loaded.effect().spec().clone();
+        store
+            .append_durable_effect_record(
+                actor_id,
+                DurableEffectPersistenceRecord::from_effect(
+                    DurableEffectRecord::prepare(spec, b"key=orders/1")
+                        .complete(b"different".to_vec()),
+                ),
+            )
+            .unwrap();
+        assert!(
+            store.load_durable_effect_record(actor_id, id).is_err(),
+            "conflicting completed results must fail closed"
+        );
+    }
+
+    #[test]
+    fn json_store_round_trips_versioned_durable_effect_history() {
+        let dir = fresh_dir("durable_effect");
+        let actor_id = 78;
+        let (id, prepared, completed) = durable_effect_pair(actor_id);
+        {
+            let mut store = JsonFileStore::new(&dir).unwrap();
+            store
+                .append_durable_effect_record(actor_id, prepared)
+                .unwrap();
+            store
+                .append_durable_effect_record(actor_id, completed.clone())
+                .unwrap();
+        }
+
+        let store = JsonFileStore::new(&dir).unwrap();
+        let history = store.read_durable_effect_records(actor_id).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            store.load_durable_effect_record(actor_id, id).unwrap(),
+            Some(completed)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_store_fails_closed_on_corrupt_durable_effect_record() {
+        let dir = fresh_dir("durable_effect_corrupt");
+        let actor_id = 79;
+        let store = JsonFileStore::new(&dir).unwrap();
+        fs::create_dir_all(store.actor_dir(actor_id)).unwrap();
+        fs::write(
+            store.durable_effects_path(actor_id),
+            b"{\"version\":999,\"record\":{}}\n",
+        )
+        .unwrap();
+
+        assert!(store.read_durable_effect_records(actor_id).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_json_file_store_save_load_snapshot() {
         let dir = fresh_dir("snapshot");
