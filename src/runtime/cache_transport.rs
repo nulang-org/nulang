@@ -543,6 +543,11 @@ pub struct CacheServiceTransportEndpoint {
     outbound_tx: SyncSender<CacheTransportOutbound>,
 }
 
+#[derive(Clone)]
+pub struct CacheServiceTransportSender {
+    outbound_tx: SyncSender<CacheTransportOutbound>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheTransportBridgeError {
     InvalidCapacity,
@@ -600,7 +605,22 @@ impl CacheRuntimeTransportEndpoint {
     }
 }
 
+impl CacheServiceTransportSender {
+    pub fn try_send(
+        &self,
+        outbound: CacheTransportOutbound,
+    ) -> Result<(), CacheTransportBridgeError> {
+        self.sender().try_send(outbound)
+    }
+}
+
 impl CacheServiceTransportEndpoint {
+    pub fn sender(&self) -> CacheServiceTransportSender {
+        CacheServiceTransportSender {
+            outbound_tx: self.outbound_tx.clone(),
+        }
+    }
+
     pub fn try_recv(
         &self,
     ) -> Result<Option<CacheTransportInbound>, CacheTransportBridgeError> {
