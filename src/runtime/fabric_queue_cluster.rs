@@ -3350,6 +3350,386 @@ mod tests {
     }
 
     #[test]
+    fn replicated_dlq_handoff_is_target_first_retry_safe_and_lossless() {
+        use crate::runtime::cluster_dst::DeterministicCluster;
+        use crate::runtime::FabricQueueJobStatus;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let addrs = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39301),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39302),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39303),
+        ];
+        let mut cluster = DeterministicCluster::new(&addrs, 0x444c5152);
+        cluster.run_rounds(30);
+        assert!(cluster.active_views_converged());
+
+        let base = std::env::temp_dir().join(format!(
+            "nulang-fabric-queue-dlq-rf3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for index in 0..3 {
+            cluster
+                .node_mut(index)
+                .fabric_stream_open(base.join(format!("node-{index}")))
+                .unwrap();
+        }
+
+        let source = "dlq-source";
+        let target = "dlq-target";
+        let placement = cluster
+            .node_mut(0)
+            .fabric_stream_placement(&queue_placement_key(source), 0, 3)
+            .unwrap();
+        let leader_index = (0..3)
+            .find(|&index| cluster.id(index) == placement.leader)
+            .unwrap();
+
+        let source_config = FabricQueueConfig {
+            visibility_timeout_ms: 100,
+            max_attempts: 1,
+            dead_letter_queue: Some(target.to_string()),
+        };
+        let first_create = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated(source, source_config.clone(), 0, 3)
+            .unwrap();
+        assert!(!first_create.policy.ready);
+        cluster.run_rounds(8);
+        let pending_create = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated(source, source_config.clone(), 0, 3)
+            .unwrap();
+        assert_eq!(pending_create.mutation_sequence, Some(1));
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_create_replicated(source, source_config, 0, 3)
+                .unwrap()
+                .created
+        );
+
+        // The DLQ target is explicitly co-owned with the source. First retry
+        // synchronizes that exact policy; the next appends QueueCreated.
+        let target_config = FabricQueueConfig {
+            visibility_timeout_ms: 30_000,
+            max_attempts: 3,
+            dead_letter_queue: None,
+        };
+        let target_sync = cluster
+            .node_mut(leader_index)
+            .fabric_queue_prepare_dead_letter_target_replicated(
+                source,
+                target,
+                target_config.clone(),
+                0,
+                3,
+            )
+            .unwrap();
+        assert!(!target_sync.created);
+        cluster.run_rounds(8);
+        let target_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_prepare_dead_letter_target_replicated(
+                source,
+                target,
+                target_config.clone(),
+                0,
+                3,
+            )
+            .unwrap();
+        assert_eq!(target_pending.mutation_sequence, Some(1));
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_prepare_dead_letter_target_replicated(
+                    source,
+                    target,
+                    target_config,
+                    0,
+                    3,
+                )
+                .unwrap()
+                .created
+        );
+
+        let target_placement = cluster
+            .node_mut(leader_index)
+            .fabric_queue_replication_placement(target)
+            .unwrap()
+            .expect("target placement must exist");
+        let source_placement = cluster
+            .node_mut(leader_index)
+            .fabric_queue_replication_placement(source)
+            .unwrap()
+            .expect("source placement must exist");
+        assert_eq!(target_placement.epoch, source_placement.epoch);
+        assert_eq!(target_placement.leader, source_placement.leader);
+        assert_eq!(target_placement.replicas, source_placement.replicas);
+        assert_eq!(
+            target_placement.membership_fingerprint,
+            source_placement.membership_fingerprint
+        );
+
+        let add = FabricQueueAddOptions {
+            job_id: Some("poison-1".to_string()),
+            priority: 7,
+            delay_ms: 0,
+        };
+        let pending_add = cluster
+            .node_mut(leader_index)
+            .fabric_queue_add_replicated(source, "render", b"poison", add.clone(), 0, 3, 100)
+            .unwrap();
+        assert!(!pending_add.enqueued);
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_add_replicated(source, "render", b"poison", add, 0, 3, 100)
+                .unwrap()
+                .enqueued
+        );
+
+        let pending_lease = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated(source, "worker-a", "dlq-acquire-1", 0, 3, 200)
+            .unwrap();
+        assert_eq!(pending_lease.mutation_sequence, Some(2));
+        cluster.run_rounds(12);
+        let delivery = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated(source, "worker-a", "dlq-acquire-1", 0, 3, 200)
+            .unwrap()
+            .delivery
+            .expect("source delivery must commit");
+        assert_eq!(delivery.lease_token, 1);
+
+        // Terminal NACK first replicates the target payload. Source metadata is
+        // untouched until that payload has reached quorum.
+        let first_dlq = cluster
+            .node_mut(leader_index)
+            .fabric_queue_nack_replicated(
+                source,
+                1,
+                "worker-a",
+                delivery.queue_epoch,
+                delivery.lease_token,
+                "dlq-nack-1",
+                0,
+                Some("poison"),
+                0,
+                3,
+                250,
+            )
+            .unwrap();
+        assert_eq!(first_dlq.mutation_sequence, None);
+        assert!(first_dlq.result.is_none());
+
+        let source_before_target_commit = cluster
+            .node_mut(leader_index)
+            .fabric_queue_info_replicated(source)
+            .unwrap();
+        assert_eq!(source_before_target_commit.active, 1);
+        assert_eq!(source_before_target_commit.dead_lettered, 0);
+
+        cluster.run_rounds(12);
+
+        // This is the crash-safe handoff window: target is durable, source is
+        // still Active. Restart/retry can only move forward from here.
+        let source_after_target_commit = cluster
+            .node_mut(leader_index)
+            .fabric_queue_info_replicated(source)
+            .unwrap();
+        let target_after_target_commit = cluster
+            .node_mut(leader_index)
+            .fabric_queue_info_replicated(target)
+            .unwrap();
+        assert_eq!(source_after_target_commit.active, 1);
+        assert_eq!(source_after_target_commit.dead_lettered, 0);
+        assert_eq!(target_after_target_commit.total, 1);
+        assert_eq!(target_after_target_commit.waiting, 1);
+
+        let source_terminal_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_nack_replicated(
+                source,
+                1,
+                "worker-a",
+                delivery.queue_epoch,
+                delivery.lease_token,
+                "dlq-nack-1",
+                0,
+                Some("poison"),
+                0,
+                3,
+                250,
+            )
+            .unwrap();
+        assert_eq!(source_terminal_pending.mutation_sequence, Some(3));
+        assert!(source_terminal_pending.result.is_none());
+
+        let retry_source_terminal = cluster
+            .node_mut(leader_index)
+            .fabric_queue_nack_replicated(
+                source,
+                1,
+                "worker-a",
+                delivery.queue_epoch,
+                delivery.lease_token,
+                "dlq-nack-1",
+                0,
+                Some("poison"),
+                0,
+                3,
+                250,
+            )
+            .unwrap();
+        assert_eq!(retry_source_terminal.mutation_sequence, Some(3));
+        assert!(retry_source_terminal.resumed);
+        assert!(retry_source_terminal.result.is_none());
+
+        cluster.run_rounds(12);
+        let source_terminal = cluster
+            .node_mut(leader_index)
+            .fabric_queue_nack_replicated(
+                source,
+                1,
+                "worker-a",
+                delivery.queue_epoch,
+                delivery.lease_token,
+                "dlq-nack-1",
+                0,
+                Some("poison"),
+                0,
+                3,
+                250,
+            )
+            .unwrap();
+        assert_eq!(
+            source_terminal.result.expect("source terminalization must commit").status,
+            FabricQueueJobStatus::DeadLettered
+        );
+
+        // Add a second poison job and let its lease expire. The reaper must use
+        // the same target-first handoff rather than terminalizing locally.
+        let add2 = FabricQueueAddOptions {
+            job_id: Some("poison-2".to_string()),
+            priority: 3,
+            delay_ms: 0,
+        };
+        let pending_add2 = cluster
+            .node_mut(leader_index)
+            .fabric_queue_add_replicated(source, "render", b"poison-2", add2.clone(), 0, 3, 1_000)
+            .unwrap();
+        assert!(!pending_add2.enqueued);
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_add_replicated(
+                    source,
+                    "render",
+                    b"poison-2",
+                    add2,
+                    0,
+                    3,
+                    1_000,
+                )
+                .unwrap()
+                .enqueued
+        );
+
+        let pending_lease2 = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated(source, "worker-b", "dlq-acquire-2", 0, 3, 1_000)
+            .unwrap();
+        assert_eq!(pending_lease2.mutation_sequence, Some(4));
+        cluster.run_rounds(12);
+        let delivery2 = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated(source, "worker-b", "dlq-acquire-2", 0, 3, 1_000)
+            .unwrap()
+            .delivery
+            .expect("second source delivery must commit");
+        assert_eq!(delivery2.lease_until_ms, 1_100);
+
+        let expiry_target_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reap_expired_replicated(source, 0, 3, 1_100)
+            .unwrap();
+        assert_eq!(expiry_target_pending.mutation_sequence, None);
+        assert_eq!(expiry_target_pending.expired_sequence, Some(2));
+        assert!(expiry_target_pending.result.is_none());
+
+        cluster.run_rounds(12);
+        let source_during_expiry_handoff = cluster
+            .node_mut(leader_index)
+            .fabric_queue_info_replicated(source)
+            .unwrap();
+        let target_two = cluster
+            .node_mut(leader_index)
+            .fabric_queue_info_replicated(target)
+            .unwrap();
+        assert_eq!(source_during_expiry_handoff.active, 1);
+        assert_eq!(source_during_expiry_handoff.dead_lettered, 1);
+        assert_eq!(target_two.total, 2);
+
+        let expiry_source_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reap_expired_replicated(source, 0, 3, 1_100)
+            .unwrap();
+        assert_eq!(expiry_source_pending.mutation_sequence, Some(5));
+        assert!(expiry_source_pending.result.is_none());
+        cluster.run_rounds(12);
+        let expiry_done = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reap_expired_replicated(source, 0, 3, 1_100)
+            .unwrap();
+        assert_eq!(
+            expiry_done.result.expect("expiry terminalization must commit").status,
+            FabricQueueJobStatus::DeadLettered
+        );
+
+        for index in 0..3 {
+            let source_info = cluster
+                .node_mut(index)
+                .fabric_queue_info_replicated(source)
+                .unwrap();
+            let target_info = cluster
+                .node_mut(index)
+                .fabric_queue_info_replicated(target)
+                .unwrap();
+            assert_eq!(source_info.total, 2);
+            assert_eq!(source_info.active, 0);
+            assert_eq!(source_info.dead_lettered, 2);
+            assert_eq!(target_info.total, 2);
+            assert_eq!(target_info.waiting, 2);
+
+            let target_records = cluster
+                .node_mut(index)
+                .fabric_stream_read_committed(&queue_stream_name(target), 1, 2)
+                .unwrap();
+            assert_eq!(target_records.len(), 2);
+            let first = decode_queue_envelope_bytes(&target_records[0].payload).unwrap();
+            let second = decode_queue_envelope_bytes(&target_records[1].payload).unwrap();
+            assert_eq!(first.job_id.as_deref(), Some("__dlq:dlq-source:1"));
+            assert_eq!(first.name, "render");
+            assert_eq!(first.payload, b"poison");
+            assert_eq!(first.priority, 7);
+            assert_eq!(second.job_id.as_deref(), Some("__dlq:dlq-source:2"));
+            assert_eq!(second.payload, b"poison-2");
+        }
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn installed_policy_request_must_match_partition_and_replication_factor() {
         let policy = sample_policy();
         assert!(validate_requested_policy(&policy, 0, 3).is_ok());
