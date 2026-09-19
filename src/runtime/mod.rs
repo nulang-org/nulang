@@ -12,6 +12,7 @@ use tracing::warn;
 
 mod actor;
 pub mod cache;
+pub mod cache_routing;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
@@ -83,6 +84,7 @@ mod tests;
 
 pub use actor::*;
 pub use cache::*;
+pub use cache_routing::*;
 pub use callbacks::RuntimeVmCallbacks;
 pub(crate) use callbacks::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks};
 pub use cluster::*;
