@@ -45,6 +45,15 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Runtime actor behavior ownership — 2026-09-18
+- **Ordinary bytecode behavior IDs are now valid only for the actor schema
+  that owns them** (`src/runtime/behavior_ownership.rs`,
+  `src/runtime/mod.rs`). Runtime delivery no longer treats a module-global
+  behavior table entry as callable by every actor in the module.
+- Name-based lookup is constrained to the target actor schema; workflow/local
+  behavior translation remains schema-aware, virtual actors resolve
+  `Type@key` through their declared `Type`, and native/manual actors retain
+  their existing native behavior-table semantics.
 ### Runtime actor schema identity preservation — 2026-09-18
 - **Module-spawned actors retain their canonical `ActorMeta.name` schema
   identity** (`src/runtime/spawn.rs`) instead of discarding it in favor of
