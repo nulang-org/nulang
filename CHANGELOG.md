@@ -177,6 +177,19 @@ two major versions.*
   new operations fail closed rather than evicting still-retryable records.
   Deterministic partition tests cover automatic recovery, terminal timeout, and
   preservation of migration source data until a matching application ACK.
+- **Exact-epoch remote migration convergence probes** (Experimental,
+  `src/runtime/cache_transport.rs`, `src/runtime/cache_server.rs`). The
+  source controller can query the importing target through the same
+  authenticated/retried NUL0 cache envelope and receive reactor-local
+  convergence state: live slot entries, active import fences, cumulative
+  import conflicts, and wrong-slot observations. Probe requests are
+  request-id correlated and reuse the retry/replay protections above. The
+  source combines the target response with a fresh source-reactor live-entry
+  count; `CacheRemoteMigrationConvergence::ready_for_live_commit` requires an
+  exact accepted target probe, a drained source, and zero target conflict or
+  wrong-slot history before ownership publication. The gate is deliberately
+  scoped to a live controller: reconstructing proof after controller/process
+  restart still requires persisted migration intent and ACK history.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.

@@ -65,6 +65,11 @@ pub enum CacheNetworkTimeoutOperation {
         placement_epoch: u64,
         slot: u16,
     },
+    MigrationProbe {
+        probe_id: u64,
+        placement_epoch: u64,
+        slot: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +215,73 @@ enum CacheRemoteControlError {
     Parse(RespParseError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheMigrationProbeSnapshot {
+    live_entries: usize,
+    import_fences: usize,
+    conflicts: u64,
+    wrong_slot: u64,
+}
+
+#[derive(Debug)]
+struct CacheTransferImportState {
+    tracker: CacheTransferImportTracker,
+    conflicts: u64,
+    wrong_slot: u64,
+}
+
+impl CacheTransferImportState {
+    fn new(slot: u16) -> Self {
+        Self {
+            tracker: CacheTransferImportTracker::new(slot),
+            conflicts: 0,
+            wrong_slot: 0,
+        }
+    }
+
+    fn import_batch(
+        &mut self,
+        store: &mut CacheStore,
+        batch: &CacheTransferBatch,
+        elapsed_ms: u64,
+        now_ms: u64,
+    ) -> Vec<CacheTransferImport> {
+        batch
+            .entries
+            .iter()
+            .map(|entry| {
+                let result = self
+                    .tracker
+                    .import_entry(store, entry, elapsed_ms, now_ms);
+                match result {
+                    CacheTransferImport::Conflict => {
+                        self.conflicts = self.conflicts.saturating_add(1);
+                    }
+                    CacheTransferImport::WrongSlot => {
+                        self.wrong_slot = self.wrong_slot.saturating_add(1);
+                    }
+                    _ => {}
+                }
+                result
+            })
+            .collect()
+    }
+
+    fn snapshot(
+        &self,
+        store: &CacheStore,
+        slot: u16,
+        now_ms: u64,
+    ) -> CacheMigrationProbeSnapshot {
+        CacheMigrationProbeSnapshot {
+            live_entries: store.live_entries_in_slot(slot, now_ms),
+            import_fences: self.tracker.len(),
+            conflicts: self.conflicts,
+            wrong_slot: self.wrong_slot,
+        }
+    }
+}
+
 enum CacheShardControlRequest {
     ExecuteRemoteCommand {
         placement_epoch: u64,
@@ -221,6 +293,13 @@ enum CacheShardControlRequest {
         placement_epoch: u64,
         batch: CacheTransferBatch,
         reply: SyncSender<Result<Vec<CacheTransferImport>, CacheRemoteControlError>>,
+    },
+    MigrationProbe {
+        placement_epoch: u64,
+        slot: u16,
+        source: CacheShardOwner,
+        target: CacheShardOwner,
+        reply: SyncSender<Result<CacheMigrationProbeSnapshot, CacheRemoteControlError>>,
     },
     Export {
         slot: u16,
@@ -311,6 +390,34 @@ impl CacheRemoteTransferReport {
 
     pub fn restart_scan_required(&self) -> bool {
         self.stale_source_versions != 0 || self.conflicts != 0 || self.wrong_slot != 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheRemoteMigrationConvergence {
+    pub probe_id: u64,
+    pub placement_epoch: u64,
+    pub slot: u16,
+    pub source: CacheShardOwner,
+    pub target: CacheShardOwner,
+    pub target_accepted: bool,
+    pub source_remaining: usize,
+    pub target_live_entries: u64,
+    pub target_import_fences: u64,
+    pub target_conflicts: u64,
+    pub target_wrong_slot: u64,
+}
+
+impl CacheRemoteMigrationConvergence {
+    /// Safe live-controller gate before publishing the ownership commit.
+    ///
+    /// This does not reconstruct lost controller history after process restart;
+    /// persisted migration intent/ACK state is required for restart recovery.
+    pub fn ready_for_live_commit(&self) -> bool {
+        self.target_accepted
+            && self.source_remaining == 0
+            && self.target_conflicts == 0
+            && self.target_wrong_slot == 0
     }
 }
 
@@ -420,6 +527,7 @@ pub enum CacheServiceError {
     RemoteTransferTargetMustBeRemote,
     RemoteTransferNotActive(u16),
     RemoteTransferAckMismatch,
+    RemoteMigrationProbeMismatch,
     ShardServer {
         shard: u16,
         source: CacheServerError,
@@ -835,6 +943,100 @@ impl CacheServiceHandle {
         Ok(())
     }
 
+    /// Probe the target reactor for exact-epoch migration convergence state.
+    pub fn send_remote_migration_probe(
+        &self,
+        source_shard: u16,
+        target: CacheShardOwner,
+        slot: u16,
+        probe_id: u64,
+    ) -> Result<(), CacheServiceError> {
+        if target.node_id == self.local_node_id {
+            return Err(CacheServiceError::RemoteTransferTargetMustBeRemote);
+        }
+        let placement = self.placement_publisher.snapshot();
+        let source = CacheShardOwner {
+            node_id: self.local_node_id,
+            shard: source_shard,
+        };
+        let Some(migration) = placement.migration_for_slot(slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(slot));
+        };
+        if migration.source != source || migration.target != target {
+            return Err(CacheServiceError::RemoteTransferNotActive(slot));
+        }
+
+        self.send_network_message(
+            NodeId(target.node_id),
+            CacheTransportMessage::MigrationProbeRequest {
+                probe_id,
+                placement_epoch: placement.epoch(),
+                source,
+                target,
+                slot,
+            },
+        )
+    }
+
+    /// Combine a target convergence response with a fresh source-reactor count.
+    pub fn complete_remote_migration_probe(
+        &self,
+        event: &CacheTransportInbound,
+    ) -> Result<CacheRemoteMigrationConvergence, CacheServiceError> {
+        let CacheTransportMessage::MigrationProbeResponse {
+            probe_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+            accepted,
+            live_entries,
+            import_fences,
+            conflicts,
+            wrong_slot,
+        } = &event.message
+        else {
+            return Err(CacheServiceError::RemoteMigrationProbeMismatch);
+        };
+
+        if source.node_id != self.local_node_id || event.from_node.0 != target.node_id {
+            return Err(CacheServiceError::RemoteMigrationProbeMismatch);
+        }
+
+        let placement = self.placement_publisher.snapshot();
+        if placement.epoch() != *placement_epoch
+            || placement
+                .migration_for_slot(*slot)
+                .is_none_or(|migration| migration.source != *source || migration.target != *target)
+        {
+            return Err(CacheServiceError::RemoteMigrationProbeMismatch);
+        }
+
+        let source_control = self.transfer_control(source.shard)?;
+        let (count_tx, count_rx) = mpsc::sync_channel(1);
+        source_control.request_control(CacheShardControlRequest::CountSlot {
+            slot: *slot,
+            reply: count_tx,
+        })?;
+        let source_remaining = count_rx
+            .recv()
+            .map_err(|_| CacheServiceError::ControlDisconnected(source.shard))?;
+
+        Ok(CacheRemoteMigrationConvergence {
+            probe_id: *probe_id,
+            placement_epoch: *placement_epoch,
+            slot: *slot,
+            source: *source,
+            target: *target,
+            target_accepted: *accepted,
+            source_remaining,
+            target_live_entries: *live_entries,
+            target_import_fences: *import_fences,
+            target_conflicts: *conflicts,
+            target_wrong_slot: *wrong_slot,
+        })
+    }
+
     /// Export one bounded source batch and send it to a remote migration target.
     ///
     /// Completion is application-level: callers wait for the matching
@@ -1246,6 +1448,7 @@ impl Drop for CacheServiceHandle {
 enum CacheNetworkPendingKey {
     Command { peer: u64, request_id: u64 },
     Transfer { peer: u64, transfer_id: u64 },
+    MigrationProbe { peer: u64, probe_id: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -1318,6 +1521,12 @@ fn cache_pending_key(
                 transfer_id: *transfer_id,
             })
         }
+        CacheTransportMessage::MigrationProbeRequest { probe_id, .. } => {
+            Some(CacheNetworkPendingKey::MigrationProbe {
+                peer: peer.0,
+                probe_id: *probe_id,
+            })
+        }
         _ => None,
     }
 }
@@ -1337,6 +1546,12 @@ fn cache_completion_key(
             Some(CacheNetworkPendingKey::Transfer {
                 peer: peer.0,
                 transfer_id: *transfer_id,
+            })
+        }
+        CacheTransportMessage::MigrationProbeResponse { probe_id, .. } => {
+            Some(CacheNetworkPendingKey::MigrationProbe {
+                peer: peer.0,
+                probe_id: *probe_id,
             })
         }
         _ => None,
@@ -1364,6 +1579,16 @@ fn cache_timeout_for_pending(pending: &CacheNetworkPending) -> CacheNetworkTimeo
             transfer_id: *transfer_id,
             placement_epoch: *placement_epoch,
             slot: batch.slot,
+        },
+        CacheTransportMessage::MigrationProbeRequest {
+            probe_id,
+            placement_epoch,
+            slot,
+            ..
+        } => CacheNetworkTimeoutOperation::MigrationProbe {
+            probe_id: *probe_id,
+            placement_epoch: *placement_epoch,
+            slot: *slot,
         },
         _ => unreachable!("only request messages enter retry state"),
     };
@@ -1422,6 +1647,7 @@ fn retry_cache_network_pending(
 enum CacheNetworkDedupeKey {
     Command { peer: u64, request_id: u64 },
     Transfer { peer: u64, transfer_id: u64 },
+    MigrationProbe { peer: u64, probe_id: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -1568,6 +1794,12 @@ fn run_cache_network_coordinator(
                         transfer_id: *transfer_id,
                     })
                 }
+                CacheTransportMessage::MigrationProbeRequest { probe_id, .. } => {
+                    Some(CacheNetworkDedupeKey::MigrationProbe {
+                        peer: inbound.from_node.0,
+                        probe_id: *probe_id,
+                    })
+                }
                 _ => None,
             };
             let fingerprint = cache_message_fingerprint(&inbound.message);
@@ -1702,8 +1934,55 @@ fn handle_cache_network_inbound(
             );
             return Some(reply);
         }
+        CacheTransportMessage::MigrationProbeRequest {
+            probe_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+        } => {
+            let snapshot = probe_remote_migration_on_reactor(
+                controls,
+                target,
+                placement_epoch,
+                slot,
+                source,
+            );
+            let (accepted, live_entries, import_fences, conflicts, wrong_slot) =
+                match snapshot {
+                    Some(snapshot) => (
+                        true,
+                        snapshot.live_entries.min(u64::MAX as usize) as u64,
+                        snapshot.import_fences.min(u64::MAX as usize) as u64,
+                        snapshot.conflicts,
+                        snapshot.wrong_slot,
+                    ),
+                    None => (false, 0, 0, 0, 0),
+                };
+            let reply = CacheTransportMessage::MigrationProbeResponse {
+                probe_id,
+                placement_epoch,
+                source,
+                target,
+                slot,
+                accepted,
+                live_entries,
+                import_fences,
+                conflicts,
+                wrong_slot,
+            };
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: from_node,
+                    message: reply.clone(),
+                },
+            );
+            return Some(reply);
+        }
         message @ (CacheTransportMessage::CommandResponse { .. }
-        | CacheTransportMessage::TransferAck { .. }) => {
+        | CacheTransportMessage::TransferAck { .. }
+        | CacheTransportMessage::MigrationProbeResponse { .. }) => {
             let completion = cache_completion_key(from_node, &message);
             match network_event_tx.try_send(CacheTransportInbound { from_node, message }) {
                 Ok(()) => {
@@ -1784,6 +2063,34 @@ fn reject_cache_network_inbound(
             );
             return Some(reply);
         }
+        CacheTransportMessage::MigrationProbeRequest {
+            probe_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+        } if target.node_id == local_node_id => {
+            let reply = CacheTransportMessage::MigrationProbeResponse {
+                probe_id,
+                placement_epoch,
+                source,
+                target,
+                slot,
+                accepted: false,
+                live_entries: 0,
+                import_fences: 0,
+                conflicts: 0,
+                wrong_slot: 0,
+            };
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: reply.clone(),
+                },
+            );
+            return Some(reply);
+        }
         _ => {}
     }
     None
@@ -1838,6 +2145,32 @@ fn reject_cache_network_id_reuse(
                 },
             );
         }
+        CacheTransportMessage::MigrationProbeRequest {
+            probe_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+        } if target.node_id == local_node_id => {
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: CacheTransportMessage::MigrationProbeResponse {
+                        probe_id,
+                        placement_epoch,
+                        source,
+                        target,
+                        slot,
+                        accepted: false,
+                        live_entries: 0,
+                        import_fences: 0,
+                        conflicts: 0,
+                        wrong_slot: 0,
+                    },
+                },
+            );
+        }
         _ => {}
     }
 }
@@ -1887,6 +2220,32 @@ fn reject_cache_network_saturated(
                         target,
                         slot: batch.slot,
                         results: vec![CacheTransferImport::Conflict; batch.entries.len()],
+                    },
+                },
+            );
+        }
+        CacheTransportMessage::MigrationProbeRequest {
+            probe_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+        } if target.node_id == local_node_id => {
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: CacheTransportMessage::MigrationProbeResponse {
+                        probe_id,
+                        placement_epoch,
+                        source,
+                        target,
+                        slot,
+                        accepted: false,
+                        live_entries: 0,
+                        import_fences: 0,
+                        conflicts: 0,
+                        wrong_slot: 0,
                     },
                 },
             );
@@ -1948,6 +2307,30 @@ fn import_remote_batch_on_reactor(
         .ok()?;
     match reply_rx.recv_timeout(CACHE_NETWORK_CONTROL_TIMEOUT) {
         Ok(Ok(results)) => Some(results),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+fn probe_remote_migration_on_reactor(
+    controls: &[CacheShardServerControl],
+    target: CacheShardOwner,
+    placement_epoch: u64,
+    slot: u16,
+    source: CacheShardOwner,
+) -> Option<CacheMigrationProbeSnapshot> {
+    let control = controls.get(target.shard as usize)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    control
+        .request_control(CacheShardControlRequest::MigrationProbe {
+            placement_epoch,
+            slot,
+            source,
+            target,
+            reply: reply_tx,
+        })
+        .ok()?;
+    match reply_rx.recv_timeout(CACHE_NETWORK_CONTROL_TIMEOUT) {
+        Ok(Ok(snapshot)) => Some(snapshot),
         Ok(Err(_)) | Err(_) => None,
     }
 }
@@ -2053,7 +2436,7 @@ pub struct CacheShardServer {
     applied_placement_epoch: Arc<AtomicU64>,
     control_tx: SyncSender<CacheShardControlRequest>,
     control_rx: Receiver<CacheShardControlRequest>,
-    transfer_imports: HashMap<u16, CacheTransferImportTracker>,
+    transfer_imports: HashMap<u16, CacheTransferImportState>,
 }
 
 impl CacheShardServer {
@@ -2283,6 +2666,21 @@ impl CacheShardServer {
             } => {
                 let _ = reply.send(self.import_remote_batch(placement_epoch, &batch, now_ms));
             }
+            CacheShardControlRequest::MigrationProbe {
+                placement_epoch,
+                slot,
+                source,
+                target,
+                reply,
+            } => {
+                let _ = reply.send(self.probe_remote_migration(
+                    placement_epoch,
+                    slot,
+                    source,
+                    target,
+                    now_ms,
+                ));
+            }
             CacheShardControlRequest::Export {
                 slot,
                 cursor,
@@ -2296,15 +2694,12 @@ impl CacheShardServer {
             }
             CacheShardControlRequest::Import { batch, reply } => {
                 let elapsed_ms = now_ms.saturating_sub(batch.exported_at_ms);
-                let tracker = self
+                let state = self
                     .transfer_imports
                     .entry(batch.slot)
-                    .or_insert_with(|| CacheTransferImportTracker::new(batch.slot));
-                let results = batch
-                    .entries
-                    .iter()
-                    .map(|entry| tracker.import_entry(&mut self.store, entry, elapsed_ms, now_ms))
-                    .collect();
+                    .or_insert_with(|| CacheTransferImportState::new(batch.slot));
+                let results =
+                    state.import_batch(&mut self.store, &batch, elapsed_ms, now_ms);
                 let _ = reply.send(results);
             }
             CacheShardControlRequest::Finalize { entries, reply } => {
@@ -2386,19 +2781,53 @@ impl CacheShardServer {
             return Err(CacheRemoteControlError::OwnerMismatch);
         }
 
-        let tracker = self
+        let state = self
             .transfer_imports
             .entry(batch.slot)
-            .or_insert_with(|| CacheTransferImportTracker::new(batch.slot));
+            .or_insert_with(|| CacheTransferImportState::new(batch.slot));
 
         // Monotonic cache clocks are process-local. The source has already
         // reduced TTL for time spent before transport; cross-node wire time is
         // deliberately not inferred from unrelated clock origins.
-        Ok(batch
-            .entries
-            .iter()
-            .map(|entry| tracker.import_entry(&mut self.store, entry, 0, now_ms))
-            .collect())
+        Ok(state.import_batch(&mut self.store, batch, 0, now_ms))
+    }
+
+    fn probe_remote_migration(
+        &mut self,
+        placement_epoch: u64,
+        slot: u16,
+        source: CacheShardOwner,
+        target: CacheShardOwner,
+        now_ms: u64,
+    ) -> Result<CacheMigrationProbeSnapshot, CacheRemoteControlError> {
+        let placement = self.dispatcher.placement();
+        if placement.epoch() != placement_epoch {
+            return Err(CacheRemoteControlError::TopologyChanged {
+                installed_epoch: placement.epoch(),
+                requested_epoch: placement_epoch,
+            });
+        }
+
+        let local = CacheShardOwner {
+            node_id: self.dispatcher.local_node_id(),
+            shard: self.dispatcher.local_shard(),
+        };
+        let Some(migration) = placement.migration_for_slot(slot) else {
+            return Err(CacheRemoteControlError::OwnerMismatch);
+        };
+        if local != target || migration.source != source || migration.target != target {
+            return Err(CacheRemoteControlError::OwnerMismatch);
+        }
+
+        Ok(match self.transfer_imports.get(&slot) {
+            Some(state) => state.snapshot(&self.store, slot, now_ms),
+            None => CacheMigrationProbeSnapshot {
+                live_entries: self.store.live_entries_in_slot(slot, now_ms),
+                import_fences: 0,
+                conflicts: 0,
+                wrong_slot: 0,
+            },
+        })
     }
 
     fn install_published_placement(&mut self) {
@@ -3093,6 +3522,34 @@ mod tests {
 
         let now = server.clock.now_ms();
         assert!(server.store_mut().get(b"ttl", now).is_none());
+    }
+
+    #[test]
+    fn migration_probe_state_remembers_target_conflicts() {
+        let key = b"k{probe-conflict}";
+        let slot = super::super::cache::redis_slot(key);
+        let mut source_store = CacheStore::new();
+        source_store.set_bytes(key, b"source", None, 0);
+        let batch = source_store.export_slot_batch(slot, None, 8, 0);
+
+        let mut target_store = CacheStore::new();
+        let mut state = CacheTransferImportState::new(slot);
+        assert_eq!(
+            state.import_batch(&mut target_store, &batch, 0, 0),
+            vec![CacheTransferImport::Imported]
+        );
+
+        target_store.set_bytes(key, b"client", None, 1);
+        assert_eq!(
+            state.import_batch(&mut target_store, &batch, 0, 1),
+            vec![CacheTransferImport::Conflict]
+        );
+
+        let snapshot = state.snapshot(&target_store, slot, 1);
+        assert_eq!(snapshot.live_entries, 1);
+        assert_eq!(snapshot.import_fences, 1);
+        assert_eq!(snapshot.conflicts, 1);
+        assert_eq!(snapshot.wrong_slot, 0);
     }
 
     #[test]

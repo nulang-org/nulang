@@ -25,6 +25,8 @@ const KIND_COMMAND_REQUEST: u8 = 1;
 const KIND_COMMAND_RESPONSE: u8 = 2;
 const KIND_TRANSFER_BATCH: u8 = 3;
 const KIND_TRANSFER_ACK: u8 = 4;
+const KIND_MIGRATION_PROBE_REQUEST: u8 = 5;
+const KIND_MIGRATION_PROBE_RESPONSE: u8 = 6;
 
 pub const MAX_CACHE_TRANSPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CACHE_COMMAND_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -61,6 +63,25 @@ pub enum CacheTransportMessage {
         slot: u16,
         results: Vec<CacheTransferImport>,
     },
+    MigrationProbeRequest {
+        probe_id: u64,
+        placement_epoch: u64,
+        source: CacheShardOwner,
+        target: CacheShardOwner,
+        slot: u16,
+    },
+    MigrationProbeResponse {
+        probe_id: u64,
+        placement_epoch: u64,
+        source: CacheShardOwner,
+        target: CacheShardOwner,
+        slot: u16,
+        accepted: bool,
+        live_entries: u64,
+        import_fences: u64,
+        conflicts: u64,
+        wrong_slot: u64,
+    },
 }
 
 impl CacheTransportMessage {
@@ -76,6 +97,12 @@ impl CacheTransportMessage {
                 placement_epoch, ..
             }
             | Self::TransferAck {
+                placement_epoch, ..
+            }
+            | Self::MigrationProbeRequest {
+                placement_epoch, ..
+            }
+            | Self::MigrationProbeResponse {
                 placement_epoch, ..
             } => *placement_epoch,
         }
@@ -162,6 +189,44 @@ impl CacheTransportMessage {
                     out.push(import_result_tag(*result));
                 }
             }
+            Self::MigrationProbeRequest {
+                probe_id,
+                placement_epoch,
+                source,
+                target,
+                slot,
+            } => {
+                out.push(KIND_MIGRATION_PROBE_REQUEST);
+                write_u64(&mut out, *probe_id);
+                write_u64(&mut out, *placement_epoch);
+                write_owner(&mut out, *source);
+                write_owner(&mut out, *target);
+                write_u16(&mut out, *slot);
+            }
+            Self::MigrationProbeResponse {
+                probe_id,
+                placement_epoch,
+                source,
+                target,
+                slot,
+                accepted,
+                live_entries,
+                import_fences,
+                conflicts,
+                wrong_slot,
+            } => {
+                out.push(KIND_MIGRATION_PROBE_RESPONSE);
+                write_u64(&mut out, *probe_id);
+                write_u64(&mut out, *placement_epoch);
+                write_owner(&mut out, *source);
+                write_owner(&mut out, *target);
+                write_u16(&mut out, *slot);
+                out.push(u8::from(*accepted));
+                write_u64(&mut out, *live_entries);
+                write_u64(&mut out, *import_fences);
+                write_u64(&mut out, *conflicts);
+                write_u64(&mut out, *wrong_slot);
+            }
         }
 
         if out.len() > MAX_CACHE_TRANSPORT_BYTES {
@@ -245,6 +310,39 @@ impl CacheTransportMessage {
                     results,
                 }
             }
+            KIND_MIGRATION_PROBE_REQUEST => {
+                Self::MigrationProbeRequest {
+                    probe_id: reader.u64()?,
+                    placement_epoch: reader.u64()?,
+                    source: reader.owner()?,
+                    target: reader.owner()?,
+                    slot: reader.u16()?,
+                }
+            }
+            KIND_MIGRATION_PROBE_RESPONSE => {
+                let probe_id = reader.u64()?;
+                let placement_epoch = reader.u64()?;
+                let source = reader.owner()?;
+                let target = reader.owner()?;
+                let slot = reader.u16()?;
+                let accepted = match reader.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(CacheTransportCodecError::InvalidBoolean(other)),
+                };
+                Self::MigrationProbeResponse {
+                    probe_id,
+                    placement_epoch,
+                    source,
+                    target,
+                    slot,
+                    accepted,
+                    live_entries: reader.u64()?,
+                    import_fences: reader.u64()?,
+                    conflicts: reader.u64()?,
+                    wrong_slot: reader.u64()?,
+                }
+            }
             other => return Err(CacheTransportCodecError::UnknownKind(other)),
         };
         reader.finish()?;
@@ -261,6 +359,8 @@ impl CacheTransportMessage {
             Self::CommandResponse { responder, .. } => responder.node_id,
             Self::TransferBatch { source, .. } => source.node_id,
             Self::TransferAck { target, .. } => target.node_id,
+            Self::MigrationProbeRequest { source, .. } => source.node_id,
+            Self::MigrationProbeResponse { target, .. } => target.node_id,
         };
         if claimed != authenticated_peer.0 {
             return Err(CacheTransportValidationError::SenderMismatch {
@@ -341,6 +441,34 @@ impl CacheTransportMessage {
                 validate_migration(placement, batch.slot, *source, *target)?;
             }
             Self::TransferAck {
+                source,
+                target,
+                slot,
+                ..
+            } => {
+                if source.node_id != local_node_id {
+                    return Err(CacheTransportValidationError::WrongNode {
+                        expected: local_node_id,
+                        received: source.node_id,
+                    });
+                }
+                validate_migration(placement, *slot, *source, *target)?;
+            }
+            Self::MigrationProbeRequest {
+                source,
+                target,
+                slot,
+                ..
+            } => {
+                if target.node_id != local_node_id {
+                    return Err(CacheTransportValidationError::WrongNode {
+                        expected: local_node_id,
+                        received: target.node_id,
+                    });
+                }
+                validate_migration(placement, *slot, *source, *target)?;
+            }
+            Self::MigrationProbeResponse {
                 source,
                 target,
                 slot,
@@ -1080,6 +1208,50 @@ mod tests {
                 received: 0,
             })
         );
+    }
+
+    #[test]
+    fn migration_probe_round_trips_and_authenticates_target_response() {
+        let mut map = CacheSlotMap::new_local(1, 1).unwrap();
+        let slot = redis_slot(b"k{probe}");
+        let source = owner(1, 0);
+        let target = owner(2, 0);
+        map.begin_migration(7, slot, source, target).unwrap();
+
+        let request = CacheTransportMessage::MigrationProbeRequest {
+            probe_id: 44,
+            placement_epoch: 7,
+            source,
+            target,
+            slot,
+        };
+        let encoded = request.to_wire_bytes().unwrap();
+        assert_eq!(
+            CacheTransportMessage::from_wire_bytes(&encoded).unwrap(),
+            request
+        );
+        assert_eq!(request.validate_sender(NodeId(1)), Ok(()));
+        assert_eq!(request.validate_for_node(2, &map), Ok(()));
+
+        let response = CacheTransportMessage::MigrationProbeResponse {
+            probe_id: 44,
+            placement_epoch: 7,
+            source,
+            target,
+            slot,
+            accepted: true,
+            live_entries: 3,
+            import_fences: 3,
+            conflicts: 0,
+            wrong_slot: 0,
+        };
+        let encoded = response.to_wire_bytes().unwrap();
+        assert_eq!(
+            CacheTransportMessage::from_wire_bytes(&encoded).unwrap(),
+            response
+        );
+        assert_eq!(response.validate_sender(NodeId(2)), Ok(()));
+        assert_eq!(response.validate_for_node(1, &map), Ok(()));
     }
 
     #[test]

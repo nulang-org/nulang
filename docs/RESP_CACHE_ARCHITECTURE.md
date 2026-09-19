@@ -239,6 +239,31 @@ with TRYAGAIN/conflict until space becomes safe to reuse. This trades bounded
 availability under extreme retry pressure for a stronger exactly-once replay
 boundary.
 
+Before a live controller publishes a migration commit, it can issue an
+exact-epoch `MigrationProbeRequest` to the importing target. The target
+revalidates the migration on the owning reactor and returns its current live
+slot-entry count, active transfer-import fence count, and cumulative conflict
+and wrong-slot observations. The source combines that reply with a fresh
+source-reactor slot count. `CacheRemoteMigrationConvergence::ready_for_live_commit`
+is true only when the target accepted the exact source/target/epoch tuple, the
+source is fully drained, and the target has observed no import conflict or
+wrong-slot payload.
+
+The probe is an additional commit gate, not a substitute for transfer ACK
+fencing. Source deletion still proves that each removed version had an
+application-level import outcome. Conversely, a target conflict observed after
+an import is retained in migration-local state and blocks the live commit gate
+until the controller reconciles it. Probe request ids use the same bounded
+retry/correlation and target replay machinery as remote command and transfer
+ids.
+
+This convergence report is intentionally **not restart proof**. Import fences,
+conflict counters, and source-controller ACK history are currently in memory.
+A controller or target process restart can therefore erase evidence needed to
+reconstruct why a source is empty. Automated commit after restart must wait for
+a persisted migration journal/checkpoint that records intent, exported batch
+identity, accepted ACKs, and reconciliation state.
+
 The same cluster layer serves topology discovery without touching CacheStore:
 `CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
 topology response, and legacy `CLUSTER SLOTS` is retained for older clients.
@@ -304,12 +329,11 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add explicit source/target convergence probes for migration completion:
-   verify target import state and source drain state before allowing ownership
-   commit, including recovery after controller restart.
-2. Persist or reconstruct in-flight migration controller state so a process
-   restart can safely resume batches without relying on an in-memory pending
-   request record.
+1. Persist in-flight migration intent, exported batch identity, accepted ACKs,
+   source drain state, and target reconciliation state so controller/target
+   restart can safely resume or refuse commit.
+2. Add restart recovery that reconstructs the migration controller from that
+   journal and re-probes both sides before any ownership publication.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 4. Allow topology publication to add/remove advertised remote endpoints without
