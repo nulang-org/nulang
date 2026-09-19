@@ -102,7 +102,9 @@ impl CapacityHeartbeatBook {
         }
 
         if let Some(current) = self.latest.get(&heartbeat.provider_id) {
-            if heartbeat.sequence <= current.sequence {
+            if current.topology_generation == heartbeat.topology_generation
+                && heartbeat.sequence <= current.sequence
+            {
                 return Err(HeartbeatError::StaleSequence {
                     provider: heartbeat.provider_id.clone(),
                     observed: heartbeat.sequence,
@@ -123,11 +125,13 @@ impl CapacityHeartbeatBook {
     pub fn is_schedulable(
         &self,
         provider_id: &str,
+        topology_generation: u64,
         now_unix_ms: u64,
         max_age_ms: u64,
     ) -> bool {
         self.latest.get(provider_id).is_some_and(|heartbeat| {
-            heartbeat.status == CapacityProviderStatus::Ready
+            heartbeat.topology_generation == topology_generation
+                && heartbeat.status == CapacityProviderStatus::Ready
                 && now_unix_ms.saturating_sub(heartbeat.observed_at_unix_ms) <= max_age_ms
         })
     }
@@ -148,6 +152,7 @@ pub fn live_allocation_candidates<'a>(
     candidates.retain(|candidate| {
         heartbeats.is_schedulable(
             &candidate.provider.id,
+            topology.generation,
             now_unix_ms,
             max_heartbeat_age_ms,
         )
@@ -216,6 +221,14 @@ pub enum AllocationError {
     ZeroResource(ResourceClass),
     #[error("allocation id {0} is already committed with different contents")]
     AllocationIdConflict(String),
+    #[error(
+        "consumer {consumer} placement token {placement_token} is already bound to allocation {existing_allocation_id}"
+    )]
+    PlacementTokenConflict {
+        consumer: String,
+        placement_token: String,
+        existing_allocation_id: String,
+    },
     #[error("provider {0} does not exist in the current topology")]
     UnknownProvider(String),
     #[error("provider {0} is disabled")]
@@ -309,6 +322,17 @@ impl AllocationLedgerSnapshot {
             return Err(AllocationError::AllocationIdConflict(
                 request.allocation.allocation_id.clone(),
             ));
+        }
+
+        if let Some(existing) = self.allocations.values().find(|existing| {
+            existing.consumer_id == request.allocation.consumer_id
+                && existing.placement_token == request.allocation.placement_token
+        }) {
+            return Err(AllocationError::PlacementTokenConflict {
+                consumer: request.allocation.consumer_id.clone(),
+                placement_token: request.allocation.placement_token.clone(),
+                existing_allocation_id: existing.allocation_id.clone(),
+            });
         }
 
         if request.topology_generation != topology.generation {
@@ -612,6 +636,25 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_sequence_can_restart_after_topology_generation_changes() {
+        let mut topology = topology();
+        let mut book = CapacityHeartbeatBook::default();
+        book.apply(
+            &topology,
+            heartbeat(99, CapacityProviderStatus::Ready, 0),
+        )
+        .unwrap();
+
+        topology.generation = 10;
+        let mut next_generation = heartbeat(1, CapacityProviderStatus::Ready, 0);
+        next_generation.topology_generation = 10;
+        book.apply(&topology, next_generation).unwrap();
+
+        assert!(book.is_schedulable("host-a", 10, 1_000, 50));
+        assert!(!book.is_schedulable("host-a", 9, 1_000, 50));
+    }
+
+    #[test]
     fn live_candidates_fail_closed_on_draining_or_stale_provider() {
         let topology = topology();
         let ledger = AllocationLedgerSnapshot::default();
@@ -680,6 +723,40 @@ mod tests {
             Err(AllocationError::GenerationMismatch {
                 expected: 1,
                 current: 2
+            })
+        );
+    }
+
+    #[test]
+    fn placement_token_cannot_reserve_twice_under_different_allocation_ids() {
+        let topology = topology();
+        let mut ledger = AllocationLedgerSnapshot::default();
+        ledger
+            .commit(
+                &topology,
+                &AllocationCommitRequest {
+                    expected_ledger_generation: 1,
+                    topology_generation: 9,
+                    allocation: allocation("alloc-1", 500),
+                },
+            )
+            .unwrap();
+
+        let mut duplicate = allocation("alloc-2", 500);
+        duplicate.placement_token = "token-alloc-1".into();
+        assert_eq!(
+            ledger.commit(
+                &topology,
+                &AllocationCommitRequest {
+                    expected_ledger_generation: 2,
+                    topology_generation: 9,
+                    allocation: duplicate,
+                }
+            ),
+            Err(AllocationError::PlacementTokenConflict {
+                consumer: "actor:orders:42".into(),
+                placement_token: "token-alloc-1".into(),
+                existing_allocation_id: "alloc-1".into()
             })
         );
     }
