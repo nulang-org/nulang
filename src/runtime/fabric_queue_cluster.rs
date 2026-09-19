@@ -15,8 +15,9 @@ use std::io;
 use serde::{Deserialize, Serialize};
 
 use super::fabric_queue::{
-    decode_queue_created_mutation, encode_queue_created_mutation,
-    queue_mutation_stream_name, queue_stream_name, validate_queue_name, FabricQueueConfig,
+    decode_queue_created_mutation, decode_queue_envelope_bytes, encode_queue_created_mutation,
+    encode_queue_envelope, queue_mutation_stream_name, queue_stream_name, validate_queue_name,
+    FabricQueueAddOptions, FabricQueueConfig,
 };
 use super::fabric_stream::{
     FabricStreamReplicationPolicy, FABRIC_STREAM_INITIAL_EPOCH,
@@ -85,6 +86,15 @@ pub struct FabricQueueReplicatedCreateResult {
     pub mutation_sequence: Option<u64>,
     pub replication: Option<FabricStreamReplicationStatus>,
     pub created: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FabricQueueReplicatedAddResult {
+    pub policy: FabricQueuePolicySyncReport,
+    pub sequence: Option<u64>,
+    pub replication: Option<FabricStreamReplicationStatus>,
+    pub deduplicated: bool,
+    pub enqueued: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -492,6 +502,133 @@ impl Runtime {
             replication: Some(appended.status),
             created: appended.status.committed,
         })
+    }
+
+    /// Replicate one immutable queue payload. A job becomes consumer-visible
+    /// only after its payload sequence is quorum committed.
+    ///
+    /// Supplying a stable job_id makes retries idempotent: an existing raw
+    /// payload record with that id is resumed and its durable replication
+    /// intent is retried instead of appending a duplicate record.
+    pub fn fabric_queue_add_replicated(
+        &mut self,
+        queue: &str,
+        name: &str,
+        payload: &[u8],
+        options: FabricQueueAddOptions,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAddResult> {
+        let policy =
+            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        if !policy.ready {
+            return Ok(FabricQueueReplicatedAddResult {
+                policy,
+                sequence: None,
+                replication: None,
+                deduplicated: false,
+                enqueued: false,
+            });
+        }
+
+        self.fabric_queue_require_committed_creation(queue)?;
+        let payload_stream = queue_stream_name(queue);
+
+        if let Some(job_id) = options.job_id.as_deref() {
+            let mut next = 1u64;
+            let mut found = None;
+            loop {
+                let records = self.fabric_stream_read(&payload_stream, next, 1024)?;
+                if records.is_empty() {
+                    break;
+                }
+                for record in &records {
+                    let envelope = decode_queue_envelope_bytes(&record.payload)?;
+                    if envelope.job_id.as_deref() == Some(job_id) {
+                        if found.is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "Fabric queue {queue:?} contains duplicate durable job id {job_id:?}"
+                                ),
+                            ));
+                        }
+                        found = Some(record.sequence);
+                    }
+                    next = record.sequence.saturating_add(1);
+                }
+                if records.len() < 1024 {
+                    break;
+                }
+            }
+
+            if let Some(sequence) = found {
+                let committed = self.fabric_stream_committed_sequence(&payload_stream)?;
+                if sequence > committed {
+                    self.fabric_stream_retry_pending(&payload_stream, partition)?;
+                }
+                let replication =
+                    self.fabric_stream_replication_status(&payload_stream, partition, sequence)
+                        .map_err(|error| {
+                            if error.kind() == io::ErrorKind::NotFound {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "uncommitted Fabric queue job {sequence} has no recoverable replication intent"
+                                    ),
+                                )
+                            } else {
+                                error
+                            }
+                        })?;
+                return Ok(FabricQueueReplicatedAddResult {
+                    policy,
+                    sequence: Some(sequence),
+                    replication: Some(replication),
+                    deduplicated: true,
+                    enqueued: replication.committed,
+                });
+            }
+        }
+
+        let bytes = encode_queue_envelope(queue, name, payload, &options, now_ms)?;
+        let appended = self.fabric_stream_replicated_append(
+            &payload_stream,
+            partition,
+            replication_factor,
+            &bytes,
+        )?;
+        Ok(FabricQueueReplicatedAddResult {
+            policy,
+            sequence: Some(appended.sequence),
+            replication: Some(appended.status),
+            deduplicated: false,
+            enqueued: appended.status.committed,
+        })
+    }
+
+    fn fabric_queue_require_committed_creation(
+        &mut self,
+        queue: &str,
+    ) -> io::Result<FabricQueueConfig> {
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let first = self.fabric_stream_read_committed(&mutation_stream, 1, 1)?;
+        let first = first.first().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue {queue:?} cannot accept jobs before QueueCreated is quorum committed"
+                ),
+            )
+        })?;
+        if first.sequence != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "committed Fabric queue metadata does not start at sequence 1",
+            ));
+        }
+        decode_queue_created_mutation(&first.payload)
     }
 
     pub fn fabric_queue_policy_sync_status(
