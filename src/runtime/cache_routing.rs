@@ -131,7 +131,6 @@ impl CacheSlotMap {
             .filter_map(|(slot, migration)| migration.map(|migration| (slot as u16, migration)))
     }
 
-
     pub fn owner_for_key(&self, key: &[u8]) -> CacheShardOwner {
         // redis_slot always returns 0..16383, so this index is guaranteed.
         self.owners[redis_slot(key) as usize]
@@ -557,7 +556,6 @@ mod tests {
         assert_eq!(map.owner_for_slot(10), before_10);
         assert_eq!(map.owner_for_slot(12), before_12);
     }
-
 
     #[test]
     fn migration_is_epoch_fenced_and_keeps_source_owner_until_commit() {
