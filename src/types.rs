@@ -2016,13 +2016,17 @@ impl NuError {
                 }
             }
             NuError::CapError { msg, .. } => {
-                if msg.contains("cannot be sent")
+                if msg.contains("remote send argument") {
+                    Some("remote messages accept only `val`, `tag`, and serializable `linear` values — project local/unique state into immutable data before crossing the network boundary")
+                } else if msg.contains("used after being moved") {
+                    Some("the `iso` value has already transferred ownership — stop using the original binding, or create an immutable `val` snapshot before the move if both sides need the data")
+                } else if msg.contains("cannot be sent")
                     || msg.contains("sendable")
                     || msg.contains("send argument")
                 {
-                    Some("only `val`, `iso`, `tag`, and `linear` capabilities are sendable between actors — use `val` for immutable shared data, `iso` for transfer-only ownership")
+                    Some("use `val` for immutable shared data, or move uniquely owned `iso`/linear data exactly once; `ref`, `trn`, and `box` must stay actor-local")
                 } else if msg.contains("linear") && msg.contains("consumed") {
-                    Some("linear values can only be used once — use `.clone()` to make a copy, or restructure to avoid the second use")
+                    Some("linear values must be moved or explicitly consumed exactly once — if multiple paths need the data, create a separate immutable value before consuming the linear binding")
                 } else if msg.contains("downgrade") {
                     Some("capability downgrade is not allowed here — the value must keep its current or stronger capability")
                 } else if msg.contains("Not a subtype") {
