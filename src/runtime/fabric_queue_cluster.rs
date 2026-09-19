@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use super::fabric_queue::{
     decode_queue_consumer_group_config, decode_queue_created_mutation, decode_queue_envelope_bytes,
-    decode_queue_lease_mutation, decode_queue_operation, encode_queue_created_mutation,
+    decode_queue_lease_mutation, decode_queue_operation, decode_queue_reschedule_mutation,
+    encode_queue_created_mutation,
     encode_queue_envelope, queue_mutation_stream_name, queue_stream_name,
     validate_consumer_group_name, validate_consumer_name, validate_operation_id,
     validate_queue_name, FabricQueueAddOptions, FabricQueueConfig, FabricQueueConsumerGroupConfig,
@@ -104,6 +105,17 @@ pub struct FabricQueueReplicatedAcquireResult {
     pub mutation_sequence: Option<u64>,
     pub replication: Option<FabricStreamReplicationStatus>,
     pub delivery: Option<FabricQueueDelivery>,
+    pub resumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FabricQueueReplicatedRescheduleResult {
+    pub policy: FabricQueuePolicySyncReport,
+    pub mutation_sequence: Option<u64>,
+    pub replication: Option<FabricStreamReplicationStatus>,
+    pub sequence: Option<u64>,
+    pub available_at_ms: u64,
+    pub updated: bool,
     pub resumed: bool,
 }
 
@@ -678,6 +690,138 @@ impl Runtime {
             replication: Some(appended.status),
             deduplicated: false,
             enqueued: appended.status.committed,
+        })
+    }
+
+    /// Reschedule one Waiting job by replacing its availability timestamp.
+    ///
+    /// This is the generic native primitive used by compatibility adapters for
+    /// operations such as BullMQ changeDelay/promote. It is serialized through
+    /// the queue metadata stream and retry-safe through operation_id.
+    pub fn fabric_queue_reschedule_replicated(
+        &mut self,
+        queue: &str,
+        job_id: &str,
+        operation_id: &str,
+        available_at_ms: u64,
+        partition: u16,
+        replication_factor: usize,
+    ) -> io::Result<FabricQueueReplicatedRescheduleResult> {
+        validate_operation_id(operation_id)?;
+        let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        if !policy.ready {
+            return Ok(FabricQueueReplicatedRescheduleResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                sequence: None,
+                available_at_ms,
+                updated: false,
+                resumed: false,
+            });
+        }
+        self.fabric_queue_require_committed_creation(queue)?;
+        let job = self
+            .fabric_queue_job_replicated(queue, job_id)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Fabric queue job {job_id:?} does not exist"),
+                )
+            })?;
+        let sequence = job.sequence;
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let info = self.fabric_stream_info(&mutation_stream)?;
+
+        let mut next = 2u64;
+        let mut matching = None;
+        loop {
+            let records = self.fabric_stream_read(&mutation_stream, next, 1024)?;
+            if records.is_empty() {
+                break;
+            }
+            for record in &records {
+                if let Some(reschedule) = decode_queue_reschedule_mutation(&record.payload)? {
+                    if reschedule.operation_id.as_deref() == Some(operation_id) {
+                        if matching.is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "Fabric queue {queue:?} contains duplicate reschedule operation id {operation_id:?}"
+                                ),
+                            ));
+                        }
+                        if reschedule.sequence != sequence
+                            || reschedule.available_at_ms != available_at_ms
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Fabric queue reschedule operation id was reused with different inputs",
+                            ));
+                        }
+                        matching = Some(record.sequence);
+                    }
+                }
+                next = record.sequence.saturating_add(1);
+            }
+            if records.len() < 1024 {
+                break;
+            }
+        }
+
+        if let Some(mutation_sequence) = matching {
+            let replication = self.fabric_queue_resume_metadata_replication(
+                &mutation_stream,
+                partition,
+                mutation_sequence,
+                info.committed_sequence,
+            )?;
+            return Ok(FabricQueueReplicatedRescheduleResult {
+                policy,
+                mutation_sequence: Some(mutation_sequence),
+                replication: Some(replication),
+                sequence: Some(sequence),
+                available_at_ms,
+                updated: replication.committed,
+                resumed: true,
+            });
+        }
+
+        if info.last_sequence.unwrap_or(0) > info.committed_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue {queue:?} has an uncommitted metadata mutation; retry it before rescheduling"
+                ),
+            ));
+        }
+
+        let (planned_sequence, bytes) = self.fabric_queue_plan_committed_reschedule(
+            queue,
+            job_id,
+            operation_id,
+            available_at_ms,
+        )?;
+        if planned_sequence != sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric queue reschedule job lookup changed during planning",
+            ));
+        }
+        let appended = self.fabric_stream_replicated_append(
+            &mutation_stream,
+            partition,
+            replication_factor,
+            &bytes,
+        )?;
+        Ok(FabricQueueReplicatedRescheduleResult {
+            policy,
+            mutation_sequence: Some(appended.sequence),
+            replication: Some(appended.status),
+            sequence: Some(sequence),
+            available_at_ms,
+            updated: appended.status.committed,
+            resumed: false,
         })
     }
 
