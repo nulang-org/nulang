@@ -1064,6 +1064,49 @@ impl EffectChecker {
         Ok(())
     }
 
+    /// RFC 0008: migration bodies are deterministic replay transforms.
+    ///
+    /// Structural validation prevents handlers from masking intrinsically
+    /// effectful constructs, while effect-row inference catches indirect calls
+    /// through ordinary Nulang helper functions. The only permitted effect is
+    /// `Event`, produced by migration-local `emit` into the replay stream.
+    fn check_migration_purity(&mut self, decls: &[&Decl]) -> NuResult<()> {
+        let mut walker = MigrationPurityWalker::new(decls);
+        let ctx = EffectContext::empty();
+
+        for decl in decls {
+            let Decl::Actor {
+                name, migrations, ..
+            } = decl
+            else {
+                continue;
+            };
+
+            for migration in migrations {
+                let edge = format!(
+                    "migration '{name}' {}->{}",
+                    migration.from_version, migration.to_version
+                );
+
+                if let Some(body) = &migration.state_body {
+                    let scope = format!("{edge} state");
+                    walker.walk(&scope, body)?;
+                    let row = self.infer_effects(&ctx, body)?;
+                    validate_migration_effect_row(&scope, &row, body.span())?;
+                }
+
+                for (event, _params, body) in &migration.event_migrations {
+                    let scope = format!("{edge} event '{event}'");
+                    walker.walk(&scope, body)?;
+                    let row = self.infer_effects(&ctx, body)?;
+                    validate_migration_effect_row(&scope, &row, body.span())?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Pass 2 of module effect checking: enforce a single (flattened)
     /// declaration's bodies.
     ///
@@ -1151,6 +1194,7 @@ impl EffectChecker {
             self.emit_deprecation_warning(decl);
         }
         self.register_function_rows(&flat)?;
+        self.check_migration_purity(&flat)?;
         self.emit_placement_warnings(&flat);
         for decl in &flat {
             self.check_decl(decl)?;
@@ -1254,6 +1298,217 @@ impl EffectChecker {
             kind, name
         ));
         let _ = span; // span reserved for future line/column diagnostics
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0008 migration purity
+// ---------------------------------------------------------------------------
+
+fn validate_migration_effect_row(scope: &str, row: &EffectRow, span: Span) -> NuResult<()> {
+    match row {
+        EffectRow::Closed(effects) if effects.iter().all(|effect| *effect == Effect::Event) => {
+            Ok(())
+        }
+        EffectRow::Closed(_) => Err(NuError::effect_error(
+            format!(
+                "{scope}: migration bodies must be pure; inferred effects {row}. Only replay-stream `emit` (Event) is allowed"
+            ),
+            span,
+        )),
+        EffectRow::Open(_, _) => Err(NuError::effect_error(
+            format!(
+                "{scope}: migration purity cannot be proven for open effect row {row}; migrations fail closed unless their effects are fully known and limited to replay-stream `emit`"
+            ),
+            span,
+        )),
+    }
+}
+
+/// Structural half of migration-purity validation.
+///
+/// Effect rows intentionally erase handled effects. RFC 0008 does not permit
+/// a migration to make an effectful operation legal merely by installing a
+/// local handler, so we must also reject intrinsically effectful syntax before
+/// consulting the inferred row. Direct calls to declared extern functions are
+/// rejected here as well because they are not represented in `fn_rows`.
+struct MigrationPurityWalker<'a> {
+    fns: std::collections::HashMap<&'a str, &'a Expr>,
+    externs: FxHashSet<&'a str>,
+    visiting: Vec<&'a str>,
+}
+
+impl<'a> MigrationPurityWalker<'a> {
+    fn new(decls: &[&'a Decl]) -> Self {
+        let fns = decls
+            .iter()
+            .filter_map(|decl| match decl {
+                Decl::Function { name, body, .. } => Some((name.as_str(), body)),
+                _ => None,
+            })
+            .collect();
+        let externs = decls
+            .iter()
+            .flat_map(|decl| match decl {
+                Decl::Extern { funcs, .. } => funcs.iter().map(|func| func.name.as_str()).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+
+        Self {
+            fns,
+            externs,
+            visiting: Vec::new(),
+        }
+    }
+
+    fn reject(&self, scope: &str, operation: &str, span: Span) -> NuResult<()> {
+        Err(NuError::effect_error(
+            format!(
+                "{scope}: `{operation}` is forbidden by RFC 0008 migration purity"
+            ),
+            span,
+        ))
+    }
+
+    fn expand_fn(&mut self, scope: &str, name: &'a str) -> NuResult<()> {
+        if self.visiting.iter().any(|current| *current == name) {
+            return Ok(());
+        }
+        if let Some(body) = self.fns.get(name).copied() {
+            self.visiting.push(name);
+            let result = self.walk(scope, body);
+            self.visiting.pop();
+            result?;
+        }
+        Ok(())
+    }
+
+    fn walk(&mut self, scope: &str, expr: &'a Expr) -> NuResult<()> {
+        match expr {
+            Expr::Perform { span, .. } => self.reject(scope, "perform", *span),
+            Expr::Spawn { span, .. } => self.reject(scope, "spawn", *span),
+            Expr::Send { span, .. } => self.reject(scope, "send", *span),
+            Expr::Ask { span, .. } => self.reject(scope, "ask", *span),
+            Expr::Receive { span, .. } => self.reject(scope, "receive/after", *span),
+            Expr::Migrate { span, .. } => self.reject(scope, "migrate", *span),
+            Expr::GrainRef { span, .. } => self.reject(scope, "virtual actor reference", *span),
+            Expr::Handle { span, .. } => self.reject(scope, "handle", *span),
+            Expr::Resume { span, .. } => self.reject(scope, "resume", *span),
+            Expr::Recover { span, .. } => self.reject(scope, "recover", *span),
+            Expr::Defer { span, .. } => self.reject(scope, "defer", *span),
+            Expr::Panic(_, span) => self.reject(scope, "panic", *span),
+
+            Expr::App { func, args, span } => {
+                self.walk(scope, func)?;
+                for arg in args {
+                    self.walk(scope, arg)?;
+                }
+                if let Expr::Var(name, _) = func.as_ref() {
+                    if self.externs.contains(name.as_str()) {
+                        return self.reject(scope, "extern call", *span);
+                    }
+                    self.expand_fn(scope, name.as_str())?;
+                }
+                Ok(())
+            }
+            Expr::Lambda { body, .. } => self.walk(scope, body),
+            Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+                self.walk(scope, value)?;
+                self.walk(scope, body)
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.walk(scope, cond)?;
+                self.walk(scope, then_branch)?;
+                if let Some(other) = else_branch {
+                    self.walk(scope, other)?;
+                }
+                Ok(())
+            }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                self.walk(scope, scrutinee)?;
+                for (_, guard, body) in arms {
+                    if let Some(guard) = guard {
+                        self.walk(scope, guard)?;
+                    }
+                    self.walk(scope, body)?;
+                }
+                Ok(())
+            }
+            Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => {
+                for expr in exprs {
+                    self.walk(scope, expr)?;
+                }
+                Ok(())
+            }
+            Expr::FString(parts, _) | Expr::Tuple(parts, _) | Expr::Array(parts, _) => {
+                for part in parts {
+                    self.walk(scope, part)?;
+                }
+                Ok(())
+            }
+            Expr::Record(fields, _) => {
+                for (_, value) in fields {
+                    self.walk(scope, value)?;
+                }
+                Ok(())
+            }
+            Expr::FieldAccess { expr, .. }
+            | Expr::CapAnnotate { expr, .. }
+            | Expr::TypeAnnotate { expr, .. }
+            | Expr::Consume { expr, .. } => self.walk(scope, expr),
+            Expr::RecordUpdate { base, fields, .. } => {
+                self.walk(scope, base)?;
+                for (_, value) in fields {
+                    self.walk(scope, value)?;
+                }
+                Ok(())
+            }
+            Expr::Index { arr, idx, .. } => {
+                self.walk(scope, arr)?;
+                self.walk(scope, idx)
+            }
+            Expr::Binary { left, right, .. } | Expr::Pipe { left, right, .. } => {
+                self.walk(scope, left)?;
+                self.walk(scope, right)
+            }
+            Expr::Unary { expr, .. } => self.walk(scope, expr),
+            Expr::Assign { target, value, .. } => {
+                self.walk(scope, target)?;
+                self.walk(scope, value)
+            }
+            Expr::Emit { args, .. } => {
+                for arg in args {
+                    self.walk(scope, arg)?;
+                }
+                Ok(())
+            }
+            Expr::For { iterable, body, .. } => {
+                self.walk(scope, iterable)?;
+                self.walk(scope, body)
+            }
+            Expr::While { cond, body, .. } => {
+                self.walk(scope, cond)?;
+                self.walk(scope, body)
+            }
+            Expr::Return(Some(value), _) | Expr::Break(Some(value), _) => {
+                self.walk(scope, value)
+            }
+            Expr::Hide { body, .. } | Expr::Seal { body, .. } => self.walk(scope, body),
+
+            Expr::Literal(..)
+            | Expr::Var(..)
+            | Expr::SelfRef(..)
+            | Expr::Return(None, _)
+            | Expr::Break(None, _) => Ok(()),
+        }
     }
 }
 
@@ -4941,5 +5196,86 @@ mod tests {
         let mut checker = EffectChecker::new();
         assert!(checker.check_module(&ast.decls).is_ok());
         assert!(checker.diagnostics.is_empty());
+    }    #[test]
+    fn migration_purity_rejects_direct_perform() {
+        let ast = parse_module(
+            r#"
+entity Counter {
+    version: 2
+    state count: Int = 0
+    migration from 1 to 2 {
+        state => { perform IO.print(42) }
     }
+}
+"#,
+        );
+        let err = EffectChecker::new().check_module(&ast.decls).unwrap_err();
+        assert!(
+            err.to_string().contains("`perform` is forbidden by RFC 0008 migration purity"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn migration_purity_rejects_indirect_effectful_helper() {
+        let ast = parse_module(
+            r#"
+fn noisy() { perform IO.print(42) }
+entity Counter {
+    version: 2
+    state count: Int = 0
+    migration from 1 to 2 {
+        state => { noisy() }
+    }
+}
+"#,
+        );
+        let err = EffectChecker::new().check_module(&ast.decls).unwrap_err();
+        assert!(
+            err.to_string().contains("`perform` is forbidden by RFC 0008 migration purity"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn migration_purity_rejects_extern_call() {
+        let ast = parse_module(
+            r#"
+extern "libm.so.6" { fn sqrt(x: Float) -> Float }
+entity Counter {
+    version: 2
+    state count: Int = 0
+    migration from 1 to 2 {
+        state => { sqrt(4.0) }
+    }
+}
+"#,
+        );
+        let err = EffectChecker::new().check_module(&ast.decls).unwrap_err();
+        assert!(
+            err.to_string().contains("`extern call` is forbidden by RFC 0008 migration purity"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn migration_purity_allows_replay_stream_emit() {
+        let ast = parse_module(
+            r#"
+entity Counter {
+    version: 2
+    state count: Int = 0
+    events | Bumped(by: Int)
+    migration from 1 to 2 {
+        events {
+            | Bumped(by) => emit Bumped(by)
+        }
+    }
+}
+"#,
+        );
+        EffectChecker::new().check_module(&ast.decls).unwrap();
+    }
+
+
 }

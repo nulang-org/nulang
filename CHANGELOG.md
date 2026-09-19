@@ -45,6 +45,15 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### RFC 0008 migration purity enforcement — 2026-09-19
+- **Migration bodies now fail closed on effects** (`src/effect_checker.rs`).
+  Direct and indirect `perform`, actor messaging/spawn/receive/migration,
+  effect handlers, virtual actor references, deferred/recovery control, and
+  declared FFI calls are rejected inside migration contracts.
+- **Replay-stream `emit` remains the only permitted effect**. Open or
+  otherwise unproven effect rows fail closed, so migration determinism cannot
+  depend on unresolved effect variables.
+
 ### C embedding handle and function dispatch correctness — 2026-09-18
 - **Public module handles now resolve through the runtime handle table before
   accessing deduplicated compiled modules** (`src/ffi/c_api.rs`). Repeated
