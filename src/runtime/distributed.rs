@@ -43,6 +43,9 @@ use std::time::{Duration, Instant};
 // Imports from sibling modules in the runtime
 // ---------------------------------------------------------------------------
 
+use super::cache_transport::{
+    cache_transport_packet, parse_cache_transport_packet, CacheTransportInbound,
+};
 use super::fabric_stream_cluster::{
     FabricStreamCommitUpdate, FabricStreamReplicaAck, FabricStreamReplicaAppend,
     FABRIC_STREAM_COMMIT_BEHAVIOR, FABRIC_STREAM_REPLICA_ACK_BEHAVIOR,
@@ -62,6 +65,98 @@ use crate::runtime::Runtime;
 use crate::types::ExitReason;
 use crate::vm::Value;
 use tracing::warn;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CacheTransportFlushReport {
+    pub drained: usize,
+    pub dispatched: usize,
+    pub unavailable: usize,
+    pub invalid: usize,
+}
+
+/// Drain a bounded prefix of cache-service outbound envelopes onto the
+/// existing NUL0 connection pool.
+///
+/// The cache bridge is intentionally not a second network stack. Messages are
+/// wrapped in the frozen ActorMessage packet shape and inherit the same
+/// authenticated peer/session handling as all other distributed traffic.
+pub(crate) fn flush_cache_transport_outbound(
+    runtime: &Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    max_messages: usize,
+) -> CacheTransportFlushReport {
+    let mut report = CacheTransportFlushReport::default();
+    if max_messages == 0 {
+        return report;
+    }
+    let Some(bridge) = runtime.distributed.cache_transport.as_ref() else {
+        return report;
+    };
+    let local_node = runtime.distributed.node_id.unwrap_or(NodeId::LOCAL);
+
+    for _ in 0..max_messages {
+        let outbound = match bridge.try_recv_outbound() {
+            Ok(Some(outbound)) => outbound,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(
+                    "nulang-cache: cache outbound bridge unavailable: {:?}",
+                    error
+                );
+                break;
+            }
+        };
+        report.drained += 1;
+
+        if outbound.to_node == local_node {
+            report.invalid += 1;
+            warn!(
+                "nulang-cache: refusing to send cache network envelope to local node {:?}",
+                local_node
+            );
+            continue;
+        }
+
+        if let Err(error) = outbound.message.validate_sender(local_node) {
+            report.invalid += 1;
+            warn!(
+                "nulang-cache: refusing outbound cache envelope with invalid local identity: {:?}",
+                error
+            );
+            continue;
+        }
+
+        let address = cluster
+            .get_node(outbound.to_node)
+            .map(|node| node.address)
+            .or_else(|| transport.connection_addr(outbound.to_node));
+        let Some(address) = address else {
+            report.unavailable += 1;
+            warn!(
+                "nulang-cache: cache target node {:?} has no routable NUL0 address",
+                outbound.to_node
+            );
+            continue;
+        };
+
+        let packet = match cache_transport_packet(local_node, &outbound.message) {
+            Ok(packet) => packet,
+            Err(error) => {
+                report.invalid += 1;
+                warn!(
+                    "nulang-cache: refusing cache envelope that cannot be encoded: {:?}",
+                    error
+                );
+                continue;
+            }
+        };
+        transport.send(outbound.to_node, address, packet);
+        report.dispatched += 1;
+    }
+
+    report
+}
 
 // Message wrapper for distributed communication
 #[derive(Debug, Clone, PartialEq)]
@@ -1001,6 +1096,40 @@ pub fn process_network_packets(
 ) {
     let packets = transport.receive();
     for incoming in packets {
+        match parse_cache_transport_packet(&incoming.packet, incoming.from_node) {
+            Ok(Some(message)) => {
+                if let Some(bridge) = runtime.distributed.cache_transport.as_ref() {
+                    if let Err(error) = bridge.try_forward_inbound(CacheTransportInbound {
+                        from_node: incoming.from_node,
+                        message,
+                    }) {
+                        warn!(
+                            "nulang-cache: dropping inbound cache system message from {:?}: {:?}",
+                            incoming.from_node, error
+                        );
+                    }
+                } else {
+                    warn!(
+                        "nulang-cache: dropping inbound cache system message from {:?}: no cache transport bridge attached",
+                        incoming.from_node
+                    );
+                }
+                // NUL0 ACK confirms transport processing only. Cache command
+                // responses and transfer ACKs remain application-level.
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+                continue;
+            }
+            Err(error) => {
+                warn!(
+                    "nulang-cache: rejecting malformed/spoofed cache system message from {:?}: {:?}",
+                    incoming.from_node, error
+                );
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+                continue;
+            }
+            Ok(None) => {}
+        }
+
         match incoming.packet {
             Packet::Heartbeat { node_id, .. } => {
                 let cluster_node_id = NodeId(node_id.0);

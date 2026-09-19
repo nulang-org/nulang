@@ -280,6 +280,14 @@ pub(crate) fn process_network(rt: &mut Runtime) {
         }
     };
     distributed::process_network_packets(rt, &mut transport, &mut cluster, &mut resolver);
+    // Cache service egress shares the authenticated NUL0 connection pool.
+    // Bound each pump so cache bulk traffic cannot starve cluster/fabric work.
+    let _ = distributed::flush_cache_transport_outbound(
+        rt,
+        transport.as_mut(),
+        &cluster,
+        256,
+    );
     rt.distributed.transport = Some(transport);
     rt.distributed.cluster = Some(cluster);
     rt.distributed.resolver = Some(resolver);

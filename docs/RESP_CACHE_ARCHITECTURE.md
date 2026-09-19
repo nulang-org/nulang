@@ -185,10 +185,37 @@ versions, bytes moved, cursor progress, and source drain completion. If a
 source version raced or the importing target changed independently, the caller
 must reconcile rather than committing ownership.
 
-The same request/reply protocol still needs a remote-node transport envelope.
-That transport must carry slot, migration/placement epoch, source/target owner,
-and transfer batch identity, and must reject stale epochs before mutating a
-target store.
+Cross-node migration now carries the same protocol over the existing
+authenticated NUL0 transport. It does not add a new NUL0 packet type: cache
+traffic is encoded as a bounded binary envelope inside the frozen
+`Packet::ActorMessage` shape, using reserved actor id 0 and an internal cache
+behavior name. Runtime verifies that the envelope's claimed sender matches the
+authenticated transport peer before forwarding it through a bounded bridge to
+the cache service.
+
+Every remote command or transfer carries the exact placement epoch plus the
+physical source/target owner. The service coordinator rejects stale/future
+epochs and owner/migration mismatches before dispatch. The target reactor then
+repeats the installed-epoch and owner/migration check immediately before
+touching `CacheStore`; this second gate closes the race where topology advances
+between coordinator validation and reactor execution.
+
+Remote command responses and transfer acknowledgements are application-level
+messages. A NUL0 transport ACK confirms packet processing only and is never
+sufficient to finalize migration data. For a remote slot transfer, the source
+exports a bounded batch, sends it with a transfer id, waits for the matching
+target ACK, and generation-fences source deletion only for entries reported as
+Imported, AlreadyImported, or ExpiredInTransit. Conflict, wrong-slot, stale
+epoch, mismatched ACK identity, or target-side mutation leaves the source copy
+intact and requires reconciliation.
+
+Cross-node monotonic clock origins are intentionally not compared. A transfer
+carries the source's remaining TTL, but remote import does not infer wire
+transit duration from unrelated process-relative clocks. This preserves clock
+correctness but can extend expiry by approximately the network transit/retry
+duration. A future transport timestamp based on a synchronized/bounded-error
+clock, or an absolute expiry representation with explicit clock assumptions,
+can tighten that behavior without weakening the current fencing guarantees.
 
 The same cluster layer serves topology discovery without touching CacheStore:
 `CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
@@ -255,11 +282,12 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add a cache-specific inter-node transport envelope for transfer/import/ACK
-   and transparent remote command handoffs, rejecting stale placement epochs
-   before any mutation.
-2. Add remote migration orchestration on top of that transport with bounded
-   retries, transfer-batch identity, and source/target convergence checks.
+1. Add bounded retry/correlation state for remote command requests and transfer
+   batches, including duplicate request/transfer suppression and timeout
+   outcomes that never weaken source fencing.
+2. Add source/target convergence checks and retry-safe migration completion so
+   packet loss, reordered ACKs, and bridge backpressure can recover without
+   operator-driven request replay.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 4. Allow topology publication to add/remove advertised remote endpoints without

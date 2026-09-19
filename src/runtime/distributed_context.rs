@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+use crate::runtime::cache_transport::CacheRuntimeTransportEndpoint;
 use crate::runtime::cluster::{ClusterState, NodeId};
 use crate::runtime::fabric_stream_cluster::FabricStreamReplicationState;
 use crate::runtime::network::NetworkTransport;
@@ -498,6 +499,7 @@ pub struct DistributedContext {
     pub resolver: Option<AddressResolver>,
     pub node_id: Option<NodeId>,
     pub enabled: bool,
+    pub(crate) cache_transport: Option<CacheRuntimeTransportEndpoint>,
     fabric: FabricRegistry,
     fabric_control_tx: Option<Vec<mpsc::Sender<FabricControl>>>,
     fabric_control_rx: Option<mpsc::Receiver<FabricControl>>,
@@ -525,6 +527,30 @@ impl DistributedContext {
 }
 
 impl Runtime {
+    /// Attach the Runtime side of a bounded cache/NUL0 bridge.
+    ///
+    /// The matching service endpoint is owned by the cache service. Runtime
+    /// only authenticates/frames system packets and forwards them across the
+    /// bridge; it never touches a CacheStore.
+    pub fn attach_cache_transport(
+        &mut self,
+        endpoint: CacheRuntimeTransportEndpoint,
+    ) -> Result<(), &'static str> {
+        if self.distributed.cache_transport.is_some() {
+            return Err("cache transport is already attached");
+        }
+        self.distributed.cache_transport = Some(endpoint);
+        Ok(())
+    }
+
+    pub fn cache_transport_attached(&self) -> bool {
+        self.distributed.cache_transport.is_some()
+    }
+
+    pub fn detach_cache_transport(&mut self) -> Option<CacheRuntimeTransportEndpoint> {
+        self.distributed.cache_transport.take()
+    }
+
     /// Create normal Runtime shards and wire Fabric's metadata control plane.
     ///
     /// Fabric publishes still use the existing Runtime cross-shard payload

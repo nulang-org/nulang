@@ -271,7 +271,6 @@ mod tests {
         assert!(pipeline.is_empty());
     }
 
-
     #[test]
     fn asking_state_is_connection_local_and_consumed_by_one_command() {
         let mut placement = CacheSlotMap::new_local(1, 2).unwrap();

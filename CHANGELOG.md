@@ -144,6 +144,23 @@ two major versions.*
   seed a key over RESP, migrate it between running local shards, observe `ASK`
   and one-shot `ASKING` during transfer, commit ownership, then observe a
   normal target read and `MOVED` from the old endpoint.
+- **Authenticated NUL0 cache transport and cross-node migration** (Experimental,
+  `src/runtime/cache_transport.rs`, `src/runtime/cache_server.rs`,
+  `src/runtime/distributed.rs`). Cache traffic reuses the frozen NUL0 v1
+  `Packet::ActorMessage` shape on reserved actor 0 instead of adding a new
+  wire discriminant or socket protocol. Bounded binary envelopes carry remote
+  command request/response and transfer batch/ACK messages with placement epoch,
+  physical source/target identity, request/transfer ids, and an 8 MiB envelope
+  ceiling. Runtime authenticates the transport peer before forwarding into a
+  bounded Runtime↔cache-service bridge; the cache coordinator validates the
+  exact installed placement snapshot, and the owning reactor repeats the epoch
+  and owner/migration check immediately before mutation. Remote SET/GET executes
+  on the target reactor, and remote migration performs source export -> NUL0
+  transfer -> target fenced import -> application ACK -> generation-fenced
+  source finalize. Transport receipt ACKs can never delete source data. Stale
+  placement epochs fail closed with TRYAGAIN/conflict, preserving the source
+  value. Deterministic two-node tests cover command round trips, full
+  ASK/ASKING migration and commit, and stale-transfer rejection.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.

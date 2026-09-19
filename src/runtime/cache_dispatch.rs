@@ -293,6 +293,10 @@ impl CacheDispatcher {
         self.routing_mode
     }
 
+    pub fn local_node_id(&self) -> u64 {
+        self.local_node_id
+    }
+
     pub fn local_shard(&self) -> u16 {
         self.local_shard
     }
@@ -631,7 +635,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn migrating_source_asks_target_for_missing_key() {
         let mut map = CacheSlotMap::new_local(1, 2).unwrap();
@@ -751,10 +754,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(out, moved.as_bytes());
-        assert_eq!(
-            store.get(&key, 0),
-            Some(CacheValueView::Bytes(b"imported"))
-        );
+        assert_eq!(store.get(&key, 0), Some(CacheValueView::Bytes(b"imported")));
     }
 
     #[test]
