@@ -138,6 +138,19 @@ pub enum CacheValueView<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtl {
+    Missing,
+    Persistent,
+    RemainingMs(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheIncrementError {
+    NotInteger,
+    Overflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheValue {
     Integer(i64),
     Bytes(PackedBytes),
@@ -334,6 +347,24 @@ impl CacheStore {
         None
     }
 
+    fn live_slot_id(&mut self, key: &[u8], now_ms: u64) -> Option<u32> {
+        let hash = Self::hash(key);
+        let slot_id = self.find_slot(key, hash)?;
+        let expired = self.slots[slot_id as usize]
+            .entry
+            .as_ref()
+            .and_then(|entry| entry.expires_at_ms)
+            .is_some_and(|deadline| deadline <= now_ms);
+
+        if expired {
+            self.remove_slot(slot_id);
+            self.stats.expirations += 1;
+            None
+        } else {
+            Some(slot_id)
+        }
+    }
+
     fn ensure_index_capacity(&mut self) {
         if self.tombstones > self.index_len && self.tombstones > 32 {
             self.rehash(self.index.len());
@@ -488,24 +519,10 @@ impl CacheStore {
     }
 
     pub fn get(&mut self, key: &[u8], now_ms: u64) -> Option<CacheValueView<'_>> {
-        let hash = Self::hash(key);
-        let Some(slot_id) = self.find_slot(key, hash) else {
+        let Some(slot_id) = self.live_slot_id(key, now_ms) else {
             self.stats.misses += 1;
             return None;
         };
-
-        let expired = self.slots[slot_id as usize]
-            .entry
-            .as_ref()
-            .and_then(|entry| entry.expires_at_ms)
-            .is_some_and(|deadline| deadline <= now_ms);
-
-        if expired {
-            self.remove_slot(slot_id);
-            self.stats.expirations += 1;
-            self.stats.misses += 1;
-            return None;
-        }
 
         self.stats.hits += 1;
         let entry = self.slots[slot_id as usize]
@@ -513,6 +530,105 @@ impl CacheStore {
             .as_ref()
             .expect("live slot vanished");
         Some(entry.value.view(&self.arena))
+    }
+
+    pub fn exists(&mut self, key: &[u8], now_ms: u64) -> bool {
+        self.live_slot_id(key, now_ms).is_some()
+    }
+
+    pub fn delete_at(&mut self, key: &[u8], now_ms: u64) -> bool {
+        let Some(slot_id) = self.live_slot_id(key, now_ms) else {
+            return false;
+        };
+        let removed = self.remove_slot(slot_id);
+        if removed {
+            self.stats.deletes += 1;
+        }
+        removed
+    }
+
+    pub fn expire_ms(&mut self, key: &[u8], ttl_ms: u64, now_ms: u64) -> bool {
+        let Some(slot_id) = self.live_slot_id(key, now_ms) else {
+            return false;
+        };
+
+        if ttl_ms == 0 {
+            if self.remove_slot(slot_id) {
+                self.stats.expirations += 1;
+                return true;
+            }
+            return false;
+        }
+
+        let expires_at_ms = now_ms.saturating_add(ttl_ms);
+        let slot = &mut self.slots[slot_id as usize];
+        let entry = slot.entry.as_mut().expect("live slot vanished");
+        entry.expires_at_ms = Some(expires_at_ms);
+        slot.generation = slot.generation.wrapping_add(1).max(1);
+        let generation = slot.generation;
+        self.expiry.schedule(
+            ExpirationRef {
+                slot: slot_id,
+                generation,
+                expires_at_ms,
+            },
+            now_ms,
+        );
+        true
+    }
+
+    pub fn ttl(&mut self, key: &[u8], now_ms: u64) -> CacheTtl {
+        let Some(slot_id) = self.live_slot_id(key, now_ms) else {
+            return CacheTtl::Missing;
+        };
+        let entry = self.slots[slot_id as usize]
+            .entry
+            .as_ref()
+            .expect("live slot vanished");
+
+        match entry.expires_at_ms {
+            Some(deadline) => CacheTtl::RemainingMs(deadline.saturating_sub(now_ms)),
+            None => CacheTtl::Persistent,
+        }
+    }
+
+    pub fn increment(
+        &mut self,
+        key: &[u8],
+        delta: i64,
+        now_ms: u64,
+    ) -> Result<i64, CacheIncrementError> {
+        let Some(slot_id) = self.live_slot_id(key, now_ms) else {
+            self.set_integer(key, delta, None, now_ms);
+            return Ok(delta);
+        };
+
+        let current = self.slots[slot_id as usize]
+            .entry
+            .as_ref()
+            .expect("live slot vanished")
+            .value;
+
+        let base = match current {
+            CacheValue::Integer(value) => value,
+            CacheValue::Bytes(bytes) => {
+                let raw = bytes.as_slice(&self.arena);
+                let text = std::str::from_utf8(raw).map_err(|_| CacheIncrementError::NotInteger)?;
+                text.parse::<i64>()
+                    .map_err(|_| CacheIncrementError::NotInteger)?
+            }
+        };
+
+        let next = base.checked_add(delta).ok_or(CacheIncrementError::Overflow)?;
+        if let CacheValue::Bytes(bytes) = current {
+            bytes.release(&mut self.arena);
+        }
+        self.slots[slot_id as usize]
+            .entry
+            .as_mut()
+            .expect("live slot vanished")
+            .value = CacheValue::Integer(next);
+        Ok(next)
     }
 
     pub fn delete(&mut self, key: &[u8]) -> bool {
@@ -697,6 +813,48 @@ mod tests {
         }
 
         assert_eq!(store.memory_stats().index_capacity, capacity);
+    }
+
+    #[test]
+    fn expire_and_ttl_preserve_live_key_semantics() {
+        let mut store = CacheStore::new();
+        store.set_bytes(b"k", b"v", None, 100);
+        assert_eq!(store.ttl(b"k", 100), CacheTtl::Persistent);
+        assert!(store.expire_ms(b"k", 2_500, 100));
+        assert_eq!(store.ttl(b"k", 600), CacheTtl::RemainingMs(2_000));
+        assert_eq!(store.ttl(b"k", 2_600), CacheTtl::Missing);
+    }
+
+    #[test]
+    fn increment_promotes_bytes_and_preserves_ttl() {
+        let mut store = CacheStore::new();
+        store.set_bytes(b"n", b"41", Some(5_000), 100);
+        assert_eq!(store.increment(b"n", 1, 200), Ok(42));
+        assert_eq!(store.get(b"n", 200), Some(CacheValueView::Integer(42)));
+        assert_eq!(store.ttl(b"n", 200), CacheTtl::RemainingMs(4_900));
+    }
+
+    #[test]
+    fn increment_rejects_non_integer_and_overflow() {
+        let mut store = CacheStore::new();
+        store.set_bytes(b"text", b"nope", None, 0);
+        assert_eq!(
+            store.increment(b"text", 1, 0),
+            Err(CacheIncrementError::NotInteger)
+        );
+        store.set_integer(b"max", i64::MAX, None, 0);
+        assert_eq!(
+            store.increment(b"max", 1, 0),
+            Err(CacheIncrementError::Overflow)
+        );
+    }
+
+    #[test]
+    fn delete_at_treats_expired_keys_as_missing() {
+        let mut store = CacheStore::new();
+        store.set_bytes(b"k", b"v", Some(5), 100);
+        assert!(!store.delete_at(b"k", 105));
+        assert!(store.is_empty());
     }
 
     #[test]
