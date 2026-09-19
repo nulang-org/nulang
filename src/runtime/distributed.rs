@@ -1537,8 +1537,7 @@ pub fn process_network_packets(
                                 address,
                                 Packet::ActorMessage {
                                     target_actor: 0,
-                                    behavior_name:
-                                        FABRIC_QUEUE_POLICY_ACK_BEHAVIOR.to_string(),
+                                    behavior_name: FABRIC_QUEUE_POLICY_ACK_BEHAVIOR.to_string(),
                                     content_hash: None,
                                     payload: Vec::new(),
                                     string_table: Vec::new(),
