@@ -231,6 +231,10 @@ enum QueueMutation {
         lease_token: u64,
         status: FabricQueueJobStatus,
         available_at_ms: Option<u64>,
+        #[serde(default)]
+        queue_epoch: u64,
+        #[serde(default)]
+        operation_id: Option<String>,
     },
 }
 
@@ -332,6 +336,7 @@ pub(crate) enum FabricQueueOperationKind {
     Ack,
     Nack,
     Renew,
+    Expire,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,7 +429,26 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             available_at_ms: None,
             lease_until_ms: Some(lease_until_ms),
         },
-        QueueMutation::QueueCreated { .. } | QueueMutation::LeaseExpired { .. } => {
+        QueueMutation::LeaseExpired {
+            sequence,
+            consumer,
+            lease_token,
+            status,
+            available_at_ms,
+            queue_epoch,
+            operation_id,
+        } => FabricQueueOperation {
+            kind: FabricQueueOperationKind::Expire,
+            sequence,
+            consumer,
+            lease_token,
+            queue_epoch,
+            operation_id,
+            status: Some(status),
+            available_at_ms,
+            lease_until_ms: None,
+        },
+        QueueMutation::QueueCreated { .. } => {
             return Ok(None);
         }
     };
@@ -435,6 +459,17 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
 pub(crate) struct FabricQueueJobSnapshot {
     pub status: FabricQueueJobStatus,
     pub deliveries: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FabricQueueExpiryPlan {
+    pub sequence: u64,
+    pub consumer: String,
+    pub lease_token: u64,
+    pub queue_epoch: u64,
+    pub operation_id: String,
+    pub mutation_bytes: Vec<u8>,
+    pub result: FabricQueueNackResult,
 }
 
 /// Queue state machine borrowing an existing Fabric stream store.
@@ -1183,6 +1218,8 @@ impl<'a> FabricQueueStore<'a> {
                 lease_token: *lease_token,
                 status,
                 available_at_ms,
+                queue_epoch: 0,
+                operation_id: None,
             };
             let event_sequence = self.append_mutation(queue, &event)?;
             apply_mutation(state, &event)?;
@@ -1682,6 +1719,101 @@ impl Runtime {
         Ok((bytes, lease_until_ms))
     }
 
+    pub(crate) fn fabric_queue_plan_committed_expiry(
+        &mut self,
+        queue: &str,
+        queue_epoch: u64,
+        now_ms: u64,
+    ) -> io::Result<Option<FabricQueueExpiryPlan>> {
+        validate_queue_name(queue)?;
+        if queue_epoch == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replicated Fabric queue expiry requires a non-zero queue epoch",
+            ));
+        }
+
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        let mut candidate: Option<(u64, u64)> = None;
+        for (&sequence, job) in &state.jobs {
+            if job.status != FabricQueueJobStatus::Active {
+                continue;
+            }
+            let Some(deadline) = job.lease_until_ms else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("active Fabric queue job {sequence} is missing a lease deadline"),
+                ));
+            };
+            if deadline > now_ms {
+                continue;
+            }
+            match candidate {
+                None => candidate = Some((sequence, deadline)),
+                Some((best_sequence, best_deadline))
+                    if deadline < best_deadline
+                        || (deadline == best_deadline && sequence < best_sequence) =>
+                {
+                    candidate = Some((sequence, deadline));
+                }
+                _ => {}
+            }
+        }
+
+        let Some((sequence, _)) = candidate else {
+            return Ok(None);
+        };
+        let job = state.jobs.get(&sequence).expect("expiry candidate must exist");
+        let consumer = job.consumer.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("active Fabric queue job {sequence} is missing a consumer"),
+            )
+        })?;
+        let lease_token = job.lease_token;
+        let deliveries = job.deliveries;
+        let (status, available_at_ms) = if deliveries >= state.config.max_attempts {
+            (
+                if state.config.dead_letter_queue.is_some() {
+                    FabricQueueJobStatus::DeadLettered
+                } else {
+                    FabricQueueJobStatus::Failed
+                },
+                None,
+            )
+        } else {
+            (FabricQueueJobStatus::Waiting, Some(now_ms))
+        };
+        let operation_id = format!(
+            "__lease_expire:{queue_epoch}:{sequence}:{lease_token}"
+        );
+        let mutation_bytes = serde_json::to_vec(&QueueMutation::LeaseExpired {
+            sequence,
+            consumer: consumer.clone(),
+            lease_token,
+            status,
+            available_at_ms,
+            queue_epoch,
+            operation_id: Some(operation_id.clone()),
+        })
+        .map_err(json_error)?;
+
+        Ok(Some(FabricQueueExpiryPlan {
+            sequence,
+            consumer,
+            lease_token,
+            queue_epoch,
+            operation_id,
+            mutation_bytes,
+            result: FabricQueueNackResult {
+                status,
+                deliveries,
+                available_at_ms,
+            },
+        }))
+    }
+
     pub(crate) fn fabric_queue_committed_job_snapshot(
         &mut self,
         queue: &str,
@@ -1882,6 +2014,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
             lease_token,
             status,
             available_at_ms,
+            ..
         } => {
             validate_mutation_lease(state, *sequence, consumer, *lease_token)?;
             if !matches!(
