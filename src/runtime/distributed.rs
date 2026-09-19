@@ -43,6 +43,10 @@ use std::time::{Duration, Instant};
 // Imports from sibling modules in the runtime
 // ---------------------------------------------------------------------------
 
+use super::fabric_queue_cluster::{
+    FabricQueuePolicyAck, FabricQueuePolicyInstall, FABRIC_QUEUE_POLICY_ACK_BEHAVIOR,
+    FABRIC_QUEUE_POLICY_BEHAVIOR,
+};
 use super::fabric_stream_cluster::{
     FabricStreamCommitUpdate, FabricStreamReplicaAck, FabricStreamReplicaAppend,
     FABRIC_STREAM_COMMIT_BEHAVIOR, FABRIC_STREAM_REPLICA_ACK_BEHAVIOR,
@@ -1469,6 +1473,122 @@ pub fn process_network_packets(
                 // RFC 0014 §3: store the replica, do NOT instantiate it.
                 // The shadow re-spawns from it only on confirmed removal.
                 runtime.store_shadow_replica(actor_id, nbc_bytes, snapshot_json, epoch);
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_QUEUE_POLICY_BEHAVIOR => {
+                let mut application_ack = None;
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric queue policy sender identity does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricQueuePolicyInstall::from_wire_bytes(bytes)
+                            .and_then(|install| {
+                                let local = runtime.distributed.node_id.ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "Fabric queue policy receiver has no local NodeId",
+                                    )
+                                })?;
+                                let apply = runtime.fabric_queue_apply_policy_from_cluster(
+                                    &install,
+                                    incoming.from_node,
+                                );
+                                application_ack = Some(if apply.is_ok() {
+                                    FabricQueuePolicyAck::accepted(&install, local)
+                                } else {
+                                    FabricQueuePolicyAck::rejected(&install, local)
+                                });
+                                apply
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric queue policy message must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+
+                if let Err(error) = &result {
+                    warn!(
+                        "nulang-fabric-queue: rejected policy install from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+
+                if let Some(application_ack) = application_ack {
+                    if let Ok(bytes) = application_ack.to_wire_bytes() {
+                        let leader = application_ack.leader();
+                        let replica = application_ack.replica();
+                        let address = cluster
+                            .get_node(leader)
+                            .map(|info| info.address)
+                            .or_else(|| transport.connection_addr(leader));
+                        if let Some(address) = address {
+                            transport.send(
+                                leader,
+                                address,
+                                Packet::ActorMessage {
+                                    target_actor: 0,
+                                    behavior_name: FABRIC_QUEUE_POLICY_ACK_BEHAVIOR.to_string(),
+                                    content_hash: None,
+                                    payload: Vec::new(),
+                                    string_table: Vec::new(),
+                                    object_table: vec![(0, bytes)],
+                                    sender_actor: 0,
+                                    sender_node: replica,
+                                    priority: MessagePriority::System,
+                                    trace_id: None,
+                                },
+                            );
+                        }
+                    }
+                }
+
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_QUEUE_POLICY_ACK_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric queue policy ACK sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricQueuePolicyAck::from_wire_bytes(bytes)
+                            .and_then(|ack| {
+                                runtime
+                                    .fabric_queue_record_policy_ack(
+                                        ack,
+                                        incoming.from_node,
+                                    )
+                                    .map(|_| ())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric queue policy ACK must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-queue: rejected policy ACK from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::ActorMessage {

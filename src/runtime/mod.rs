@@ -24,6 +24,7 @@ mod cluster;
 mod distributed;
 mod distributed_context;
 mod fabric_queue;
+mod fabric_queue_cluster;
 mod fabric_stream;
 mod fabric_stream_cluster;
 mod fabric_stream_epoch;
@@ -37,8 +38,16 @@ pub use distributed_context::{
     DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot, FabricPublishReport,
 };
 pub use fabric_queue::{
-    FabricQueueAddOptions, FabricQueueAddResult, FabricQueueConfig, FabricQueueDelivery,
-    FabricQueueInfo, FabricQueueJobStatus, FabricQueueNackResult, FabricQueueStore,
+    FabricQueueAddOptions, FabricQueueAddResult, FabricQueueConfig, FabricQueueConsumerGroupConfig,
+    FabricQueueConsumerGroupInfo, FabricQueueDelivery, FabricQueueInfo, FabricQueueJobStatus,
+    FabricQueueNackResult, FabricQueueStore,
+};
+pub use fabric_queue_cluster::{
+    FabricQueuePlacement, FabricQueuePolicySyncReport, FabricQueueReplicatedAckResult,
+    FabricQueueReplicatedAcquireResult, FabricQueueReplicatedAddResult,
+    FabricQueueReplicatedCreateResult, FabricQueueReplicatedDeadLetterResult,
+    FabricQueueReplicatedGroupConfigResult, FabricQueueReplicatedNackResult,
+    FabricQueueReplicatedReapResult, FabricQueueReplicatedRenewResult,
 };
 pub use fabric_stream::{
     FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,

@@ -10,6 +10,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use crate::runtime::cluster::{ClusterState, NodeId};
+use crate::runtime::fabric_queue_cluster::FabricQueuePolicySyncState;
 use crate::runtime::fabric_stream_cluster::FabricStreamReplicationState;
 use crate::runtime::network::NetworkTransport;
 use crate::runtime::{
@@ -511,6 +512,9 @@ pub struct DistributedContext {
     /// Leader-local pending quorum tickets for durable Fabric stream appends.
     /// The durable committed boundary itself lives in the stream store.
     pub(crate) fabric_stream_replication: FabricStreamReplicationState,
+    /// Leader-local application-level acknowledgements proving that every
+    /// configured queue replica installed the same queue ownership policy.
+    pub(crate) fabric_queue_policy_sync: FabricQueuePolicySyncState,
     /// Confirmed removed nodes awaiting Fabric stream ownership orchestration.
     /// Processing is deferred until Runtime owns cluster/transport state again.
     pub(crate) fabric_stream_removed_nodes_pending: HashSet<NodeId>,
