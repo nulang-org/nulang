@@ -102,7 +102,10 @@ pub fn execute_cluster_command(
 
     if subcommand.eq_ignore_ascii_case(b"KEYSLOT") {
         if command.argc() != 2 {
-            write_error(out, b"ERR wrong number of arguments for 'cluster|keyslot' command");
+            write_error(
+                out,
+                b"ERR wrong number of arguments for 'cluster|keyslot' command",
+            );
             return Some(Ok(()));
         }
         let key = args.next().expect("validated KEYSLOT key");
@@ -112,7 +115,10 @@ pub fn execute_cluster_command(
 
     if subcommand.eq_ignore_ascii_case(b"SLOTS") {
         if command.argc() != 1 {
-            write_error(out, b"ERR wrong number of arguments for 'cluster|slots' command");
+            write_error(
+                out,
+                b"ERR wrong number of arguments for 'cluster|slots' command",
+            );
             return Some(Ok(()));
         }
         return Some(write_cluster_slots(placement, endpoints, out));
@@ -120,7 +126,10 @@ pub fn execute_cluster_command(
 
     if subcommand.eq_ignore_ascii_case(b"SHARDS") {
         if command.argc() != 1 {
-            write_error(out, b"ERR wrong number of arguments for 'cluster|shards' command");
+            write_error(
+                out,
+                b"ERR wrong number of arguments for 'cluster|shards' command",
+            );
             return Some(Ok(()));
         }
         return Some(write_cluster_shards(placement, endpoints, out));
@@ -186,7 +195,9 @@ fn write_cluster_shards(
 
     write_array_len(out, shards.len());
     for (owner, ranges) in shards {
-        let endpoint = endpoints.get(owner).expect("topology endpoint prevalidated");
+        let endpoint = endpoints
+            .get(owner)
+            .expect("topology endpoint prevalidated");
 
         // RESP2 map representation: ["slots", [...], "nodes", [...]]
         write_array_len(out, 4);
@@ -265,9 +276,9 @@ fn write_u16_decimal(out: &mut Vec<u8>, mut value: u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::cache_routing::CacheSlotRange;
     use super::super::resp::parse_command;
+    use super::*;
 
     fn command(frame: &[u8]) -> RespCommand<'_> {
         parse_command(frame).unwrap().unwrap().0
