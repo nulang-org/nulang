@@ -2478,6 +2478,7 @@ mod tests {
             job_id: Some("job-1".to_string()),
             priority: 7,
             delay_ms: 0,
+            max_attempts: None,
         };
         let pending_job = cluster
             .node_mut(leader_index)
@@ -2814,6 +2815,7 @@ mod tests {
             job_id: Some("job-2".to_string()),
             priority: 1,
             delay_ms: 0,
+            max_attempts: None,
         };
         let pending_job2 = cluster
             .node_mut(leader_index)
@@ -3128,6 +3130,7 @@ mod tests {
                 job_id: Some(job_id.to_string()),
                 priority: 0,
                 delay_ms: 0,
+                max_attempts: None,
             };
             let pending = cluster
                 .node_mut(leader_index)
@@ -3482,6 +3485,7 @@ mod tests {
             job_id: Some("poison-1".to_string()),
             priority: 7,
             delay_ms: 0,
+            max_attempts: None,
         };
         let pending_add = cluster
             .node_mut(leader_index)
@@ -3568,6 +3572,7 @@ mod tests {
                     job_id: Some("__dlq:dlq-source:1".to_string()),
                     priority: 7,
                     delay_ms: 0,
+                    max_attempts: None,
                 },
                 0,
                 3,
@@ -3646,6 +3651,7 @@ mod tests {
             job_id: Some("poison-2".to_string()),
             priority: 3,
             delay_ms: 0,
+            max_attempts: None,
         };
         let pending_add2 = cluster
             .node_mut(leader_index)
