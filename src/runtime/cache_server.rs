@@ -538,6 +538,7 @@ pub enum CacheServiceError {
     RemoteTransferNotActive(u16),
     RemoteTransferAckMismatch,
     RemoteMigrationProbeMismatch,
+    RemoteMigrationNotConverged(u16),
     MigrationJournalUnavailable,
     MigrationRecoveryNotFound,
     MigrationRecoveryTransferNotFound(u64),
@@ -854,6 +855,7 @@ impl CacheService {
             network_retry: has_transport.then_some(network_retry),
             migration_journal,
             migration_incarnation: self.migration_incarnation,
+            migration_proofs: Mutex::new(HashMap::new()),
             network_thread,
             network_shutdown,
         })
@@ -873,6 +875,7 @@ pub struct CacheServiceHandle {
     network_retry: Option<Arc<Mutex<CacheNetworkRetryState>>>,
     migration_journal: Option<Arc<Mutex<CacheMigrationJournal>>>,
     migration_incarnation: [u8; 16],
+    migration_proofs: Mutex<HashMap<CacheMigrationKey, CacheRemoteMigrationConvergence>>,
     network_thread: Option<JoinHandle<()>>,
     network_shutdown: Arc<AtomicBool>,
 }
@@ -1003,7 +1006,85 @@ impl CacheServiceHandle {
     /// thread-local dispatcher, and then return to lock-free indexed routing.
     pub fn install_placement(&self, placement: CacheSlotMap) -> Result<(), CacheServiceError> {
         validate_placement_endpoints(&placement, &self.endpoints)?;
-        self.placement_publisher.publish(placement)?;
+        let current = self.placement_publisher.snapshot();
+        if placement.epoch() <= current.epoch() {
+            return Err(CacheServiceError::StalePlacementEpoch {
+                current: current.epoch(),
+                proposed: placement.epoch(),
+            });
+        }
+
+        let mut committing = Vec::new();
+        {
+            let proofs = self.migration_proofs.lock();
+            for (slot, migration) in current.migrations() {
+                // Only the source service owns the destructive commit proof for
+                // a remote migration. Target/observer nodes may install the
+                // already-decided topology without duplicating source state.
+                if migration.source.node_id != self.local_node_id
+                    || migration.target.node_id == self.local_node_id
+                {
+                    continue;
+                }
+                let commits_to_target = placement.migration_for_slot(slot).is_none()
+                    && placement.owner_for_slot(slot) == Some(migration.target);
+                if !commits_to_target {
+                    continue;
+                }
+
+                let key = CacheMigrationKey {
+                    started_epoch: migration.started_epoch,
+                    slot,
+                    source: migration.source,
+                    target: migration.target,
+                };
+                let Some(proof) = proofs.get(&key) else {
+                    return Err(CacheServiceError::RemoteMigrationNotConverged(slot));
+                };
+                if proof.placement_epoch != current.epoch() || !proof.ready_for_live_commit() {
+                    return Err(CacheServiceError::RemoteMigrationNotConverged(slot));
+                }
+                committing.push(key);
+            }
+        }
+
+        let mut journaled_intents = Vec::new();
+        if let Some(journal) = &self.migration_journal {
+            let mut journal = journal.lock();
+            for key in &committing {
+                if let Err(error) = journal.record_commit_intent(*key, placement.epoch()) {
+                    for written in journaled_intents.drain(..) {
+                        let _ = journal.record_commit_aborted(written, placement.epoch());
+                    }
+                    return Err(CacheServiceError::Io(error));
+                }
+                journaled_intents.push(*key);
+            }
+        }
+
+        if let Err(error) = self.placement_publisher.publish(placement.clone()) {
+            if let Some(journal) = &self.migration_journal {
+                let mut journal = journal.lock();
+                for key in journaled_intents {
+                    let _ = journal.record_commit_aborted(key, placement.epoch());
+                }
+            }
+            return Err(error);
+        }
+
+        if let Some(journal) = &self.migration_journal {
+            let mut journal = journal.lock();
+            for key in &committing {
+                journal.record_completed(*key, placement.epoch())?;
+            }
+        }
+        if !committing.is_empty() {
+            let mut proofs = self.migration_proofs.lock();
+            for key in &committing {
+                proofs.remove(key);
+            }
+        }
+
         for control in &self.controls {
             control.wake();
         }
@@ -1218,7 +1299,7 @@ impl CacheServiceHandle {
             true
         };
 
-        Ok(CacheRemoteMigrationConvergence {
+        let report = CacheRemoteMigrationConvergence {
             probe_id: *probe_id,
             placement_epoch: *placement_epoch,
             slot: *slot,
@@ -1231,7 +1312,17 @@ impl CacheServiceHandle {
             target_conflicts: *conflicts,
             target_wrong_slot: *wrong_slot,
             durable_history_satisfied,
-        })
+        };
+        self.migration_proofs.lock().insert(
+            CacheMigrationKey {
+                started_epoch: migration.started_epoch,
+                slot: *slot,
+                source: *source,
+                target: *target,
+            },
+            report.clone(),
+        );
+        Ok(report)
     }
 
     /// Export one bounded source batch and send it to a remote migration target.
