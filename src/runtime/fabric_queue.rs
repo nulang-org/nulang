@@ -216,6 +216,33 @@ enum QueueMutation {
     },
 }
 
+pub(crate) fn encode_queue_created_mutation(
+    config: &FabricQueueConfig,
+) -> io::Result<Vec<u8>> {
+    config.validate()?;
+    serde_json::to_vec(&QueueMutation::QueueCreated {
+        config: config.clone(),
+    })
+    .map_err(json_error)
+}
+
+pub(crate) fn decode_queue_created_mutation(
+    bytes: &[u8],
+) -> io::Result<FabricQueueConfig> {
+    let event: QueueMutation = serde_json::from_slice(bytes).map_err(json_error)?;
+    match event {
+        QueueMutation::QueueCreated { config } => {
+            config.validate()?;
+            Ok(config)
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "first Fabric queue mutation must be QueueCreated",
+        )),
+    }
+}
+
+
 /// Queue state machine borrowing an existing Fabric stream store.
 ///
 /// The payload stream and queue mutation stream are the durable sources of
