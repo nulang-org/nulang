@@ -280,6 +280,37 @@ state machine:
 Do not implement JetStream wire/API compatibility until native consumer-group
 ownership, retention, and replicated lease state are stable.
 
+## Queue-level replicated ownership
+
+A replicated queue cannot independently rendezvous-hash its payload and mutation
+stream names. `__queue.<name>` and `__queue_meta.<name>` could otherwise select
+different leaders, making a lease mutation and its job payload belong to
+different consensus domains.
+
+The replication layer therefore derives placement once from the logical key:
+
+```text
+__queue_owner.<name>
+```
+
+and installs that exact epoch, leader, membership fingerprint, replication
+factor, and ordered replica set on both internal streams.
+
+Bootstrap is fail-closed:
+
+- both internal streams unowned + empty: derive and install one policy,
+- both already carry the identical policy: reuse it,
+- a crash leaves one side installed and the other unowned + empty: resume the
+  same installed policy onto the missing side,
+- divergent policies: reject,
+- unowned durable history: reject and require explicit migration.
+
+This bootstrap API remains crate-private until a queue-policy control message
+installs the policy on followers before ordinary replicated queue traffic.
+That follower propagation is required because ordinary per-stream first-contact
+bootstrap would recompute placement from the internal stream name and defeat the
+shared queue ownership invariant.
+
 ## Distributed follow-up
 
 The current queue state machine is local to one Fabric stream store. Moving it
