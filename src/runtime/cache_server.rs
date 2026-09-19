@@ -210,6 +210,73 @@ enum CacheRemoteControlError {
     Parse(RespParseError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheMigrationProbeSnapshot {
+    live_entries: usize,
+    import_fences: usize,
+    conflicts: u64,
+    wrong_slot: u64,
+}
+
+#[derive(Debug)]
+struct CacheTransferImportState {
+    tracker: CacheTransferImportTracker,
+    conflicts: u64,
+    wrong_slot: u64,
+}
+
+impl CacheTransferImportState {
+    fn new(slot: u16) -> Self {
+        Self {
+            tracker: CacheTransferImportTracker::new(slot),
+            conflicts: 0,
+            wrong_slot: 0,
+        }
+    }
+
+    fn import_batch(
+        &mut self,
+        store: &mut CacheStore,
+        batch: &CacheTransferBatch,
+        elapsed_ms: u64,
+        now_ms: u64,
+    ) -> Vec<CacheTransferImport> {
+        batch
+            .entries
+            .iter()
+            .map(|entry| {
+                let result = self
+                    .tracker
+                    .import_entry(store, entry, elapsed_ms, now_ms);
+                match result {
+                    CacheTransferImport::Conflict => {
+                        self.conflicts = self.conflicts.saturating_add(1);
+                    }
+                    CacheTransferImport::WrongSlot => {
+                        self.wrong_slot = self.wrong_slot.saturating_add(1);
+                    }
+                    _ => {}
+                }
+                result
+            })
+            .collect()
+    }
+
+    fn snapshot(
+        &self,
+        store: &CacheStore,
+        slot: u16,
+        now_ms: u64,
+    ) -> CacheMigrationProbeSnapshot {
+        CacheMigrationProbeSnapshot {
+            live_entries: store.live_entries_in_slot(slot, now_ms),
+            import_fences: self.tracker.len(),
+            conflicts: self.conflicts,
+            wrong_slot: self.wrong_slot,
+        }
+    }
+}
+
 enum CacheShardControlRequest {
     ExecuteRemoteCommand {
         placement_epoch: u64,
@@ -221,6 +288,13 @@ enum CacheShardControlRequest {
         placement_epoch: u64,
         batch: CacheTransferBatch,
         reply: SyncSender<Result<Vec<CacheTransferImport>, CacheRemoteControlError>>,
+    },
+    MigrationProbe {
+        placement_epoch: u64,
+        slot: u16,
+        source: CacheShardOwner,
+        target: CacheShardOwner,
+        reply: SyncSender<Result<CacheMigrationProbeSnapshot, CacheRemoteControlError>>,
     },
     Export {
         slot: u16,
@@ -2053,7 +2127,7 @@ pub struct CacheShardServer {
     applied_placement_epoch: Arc<AtomicU64>,
     control_tx: SyncSender<CacheShardControlRequest>,
     control_rx: Receiver<CacheShardControlRequest>,
-    transfer_imports: HashMap<u16, CacheTransferImportTracker>,
+    transfer_imports: HashMap<u16, CacheTransferImportState>,
 }
 
 impl CacheShardServer {
