@@ -250,6 +250,8 @@ enum QueueMutation {
         consumer: String,
         lease_token: u64,
         lease_until_ms: u64,
+        #[serde(default)]
+        lease_duration_ms: u64,
         deliveries: u32,
         #[serde(default)]
         consumer_group: Option<String>,
@@ -377,6 +379,7 @@ pub(crate) struct FabricQueueLeaseMutation {
     pub consumer: String,
     pub lease_token: u64,
     pub lease_until_ms: u64,
+    pub lease_duration_ms: u64,
     pub deliveries: u32,
     pub consumer_group: Option<String>,
     pub queue_epoch: u64,
@@ -399,6 +402,7 @@ pub(crate) fn decode_queue_lease_mutation(
             consumer,
             lease_token,
             lease_until_ms,
+            lease_duration_ms,
             deliveries,
             consumer_group,
             queue_epoch,
@@ -408,6 +412,7 @@ pub(crate) fn decode_queue_lease_mutation(
             consumer,
             lease_token,
             lease_until_ms,
+            lease_duration_ms,
             deliveries,
             consumer_group,
             queue_epoch,
@@ -772,6 +777,7 @@ impl<'a> FabricQueueStore<'a> {
             consumer: consumer.to_string(),
             lease_token,
             lease_until_ms,
+            lease_duration_ms: state.config.visibility_timeout_ms,
             deliveries,
             consumer_group: None,
             queue_epoch: 0,
@@ -1579,6 +1585,7 @@ impl Runtime {
         consumer_group: Option<&str>,
         operation_id: &str,
         queue_epoch: u64,
+        lease_duration_ms: Option<u64>,
         now_ms: u64,
     ) -> io::Result<Option<FabricQueueLeasePlan>> {
         validate_queue_name(queue)?;
@@ -1591,6 +1598,12 @@ impl Runtime {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "replicated Fabric queue lease requires a non-zero queue epoch",
+            ));
+        }
+        if lease_duration_ms == Some(0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replicated Fabric queue lease duration must be greater than zero",
             ));
         }
 
@@ -1643,12 +1656,15 @@ impl Runtime {
         let lease_token = current.lease_token.checked_add(1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "Fabric queue lease token overflow")
         })?;
-        let lease_until_ms = now_ms.saturating_add(state.config.visibility_timeout_ms);
+        let lease_duration_ms =
+            lease_duration_ms.unwrap_or(state.config.visibility_timeout_ms);
+        let lease_until_ms = now_ms.saturating_add(lease_duration_ms);
         let mutation_bytes = serde_json::to_vec(&QueueMutation::LeaseAcquired {
             sequence,
             consumer: consumer.to_string(),
             lease_token,
             lease_until_ms,
+            lease_duration_ms,
             deliveries,
             consumer_group: consumer_group.map(ToOwned::to_owned),
             queue_epoch,
