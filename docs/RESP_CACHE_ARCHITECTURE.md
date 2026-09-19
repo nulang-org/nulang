@@ -137,6 +137,14 @@ semantics; process-relative timestamps are not sent to remote nodes. Input,
 output, connection count, pipeline depth, inbox drain size, and expiry work are
 all bounded by configuration.
 
+`cache_service.rs` assembles these reactors into one local service. It binds
+every shard listener before creating dispatchers, so ephemeral ports can be
+advertised exactly in `MOVED` and cluster topology responses. One shared slot
+map, dispatch-channel set, endpoint map, and monotonic clock are cloned into
+the shard reactors. The service can then spawn one named OS thread per shard,
+optionally pin shard i to logical CPU i, and shut down all reactors through
+their Mio wake handles before joining the threads.
+
 ## Durability
 
 Durability is not implicit in the cache kernel. Add it above the mutation path
@@ -169,9 +177,9 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add a multi-shard server builder that reserves/binds advertised endpoints,
-   shares one `CacheServerClock`, pins reactor threads when requested, and
-   starts/stops the shard set as one service.
+1. Add a small executable/config surface for starting the cache service,
+   including advertised host, shard count, base port, core pinning, and
+   resource-limit flags.
 2. Add ASK/ASKING and migration-state redirects when live slot migration is
    implemented.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
