@@ -293,6 +293,10 @@ impl CacheDispatcher {
         self.routing_mode
     }
 
+    pub fn local_node_id(&self) -> u64 {
+        self.local_node_id
+    }
+
     pub fn local_shard(&self) -> u16 {
         self.local_shard
     }
