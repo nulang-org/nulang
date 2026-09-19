@@ -21,18 +21,15 @@ use super::fabric_queue::{
     validate_queue_name, FabricQueueAddOptions, FabricQueueConfig, FabricQueueDelivery,
     FabricQueueNackResult, FabricQueueOperation, FabricQueueOperationKind,
 };
-use super::fabric_stream::{
-    FabricStreamReplicationPolicy, FABRIC_STREAM_INITIAL_EPOCH,
-};
+use super::fabric_stream::{FabricStreamReplicationPolicy, FABRIC_STREAM_INITIAL_EPOCH};
 use super::{
-    FabricStreamConfig, FabricStreamReplicationStatus, MessagePriority, NodeId, NodeStatus,
-    Packet, Runtime,
+    FabricStreamConfig, FabricStreamReplicationStatus, MessagePriority, NodeId, NodeStatus, Packet,
+    Runtime,
 };
 
 const QUEUE_PLACEMENT_PREFIX: &str = "__queue_owner.";
 pub(crate) const FABRIC_QUEUE_POLICY_BEHAVIOR: &str = "__nulang_fabric_queue_policy_v1";
-pub(crate) const FABRIC_QUEUE_POLICY_ACK_BEHAVIOR: &str =
-    "__nulang_fabric_queue_policy_ack_v1";
+pub(crate) const FABRIC_QUEUE_POLICY_ACK_BEHAVIOR: &str = "__nulang_fabric_queue_policy_ack_v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FabricQueuePlacement {
@@ -212,8 +209,7 @@ impl FabricQueuePolicyInstall {
     }
 
     pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
-        serde_json::to_vec(self)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        serde_json::to_vec(self).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
@@ -237,10 +233,7 @@ pub(crate) struct FabricQueuePolicyAck {
 }
 
 impl FabricQueuePolicyAck {
-    pub(crate) fn accepted(
-        install: &FabricQueuePolicyInstall,
-        replica: NodeId,
-    ) -> Self {
+    pub(crate) fn accepted(install: &FabricQueuePolicyInstall, replica: NodeId) -> Self {
         Self {
             queue: install.queue.clone(),
             partition: install.partition,
@@ -253,10 +246,7 @@ impl FabricQueuePolicyAck {
         }
     }
 
-    pub(crate) fn rejected(
-        install: &FabricQueuePolicyInstall,
-        replica: NodeId,
-    ) -> Self {
+    pub(crate) fn rejected(install: &FabricQueuePolicyInstall, replica: NodeId) -> Self {
         let mut ack = Self::accepted(install, replica);
         ack.accepted = false;
         ack
@@ -271,8 +261,7 @@ impl FabricQueuePolicyAck {
     }
 
     pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
-        serde_json::to_vec(self)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        serde_json::to_vec(self).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
@@ -319,9 +308,7 @@ impl Runtime {
             )),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "Fabric queue {queue:?} has a partially installed replication policy"
-                ),
+                format!("Fabric queue {queue:?} has a partially installed replication policy"),
             )),
         }
     }
@@ -447,8 +434,7 @@ impl Runtime {
         partition: u16,
         replication_factor: usize,
     ) -> io::Result<FabricQueueReplicatedCreateResult> {
-        let policy =
-            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
         if !policy.ready {
             return Ok(FabricQueueReplicatedCreateResult {
                 policy,
@@ -478,9 +464,7 @@ impl Runtime {
             if existing != config {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    format!(
-                        "Fabric queue {queue:?} already exists with different config"
-                    ),
+                    format!("Fabric queue {queue:?} already exists with different config"),
                 ));
             }
 
@@ -558,8 +542,7 @@ impl Runtime {
         replication_factor: usize,
         now_ms: u64,
     ) -> io::Result<FabricQueueReplicatedAddResult> {
-        let policy =
-            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
         if !policy.ready {
             return Ok(FabricQueueReplicatedAddResult {
                 policy,
@@ -757,8 +740,7 @@ impl Runtime {
             ));
         }
 
-        let policy =
-            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
         if !policy.ready {
             return Ok(FabricQueueReplicatedAcquireResult {
                 policy,
@@ -866,7 +848,8 @@ impl Runtime {
             operation_id,
             placement.epoch,
             now_ms,
-        )? else {
+        )?
+        else {
             return Ok(FabricQueueReplicatedAcquireResult {
                 policy,
                 mutation_sequence: None,
@@ -910,8 +893,7 @@ impl Runtime {
     ) -> io::Result<FabricQueueReplicatedAckResult> {
         validate_consumer_name(consumer)?;
         validate_operation_id(operation_id)?;
-        let policy =
-            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
         if !policy.ready {
             return Ok(FabricQueueReplicatedAckResult {
                 policy,
@@ -923,7 +905,9 @@ impl Runtime {
         }
         let placement = self
             .fabric_queue_replication_placement(queue)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing")
+            })?;
         if queue_epoch != placement.epoch {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1008,8 +992,7 @@ impl Runtime {
     ) -> io::Result<FabricQueueReplicatedNackResult> {
         validate_consumer_name(consumer)?;
         validate_operation_id(operation_id)?;
-        let policy =
-            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
         if !policy.ready {
             return Ok(FabricQueueReplicatedNackResult {
                 policy,
@@ -1021,7 +1004,9 @@ impl Runtime {
         }
         let placement = self
             .fabric_queue_replication_placement(queue)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing")
+            })?;
         if queue_epoch != placement.epoch {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1129,8 +1114,7 @@ impl Runtime {
     ) -> io::Result<FabricQueueReplicatedRenewResult> {
         validate_consumer_name(consumer)?;
         validate_operation_id(operation_id)?;
-        let policy =
-            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
         if !policy.ready {
             return Ok(FabricQueueReplicatedRenewResult {
                 policy,
@@ -1142,7 +1126,9 @@ impl Runtime {
         }
         let placement = self
             .fabric_queue_replication_placement(queue)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing")
+            })?;
         if queue_epoch != placement.epoch {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1274,10 +1260,7 @@ impl Runtime {
         Ok(self.fabric_queue_policy_sync_status(queue)?.ready)
     }
 
-    pub(crate) fn fabric_queue_has_replication_policy(
-        &mut self,
-        queue: &str,
-    ) -> io::Result<bool> {
+    pub(crate) fn fabric_queue_has_replication_policy(&mut self, queue: &str) -> io::Result<bool> {
         validate_queue_name(queue)?;
         for stream in [queue_stream_name(queue), queue_mutation_stream_name(queue)] {
             match self.fabric_stream_replication_policy(&stream) {
@@ -1451,20 +1434,14 @@ impl Runtime {
                 validate_requested_policy(installed, partition, replication_factor)?;
                 require_empty_stream(self, &payload)?;
                 require_unowned_empty_stream(self, &mutations)?;
-                self.fabric_stream_establish_replication_policy(
-                    &mutations,
-                    installed.clone(),
-                )?;
+                self.fabric_stream_establish_replication_policy(&mutations, installed.clone())?;
                 installed.clone()
             }
             (None, Some(installed)) => {
                 validate_requested_policy(installed, partition, replication_factor)?;
                 require_empty_stream(self, &mutations)?;
                 require_unowned_empty_stream(self, &payload)?;
-                self.fabric_stream_establish_replication_policy(
-                    &payload,
-                    installed.clone(),
-                )?;
+                self.fabric_stream_establish_replication_policy(&payload, installed.clone())?;
                 installed.clone()
             }
             (None, None) => {
@@ -1483,14 +1460,8 @@ impl Runtime {
                     replicas: placement.replicas.iter().map(|node| node.0).collect(),
                 };
 
-                self.fabric_stream_establish_replication_policy(
-                    &payload,
-                    policy.clone(),
-                )?;
-                self.fabric_stream_establish_replication_policy(
-                    &mutations,
-                    policy.clone(),
-                )?;
+                self.fabric_stream_establish_replication_policy(&payload, policy.clone())?;
+                self.fabric_stream_establish_replication_policy(&mutations, policy.clone())?;
                 policy
             }
         };
@@ -1603,10 +1574,7 @@ mod tests {
         assert_eq!(placement.partition, 0);
         assert_eq!(placement.epoch, 7);
         assert_eq!(placement.leader, NodeId(11));
-        assert_eq!(
-            placement.replicas,
-            vec![NodeId(11), NodeId(22), NodeId(33)]
-        );
+        assert_eq!(placement.replicas, vec![NodeId(11), NodeId(22), NodeId(33)]);
         assert_eq!(placement.replication_factor(), 3);
         assert_eq!(placement.membership_fingerprint, 99);
     }
@@ -1824,15 +1792,7 @@ mod tests {
         cluster.run_rounds(12);
         let committed_job = cluster
             .node_mut(leader_index)
-            .fabric_queue_add_replicated(
-                "orders",
-                "render",
-                b"payload",
-                add_options,
-                0,
-                3,
-                100,
-            )
+            .fabric_queue_add_replicated("orders", "render", b"payload", add_options, 0, 3, 100)
             .unwrap();
         assert_eq!(committed_job.sequence, Some(1));
         assert!(committed_job.deduplicated);
@@ -1894,7 +1854,9 @@ mod tests {
             .unwrap();
         assert!(committed_lease.resumed);
         assert!(committed_lease.replication.unwrap().committed);
-        let delivery = committed_lease.delivery.expect("lease must be visible after quorum");
+        let delivery = committed_lease
+            .delivery
+            .expect("lease must be visible after quorum");
         assert_eq!(delivery.sequence, 1);
         assert_eq!(delivery.queue_epoch, queue_epoch);
         assert_eq!(delivery.job_id, "job-1");
@@ -2001,7 +1963,9 @@ mod tests {
             )
             .unwrap();
         assert!(committed_nack.resumed);
-        let nack_result = committed_nack.result.expect("NACK must be visible after quorum");
+        let nack_result = committed_nack
+            .result
+            .expect("NACK must be visible after quorum");
         assert_eq!(nack_result.status, FabricQueueJobStatus::Waiting);
         assert_eq!(nack_result.deliveries, 1);
         assert_eq!(nack_result.available_at_ms, Some(500));
@@ -2128,7 +2092,10 @@ mod tests {
         assert_eq!(
             cluster
                 .node_mut(leader_index)
-                .fabric_stream_append(&queue_mutation_stream_name("orders"), b"not-a-queue-mutation")
+                .fabric_stream_append(
+                    &queue_mutation_stream_name("orders"),
+                    b"not-a-queue-mutation"
+                )
                 .unwrap(),
             7
         );
@@ -2149,15 +2116,11 @@ mod tests {
         let policy = sample_policy();
         assert!(validate_requested_policy(&policy, 0, 3).is_ok());
         assert_eq!(
-            validate_requested_policy(&policy, 0, 2)
-                .unwrap_err()
-                .kind(),
+            validate_requested_policy(&policy, 0, 2).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
         assert_eq!(
-            validate_requested_policy(&policy, 1, 3)
-                .unwrap_err()
-                .kind(),
+            validate_requested_policy(&policy, 1, 3).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
     }
