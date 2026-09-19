@@ -2145,6 +2145,32 @@ fn reject_cache_network_id_reuse(
                 },
             );
         }
+        CacheTransportMessage::MigrationProbeRequest {
+            probe_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+        } if target.node_id == local_node_id => {
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: CacheTransportMessage::MigrationProbeResponse {
+                        probe_id,
+                        placement_epoch,
+                        source,
+                        target,
+                        slot,
+                        accepted: false,
+                        live_entries: 0,
+                        import_fences: 0,
+                        conflicts: 0,
+                        wrong_slot: 0,
+                    },
+                },
+            );
+        }
         _ => {}
     }
 }
@@ -2194,6 +2220,32 @@ fn reject_cache_network_saturated(
                         target,
                         slot: batch.slot,
                         results: vec![CacheTransferImport::Conflict; batch.entries.len()],
+                    },
+                },
+            );
+        }
+        CacheTransportMessage::MigrationProbeRequest {
+            probe_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+        } if target.node_id == local_node_id => {
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: CacheTransportMessage::MigrationProbeResponse {
+                        probe_id,
+                        placement_epoch,
+                        source,
+                        target,
+                        slot,
+                        accepted: false,
+                        live_entries: 0,
+                        import_fences: 0,
+                        conflicts: 0,
+                        wrong_slot: 0,
                     },
                 },
             );
