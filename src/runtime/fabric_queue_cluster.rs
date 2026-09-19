@@ -1449,6 +1449,60 @@ impl Runtime {
         replication_factor: usize,
         now_ms: u64,
     ) -> io::Result<FabricQueueReplicatedAckResult> {
+        self.fabric_queue_ack_replicated_inner(
+            queue,
+            sequence,
+            consumer,
+            queue_epoch,
+            lease_token,
+            operation_id,
+            None,
+            partition,
+            replication_factor,
+            now_ms,
+        )
+    }
+
+    pub fn fabric_queue_ack_replicated_with_result(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        result: &[u8],
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAckResult> {
+        self.fabric_queue_ack_replicated_inner(
+            queue,
+            sequence,
+            consumer,
+            queue_epoch,
+            lease_token,
+            operation_id,
+            Some(result),
+            partition,
+            replication_factor,
+            now_ms,
+        )
+    }
+
+    fn fabric_queue_ack_replicated_inner(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        result: Option<&[u8]>,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAckResult> {
         validate_consumer_name(consumer)?;
         validate_operation_id(operation_id)?;
         let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
@@ -1487,6 +1541,12 @@ impl Runtime {
                 queue_epoch,
                 lease_token,
             )?;
+            if operation.result.as_deref() != result {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric queue ACK operation id was reused with a different completion result",
+                ));
+            }
             let replication = self.fabric_queue_resume_metadata_replication(
                 &mutation_stream,
                 partition,
@@ -1517,7 +1577,7 @@ impl Runtime {
             queue_epoch,
             lease_token,
             operation_id,
-            None,
+            result,
             now_ms,
         )?;
         let appended = self.fabric_stream_replicated_append(
