@@ -822,6 +822,44 @@ impl CacheServiceHandle {
         Ok(pending)
     }
 
+    /// Retry a previously exported remote transfer batch without re-exporting.
+    ///
+    /// The transfer id and payload are preserved exactly. The target's
+    /// authenticated dedupe cache therefore replays the original application
+    /// ACK instead of importing the batch a second time.
+    pub fn retry_remote_slot_batch(
+        &self,
+        pending: &CacheRemoteTransferPending,
+    ) -> Result<(), CacheServiceError> {
+        let placement = self.placement_publisher.snapshot();
+        if placement.epoch() != pending.placement_epoch {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        }
+        let Some(migration) = placement.migration_for_slot(pending.batch.slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        };
+        if migration.source != pending.source || migration.target != pending.target {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        }
+
+        self.send_network_message(
+            NodeId(pending.target.node_id),
+            CacheTransportMessage::TransferBatch {
+                transfer_id: pending.transfer_id,
+                placement_epoch: pending.placement_epoch,
+                source: pending.source,
+                target: pending.target,
+                batch: pending.batch.clone(),
+            },
+        )
+    }
+
     /// Apply a matching remote TransferAck and generation-fence source deletion.
     pub fn complete_remote_slot_batch(
         &self,
