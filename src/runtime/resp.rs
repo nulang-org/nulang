@@ -222,6 +222,14 @@ pub fn write_null_bulk(out: &mut Vec<u8>) {
     out.extend_from_slice(b"$-1\r\n");
 }
 
+pub fn write_moved(out: &mut Vec<u8>, slot: u16, target: &[u8]) {
+    out.extend_from_slice(b"-MOVED ");
+    write_u64_decimal(out, slot as u64);
+    out.push(b' ');
+    out.extend_from_slice(target);
+    out.extend_from_slice(b"\r\n");
+}
+
 pub fn write_array_len(out: &mut Vec<u8>, len: usize) {
     out.push(b'*');
     write_u64_decimal(out, len as u64);
@@ -349,5 +357,9 @@ mod tests {
         out.clear();
         write_array_len(&mut out, 3);
         assert_eq!(out, b"*3\r\n");
+
+        out.clear();
+        write_moved(&mut out, 3999, b"127.0.0.1:6381");
+        assert_eq!(out, b"-MOVED 3999 127.0.0.1:6381\r\n");
     }
 }
