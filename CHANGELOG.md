@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### PostgreSQL capacity allocation store — 2026-09-19
+- **Provider-scoped durable allocation CAS** (Experimental, `crates/nulang-capacity-postgres/`). Adds a separate async `tokio-postgres` adapter crate and migration for provider-local allocation snapshots. One row per concrete resource provider stores its optimistic generation and JSONB allocation/tombstone state; compare-and-swap updates fence concurrent schedulers without a fleet-wide lock. PostgreSQL remains outside the provider-neutral `nulang-capacity` crate.
+
 ### Live capacity heartbeat and allocation ledger — 2026-09-19
 - **Fail-closed liveness gating and reservation accounting** (Experimental, `crates/nulang-capacity/src/state.rs`). Adds topology-bound monotonic provider heartbeats, `ready`/`draining`/`unavailable` scheduling state, heartbeat freshness checks, generation-fenced idempotent resource allocations, expiry/release semantics, aggregate runtime-vs-ledger drift evidence, and an atomic compare-and-swap persistence boundary for hosted control-plane implementations. Heartbeat-observed usage never silently replaces durable reservations.
 
