@@ -42,6 +42,10 @@ use super::resp_cache::{command_slot, execute_command, RespCommandSlot};
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
 const FIRST_CONNECTION_TOKEN: usize = 2;
+const CACHE_NETWORK_EVENT_CAPACITY: usize = 1024;
+const CACHE_NETWORK_MAX_BATCH: usize = 64;
+const CACHE_NETWORK_IDLE_SLEEP: Duration = Duration::from_millis(1);
+const CACHE_NETWORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct CacheServerConfig {
@@ -551,6 +555,13 @@ impl CacheService {
 
     pub fn start(self) -> Result<CacheServiceHandle, CacheServiceError> {
         let controls: Vec<_> = self.servers.iter().map(CacheShardServer::control).collect();
+        let transport_sender = self
+            .transport_endpoint
+            .as_ref()
+            .map(CacheServiceTransportEndpoint::sender);
+        let network_shutdown = Arc::new(AtomicBool::new(false));
+        let (network_event_tx, network_event_rx) =
+            mpsc::sync_channel(CACHE_NETWORK_EVENT_CAPACITY);
         let mut threads: Vec<(u16, JoinHandle<Result<(), CacheServerError>>)> =
             Vec::with_capacity(self.servers.len());
 
@@ -581,12 +592,50 @@ impl CacheService {
             }
         }
 
+        let network_thread = if let Some(endpoint) = self.transport_endpoint {
+            let coordinator_controls = controls.clone();
+            let placement_publisher = self.placement_publisher.clone();
+            let shutdown = network_shutdown.clone();
+            let local_node_id = self.local_node_id;
+            match thread::Builder::new()
+                .name("nulang-cache-network".to_string())
+                .spawn(move || {
+                    run_cache_network_coordinator(
+                        local_node_id,
+                        endpoint,
+                        coordinator_controls,
+                        placement_publisher,
+                        network_event_tx,
+                        shutdown,
+                    );
+                })
+            {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    network_shutdown.store(true, Ordering::Release);
+                    for control in &controls {
+                        control.shutdown();
+                    }
+                    for (_, handle) in threads {
+                        let _ = handle.join();
+                    }
+                    return Err(CacheServiceError::Io(error));
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(CacheServiceHandle {
             controls,
             threads,
             local_addrs: self.local_addrs,
             endpoints: self.endpoints,
             placement_publisher: self.placement_publisher,
+            transport_sender,
+            network_events: transport_sender.as_ref().map(|_| network_event_rx),
+            network_thread,
+            network_shutdown,
         })
     }
 }
@@ -597,6 +646,10 @@ pub struct CacheServiceHandle {
     local_addrs: Vec<SocketAddr>,
     endpoints: CacheEndpointMap,
     placement_publisher: Arc<CachePlacementPublisher>,
+    transport_sender: Option<CacheServiceTransportSender>,
+    network_events: Option<Receiver<CacheTransportInbound>>,
+    network_thread: Option<JoinHandle<()>>,
+    network_shutdown: Arc<AtomicBool>,
 }
 
 impl CacheServiceHandle {
@@ -789,6 +842,7 @@ impl CacheServiceHandle {
     }
 
     pub fn request_shutdown(&self) {
+        self.network_shutdown.store(true, Ordering::Release);
         for control in &self.controls {
             control.shutdown();
         }
@@ -813,6 +867,11 @@ impl CacheServiceHandle {
             };
             if first_error.is_none() {
                 first_error = result;
+            }
+        }
+        if let Some(handle) = self.network_thread.take() {
+            if handle.join().is_err() && first_error.is_none() {
+                first_error = Some(CacheServiceError::ThreadPanicked(u16::MAX));
             }
         }
         match first_error {
