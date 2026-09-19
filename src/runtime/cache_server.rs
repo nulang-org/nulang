@@ -49,7 +49,7 @@ impl Default for CacheServerConfig {
             max_pipeline_depth: 1024,
             events_capacity: 1024,
             max_inbox_batch: 256,
-            expiry_sweep_interval: Duration::from_millis(10),
+            expiry_sweep_interval: Duration::from_millis(100),
             max_expiry_items_per_sweep: 4096,
         }
     }
@@ -230,7 +230,7 @@ impl CacheShardServer {
             return Err(CacheServerError::DispatchConfig(
                 CacheDispatchConfigError::InvalidLocalShard {
                     shard: inbox.shard(),
-                    shard_count: dispatcher.local_shard().saturating_add(1),
+                    shard_count: dispatcher.shard_count(),
                 },
             ));
         }
@@ -466,7 +466,13 @@ impl CacheShardServer {
                     ));
                 }
                 Ok(read) => {
-                    if connection.input.len().saturating_add(read) > self.config.max_input_buffer {
+                    if connection
+                        .input
+                        .len()
+                        .saturating_sub(connection.input_start)
+                        .saturating_add(read)
+                        > self.config.max_input_buffer
+                    {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "cache input buffer limit exceeded",
