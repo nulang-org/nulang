@@ -283,7 +283,7 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
     runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
 
     let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
-        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 73402))
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53402))
         .with_shard(CacheServiceShardConfig::new(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1",
@@ -295,7 +295,7 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
         .unwrap();
 
     let service_b = CacheServiceBuilder::new(node_b.0, base.clone())
-        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 73401))
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53401))
         .with_shard(CacheServiceShardConfig::new(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1",
