@@ -1202,6 +1202,7 @@ impl<'a> FabricQueueStore<'a> {
                             job_id: envelope.job_id,
                             available_at_ms: envelope.available_at_ms,
                             priority: envelope.priority,
+                            max_attempts: envelope.max_attempts,
                             deliveries: 0,
                             lease_token: 0,
                             status: FabricQueueJobStatus::Waiting,
