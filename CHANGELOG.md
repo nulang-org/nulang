@@ -45,6 +45,16 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### C embedding handle and function dispatch correctness — 2026-09-18
+- **Public module handles now resolve through the runtime handle table before
+  accessing deduplicated compiled modules** (`src/ffi/c_api.rs`). Repeated
+  compilation of identical source can therefore use fresh public handles
+  consistently for execution, named calls, module string interning, and
+  returned-string stabilization.
+- **Named C API function calls now execute from the function's actual bytecode
+  offset instead of its function-table slot** (`src/bytecode.rs`,
+  `src/ffi/c_api.rs`). Non-first top-level functions no longer risk starting
+  execution at an unrelated bytecode PC.
 ### Fabric confirmed-removal automatic failover — 2026-09-18
 - **Automatic ownership transition after confirmed leader removal**
   (Experimental, `src/runtime/fabric_stream_epoch.rs`,
