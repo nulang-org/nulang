@@ -3,12 +3,14 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdTcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nulang::runtime::{
-    cache_transport_bridge, redis_slot, CacheAdvertisedEndpoint, CacheServiceBuilder,
-    CacheServiceHandle, CacheServiceShardConfig, CacheShardOwner, CacheSlotMap,
+    cache_transport_bridge, redis_slot, CacheAdvertisedEndpoint, CacheMigrationJournal,
+    CacheMigrationKey, CacheServiceBuilder, CacheServiceHandle, CacheServiceShardConfig,
+    CacheShardOwner, CacheSlotMap,
     CacheTransportInbound, CacheTransportMessage, DeterministicNetworkTransport, IncomingPacket,
     NodeId, OutgoingPacket, Runtime,
 };
@@ -24,6 +26,17 @@ type Bus = Arc<
         >,
     >,
 >;
+
+fn temp_journal_path(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "nulang-cache-{name}-{}-{nonce}.journal",
+        std::process::id()
+    ))
+}
 
 fn distributed_runtime(addr: SocketAddr, bus: Bus) -> Runtime {
     let mut runtime = Runtime::new();
@@ -243,6 +256,7 @@ fn remote_cache_command_executes_on_owning_reactor_and_stale_epoch_fails_closed(
 
 #[test]
 fn remote_slot_migration_moves_data_then_commits_ownership() {
+    let journal_path = temp_journal_path("full-migration");
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let addr_a: SocketAddr = "127.0.0.1:33401".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:33402".parse().unwrap();
@@ -283,6 +297,7 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
     runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
 
     let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_migration_journal_path(&journal_path)
         .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53402))
         .with_shard(CacheServiceShardConfig::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -353,7 +368,26 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
     assert_eq!(convergence.target_import_fences, 1);
     assert_eq!(convergence.target_conflicts, 0);
     assert_eq!(convergence.target_wrong_slot, 0);
+    assert!(convergence.durable_history_satisfied);
     assert!(convergence.ready_for_live_commit());
+
+    let journal_key = CacheMigrationKey {
+        started_epoch: 1,
+        slot,
+        source,
+        target,
+    };
+    let recovered = service_a
+        .recovered_remote_migration(journal_key)
+        .expect("durable migration proof");
+    assert_eq!(recovered.source_incarnation, service_a.migration_incarnation());
+    assert_eq!(recovered.source_remaining, Some(0));
+    assert!(recovered.all_sent_transfers_acked());
+    assert_eq!(recovered.expected_import_fences(), 1);
+    assert_eq!(
+        recovered.convergence.as_ref().map(|evidence| evidence.probe_id),
+        Some(9002)
+    );
 
     // The source is drained but remains stable owner until commit, so it asks.
     source_client.write_all(&frame(&[b"GET", key])).unwrap();
@@ -394,6 +428,14 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
 
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
+
+    let journal = CacheMigrationJournal::open(&journal_path).unwrap();
+    let recovered = journal
+        .recovery_state(journal_key)
+        .expect("journal should survive service shutdown");
+    assert_eq!(recovered.source_remaining, Some(0));
+    assert!(recovered.all_sent_transfers_acked());
+    std::fs::remove_file(journal_path).unwrap();
 }
 
 #[test]
