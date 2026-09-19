@@ -174,23 +174,34 @@ impl CacheResponsePipeline {
 
         loop {
             let action = match self.pending.front() {
-                Some(PendingResponse::Ready(bytes)) => Some(ReadyAction::Bytes(bytes.clone())),
+                Some(PendingResponse::Ready(_)) => FrontAction::MoveReady,
                 Some(PendingResponse::Local(reply)) => match reply.try_recv()? {
-                    Some(bytes) => Some(ReadyAction::Bytes(bytes)),
-                    None => None,
+                    Some(bytes) => FrontAction::Completed(bytes),
+                    None => FrontAction::Pending,
                 },
-                Some(PendingResponse::Remote(request_id)) => self
-                    .remote_ready
-                    .remove(request_id)
-                    .map(ReadyAction::Bytes),
-                None => None,
+                Some(PendingResponse::Remote(request_id)) => {
+                    match self.remote_ready.remove(request_id) {
+                        Some(bytes) => FrontAction::Completed(bytes),
+                        None => FrontAction::Pending,
+                    }
+                }
+                None => FrontAction::Pending,
             };
 
-            let Some(ReadyAction::Bytes(bytes)) = action else {
-                break;
+            let bytes = match action {
+                FrontAction::MoveReady => {
+                    let Some(PendingResponse::Ready(bytes)) = self.pending.pop_front() else {
+                        unreachable!("front response changed while draining")
+                    };
+                    bytes
+                }
+                FrontAction::Completed(bytes) => {
+                    self.pending.pop_front();
+                    bytes
+                }
+                FrontAction::Pending => break,
             };
 
-            self.pending.pop_front();
             socket_out.extend_from_slice(&bytes);
             flushed += 1;
         }
@@ -199,8 +210,10 @@ impl CacheResponsePipeline {
     }
 }
 
-enum ReadyAction {
-    Bytes(Vec<u8>),
+enum FrontAction {
+    MoveReady,
+    Completed(Vec<u8>),
+    Pending,
 }
 
 #[cfg(test)]
