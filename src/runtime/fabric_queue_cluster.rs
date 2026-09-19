@@ -940,6 +940,107 @@ mod tests {
     }
 
     #[test]
+    fn replicated_queue_creation_is_policy_gated_retry_safe_and_quorum_committed() {
+        use crate::runtime::cluster_dst::DeterministicCluster;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let addrs = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39101),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39102),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39103),
+        ];
+        let mut cluster = DeterministicCluster::new(&addrs, 0x5155455545);
+        cluster.run_rounds(30);
+        assert!(cluster.active_views_converged());
+
+        let base = std::env::temp_dir().join(format!(
+            "nulang-fabric-queue-rf3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let roots: Vec<_> = (0..3)
+            .map(|index| base.join(format!("node-{index}")))
+            .collect();
+        for (index, root) in roots.iter().enumerate() {
+            cluster.node_mut(index).fabric_stream_open(root).unwrap();
+        }
+
+        let placement = cluster
+            .node_mut(0)
+            .fabric_stream_placement(&queue_placement_key("orders"), 0, 3)
+            .unwrap();
+        let leader_index = (0..3)
+            .find(|&index| cluster.id(index) == placement.leader)
+            .unwrap();
+        let config = FabricQueueConfig {
+            visibility_timeout_ms: 15_000,
+            max_attempts: 5,
+            dead_letter_queue: None,
+        };
+
+        // First call persists/broadcasts policy only. No queue mutation may
+        // appear before every replica has acknowledged the shared policy.
+        let first = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("orders", config.clone(), 0, 3)
+            .unwrap();
+        assert!(!first.policy.ready);
+        assert_eq!(first.mutation_sequence, None);
+
+        cluster.run_rounds(8);
+        let policy = cluster
+            .node_mut(leader_index)
+            .fabric_queue_policy_sync_status("orders")
+            .unwrap();
+        assert!(policy.ready);
+        assert_eq!(policy.acknowledgements, 3);
+
+        // QueueCreated is now sequence 1. Calling create again before quorum
+        // completes must redispatch that same sequence, never append sequence 2.
+        let pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("orders", config.clone(), 0, 3)
+            .unwrap();
+        assert_eq!(pending.mutation_sequence, Some(1));
+        let retry = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("orders", config.clone(), 0, 3)
+            .unwrap();
+        assert_eq!(retry.mutation_sequence, Some(1));
+        assert_eq!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_stream_info(&queue_mutation_stream_name("orders"))
+                .unwrap()
+                .last_sequence,
+            Some(1)
+        );
+
+        cluster.run_rounds(12);
+        let created = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("orders", config, 0, 3)
+            .unwrap();
+        assert!(created.created);
+        assert!(created.replication.unwrap().committed);
+
+        for index in 0..3 {
+            assert_eq!(
+                cluster
+                    .node_mut(index)
+                    .fabric_stream_committed_sequence(&queue_mutation_stream_name("orders"))
+                    .unwrap(),
+                1
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn installed_policy_request_must_match_partition_and_replication_factor() {
         let policy = sample_policy();
         assert!(validate_requested_policy(&policy, 0, 3).is_ok());
