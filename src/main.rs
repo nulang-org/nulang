@@ -10,6 +10,7 @@
 //!   nulang agent <init|run|chat|goals|graph>
 //!   nulang nula <new|build|build-wasm|test|run|add|remove|publish|deploy|watch|doc>
 //!   nulang fmt [--check] [<file>]
+//!   nulang effects [--json] <file>
 //!
 //! Options:
 //!   -r, --repl               Start interactive REPL
@@ -174,6 +175,15 @@ fn main() {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
+    }
+
+    // `nulang effects <file>` — print transitive per-function effect rows.
+    if args[1] == "effects" {
+        if let Err(e) = run_effects_cmd(&args[2..]) {
+            print_error(&e, true);
+            std::process::exit(exit_code(&e));
+        }
+        return;
     }
 
     // `nulang nula <cmd>` dispatches to the package manager.
@@ -1070,6 +1080,7 @@ fn print_help() {
     println!("       nulang --lsp");
     println!("       nulang --dap");
     println!("       nulang fmt [--check] [<file>]");
+    println!("       nulang effects [--json] <file>");
     println!("       nulang node --listen <ADDR> [--seed <ADDR>] [--expected-nodes <N>]");
     println!("       nulang --doc");
     println!();
@@ -1543,6 +1554,112 @@ fn run_bench<F: FnMut() -> NuResult<()>>(mut run: F, n: usize) -> NuResult<()> {
     let _ = std::io::stdout().flush();
 
     print_bench_stats(&times);
+    Ok(())
+}
+
+fn run_effects_cmd(args: &[String]) -> NuResult<()> {
+    let mut json = false;
+    let mut file: Option<&str> = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            s if s.starts_with('-') => {
+                return Err(NuError::VMError {
+                    msg: format!("unknown effects option '{}'", s),
+                    span: Span::default(),
+                });
+            }
+            s => {
+                if file.replace(s).is_some() {
+                    return Err(NuError::VMError {
+                        msg: "effects accepts exactly one source file".to_string(),
+                        span: Span::default(),
+                    });
+                }
+            }
+        }
+    }
+
+    let file = file.ok_or_else(|| NuError::VMError {
+        msg: "usage: nulang effects [--json] <file>".to_string(),
+        span: Span::default(),
+    })?;
+    let source = std::fs::read_to_string(file).map_err(|e| NuError::VMError {
+        msg: format!("cannot read '{}': {}", file, e),
+        span: Span::default(),
+    })?;
+
+    // Reuse the normal frontend so imports, prelude types, type checking,
+    // effect validation, and capability validation behave exactly like a
+    // regular compile. Grant all resource categories here: this command is
+    // introspective and must be able to *report* FS/Net/OS effects without
+    // requiring execution permissions.
+    let report_grants = vec!["fs".to_string(), "net".to_string(), "os".to_string()];
+    let (ast, _) = run_frontend(
+        &source,
+        Some(file),
+        false,
+        &report_grants,
+        false,
+    )?;
+
+    let mut checker = EffectChecker::new();
+    checker.set_resource_grants(&report_grants);
+    checker.check_module(&ast.decls)?;
+    let report = checker.function_effect_report(&ast.decls);
+
+    if json {
+        let rows: Vec<_> = report
+            .iter()
+            .map(|row| {
+                let origins: Vec<_> = row
+                    .origins
+                    .iter()
+                    .map(|origin| {
+                        serde_json::json!({
+                            "effect": origin.effect.to_string(),
+                            "path": &origin.path,
+                            "kind": origin.kind.to_string(),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "function": &row.name,
+                    "effects": row.row.to_string(),
+                    "declared": row.declared,
+                    "origins": origins,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).map_err(|e| NuError::VMError {
+                msg: format!("failed to serialize effect report: {}", e),
+                span: Span::default(),
+            })?
+        );
+    } else if report.is_empty() {
+        println!("No module-level functions.");
+    } else {
+        for row in report {
+            println!(
+                "{} ! {} [{}]",
+                row.name,
+                row.row,
+                if row.declared { "declared" } else { "inferred" }
+            );
+            for origin in row.origins {
+                println!(
+                    "  {} <- {} [{}]",
+                    origin.effect,
+                    origin.path.join(" -> "),
+                    origin.kind
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
