@@ -134,11 +134,15 @@ receives one-command authorization to execute the next request locally. The
 authorization lives in `CacheResponsePipeline`, making it connection-local
 and one-shot rather than a property of the shard.
 
-This establishes the data-plane and topology invariants for migration, but
-does not yet distribute a new placement snapshot into already-running reactor
-threads. The next control-plane slice must install monotonically newer
-snapshots on every local shard without putting synchronization on the GET/SET
-hot path.
+Running services install those snapshots through
+`CacheServiceHandle::install_placement`. Publication validates endpoint
+coverage, rejects non-monotonic epochs, stores the immutable snapshot once
+behind a cold-path mutex, then wakes every local reactor. A reactor compares an
+atomic published epoch on its Mio wake path and clones a newer snapshot into
+its thread-local dispatcher only when needed. Ordinary GET/SET routing never
+reads the mutex or shared topology object. Per-shard applied epochs remain
+observable so the control plane can detect incomplete convergence before
+advancing a migration phase.
 
 The same cluster layer serves topology discovery without touching CacheStore:
 `CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
@@ -205,15 +209,15 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add a reactor control-plane channel that installs newer placement/migration
-   snapshots across the running local shard set with monotonic epoch checks.
+1. Add explicit key-transfer primitives and migration progress accounting so
+   ASK/ASKING can drive an end-to-end live slot move rather than only routing
+   an externally transferred key set.
 2. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 3. Connect remote transparent handoffs to a cache-specific cluster transport
-   and validate the carried placement epoch on receipt.
-4. Add explicit key-transfer primitives and migration progress accounting so
-   ASK/ASKING can drive an end-to-end live slot move rather than only routing
-   an externally transferred key set.
+   and reject stale carried placement epochs on receipt.
+4. Allow topology publication to add/remove advertised remote endpoints without
+   restarting local reactors.
 5. Promote expiration to a hierarchical timing wheel, then add packed
    aggregate structures and durability acknowledgement modes.
 6. Expand RESP compatibility and add Nulang-native leases, locks, semaphores,
