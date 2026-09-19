@@ -21,8 +21,8 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use parking_lot::Mutex;
 
 use super::cache::{
-    CacheStore, CacheTransferBatch, CacheTransferCursor, CacheTransferEntry,
-    CacheTransferFinalize, CacheTransferImport, CacheTransferImportTracker,
+    CacheStore, CacheTransferBatch, CacheTransferCursor, CacheTransferEntry, CacheTransferFinalize,
+    CacheTransferImport, CacheTransferImportTracker,
 };
 use super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap, CacheRoutingMode};
 use super::cache_dispatch::{
@@ -126,7 +126,6 @@ impl Default for CacheServerClock {
     }
 }
 
-
 struct CachePlacementPublisher {
     published_epoch: AtomicU64,
     snapshot: Mutex<CacheSlotMap>,
@@ -149,10 +148,7 @@ impl CachePlacementPublisher {
         let mut snapshot = self.snapshot.lock();
         let current = snapshot.epoch();
         if proposed <= current {
-            return Err(CacheServiceError::StalePlacementEpoch {
-                current,
-                proposed,
-            });
+            return Err(CacheServiceError::StalePlacementEpoch { current, proposed });
         }
         *snapshot = next;
         self.published_epoch.store(proposed, Ordering::Release);
@@ -171,7 +167,6 @@ impl CachePlacementPublisher {
         self.snapshot.lock().clone()
     }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheRemoteControlError {
@@ -311,11 +306,7 @@ impl CacheShardServerControl {
         self.applied_placement_epoch.load(Ordering::Acquire)
     }
 
-
-    fn request_control(
-        &self,
-        request: CacheShardControlRequest,
-    ) -> Result<(), CacheServiceError> {
+    fn request_control(&self, request: CacheShardControlRequest) -> Result<(), CacheServiceError> {
         match self.control_tx.try_send(request) {
             Ok(()) => {
                 let _ = self.waker.wake();
@@ -468,10 +459,7 @@ impl CacheServiceBuilder {
         self
     }
 
-    pub fn with_transport_endpoint(
-        mut self,
-        endpoint: CacheServiceTransportEndpoint,
-    ) -> Self {
+    pub fn with_transport_endpoint(mut self, endpoint: CacheServiceTransportEndpoint) -> Self {
         self.transport_endpoint = Some(endpoint);
         self
     }
@@ -505,8 +493,7 @@ impl CacheServiceBuilder {
             }
         }
 
-        let (channels, inboxes) =
-            CacheDispatchChannels::new(shard_count, self.queue_capacity)?;
+        let (channels, inboxes) = CacheDispatchChannels::new(shard_count, self.queue_capacity)?;
 
         // Bind every listener before constructing any dispatcher. This makes
         // actual port-0 allocations available to every shard's topology view.
@@ -601,13 +588,15 @@ impl CacheService {
             .as_ref()
             .map(CacheServiceTransportEndpoint::sender);
         let network_shutdown = Arc::new(AtomicBool::new(false));
-        let (network_event_tx, network_event_rx) =
-            mpsc::sync_channel(CACHE_NETWORK_EVENT_CAPACITY);
+        let (network_event_tx, network_event_rx) = mpsc::sync_channel(CACHE_NETWORK_EVENT_CAPACITY);
         let mut threads: Vec<(u16, JoinHandle<Result<(), CacheServerError>>)> =
             Vec::with_capacity(self.servers.len());
 
-        for (index, (mut server, cpu)) in
-            self.servers.into_iter().zip(self.cpus.into_iter()).enumerate()
+        for (index, (mut server, cpu)) in self
+            .servers
+            .into_iter()
+            .zip(self.cpus.into_iter())
+            .enumerate()
         {
             let shard = index as u16;
             let spawn = thread::Builder::new()
@@ -650,8 +639,7 @@ impl CacheService {
                         network_event_tx,
                         shutdown,
                     );
-                })
-            {
+                }) {
                 Ok(handle) => Some(handle),
                 Err(error) => {
                     network_shutdown.store(true, Ordering::Release);
@@ -764,7 +752,6 @@ impl CacheServiceHandle {
         }
         Ok(())
     }
-
 
     /// Export one bounded source batch and send it to a remote migration target.
     ///
@@ -1079,16 +1066,13 @@ impl CacheServiceHandle {
             .map_err(|_| CacheServiceError::ControlDisconnected(target_shard))
     }
 
-    fn transfer_control(
-        &self,
-        shard: u16,
-    ) -> Result<&CacheShardServerControl, CacheServiceError> {
-        self.controls.get(shard as usize).ok_or(
-            CacheServiceError::InvalidTransferShard {
+    fn transfer_control(&self, shard: u16) -> Result<&CacheShardServerControl, CacheServiceError> {
+        self.controls
+            .get(shard as usize)
+            .ok_or(CacheServiceError::InvalidTransferShard {
                 shard,
                 shard_count: self.controls.len().min(u16::MAX as usize) as u16,
-            },
-        )
+            })
     }
 
     pub fn request_shutdown(&self) {
@@ -1173,21 +1157,13 @@ fn run_cache_network_coordinator(
                 placement = next;
             }
 
-            if let Err(error) = inbound
-                .message
-                .validate_for_node(local_node_id, &placement)
-            {
+            if let Err(error) = inbound.message.validate_for_node(local_node_id, &placement) {
                 tracing::warn!(
                     "nulang-cache: rejecting cache envelope from {:?}: {:?}",
                     inbound.from_node,
                     error
                 );
-                reject_cache_network_inbound(
-                    local_node_id,
-                    &sender,
-                    inbound,
-                    error,
-                );
+                reject_cache_network_inbound(local_node_id, &sender, inbound, error);
                 continue;
             }
 
@@ -1222,13 +1198,8 @@ fn handle_cache_network_inbound(
             target,
             frame,
         } => {
-            let response = execute_remote_command_on_reactor(
-                controls,
-                target,
-                placement_epoch,
-                slot,
-                frame,
-            );
+            let response =
+                execute_remote_command_on_reactor(controls, target, placement_epoch, slot, frame);
             send_cache_transport_outbound(
                 sender,
                 CacheTransportOutbound {
@@ -1250,13 +1221,9 @@ fn handle_cache_network_inbound(
             target,
             batch,
         } => {
-            let results = import_remote_batch_on_reactor(
-                controls,
-                target,
-                placement_epoch,
-                batch.clone(),
-            )
-            .unwrap_or_else(|| vec![CacheTransferImport::Conflict; batch.entries.len()]);
+            let results =
+                import_remote_batch_on_reactor(controls, target, placement_epoch, batch.clone())
+                    .unwrap_or_else(|| vec![CacheTransferImport::Conflict; batch.entries.len()]);
             send_cache_transport_outbound(
                 sender,
                 CacheTransportOutbound {
@@ -1274,10 +1241,7 @@ fn handle_cache_network_inbound(
         }
         message @ (CacheTransportMessage::CommandResponse { .. }
         | CacheTransportMessage::TransferAck { .. }) => {
-            match network_event_tx.try_send(CacheTransportInbound {
-                from_node,
-                message,
-            }) {
+            match network_event_tx.try_send(CacheTransportInbound { from_node, message }) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => tracing::warn!(
                     "nulang-cache: dropping cache network event because event queue is full"
@@ -1371,12 +1335,13 @@ fn execute_remote_command_on_reactor(
 
     match reply_rx.recv_timeout(CACHE_NETWORK_CONTROL_TIMEOUT) {
         Ok(Ok(response)) => response,
-        Ok(Err(CacheRemoteControlError::Parse(_)
-        | CacheRemoteControlError::InvalidFrame)) => {
+        Ok(Err(CacheRemoteControlError::Parse(_) | CacheRemoteControlError::InvalidFrame)) => {
             b"-ERR invalid cache transport command\r\n".to_vec()
         }
-        Ok(Err(CacheRemoteControlError::TopologyChanged { .. }
-        | CacheRemoteControlError::OwnerMismatch))
+        Ok(Err(
+            CacheRemoteControlError::TopologyChanged { .. }
+            | CacheRemoteControlError::OwnerMismatch,
+        ))
         | Err(_) => b"-TRYAGAIN cache topology changed\r\n".to_vec(),
     }
 }
@@ -1723,23 +1688,15 @@ impl CacheShardServer {
                 frame,
                 reply,
             } => {
-                let _ = reply.send(self.execute_remote_command(
-                    placement_epoch,
-                    slot,
-                    &frame,
-                    now_ms,
-                ));
+                let _ =
+                    reply.send(self.execute_remote_command(placement_epoch, slot, &frame, now_ms));
             }
             CacheShardControlRequest::ImportRemoteBatch {
                 placement_epoch,
                 batch,
                 reply,
             } => {
-                let _ = reply.send(self.import_remote_batch(
-                    placement_epoch,
-                    &batch,
-                    now_ms,
-                ));
+                let _ = reply.send(self.import_remote_batch(placement_epoch, &batch, now_ms));
             }
             CacheShardControlRequest::Export {
                 slot,
@@ -1761,9 +1718,7 @@ impl CacheShardServer {
                 let results = batch
                     .entries
                     .iter()
-                    .map(|entry| {
-                        tracker.import_entry(&mut self.store, entry, elapsed_ms, now_ms)
-                    })
+                    .map(|entry| tracker.import_entry(&mut self.store, entry, elapsed_ms, now_ms))
                     .collect();
                 let _ = reply.send(results);
             }
@@ -2242,10 +2197,7 @@ mod tests {
         assert_ne!(service.local_addrs()[0], service.local_addrs()[1]);
 
         for shard in 0..2 {
-            let owner = CacheShardOwner {
-                node_id: 11,
-                shard,
-            };
+            let owner = CacheShardOwner { node_id: 11, shard };
             let endpoint = service.endpoints().get(owner).unwrap();
             assert_eq!(
                 endpoint.port(),
@@ -2253,7 +2205,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn service_builder_rejects_unadvertised_migration_target() {
@@ -2313,9 +2264,7 @@ mod tests {
         let target_port = handle.local_addrs()[1].port();
 
         let mut migrating = placement;
-        migrating
-            .begin_migration(1, slot, source, target)
-            .unwrap();
+        migrating.begin_migration(1, slot, source, target).unwrap();
         handle.install_placement(migrating.clone()).unwrap();
         wait_for_placement_epoch(&handle, 1);
         assert_eq!(handle.published_placement_epoch(), 1);
@@ -2333,9 +2282,7 @@ mod tests {
         let expected_ask = format!("-ASK {} 127.0.0.1:{target_port}\r\n", slot);
         assert_eq!(ask, expected_ask.as_bytes());
 
-        migrating
-            .commit_migration(2, slot, source, target)
-            .unwrap();
+        migrating.commit_migration(2, slot, source, target).unwrap();
         handle.install_placement(migrating.clone()).unwrap();
         wait_for_placement_epoch(&handle, 2);
 
@@ -2401,9 +2348,7 @@ mod tests {
         assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
 
         let mut migrating = placement;
-        migrating
-            .begin_migration(1, slot, source, target)
-            .unwrap();
+        migrating.begin_migration(1, slot, source, target).unwrap();
         handle.install_placement(migrating.clone()).unwrap();
         wait_for_placement_epoch(&handle, 1);
 
@@ -2432,9 +2377,7 @@ mod tests {
         target_client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        target_client
-            .write_all(b"*1\r\n$6\r\nASKING\r\n")
-            .unwrap();
+        target_client.write_all(b"*1\r\n$6\r\nASKING\r\n").unwrap();
         assert_eq!(read_resp_line(&mut target_client), b"+OK\r\n");
         target_client.write_all(&get).unwrap();
         let mut imported_value = [0u8; 11];
@@ -2442,9 +2385,7 @@ mod tests {
         assert_eq!(&imported_value, b"$5\r\nvalue\r\n");
 
         // Commit stable ownership and verify the target now serves normally.
-        migrating
-            .commit_migration(2, slot, source, target)
-            .unwrap();
+        migrating.commit_migration(2, slot, source, target).unwrap();
         handle.install_placement(migrating).unwrap();
         wait_for_placement_epoch(&handle, 2);
         handle.clear_local_transfer_imports(1, slot).unwrap();
@@ -2455,8 +2396,7 @@ mod tests {
         assert_eq!(&stable_value, b"$5\r\nvalue\r\n");
 
         source_client.write_all(&get).unwrap();
-        let expected_moved =
-            format!("-MOVED {} 127.0.0.1:{}\r\n", slot, target_addr.port());
+        let expected_moved = format!("-MOVED {} 127.0.0.1:{}\r\n", slot, target_addr.port());
         assert_eq!(
             read_resp_line(&mut source_client),
             expected_moved.as_bytes()
