@@ -366,11 +366,7 @@ mod tests {
         let mut store = CacheStore::new();
         assert_eq!(run(&mut store, b"*1\r\n$4\r\nPING\r\n", 0), b"+PONG\r\n");
         assert_eq!(
-            run(
-                &mut store,
-                b"*3\r\n$3\r\nSET\r\n$1\r\nn\r\n$2\r\n41\r\n",
-                0
-            ),
+            run(&mut store, b"*3\r\n$3\r\nSET\r\n$1\r\nn\r\n$2\r\n41\r\n", 0),
             b"+OK\r\n"
         );
         assert_eq!(
@@ -460,11 +456,7 @@ mod tests {
             b":1\r\n"
         );
         assert_eq!(
-            run(
-                &mut store,
-                b"*2\r\n$6\r\nEXISTS\r\n$4\r\nkey1\r\n",
-                1_000
-            ),
+            run(&mut store, b"*2\r\n$6\r\nEXISTS\r\n$4\r\nkey1\r\n", 1_000),
             b":0\r\n"
         );
     }
