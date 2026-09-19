@@ -791,6 +791,35 @@ mod tests {
     }
 
     #[test]
+    fn local_queue_api_fails_closed_once_replication_policy_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "nulang-fabric-queue-replicated-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut runtime = Runtime::new();
+        runtime.fabric_stream_open(&root).unwrap();
+
+        let payload = queue_stream_name("orders");
+        runtime
+            .fabric_stream_create(&payload, FabricStreamConfig::default())
+            .unwrap();
+        runtime
+            .fabric_stream_establish_replication_policy(&payload, sample_policy())
+            .unwrap();
+
+        let error = runtime
+            .fabric_queue_create("orders", crate::runtime::FabricQueueConfig::default())
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn installed_policy_request_must_match_partition_and_replication_factor() {
         let policy = sample_policy();
         assert!(validate_requested_policy(&policy, 0, 3).is_ok());
