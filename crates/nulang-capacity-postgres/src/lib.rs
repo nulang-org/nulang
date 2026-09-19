@@ -88,13 +88,7 @@ impl PostgresAllocationLedgerStore {
     /// so the hosted control plane can monitor its lifecycle.
     pub async fn connect(
         database_url: &str,
-    ) -> Result<
-        (
-            Self,
-            JoinHandle<Result<(), tokio_postgres::Error>>,
-        ),
-        PostgresCapacityError,
-    > {
+    ) -> Result<(Self, JoinHandle<Result<(), tokio_postgres::Error>>), PostgresCapacityError> {
         let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
         let connection_task = tokio::spawn(connection);
         Ok((Self::new(client), connection_task))
@@ -111,7 +105,11 @@ impl PostgresAllocationLedgerStore {
     ) -> Result<ProviderAllocationLedgerSnapshot, PostgresCapacityError> {
         validate_provider_id(provider_id)?;
 
-        let Some(row) = self.client.query_opt(LOAD_PROVIDER_SQL, &[&provider_id]).await? else {
+        let Some(row) = self
+            .client
+            .query_opt(LOAD_PROVIDER_SQL, &[&provider_id])
+            .await?
+        else {
             return Ok(empty_snapshot(provider_id));
         };
 
@@ -151,12 +149,7 @@ impl PostgresAllocationLedgerStore {
             .client
             .execute(
                 UPDATE_PROVIDER_SQL,
-                &[
-                    &next.provider_id,
-                    &expected_i64,
-                    &next_i64,
-                    &snapshot_json,
-                ],
+                &[&next.provider_id, &expected_i64, &next_i64, &snapshot_json],
             )
             .await?;
 
@@ -231,9 +224,12 @@ fn validate_transition(
         return Err(PostgresCapacityError::InvalidGeneration);
     }
 
-    let required_next = expected_generation
-        .checked_add(1)
-        .ok_or(PostgresCapacityError::GenerationTooLarge(expected_generation))?;
+    let required_next =
+        expected_generation
+            .checked_add(1)
+            .ok_or(PostgresCapacityError::GenerationTooLarge(
+                expected_generation,
+            ))?;
     if next.generation != required_next {
         return Err(PostgresCapacityError::InvalidTransition {
             expected: expected_generation,
@@ -253,8 +249,7 @@ fn decode_generation(generation: i64) -> Result<u64, PostgresCapacityError> {
     if generation < 1 {
         return Err(PostgresCapacityError::GenerationOutOfRange(generation));
     }
-    u64::try_from(generation)
-        .map_err(|_| PostgresCapacityError::GenerationOutOfRange(generation))
+    u64::try_from(generation).map_err(|_| PostgresCapacityError::GenerationOutOfRange(generation))
 }
 
 #[cfg(test)]
