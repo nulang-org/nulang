@@ -6148,6 +6148,7 @@ impl Runtime {
                 actor_id: *id,
                 depth: actor.mailbox.len(),
                 capacity: actor.mailbox.capacity(),
+                rejected: actor.mailbox.rejected_count(),
             })
             .collect();
 
@@ -6615,6 +6616,8 @@ pub struct ActorMailboxMetric {
     pub depth: usize,
     /// Configured logical-message capacity. `0` means unbounded.
     pub capacity: usize,
+    /// Cumulative bounded Normal/Bulk admissions rejected at capacity.
+    pub rejected: usize,
 }
 
 /// One supervisor in the topology snapshot.
