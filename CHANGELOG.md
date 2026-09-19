@@ -76,6 +76,12 @@ two major versions.*
   per-connection sequencer and emitted only as the longest contiguous completed
   prefix. Direct responses stay immediate when no earlier async request is
   pending; pipeline saturation is explicit backpressure.
+- **Redis Cluster MOVED redirect mode** (Experimental,
+  `src/runtime/cache_cluster.rs`, `src/runtime/cache_dispatch.rs`). Physical
+  cache owners can advertise preformatted RESP endpoints. Redirect mode sends
+  `MOVED` immediately for keyed commands received by a non-owning shard or
+  node, while transparent mode retains internal queue/transport routing.
+  Missing endpoint metadata fails closed rather than silently proxying.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
