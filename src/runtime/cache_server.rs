@@ -1105,6 +1105,30 @@ impl CacheShardServer {
     fn handle_control(&mut self, request: CacheShardControlRequest) {
         let now_ms = self.clock.now_ms();
         match request {
+            CacheShardControlRequest::ExecuteRemoteCommand {
+                placement_epoch,
+                slot,
+                frame,
+                reply,
+            } => {
+                let _ = reply.send(self.execute_remote_command(
+                    placement_epoch,
+                    slot,
+                    &frame,
+                    now_ms,
+                ));
+            }
+            CacheShardControlRequest::ImportRemoteBatch {
+                placement_epoch,
+                batch,
+                reply,
+            } => {
+                let _ = reply.send(self.import_remote_batch(
+                    placement_epoch,
+                    &batch,
+                    now_ms,
+                ));
+            }
             CacheShardControlRequest::Export {
                 slot,
                 cursor,
@@ -1146,6 +1170,83 @@ impl CacheShardServer {
                 let _ = reply.send(());
             }
         }
+    }
+
+    fn execute_remote_command(
+        &mut self,
+        placement_epoch: u64,
+        slot: u16,
+        frame: &[u8],
+        now_ms: u64,
+    ) -> Result<Vec<u8>, CacheRemoteControlError> {
+        let placement = self.dispatcher.placement();
+        if placement.epoch() != placement_epoch {
+            return Err(CacheRemoteControlError::TopologyChanged {
+                installed_epoch: placement.epoch(),
+                requested_epoch: placement_epoch,
+            });
+        }
+
+        let local = CacheShardOwner {
+            node_id: self.dispatcher.local_node_id(),
+            shard: self.dispatcher.local_shard(),
+        };
+        if placement.owner_for_slot(slot) != Some(local) {
+            return Err(CacheRemoteControlError::OwnerMismatch);
+        }
+
+        let Some((command, consumed)) =
+            parse_command(frame).map_err(CacheRemoteControlError::Parse)?
+        else {
+            return Err(CacheRemoteControlError::InvalidFrame);
+        };
+        if consumed != frame.len() || command_slot(command) != RespCommandSlot::Slot(slot) {
+            return Err(CacheRemoteControlError::InvalidFrame);
+        }
+
+        let mut out = Vec::with_capacity(128);
+        execute_command(&mut self.store, command, now_ms, &mut out);
+        Ok(out)
+    }
+
+    fn import_remote_batch(
+        &mut self,
+        placement_epoch: u64,
+        batch: &CacheTransferBatch,
+        now_ms: u64,
+    ) -> Result<Vec<CacheTransferImport>, CacheRemoteControlError> {
+        let placement = self.dispatcher.placement();
+        if placement.epoch() != placement_epoch {
+            return Err(CacheRemoteControlError::TopologyChanged {
+                installed_epoch: placement.epoch(),
+                requested_epoch: placement_epoch,
+            });
+        }
+
+        let local = CacheShardOwner {
+            node_id: self.dispatcher.local_node_id(),
+            shard: self.dispatcher.local_shard(),
+        };
+        let Some(migration) = placement.migration_for_slot(batch.slot) else {
+            return Err(CacheRemoteControlError::OwnerMismatch);
+        };
+        if migration.target != local {
+            return Err(CacheRemoteControlError::OwnerMismatch);
+        }
+
+        let tracker = self
+            .transfer_imports
+            .entry(batch.slot)
+            .or_insert_with(|| CacheTransferImportTracker::new(batch.slot));
+
+        // Monotonic cache clocks are process-local. The source has already
+        // reduced TTL for time spent before transport; cross-node wire time is
+        // deliberately not inferred from unrelated clock origins.
+        Ok(batch
+            .entries
+            .iter()
+            .map(|entry| tracker.import_entry(&mut self.store, entry, 0, now_ms))
+            .collect())
     }
 
     fn install_published_placement(&mut self) {
