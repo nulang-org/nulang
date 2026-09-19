@@ -430,6 +430,37 @@ concurrency domains over one work queue:
 Ungrouped workers continue to use `fabric_queue_acquire_replicated`; grouped
 and ungrouped workers still compete for the same underlying jobs.
 
+Dead-letter forwarding is implemented as a crash-safe target-first handoff.
+
+Because Fabric Stream writes are leader-local, the source queue and its DLQ
+target must share one queue ownership policy. Prepare the target with
+`fabric_queue_prepare_dead_letter_target_replicated`, which installs the
+source queue's exact epoch/leader/replica placement on an empty target before
+QueueCreated is replicated there.
+
+Terminal NACK and terminal lease expiry then follow this protocol:
+
+1. derive a deterministic target job id: `__dlq:<source>:<sequence>`,
+2. enqueue the original immutable job into the DLQ target,
+3. wait until that target payload sequence reaches quorum,
+4. only then append `DeadLettered` to the source queue metadata stream,
+5. wait for the source terminal mutation to reach quorum.
+
+A crash after step 3 cannot lose the job: the source remains Active while the
+DLQ copy is already durable. Retrying the handoff reuses the deterministic job
+id and resumes/deduplicates the target append, then resumes source
+terminalization. Stable job-id dedup also validates immutable name, payload,
+priority, and delay so a conflicting record cannot hijack the retry identity.
+
+This is deliberately described as a crash-safe handoff rather than a
+cross-queue ACID transaction. The observable intermediate state
+`target durable + source still Active` is safe and retryable; the unsafe state
+`source terminal + target missing` is never produced by the replicated DLQ
+path.
+
+Generic replicated NACK/expiry fail closed instead of directly marking a
+DLQ-configured job DeadLettered without forwarding.
+
 
 ## Distributed follow-up
 
@@ -464,10 +495,8 @@ The compatibility layers must preserve these invariants:
 
 ## Next implementation slice
 
-1. Implement atomic DLQ forwarding with explicit cross-queue durability
-   semantics.
-2. Build the minimal BullMQ B1 backend against these APIs.
-3. Run BullMQ's adapter conformance suite and use failures to drive only the
+1. Build the minimal BullMQ B1 backend against these APIs.
+2. Run BullMQ's adapter conformance suite and use failures to drive only the
    missing generally useful native queue semantics.
-4. Then build Core NATS wire compatibility; JetStream follows after replicated
+3. Then build Core NATS wire compatibility; JetStream follows after replicated
    consumer semantics are proven.
