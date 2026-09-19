@@ -1095,6 +1095,35 @@ mod tests {
     use super::*;
     use std::net::TcpStream as StdTcpStream;
 
+    fn read_resp_line(client: &mut StdTcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            client.read_exact(&mut byte).unwrap();
+            response.push(byte[0]);
+            if response.ends_with(b"\r\n") {
+                return response;
+            }
+        }
+    }
+
+    fn wait_for_placement_epoch(handle: &CacheServiceHandle, epoch: u64) {
+        for _ in 0..100 {
+            if handle
+                .shard_placement_epochs()
+                .iter()
+                .all(|applied| *applied >= epoch)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "cache shards did not apply epoch {epoch}; observed {:?}",
+            handle.shard_placement_epochs()
+        );
+    }
+
     fn build_server() -> CacheShardServer {
         let placement = CacheSlotMap::new_local(1, 1).unwrap();
         let owner = placement.owner_for_slot(0).unwrap();
@@ -1175,6 +1204,82 @@ mod tests {
             result,
             Err(CacheServiceError::MissingEndpoint(owner)) if owner == target
         ));
+    }
+
+    #[test]
+    fn running_service_installs_migration_and_commit_epochs() {
+        let placement = CacheSlotMap::new_local(41, 2).unwrap();
+        let mut key = None;
+        for index in 0..10_000 {
+            let candidate = format!("live-topology-{index}").into_bytes();
+            if placement.owner_for_key(&candidate).shard == 0 {
+                key = Some(candidate);
+                break;
+            }
+        }
+        let key = key.expect("key for source shard");
+        let slot = super::super::cache::redis_slot(&key);
+        let source = placement.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 41,
+            shard: 1,
+        };
+
+        let service = CacheServiceBuilder::new(41, placement.clone())
+            .with_shard(CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            ))
+            .with_shard(CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            ))
+            .build()
+            .unwrap();
+        let handle = service.start().unwrap();
+        let target_port = handle.local_addrs()[1].port();
+
+        let mut migrating = placement;
+        migrating
+            .begin_migration(1, slot, source, target)
+            .unwrap();
+        handle.install_placement(migrating.clone()).unwrap();
+        wait_for_placement_epoch(&handle, 1);
+        assert_eq!(handle.published_placement_epoch(), 1);
+
+        let mut client = StdTcpStream::connect(handle.local_addrs()[0]).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut request = format!("*2\r\n$3\r\nGET\r\n${}\r\n", key.len()).into_bytes();
+        request.extend_from_slice(&key);
+        request.extend_from_slice(b"\r\n");
+        client.write_all(&request).unwrap();
+
+        let ask = read_resp_line(&mut client);
+        let expected_ask = format!("-ASK {} 127.0.0.1:{target_port}\r\n", slot);
+        assert_eq!(ask, expected_ask.as_bytes());
+
+        migrating
+            .commit_migration(2, slot, source, target)
+            .unwrap();
+        handle.install_placement(migrating.clone()).unwrap();
+        wait_for_placement_epoch(&handle, 2);
+
+        client.write_all(&request).unwrap();
+        let moved = read_resp_line(&mut client);
+        let expected_moved = format!("-MOVED {} 127.0.0.1:{target_port}\r\n", slot);
+        assert_eq!(moved, expected_moved.as_bytes());
+
+        assert!(matches!(
+            handle.install_placement(migrating),
+            Err(CacheServiceError::StalePlacementEpoch {
+                current: 2,
+                proposed: 2,
+            })
+        ));
+
+        handle.shutdown().unwrap();
     }
 
     #[test]
