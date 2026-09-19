@@ -15,7 +15,7 @@
 //!   recycled slot;
 //! - Redis Cluster compatible 16,384-slot hashing and hash tags.
 
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::Hasher;
 
 pub const REDIS_CLUSTER_SLOTS: u16 = 16_384;
@@ -332,7 +332,82 @@ pub enum CacheTransferFinalize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheTransferImport {
     Imported,
+    AlreadyImported,
     ExpiredInTransit,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheImportFence {
+    source: CacheTransferToken,
+    target: CacheTransferToken,
+}
+
+/// Migration-only target-side replay and conflict fencing.
+///
+/// This state is deliberately separate from every normal cache entry so the
+/// steady-state memory layout pays no migration tax. Drop or clear the tracker
+/// after its slot migration completes.
+#[derive(Debug, Default)]
+pub struct CacheTransferImportTracker {
+    fences: FxHashMap<Vec<u8>, CacheImportFence>,
+}
+
+impl CacheTransferImportTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.fences.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fences.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.fences.clear();
+    }
+
+    pub fn import_entry(
+        &mut self,
+        store: &mut CacheStore,
+        entry: &CacheTransferEntry,
+        elapsed_ms: u64,
+        now_ms: u64,
+    ) -> CacheTransferImport {
+        let current = store.transfer_token_for_key(&entry.key, now_ms);
+
+        if let Some(fence) = self.fences.get(&entry.key).copied() {
+            if current != Some(fence.target) {
+                return CacheTransferImport::Conflict;
+            }
+            if fence.source == entry.token {
+                return CacheTransferImport::AlreadyImported;
+            }
+        } else if current.is_some() {
+            // The target acquired this key outside this migration session.
+            return CacheTransferImport::Conflict;
+        }
+
+        let result = store.apply_transfer_entry(entry, elapsed_ms, now_ms);
+        if result != CacheTransferImport::Imported {
+            return result;
+        }
+
+        let target = store
+            .transfer_token_for_key(&entry.key, now_ms)
+            .expect("imported transfer entry must have a live target token");
+        self.fences.insert(
+            entry.key.clone(),
+            CacheImportFence {
+                source: entry.token,
+                target,
+            },
+        );
+        CacheTransferImport::Imported
+    }
 }
 
 /// Shard-local compact cache storage.
@@ -835,7 +910,7 @@ impl CacheStore {
     /// elapsed_ms allows a migration transport to subtract time spent in
     /// flight from a relative TTL. Passing zero is valid when the caller does
     /// not have a transit measurement.
-    pub fn import_transfer_entry(
+    fn apply_transfer_entry(
         &mut self,
         entry: &CacheTransferEntry,
         elapsed_ms: u64,
@@ -861,6 +936,18 @@ impl CacheStore {
             }
         }
         CacheTransferImport::Imported
+    }
+
+    fn transfer_token_for_key(
+        &mut self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Option<CacheTransferToken> {
+        let slot_id = self.live_slot_id(key, now_ms)?;
+        Some(CacheTransferToken {
+            source_slot: slot_id,
+            source_generation: self.slots[slot_id as usize].generation,
+        })
     }
 
     /// Delete the source copy only if it is still exactly the version that was
@@ -981,9 +1068,10 @@ mod tests {
         assert!(batch.payload_bytes > 0);
 
         let mut target = CacheStore::new();
+        let mut imports = CacheTransferImportTracker::new();
         for entry in &batch.entries {
             assert_eq!(
-                target.import_transfer_entry(entry, 5, 1000),
+                imports.import_entry(&mut target, entry, 5, 1000),
                 CacheTransferImport::Imported
             );
         }
@@ -1078,6 +1166,101 @@ mod tests {
     }
 
     #[test]
+    fn repeated_import_is_idempotent_and_does_not_refresh_ttl() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"k{move}", b"value", Some(100), 0);
+        let slot = redis_slot(b"k{move}");
+        let entry = source
+            .export_slot_batch(slot, None, 1, 0)
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut target = CacheStore::new();
+        let mut imports = CacheTransferImportTracker::new();
+        assert_eq!(
+            imports.import_entry(&mut target, &entry, 0, 1000),
+            CacheTransferImport::Imported
+        );
+        assert_eq!(target.ttl(b"k{move}", 1020), CacheTtl::RemainingMs(80));
+
+        assert_eq!(
+            imports.import_entry(&mut target, &entry, 0, 1020),
+            CacheTransferImport::AlreadyImported
+        );
+        assert_eq!(target.ttl(b"k{move}", 1020), CacheTtl::RemainingMs(80));
+    }
+
+    #[test]
+    fn replayed_transfer_cannot_overwrite_target_side_write() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"k{move}", b"source", None, 0);
+        let slot = redis_slot(b"k{move}");
+        let entry = source
+            .export_slot_batch(slot, None, 1, 0)
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut target = CacheStore::new();
+        let mut imports = CacheTransferImportTracker::new();
+        assert_eq!(
+            imports.import_entry(&mut target, &entry, 0, 0),
+            CacheTransferImport::Imported
+        );
+
+        target.set_bytes(b"k{move}", b"client", None, 1);
+        assert_eq!(
+            imports.import_entry(&mut target, &entry, 0, 1),
+            CacheTransferImport::Conflict
+        );
+        assert_eq!(
+            target.get(b"k{move}", 1),
+            Some(CacheValueView::Bytes(b"client"))
+        );
+    }
+
+    #[test]
+    fn newer_source_version_replaces_unchanged_prior_import() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"k{move}", b"old", None, 0);
+        let slot = redis_slot(b"k{move}");
+        let first = source
+            .export_slot_batch(slot, None, 1, 0)
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut target = CacheStore::new();
+        let mut imports = CacheTransferImportTracker::new();
+        assert_eq!(
+            imports.import_entry(&mut target, &first, 0, 0),
+            CacheTransferImport::Imported
+        );
+
+        source.set_bytes(b"k{move}", b"new", None, 1);
+        let second = source
+            .export_slot_batch(slot, None, 1, 1)
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_ne!(first.token, second.token);
+
+        assert_eq!(
+            imports.import_entry(&mut target, &second, 0, 1),
+            CacheTransferImport::Imported
+        );
+        assert_eq!(
+            target.get(b"k{move}", 1),
+            Some(CacheValueView::Bytes(b"new"))
+        );
+    }
+
+    #[test]
     fn transfer_import_does_not_resurrect_expired_in_transit_key() {
         let mut source = CacheStore::new();
         source.set_bytes(b"k{move}", b"value", Some(5), 0);
@@ -1089,9 +1272,10 @@ mod tests {
             .next()
             .unwrap();
         let mut target = CacheStore::new();
+        let mut imports = CacheTransferImportTracker::new();
 
         assert_eq!(
-            target.import_transfer_entry(&entry, 5, 100),
+            imports.import_entry(&mut target, &entry, 5, 100),
             CacheTransferImport::ExpiredInTransit
         );
         assert!(!target.exists(b"k{move}", 100));
