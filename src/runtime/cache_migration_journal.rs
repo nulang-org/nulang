@@ -137,6 +137,10 @@ impl CacheMigrationRecoveryState {
         evidence: &CacheMigrationConvergenceEvidence,
     ) -> bool {
         self.restart_reprobe_candidate()
+            && self
+                .convergence
+                .as_ref()
+                .is_none_or(|previous| previous.probe_id != evidence.probe_id)
             && evidence.target_accepted
             && evidence.source_remaining == 0
             && evidence.target_conflicts == 0
