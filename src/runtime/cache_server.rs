@@ -7,7 +7,7 @@
 
 #![cfg(feature = "cache-server")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,6 +46,37 @@ const CACHE_NETWORK_EVENT_CAPACITY: usize = 1024;
 const CACHE_NETWORK_MAX_BATCH: usize = 64;
 const CACHE_NETWORK_IDLE_SLEEP: Duration = Duration::from_millis(1);
 const CACHE_NETWORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+const CACHE_NETWORK_DEDUPE_ENTRIES: usize = 4_096;
+const CACHE_NETWORK_DEDUPE_RETENTION: Duration = Duration::from_secs(120);
+const CACHE_NETWORK_PENDING_ENTRIES: usize = 4_096;
+const CACHE_NETWORK_RETRY_INITIAL: Duration = Duration::from_millis(10);
+const CACHE_NETWORK_RETRY_MAX: Duration = Duration::from_millis(250);
+const CACHE_NETWORK_RETRY_ATTEMPTS: u8 = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheNetworkTimeoutOperation {
+    Command {
+        request_id: u64,
+        placement_epoch: u64,
+        slot: u16,
+    },
+    Transfer {
+        transfer_id: u64,
+        placement_epoch: u64,
+        slot: u16,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheNetworkTimeout {
+    pub peer: NodeId,
+    pub attempts: u8,
+    /// A command timeout means the execution outcome is unknown: the remote
+    /// mutation may have committed while every response was lost. A transfer
+    /// timeout is safer because source finalization still requires its matching
+    /// application-level TransferAck.
+    pub operation: CacheNetworkTimeoutOperation,
+}
 
 #[derive(Debug, Clone)]
 pub struct CacheServerConfig {
@@ -384,6 +415,8 @@ pub enum CacheServiceError {
     TransportUnavailable,
     TransportBridge(CacheTransportBridgeError),
     NetworkEventDisconnected,
+    NetworkRetryQueueFull,
+    NetworkRequestIdInUse,
     RemoteTransferTargetMustBeRemote,
     RemoteTransferNotActive(u16),
     RemoteTransferAckMismatch,
@@ -588,7 +621,11 @@ impl CacheService {
             .as_ref()
             .map(CacheServiceTransportEndpoint::sender);
         let network_shutdown = Arc::new(AtomicBool::new(false));
+        let network_retry = Arc::new(Mutex::new(CacheNetworkRetryState::new(
+            CACHE_NETWORK_PENDING_ENTRIES,
+        )));
         let (network_event_tx, network_event_rx) = mpsc::sync_channel(CACHE_NETWORK_EVENT_CAPACITY);
+        let (network_timeout_tx, network_timeout_rx) = mpsc::channel();
         let mut threads: Vec<(u16, JoinHandle<Result<(), CacheServerError>>)> =
             Vec::with_capacity(self.servers.len());
 
@@ -627,6 +664,7 @@ impl CacheService {
             let coordinator_controls = controls.clone();
             let placement_publisher = self.placement_publisher.clone();
             let shutdown = network_shutdown.clone();
+            let retry_state = network_retry.clone();
             let local_node_id = self.local_node_id;
             match thread::Builder::new()
                 .name("nulang-cache-network".to_string())
@@ -637,6 +675,8 @@ impl CacheService {
                         coordinator_controls,
                         placement_publisher,
                         network_event_tx,
+                        network_timeout_tx,
+                        retry_state,
                         shutdown,
                     );
                 }) {
@@ -665,6 +705,8 @@ impl CacheService {
             placement_publisher: self.placement_publisher,
             transport_sender,
             network_events: has_transport.then_some(network_event_rx),
+            network_timeouts: has_transport.then_some(network_timeout_rx),
+            network_retry: has_transport.then_some(network_retry),
             network_thread,
             network_shutdown,
         })
@@ -680,6 +722,8 @@ pub struct CacheServiceHandle {
     placement_publisher: Arc<CachePlacementPublisher>,
     transport_sender: Option<CacheServiceTransportSender>,
     network_events: Option<Receiver<CacheTransportInbound>>,
+    network_timeouts: Option<Receiver<CacheNetworkTimeout>>,
+    network_retry: Option<Arc<Mutex<CacheNetworkRetryState>>>,
     network_thread: Option<JoinHandle<()>>,
     network_shutdown: Arc<AtomicBool>,
 }
@@ -716,9 +760,27 @@ impl CacheServiceHandle {
         message
             .validate_sender(NodeId(self.local_node_id))
             .map_err(|_| CacheServiceError::TransportUnavailable)?;
-        sender
-            .try_send(CacheTransportOutbound { to_node, message })
-            .map_err(CacheServiceError::from)
+
+        let outbound = CacheTransportOutbound { to_node, message };
+        let retry_key = cache_pending_key(outbound.to_node, &outbound.message);
+        if let Some(key) = retry_key {
+            let retry = self
+                .network_retry
+                .as_ref()
+                .ok_or(CacheServiceError::TransportUnavailable)?;
+            let mut retry = retry.lock();
+            retry.register(key, outbound.clone())?;
+        }
+
+        match sender.try_send(outbound) {
+            Ok(()) | Err(CacheTransportBridgeError::OutboundFull) => Ok(()),
+            Err(error) => {
+                if let (Some(key), Some(retry)) = (retry_key, self.network_retry.as_ref()) {
+                    retry.lock().remove(key);
+                }
+                Err(CacheServiceError::TransportBridge(error))
+            }
+        }
     }
 
     /// Receive an application-level remote command response or transfer ACK.
@@ -734,6 +796,26 @@ impl CacheServiceHandle {
             .ok_or(CacheServiceError::TransportUnavailable)?;
         match receiver.try_recv() {
             Ok(event) => Ok(Some(event)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(CacheServiceError::NetworkEventDisconnected),
+        }
+    }
+
+    /// Receive a terminal retry outcome.
+    ///
+    /// Command timeouts are deliberately not converted into RESP errors because
+    /// execution may have happened remotely before the reply was lost. Transfer
+    /// timeouts never finalize the source batch and are therefore safe to retry
+    /// later with a fresh controller decision.
+    pub fn try_recv_network_timeout(
+        &self,
+    ) -> Result<Option<CacheNetworkTimeout>, CacheServiceError> {
+        let receiver = self
+            .network_timeouts
+            .as_ref()
+            .ok_or(CacheServiceError::TransportUnavailable)?;
+        match receiver.try_recv() {
+            Ok(timeout) => Ok(Some(timeout)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(CacheServiceError::NetworkEventDisconnected),
         }
@@ -817,6 +899,44 @@ impl CacheServiceHandle {
             },
         )?;
         Ok(pending)
+    }
+
+    /// Retry a previously exported remote transfer batch without re-exporting.
+    ///
+    /// The transfer id and payload are preserved exactly. The target's
+    /// authenticated dedupe cache therefore replays the original application
+    /// ACK instead of importing the batch a second time.
+    pub fn retry_remote_slot_batch(
+        &self,
+        pending: &CacheRemoteTransferPending,
+    ) -> Result<(), CacheServiceError> {
+        let placement = self.placement_publisher.snapshot();
+        if placement.epoch() != pending.placement_epoch {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        }
+        let Some(migration) = placement.migration_for_slot(pending.batch.slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        };
+        if migration.source != pending.source || migration.target != pending.target {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        }
+
+        self.send_network_message(
+            NodeId(pending.target.node_id),
+            CacheTransportMessage::TransferBatch {
+                transfer_id: pending.transfer_id,
+                placement_epoch: pending.placement_epoch,
+                source: pending.source,
+                target: pending.target,
+                batch: pending.batch.clone(),
+            },
+        )
     }
 
     /// Apply a matching remote TransferAck and generation-fence source deletion.
@@ -1122,18 +1242,296 @@ impl Drop for CacheServiceHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CacheNetworkPendingKey {
+    Command { peer: u64, request_id: u64 },
+    Transfer { peer: u64, transfer_id: u64 },
+}
+
+#[derive(Debug, Clone)]
+struct CacheNetworkPending {
+    outbound: CacheTransportOutbound,
+    next_attempt: Instant,
+    backoff: Duration,
+    attempts: u8,
+}
+
+#[derive(Debug)]
+struct CacheNetworkRetryState {
+    capacity: usize,
+    pending: HashMap<CacheNetworkPendingKey, CacheNetworkPending>,
+}
+
+impl CacheNetworkRetryState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            pending: HashMap::with_capacity(capacity),
+        }
+    }
+
+    fn register(
+        &mut self,
+        key: CacheNetworkPendingKey,
+        outbound: CacheTransportOutbound,
+    ) -> Result<(), CacheServiceError> {
+        if let Some(existing) = self.pending.get(&key) {
+            if existing.outbound == outbound {
+                return Ok(());
+            }
+            return Err(CacheServiceError::NetworkRequestIdInUse);
+        }
+        if self.pending.len() >= self.capacity {
+            return Err(CacheServiceError::NetworkRetryQueueFull);
+        }
+        self.pending.insert(
+            key,
+            CacheNetworkPending {
+                outbound,
+                next_attempt: Instant::now() + CACHE_NETWORK_RETRY_INITIAL,
+                backoff: CACHE_NETWORK_RETRY_INITIAL,
+                attempts: 1,
+            },
+        );
+        Ok(())
+    }
+
+    fn remove(&mut self, key: CacheNetworkPendingKey) {
+        self.pending.remove(&key);
+    }
+}
+
+fn cache_pending_key(
+    peer: NodeId,
+    message: &CacheTransportMessage,
+) -> Option<CacheNetworkPendingKey> {
+    match message {
+        CacheTransportMessage::CommandRequest { request_id, .. } => {
+            Some(CacheNetworkPendingKey::Command {
+                peer: peer.0,
+                request_id: *request_id,
+            })
+        }
+        CacheTransportMessage::TransferBatch { transfer_id, .. } => {
+            Some(CacheNetworkPendingKey::Transfer {
+                peer: peer.0,
+                transfer_id: *transfer_id,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn cache_completion_key(
+    peer: NodeId,
+    message: &CacheTransportMessage,
+) -> Option<CacheNetworkPendingKey> {
+    match message {
+        CacheTransportMessage::CommandResponse { request_id, .. } => {
+            Some(CacheNetworkPendingKey::Command {
+                peer: peer.0,
+                request_id: *request_id,
+            })
+        }
+        CacheTransportMessage::TransferAck { transfer_id, .. } => {
+            Some(CacheNetworkPendingKey::Transfer {
+                peer: peer.0,
+                transfer_id: *transfer_id,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn cache_timeout_for_pending(pending: &CacheNetworkPending) -> CacheNetworkTimeout {
+    let operation = match &pending.outbound.message {
+        CacheTransportMessage::CommandRequest {
+            request_id,
+            placement_epoch,
+            slot,
+            ..
+        } => CacheNetworkTimeoutOperation::Command {
+            request_id: *request_id,
+            placement_epoch: *placement_epoch,
+            slot: *slot,
+        },
+        CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch,
+            batch,
+            ..
+        } => CacheNetworkTimeoutOperation::Transfer {
+            transfer_id: *transfer_id,
+            placement_epoch: *placement_epoch,
+            slot: batch.slot,
+        },
+        _ => unreachable!("only request messages enter retry state"),
+    };
+    CacheNetworkTimeout {
+        peer: pending.outbound.to_node,
+        attempts: pending.attempts,
+        operation,
+    }
+}
+
+fn retry_cache_network_pending(
+    sender: &CacheServiceTransportSender,
+    retry: &Arc<Mutex<CacheNetworkRetryState>>,
+    timeout_tx: &mpsc::Sender<CacheNetworkTimeout>,
+) {
+    let now = Instant::now();
+    let mut exhausted = Vec::new();
+    let mut retry = retry.lock();
+
+    for (key, pending) in retry.pending.iter_mut() {
+        if pending.next_attempt > now {
+            continue;
+        }
+        if pending.attempts >= CACHE_NETWORK_RETRY_ATTEMPTS {
+            exhausted.push((*key, cache_timeout_for_pending(pending)));
+            continue;
+        }
+
+        match sender.try_send(pending.outbound.clone()) {
+            Ok(()) | Err(CacheTransportBridgeError::OutboundFull) => {
+                pending.attempts = pending.attempts.saturating_add(1);
+                pending.backoff = pending
+                    .backoff
+                    .saturating_mul(2)
+                    .min(CACHE_NETWORK_RETRY_MAX);
+                pending.next_attempt = now + pending.backoff;
+            }
+            Err(CacheTransportBridgeError::OutboundDisconnected) => {
+                pending.attempts = CACHE_NETWORK_RETRY_ATTEMPTS;
+                exhausted.push((*key, cache_timeout_for_pending(pending)));
+            }
+            Err(_) => {
+                pending.attempts = pending.attempts.saturating_add(1);
+                pending.next_attempt = now + pending.backoff;
+            }
+        }
+    }
+
+    for (key, timeout) in exhausted {
+        retry.pending.remove(&key);
+        let _ = timeout_tx.send(timeout);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CacheNetworkDedupeKey {
+    Command { peer: u64, request_id: u64 },
+    Transfer { peer: u64, transfer_id: u64 },
+}
+
+#[derive(Debug, Clone)]
+struct CacheNetworkDedupeRecord {
+    fingerprint: [u8; 32],
+    reply: CacheTransportMessage,
+    expires_at: Instant,
+}
+
+#[derive(Debug)]
+struct CacheNetworkDedupe {
+    capacity: usize,
+    order: VecDeque<CacheNetworkDedupeKey>,
+    records: HashMap<CacheNetworkDedupeKey, CacheNetworkDedupeRecord>,
+}
+
+impl CacheNetworkDedupe {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            order: VecDeque::with_capacity(capacity),
+            records: HashMap::with_capacity(capacity),
+        }
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        loop {
+            let Some(key) = self.order.front().copied() else {
+                break;
+            };
+            let expired = self
+                .records
+                .get(&key)
+                .is_none_or(|record| record.expires_at <= now);
+            if !expired {
+                break;
+            }
+            self.order.pop_front();
+            self.records.remove(&key);
+        }
+    }
+
+    fn lookup(
+        &mut self,
+        key: CacheNetworkDedupeKey,
+        fingerprint: [u8; 32],
+        now: Instant,
+    ) -> Result<Option<CacheTransportMessage>, ()> {
+        self.prune_expired(now);
+        match self.records.get(&key) {
+            Some(record) if record.fingerprint == fingerprint => Ok(Some(record.reply.clone())),
+            Some(_) => Err(()),
+            None => Ok(None),
+        }
+    }
+
+    fn can_admit(&mut self, now: Instant) -> bool {
+        self.prune_expired(now);
+        self.records.len() < self.capacity
+    }
+
+    fn insert(
+        &mut self,
+        key: CacheNetworkDedupeKey,
+        fingerprint: [u8; 32],
+        reply: CacheTransportMessage,
+        now: Instant,
+    ) {
+        if self.records.contains_key(&key) {
+            return;
+        }
+        debug_assert!(
+            self.records.len() < self.capacity,
+            "cache retry record inserted without admission"
+        );
+        self.order.push_back(key);
+        self.records.insert(
+            key,
+            CacheNetworkDedupeRecord {
+                fingerprint,
+                reply,
+                expires_at: now + CACHE_NETWORK_DEDUPE_RETENTION,
+            },
+        );
+    }
+}
+
+fn cache_message_fingerprint(message: &CacheTransportMessage) -> [u8; 32] {
+    match message.to_wire_bytes() {
+        Ok(bytes) => *blake3::hash(&bytes).as_bytes(),
+        Err(_) => [0u8; 32],
+    }
+}
+
 fn run_cache_network_coordinator(
     local_node_id: u64,
     endpoint: CacheServiceTransportEndpoint,
     controls: Vec<CacheShardServerControl>,
     placement_publisher: Arc<CachePlacementPublisher>,
     network_event_tx: SyncSender<CacheTransportInbound>,
+    network_timeout_tx: mpsc::Sender<CacheNetworkTimeout>,
+    retry_state: Arc<Mutex<CacheNetworkRetryState>>,
     shutdown: Arc<AtomicBool>,
 ) {
     let sender = endpoint.sender();
     let mut placement = placement_publisher.snapshot();
+    let mut dedupe = CacheNetworkDedupe::new(CACHE_NETWORK_DEDUPE_ENTRIES);
 
     while !shutdown.load(Ordering::Acquire) {
+        retry_cache_network_pending(&sender, &retry_state, &network_timeout_tx);
         if let Some(next) = placement_publisher.snapshot_if_newer(placement.epoch()) {
             placement = next;
         }
@@ -1157,23 +1555,83 @@ fn run_cache_network_coordinator(
                 placement = next;
             }
 
+            let dedupe_key = match &inbound.message {
+                CacheTransportMessage::CommandRequest { request_id, .. } => {
+                    Some(CacheNetworkDedupeKey::Command {
+                        peer: inbound.from_node.0,
+                        request_id: *request_id,
+                    })
+                }
+                CacheTransportMessage::TransferBatch { transfer_id, .. } => {
+                    Some(CacheNetworkDedupeKey::Transfer {
+                        peer: inbound.from_node.0,
+                        transfer_id: *transfer_id,
+                    })
+                }
+                _ => None,
+            };
+            let fingerprint = cache_message_fingerprint(&inbound.message);
+
+            if let Some(key) = dedupe_key {
+                let dedupe_now = Instant::now();
+                match dedupe.lookup(key, fingerprint, dedupe_now) {
+                    Ok(Some(reply)) => {
+                        send_cache_transport_outbound(
+                            &sender,
+                            CacheTransportOutbound {
+                                to_node: inbound.from_node,
+                                message: reply,
+                            },
+                        );
+                        continue;
+                    }
+                    Err(()) => {
+                        tracing::warn!(
+                            "nulang-cache: rejecting cache request id reuse with different payload from {:?}",
+                            inbound.from_node
+                        );
+                        reject_cache_network_id_reuse(local_node_id, &sender, inbound);
+                        continue;
+                    }
+                    Ok(None) => {
+                        if !dedupe.can_admit(dedupe_now) {
+                            tracing::warn!(
+                                "nulang-cache: retry dedupe window saturated; rejecting new cache operation from {:?}",
+                                inbound.from_node
+                            );
+                            reject_cache_network_saturated(local_node_id, &sender, inbound);
+                            continue;
+                        }
+                    }
+                }
+            }
+
             if let Err(error) = inbound.message.validate_for_node(local_node_id, &placement) {
                 tracing::warn!(
                     "nulang-cache: rejecting cache envelope from {:?}: {:?}",
                     inbound.from_node,
                     error
                 );
-                reject_cache_network_inbound(local_node_id, &sender, inbound, error);
+                let reply =
+                    reject_cache_network_inbound(local_node_id, &sender, inbound.clone(), error);
+                if let (Some(key), Some(reply)) = (dedupe_key, reply) {
+                    dedupe.insert(key, fingerprint, reply, Instant::now());
+                }
                 continue;
             }
 
-            handle_cache_network_inbound(
+            if let Some(reply) = handle_cache_network_inbound(
                 local_node_id,
                 &sender,
                 &controls,
                 &network_event_tx,
-                inbound,
-            );
+                &retry_state,
+                inbound.clone(),
+            ) {
+                if let Some(key) = dedupe_key {
+                    dedupe.insert(key, fingerprint, reply, Instant::now());
+                }
+            }
         }
 
         if processed == 0 {
@@ -1187,8 +1645,9 @@ fn handle_cache_network_inbound(
     sender: &CacheServiceTransportSender,
     controls: &[CacheShardServerControl],
     network_event_tx: &SyncSender<CacheTransportInbound>,
+    retry_state: &Arc<Mutex<CacheNetworkRetryState>>,
     inbound: CacheTransportInbound,
-) {
+) -> Option<CacheTransportMessage> {
     let from_node = inbound.from_node;
     match inbound.message {
         CacheTransportMessage::CommandRequest {
@@ -1200,19 +1659,21 @@ fn handle_cache_network_inbound(
         } => {
             let response =
                 execute_remote_command_on_reactor(controls, target, placement_epoch, slot, frame);
+            let reply = CacheTransportMessage::CommandResponse {
+                request_id,
+                placement_epoch,
+                slot,
+                responder: target,
+                response,
+            };
             send_cache_transport_outbound(
                 sender,
                 CacheTransportOutbound {
                     to_node: from_node,
-                    message: CacheTransportMessage::CommandResponse {
-                        request_id,
-                        placement_epoch,
-                        slot,
-                        responder: target,
-                        response,
-                    },
+                    message: reply.clone(),
                 },
             );
+            return Some(reply);
         }
         CacheTransportMessage::TransferBatch {
             transfer_id,
@@ -1224,36 +1685,49 @@ fn handle_cache_network_inbound(
             let results =
                 import_remote_batch_on_reactor(controls, target, placement_epoch, batch.clone())
                     .unwrap_or_else(|| vec![CacheTransferImport::Conflict; batch.entries.len()]);
+            let reply = CacheTransportMessage::TransferAck {
+                transfer_id,
+                placement_epoch,
+                source,
+                target,
+                slot: batch.slot,
+                results,
+            };
             send_cache_transport_outbound(
                 sender,
                 CacheTransportOutbound {
                     to_node: from_node,
-                    message: CacheTransportMessage::TransferAck {
-                        transfer_id,
-                        placement_epoch,
-                        source,
-                        target,
-                        slot: batch.slot,
-                        results,
-                    },
+                    message: reply.clone(),
                 },
             );
+            return Some(reply);
         }
         message @ (CacheTransportMessage::CommandResponse { .. }
         | CacheTransportMessage::TransferAck { .. }) => {
+            let completion = cache_completion_key(from_node, &message);
             match network_event_tx.try_send(CacheTransportInbound { from_node, message }) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Some(key) = completion {
+                        retry_state.lock().remove(key);
+                    }
+                }
                 Err(TrySendError::Full(_)) => tracing::warn!(
-                    "nulang-cache: dropping cache network event because event queue is full"
+                    "nulang-cache: cache network event queue is full; keeping retry active"
                 ),
-                Err(TrySendError::Disconnected(_)) => tracing::warn!(
-                    "nulang-cache: dropping cache network event because receiver disconnected"
-                ),
+                Err(TrySendError::Disconnected(_)) => {
+                    if let Some(key) = completion {
+                        retry_state.lock().remove(key);
+                    }
+                    tracing::warn!(
+                        "nulang-cache: dropping cache network event because receiver disconnected"
+                    );
+                }
             }
         }
     }
 
     let _ = local_node_id;
+    None
 }
 
 fn reject_cache_network_inbound(
@@ -1261,6 +1735,64 @@ fn reject_cache_network_inbound(
     sender: &CacheServiceTransportSender,
     inbound: CacheTransportInbound,
     _error: super::cache_transport::CacheTransportValidationError,
+) -> Option<CacheTransportMessage> {
+    match inbound.message {
+        CacheTransportMessage::CommandRequest {
+            request_id,
+            placement_epoch,
+            slot,
+            target,
+            ..
+        } if target.node_id == local_node_id => {
+            let reply = CacheTransportMessage::CommandResponse {
+                request_id,
+                placement_epoch,
+                slot,
+                responder: target,
+                response: b"-TRYAGAIN cache topology changed\r\n".to_vec(),
+            };
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: reply.clone(),
+                },
+            );
+            return Some(reply);
+        }
+        CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch,
+            source,
+            target,
+            batch,
+        } if target.node_id == local_node_id => {
+            let reply = CacheTransportMessage::TransferAck {
+                transfer_id,
+                placement_epoch,
+                source,
+                target,
+                slot: batch.slot,
+                results: vec![CacheTransferImport::Conflict; batch.entries.len()],
+            };
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: reply.clone(),
+                },
+            );
+            return Some(reply);
+        }
+        _ => {}
+    }
+    None
+}
+
+fn reject_cache_network_id_reuse(
+    local_node_id: u64,
+    sender: &CacheServiceTransportSender,
+    inbound: CacheTransportInbound,
 ) {
     match inbound.message {
         CacheTransportMessage::CommandRequest {
@@ -1279,7 +1811,60 @@ fn reject_cache_network_inbound(
                         placement_epoch,
                         slot,
                         responder: target,
-                        response: b"-TRYAGAIN cache topology changed\r\n".to_vec(),
+                        response: b"-ERR cache request id reused with different payload\r\n".to_vec(),
+                    },
+                },
+            );
+        }
+        CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch,
+            source,
+            target,
+            batch,
+        } if target.node_id == local_node_id => {
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: CacheTransportMessage::TransferAck {
+                        transfer_id,
+                        placement_epoch,
+                        source,
+                        target,
+                        slot: batch.slot,
+                        results: vec![CacheTransferImport::Conflict; batch.entries.len()],
+                    },
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
+fn reject_cache_network_saturated(
+    local_node_id: u64,
+    sender: &CacheServiceTransportSender,
+    inbound: CacheTransportInbound,
+) {
+    match inbound.message {
+        CacheTransportMessage::CommandRequest {
+            request_id,
+            placement_epoch,
+            slot,
+            target,
+            ..
+        } if target.node_id == local_node_id => {
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: CacheTransportMessage::CommandResponse {
+                        request_id,
+                        placement_epoch,
+                        slot,
+                        responder: target,
+                        response: b"-TRYAGAIN cache retry window saturated\r\n".to_vec(),
                     },
                 },
             );

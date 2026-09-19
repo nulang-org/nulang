@@ -1,6 +1,6 @@
 #![cfg(feature = "cache-server")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdTcpStream};
 use std::sync::Arc;
@@ -493,6 +493,789 @@ fn stale_remote_transfer_epoch_never_finalizes_source_key() {
     let mut value = [0u8; 11];
     source_client.read_exact(&mut value).unwrap();
     assert_eq!(&value, b"$5\r\nvalue\r\n");
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
+
+
+#[test]
+fn duplicate_remote_command_replays_cached_response_without_reexecution() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33601".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33602".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"retry-counter";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let mut placement = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+    placement
+        .apply_epoch(
+            1,
+            &[nulang::runtime::CacheSlotRange {
+                start: slot,
+                end: slot,
+                owner: target,
+            }],
+        )
+        .unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, placement.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53602))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, placement)
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53601))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let set = CacheTransportMessage::CommandRequest {
+        request_id: 1,
+        placement_epoch: 1,
+        slot,
+        target,
+        frame: frame(&[b"SET", key, b"0"]),
+    };
+    service_a.send_network_message(node_b, set).unwrap();
+    let _ = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+
+    let increment = CacheTransportMessage::CommandRequest {
+        request_id: 77,
+        placement_epoch: 1,
+        slot,
+        target,
+        frame: frame(&[b"INCR", key]),
+    };
+    service_a
+        .send_network_message(node_b, increment.clone())
+        .unwrap();
+    let first = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match first.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(response, b":1\r\n");
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+
+    service_a
+        .send_network_message(node_b, increment)
+        .unwrap();
+    let duplicate = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match duplicate.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(response, b":1\r\n");
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+
+    let get = CacheTransportMessage::CommandRequest {
+        request_id: 78,
+        placement_epoch: 1,
+        slot,
+        target,
+        frame: frame(&[b"GET", key]),
+    };
+    service_a.send_network_message(node_b, get).unwrap();
+    let current = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match current.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(response, b"$1\r\n1\r\n");
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+
+    let reused_id = CacheTransportMessage::CommandRequest {
+        request_id: 77,
+        placement_epoch: 1,
+        slot,
+        target,
+        frame: frame(&[b"GET", key]),
+    };
+    service_a
+        .send_network_message(node_b, reused_id)
+        .unwrap();
+    let rejected = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match rejected.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(
+                response,
+                b"-ERR cache request id reused with different payload\r\n"
+            );
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
+
+
+#[test]
+fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33701".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33702".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"retry-transfer-key";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let base = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53702))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, base.clone())
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53701))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut source_client = StdTcpStream::connect(service_a.local_addrs()[0]).unwrap();
+    source_client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    source_client
+        .write_all(&frame(&[b"SET", key, b"value"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
+
+    let mut migrating = base;
+    migrating.begin_migration(1, slot, source, target).unwrap();
+    service_a.install_placement(migrating.clone()).unwrap();
+    service_b.install_placement(migrating).unwrap();
+    wait_epoch(&service_a, 1);
+    wait_epoch(&service_b, 1);
+
+    let pending = service_a
+        .send_remote_slot_batch(0, target, slot, None, 8, 9301)
+        .unwrap();
+    service_a.retry_remote_slot_batch(&pending).unwrap();
+
+    let first = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    let second = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+
+    let first_results = match &first.message {
+        CacheTransportMessage::TransferAck {
+            transfer_id,
+            results,
+            ..
+        } => {
+            assert_eq!(*transfer_id, 9301);
+            results.clone()
+        }
+        other => panic!("unexpected first transfer event: {other:?}"),
+    };
+    let second_results = match &second.message {
+        CacheTransportMessage::TransferAck {
+            transfer_id,
+            results,
+            ..
+        } => {
+            assert_eq!(*transfer_id, 9301);
+            results.clone()
+        }
+        other => panic!("unexpected second transfer event: {other:?}"),
+    };
+
+    assert_eq!(first_results, second_results);
+    assert_eq!(
+        first_results,
+        vec![nulang::runtime::CacheTransferImport::Imported]
+    );
+
+    let report = service_a
+        .complete_remote_slot_batch(&pending, &first)
+        .unwrap();
+    assert_eq!(report.imported, 1);
+    assert_eq!(report.finalized_removed, 1);
+    assert!(report.source_drained());
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
+
+
+#[test]
+fn automatic_remote_command_retry_recovers_after_partition_heals() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33801".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33802".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"partition-retry-counter";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let mut placement = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+    placement
+        .apply_epoch(
+            1,
+            &[nulang::runtime::CacheSlotRange {
+                start: slot,
+                end: slot,
+                owner: target,
+            }],
+        )
+        .unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, placement.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53802))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, placement)
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53801))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    runtime_a
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([node_b]));
+
+    let increment = CacheTransportMessage::CommandRequest {
+        request_id: 8801,
+        placement_epoch: 1,
+        slot,
+        target,
+        frame: frame(&[b"INCR", key]),
+    };
+    service_a.send_network_message(node_b, increment).unwrap();
+
+    let partition_until = std::time::Instant::now() + Duration::from_millis(60);
+    while std::time::Instant::now() < partition_until {
+        runtime_a.process_network();
+        runtime_b.process_network();
+        assert!(service_a.try_recv_network_event().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    runtime_a
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+
+    let response = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match response.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(response, b":1\r\n");
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+    assert!(service_a.try_recv_network_timeout().unwrap().is_none());
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
+
+#[test]
+fn exhausted_remote_command_retry_reports_unknown_execution_timeout() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33901".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33902".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"timeout-counter";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let mut placement = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+    placement
+        .apply_epoch(
+            1,
+            &[nulang::runtime::CacheSlotRange {
+                start: slot,
+                end: slot,
+                owner: target,
+            }],
+        )
+        .unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, placement.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53902))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, placement)
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53901))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    runtime_a
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([node_b]));
+
+    service_a
+        .send_network_message(
+            node_b,
+            CacheTransportMessage::CommandRequest {
+                request_id: 9901,
+                placement_epoch: 1,
+                slot,
+                target,
+                frame: frame(&[b"INCR", key]),
+            },
+        )
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let timeout = loop {
+        runtime_a.process_network();
+        runtime_b.process_network();
+        if let Some(timeout) = service_a.try_recv_network_timeout().unwrap() {
+            break timeout;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for retry exhaustion"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+
+    assert_eq!(timeout.peer, node_b);
+    assert_eq!(timeout.attempts, 6);
+    assert!(matches!(
+        timeout.operation,
+        nulang::runtime::CacheNetworkTimeoutOperation::Command {
+            request_id: 9901,
+            placement_epoch: 1,
+            slot: timeout_slot,
+        } if timeout_slot == slot
+    ));
+    assert!(service_a.try_recv_network_event().unwrap().is_none());
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
+
+
+#[test]
+fn exhausted_remote_transfer_retry_preserves_source_without_ack() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:34001".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:34002".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"timeout-transfer-key";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let base = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 54002))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, base.clone())
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 54001))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut source_client = StdTcpStream::connect(service_a.local_addrs()[0]).unwrap();
+    source_client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    source_client
+        .write_all(&frame(&[b"SET", key, b"value"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
+
+    let mut migrating = base;
+    migrating.begin_migration(1, slot, source, target).unwrap();
+    service_a.install_placement(migrating.clone()).unwrap();
+    service_b.install_placement(migrating).unwrap();
+    wait_epoch(&service_a, 1);
+    wait_epoch(&service_b, 1);
+
+    runtime_a
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([node_b]));
+
+    let pending = service_a
+        .send_remote_slot_batch(0, target, slot, None, 8, 10_001)
+        .unwrap();
+    assert_eq!(pending.batch.entries.len(), 1);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let timeout = loop {
+        runtime_a.process_network();
+        runtime_b.process_network();
+        if let Some(timeout) = service_a.try_recv_network_timeout().unwrap() {
+            break timeout;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for transfer retry exhaustion"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+
+    assert_eq!(timeout.peer, node_b);
+    assert_eq!(timeout.attempts, 6);
+    assert!(matches!(
+        timeout.operation,
+        nulang::runtime::CacheNetworkTimeoutOperation::Transfer {
+            transfer_id: 10_001,
+            placement_epoch: 1,
+            slot: timeout_slot,
+        } if timeout_slot == slot
+    ));
+    assert!(service_a.try_recv_network_event().unwrap().is_none());
+
+    // No application-level TransferAck was received, so source finalization
+    // must never have run. The source remains authoritative during migration.
+    source_client.write_all(&frame(&[b"GET", key])).unwrap();
+    let mut value = [0u8; 11];
+    source_client.read_exact(&mut value).unwrap();
+    assert_eq!(&value, b"$5\r\nvalue\r\n");
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
+
+
+#[test]
+fn automatic_remote_transfer_retry_recovers_without_early_source_finalize() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:34001".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:34002".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"partition-transfer-key";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let base = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 54002))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, base.clone())
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 54001))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut source_client = StdTcpStream::connect(service_a.local_addrs()[0]).unwrap();
+    source_client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    source_client
+        .write_all(&frame(&[b"SET", key, b"value"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
+
+    let mut migrating = base;
+    migrating.begin_migration(1, slot, source, target).unwrap();
+    service_a.install_placement(migrating.clone()).unwrap();
+    service_b.install_placement(migrating).unwrap();
+    wait_epoch(&service_a, 1);
+    wait_epoch(&service_b, 1);
+
+    runtime_a
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([node_b]));
+
+    let pending = service_a
+        .send_remote_slot_batch(0, target, slot, None, 8, 9401)
+        .unwrap();
+
+    let partition_until = std::time::Instant::now() + Duration::from_millis(60);
+    while std::time::Instant::now() < partition_until {
+        runtime_a.process_network();
+        runtime_b.process_network();
+        assert!(service_a.try_recv_network_event().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // No application ACK exists yet, so the source must still retain the key.
+    source_client.write_all(&frame(&[b"GET", key])).unwrap();
+    let mut source_value = [0u8; 11];
+    source_client.read_exact(&mut source_value).unwrap();
+    assert_eq!(&source_value, b"$5\r\nvalue\r\n");
+
+    runtime_a
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+
+    let ack = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    let report = service_a
+        .complete_remote_slot_batch(&pending, &ack)
+        .unwrap();
+    assert_eq!(report.imported, 1);
+    assert_eq!(report.finalized_removed, 1);
+    assert!(report.source_drained());
+    assert!(service_a.try_recv_network_timeout().unwrap().is_none());
 
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();

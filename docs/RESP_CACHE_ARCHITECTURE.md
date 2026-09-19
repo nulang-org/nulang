@@ -217,6 +217,28 @@ duration. A future transport timestamp based on a synchronized/bounded-error
 clock, or an absolute expiry representation with explicit clock assumptions,
 can tighten that behavior without weakening the current fencing guarantees.
 
+Remote requests are retry-correlated by authenticated peer plus request or
+transfer id. The source-side service keeps at most 4,096 pending operations and
+retries them with exponential backoff (10ms initial, 250ms cap, six attempts).
+A matching CommandResponse or TransferAck cancels retry only after that event
+has been admitted to the application-facing event queue. If retries exhaust, a
+command reports an explicit timeout with an **unknown execution outcome**:
+the mutation may have committed remotely while every reply was lost. A
+transfer timeout is safer: without a matching application TransferAck the
+source batch is never finalized, so source data remains authoritative.
+
+The target independently keeps a bounded replay table keyed by authenticated
+peer and operation id. Each record stores a BLAKE3 fingerprint of the exact
+wire envelope and the original application response/ACK for 120 seconds, well
+beyond the automatic retry horizon. An identical duplicate therefore receives
+the exact original result without re-running a non-idempotent command or
+re-importing a migration batch. Reusing an id with different payload bytes is
+rejected. The replay table does not evict unexpired records merely to admit new
+work: if all 4,096 protected entries are occupied, new operations fail closed
+with TRYAGAIN/conflict until space becomes safe to reuse. This trades bounded
+availability under extreme retry pressure for a stronger exactly-once replay
+boundary.
+
 The same cluster layer serves topology discovery without touching CacheStore:
 `CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
 topology response, and legacy `CLUSTER SLOTS` is retained for older clients.
@@ -282,12 +304,12 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add bounded retry/correlation state for remote command requests and transfer
-   batches, including duplicate request/transfer suppression and timeout
-   outcomes that never weaken source fencing.
-2. Add source/target convergence checks and retry-safe migration completion so
-   packet loss, reordered ACKs, and bridge backpressure can recover without
-   operator-driven request replay.
+1. Add explicit source/target convergence probes for migration completion:
+   verify target import state and source drain state before allowing ownership
+   commit, including recovery after controller restart.
+2. Persist or reconstruct in-flight migration controller state so a process
+   restart can safely resume batches without relying on an in-memory pending
+   request record.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 4. Allow topology publication to add/remove advertised remote endpoints without
