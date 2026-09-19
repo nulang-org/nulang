@@ -24,6 +24,8 @@ mod cluster;
 mod distributed;
 mod distributed_context;
 mod fabric_queue;
+#[cfg(feature = "tcp")]
+mod fabric_queue_api;
 mod fabric_queue_cluster;
 mod fabric_stream;
 mod fabric_stream_cluster;
@@ -39,9 +41,11 @@ pub use distributed_context::{
 };
 pub use fabric_queue::{
     FabricQueueAddOptions, FabricQueueAddResult, FabricQueueConfig, FabricQueueConsumerGroupConfig,
-    FabricQueueConsumerGroupInfo, FabricQueueDelivery, FabricQueueInfo, FabricQueueJobStatus,
-    FabricQueueNackResult, FabricQueueStore,
+    FabricQueueConsumerGroupInfo, FabricQueueDelivery, FabricQueueInfo, FabricQueueJobInfo,
+    FabricQueueJobStatus, FabricQueueNackResult, FabricQueueReadySignal, FabricQueueStore,
 };
+#[cfg(feature = "tcp")]
+pub use fabric_queue_api::FabricQueueApiServer;
 pub use fabric_queue_cluster::{
     FabricQueuePlacement, FabricQueuePolicySyncReport, FabricQueueReplicatedAckResult,
     FabricQueueReplicatedAcquireResult, FabricQueueReplicatedAddResult,
