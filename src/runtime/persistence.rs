@@ -1947,6 +1947,22 @@ impl PostgresStore {
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS durable_effects (
+                id BIGSERIAL PRIMARY KEY,
+                actor_id BIGINT NOT NULL,
+                effect_id TEXT NOT NULL,
+                record TEXT NOT NULL
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS durable_effects_actor_idx
+             ON durable_effects(actor_id, id)",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(())
     }
 }
@@ -2176,6 +2192,49 @@ impl PersistenceStore for PostgresStore {
             .collect()
     }
 
+    fn append_durable_effect_record(
+        &mut self,
+        actor_id: u64,
+        record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        let effect_id = record.effect_id().to_string();
+        let record_json = String::from_utf8(
+            record
+                .to_json()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO durable_effects (actor_id, effect_id, record)
+             VALUES ($1, $2, $3)",
+            &[&(actor_id as i64), &effect_id, &record_json],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    fn read_durable_effect_records(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        let mut conn = self.conn.lock().unwrap();
+        let rows = conn
+            .query(
+                "SELECT record FROM durable_effects
+                 WHERE actor_id = $1 ORDER BY id ASC",
+                &[&(actor_id as i64)],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                let record_json: String = row.get(0);
+                DurableEffectPersistenceRecord::from_json(record_json.as_bytes())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect()
+    }
+
     fn latest_sequence(&self, actor_id: u64) -> u64 {
         let mut conn = match self.conn.lock() {
             Ok(c) => c,
@@ -2222,7 +2281,13 @@ impl PersistenceStore for PostgresStore {
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        for table in ["snapshots", "journal", "workflow_events", "events"] {
+        for table in [
+            "snapshots",
+            "journal",
+            "workflow_events",
+            "events",
+            "durable_effects",
+        ] {
             conn.execute(
                 &format!("DELETE FROM {} WHERE actor_id = $1", table),
                 &[&(actor_id as i64)],
