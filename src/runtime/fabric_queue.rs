@@ -550,7 +550,6 @@ pub(crate) struct FabricQueueExpiryPlan {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FabricQueueDeadLetterPlan {
-    pub source_sequence: u64,
     pub target_queue: String,
     pub target_name: String,
     pub target_payload: Vec<u8>,
@@ -854,14 +853,13 @@ impl<'a> FabricQueueStore<'a> {
             .expect("validated queue job must exist")
             .deliveries;
         let (status, available_at_ms) = if deliveries >= state.config.max_attempts {
-            (
-                if state.config.dead_letter_queue.is_some() {
-                    FabricQueueJobStatus::DeadLettered
-                } else {
-                    FabricQueueJobStatus::Failed
-                },
-                None,
-            )
+            if state.config.dead_letter_queue.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "replicated Fabric queue DLQ terminalization requires crash-safe dead-letter handoff",
+                ));
+            }
+            (FabricQueueJobStatus::Failed, None)
         } else {
             (
                 FabricQueueJobStatus::Waiting,
@@ -1787,7 +1785,6 @@ impl Runtime {
         .map_err(json_error)?;
 
         Ok(Some(FabricQueueDeadLetterPlan {
-            source_sequence: sequence,
             target_queue,
             target_name: envelope.name,
             target_payload: envelope.payload,
@@ -1834,14 +1831,13 @@ impl Runtime {
             .expect("validated queue job must exist")
             .deliveries;
         let (status, available_at_ms) = if deliveries >= state.config.max_attempts {
-            (
-                if state.config.dead_letter_queue.is_some() {
-                    FabricQueueJobStatus::DeadLettered
-                } else {
-                    FabricQueueJobStatus::Failed
-                },
-                None,
-            )
+            if state.config.dead_letter_queue.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "replicated Fabric queue DLQ expiry requires crash-safe dead-letter handoff",
+                ));
+            }
+            (FabricQueueJobStatus::Failed, None)
         } else {
             (
                 FabricQueueJobStatus::Waiting,
@@ -1908,6 +1904,103 @@ impl Runtime {
         })
         .map_err(json_error)?;
         Ok((bytes, lease_until_ms))
+    }
+
+    pub(crate) fn fabric_queue_plan_committed_dead_letter_expiry(
+        &mut self,
+        queue: &str,
+        queue_epoch: u64,
+        now_ms: u64,
+    ) -> io::Result<Option<FabricQueueDeadLetterPlan>> {
+        validate_queue_name(queue)?;
+        if queue_epoch == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replicated Fabric queue expiry requires a non-zero queue epoch",
+            ));
+        }
+
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        let mut candidate: Option<(u64, u64)> = None;
+        for (&sequence, job) in &state.jobs {
+            if job.status != FabricQueueJobStatus::Active {
+                continue;
+            }
+            let Some(deadline) = job.lease_until_ms else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("active Fabric queue job {sequence} is missing a lease deadline"),
+                ));
+            };
+            if deadline > now_ms {
+                continue;
+            }
+            match candidate {
+                None => candidate = Some((sequence, deadline)),
+                Some((best_sequence, best_deadline))
+                    if deadline < best_deadline
+                        || (deadline == best_deadline && sequence < best_sequence) =>
+                {
+                    candidate = Some((sequence, deadline));
+                }
+                _ => {}
+            }
+        }
+
+        let Some((sequence, _)) = candidate else {
+            return Ok(None);
+        };
+        let job = state.jobs.get(&sequence).expect("expiry candidate must exist");
+        if job.deliveries < state.config.max_attempts {
+            return Ok(None);
+        }
+        let Some(target_queue) = state.config.dead_letter_queue.clone() else {
+            return Ok(None);
+        };
+        if target_queue == queue {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric queue cannot dead-letter into itself",
+            ));
+        }
+        let consumer = job.consumer.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("active Fabric queue job {sequence} is missing a consumer"),
+            )
+        })?;
+        let envelope = store.read_committed_envelope(queue, sequence)?;
+        let target_job_id = format!("__dlq:{queue}:{sequence}");
+        validate_job_id(&target_job_id)?;
+        let operation_id = format!("__lease_expire:{queue_epoch}:{sequence}:{}", job.lease_token);
+        let source_mutation_bytes = serde_json::to_vec(&QueueMutation::LeaseExpired {
+            sequence,
+            consumer,
+            lease_token: job.lease_token,
+            status: FabricQueueJobStatus::DeadLettered,
+            available_at_ms: None,
+            queue_epoch,
+            operation_id: Some(operation_id),
+        })
+        .map_err(json_error)?;
+
+        Ok(Some(FabricQueueDeadLetterPlan {
+            target_queue,
+            target_name: envelope.name,
+            target_payload: envelope.payload,
+            target_options: FabricQueueAddOptions {
+                job_id: Some(target_job_id),
+                priority: envelope.priority,
+                delay_ms: 0,
+            },
+            source_mutation_bytes,
+            result: FabricQueueNackResult {
+                status: FabricQueueJobStatus::DeadLettered,
+                deliveries: job.deliveries,
+                available_at_ms: None,
+            },
+        }))
     }
 
     pub(crate) fn fabric_queue_plan_committed_expiry(
