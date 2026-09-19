@@ -3525,6 +3525,34 @@ mod tests {
     }
 
     #[test]
+    fn migration_probe_state_remembers_target_conflicts() {
+        let key = b"k{probe-conflict}";
+        let slot = super::super::cache::redis_slot(key);
+        let mut source_store = CacheStore::new();
+        source_store.set_bytes(key, b"source", None, 0);
+        let batch = source_store.export_slot_batch(slot, None, 8, 0);
+
+        let mut target_store = CacheStore::new();
+        let mut state = CacheTransferImportState::new(slot);
+        assert_eq!(
+            state.import_batch(&mut target_store, &batch, 0, 0),
+            vec![CacheTransferImport::Imported]
+        );
+
+        target_store.set_bytes(key, b"client", None, 1);
+        assert_eq!(
+            state.import_batch(&mut target_store, &batch, 0, 1),
+            vec![CacheTransferImport::Conflict]
+        );
+
+        let snapshot = state.snapshot(&target_store, slot, 1);
+        assert_eq!(snapshot.live_entries, 1);
+        assert_eq!(snapshot.import_fences, 1);
+        assert_eq!(snapshot.conflicts, 1);
+        assert_eq!(snapshot.wrong_slot, 0);
+    }
+
+    #[test]
     fn redirect_mode_is_required() {
         let placement = CacheSlotMap::new_local(1, 1).unwrap();
         let (channels, mut inboxes) = CacheDispatchChannels::new(1, 8).unwrap();
