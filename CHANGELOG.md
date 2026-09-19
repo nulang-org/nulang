@@ -64,6 +64,12 @@ two major versions.*
   indexed lookup to a physical node/shard owner. Placement changes validate the
   complete range batch before mutation and reject stale epochs or overlapping
   assignments, keeping topology coordination off the GET/SET hot path.
+- **Cache-specific local/remote dispatch boundary** (Experimental,
+  `src/runtime/cache_dispatch.rs`). Same-shard commands execute directly on
+  the owning `CacheStore`; other local shards use bounded request/reply queues
+  with explicit backpressure, while remote ownership produces a transport
+  handoff tagged with slot and placement epoch. RESP frames are copied only
+  when crossing a shard or node boundary.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
