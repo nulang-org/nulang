@@ -37,15 +37,15 @@ mod supervisor;
 pub use distributed_context::{
     DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot, FabricPublishReport,
 };
-pub use fabric_queue_cluster::{
-    FabricQueuePlacement, FabricQueuePolicySyncReport, FabricQueueReplicatedAcquireResult,
-    FabricQueueReplicatedAckResult, FabricQueueReplicatedAddResult,
-    FabricQueueReplicatedCreateResult, FabricQueueReplicatedNackResult,
-    FabricQueueReplicatedRenewResult,
-};
 pub use fabric_queue::{
     FabricQueueAddOptions, FabricQueueAddResult, FabricQueueConfig, FabricQueueDelivery,
     FabricQueueInfo, FabricQueueJobStatus, FabricQueueNackResult, FabricQueueStore,
+};
+pub use fabric_queue_cluster::{
+    FabricQueuePlacement, FabricQueuePolicySyncReport, FabricQueueReplicatedAckResult,
+    FabricQueueReplicatedAcquireResult, FabricQueueReplicatedAddResult,
+    FabricQueueReplicatedCreateResult, FabricQueueReplicatedNackResult,
+    FabricQueueReplicatedRenewResult,
 };
 pub use fabric_stream::{
     FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
