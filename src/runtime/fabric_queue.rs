@@ -327,6 +327,12 @@ enum QueueMutation {
         #[serde(default)]
         operation_id: Option<String>,
     },
+    Rescheduled {
+        sequence: u64,
+        available_at_ms: u64,
+        #[serde(default)]
+        operation_id: Option<String>,
+    },
 }
 
 pub(crate) fn encode_queue_created_mutation(config: &FabricQueueConfig) -> io::Result<Vec<u8>> {
@@ -441,6 +447,31 @@ pub(crate) fn decode_queue_lease_mutation(
             deliveries,
             consumer_group,
             queue_epoch,
+            operation_id,
+        })),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FabricQueueRescheduleMutation {
+    pub sequence: u64,
+    pub available_at_ms: u64,
+    pub operation_id: Option<String>,
+}
+
+pub(crate) fn decode_queue_reschedule_mutation(
+    bytes: &[u8],
+) -> io::Result<Option<FabricQueueRescheduleMutation>> {
+    let event: QueueMutation = serde_json::from_slice(bytes).map_err(json_error)?;
+    match event {
+        QueueMutation::Rescheduled {
+            sequence,
+            available_at_ms,
+            operation_id,
+        } => Ok(Some(FabricQueueRescheduleMutation {
+            sequence,
+            available_at_ms,
             operation_id,
         })),
         _ => Ok(None),
@@ -579,7 +610,9 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             lease_until_ms: None,
             result: None,
         },
-        QueueMutation::QueueCreated { .. } | QueueMutation::ConsumerGroupConfigured { .. } => {
+        QueueMutation::QueueCreated { .. }
+        | QueueMutation::ConsumerGroupConfigured { .. }
+        | QueueMutation::Rescheduled { .. } => {
             return Ok(None);
         }
     };
@@ -2314,6 +2347,56 @@ impl Runtime {
         }))
     }
 
+    pub(crate) fn fabric_queue_plan_committed_reschedule(
+        &mut self,
+        queue: &str,
+        job_id: &str,
+        operation_id: &str,
+        available_at_ms: u64,
+    ) -> io::Result<(u64, Vec<u8>)> {
+        validate_queue_name(queue)?;
+        validate_job_id(job_id)?;
+        validate_operation_id(operation_id)?;
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        let mut sequence = None;
+        for (&candidate_sequence, job) in &state.jobs {
+            let candidate_id = job
+                .job_id
+                .as_deref()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| candidate_sequence.to_string());
+            if candidate_id == job_id {
+                if sequence.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Fabric queue {queue:?} contains duplicate committed job id {job_id:?}"),
+                    ));
+                }
+                if job.status != FabricQueueJobStatus::Waiting {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Fabric queue job {job_id:?} must be Waiting to reschedule"),
+                    ));
+                }
+                sequence = Some(candidate_sequence);
+            }
+        }
+        let sequence = sequence.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Fabric queue job {job_id:?} does not exist"),
+            )
+        })?;
+        let bytes = serde_json::to_vec(&QueueMutation::Rescheduled {
+            sequence,
+            available_at_ms,
+            operation_id: Some(operation_id.to_string()),
+        })
+        .map_err(json_error)?;
+        Ok((sequence, bytes))
+    }
+
     pub(crate) fn fabric_queue_committed_job_snapshot(
         &mut self,
         queue: &str,
@@ -2549,6 +2632,25 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
             job.available_at_ms = available_at_ms.unwrap_or(job.available_at_ms);
             job.last_error = last_error.clone();
             job.result = None;
+        }
+        QueueMutation::Rescheduled {
+            sequence,
+            available_at_ms,
+            ..
+        } => {
+            let job = state.jobs.get_mut(sequence).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Fabric queue reschedule references missing job {sequence}"),
+                )
+            })?;
+            if job.status != FabricQueueJobStatus::Waiting {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Fabric queue reschedule requires Waiting job {sequence}"),
+                ));
+            }
+            job.available_at_ms = *available_at_ms;
         }
         QueueMutation::LeaseRenewed {
             sequence,
