@@ -374,10 +374,10 @@ mod tests {
             .unwrap();
         assert!(matches!(first, CacheDispatchOutcome::LocalQueued { .. }));
 
-        assert_eq!(
+        assert!(matches!(
             dispatcher.dispatch_frame(&mut store, &command, 0, &mut out),
             Err(CacheDispatchError::QueueFull(1))
-        );
+        ));
     }
 
     #[test]
