@@ -184,6 +184,21 @@ pub struct FabricQueueInfo {
     pub total: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricQueueJobInfo {
+    pub sequence: u64,
+    pub job_id: String,
+    pub name: String,
+    pub payload: Vec<u8>,
+    pub priority: i32,
+    pub status: FabricQueueJobStatus,
+    pub deliveries: u32,
+    pub available_at_ms: u64,
+    pub lease_until_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub result: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct QueueEnvelope {
     pub(crate) name: String,
@@ -212,6 +227,8 @@ struct QueueJobState {
     consumer_group: Option<String>,
     lease_until_ms: Option<u64>,
     last_error: Option<String>,
+    #[serde(default)]
+    result: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +285,8 @@ enum QueueMutation {
         queue_epoch: u64,
         #[serde(default)]
         operation_id: Option<String>,
+        #[serde(default)]
+        result: Option<Vec<u8>>,
     },
     Nacked {
         sequence: u64,
@@ -475,6 +494,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             lease_token,
             queue_epoch,
             operation_id,
+            ..
         } => FabricQueueOperation {
             kind: FabricQueueOperationKind::Ack,
             sequence,
@@ -705,6 +725,7 @@ impl<'a> FabricQueueStore<'a> {
                 consumer_group: None,
                 lease_until_ms: None,
                 last_error: None,
+                result: None,
             },
         );
         self.write_state(queue, &state)?;
@@ -782,6 +803,7 @@ impl<'a> FabricQueueStore<'a> {
             consumer_group: None,
             queue_epoch: 0,
             operation_id: None,
+            result: None,
         };
         let event_sequence = self.append_mutation(queue, &event)?;
         apply_mutation(&mut state, &event)?;
@@ -1077,6 +1099,7 @@ impl<'a> FabricQueueStore<'a> {
                         consumer_group: None,
                         lease_until_ms: None,
                         last_error: None,
+                        result: None,
                     },
                 );
                 next = next.saturating_add(1);
@@ -1216,6 +1239,7 @@ impl<'a> FabricQueueStore<'a> {
                             consumer_group: None,
                             lease_until_ms: None,
                             last_error: None,
+                            result: None,
                         },
                     );
                     changed = true;
@@ -1745,6 +1769,7 @@ impl Runtime {
         queue_epoch: u64,
         lease_token: u64,
         operation_id: &str,
+        result: Option<&[u8]>,
         now_ms: u64,
     ) -> io::Result<Vec<u8>> {
         validate_consumer_name(consumer)?;
@@ -1764,6 +1789,7 @@ impl Runtime {
             lease_token,
             queue_epoch,
             operation_id: Some(operation_id.to_string()),
+            result: result.map(ToOwned::to_owned),
         })
         .map_err(json_error)
     }
@@ -2189,6 +2215,55 @@ impl Runtime {
         })
     }
 
+    pub fn fabric_queue_job_replicated(
+        &mut self,
+        queue: &str,
+        job_id: &str,
+    ) -> io::Result<Option<FabricQueueJobInfo>> {
+        if !self.fabric_queue_has_replication_policy(queue)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Fabric queue {queue:?} does not have a replication policy"),
+            ));
+        }
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        let mut found: Option<(u64, &QueueJobState)> = None;
+        for (&sequence, job) in &state.jobs {
+            let current_id = job
+                .job_id
+                .as_deref()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| sequence.to_string());
+            if current_id == job_id {
+                if found.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Fabric queue {queue:?} contains duplicate committed job id {job_id:?}"),
+                    ));
+                }
+                found = Some((sequence, job));
+            }
+        }
+        let Some((sequence, job)) = found else {
+            return Ok(None);
+        };
+        let envelope = store.read_committed_envelope(queue, sequence)?;
+        Ok(Some(FabricQueueJobInfo {
+            sequence,
+            job_id: envelope.job_id.unwrap_or_else(|| sequence.to_string()),
+            name: envelope.name,
+            payload: envelope.payload,
+            priority: job.priority,
+            status: job.status,
+            deliveries: job.deliveries,
+            available_at_ms: job.available_at_ms,
+            lease_until_ms: job.lease_until_ms,
+            last_error: job.last_error.clone(),
+            result: job.result.clone(),
+        }))
+    }
+
     pub(crate) fn fabric_queue_committed_job_snapshot(
         &mut self,
         queue: &str,
@@ -2377,6 +2452,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
             sequence,
             consumer,
             lease_token,
+            result,
             ..
         } => {
             validate_mutation_lease(state, *sequence, consumer, *lease_token)?;
@@ -2389,6 +2465,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
             job.consumer_group = None;
             job.lease_until_ms = None;
             job.last_error = None;
+            job.result = result.clone();
         }
         QueueMutation::Nacked {
             sequence,
@@ -2421,6 +2498,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
             job.lease_until_ms = None;
             job.available_at_ms = available_at_ms.unwrap_or(job.available_at_ms);
             job.last_error = last_error.clone();
+            job.result = None;
         }
         QueueMutation::LeaseRenewed {
             sequence,
@@ -2935,6 +3013,7 @@ mod tests {
                         lease_token: delivery.lease_token,
                         queue_epoch: 0,
                         operation_id: None,
+                        result: None,
                     },
                 )
                 .unwrap();
