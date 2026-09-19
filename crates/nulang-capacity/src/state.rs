@@ -173,14 +173,14 @@ pub struct ResourceAllocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllocationLedgerSnapshot {
-    pub generation: u64,
+    pub provider_generations: BTreeMap<String, u64>,
     pub allocations: BTreeMap<String, ResourceAllocation>,
 }
 
 impl Default for AllocationLedgerSnapshot {
     fn default() -> Self {
         Self {
-            generation: 1,
+            provider_generations: BTreeMap::new(),
             allocations: BTreeMap::new(),
         }
     }
@@ -188,7 +188,7 @@ impl Default for AllocationLedgerSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocationCommitRequest {
-    pub expected_ledger_generation: u64,
+    pub expected_provider_generation: u64,
     pub topology_generation: u64,
     pub allocation: ResourceAllocation,
 }
@@ -238,9 +238,21 @@ pub enum AllocationError {
     )]
     StaleTopology { observed: u64, current: u64 },
     #[error(
-        "allocation ledger generation {expected} is stale; current generation is {current}"
+        "allocation generation for provider {provider} expected {expected}, current {current}"
     )]
-    GenerationMismatch { expected: u64, current: u64 },
+    GenerationMismatch {
+        provider: String,
+        expected: u64,
+        current: u64,
+    },
+    #[error(
+        "allocation {allocation_id} belongs to provider {actual_provider}, not {requested_provider}"
+    )]
+    AllocationProviderMismatch {
+        allocation_id: String,
+        requested_provider: String,
+        actual_provider: String,
+    },
     #[error("provider {provider} has no inventory for resource {resource}")]
     MissingInventory {
         provider: String,
@@ -281,6 +293,32 @@ pub enum CapacityStateError {
 }
 
 impl AllocationLedgerSnapshot {
+    pub fn provider_generation(&self, provider_id: &str) -> u64 {
+        self.provider_generations
+            .get(provider_id)
+            .copied()
+            .unwrap_or(1)
+    }
+
+    fn advance_provider_generation(&mut self, provider_id: &str) -> u64 {
+        let next = self.provider_generation(provider_id).saturating_add(1);
+        self.provider_generations.insert(provider_id.to_string(), next);
+        next
+    }
+
+    pub fn provider_snapshot(&self, provider_id: &str) -> ProviderAllocationLedgerSnapshot {
+        ProviderAllocationLedgerSnapshot {
+            provider_id: provider_id.to_string(),
+            generation: self.provider_generation(provider_id),
+            allocations: self
+                .allocations
+                .iter()
+                .filter(|(_, allocation)| allocation.provider_id == provider_id)
+                .map(|(id, allocation)| (id.clone(), allocation.clone()))
+                .collect(),
+        }
+    }
+
     pub fn usage(&self) -> Result<BTreeMap<String, ProviderUsage>, AllocationError> {
         let mut usage: BTreeMap<String, ProviderUsage> = BTreeMap::new();
         for allocation in self.allocations.values() {
@@ -316,7 +354,7 @@ impl AllocationLedgerSnapshot {
         if let Some(existing) = self.allocations.get(&request.allocation.allocation_id) {
             if existing == &request.allocation {
                 return Ok(AllocationCommitResult::AlreadyCommitted {
-                    generation: self.generation,
+                    generation: self.provider_generation(&existing.provider_id),
                 });
             }
             return Err(AllocationError::AllocationIdConflict(
@@ -341,10 +379,12 @@ impl AllocationLedgerSnapshot {
                 current: topology.generation,
             });
         }
-        if request.expected_ledger_generation != self.generation {
+        let current_generation = self.provider_generation(&request.allocation.provider_id);
+        if request.expected_provider_generation != current_generation {
             return Err(AllocationError::GenerationMismatch {
-                expected: request.expected_ledger_generation,
-                current: self.generation,
+                provider: request.allocation.provider_id.clone(),
+                expected: request.expected_provider_generation,
+                current: current_generation,
             });
         }
 
@@ -392,34 +432,40 @@ impl AllocationLedgerSnapshot {
             request.allocation.allocation_id.clone(),
             request.allocation.clone(),
         );
-        self.generation = self.generation.saturating_add(1);
-        Ok(AllocationCommitResult::Committed {
-            generation: self.generation,
-        })
+        let generation = self.advance_provider_generation(&provider.id);
+        Ok(AllocationCommitResult::Committed { generation })
     }
 
     pub fn release(
         &mut self,
+        provider_id: &str,
         allocation_id: &str,
-        expected_ledger_generation: u64,
+        expected_provider_generation: u64,
     ) -> Result<AllocationReleaseResult, AllocationError> {
-        if !self.allocations.contains_key(allocation_id) {
+        let current_generation = self.provider_generation(provider_id);
+        let Some(existing) = self.allocations.get(allocation_id) else {
             return Ok(AllocationReleaseResult::AlreadyAbsent {
-                generation: self.generation,
+                generation: current_generation,
+            });
+        };
+        if existing.provider_id != provider_id {
+            return Err(AllocationError::AllocationProviderMismatch {
+                allocation_id: allocation_id.to_string(),
+                requested_provider: provider_id.to_string(),
+                actual_provider: existing.provider_id.clone(),
             });
         }
-        if expected_ledger_generation != self.generation {
+        if expected_provider_generation != current_generation {
             return Err(AllocationError::GenerationMismatch {
-                expected: expected_ledger_generation,
-                current: self.generation,
+                provider: provider_id.to_string(),
+                expected: expected_provider_generation,
+                current: current_generation,
             });
         }
 
         self.allocations.remove(allocation_id);
-        self.generation = self.generation.saturating_add(1);
-        Ok(AllocationReleaseResult::Released {
-            generation: self.generation,
-        })
+        let generation = self.advance_provider_generation(provider_id);
+        Ok(AllocationReleaseResult::Released { generation })
     }
 
     pub fn expire_before(&mut self, now_unix_ms: u64) -> Vec<ResourceAllocation> {
@@ -435,13 +481,15 @@ impl AllocationLedgerSnapshot {
             .collect();
 
         let mut expired = Vec::with_capacity(expired_ids.len());
+        let mut affected_providers = BTreeSet::new();
         for id in expired_ids {
             if let Some(allocation) = self.allocations.remove(&id) {
+                affected_providers.insert(allocation.provider_id.clone());
                 expired.push(allocation);
             }
         }
-        if !expired.is_empty() {
-            self.generation = self.generation.saturating_add(1);
+        for provider_id in affected_providers {
+            self.advance_provider_generation(&provider_id);
         }
         expired
     }
@@ -518,30 +566,38 @@ pub fn usage_drift(
     Ok(drift)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAllocationLedgerSnapshot {
+    pub provider_id: String,
+    pub generation: u64,
+    pub allocations: BTreeMap<String, ResourceAllocation>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerCasResult {
     Stored,
     GenerationChanged,
 }
 
-pub type LedgerLoadFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<AllocationLedgerSnapshot, String>> + Send + 'a>>;
+pub type LedgerLoadFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<ProviderAllocationLedgerSnapshot, String>> + Send + 'a>,
+>;
 pub type LedgerCasFuture<'a> =
     Pin<Box<dyn Future<Output = Result<LedgerCasResult, String>> + Send + 'a>>;
 
-/// Durable storage boundary for the allocation ledger.
+/// Durable provider-scoped storage boundary for the allocation ledger.
 ///
-/// A scheduler replica loads a snapshot, applies commit/release locally, then
-/// atomically stores the next snapshot iff expected_generation still matches
-/// durable state. GenerationChanged means reload and re-plan; it must never be
-/// silently treated as success.
+/// Provider-local generations avoid a global scheduling lock: a reservation on
+/// one host does not force retries for unrelated hosts. A production store may
+/// use normalized rows rather than serialized snapshots, but compare_and_swap
+/// must atomically enforce the provider generation and allocation identity.
 pub trait AllocationLedgerStore: Send + Sync {
-    fn load<'a>(&'a self) -> LedgerLoadFuture<'a>;
+    fn load_provider<'a>(&'a self, provider_id: &'a str) -> LedgerLoadFuture<'a>;
 
-    fn compare_and_swap<'a>(
+    fn compare_and_swap_provider<'a>(
         &'a self,
         expected_generation: u64,
-        next: &'a AllocationLedgerSnapshot,
+        next: &'a ProviderAllocationLedgerSnapshot,
     ) -> LedgerCasFuture<'a>;
 }
 
@@ -699,7 +755,7 @@ mod tests {
         let mut ledger = AllocationLedgerSnapshot::default();
         let first = allocation("alloc-1", 2_000);
         let request = AllocationCommitRequest {
-            expected_ledger_generation: 1,
+            expected_provider_generation: 1,
             topology_generation: 9,
             allocation: first.clone(),
         };
@@ -714,17 +770,57 @@ mod tests {
         );
 
         let stale_request = AllocationCommitRequest {
-            expected_ledger_generation: 1,
+            expected_provider_generation: 1,
             topology_generation: 9,
             allocation: allocation("alloc-2", 1_000),
         };
         assert_eq!(
             ledger.commit(&topology, &stale_request),
             Err(AllocationError::GenerationMismatch {
+                provider: "host-a".into(),
                 expected: 1,
                 current: 2
             })
         );
+    }
+
+    #[test]
+    fn provider_generations_do_not_conflict_across_unrelated_hosts() {
+        let mut topology = topology();
+        let mut host_b = topology.providers[0].clone();
+        host_b.id = "host-b".into();
+        host_b.location.host = Some("host-b".into());
+        host_b.location.zone = Some("az-b".into());
+        topology.providers.push(host_b);
+
+        let mut ledger = AllocationLedgerSnapshot::default();
+        ledger
+            .commit(
+                &topology,
+                &AllocationCommitRequest {
+                    expected_provider_generation: 1,
+                    topology_generation: 9,
+                    allocation: allocation("alloc-a", 500),
+                },
+            )
+            .unwrap();
+
+        let mut on_b = allocation("alloc-b", 500);
+        on_b.provider_id = "host-b".into();
+        on_b.placement_token = "token-b".into();
+        ledger
+            .commit(
+                &topology,
+                &AllocationCommitRequest {
+                    expected_provider_generation: 1,
+                    topology_generation: 9,
+                    allocation: on_b,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(ledger.provider_generation("host-a"), 2);
+        assert_eq!(ledger.provider_generation("host-b"), 2);
     }
 
     #[test]
@@ -735,7 +831,7 @@ mod tests {
             .commit(
                 &topology,
                 &AllocationCommitRequest {
-                    expected_ledger_generation: 1,
+                    expected_provider_generation: 1,
                     topology_generation: 9,
                     allocation: allocation("alloc-1", 500),
                 },
@@ -748,7 +844,7 @@ mod tests {
             ledger.commit(
                 &topology,
                 &AllocationCommitRequest {
-                    expected_ledger_generation: 2,
+                    expected_provider_generation: 2,
                     topology_generation: 9,
                     allocation: duplicate,
                 }
@@ -769,7 +865,7 @@ mod tests {
             .commit(
                 &topology,
                 &AllocationCommitRequest {
-                    expected_ledger_generation: 1,
+                    expected_provider_generation: 1,
                     topology_generation: 9,
                     allocation: allocation("alloc-1", 2_500),
                 },
@@ -780,7 +876,7 @@ mod tests {
             ledger.commit(
                 &topology,
                 &AllocationCommitRequest {
-                    expected_ledger_generation: 2,
+                    expected_provider_generation: 2,
                     topology_generation: 9,
                     allocation: allocation("alloc-2", 1_100),
                 }
@@ -802,7 +898,7 @@ mod tests {
             .commit(
                 &topology,
                 &AllocationCommitRequest {
-                    expected_ledger_generation: 1,
+                    expected_provider_generation: 1,
                     topology_generation: 9,
                     allocation: allocation("alloc-1", 3_000),
                 },
@@ -810,11 +906,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ledger.release("alloc-1", 2).unwrap(),
+            ledger.release("host-a", "alloc-1", 2).unwrap(),
             AllocationReleaseResult::Released { generation: 3 }
         );
         assert_eq!(
-            ledger.release("alloc-1", 1).unwrap(),
+            ledger.release("host-a", "alloc-1", 1).unwrap(),
             AllocationReleaseResult::AlreadyAbsent { generation: 3 }
         );
 
@@ -822,7 +918,7 @@ mod tests {
             .commit(
                 &topology,
                 &AllocationCommitRequest {
-                    expected_ledger_generation: 3,
+                    expected_provider_generation: 3,
                     topology_generation: 9,
                     allocation: allocation("alloc-2", 3_000),
                 },
@@ -838,7 +934,7 @@ mod tests {
             .commit(
                 &topology,
                 &AllocationCommitRequest {
-                    expected_ledger_generation: 1,
+                    expected_provider_generation: 1,
                     topology_generation: 9,
                     allocation: allocation("alloc-1", 1_500),
                 },
@@ -884,7 +980,7 @@ mod tests {
             .commit(
                 &topology,
                 &AllocationCommitRequest {
-                    expected_ledger_generation: 1,
+                    expected_provider_generation: 1,
                     topology_generation: 9,
                     allocation: expiring,
                 },
@@ -894,7 +990,7 @@ mod tests {
         assert!(ledger.expire_before(1_099).is_empty());
         let expired = ledger.expire_before(1_100);
         assert_eq!(expired.len(), 1);
-        assert_eq!(ledger.generation, 3);
+        assert_eq!(ledger.provider_generation("host-a"), 3);
         assert!(ledger.allocations.is_empty());
     }
 }
