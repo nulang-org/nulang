@@ -1161,10 +1161,71 @@ mod tests {
         cluster.run_rounds(12);
         let created = cluster
             .node_mut(leader_index)
-            .fabric_queue_create_replicated("orders", config, 0, 3)
+            .fabric_queue_create_replicated("orders", config.clone(), 0, 3)
             .unwrap();
         assert!(created.created);
         assert!(created.replication.unwrap().committed);
+
+        let add_options = FabricQueueAddOptions {
+            job_id: Some("job-1".to_string()),
+            priority: 7,
+            delay_ms: 0,
+        };
+        let pending_job = cluster
+            .node_mut(leader_index)
+            .fabric_queue_add_replicated(
+                "orders",
+                "render",
+                b"payload",
+                add_options.clone(),
+                0,
+                3,
+                100,
+            )
+            .unwrap();
+        assert_eq!(pending_job.sequence, Some(1));
+        assert!(!pending_job.enqueued);
+
+        let retry_job = cluster
+            .node_mut(leader_index)
+            .fabric_queue_add_replicated(
+                "orders",
+                "render",
+                b"payload",
+                add_options.clone(),
+                0,
+                3,
+                100,
+            )
+            .unwrap();
+        assert_eq!(retry_job.sequence, Some(1));
+        assert!(retry_job.deduplicated);
+        assert_eq!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_stream_info(&queue_stream_name("orders"))
+                .unwrap()
+                .last_sequence,
+            Some(1)
+        );
+
+        cluster.run_rounds(12);
+        let committed_job = cluster
+            .node_mut(leader_index)
+            .fabric_queue_add_replicated(
+                "orders",
+                "render",
+                b"payload",
+                add_options,
+                0,
+                3,
+                100,
+            )
+            .unwrap();
+        assert_eq!(committed_job.sequence, Some(1));
+        assert!(committed_job.deduplicated);
+        assert!(committed_job.enqueued);
+        assert!(committed_job.replication.unwrap().committed);
 
         for index in 0..3 {
             assert_eq!(
@@ -1178,8 +1239,15 @@ mod tests {
                 .node_mut(index)
                 .fabric_queue_info_replicated("orders")
                 .unwrap();
-            assert_eq!(info.total, 0);
-            assert_eq!(info.waiting, 0);
+            assert_eq!(
+                cluster
+                    .node_mut(index)
+                    .fabric_stream_committed_sequence(&queue_stream_name("orders"))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(info.total, 1);
+            assert_eq!(info.waiting, 1);
         }
 
         // Simulate leader-local torn/uncommitted tails. The replicated read
@@ -1190,7 +1258,7 @@ mod tests {
                 .node_mut(leader_index)
                 .fabric_stream_append(&queue_stream_name("orders"), b"not-a-queue-envelope")
                 .unwrap(),
-            1
+            2
         );
         assert_eq!(
             cluster
@@ -1203,8 +1271,8 @@ mod tests {
             .node_mut(leader_index)
             .fabric_queue_info_replicated("orders")
             .unwrap();
-        assert_eq!(committed_view.total, 0);
-        assert_eq!(committed_view.waiting, 0);
+        assert_eq!(committed_view.total, 1);
+        assert_eq!(committed_view.waiting, 1);
 
         let _ = std::fs::remove_dir_all(base);
     }
