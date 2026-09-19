@@ -251,6 +251,14 @@ enum QueueApiRequest {
         replication_factor: usize,
         now_ms: u64,
     },
+    Reschedule {
+        queue: String,
+        job_id: String,
+        operation_id: String,
+        available_at_ms: u64,
+        partition: u16,
+        replication_factor: usize,
+    },
     Info {
         queue: String,
     },
@@ -540,6 +548,31 @@ fn dispatch_request(runtime: &mut Runtime, request: QueueApiRequest) -> io::Resu
                 "resumed": result.resumed
             }))
         }
+        QueueApiRequest::Reschedule {
+            queue,
+            job_id,
+            operation_id,
+            available_at_ms,
+            partition,
+            replication_factor,
+        } => {
+            let result = runtime.fabric_queue_reschedule_replicated(
+                &queue,
+                &job_id,
+                &operation_id,
+                available_at_ms,
+                partition,
+                replication_factor,
+            )?;
+            Ok(json!({
+                "mutationSequence": result.mutation_sequence,
+                "committed": result.replication.map(|status| status.committed).unwrap_or(false),
+                "sequence": result.sequence,
+                "availableAtMs": result.available_at_ms,
+                "updated": result.updated,
+                "resumed": result.resumed
+            }))
+        }
         QueueApiRequest::Info { queue } => {
             let info = runtime.fabric_queue_info_replicated(&queue)?;
             Ok(json!({
@@ -688,6 +721,43 @@ mod tests {
             }),
         );
         assert_eq!(added["enqueued"], true);
+
+        let delayed = call(
+            cluster.node_mut(0),
+            json!({
+                "op": "reschedule",
+                "queue": "jobs",
+                "job_id": "job-1",
+                "operation_id": "delay-1",
+                "available_at_ms": 1_000,
+                "partition": 0,
+                "replication_factor": 1
+            }),
+        );
+        assert_eq!(delayed["updated"], true);
+        let delayed_job = call(
+            cluster.node_mut(0),
+            json!({
+                "op": "job",
+                "queue": "jobs",
+                "job_id": "job-1"
+            }),
+        );
+        assert_eq!(delayed_job["availableAtMs"], 1_000);
+
+        let promoted = call(
+            cluster.node_mut(0),
+            json!({
+                "op": "reschedule",
+                "queue": "jobs",
+                "job_id": "job-1",
+                "operation_id": "promote-1",
+                "available_at_ms": 150,
+                "partition": 0,
+                "replication_factor": 1
+            }),
+        );
+        assert_eq!(promoted["updated"], true);
 
         let acquired = call(
             cluster.node_mut(0),
