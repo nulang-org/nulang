@@ -103,6 +103,9 @@ pub struct FabricQueueDelivery {
     pub sequence: u64,
     /// Queue ownership epoch that fenced this delivery. Local-only queues use 0.
     pub queue_epoch: u64,
+    /// Optional durable worker concurrency domain. This is not a fan-out
+    /// subscription group; workers in one group still compete for queue jobs.
+    pub consumer_group: Option<String>,
     pub job_id: String,
     pub name: String,
     pub payload: Vec<u8>,
@@ -121,6 +124,34 @@ pub struct FabricQueueNackResult {
     pub status: FabricQueueJobStatus,
     pub deliveries: u32,
     pub available_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FabricQueueConsumerGroupConfig {
+    pub name: String,
+    pub max_concurrency: usize,
+}
+
+impl FabricQueueConsumerGroupConfig {
+    pub fn new(name: impl Into<String>, max_concurrency: usize) -> io::Result<Self> {
+        let config = Self {
+            name: name.into(),
+            max_concurrency,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        validate_consumer_group_name(&self.name)?;
+        if self.max_concurrency == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric queue consumer-group max_concurrency must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +185,8 @@ struct QueueJobState {
     lease_token: u64,
     status: FabricQueueJobStatus,
     consumer: Option<String>,
+    #[serde(default)]
+    consumer_group: Option<String>,
     lease_until_ms: Option<u64>,
     last_error: Option<String>,
 }
@@ -164,6 +197,8 @@ struct QueueStateFile {
     config: FabricQueueConfig,
     #[serde(default)]
     event_cursor: u64,
+    #[serde(default)]
+    consumer_groups: BTreeMap<String, FabricQueueConsumerGroupConfig>,
     jobs: BTreeMap<u64, QueueJobState>,
 }
 
@@ -173,6 +208,7 @@ impl QueueStateFile {
             version: QUEUE_FORMAT_VERSION,
             config,
             event_cursor: 0,
+            consumer_groups: BTreeMap::new(),
             jobs: BTreeMap::new(),
         }
     }
@@ -183,12 +219,17 @@ enum QueueMutation {
     QueueCreated {
         config: FabricQueueConfig,
     },
+    ConsumerGroupConfigured {
+        config: FabricQueueConsumerGroupConfig,
+    },
     LeaseAcquired {
         sequence: u64,
         consumer: String,
         lease_token: u64,
         lease_until_ms: u64,
         deliveries: u32,
+        #[serde(default)]
+        consumer_group: Option<String>,
         #[serde(default)]
         queue_epoch: u64,
         #[serde(default)]
@@ -294,7 +335,9 @@ pub(crate) struct FabricQueueLeaseMutation {
     pub lease_token: u64,
     pub lease_until_ms: u64,
     pub deliveries: u32,
+    pub consumer_group: Option<String>,
     pub queue_epoch: u64,
+    pub consumer_group: Option<String>,
     pub operation_id: Option<String>,
 }
 
@@ -315,6 +358,7 @@ pub(crate) fn decode_queue_lease_mutation(
             lease_token,
             lease_until_ms,
             deliveries,
+            consumer_group,
             queue_epoch,
             operation_id,
         } => Ok(Some(FabricQueueLeaseMutation {
@@ -323,6 +367,7 @@ pub(crate) fn decode_queue_lease_mutation(
             lease_token,
             lease_until_ms,
             deliveries,
+            consumer_group,
             queue_epoch,
             operation_id,
         })),
@@ -360,6 +405,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             consumer,
             lease_token,
             lease_until_ms,
+            consumer_group,
             queue_epoch,
             operation_id,
             ..
@@ -369,6 +415,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             consumer,
             lease_token,
             queue_epoch,
+            consumer_group,
             operation_id,
             status: None,
             available_at_ms: None,
@@ -386,6 +433,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             consumer,
             lease_token,
             queue_epoch,
+            consumer_group: None,
             operation_id,
             status: Some(FabricQueueJobStatus::Completed),
             available_at_ms: None,
@@ -406,6 +454,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             consumer,
             lease_token,
             queue_epoch,
+            consumer_group: None,
             operation_id,
             status: Some(status),
             available_at_ms,
@@ -424,6 +473,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             consumer,
             lease_token,
             queue_epoch,
+            consumer_group: None,
             operation_id,
             status: None,
             available_at_ms: None,
@@ -443,12 +493,13 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             consumer,
             lease_token,
             queue_epoch,
+            consumer_group: None,
             operation_id,
             status: Some(status),
             available_at_ms,
             lease_until_ms: None,
         },
-        QueueMutation::QueueCreated { .. } => {
+        QueueMutation::QueueCreated { .. } | QueueMutation::ConsumerGroupConfigured { .. } => {
             return Ok(None);
         }
     };
@@ -666,6 +717,7 @@ impl<'a> FabricQueueStore<'a> {
             lease_token,
             lease_until_ms,
             deliveries,
+            consumer_group: None,
             queue_epoch: 0,
             operation_id: None,
         };
@@ -677,6 +729,7 @@ impl<'a> FabricQueueStore<'a> {
         Ok(Some(FabricQueueDelivery {
             sequence,
             queue_epoch: 0,
+            consumer_group: None,
             job_id: envelope.job_id.unwrap_or_else(|| sequence.to_string()),
             name: envelope.name,
             payload: envelope.payload,
@@ -958,6 +1011,7 @@ impl<'a> FabricQueueStore<'a> {
                         lease_token: 0,
                         status: FabricQueueJobStatus::Waiting,
                         consumer: None,
+                        consumer_group: None,
                         lease_until_ms: None,
                         last_error: None,
                     },
@@ -1461,12 +1515,16 @@ impl Runtime {
         &mut self,
         queue: &str,
         consumer: &str,
+        consumer_group: Option<&str>,
         operation_id: &str,
         queue_epoch: u64,
         now_ms: u64,
     ) -> io::Result<Option<FabricQueueLeasePlan>> {
         validate_queue_name(queue)?;
         validate_consumer_name(consumer)?;
+        if let Some(group) = consumer_group {
+            validate_consumer_group_name(group)?;
+        }
         validate_operation_id(operation_id)?;
         if queue_epoch == 0 {
             return Err(io::Error::new(
@@ -1477,6 +1535,25 @@ impl Runtime {
 
         let mut store = self.fabric_queue_store()?;
         let state = store.load_committed_state(queue)?;
+        if let Some(group) = consumer_group {
+            let config = state.consumer_groups.get(group).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Fabric queue consumer group {group:?} is not configured"),
+                )
+            })?;
+            let active = state
+                .jobs
+                .values()
+                .filter(|job| {
+                    job.status == FabricQueueJobStatus::Active
+                        && job.consumer_group.as_deref() == Some(group)
+                })
+                .count();
+            if active >= config.max_concurrency {
+                return Ok(None);
+            }
+        }
         let mut candidate: Option<(u64, i32)> = None;
         for (&sequence, job) in &state.jobs {
             if job.status != FabricQueueJobStatus::Waiting
@@ -1512,6 +1589,7 @@ impl Runtime {
             lease_token,
             lease_until_ms,
             deliveries,
+            consumer_group: consumer_group.map(ToOwned::to_owned),
             queue_epoch,
             operation_id: Some(operation_id.to_string()),
         })
@@ -1520,6 +1598,7 @@ impl Runtime {
         let delivery = FabricQueueDelivery {
             sequence,
             queue_epoch,
+            consumer_group: consumer_group.map(ToOwned::to_owned),
             job_id: envelope.job_id.unwrap_or_else(|| sequence.to_string()),
             name: envelope.name,
             payload: envelope.payload,
@@ -1552,6 +1631,7 @@ impl Runtime {
         })?;
         if job.status != FabricQueueJobStatus::Active
             || job.consumer.as_deref() != Some(lease.consumer.as_str())
+            || job.consumer_group != lease.consumer_group
             || job.lease_token != lease.lease_token
             || job.deliveries != lease.deliveries
         {
@@ -1567,6 +1647,7 @@ impl Runtime {
         Ok(FabricQueueDelivery {
             sequence: lease.sequence,
             queue_epoch: lease.queue_epoch,
+            consumer_group: lease.consumer_group.clone(),
             job_id: envelope
                 .job_id
                 .unwrap_or_else(|| lease.sequence.to_string()),
@@ -1807,6 +1888,30 @@ impl Runtime {
         }))
     }
 
+    pub(crate) fn fabric_queue_encode_consumer_group_config(
+        &mut self,
+        queue: &str,
+        config: &FabricQueueConsumerGroupConfig,
+    ) -> io::Result<Vec<u8>> {
+        validate_queue_name(queue)?;
+        config.validate()?;
+        serde_json::to_vec(&QueueMutation::ConsumerGroupConfigured {
+            config: config.clone(),
+        })
+        .map_err(json_error)
+    }
+
+    pub(crate) fn fabric_queue_find_consumer_group_config(
+        &mut self,
+        queue: &str,
+        group: &str,
+    ) -> io::Result<Option<FabricQueueConsumerGroupConfig>> {
+        validate_consumer_group_name(group)?;
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        Ok(state.consumer_groups.get(group).cloned())
+    }
+
     pub(crate) fn fabric_queue_committed_job_snapshot(
         &mut self,
         queue: &str,
@@ -1911,14 +2016,60 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
                 ));
             }
         }
+        QueueMutation::ConsumerGroupConfigured { config } => {
+            config.validate()?;
+            match state.consumer_groups.get(&config.name) {
+                Some(existing) if existing == config => {}
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Fabric queue consumer group {:?} has conflicting configuration",
+                            config.name
+                        ),
+                    ));
+                }
+                None => {
+                    state
+                        .consumer_groups
+                        .insert(config.name.clone(), config.clone());
+                }
+            }
+        }
         QueueMutation::LeaseAcquired {
             sequence,
             consumer,
             lease_token,
             lease_until_ms,
             deliveries,
+            consumer_group,
             ..
         } => {
+            if let Some(group) = consumer_group {
+                let config = state.consumer_groups.get(group).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Fabric queue lease references unknown consumer group {group:?}"),
+                    )
+                })?;
+                let active = state
+                    .jobs
+                    .values()
+                    .filter(|job| {
+                        job.status == FabricQueueJobStatus::Active
+                            && job.consumer_group.as_deref() == Some(group.as_str())
+                    })
+                    .count();
+                if active >= config.max_concurrency {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Fabric queue consumer group {group:?} exceeds max concurrency {}",
+                            config.max_concurrency
+                        ),
+                    ));
+                }
+            }
             let job = state.jobs.get_mut(sequence).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1936,6 +2087,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
             }
             job.status = FabricQueueJobStatus::Active;
             job.consumer = Some(consumer.clone());
+            job.consumer_group = consumer_group.clone();
             job.lease_token = *lease_token;
             job.lease_until_ms = Some(*lease_until_ms);
             job.deliveries = *deliveries;
@@ -1953,6 +2105,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
                 .expect("validated job must exist");
             job.status = FabricQueueJobStatus::Completed;
             job.consumer = None;
+            job.consumer_group = None;
             job.lease_until_ms = None;
             job.last_error = None;
         }
@@ -1983,6 +2136,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
                 .expect("validated job must exist");
             job.status = *status;
             job.consumer = None;
+            job.consumer_group = None;
             job.lease_until_ms = None;
             job.available_at_ms = available_at_ms.unwrap_or(job.available_at_ms);
             job.last_error = last_error.clone();
@@ -2027,6 +2181,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
                 .expect("validated job must exist");
             job.status = *status;
             job.consumer = None;
+            job.consumer_group = None;
             job.lease_until_ms = None;
             job.available_at_ms = available_at_ms.unwrap_or(job.available_at_ms);
         }
@@ -2090,6 +2245,21 @@ pub(crate) fn validate_consumer_name(name: &str) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Fabric queue consumer names must be 1..=128 bytes",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_consumer_group_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Fabric queue consumer-group names must be 1..=128 ASCII letters, digits, '.', '_', '-', or ':'",
         ));
     }
     Ok(())
