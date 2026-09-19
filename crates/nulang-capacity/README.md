@@ -39,7 +39,7 @@ Implemented:
 - GCP Spot/standard normalizer and preemption normalization
 - Nebius preemptible/regular normalizer and preemption normalization
 - observed fleet telemetry estimates for dynamic scheduler inputs
-- concrete resource-provider topology with hierarchical parent links, integer inventories, required/forbidden traits, and generation-fenced snapshots
+- concrete resource-provider topology with hierarchical parent links, integer inventories, required/forbidden traits, and generation-tagged snapshots
 - hard allocation-candidate generation separated from soft economic/locality scoring
 - deterministic replica ordering and fail-closed spreading across host, rack, zone, region, or provider failure domains
 - tests covering Spot economics, long-running interruption risk, egress, GPU/trust constraints, critical workload policy, cross-provider ranking, stale snapshots, provider health, interruption transitions, telemetry, and lease idempotency
