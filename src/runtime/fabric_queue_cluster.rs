@@ -1196,6 +1196,29 @@ impl Runtime {
             consumer,
             None,
             operation_id,
+            None,
+            partition,
+            replication_factor,
+            now_ms,
+        )
+    }
+
+    pub fn fabric_queue_acquire_replicated_with_lease_duration(
+        &mut self,
+        queue: &str,
+        consumer: &str,
+        operation_id: &str,
+        lease_duration_ms: u64,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAcquireResult> {
+        self.fabric_queue_acquire_replicated_inner(
+            queue,
+            consumer,
+            None,
+            operation_id,
+            Some(lease_duration_ms),
             partition,
             replication_factor,
             now_ms,
@@ -1218,6 +1241,31 @@ impl Runtime {
             consumer,
             Some(group),
             operation_id,
+            None,
+            partition,
+            replication_factor,
+            now_ms,
+        )
+    }
+
+    pub fn fabric_queue_acquire_consumer_group_replicated_with_lease_duration(
+        &mut self,
+        queue: &str,
+        group: &str,
+        consumer: &str,
+        operation_id: &str,
+        lease_duration_ms: u64,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAcquireResult> {
+        validate_consumer_group_name(group)?;
+        self.fabric_queue_acquire_replicated_inner(
+            queue,
+            consumer,
+            Some(group),
+            operation_id,
+            Some(lease_duration_ms),
             partition,
             replication_factor,
             now_ms,
@@ -1230,6 +1278,7 @@ impl Runtime {
         consumer: &str,
         consumer_group: Option<&str>,
         operation_id: &str,
+        lease_duration_ms: Option<u64>,
         partition: u16,
         replication_factor: usize,
         now_ms: u64,
@@ -1286,6 +1335,8 @@ impl Runtime {
                         if lease.consumer != consumer
                             || lease.consumer_group.as_deref() != consumer_group
                             || lease.queue_epoch != placement.epoch
+                            || lease_duration_ms
+                                .is_some_and(|duration| duration != lease.lease_duration_ms)
                         {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -1353,6 +1404,7 @@ impl Runtime {
             consumer_group,
             operation_id,
             placement.epoch,
+            lease_duration_ms,
             now_ms,
         )?
         else {
