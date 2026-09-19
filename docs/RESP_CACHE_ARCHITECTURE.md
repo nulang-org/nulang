@@ -54,11 +54,18 @@ hashed timing wheel with generation checks and lazy expiry on reads. The next
 iteration should promote this to a hierarchical wheel so long TTLs do not
 revisit the same bucket each rotation.
 
-## RESP ingress
+## RESP ingress and command execution
 
 `src/runtime/resp.rs` parses RESP2 array-of-bulk-string commands into borrowed
 slices. It validates the complete frame while avoiding a per-command argument
 vector. Pipelined frames report their exact consumed length.
+
+`src/runtime/resp_cache.rs` executes the initial compatibility surface directly
+against the shard-local kernel: PING, GET, SET (including EX/PX), DEL, EXISTS,
+INCR, EXPIRE, TTL, MGET, and MSET. Multi-key commands validate Redis logical
+slot equality before execution; cross-slot commands return CROSSSLOT before any
+mutation. Same-slot MSET is atomic with respect to other commands because the
+owning shard executes one command to completion without yielding.
 
 The network server should retain ownership of the receive buffer until the
 local command finishes. Remote dispatch may then move/copy only the command
@@ -97,11 +104,10 @@ must be measured separately from steady-state command execution.
 ## Next implementation sequence
 
 1. Wire a TCP RESP endpoint to the borrowed parser and direct local shard API.
-2. Add GET, SET, DEL, EXISTS, INCR, EXPIRE, TTL, PING, MGET, and MSET.
-3. Enforce same-slot atomicity for multi-key writes and Redis-compatible
-   CROSSSLOT errors otherwise.
-4. Add an explicit logical-slot placement table and remote shard dispatch.
-5. Add hierarchical expiration and packed aggregate data structures.
-6. Add WAL/replication acknowledgement modes.
-7. Add Nulang-native coordination primitives: leases, locks, semaphores,
+2. Add an explicit logical-slot placement table and remote shard dispatch.
+3. Add hierarchical expiration and packed aggregate data structures.
+4. Add WAL/replication acknowledgement modes.
+5. Add RESP compatibility for hashes, sets, lists, sorted sets, and scripts or
+   stored functions where they align with the product boundary.
+6. Add Nulang-native coordination primitives: leases, locks, semaphores,
    fencing tokens, durable queues, and stored functions.
