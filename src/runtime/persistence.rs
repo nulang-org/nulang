@@ -1629,6 +1629,7 @@ impl RocksDbStore {
     const CF_JOURNAL: &'static str = "journal";
     const CF_WORKFLOW_EVENTS: &'static str = "workflow_events";
     const CF_EVENTS: &'static str = "events";
+    const CF_DURABLE_EFFECTS: &'static str = "durable_effects";
 
     /// Open (or create) a RocksDB-backed store at `path`.
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
@@ -1646,6 +1647,10 @@ impl RocksDbStore {
                 rocksdb::Options::default(),
             ),
             rocksdb::ColumnFamilyDescriptor::new(Self::CF_EVENTS, rocksdb::Options::default()),
+            rocksdb::ColumnFamilyDescriptor::new(
+                Self::CF_DURABLE_EFFECTS,
+                rocksdb::Options::default(),
+            ),
         ];
         let db = rocksdb::DB::open_cf_descriptors(&opts, path, cfs)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1660,6 +1665,23 @@ impl RocksDbStore {
         let mut key = [0u8; 16];
         key[..8].copy_from_slice(&actor_id.to_be_bytes());
         key[8..].copy_from_slice(&sequence.to_be_bytes());
+        key
+    }
+
+    /// Durable-effect keys preserve Prepared and Completed as distinct slots
+    /// for one logical effect, so writing a stale Prepared record can never
+    /// overwrite a Completed result in the LSM tree.
+    fn durable_effect_key(
+        actor_id: u64,
+        record: &DurableEffectPersistenceRecord,
+    ) -> [u8; 41] {
+        let mut key = [0u8; 41];
+        key[..8].copy_from_slice(&actor_id.to_be_bytes());
+        key[8..40].copy_from_slice(record.effect_id().as_bytes());
+        key[40] = match record.effect() {
+            DurableEffectRecord::Prepared { .. } => 0,
+            DurableEffectRecord::Completed { .. } => 1,
+        };
         key
     }
 
@@ -1806,6 +1828,75 @@ impl PersistenceStore for RocksDbStore {
         entries
     }
 
+    fn append_durable_effect_record(
+        &mut self,
+        actor_id: u64,
+        record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        let cf = self.cf(Self::CF_DURABLE_EFFECTS)?;
+        let key = Self::durable_effect_key(actor_id, &record);
+        let bytes = record
+            .to_json()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        if let Some(existing) = self
+            .db
+            .get_cf(cf, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        {
+            if existing.as_ref() != bytes.as_slice() {
+                let existing_record = DurableEffectPersistenceRecord::from_json(&existing)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                // Same state-kind key with different bytes is only legal if
+                // the semantic fold says the records are equivalent. For
+                // Prepared/Prepared and Completed/Completed, any meaningful
+                // disagreement is a corruption/conflict.
+                merge_durable_effect_record(existing_record.clone(), record.clone())?;
+                if existing_record != record {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "conflicting RocksDB durable effect record for {}",
+                            record.effect_id()
+                        ),
+                    ));
+                }
+            }
+            return Ok(());
+        }
+
+        self.db
+            .put_cf(cf, key, bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn read_durable_effect_records(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        let cf = self.cf(Self::CF_DURABLE_EFFECTS)?;
+        let actor_prefix = Self::actor_key(actor_id);
+        let mut records = Vec::new();
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&actor_prefix, rocksdb::Direction::Forward),
+        );
+        while let Some(item) = iter.next() {
+            let (key, value) =
+                item.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            if key.len() < 8 || key[..8] != actor_prefix {
+                break;
+            }
+            let record = DurableEffectPersistenceRecord::from_json(&value)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     fn latest_sequence(&self, actor_id: u64) -> u64 {
         let snapshot_seq = self
             .load_snapshot(actor_id)
@@ -1838,6 +1929,7 @@ impl PersistenceStore for RocksDbStore {
             Self::CF_JOURNAL,
             Self::CF_WORKFLOW_EVENTS,
             Self::CF_EVENTS,
+            Self::CF_DURABLE_EFFECTS,
         ] {
             let cf = self.cf(cf_name)?;
             // Start from the bare actor prefix.  Snapshot keys are exactly 8
