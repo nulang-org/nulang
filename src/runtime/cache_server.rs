@@ -979,9 +979,6 @@ fn validate_config(config: &CacheServerConfig) -> Result<(), CacheServerError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap};
-    use super::super::cache_dispatch::CacheDispatchChannels;
-    use super::super::cache_routing::CacheSlotMap;
     use super::*;
     use std::net::TcpStream as StdTcpStream;
 
@@ -1075,7 +1072,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
 
-        let mut request = format!("*2\r\n$3\r\nGET\r\n$\{}\r\n", key.len()).into_bytes();
+        let mut request = format!("*2\r\n$3\r\nGET\r\n${}\r\n", key.len()).into_bytes();
         request.extend_from_slice(&key);
         request.extend_from_slice(b"\r\n");
         client.write_all(&request).unwrap();
