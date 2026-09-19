@@ -1913,6 +1913,201 @@ mod tests {
             assert_eq!(info.active, 1);
         }
 
+        let lease_epoch = delivery.queue_epoch;
+        let lease_token = delivery.lease_token;
+
+        // Renew is also quorum-gated. The new deadline is hidden until the
+        // LeaseRenewed mutation commits.
+        let pending_renew = cluster
+            .node_mut(leader_index)
+            .fabric_queue_renew_replicated(
+                "orders",
+                1,
+                "worker-a",
+                lease_epoch,
+                lease_token,
+                "renew-1",
+                20_000,
+                0,
+                3,
+                300,
+            )
+            .unwrap();
+        assert_eq!(pending_renew.mutation_sequence, Some(3));
+        assert!(pending_renew.lease_until_ms.is_none());
+
+        cluster.run_rounds(12);
+        let committed_renew = cluster
+            .node_mut(leader_index)
+            .fabric_queue_renew_replicated(
+                "orders",
+                1,
+                "worker-a",
+                lease_epoch,
+                lease_token,
+                "renew-1",
+                20_000,
+                0,
+                3,
+                300,
+            )
+            .unwrap();
+        assert!(committed_renew.resumed);
+        assert!(committed_renew.replication.unwrap().committed);
+        assert_eq!(committed_renew.lease_until_ms, Some(20_300));
+
+        // NACK returns the job to Waiting only after the mutation commits.
+        let pending_nack = cluster
+            .node_mut(leader_index)
+            .fabric_queue_nack_replicated(
+                "orders",
+                1,
+                "worker-a",
+                lease_epoch,
+                lease_token,
+                "nack-1",
+                100,
+                Some("retry"),
+                0,
+                3,
+                400,
+            )
+            .unwrap();
+        assert_eq!(pending_nack.mutation_sequence, Some(4));
+        assert!(pending_nack.result.is_none());
+
+        cluster.run_rounds(12);
+        let committed_nack = cluster
+            .node_mut(leader_index)
+            .fabric_queue_nack_replicated(
+                "orders",
+                1,
+                "worker-a",
+                lease_epoch,
+                lease_token,
+                "nack-1",
+                100,
+                Some("retry"),
+                0,
+                3,
+                400,
+            )
+            .unwrap();
+        assert!(committed_nack.resumed);
+        let nack_result = committed_nack.result.expect("NACK must be visible after quorum");
+        assert_eq!(nack_result.status, FabricQueueJobStatus::Waiting);
+        assert_eq!(nack_result.deliveries, 1);
+        assert_eq!(nack_result.available_at_ms, Some(500));
+
+        // The next acquisition increments the fencing token.
+        let second_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("orders", "worker-b", "acquire-2", 0, 3, 600)
+            .unwrap();
+        assert_eq!(second_pending.mutation_sequence, Some(5));
+        assert!(second_pending.delivery.is_none());
+
+        cluster.run_rounds(12);
+        let second_committed = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("orders", "worker-b", "acquire-2", 0, 3, 600)
+            .unwrap();
+        let second_delivery = second_committed
+            .delivery
+            .expect("second lease must be visible after quorum");
+        assert_eq!(second_delivery.queue_epoch, lease_epoch);
+        assert_eq!(second_delivery.lease_token, 2);
+        assert_eq!(second_delivery.deliveries, 2);
+
+        // The previous worker/token is now fenced out, as is a stale queue
+        // epoch.
+        let stale_token = cluster
+            .node_mut(leader_index)
+            .fabric_queue_ack_replicated(
+                "orders",
+                1,
+                "worker-a",
+                lease_epoch,
+                1,
+                "ack-stale-token",
+                0,
+                3,
+                700,
+            )
+            .unwrap_err();
+        assert_eq!(stale_token.kind(), io::ErrorKind::PermissionDenied);
+
+        let stale_epoch = cluster
+            .node_mut(leader_index)
+            .fabric_queue_ack_replicated(
+                "orders",
+                1,
+                "worker-b",
+                lease_epoch.saturating_add(1),
+                2,
+                "ack-stale-epoch",
+                0,
+                3,
+                700,
+            )
+            .unwrap_err();
+        assert_eq!(stale_epoch.kind(), io::ErrorKind::PermissionDenied);
+
+        // ACK is not considered complete until its metadata mutation commits.
+        let pending_ack = cluster
+            .node_mut(leader_index)
+            .fabric_queue_ack_replicated(
+                "orders",
+                1,
+                "worker-b",
+                lease_epoch,
+                2,
+                "ack-2",
+                0,
+                3,
+                700,
+            )
+            .unwrap();
+        assert_eq!(pending_ack.mutation_sequence, Some(6));
+        assert!(!pending_ack.completed);
+
+        cluster.run_rounds(12);
+        let committed_ack = cluster
+            .node_mut(leader_index)
+            .fabric_queue_ack_replicated(
+                "orders",
+                1,
+                "worker-b",
+                lease_epoch,
+                2,
+                "ack-2",
+                0,
+                3,
+                700,
+            )
+            .unwrap();
+        assert!(committed_ack.resumed);
+        assert!(committed_ack.completed);
+        assert!(committed_ack.replication.unwrap().committed);
+
+        for index in 0..3 {
+            assert_eq!(
+                cluster
+                    .node_mut(index)
+                    .fabric_stream_committed_sequence(&queue_mutation_stream_name("orders"))
+                    .unwrap(),
+                6
+            );
+            let info = cluster
+                .node_mut(index)
+                .fabric_queue_info_replicated("orders")
+                .unwrap();
+            assert_eq!(info.total, 1);
+            assert_eq!(info.waiting, 0);
+            assert_eq!(info.active, 0);
+            assert_eq!(info.completed, 1);
+        }
+
         // Simulate leader-local torn/uncommitted tails. The replicated read
         // path must stop at each durable commit boundary and never attempt to
         // decode these malformed records.
@@ -1928,7 +2123,7 @@ mod tests {
                 .node_mut(leader_index)
                 .fabric_stream_append(&queue_mutation_stream_name("orders"), b"not-a-queue-mutation")
                 .unwrap(),
-            3
+            7
         );
         let committed_view = cluster
             .node_mut(leader_index)
@@ -1936,7 +2131,8 @@ mod tests {
             .unwrap();
         assert_eq!(committed_view.total, 1);
         assert_eq!(committed_view.waiting, 0);
-        assert_eq!(committed_view.active, 1);
+        assert_eq!(committed_view.active, 0);
+        assert_eq!(committed_view.completed, 1);
 
         let _ = std::fs::remove_dir_all(base);
     }
