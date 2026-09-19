@@ -1048,7 +1048,7 @@ impl Runtime {
         let Some(plan) = self.fabric_queue_plan_committed_lease(
             queue,
             consumer,
-            None,
+            consumer_group,
             operation_id,
             placement.epoch,
             now_ms,
