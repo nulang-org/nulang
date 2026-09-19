@@ -1169,6 +1169,42 @@ mod tests {
     }
 
     #[test]
+    fn typed_local_admission_reports_backpressure_and_capacity() {
+        let mut rt = Runtime::new();
+        let actor_id = 9_001_u64;
+        let mut actor = Actor::new(actor_id, "bounded-admission-target", 1);
+        actor.state = ActorState::Running;
+        actor.register_behavior("handle", noop);
+        rt.actors.insert(actor_id, actor);
+
+        assert_eq!(
+            rt.try_admit_local_message_by_id(actor_id, 0, &[Value::int(1)]),
+            MessageAdmission::Accepted
+        );
+        assert_eq!(
+            rt.try_admit_local_message_by_id(actor_id, 0, &[Value::int(2)]),
+            MessageAdmission::Backpressured
+        );
+        assert_eq!(
+            rt.try_admit_local_message_by_id(99_999, 0, &[]),
+            MessageAdmission::Rejected
+        );
+
+        let snapshot = rt.metrics_snapshot();
+        let mailbox = snapshot
+            .actors_mailboxes
+            .iter()
+            .find(|metric| metric.actor_id == actor_id)
+            .expect("bounded actor should appear in metrics");
+        assert_eq!(mailbox.depth, 1);
+        assert_eq!(mailbox.capacity, 1);
+
+        let prometheus = snapshot.to_prometheus_text();
+        assert!(prometheus.contains(
+            "nulang_actor_mailbox_capacity{actor_id=\"9001\"} 1"
+        ));
+    }
+    #[test]
     fn fabric_publish_report_exposes_cross_shard_channel_backpressure() {
         let mut shards = Runtime::new_fabric_sharded(2);
         let actor_id = 2_u64;
