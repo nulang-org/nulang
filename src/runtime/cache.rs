@@ -425,19 +425,16 @@ impl CacheStore {
         true
     }
 
-    fn set_value(
-        &mut self,
-        key: &[u8],
-        value: CacheValue,
-        ttl_ms: Option<u64>,
-        now_ms: u64,
-    ) {
+    fn set_value(&mut self, key: &[u8], value: CacheValue, ttl_ms: Option<u64>, now_ms: u64) {
         let hash = Self::hash(key);
         let expires_at_ms = ttl_ms.map(|ttl| now_ms.saturating_add(ttl));
 
         if let Some(slot_id) = self.find_slot(key, hash) {
             let slot = &mut self.slots[slot_id as usize];
-            let entry = slot.entry.as_mut().expect("live index points to live entry");
+            let entry = slot
+                .entry
+                .as_mut()
+                .expect("live index points to live entry");
             let old_value = std::mem::replace(&mut entry.value, value);
             old_value.release(&mut self.arena);
             entry.expires_at_ms = expires_at_ms;
@@ -654,7 +651,10 @@ mod tests {
         assert!(store.delete(b"a"));
         store.set_bytes(b"b", &b, None, 0);
         assert_eq!(store.memory_stats().arena_reserved_bytes, reserved);
-        assert_eq!(store.get(b"b", 0), Some(CacheValueView::Bytes(b.as_slice())));
+        assert_eq!(
+            store.get(b"b", 0),
+            Some(CacheValueView::Bytes(b.as_slice()))
+        );
     }
 
     #[test]
@@ -717,7 +717,10 @@ mod tests {
 
     #[test]
     fn redis_hash_tags_colocate_related_keys() {
-        assert_eq!(redis_slot(b"user:{42}:profile"), redis_slot(b"user:{42}:sessions"));
+        assert_eq!(
+            redis_slot(b"user:{42}:profile"),
+            redis_slot(b"user:{42}:sessions")
+        );
         assert_eq!(redis_slot(b"foo{bar}zap"), redis_slot(b"bar"));
     }
 
