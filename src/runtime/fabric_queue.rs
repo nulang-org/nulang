@@ -34,9 +34,8 @@ pub struct FabricQueueConfig {
     pub visibility_timeout_ms: u64,
     /// Maximum number of deliveries before a job becomes terminal.
     pub max_attempts: u32,
-    /// Optional logical dead-letter destination. This slice records
-    /// DeadLettered terminal state; forwarding to the destination is a
-    /// follow-up transport concern.
+    /// Optional logical dead-letter destination. Replicated atomic handoff
+    /// requires the destination queue to share this queue's ownership policy.
     pub dead_letter_queue: Option<String>,
 }
 
@@ -546,6 +545,17 @@ pub(crate) struct FabricQueueJobSnapshot {
 pub(crate) struct FabricQueueExpiryPlan {
     pub sequence: u64,
     pub mutation_bytes: Vec<u8>,
+    pub result: FabricQueueNackResult,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FabricQueueDeadLetterPlan {
+    pub source_sequence: u64,
+    pub target_queue: String,
+    pub target_name: String,
+    pub target_payload: Vec<u8>,
+    pub target_options: FabricQueueAddOptions,
+    pub source_mutation_bytes: Vec<u8>,
     pub result: FabricQueueNackResult,
 }
 
@@ -1721,6 +1731,78 @@ impl Runtime {
             operation_id: Some(operation_id.to_string()),
         })
         .map_err(json_error)
+    }
+
+    pub(crate) fn fabric_queue_plan_committed_dead_letter_nack(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        error: Option<&str>,
+        now_ms: u64,
+    ) -> io::Result<Option<FabricQueueDeadLetterPlan>> {
+        validate_queue_name(queue)?;
+        validate_consumer_name(consumer)?;
+        validate_operation_id(operation_id)?;
+        if queue_epoch == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replicated Fabric queue dead-letter handoff requires a non-zero queue epoch",
+            ));
+        }
+
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        validate_active_job(&state, sequence, consumer, lease_token, now_ms)?;
+        let job = state.jobs.get(&sequence).expect("validated queue job must exist");
+        if job.deliveries < state.config.max_attempts {
+            return Ok(None);
+        }
+        let Some(target_queue) = state.config.dead_letter_queue.clone() else {
+            return Ok(None);
+        };
+        if target_queue == queue {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric queue cannot dead-letter into itself",
+            ));
+        }
+
+        let envelope = store.read_committed_envelope(queue, sequence)?;
+        let target_job_id = format!("__dlq:{queue}:{sequence}");
+        validate_job_id(&target_job_id)?;
+        let source_mutation_bytes = serde_json::to_vec(&QueueMutation::Nacked {
+            sequence,
+            consumer: consumer.to_string(),
+            lease_token,
+            status: FabricQueueJobStatus::DeadLettered,
+            available_at_ms: None,
+            last_error: error.map(ToOwned::to_owned),
+            queue_epoch,
+            operation_id: Some(operation_id.to_string()),
+        })
+        .map_err(json_error)?;
+
+        Ok(Some(FabricQueueDeadLetterPlan {
+            source_sequence: sequence,
+            target_queue,
+            target_name: envelope.name,
+            target_payload: envelope.payload,
+            target_options: FabricQueueAddOptions {
+                job_id: Some(target_job_id),
+                priority: envelope.priority,
+                delay_ms: 0,
+            },
+            source_mutation_bytes,
+            result: FabricQueueNackResult {
+                status: FabricQueueJobStatus::DeadLettered,
+                deliveries: job.deliveries,
+                available_at_ms: None,
+            },
+        }))
     }
 
     pub(crate) fn fabric_queue_plan_committed_nack(
