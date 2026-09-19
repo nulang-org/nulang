@@ -29,6 +29,7 @@ export interface NulangQueueAcquireRequest {
   queue: string;
   consumer: string;
   operationId: string;
+  leaseDurationMs: number;
   nowMs: number;
 }
 
@@ -82,6 +83,7 @@ export interface NulangQueueCounts {
 
 export interface NulangQueueFailRequest extends NulangQueueLeaseRef {
   failedReason: string;
+  fieldsToUpdate?: Record<string, unknown>;
   delayMs: number;
   terminal: boolean;
   nowMs: number;
