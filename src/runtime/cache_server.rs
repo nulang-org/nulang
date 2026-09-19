@@ -10,6 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -25,6 +26,10 @@ use super::cache::{
     CacheTransferImport, CacheTransferImportTracker,
 };
 use super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap, CacheRoutingMode};
+use super::cache_migration_journal::{
+    CacheMigrationConvergenceEvidence, CacheMigrationJournal, CacheMigrationKey,
+    CacheMigrationRecoveryState,
+};
 use super::cache_dispatch::{
     CacheDispatchChannels, CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher,
     CacheShardInbox,
@@ -406,6 +411,9 @@ pub struct CacheRemoteMigrationConvergence {
     pub target_import_fences: u64,
     pub target_conflicts: u64,
     pub target_wrong_slot: u64,
+    /// True when configured durable migration history agrees that every sent
+    /// transfer has a durable application ACK and this probe is fresh.
+    pub durable_history_satisfied: bool,
 }
 
 impl CacheRemoteMigrationConvergence {
@@ -418,6 +426,7 @@ impl CacheRemoteMigrationConvergence {
             && self.source_remaining == 0
             && self.target_conflicts == 0
             && self.target_wrong_slot == 0
+            && self.durable_history_satisfied
     }
 }
 
@@ -567,6 +576,7 @@ pub struct CacheServiceBuilder {
     queue_capacity: usize,
     server_config: CacheServerConfig,
     transport_endpoint: Option<CacheServiceTransportEndpoint>,
+    migration_journal_path: Option<PathBuf>,
 }
 
 impl CacheServiceBuilder {
@@ -579,6 +589,7 @@ impl CacheServiceBuilder {
             queue_capacity: 1024,
             server_config: CacheServerConfig::default(),
             transport_endpoint: None,
+            migration_journal_path: None,
         }
     }
 
@@ -602,6 +613,12 @@ impl CacheServiceBuilder {
 
     pub fn with_transport_endpoint(mut self, endpoint: CacheServiceTransportEndpoint) -> Self {
         self.transport_endpoint = Some(endpoint);
+        self
+    }
+
+    /// Enable fsynced source-controller migration proof journaling.
+    pub fn with_migration_journal_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.migration_journal_path = Some(path.into());
         self
     }
 
@@ -691,6 +708,12 @@ impl CacheServiceBuilder {
             cpus.push(cpu);
         }
 
+        let migration_journal = self
+            .migration_journal_path
+            .as_ref()
+            .map(CacheMigrationJournal::open)
+            .transpose()?;
+
         Ok(CacheService {
             local_node_id: self.local_node_id,
             servers,
@@ -699,6 +722,7 @@ impl CacheServiceBuilder {
             cpus,
             placement_publisher,
             transport_endpoint: self.transport_endpoint,
+            migration_journal,
         })
     }
 }
@@ -711,6 +735,7 @@ pub struct CacheService {
     cpus: Vec<Option<usize>>,
     placement_publisher: Arc<CachePlacementPublisher>,
     transport_endpoint: Option<CacheServiceTransportEndpoint>,
+    migration_journal: Option<CacheMigrationJournal>,
 }
 
 impl CacheService {
@@ -728,6 +753,9 @@ impl CacheService {
             .transport_endpoint
             .as_ref()
             .map(CacheServiceTransportEndpoint::sender);
+        let migration_journal = self
+            .migration_journal
+            .map(|journal| Arc::new(Mutex::new(journal)));
         let network_shutdown = Arc::new(AtomicBool::new(false));
         let network_retry = Arc::new(Mutex::new(CacheNetworkRetryState::new(
             CACHE_NETWORK_PENDING_ENTRIES,
@@ -815,6 +843,7 @@ impl CacheService {
             network_events: has_transport.then_some(network_event_rx),
             network_timeouts: has_transport.then_some(network_timeout_rx),
             network_retry: has_transport.then_some(network_retry),
+            migration_journal,
             network_thread,
             network_shutdown,
         })
@@ -832,6 +861,7 @@ pub struct CacheServiceHandle {
     network_events: Option<Receiver<CacheTransportInbound>>,
     network_timeouts: Option<Receiver<CacheNetworkTimeout>>,
     network_retry: Option<Arc<Mutex<CacheNetworkRetryState>>>,
+    migration_journal: Option<Arc<Mutex<CacheMigrationJournal>>>,
     network_thread: Option<JoinHandle<()>>,
     network_shutdown: Arc<AtomicBool>,
 }
@@ -847,6 +877,23 @@ impl CacheServiceHandle {
 
     pub fn published_placement_epoch(&self) -> u64 {
         self.placement_publisher.published_epoch()
+    }
+
+    /// Durable unfinished/completed migration state reconstructed on journal open.
+    pub fn recovered_remote_migrations(&self) -> Vec<CacheMigrationRecoveryState> {
+        self.migration_journal
+            .as_ref()
+            .map(|journal| journal.lock().recovery_states().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn recovered_remote_migration(
+        &self,
+        key: CacheMigrationKey,
+    ) -> Option<CacheMigrationRecoveryState> {
+        self.migration_journal
+            .as_ref()
+            .and_then(|journal| journal.lock().recovery_state(key).cloned())
     }
 
     pub fn shard_placement_epochs(&self) -> Vec<u64> {
