@@ -325,6 +325,21 @@ The legacy local `fabric_queue_*` mutation/read APIs also reject any queue that
 already carries a replication policy. This prevents callers from accidentally
 bypassing the committed replicated path while that path is being completed.
 
+Replicated queue creation is exposed as `fabric_queue_create_replicated`.
+Creation is a resumable operation:
+
+1. synchronize the queue policy,
+2. do not append queue metadata until policy synchronization is ready,
+3. append `QueueCreated` as mutation sequence 1 through
+   `fabric_stream_replicated_append`,
+4. on retry/restart, inspect sequence 1 and reconstruct/retry its durable
+   replication ticket rather than appending another creation event,
+5. report `created = true` only after sequence 1 is quorum committed.
+
+A deterministic three-node RF=3 test exercises the full policy install/ACK,
+retry, stream replica ACK, quorum commit and committed-boundary propagation
+path.
+
 ## Distributed follow-up
 
 The current queue state machine is local to one Fabric stream store. Moving it
@@ -358,10 +373,10 @@ The compatibility layers must preserve these invariants:
 
 ## Next implementation slice
 
-1. Add a retry-safe replicated queue-creation operation whose `QueueCreated`
-   mutation becomes visible only after quorum commit.
-2. Replay queue metadata exclusively from the mutation stream's committed
+1. Replay queue metadata exclusively from the mutation stream's committed
    prefix on replicas.
+2. Add a replicated enqueue path that commits the immutable payload before any
+   consumer-visible state references it.
 3. Add replicated consumer-group ownership while preserving lease fencing tokens.
 4. Make lease acquisition a quorum-safe compare-and-set against the installed
    queue epoch and include `epoch + lease_token` in every delivery.
