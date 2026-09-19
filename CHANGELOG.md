@@ -112,6 +112,15 @@ two major versions.*
   connection-local `ASKING`, whose authorization is consumed by exactly one
   subsequent command. Generic placement updates cannot bypass an active
   migration, and service construction rejects unadvertised migration targets.
+- **Live placement publication to running cache reactors** (Experimental,
+  `src/runtime/cache_server.rs`). `CacheServiceHandle::install_placement`
+  validates a newer topology snapshot, publishes it once through a cold-path
+  mutex plus atomic epoch, and wakes every shard reactor. Each reactor clones a
+  newer snapshot into its thread-local dispatcher on the wake path and exposes
+  its applied epoch for convergence checks. GET/SET routing performs no mutex
+  or atomic topology lookup. End-to-end coverage verifies a live source changes
+  from `ASK` during migration to `MOVED` after the committed owner epoch
+  without restarting the service.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
