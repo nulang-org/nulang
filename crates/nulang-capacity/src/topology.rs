@@ -290,7 +290,9 @@ pub fn allocation_candidates<'a>(
             continue;
         }
         if !request.allowed_providers.is_empty()
-            && !request.allowed_providers.contains(&provider.location.provider)
+            && !request
+                .allowed_providers
+                .contains(&provider.location.provider)
         {
             continue;
         }
@@ -548,9 +550,11 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].provider.id, "stable");
 
-        assert!(allocation_candidates(&topology, &BTreeMap::new(), &request(250))
-            .unwrap()
-            .is_empty());
+        assert!(
+            allocation_candidates(&topology, &BTreeMap::new(), &request(250))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -564,8 +568,7 @@ mod tests {
                 host("c1", "az-c", "rack-d", &[]),
             ],
         };
-        let candidates =
-            allocation_candidates(&topology, &BTreeMap::new(), &request(100)).unwrap();
+        let candidates = allocation_candidates(&topology, &BTreeMap::new(), &request(100)).unwrap();
 
         let first =
             select_spread_replicas("actor:orders:42", &candidates, 3, FailureDomain::Zone).unwrap();
