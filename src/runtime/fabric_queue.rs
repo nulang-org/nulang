@@ -1756,7 +1756,10 @@ impl Runtime {
         let mut store = self.fabric_queue_store()?;
         let state = store.load_committed_state(queue)?;
         validate_active_job(&state, sequence, consumer, lease_token, now_ms)?;
-        let job = state.jobs.get(&sequence).expect("validated queue job must exist");
+        let job = state
+            .jobs
+            .get(&sequence)
+            .expect("validated queue job must exist");
         if job.deliveries < state.config.max_attempts {
             return Ok(None);
         }
@@ -1953,7 +1956,10 @@ impl Runtime {
         let Some((sequence, _)) = candidate else {
             return Ok(None);
         };
-        let job = state.jobs.get(&sequence).expect("expiry candidate must exist");
+        let job = state
+            .jobs
+            .get(&sequence)
+            .expect("expiry candidate must exist");
         if job.deliveries < state.config.max_attempts {
             return Ok(None);
         }
@@ -1975,7 +1981,10 @@ impl Runtime {
         let envelope = store.read_committed_envelope(queue, sequence)?;
         let target_job_id = format!("__dlq:{queue}:{sequence}");
         validate_job_id(&target_job_id)?;
-        let operation_id = format!("__lease_expire:{queue_epoch}:{sequence}:{}", job.lease_token);
+        let operation_id = format!(
+            "__lease_expire:{queue_epoch}:{sequence}:{}",
+            job.lease_token
+        );
         let source_mutation_bytes = serde_json::to_vec(&QueueMutation::LeaseExpired {
             sequence,
             consumer,
