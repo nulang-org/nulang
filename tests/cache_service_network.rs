@@ -1,6 +1,6 @@
 #![cfg(feature = "cache-server")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdTcpStream};
 use std::sync::Arc;
@@ -777,6 +777,249 @@ fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
     assert_eq!(report.imported, 1);
     assert_eq!(report.finalized_removed, 1);
     assert!(report.source_drained());
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
+
+
+#[test]
+fn automatic_remote_command_retry_recovers_after_partition_heals() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33801".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33802".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"partition-retry-counter";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let mut placement = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+    placement
+        .apply_epoch(
+            1,
+            &[nulang::runtime::CacheSlotRange {
+                start: slot,
+                end: slot,
+                owner: target,
+            }],
+        )
+        .unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, placement.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53802))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, placement)
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53801))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    runtime_a
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([node_b]));
+
+    let increment = CacheTransportMessage::CommandRequest {
+        request_id: 8801,
+        placement_epoch: 1,
+        slot,
+        target,
+        frame: frame(&[b"INCR", key]),
+    };
+    service_a.send_network_message(node_b, increment).unwrap();
+
+    let partition_until = std::time::Instant::now() + Duration::from_millis(60);
+    while std::time::Instant::now() < partition_until {
+        runtime_a.process_network();
+        runtime_b.process_network();
+        assert!(service_a.try_recv_network_event().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    runtime_a
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+
+    let response = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match response.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(response, b":1\r\n");
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+    assert!(service_a.try_recv_network_timeout().unwrap().is_none());
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
+
+#[test]
+fn exhausted_remote_command_retry_reports_unknown_execution_timeout() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33901".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33902".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"timeout-counter";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let mut placement = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+    placement
+        .apply_epoch(
+            1,
+            &[nulang::runtime::CacheSlotRange {
+                start: slot,
+                end: slot,
+                owner: target,
+            }],
+        )
+        .unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, placement.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53902))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, placement)
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53901))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    runtime_a
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([node_b]));
+
+    service_a
+        .send_network_message(
+            node_b,
+            CacheTransportMessage::CommandRequest {
+                request_id: 9901,
+                placement_epoch: 1,
+                slot,
+                target,
+                frame: frame(&[b"INCR", key]),
+            },
+        )
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let timeout = loop {
+        runtime_a.process_network();
+        runtime_b.process_network();
+        if let Some(timeout) = service_a.try_recv_network_timeout().unwrap() {
+            break timeout;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for retry exhaustion"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+
+    assert_eq!(timeout.peer, node_b);
+    assert_eq!(timeout.attempts, 6);
+    assert!(matches!(
+        timeout.operation,
+        nulang::runtime::CacheNetworkTimeoutOperation::Command {
+            request_id: 9901,
+            placement_epoch: 1,
+            slot: timeout_slot,
+        } if timeout_slot == slot
+    ));
+    assert!(service_a.try_recv_network_event().unwrap().is_none());
 
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
