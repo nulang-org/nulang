@@ -7,7 +7,8 @@
 
 #![cfg(feature = "cache-server")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use parking_lot::Mutex;
+use rustc_hash::FxHasher;
 
 use super::cache::{
     CacheStore, CacheTransferBatch, CacheTransferCursor, CacheTransferEntry, CacheTransferFinalize,
@@ -46,6 +48,7 @@ const CACHE_NETWORK_EVENT_CAPACITY: usize = 1024;
 const CACHE_NETWORK_MAX_BATCH: usize = 64;
 const CACHE_NETWORK_IDLE_SLEEP: Duration = Duration::from_millis(1);
 const CACHE_NETWORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+const CACHE_NETWORK_DEDUPE_ENTRIES: usize = 4_096;
 
 #[derive(Debug, Clone)]
 pub struct CacheServerConfig {
@@ -1122,6 +1125,81 @@ impl Drop for CacheServiceHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CacheNetworkDedupeKey {
+    Command { peer: u64, request_id: u64 },
+    Transfer { peer: u64, transfer_id: u64 },
+}
+
+#[derive(Debug, Clone)]
+struct CacheNetworkDedupeRecord {
+    fingerprint: u64,
+    reply: CacheTransportMessage,
+}
+
+#[derive(Debug)]
+struct CacheNetworkDedupe {
+    capacity: usize,
+    order: VecDeque<CacheNetworkDedupeKey>,
+    records: HashMap<CacheNetworkDedupeKey, CacheNetworkDedupeRecord>,
+}
+
+impl CacheNetworkDedupe {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            order: VecDeque::with_capacity(capacity),
+            records: HashMap::with_capacity(capacity),
+        }
+    }
+
+    fn lookup(
+        &self,
+        key: CacheNetworkDedupeKey,
+        fingerprint: u64,
+    ) -> Result<Option<CacheTransportMessage>, ()> {
+        match self.records.get(&key) {
+            Some(record) if record.fingerprint == fingerprint => Ok(Some(record.reply.clone())),
+            Some(_) => Err(()),
+            None => Ok(None),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        key: CacheNetworkDedupeKey,
+        fingerprint: u64,
+        reply: CacheTransportMessage,
+    ) {
+        if self.records.contains_key(&key) {
+            return;
+        }
+        while self.records.len() >= self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.records.remove(&oldest);
+        }
+        self.order.push_back(key);
+        self.records.insert(
+            key,
+            CacheNetworkDedupeRecord {
+                fingerprint,
+                reply,
+            },
+        );
+    }
+}
+
+fn cache_message_fingerprint(message: &CacheTransportMessage) -> u64 {
+    let mut hasher = FxHasher::default();
+    match message.to_wire_bytes() {
+        Ok(bytes) => bytes.hash(&mut hasher),
+        Err(_) => std::mem::discriminant(message).hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
 fn run_cache_network_coordinator(
     local_node_id: u64,
     endpoint: CacheServiceTransportEndpoint,
@@ -1132,6 +1210,7 @@ fn run_cache_network_coordinator(
 ) {
     let sender = endpoint.sender();
     let mut placement = placement_publisher.snapshot();
+    let mut dedupe = CacheNetworkDedupe::new(CACHE_NETWORK_DEDUPE_ENTRIES);
 
     while !shutdown.load(Ordering::Acquire) {
         if let Some(next) = placement_publisher.snapshot_if_newer(placement.epoch()) {
@@ -1157,23 +1236,72 @@ fn run_cache_network_coordinator(
                 placement = next;
             }
 
+            let dedupe_key = match &inbound.message {
+                CacheTransportMessage::CommandRequest { request_id, .. } => {
+                    Some(CacheNetworkDedupeKey::Command {
+                        peer: inbound.from_node.0,
+                        request_id: *request_id,
+                    })
+                }
+                CacheTransportMessage::TransferBatch { transfer_id, .. } => {
+                    Some(CacheNetworkDedupeKey::Transfer {
+                        peer: inbound.from_node.0,
+                        transfer_id: *transfer_id,
+                    })
+                }
+                _ => None,
+            };
+            let fingerprint = cache_message_fingerprint(&inbound.message);
+
+            if let Some(key) = dedupe_key {
+                match dedupe.lookup(key, fingerprint) {
+                    Ok(Some(reply)) => {
+                        send_cache_transport_outbound(
+                            &sender,
+                            CacheTransportOutbound {
+                                to_node: inbound.from_node,
+                                message: reply,
+                            },
+                        );
+                        continue;
+                    }
+                    Err(()) => {
+                        tracing::warn!(
+                            "nulang-cache: rejecting cache request id reuse with different payload from {:?}",
+                            inbound.from_node
+                        );
+                        reject_cache_network_id_reuse(local_node_id, &sender, inbound);
+                        continue;
+                    }
+                    Ok(None) => {}
+                }
+            }
+
             if let Err(error) = inbound.message.validate_for_node(local_node_id, &placement) {
                 tracing::warn!(
                     "nulang-cache: rejecting cache envelope from {:?}: {:?}",
                     inbound.from_node,
                     error
                 );
-                reject_cache_network_inbound(local_node_id, &sender, inbound, error);
+                let reply =
+                    reject_cache_network_inbound(local_node_id, &sender, inbound.clone(), error);
+                if let (Some(key), Some(reply)) = (dedupe_key, reply) {
+                    dedupe.insert(key, fingerprint, reply);
+                }
                 continue;
             }
 
-            handle_cache_network_inbound(
+            if let Some(reply) = handle_cache_network_inbound(
                 local_node_id,
                 &sender,
                 &controls,
                 &network_event_tx,
-                inbound,
-            );
+                inbound.clone(),
+            ) {
+                if let Some(key) = dedupe_key {
+                    dedupe.insert(key, fingerprint, reply);
+                }
+            }
         }
 
         if processed == 0 {
@@ -1188,7 +1316,7 @@ fn handle_cache_network_inbound(
     controls: &[CacheShardServerControl],
     network_event_tx: &SyncSender<CacheTransportInbound>,
     inbound: CacheTransportInbound,
-) {
+) -> Option<CacheTransportMessage> {
     let from_node = inbound.from_node;
     match inbound.message {
         CacheTransportMessage::CommandRequest {
@@ -1200,19 +1328,21 @@ fn handle_cache_network_inbound(
         } => {
             let response =
                 execute_remote_command_on_reactor(controls, target, placement_epoch, slot, frame);
+            let reply = CacheTransportMessage::CommandResponse {
+                request_id,
+                placement_epoch,
+                slot,
+                responder: target,
+                response,
+            };
             send_cache_transport_outbound(
                 sender,
                 CacheTransportOutbound {
                     to_node: from_node,
-                    message: CacheTransportMessage::CommandResponse {
-                        request_id,
-                        placement_epoch,
-                        slot,
-                        responder: target,
-                        response,
-                    },
+                    message: reply.clone(),
                 },
             );
+            return Some(reply);
         }
         CacheTransportMessage::TransferBatch {
             transfer_id,
@@ -1224,20 +1354,22 @@ fn handle_cache_network_inbound(
             let results =
                 import_remote_batch_on_reactor(controls, target, placement_epoch, batch.clone())
                     .unwrap_or_else(|| vec![CacheTransferImport::Conflict; batch.entries.len()]);
+            let reply = CacheTransportMessage::TransferAck {
+                transfer_id,
+                placement_epoch,
+                source,
+                target,
+                slot: batch.slot,
+                results,
+            };
             send_cache_transport_outbound(
                 sender,
                 CacheTransportOutbound {
                     to_node: from_node,
-                    message: CacheTransportMessage::TransferAck {
-                        transfer_id,
-                        placement_epoch,
-                        source,
-                        target,
-                        slot: batch.slot,
-                        results,
-                    },
+                    message: reply.clone(),
                 },
             );
+            return Some(reply);
         }
         message @ (CacheTransportMessage::CommandResponse { .. }
         | CacheTransportMessage::TransferAck { .. }) => {
@@ -1254,6 +1386,7 @@ fn handle_cache_network_inbound(
     }
 
     let _ = local_node_id;
+    None
 }
 
 fn reject_cache_network_inbound(
@@ -1261,6 +1394,64 @@ fn reject_cache_network_inbound(
     sender: &CacheServiceTransportSender,
     inbound: CacheTransportInbound,
     _error: super::cache_transport::CacheTransportValidationError,
+) -> Option<CacheTransportMessage> {
+    match inbound.message {
+        CacheTransportMessage::CommandRequest {
+            request_id,
+            placement_epoch,
+            slot,
+            target,
+            ..
+        } if target.node_id == local_node_id => {
+            let reply = CacheTransportMessage::CommandResponse {
+                request_id,
+                placement_epoch,
+                slot,
+                responder: target,
+                response: b"-TRYAGAIN cache topology changed\r\n".to_vec(),
+            };
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: reply.clone(),
+                },
+            );
+            return Some(reply);
+        }
+        CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch,
+            source,
+            target,
+            batch,
+        } if target.node_id == local_node_id => {
+            let reply = CacheTransportMessage::TransferAck {
+                transfer_id,
+                placement_epoch,
+                source,
+                target,
+                slot: batch.slot,
+                results: vec![CacheTransferImport::Conflict; batch.entries.len()],
+            };
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: reply.clone(),
+                },
+            );
+            return Some(reply);
+        }
+        _ => {}
+    }
+    None
+}
+
+fn reject_cache_network_id_reuse(
+    local_node_id: u64,
+    sender: &CacheServiceTransportSender,
+    inbound: CacheTransportInbound,
 ) {
     match inbound.message {
         CacheTransportMessage::CommandRequest {
@@ -1279,7 +1470,7 @@ fn reject_cache_network_inbound(
                         placement_epoch,
                         slot,
                         responder: target,
-                        response: b"-TRYAGAIN cache topology changed\r\n".to_vec(),
+                        response: b"-ERR cache request id reused with different payload\r\n".to_vec(),
                     },
                 },
             );
