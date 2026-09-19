@@ -31,6 +31,8 @@ const KIND_TRANSFER_ACK: u8 = 3;
 const KIND_SOURCE_REMAINING: u8 = 4;
 const KIND_CONVERGENCE: u8 = 5;
 const KIND_COMPLETED: u8 = 6;
+const KIND_COMMIT_INTENT: u8 = 7;
+const KIND_COMMIT_ABORTED: u8 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheMigrationKey {
@@ -65,6 +67,7 @@ pub struct CacheMigrationRecoveryState {
     pub transfers: HashMap<u64, CacheMigrationRecoveredTransfer>,
     pub source_remaining: Option<usize>,
     pub convergence: Option<CacheMigrationConvergenceEvidence>,
+    pub pending_commit_epoch: Option<u64>,
     pub completed_commit_epoch: Option<u64>,
 }
 
@@ -76,6 +79,7 @@ impl CacheMigrationRecoveryState {
             transfers: HashMap::new(),
             source_remaining: None,
             convergence: None,
+            pending_commit_epoch: None,
             completed_commit_epoch: None,
         }
     }
@@ -126,6 +130,7 @@ impl CacheMigrationRecoveryState {
     /// drained source.
     pub fn restart_reprobe_candidate(&self) -> bool {
         self.completed_commit_epoch.is_none()
+            && self.pending_commit_epoch.is_none()
             && self.source_remaining == Some(0)
             && self.all_sent_transfers_acked()
     }
@@ -430,6 +435,51 @@ impl CacheMigrationJournal {
         Ok(())
     }
 
+    pub fn record_commit_intent(
+        &mut self,
+        key: CacheMigrationKey,
+        commit_epoch: u64,
+    ) -> io::Result<()> {
+        let state = self.require_state(key)?;
+        if state.completed_commit_epoch == Some(commit_epoch)
+            || state.pending_commit_epoch == Some(commit_epoch)
+        {
+            return Ok(());
+        }
+        if state.pending_commit_epoch.is_some() {
+            return Err(invalid_data("different cache migration commit is already pending"));
+        }
+        let mut payload = Vec::with_capacity(38);
+        write_key(&mut payload, key);
+        write_u64(&mut payload, commit_epoch);
+        self.append_record(KIND_COMMIT_INTENT, &payload)?;
+        self.states
+            .get_mut(&key)
+            .expect("migration state disappeared")
+            .pending_commit_epoch = Some(commit_epoch);
+        Ok(())
+    }
+
+    pub fn record_commit_aborted(
+        &mut self,
+        key: CacheMigrationKey,
+        commit_epoch: u64,
+    ) -> io::Result<()> {
+        let state = self.require_state(key)?;
+        if state.pending_commit_epoch != Some(commit_epoch) {
+            return Err(invalid_data("cache migration commit abort does not match pending intent"));
+        }
+        let mut payload = Vec::with_capacity(38);
+        write_key(&mut payload, key);
+        write_u64(&mut payload, commit_epoch);
+        self.append_record(KIND_COMMIT_ABORTED, &payload)?;
+        self.states
+            .get_mut(&key)
+            .expect("migration state disappeared")
+            .pending_commit_epoch = None;
+        Ok(())
+    }
+
     pub fn record_completed(
         &mut self,
         key: CacheMigrationKey,
@@ -440,10 +490,12 @@ impl CacheMigrationJournal {
         write_key(&mut payload, key);
         write_u64(&mut payload, commit_epoch);
         self.append_record(KIND_COMPLETED, &payload)?;
-        self.states
+        let state = self
+            .states
             .get_mut(&key)
-            .expect("migration state disappeared")
-            .completed_commit_epoch = Some(commit_epoch);
+            .expect("migration state disappeared");
+        state.pending_commit_epoch = None;
+        state.completed_commit_epoch = Some(commit_epoch);
         Ok(())
     }
 
@@ -607,10 +659,44 @@ fn apply_record(
         KIND_COMPLETED => {
             let commit_epoch = reader.u64()?;
             reader.finish()?;
-            states
+            let state = states
                 .get_mut(&key)
-                .ok_or_else(|| invalid_data("completion precedes migration intent"))?
-                .completed_commit_epoch = Some(commit_epoch);
+                .ok_or_else(|| invalid_data("completion precedes migration intent"))?;
+            if state
+                .pending_commit_epoch
+                .is_some_and(|pending| pending != commit_epoch)
+            {
+                return Err(invalid_data("completion does not match pending commit intent"));
+            }
+            state.pending_commit_epoch = None;
+            state.completed_commit_epoch = Some(commit_epoch);
+        }
+        KIND_COMMIT_INTENT => {
+            let commit_epoch = reader.u64()?;
+            reader.finish()?;
+            let state = states
+                .get_mut(&key)
+                .ok_or_else(|| invalid_data("commit intent precedes migration intent"))?;
+            if state.completed_commit_epoch == Some(commit_epoch) {
+                // Idempotent replay after a compact/copy sequence.
+            } else if state.pending_commit_epoch.is_none()
+                || state.pending_commit_epoch == Some(commit_epoch)
+            {
+                state.pending_commit_epoch = Some(commit_epoch);
+            } else {
+                return Err(invalid_data("conflicting commit intents in migration journal"));
+            }
+        }
+        KIND_COMMIT_ABORTED => {
+            let commit_epoch = reader.u64()?;
+            reader.finish()?;
+            let state = states
+                .get_mut(&key)
+                .ok_or_else(|| invalid_data("commit abort precedes migration intent"))?;
+            if state.pending_commit_epoch != Some(commit_epoch) {
+                return Err(invalid_data("commit abort does not match pending intent"));
+            }
+            state.pending_commit_epoch = None;
         }
         other => {
             return Err(io::Error::new(
@@ -1005,6 +1091,31 @@ mod tests {
             .record_intent(migration, [0xa5; 16])
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pending_commit_intent_is_restart_ambiguous_until_completed_or_aborted() {
+        let path = temp_path("migration-commit-intent");
+        let migration = key();
+        {
+            let mut journal = CacheMigrationJournal::open(&path).unwrap();
+            journal.record_intent(migration, incarnation()).unwrap();
+            journal.record_source_remaining(migration, 0).unwrap();
+            journal.record_commit_intent(migration, 8).unwrap();
+        }
+
+        let mut journal = CacheMigrationJournal::open(&path).unwrap();
+        let state = journal.recovery_state(migration).unwrap();
+        assert_eq!(state.pending_commit_epoch, Some(8));
+        assert!(!state.restart_reprobe_candidate());
+
+        journal.record_commit_aborted(migration, 8).unwrap();
+        assert!(journal
+            .recovery_state(migration)
+            .unwrap()
+            .pending_commit_epoch
+            .is_none());
         fs::remove_file(path).unwrap();
     }
 
