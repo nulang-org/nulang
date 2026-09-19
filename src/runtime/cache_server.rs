@@ -1614,6 +1614,116 @@ mod tests {
     }
 
     #[test]
+    fn local_transfer_coordinator_moves_key_between_running_shards() {
+        let placement = CacheSlotMap::new_local(51, 2).unwrap();
+        let mut key = None;
+        for index in 0..10_000 {
+            let candidate = format!("transfer-live-{index}").into_bytes();
+            if placement.owner_for_key(&candidate).shard == 0 {
+                key = Some(candidate);
+                break;
+            }
+        }
+        let key = key.expect("key for source shard");
+        let slot = super::super::cache::redis_slot(&key);
+        let source = placement.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 51,
+            shard: 1,
+        };
+
+        let service = CacheServiceBuilder::new(51, placement.clone())
+            .with_shard(CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            ))
+            .with_shard(CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            ))
+            .build()
+            .unwrap();
+        let handle = service.start().unwrap();
+        let source_addr = handle.local_addrs()[0];
+        let target_addr = handle.local_addrs()[1];
+
+        // Seed the stable source through the real RESP listener.
+        let mut source_client = StdTcpStream::connect(source_addr).unwrap();
+        source_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut set = format!("*3\r\n$3\r\nSET\r\n\${}\r\n", key.len()).into_bytes();
+        set.extend_from_slice(&key);
+        set.extend_from_slice(b"\r\n$5\r\nvalue\r\n");
+        source_client.write_all(&set).unwrap();
+        assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
+
+        let mut migrating = placement;
+        migrating
+            .begin_migration(1, slot, source, target)
+            .unwrap();
+        handle.install_placement(migrating.clone()).unwrap();
+        wait_for_placement_epoch(&handle, 1);
+
+        let report = handle
+            .transfer_local_slot_batch(0, 1, slot, None, 8)
+            .unwrap();
+        assert_eq!(report.exported_entries, 1);
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.finalized_removed, 1);
+        assert_eq!(report.stale_source_versions, 0);
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(report.source_remaining, 0);
+        assert!(report.source_drained());
+        assert!(!report.restart_scan_required());
+
+        // The source no longer has the key, so migration routing now emits ASK.
+        let mut get = format!("*2\r\n$3\r\nGET\r\n\${}\r\n", key.len()).into_bytes();
+        get.extend_from_slice(&key);
+        get.extend_from_slice(b"\r\n");
+        source_client.write_all(&get).unwrap();
+        let expected_ask = format!("-ASK {} 127.0.0.1:{}\r\n", slot, target_addr.port());
+        assert_eq!(read_resp_line(&mut source_client), expected_ask.as_bytes());
+
+        // The importing target serves it only behind one-shot ASKING.
+        let mut target_client = StdTcpStream::connect(target_addr).unwrap();
+        target_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        target_client
+            .write_all(b"*1\r\n$6\r\nASKING\r\n")
+            .unwrap();
+        assert_eq!(read_resp_line(&mut target_client), b"+OK\r\n");
+        target_client.write_all(&get).unwrap();
+        let mut imported_value = [0u8; 11];
+        target_client.read_exact(&mut imported_value).unwrap();
+        assert_eq!(&imported_value, b"$5\r\nvalue\r\n");
+
+        // Commit stable ownership and verify the target now serves normally.
+        migrating
+            .commit_migration(2, slot, source, target)
+            .unwrap();
+        handle.install_placement(migrating).unwrap();
+        wait_for_placement_epoch(&handle, 2);
+        handle.clear_local_transfer_imports(1, slot).unwrap();
+
+        target_client.write_all(&get).unwrap();
+        let mut stable_value = [0u8; 11];
+        target_client.read_exact(&mut stable_value).unwrap();
+        assert_eq!(&stable_value, b"$5\r\nvalue\r\n");
+
+        source_client.write_all(&get).unwrap();
+        let expected_moved =
+            format!("-MOVED {} 127.0.0.1:{}\r\n", slot, target_addr.port());
+        assert_eq!(
+            read_resp_line(&mut source_client),
+            expected_moved.as_bytes()
+        );
+
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
     fn service_redirects_to_the_reserved_peer_endpoint() {
         let placement = CacheSlotMap::new_local(23, 2).unwrap();
         let mut key = None;
