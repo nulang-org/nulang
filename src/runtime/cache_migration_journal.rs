@@ -61,6 +61,7 @@ pub struct CacheMigrationRecoveredTransfer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheMigrationRecoveryState {
     pub key: CacheMigrationKey,
+    pub source_incarnation: [u8; 16],
     pub transfers: HashMap<u64, CacheMigrationRecoveredTransfer>,
     pub source_remaining: Option<usize>,
     pub convergence: Option<CacheMigrationConvergenceEvidence>,
@@ -68,9 +69,10 @@ pub struct CacheMigrationRecoveryState {
 }
 
 impl CacheMigrationRecoveryState {
-    fn new(key: CacheMigrationKey) -> Self {
+    fn new(key: CacheMigrationKey, source_incarnation: [u8; 16]) -> Self {
         Self {
             key,
+            source_incarnation,
             transfers: HashMap::new(),
             source_remaining: None,
             convergence: None,
@@ -267,14 +269,27 @@ impl CacheMigrationJournal {
         self.states.get(&key)
     }
 
-    pub fn record_intent(&mut self, key: CacheMigrationKey) -> io::Result<()> {
-        if self.states.contains_key(&key) {
-            return Ok(());
+    pub fn record_intent(
+        &mut self,
+        key: CacheMigrationKey,
+        source_incarnation: [u8; 16],
+    ) -> io::Result<()> {
+        if let Some(existing) = self.states.get(&key) {
+            if existing.source_incarnation == source_incarnation {
+                return Ok(());
+            }
+            return Err(invalid_data(
+                "cache migration source incarnation changed; ephemeral source continuity is unproven",
+            ));
         }
-        let mut payload = Vec::with_capacity(30);
+        let mut payload = Vec::with_capacity(46);
         write_key(&mut payload, key);
+        payload.extend_from_slice(&source_incarnation);
         self.append_record(KIND_INTENT, &payload)?;
-        self.states.insert(key, CacheMigrationRecoveryState::new(key));
+        self.states.insert(
+            key,
+            CacheMigrationRecoveryState::new(key, source_incarnation),
+        );
         Ok(())
     }
 
@@ -475,10 +490,25 @@ fn apply_record(
 
     match kind {
         KIND_INTENT => {
+            let source_incarnation: [u8; 16] = reader
+                .take(16)?
+                .try_into()
+                .expect("source incarnation slice");
             reader.finish()?;
-            states
-                .entry(key)
-                .or_insert_with(|| CacheMigrationRecoveryState::new(key));
+            match states.get(&key) {
+                Some(existing) if existing.source_incarnation == source_incarnation => {}
+                Some(_) => {
+                    return Err(invalid_data(
+                        "conflicting source incarnation in migration journal",
+                    ));
+                }
+                None => {
+                    states.insert(
+                        key,
+                        CacheMigrationRecoveryState::new(key, source_incarnation),
+                    );
+                }
+            }
         }
         KIND_TRANSFER_SENT => {
             let transfer_id = reader.u64()?;
@@ -809,6 +839,10 @@ mod tests {
         std::env::temp_dir().join(format!("nulang-{name}-{}-{nonce}.journal", std::process::id()))
     }
 
+    fn incarnation() -> [u8; 16] {
+        [0x5a; 16]
+    }
+
     fn key() -> CacheMigrationKey {
         CacheMigrationKey {
             started_epoch: 7,
@@ -866,7 +900,7 @@ mod tests {
         let migration = key();
         {
             let mut journal = CacheMigrationJournal::open(&path).unwrap();
-            journal.record_intent(migration).unwrap();
+            journal.record_intent(migration, incarnation()).unwrap();
             journal
                 .record_transfer_sent(migration, &request(migration, 41))
                 .unwrap();
@@ -918,7 +952,7 @@ mod tests {
         let migration = key();
         {
             let mut journal = CacheMigrationJournal::open(&path).unwrap();
-            journal.record_intent(migration).unwrap();
+            journal.record_intent(migration, incarnation()).unwrap();
         }
         {
             let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -945,7 +979,7 @@ mod tests {
         let migration = key();
         {
             let mut journal = CacheMigrationJournal::open(&path).unwrap();
-            journal.record_intent(migration).unwrap();
+            journal.record_intent(migration, incarnation()).unwrap();
         }
         let mut bytes = fs::read(&path).unwrap();
         let last = bytes.len() - 1;
@@ -958,11 +992,28 @@ mod tests {
     }
 
     #[test]
+    fn reopened_journal_rejects_different_source_incarnation() {
+        let path = temp_path("migration-incarnation");
+        let migration = key();
+        {
+            let mut journal = CacheMigrationJournal::open(&path).unwrap();
+            journal.record_intent(migration, incarnation()).unwrap();
+        }
+
+        let mut journal = CacheMigrationJournal::open(&path).unwrap();
+        let error = journal
+            .record_intent(migration, [0xa5; 16])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn unacked_transfer_blocks_restart_reprobe() {
         let path = temp_path("migration-unacked");
         let migration = key();
         let mut journal = CacheMigrationJournal::open(&path).unwrap();
-        journal.record_intent(migration).unwrap();
+        journal.record_intent(migration, incarnation()).unwrap();
         journal
             .record_transfer_sent(migration, &request(migration, 77))
             .unwrap();
