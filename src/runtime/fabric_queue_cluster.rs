@@ -611,6 +611,7 @@ impl Runtime {
                             || envelope.payload.as_slice() != payload
                             || envelope.priority != options.priority
                             || existing_delay != options.delay_ms
+                            || envelope.max_attempts != options.max_attempts
                         {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
