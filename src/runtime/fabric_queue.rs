@@ -101,6 +101,8 @@ pub enum FabricQueueJobStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FabricQueueDelivery {
     pub sequence: u64,
+    /// Queue ownership epoch that fenced this delivery. Local-only queues use 0.
+    pub queue_epoch: u64,
     pub job_id: String,
     pub name: String,
     pub payload: Vec<u8>,
@@ -187,6 +189,10 @@ enum QueueMutation {
         lease_token: u64,
         lease_until_ms: u64,
         deliveries: u32,
+        #[serde(default)]
+        queue_epoch: u64,
+        #[serde(default)]
+        operation_id: Option<String>,
     },
     Completed {
         sequence: u64,
@@ -267,6 +273,50 @@ pub(crate) fn encode_queue_envelope(
 
 pub(crate) fn decode_queue_envelope_bytes(bytes: &[u8]) -> io::Result<QueueEnvelope> {
     serde_json::from_slice(bytes).map_err(json_error)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FabricQueueLeaseMutation {
+    pub sequence: u64,
+    pub consumer: String,
+    pub lease_token: u64,
+    pub lease_until_ms: u64,
+    pub deliveries: u32,
+    pub queue_epoch: u64,
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FabricQueueLeasePlan {
+    pub mutation: FabricQueueLeaseMutation,
+    pub mutation_bytes: Vec<u8>,
+    pub delivery: FabricQueueDelivery,
+}
+
+pub(crate) fn decode_queue_lease_mutation(
+    bytes: &[u8],
+) -> io::Result<Option<FabricQueueLeaseMutation>> {
+    let event: QueueMutation = serde_json::from_slice(bytes).map_err(json_error)?;
+    match event {
+        QueueMutation::LeaseAcquired {
+            sequence,
+            consumer,
+            lease_token,
+            lease_until_ms,
+            deliveries,
+            queue_epoch,
+            operation_id,
+        } => Ok(Some(FabricQueueLeaseMutation {
+            sequence,
+            consumer,
+            lease_token,
+            lease_until_ms,
+            deliveries,
+            queue_epoch,
+            operation_id,
+        })),
+        _ => Ok(None),
+    }
 }
 
 
@@ -470,6 +520,8 @@ impl<'a> FabricQueueStore<'a> {
             lease_token,
             lease_until_ms,
             deliveries,
+            queue_epoch: 0,
+            operation_id: None,
         };
         let event_sequence = self.append_mutation(queue, &event)?;
         apply_mutation(&mut state, &event)?;
@@ -478,6 +530,7 @@ impl<'a> FabricQueueStore<'a> {
 
         Ok(Some(FabricQueueDelivery {
             sequence,
+            queue_epoch: 0,
             job_id: envelope.job_id.unwrap_or_else(|| sequence.to_string()),
             name: envelope.name,
             payload: envelope.payload,
@@ -1036,6 +1089,25 @@ impl<'a> FabricQueueStore<'a> {
         }
     }
 
+    fn read_committed_envelope(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+    ) -> io::Result<QueueEnvelope> {
+        let records = self
+            .streams
+            .read_committed(&queue_stream_name(queue), sequence, 1)?;
+        match records.first() {
+            Some(record) if record.sequence == sequence => decode_envelope(record),
+            _ => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue record {sequence} is not quorum committed"
+                ),
+            )),
+        }
+    }
+
     fn state_path(&self, queue: &str) -> PathBuf {
         self.streams
             .root()
@@ -1228,6 +1300,138 @@ impl Runtime {
         self.fabric_queue_store()?.committed_info(queue)
     }
 
+    pub(crate) fn fabric_queue_plan_committed_lease(
+        &mut self,
+        queue: &str,
+        consumer: &str,
+        operation_id: &str,
+        queue_epoch: u64,
+        now_ms: u64,
+    ) -> io::Result<Option<FabricQueueLeasePlan>> {
+        validate_queue_name(queue)?;
+        validate_consumer_name(consumer)?;
+        validate_operation_id(operation_id)?;
+        if queue_epoch == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replicated Fabric queue lease requires a non-zero queue epoch",
+            ));
+        }
+
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        let mut candidate: Option<(u64, i32)> = None;
+        for (&sequence, job) in &state.jobs {
+            if job.status != FabricQueueJobStatus::Waiting
+                || job.available_at_ms > now_ms
+                || job.deliveries >= state.config.max_attempts
+            {
+                continue;
+            }
+            match candidate {
+                None => candidate = Some((sequence, job.priority)),
+                Some((best_sequence, best_priority))
+                    if job.priority > best_priority
+                        || (job.priority == best_priority && sequence < best_sequence) =>
+                {
+                    candidate = Some((sequence, job.priority));
+                }
+                _ => {}
+            }
+        }
+
+        let Some((sequence, priority)) = candidate else {
+            return Ok(None);
+        };
+        let current = state.jobs.get(&sequence).expect("candidate must exist");
+        let deliveries = current.deliveries.saturating_add(1);
+        let lease_token = current.lease_token.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "Fabric queue lease token overflow")
+        })?;
+        let lease_until_ms = now_ms.saturating_add(state.config.visibility_timeout_ms);
+        let mutation = FabricQueueLeaseMutation {
+            sequence,
+            consumer: consumer.to_string(),
+            lease_token,
+            lease_until_ms,
+            deliveries,
+            queue_epoch,
+            operation_id: Some(operation_id.to_string()),
+        };
+        let mutation_bytes = serde_json::to_vec(&QueueMutation::LeaseAcquired {
+            sequence,
+            consumer: consumer.to_string(),
+            lease_token,
+            lease_until_ms,
+            deliveries,
+            queue_epoch,
+            operation_id: Some(operation_id.to_string()),
+        })
+        .map_err(json_error)?;
+        let envelope = store.read_committed_envelope(queue, sequence)?;
+        let delivery = FabricQueueDelivery {
+            sequence,
+            queue_epoch,
+            job_id: envelope.job_id.unwrap_or_else(|| sequence.to_string()),
+            name: envelope.name,
+            payload: envelope.payload,
+            priority,
+            deliveries,
+            lease_token,
+            lease_until_ms,
+        };
+        Ok(Some(FabricQueueLeasePlan {
+            mutation,
+            mutation_bytes,
+            delivery,
+        }))
+    }
+
+    pub(crate) fn fabric_queue_delivery_for_committed_lease(
+        &mut self,
+        queue: &str,
+        lease: &FabricQueueLeaseMutation,
+    ) -> io::Result<FabricQueueDelivery> {
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        let job = state.jobs.get(&lease.sequence).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "committed Fabric queue lease references missing job {}",
+                    lease.sequence
+                ),
+            )
+        })?;
+        if job.status != FabricQueueJobStatus::Active
+            || job.consumer.as_deref() != Some(lease.consumer.as_str())
+            || job.lease_token != lease.lease_token
+            || job.deliveries != lease.deliveries
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "committed Fabric queue state does not match lease operation for job {}",
+                    lease.sequence
+                ),
+            ));
+        }
+        let envelope = store.read_committed_envelope(queue, lease.sequence)?;
+        Ok(FabricQueueDelivery {
+            sequence: lease.sequence,
+            queue_epoch: lease.queue_epoch,
+            job_id: envelope
+                .job_id
+                .unwrap_or_else(|| lease.sequence.to_string()),
+            name: envelope.name,
+            payload: envelope.payload,
+            priority: job.priority,
+            deliveries: lease.deliveries,
+            lease_token: lease.lease_token,
+            lease_until_ms: lease.lease_until_ms,
+        })
+    }
+
     pub fn fabric_queue_info(&mut self, queue: &str) -> io::Result<FabricQueueInfo> {
         self.fabric_queue_local_store(queue)?.info(queue)
     }
@@ -1319,6 +1523,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
             lease_token,
             lease_until_ms,
             deliveries,
+            ..
         } => {
             let job = state.jobs.get_mut(sequence).ok_or_else(|| {
                 io::Error::new(
@@ -1470,11 +1675,21 @@ pub(crate) fn validate_queue_name(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_consumer_name(name: &str) -> io::Result<()> {
+pub(crate) fn validate_consumer_name(name: &str) -> io::Result<()> {
     if name.is_empty() || name.len() > 128 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Fabric queue consumer names must be 1..=128 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_operation_id(operation_id: &str) -> io::Result<()> {
+    if operation_id.is_empty() || operation_id.len() > 256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Fabric queue operation ids must be 1..=256 bytes",
         ));
     }
     Ok(())
