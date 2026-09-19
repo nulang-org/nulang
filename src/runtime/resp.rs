@@ -57,8 +57,7 @@ impl<'a> Iterator for RespArgs<'a> {
 
         // parse_command validates the complete frame first, so failure here
         // can only occur if RespArgs was constructed incorrectly.
-        let parsed = parse_bulk(&self.bytes[self.cursor..]).ok().flatten()?;
-        let (value, consumed) = parsed;
+        let (value, consumed) = parse_bulk(&self.bytes[self.cursor..]).ok().flatten()?;
         self.cursor += consumed;
         self.remaining -= 1;
         Some(value)
@@ -73,7 +72,7 @@ impl ExactSizeIterator for RespArgs<'_> {}
 
 /// Parse one RESP2 array-of-bulk-strings command.
 ///
-/// Ok(None) means the caller should read more bytes. On success the returned
+/// `Ok(None)` means the caller should read more bytes. On success the returned
 /// usize is the exact number of consumed bytes, allowing pipelined frames to
 /// remain in the socket buffer.
 pub fn parse_command(input: &[u8]) -> Result<Option<(RespCommand<'_>, usize)>, RespParseError> {
@@ -350,93 +349,5 @@ mod tests {
         out.clear();
         write_array_len(&mut out, 3);
         assert_eq!(out, b"*3\r\n");
-    }
-}
-);
-    write_u64_decimal(out, len as u64);
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&digits[..len]);
-    out.extend_from_slice(b"\r\n");
-}
-
-fn write_i64_decimal(out: &mut Vec<u8>, value: i64) {
-    if value < 0 {
-        out.push(b'-');
-    }
-    write_u64_decimal(out, value.unsigned_abs());
-}
-
-fn write_u64_decimal(out: &mut Vec<u8>, mut value: u64) {
-    let mut buf = [0u8; 20];
-    let mut cursor = buf.len();
-
-    if value == 0 {
-        out.push(b'0');
-        return;
-    }
-
-    while value != 0 {
-        cursor -= 1;
-        buf[cursor] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    out.extend_from_slice(&buf[cursor..]);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_get_without_argument_allocation() {
-        let input = b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
-        let (command, consumed) = parse_command(input).unwrap().unwrap();
-        assert_eq!(consumed, input.len());
-        assert_eq!(command.name(), b"GET");
-        assert_eq!(command.argc(), 1);
-        assert_eq!(command.args().collect::<Vec<_>>(), vec![b"foo".as_slice()]);
-    }
-
-    #[test]
-    fn parses_pipelined_command_boundary() {
-        let first = b"*1\r\n$4\r\nPING\r\n";
-        let mut input = first.to_vec();
-        input.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\nx\r\n");
-
-        let (command, consumed) = parse_command(&input).unwrap().unwrap();
-        assert_eq!(command.name(), b"PING");
-        assert_eq!(command.argc(), 0);
-        assert_eq!(consumed, first.len());
-    }
-
-    #[test]
-    fn incomplete_frame_requests_more_bytes() {
-        assert!(parse_command(b"*2\r\n$3\r\nGET\r\n$5\r\nhe")
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn rejects_non_bulk_command_arguments() {
-        assert_eq!(
-            parse_command(b"*2\r\n$3\r\nGET\r\n:1\r\n"),
-            Err(RespParseError::ExpectedBulkString)
-        );
-    }
-
-    #[test]
-    fn encodes_basic_responses_without_decimal_strings() {
-        let mut out = Vec::new();
-
-        write_bulk(&mut out, b"hello");
-        assert_eq!(out, b"$5\r\nhello\r\n");
-
-        out.clear();
-        write_integer(&mut out, 42);
-        assert_eq!(out, b":42\r\n");
-
-        out.clear();
-        write_integer(&mut out, i64::MIN);
-        assert_eq!(out, b":-9223372036854775808\r\n");
     }
 }
