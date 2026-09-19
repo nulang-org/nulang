@@ -522,30 +522,28 @@ mod tests {
 
     #[test]
     fn command_slot_distinguishes_keyed_unkeyed_and_cross_slot_commands() {
-        let (ping, _) = parse_command(b"*1\r\n$4\r\nPING\r\n")
-            .unwrap()
-            .unwrap();
+        let (ping, _) = parse_command(b"*1\r\n$4\r\nPING\r\n").unwrap().unwrap();
         assert_eq!(command_slot(ping), RespCommandSlot::Unkeyed);
 
         let (get, _) = parse_command(b"*2\r\n$3\r\nGET\r\n$5\r\na{42}\r\n")
             .unwrap()
             .unwrap();
-        assert_eq!(command_slot(get), RespCommandSlot::Slot(redis_slot(b"a{42}")));
+        assert_eq!(
+            command_slot(get),
+            RespCommandSlot::Slot(redis_slot(b"a{42}"))
+        );
 
-        let (mget, _) = parse_command(
-            b"*3\r\n$4\r\nMGET\r\n$5\r\na{42}\r\n$5\r\nb{42}\r\n",
-        )
-        .unwrap()
-        .unwrap();
+        let (mget, _) = parse_command(b"*3\r\n$4\r\nMGET\r\n$5\r\na{42}\r\n$5\r\nb{42}\r\n")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             command_slot(mget),
             RespCommandSlot::Slot(redis_slot(b"a{42}"))
         );
 
-        let (cross, _) =
-            parse_command(b"*3\r\n$4\r\nMGET\r\n$1\r\na\r\n$1\r\nb\r\n")
-                .unwrap()
-                .unwrap();
+        let (cross, _) = parse_command(b"*3\r\n$4\r\nMGET\r\n$1\r\na\r\n$1\r\nb\r\n")
+            .unwrap()
+            .unwrap();
         assert_eq!(command_slot(cross), RespCommandSlot::CrossSlot);
     }
 
