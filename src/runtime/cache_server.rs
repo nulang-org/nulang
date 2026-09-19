@@ -574,7 +574,7 @@ impl CacheShardServer {
             ));
         }
 
-        let mut poll = Poll::new()?;
+        let poll = Poll::new()?;
         poll.registry()
             .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)?;
 
