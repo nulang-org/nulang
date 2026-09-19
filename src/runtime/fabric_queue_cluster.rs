@@ -15,12 +15,16 @@ use std::io;
 use serde::{Deserialize, Serialize};
 
 use super::fabric_queue::{
-    queue_mutation_stream_name, queue_stream_name, validate_queue_name,
+    decode_queue_created_mutation, encode_queue_created_mutation,
+    queue_mutation_stream_name, queue_stream_name, validate_queue_name, FabricQueueConfig,
 };
 use super::fabric_stream::{
     FabricStreamReplicationPolicy, FABRIC_STREAM_INITIAL_EPOCH,
 };
-use super::{FabricStreamConfig, MessagePriority, NodeId, NodeStatus, Packet, Runtime};
+use super::{
+    FabricStreamConfig, FabricStreamReplicationStatus, MessagePriority, NodeId, NodeStatus,
+    Packet, Runtime,
+};
 
 const QUEUE_PLACEMENT_PREFIX: &str = "__queue_owner.";
 pub(crate) const FABRIC_QUEUE_POLICY_BEHAVIOR: &str = "__nulang_fabric_queue_policy_v1";
@@ -73,6 +77,14 @@ pub struct FabricQueuePolicySyncReport {
     pub acknowledgements: usize,
     pub required: usize,
     pub ready: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FabricQueueReplicatedCreateResult {
+    pub policy: FabricQueuePolicySyncReport,
+    pub mutation_sequence: Option<u64>,
+    pub replication: Option<FabricStreamReplicationStatus>,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +384,114 @@ impl Runtime {
         report.acknowledgements = status.acknowledgements;
         report.ready = status.ready;
         Ok(report)
+    }
+
+    /// Retry-safe replicated queue creation.
+    ///
+    /// The shared queue policy is synchronized first. Once every configured
+    /// replica has acknowledged that policy, QueueCreated is appended through
+    /// the existing Fabric stream quorum path. Repeated calls resume sequence 1
+    /// instead of appending duplicate creation records.
+    pub fn fabric_queue_create_replicated(
+        &mut self,
+        queue: &str,
+        config: FabricQueueConfig,
+        partition: u16,
+        replication_factor: usize,
+    ) -> io::Result<FabricQueueReplicatedCreateResult> {
+        let policy =
+            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        if !policy.ready {
+            return Ok(FabricQueueReplicatedCreateResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                created: false,
+            });
+        }
+
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let expected = encode_queue_created_mutation(&config)?;
+        let info = self.fabric_stream_info(&mutation_stream)?;
+
+        if info.last_sequence.is_some() {
+            let record = self
+                .fabric_stream_read(&mutation_stream, 1, 1)?
+                .into_iter()
+                .next()
+                .filter(|record| record.sequence == 1)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Fabric queue mutation stream is missing sequence 1",
+                    )
+                })?;
+            let existing = decode_queue_created_mutation(&record.payload)?;
+            if existing != config {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "Fabric queue {queue:?} already exists with different config"
+                    ),
+                ));
+            }
+
+            if info.committed_sequence >= 1 {
+                let replication =
+                    self.fabric_stream_replication_status(&mutation_stream, partition, 1)?;
+                return Ok(FabricQueueReplicatedCreateResult {
+                    policy,
+                    mutation_sequence: Some(1),
+                    replication: Some(replication),
+                    created: true,
+                });
+            }
+
+            // Reconstruct the durable pending ticket after a leader restart and
+            // re-dispatch sequence 1. Exact-sequence replica application is
+            // idempotent, so duplicate retries are safe.
+            self.fabric_stream_retry_pending(&mutation_stream, partition)?;
+            let replication =
+                self.fabric_stream_replication_status(&mutation_stream, partition, 1)
+                    .map_err(|error| {
+                        if error.kind() == io::ErrorKind::NotFound {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "uncommitted Fabric QueueCreated record has no recoverable replication intent",
+                            )
+                        } else {
+                            error
+                        }
+                    })?;
+            return Ok(FabricQueueReplicatedCreateResult {
+                policy,
+                mutation_sequence: Some(1),
+                replication: Some(replication),
+                created: replication.committed,
+            });
+        }
+
+        let appended = self.fabric_stream_replicated_append(
+            &mutation_stream,
+            partition,
+            replication_factor,
+            &expected,
+        )?;
+        if appended.sequence != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric QueueCreated must be mutation sequence 1, got {}",
+                    appended.sequence
+                ),
+            ));
+        }
+        Ok(FabricQueueReplicatedCreateResult {
+            policy,
+            mutation_sequence: Some(appended.sequence),
+            replication: Some(appended.status),
+            created: appended.status.committed,
+        })
     }
 
     pub fn fabric_queue_policy_sync_status(
