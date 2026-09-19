@@ -133,13 +133,13 @@ pub struct FabricQueueInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct QueueEnvelope {
-    name: String,
-    payload: Vec<u8>,
-    job_id: Option<String>,
-    priority: i32,
-    created_at_ms: u64,
-    available_at_ms: u64,
+pub(crate) struct QueueEnvelope {
+    pub(crate) name: String,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) job_id: Option<String>,
+    pub(crate) priority: i32,
+    pub(crate) created_at_ms: u64,
+    pub(crate) available_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +240,33 @@ pub(crate) fn decode_queue_created_mutation(
             "first Fabric queue mutation must be QueueCreated",
         )),
     }
+}
+
+pub(crate) fn encode_queue_envelope(
+    queue: &str,
+    name: &str,
+    payload: &[u8],
+    options: &FabricQueueAddOptions,
+    now_ms: u64,
+) -> io::Result<Vec<u8>> {
+    validate_queue_name(queue)?;
+    validate_job_name(name)?;
+    if let Some(job_id) = options.job_id.as_deref() {
+        validate_job_id(job_id)?;
+    }
+    serde_json::to_vec(&QueueEnvelope {
+        name: name.to_string(),
+        payload: payload.to_vec(),
+        job_id: options.job_id.clone(),
+        priority: options.priority,
+        created_at_ms: now_ms,
+        available_at_ms: now_ms.saturating_add(options.delay_ms),
+    })
+    .map_err(json_error)
+}
+
+pub(crate) fn decode_queue_envelope_bytes(bytes: &[u8]) -> io::Result<QueueEnvelope> {
+    serde_json::from_slice(bytes).map_err(json_error)
 }
 
 
@@ -353,15 +380,7 @@ impl<'a> FabricQueueStore<'a> {
         }
 
         let available_at_ms = now_ms.saturating_add(options.delay_ms);
-        let envelope = QueueEnvelope {
-            name: name.to_string(),
-            payload: payload.to_vec(),
-            job_id: options.job_id.clone(),
-            priority: options.priority,
-            created_at_ms: now_ms,
-            available_at_ms,
-        };
-        let bytes = serde_json::to_vec(&envelope).map_err(json_error)?;
+        let bytes = encode_queue_envelope(queue, name, payload, &options, now_ms)?;
         let sequence = self.streams.append(&queue_stream_name(queue), &bytes)?;
 
         state.jobs.insert(
