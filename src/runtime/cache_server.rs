@@ -1652,7 +1652,7 @@ mod tests {
         source_client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let mut set = format!("*3\r\n$3\r\nSET\r\n\${}\r\n", key.len()).into_bytes();
+        let mut set = format!("*3\r\n$3\r\nSET\r\n${}\r\n", key.len()).into_bytes();
         set.extend_from_slice(&key);
         set.extend_from_slice(b"\r\n$5\r\nvalue\r\n");
         source_client.write_all(&set).unwrap();
@@ -1678,7 +1678,7 @@ mod tests {
         assert!(!report.restart_scan_required());
 
         // The source no longer has the key, so migration routing now emits ASK.
-        let mut get = format!("*2\r\n$3\r\nGET\r\n\${}\r\n", key.len()).into_bytes();
+        let mut get = format!("*2\r\n$3\r\nGET\r\n${}\r\n", key.len()).into_bytes();
         get.extend_from_slice(&key);
         get.extend_from_slice(b"\r\n");
         source_client.write_all(&get).unwrap();
