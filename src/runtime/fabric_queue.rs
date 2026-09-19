@@ -441,10 +441,6 @@ pub(crate) fn decode_queue_operation(
 pub(crate) struct FabricQueueJobSnapshot {
     pub status: FabricQueueJobStatus,
     pub deliveries: u32,
-    pub lease_token: u64,
-    pub consumer: Option<String>,
-    pub available_at_ms: u64,
-    pub lease_until_ms: Option<u64>,
 }
 
 
@@ -1708,10 +1704,6 @@ impl Runtime {
         Ok(FabricQueueJobSnapshot {
             status: job.status,
             deliveries: job.deliveries,
-            lease_token: job.lease_token,
-            consumer: job.consumer.clone(),
-            available_at_ms: job.available_at_ms,
-            lease_until_ms: job.lease_until_ms,
         })
     }
 
