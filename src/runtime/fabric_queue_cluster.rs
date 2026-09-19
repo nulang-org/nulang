@@ -4047,6 +4047,231 @@ mod tests {
     }
 
     #[test]
+    fn replicated_reschedule_is_quorum_visible_and_retry_fenced() {
+        use crate::runtime::cluster_dst::DeterministicCluster;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let addrs = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39401),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39402),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39403),
+        ];
+        let mut cluster = DeterministicCluster::new(&addrs, 0x5253434844);
+        cluster.run_rounds(30);
+        assert!(cluster.active_views_converged());
+
+        let base = std::env::temp_dir().join(format!(
+            "nulang-fabric-queue-reschedule-rf3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for index in 0..3 {
+            cluster
+                .node_mut(index)
+                .fabric_stream_open(base.join(format!("node-{index}")))
+                .unwrap();
+        }
+
+        let placement = cluster
+            .node_mut(0)
+            .fabric_stream_placement(&queue_placement_key("scheduled"), 0, 3)
+            .unwrap();
+        let leader_index = (0..3)
+            .find(|&index| cluster.id(index) == placement.leader)
+            .unwrap();
+        let config = FabricQueueConfig::default();
+
+        let first = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("scheduled", config.clone(), 0, 3)
+            .unwrap();
+        assert!(!first.policy.ready);
+        cluster.run_rounds(8);
+
+        let pending_create = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("scheduled", config.clone(), 0, 3)
+            .unwrap();
+        assert_eq!(pending_create.mutation_sequence, Some(1));
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_create_replicated("scheduled", config, 0, 3)
+                .unwrap()
+                .created
+        );
+
+        let options = FabricQueueAddOptions {
+            job_id: Some("job-1".to_string()),
+            priority: 0,
+            delay_ms: 0,
+            max_attempts: Some(3),
+        };
+        let pending_add = cluster
+            .node_mut(leader_index)
+            .fabric_queue_add_replicated(
+                "scheduled",
+                "work",
+                b"payload",
+                options.clone(),
+                0,
+                3,
+                100,
+            )
+            .unwrap();
+        assert!(!pending_add.enqueued);
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_add_replicated(
+                    "scheduled",
+                    "work",
+                    b"payload",
+                    options,
+                    0,
+                    3,
+                    100,
+                )
+                .unwrap()
+                .enqueued
+        );
+
+        let pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reschedule_replicated(
+                "scheduled",
+                "job-1",
+                "delay-1",
+                1_000,
+                0,
+                3,
+            )
+            .unwrap();
+        assert_eq!(pending.mutation_sequence, Some(2));
+        assert!(!pending.updated);
+        assert_eq!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_job_replicated("scheduled", "job-1")
+                .unwrap()
+                .unwrap()
+                .available_at_ms,
+            100
+        );
+
+        let retry = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reschedule_replicated(
+                "scheduled",
+                "job-1",
+                "delay-1",
+                1_000,
+                0,
+                3,
+            )
+            .unwrap();
+        assert_eq!(retry.mutation_sequence, Some(2));
+        assert!(retry.resumed);
+        assert!(!retry.updated);
+
+        let conflict = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reschedule_replicated(
+                "scheduled",
+                "job-1",
+                "delay-1",
+                2_000,
+                0,
+                3,
+            )
+            .unwrap_err();
+        assert_eq!(conflict.kind(), io::ErrorKind::InvalidData);
+
+        cluster.run_rounds(12);
+        let committed = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reschedule_replicated(
+                "scheduled",
+                "job-1",
+                "delay-1",
+                1_000,
+                0,
+                3,
+            )
+            .unwrap();
+        assert!(committed.updated);
+        assert!(committed.resumed);
+        for index in 0..3 {
+            assert_eq!(
+                cluster
+                    .node_mut(index)
+                    .fabric_queue_job_replicated("scheduled", "job-1")
+                    .unwrap()
+                    .unwrap()
+                    .available_at_ms,
+                1_000
+            );
+        }
+
+        let promote = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reschedule_replicated(
+                "scheduled",
+                "job-1",
+                "promote-1",
+                150,
+                0,
+                3,
+            )
+            .unwrap();
+        assert_eq!(promote.mutation_sequence, Some(3));
+        assert!(!promote.updated);
+        assert_eq!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_job_replicated("scheduled", "job-1")
+                .unwrap()
+                .unwrap()
+                .available_at_ms,
+            1_000
+        );
+
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_reschedule_replicated(
+                    "scheduled",
+                    "job-1",
+                    "promote-1",
+                    150,
+                    0,
+                    3,
+                )
+                .unwrap()
+                .updated
+        );
+        for index in 0..3 {
+            assert_eq!(
+                cluster
+                    .node_mut(index)
+                    .fabric_queue_job_replicated("scheduled", "job-1")
+                    .unwrap()
+                    .unwrap()
+                    .available_at_ms,
+                150
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn installed_policy_request_must_match_partition_and_replication_factor() {
         let policy = sample_policy();
         assert!(validate_requested_policy(&policy, 0, 3).is_ok());
