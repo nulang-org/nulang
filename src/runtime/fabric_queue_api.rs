@@ -259,6 +259,16 @@ enum QueueApiRequest {
         partition: u16,
         replication_factor: usize,
     },
+    Requeue {
+        queue: String,
+        job_id: String,
+        operation_id: String,
+        expected_status: String,
+        available_at_ms: u64,
+        reset_deliveries: bool,
+        partition: u16,
+        replication_factor: usize,
+    },
     Info {
         queue: String,
     },
@@ -569,6 +579,44 @@ fn dispatch_request(runtime: &mut Runtime, request: QueueApiRequest) -> io::Resu
                 "committed": result.replication.map(|status| status.committed).unwrap_or(false),
                 "sequence": result.sequence,
                 "availableAtMs": result.available_at_ms,
+                "updated": result.updated,
+                "resumed": result.resumed
+            }))
+        }
+        QueueApiRequest::Requeue {
+            queue,
+            job_id,
+            operation_id,
+            expected_status,
+            available_at_ms,
+            reset_deliveries,
+            partition,
+            replication_factor,
+        } => {
+            let expected_status = match expected_status.as_str() {
+                "completed" => FabricQueueJobStatus::Completed,
+                "failed" => FabricQueueJobStatus::Failed,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "queue API requeue expected_status must be completed or failed",
+                    ))
+                }
+            };
+            let result = runtime.fabric_queue_requeue_replicated(
+                &queue,
+                &job_id,
+                &operation_id,
+                expected_status,
+                available_at_ms,
+                reset_deliveries,
+                partition,
+                replication_factor,
+            )?;
+            Ok(json!({
+                "mutationSequence": result.mutation_sequence,
+                "committed": result.replication.map(|status| status.committed).unwrap_or(false),
+                "sequence": result.sequence,
                 "updated": result.updated,
                 "resumed": result.resumed
             }))
