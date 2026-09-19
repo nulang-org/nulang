@@ -126,6 +126,13 @@ export interface NulangQueueClient {
   getCounts(queue: string): Promise<NulangQueueCounts>;
   getCountsPerPriority?(queue: string, priorities: number[]): Promise<number[]>;
 
+  setQueueMeta(
+    queue: string,
+    values: Record<string, string | number>,
+  ): Promise<number>;
+  getQueueMeta(queue: string): Promise<Record<string, string>>;
+  removeQueueMetaFields(queue: string, fields: string[]): Promise<number>;
+
   waitForJob(
     queue: string,
     blockTimeoutMs: number,
