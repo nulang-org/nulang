@@ -203,16 +203,93 @@ pub fn write_error(out: &mut Vec<u8>, value: &[u8]) {
 
 pub fn write_integer(out: &mut Vec<u8>, value: i64) {
     out.push(b':');
-    out.extend_from_slice(value.to_string().as_bytes());
+    write_i64_decimal(out, value);
     out.extend_from_slice(b"\r\n");
 }
 
 pub fn write_bulk(out: &mut Vec<u8>, value: &[u8]) {
-    out.push(b'$');
-    out.extend_from_slice(value.len().to_string().as_bytes());
+    out.push(b'
+
+pub fn write_null_bulk(out: &mut Vec<u8>) {
+    out.extend_from_slice(b"$-1\r\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_get_without_argument_allocation() {
+        let input = b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
+        let (command, consumed) = parse_command(input).unwrap().unwrap();
+        assert_eq!(consumed, input.len());
+        assert_eq!(command.name(), b"GET");
+        assert_eq!(command.argc(), 1);
+        assert_eq!(command.args().collect::<Vec<_>>(), vec![b"foo".as_slice()]);
+    }
+
+    #[test]
+    fn parses_pipelined_command_boundary() {
+        let first = b"*1\r\n$4\r\nPING\r\n";
+        let mut input = first.to_vec();
+        input.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\nx\r\n");
+        let (command, consumed) = parse_command(&input).unwrap().unwrap();
+        assert_eq!(command.name(), b"PING");
+        assert_eq!(consumed, first.len());
+    }
+
+    #[test]
+    fn incomplete_frame_requests_more_bytes() {
+        assert_eq!(parse_command(b"*2\r\n$3\r\nGET\r\n$5\r\nhe").unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_non_bulk_command_arguments() {
+        assert_eq!(
+            parse_command(b"*2\r\n$3\r\nGET\r\n:1\r\n"),
+            Err(RespParseError::ExpectedBulkString)
+        );
+    }
+
+    #[test]
+    fn encodes_basic_responses() {
+        let mut out = Vec::new();
+        write_bulk(&mut out, b"hello");
+        assert_eq!(out, b"$5\r\nhello\r\n");
+        out.clear();
+        write_integer(&mut out, 42);
+        assert_eq!(out, b":42\r\n");
+    }
+}
+);
+    write_u64_decimal(out, value.len() as u64);
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(value);
     out.extend_from_slice(b"\r\n");
+}
+
+fn write_i64_decimal(out: &mut Vec<u8>, value: i64) {
+    if value < 0 {
+        out.push(b'-');
+    }
+    write_u64_decimal(out, value.unsigned_abs());
+}
+
+fn write_u64_decimal(out: &mut Vec<u8>, mut value: u64) {
+    let mut buf = [0u8; 20];
+    let mut cursor = buf.len();
+
+    if value == 0 {
+        out.push(b'0');
+        return;
+    }
+
+    while value != 0 {
+        cursor -= 1;
+        buf[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    out.extend_from_slice(&buf[cursor..]);
 }
 
 pub fn write_null_bulk(out: &mut Vec<u8>) {
