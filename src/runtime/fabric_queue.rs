@@ -644,25 +644,16 @@ impl<'a> FabricQueueStore<'a> {
     pub fn info_at(&mut self, queue: &str, now_ms: u64) -> io::Result<FabricQueueInfo> {
         self.reap_expired_at(queue, now_ms)?;
         let state = self.load_state(queue)?;
-        let mut info = FabricQueueInfo {
-            name: queue.to_string(),
-            waiting: 0,
-            active: 0,
-            completed: 0,
-            failed: 0,
-            dead_lettered: 0,
-            total: state.jobs.len(),
-        };
-        for job in state.jobs.values() {
-            match job.status {
-                FabricQueueJobStatus::Waiting => info.waiting += 1,
-                FabricQueueJobStatus::Active => info.active += 1,
-                FabricQueueJobStatus::Completed => info.completed += 1,
-                FabricQueueJobStatus::Failed => info.failed += 1,
-                FabricQueueJobStatus::DeadLettered => info.dead_lettered += 1,
-            }
-        }
-        Ok(info)
+        Ok(queue_info_from_state(queue, &state))
+    }
+
+    /// Reconstruct an immutable queue view using only quorum-committed stream
+    /// prefixes. This deliberately ignores queue_state.json and does not
+    /// perform local lease expiry, because either would allow a replica to
+    /// expose state that has not passed the replicated mutation boundary.
+    pub(crate) fn committed_info(&mut self, queue: &str) -> io::Result<FabricQueueInfo> {
+        let state = self.load_committed_state(queue)?;
+        Ok(queue_info_from_state(queue, &state))
     }
 
     fn ensure_stream(&mut self, name: &str) -> io::Result<()> {
@@ -674,6 +665,126 @@ impl<'a> FabricQueueStore<'a> {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    fn load_committed_state(&mut self, queue: &str) -> io::Result<QueueStateFile> {
+        validate_queue_name(queue)?;
+        let payload_stream = queue_stream_name(queue);
+        let mutation_stream = queue_mutation_stream_name(queue);
+        self.streams.stream_info(&payload_stream)?;
+        self.streams.stream_info(&mutation_stream)?;
+
+        let first = self.streams.read_committed(&mutation_stream, 1, 1)?;
+        let first = first.first().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue {queue:?} is not visible because QueueCreated is not quorum committed"
+                ),
+            )
+        })?;
+        if first.sequence != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "committed Fabric queue mutation prefix does not start at sequence 1",
+            ));
+        }
+        let config = decode_queue_created_mutation(&first.payload)?;
+        let mut state = QueueStateFile::new(config);
+        state.event_cursor = 1;
+
+        self.reconcile_committed_payloads(queue, &mut state)?;
+        self.replay_committed_mutations(queue, &mut state)?;
+        Ok(state)
+    }
+
+    fn reconcile_committed_payloads(
+        &mut self,
+        queue: &str,
+        state: &mut QueueStateFile,
+    ) -> io::Result<()> {
+        let stream = queue_stream_name(queue);
+        let mut next = 1u64;
+
+        loop {
+            let records = self.streams.read_committed(&stream, next, RECONCILE_BATCH)?;
+            if records.is_empty() {
+                break;
+            }
+            for record in &records {
+                if record.sequence != next {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "committed Fabric queue payload prefix has a gap: expected {next}, found {}",
+                            record.sequence
+                        ),
+                    ));
+                }
+                let envelope = decode_envelope(record)?;
+                state.jobs.insert(
+                    record.sequence,
+                    QueueJobState {
+                        job_id: envelope.job_id,
+                        available_at_ms: envelope.available_at_ms,
+                        priority: envelope.priority,
+                        deliveries: 0,
+                        lease_token: 0,
+                        status: FabricQueueJobStatus::Waiting,
+                        consumer: None,
+                        lease_until_ms: None,
+                        last_error: None,
+                    },
+                );
+                next = next.saturating_add(1);
+            }
+            if records.len() < RECONCILE_BATCH {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_committed_mutations(
+        &mut self,
+        queue: &str,
+        state: &mut QueueStateFile,
+    ) -> io::Result<()> {
+        let stream = queue_mutation_stream_name(queue);
+        let mut next = 2u64;
+
+        loop {
+            let records = self.streams.read_committed(&stream, next, RECONCILE_BATCH)?;
+            if records.is_empty() {
+                break;
+            }
+            for record in &records {
+                if record.sequence != next {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "committed Fabric queue mutation prefix has a gap: expected {next}, found {}",
+                            record.sequence
+                        ),
+                    ));
+                }
+                let event: QueueMutation =
+                    serde_json::from_slice(&record.payload).map_err(json_error)?;
+                if matches!(event, QueueMutation::QueueCreated { .. }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Fabric queue mutation log contains duplicate QueueCreated event",
+                    ));
+                }
+                apply_mutation(state, &event)?;
+                state.event_cursor = record.sequence;
+                next = next.saturating_add(1);
+            }
+            if records.len() < RECONCILE_BATCH {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn load_state(&mut self, queue: &str) -> io::Result<QueueStateFile> {
@@ -1083,6 +1194,21 @@ impl Runtime {
             .reap_expired_at(queue, now_ms)
     }
 
+    /// Inspect a replicated queue using only quorum-committed payload and
+    /// mutation prefixes. Uncommitted local tails are never decoded or exposed.
+    pub fn fabric_queue_info_replicated(
+        &mut self,
+        queue: &str,
+    ) -> io::Result<FabricQueueInfo> {
+        if !self.fabric_queue_has_replication_policy(queue)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Fabric queue {queue:?} does not have a replication policy"),
+            ));
+        }
+        self.fabric_queue_store()?.committed_info(queue)
+    }
+
     pub fn fabric_queue_info(&mut self, queue: &str) -> io::Result<FabricQueueInfo> {
         self.fabric_queue_local_store(queue)?.info(queue)
     }
@@ -1094,6 +1220,28 @@ impl Runtime {
     ) -> io::Result<FabricQueueInfo> {
         self.fabric_queue_local_store(queue)?.info_at(queue, now_ms)
     }
+}
+
+fn queue_info_from_state(queue: &str, state: &QueueStateFile) -> FabricQueueInfo {
+    let mut info = FabricQueueInfo {
+        name: queue.to_string(),
+        waiting: 0,
+        active: 0,
+        completed: 0,
+        failed: 0,
+        dead_lettered: 0,
+        total: state.jobs.len(),
+    };
+    for job in state.jobs.values() {
+        match job.status {
+            FabricQueueJobStatus::Waiting => info.waiting += 1,
+            FabricQueueJobStatus::Active => info.active += 1,
+            FabricQueueJobStatus::Completed => info.completed += 1,
+            FabricQueueJobStatus::Failed => info.failed += 1,
+            FabricQueueJobStatus::DeadLettered => info.dead_lettered += 1,
+        }
+    }
+    info
 }
 
 fn validate_active_job(
