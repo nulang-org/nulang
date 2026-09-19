@@ -38,14 +38,16 @@ pub use distributed_context::{
     DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot, FabricPublishReport,
 };
 pub use fabric_queue::{
-    FabricQueueAddOptions, FabricQueueAddResult, FabricQueueConfig, FabricQueueDelivery,
-    FabricQueueInfo, FabricQueueJobStatus, FabricQueueNackResult, FabricQueueStore,
+    FabricQueueAddOptions, FabricQueueAddResult, FabricQueueConfig, FabricQueueConsumerGroupConfig,
+    FabricQueueConsumerGroupInfo, FabricQueueDelivery, FabricQueueInfo, FabricQueueJobStatus,
+    FabricQueueNackResult, FabricQueueStore,
 };
 pub use fabric_queue_cluster::{
     FabricQueuePlacement, FabricQueuePolicySyncReport, FabricQueueReplicatedAckResult,
     FabricQueueReplicatedAcquireResult, FabricQueueReplicatedAddResult,
-    FabricQueueReplicatedCreateResult, FabricQueueReplicatedNackResult,
-    FabricQueueReplicatedReapResult, FabricQueueReplicatedRenewResult,
+    FabricQueueReplicatedCreateResult, FabricQueueReplicatedGroupConfigResult,
+    FabricQueueReplicatedNackResult, FabricQueueReplicatedReapResult,
+    FabricQueueReplicatedRenewResult,
 };
 pub use fabric_stream::{
     FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
