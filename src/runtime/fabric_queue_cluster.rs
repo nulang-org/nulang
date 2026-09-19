@@ -15,10 +15,12 @@ use std::io;
 use serde::{Deserialize, Serialize};
 
 use super::fabric_queue::{
-    decode_queue_created_mutation, decode_queue_envelope_bytes, decode_queue_lease_mutation,
-    decode_queue_operation, encode_queue_created_mutation, encode_queue_envelope,
-    queue_mutation_stream_name, queue_stream_name, validate_consumer_name, validate_operation_id,
-    validate_queue_name, FabricQueueAddOptions, FabricQueueConfig, FabricQueueDelivery,
+    decode_queue_consumer_group_config, decode_queue_created_mutation,
+    decode_queue_envelope_bytes, decode_queue_lease_mutation, decode_queue_operation,
+    encode_queue_created_mutation, encode_queue_envelope, queue_mutation_stream_name,
+    queue_stream_name, validate_consumer_group_name, validate_consumer_name,
+    validate_operation_id, validate_queue_name, FabricQueueAddOptions, FabricQueueConfig,
+    FabricQueueConsumerGroupConfig, FabricQueueConsumerGroupInfo, FabricQueueDelivery,
     FabricQueueNackResult, FabricQueueOperation, FabricQueueOperationKind,
 };
 use super::fabric_stream::{FabricStreamReplicationPolicy, FABRIC_STREAM_INITIAL_EPOCH};
@@ -102,6 +104,15 @@ pub struct FabricQueueReplicatedAcquireResult {
     pub mutation_sequence: Option<u64>,
     pub replication: Option<FabricStreamReplicationStatus>,
     pub delivery: Option<FabricQueueDelivery>,
+    pub resumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FabricQueueReplicatedGroupConfigResult {
+    pub policy: FabricQueuePolicySyncReport,
+    pub mutation_sequence: Option<u64>,
+    pub replication: Option<FabricStreamReplicationStatus>,
+    pub configured: bool,
     pub resumed: bool,
 }
 
@@ -641,6 +652,142 @@ impl Runtime {
         })
     }
 
+    /// Configure an immutable durable worker concurrency domain.
+    ///
+    /// This is a work-queue concurrency cap, not a fan-out subscription group.
+    /// Repeating the same configuration resumes or reuses the original durable
+    /// metadata mutation; changing max_concurrency requires an explicit future
+    /// reconfiguration primitive rather than silently rewriting history.
+    pub fn fabric_queue_configure_consumer_group_replicated(
+        &mut self,
+        queue: &str,
+        group: &str,
+        max_concurrency: usize,
+        partition: u16,
+        replication_factor: usize,
+    ) -> io::Result<FabricQueueReplicatedGroupConfigResult> {
+        let config = FabricQueueConsumerGroupConfig::new(group, max_concurrency)?;
+        let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        if !policy.ready {
+            return Ok(FabricQueueReplicatedGroupConfigResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                configured: false,
+                resumed: false,
+            });
+        }
+        self.fabric_queue_require_committed_creation(queue)?;
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let info = self.fabric_stream_info(&mutation_stream)?;
+
+        let mut next = 2u64;
+        let mut found = None;
+        loop {
+            let records = self.fabric_stream_read(&mutation_stream, next, 1024)?;
+            if records.is_empty() {
+                break;
+            }
+            for record in &records {
+                if let Some(existing) = decode_queue_consumer_group_config(&record.payload)? {
+                    if existing.name == group {
+                        if found.is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "Fabric queue {queue:?} contains duplicate consumer-group configuration for {group:?}"
+                                ),
+                            ));
+                        }
+                        if existing != config {
+                            return Err(io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                format!(
+                                    "Fabric queue consumer group {group:?} is already configured with max_concurrency {}",
+                                    existing.max_concurrency
+                                ),
+                            ));
+                        }
+                        found = Some(record.sequence);
+                    }
+                }
+                next = record.sequence.saturating_add(1);
+            }
+            if records.len() < 1024 {
+                break;
+            }
+        }
+
+        if let Some(sequence) = found {
+            if sequence > info.committed_sequence {
+                self.fabric_stream_retry_pending(&mutation_stream, partition)?;
+            }
+            let replication = self.fabric_stream_replication_status(
+                &mutation_stream,
+                partition,
+                sequence,
+            )
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "uncommitted Fabric queue consumer-group configuration {sequence} has no recoverable replication intent"
+                        ),
+                    )
+                } else {
+                    error
+                }
+            })?;
+            return Ok(FabricQueueReplicatedGroupConfigResult {
+                policy,
+                mutation_sequence: Some(sequence),
+                replication: Some(replication),
+                configured: replication.committed,
+                resumed: true,
+            });
+        }
+
+        if info.last_sequence.unwrap_or(0) > info.committed_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue {queue:?} has an uncommitted metadata mutation; retry it before configuring consumer group {group:?}"
+                ),
+            ));
+        }
+
+        let bytes = self.fabric_queue_encode_consumer_group_config(queue, &config)?;
+        let appended = self.fabric_stream_replicated_append(
+            &mutation_stream,
+            partition,
+            replication_factor,
+            &bytes,
+        )?;
+        Ok(FabricQueueReplicatedGroupConfigResult {
+            policy,
+            mutation_sequence: Some(appended.sequence),
+            replication: Some(appended.status),
+            configured: appended.status.committed,
+            resumed: false,
+        })
+    }
+
+    pub fn fabric_queue_consumer_group_info_replicated(
+        &mut self,
+        queue: &str,
+        group: &str,
+    ) -> io::Result<FabricQueueConsumerGroupInfo> {
+        self.fabric_queue_replication_placement(queue)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("Fabric queue {queue:?} does not have a replication policy"),
+                )
+            })?;
+        self.fabric_queue_committed_consumer_group_info(queue, group)
+    }
+
     fn fabric_queue_find_operation(
         &mut self,
         mutation_stream: &str,
@@ -742,6 +889,49 @@ impl Runtime {
         replication_factor: usize,
         now_ms: u64,
     ) -> io::Result<FabricQueueReplicatedAcquireResult> {
+        self.fabric_queue_acquire_replicated_inner(
+            queue,
+            consumer,
+            consumer_group,
+            operation_id,
+            partition,
+            replication_factor,
+            now_ms,
+        )
+    }
+
+    pub fn fabric_queue_acquire_consumer_group_replicated(
+        &mut self,
+        queue: &str,
+        group: &str,
+        consumer: &str,
+        operation_id: &str,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAcquireResult> {
+        validate_consumer_group_name(group)?;
+        self.fabric_queue_acquire_replicated_inner(
+            queue,
+            consumer,
+            Some(group),
+            operation_id,
+            partition,
+            replication_factor,
+            now_ms,
+        )
+    }
+
+    fn fabric_queue_acquire_replicated_inner(
+        &mut self,
+        queue: &str,
+        consumer: &str,
+        consumer_group: Option<&str>,
+        operation_id: &str,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAcquireResult> {
         validate_consumer_name(consumer)?;
         if operation_id.is_empty() || operation_id.len() > 256 {
             return Err(io::Error::new(
@@ -791,7 +981,10 @@ impl Runtime {
                                 ),
                             ));
                         }
-                        if lease.consumer != consumer || lease.queue_epoch != placement.epoch {
+                        if lease.consumer != consumer
+                            || lease.consumer_group.as_deref() != consumer_group
+                            || lease.queue_epoch != placement.epoch
+                        {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "Fabric queue acquire operation id was reused with different fencing inputs",
