@@ -486,7 +486,10 @@ impl CacheShardServer {
         }
     }
 
-    fn process_input(&mut self, connection: &mut CacheConnection) -> Result<(), CachePipelineError> {
+    fn process_input(
+        &mut self,
+        connection: &mut CacheConnection,
+    ) -> Result<(), CachePipelineError> {
         loop {
             if connection.input_start == connection.input.len() {
                 connection.compact_input();
@@ -689,9 +692,7 @@ mod tests {
         client.write_all(&request).unwrap();
 
         for _ in 0..8 {
-            server
-                .poll_once(Some(Duration::from_millis(10)))
-                .unwrap();
+            server.poll_once(Some(Duration::from_millis(10))).unwrap();
         }
 
         let mut response = [0u8; 16];
@@ -715,14 +716,10 @@ mod tests {
     fn idle_reactor_purges_expired_values() {
         let mut server = build_server();
         let now = server.clock.now_ms();
-        server
-            .store_mut()
-            .set_bytes(b"ttl", b"value", Some(1), now);
+        server.store_mut().set_bytes(b"ttl", b"value", Some(1), now);
 
         std::thread::sleep(Duration::from_millis(3));
-        server
-            .poll_once(Some(Duration::from_millis(1)))
-            .unwrap();
+        server.poll_once(Some(Duration::from_millis(1))).unwrap();
 
         let now = server.clock.now_ms();
         assert!(server.store_mut().get(b"ttl", now).is_none());
@@ -743,6 +740,9 @@ mod tests {
             CacheServerClock::new(),
         );
 
-        assert!(matches!(result, Err(CacheServerError::RedirectModeRequired)));
+        assert!(matches!(
+            result,
+            Err(CacheServerError::RedirectModeRequired)
+        ));
     }
 }
