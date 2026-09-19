@@ -236,7 +236,7 @@ fn execute_expire(
         };
         store.expire_ms(key, ttl_ms, now_ms)
     };
-    write_integer(out, i64::from(changed));
+    write_integer(out, if changed { 1 } else { 0 });
 }
 
 fn execute_ttl(
