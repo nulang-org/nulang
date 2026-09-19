@@ -8,6 +8,7 @@ pub mod interruption;
 pub mod lease;
 pub mod provider;
 pub mod providers;
+pub mod state;
 pub mod telemetry;
 pub mod topology;
 
