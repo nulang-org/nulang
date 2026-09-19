@@ -295,6 +295,15 @@ impl CacheServiceBuilder {
             }
         }
 
+        // Migration targets are not stable owners yet, so they do not appear
+        // in slot_ranges(). They still must be routable before a source can
+        // safely emit ASK.
+        for (_, migration) in self.placement.migrations() {
+            if endpoints.get(migration.target).is_none() {
+                return Err(CacheServiceError::MissingEndpoint(migration.target));
+            }
+        }
+
         let clock = CacheServerClock::new();
         let mut servers = Vec::with_capacity(self.shards.len());
         let mut local_addrs = Vec::with_capacity(self.shards.len());
@@ -1035,6 +1044,31 @@ mod tests {
                 service.local_addrs()[shard as usize].port()
             );
         }
+    }
+
+
+    #[test]
+    fn service_builder_rejects_unadvertised_migration_target() {
+        let mut placement = CacheSlotMap::new_local(31, 1).unwrap();
+        let slot = 42;
+        let source = placement.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 99,
+            shard: 0,
+        };
+        placement.begin_migration(1, slot, source, target).unwrap();
+
+        let result = CacheServiceBuilder::new(31, placement)
+            .with_shard(CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            ))
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CacheServiceError::MissingEndpoint(owner)) if owner == target
+        ));
     }
 
     #[test]
