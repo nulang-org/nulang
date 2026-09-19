@@ -134,9 +134,7 @@ fn parse_bulk(input: &[u8]) -> Result<Option<(&[u8], usize)>, RespParseError> {
     let end = header
         .checked_add(len)
         .ok_or(RespParseError::InvalidLength)?;
-    let frame_end = end
-        .checked_add(2)
-        .ok_or(RespParseError::InvalidLength)?;
+    let frame_end = end.checked_add(2).ok_or(RespParseError::InvalidLength)?;
 
     if input.len() < frame_end {
         return Ok(None);
@@ -148,10 +146,7 @@ fn parse_bulk(input: &[u8]) -> Result<Option<(&[u8], usize)>, RespParseError> {
     Ok(Some((&input[header..end], frame_end)))
 }
 
-fn parse_number_line(
-    input: &[u8],
-    marker: u8,
-) -> Result<Option<(i64, usize)>, RespParseError> {
+fn parse_number_line(input: &[u8], marker: u8) -> Result<Option<(i64, usize)>, RespParseError> {
     if input.is_empty() {
         return Ok(None);
     }
@@ -159,10 +154,7 @@ fn parse_number_line(
         return Err(RespParseError::InvalidInteger);
     }
 
-    let Some(relative_end) = input[1..]
-        .windows(2)
-        .position(|window| window == b"\r\n")
-    else {
+    let Some(relative_end) = input[1..].windows(2).position(|window| window == b"\r\n") else {
         return Ok(None);
     };
     let line_end = relative_end + 1;
@@ -266,10 +258,7 @@ mod tests {
         assert_eq!(consumed, input.len());
         assert_eq!(command.name(), b"GET");
         assert_eq!(command.argc(), 1);
-        assert_eq!(
-            command.args().collect::<Vec<_>>(),
-            vec![b"foo".as_slice()]
-        );
+        assert_eq!(command.args().collect::<Vec<_>>(), vec![b"foo".as_slice()]);
     }
 
     #[test]
