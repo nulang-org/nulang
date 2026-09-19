@@ -527,6 +527,7 @@ pub enum CacheServiceError {
     RemoteTransferTargetMustBeRemote,
     RemoteTransferNotActive(u16),
     RemoteTransferAckMismatch,
+    RemoteMigrationProbeMismatch,
     ShardServer {
         shard: u16,
         source: CacheServerError,
@@ -940,6 +941,100 @@ impl CacheServiceHandle {
             control.wake();
         }
         Ok(())
+    }
+
+    /// Probe the target reactor for exact-epoch migration convergence state.
+    pub fn send_remote_migration_probe(
+        &self,
+        source_shard: u16,
+        target: CacheShardOwner,
+        slot: u16,
+        probe_id: u64,
+    ) -> Result<(), CacheServiceError> {
+        if target.node_id == self.local_node_id {
+            return Err(CacheServiceError::RemoteTransferTargetMustBeRemote);
+        }
+        let placement = self.placement_publisher.snapshot();
+        let source = CacheShardOwner {
+            node_id: self.local_node_id,
+            shard: source_shard,
+        };
+        let Some(migration) = placement.migration_for_slot(slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(slot));
+        };
+        if migration.source != source || migration.target != target {
+            return Err(CacheServiceError::RemoteTransferNotActive(slot));
+        }
+
+        self.send_network_message(
+            NodeId(target.node_id),
+            CacheTransportMessage::MigrationProbeRequest {
+                probe_id,
+                placement_epoch: placement.epoch(),
+                source,
+                target,
+                slot,
+            },
+        )
+    }
+
+    /// Combine a target convergence response with a fresh source-reactor count.
+    pub fn complete_remote_migration_probe(
+        &self,
+        event: &CacheTransportInbound,
+    ) -> Result<CacheRemoteMigrationConvergence, CacheServiceError> {
+        let CacheTransportMessage::MigrationProbeResponse {
+            probe_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+            accepted,
+            live_entries,
+            import_fences,
+            conflicts,
+            wrong_slot,
+        } = &event.message
+        else {
+            return Err(CacheServiceError::RemoteMigrationProbeMismatch);
+        };
+
+        if source.node_id != self.local_node_id || event.from_node.0 != target.node_id {
+            return Err(CacheServiceError::RemoteMigrationProbeMismatch);
+        }
+
+        let placement = self.placement_publisher.snapshot();
+        if placement.epoch() != *placement_epoch
+            || placement
+                .migration_for_slot(*slot)
+                .is_none_or(|migration| migration.source != *source || migration.target != *target)
+        {
+            return Err(CacheServiceError::RemoteMigrationProbeMismatch);
+        }
+
+        let source_control = self.transfer_control(source.shard)?;
+        let (count_tx, count_rx) = mpsc::sync_channel(1);
+        source_control.request_control(CacheShardControlRequest::CountSlot {
+            slot: *slot,
+            reply: count_tx,
+        })?;
+        let source_remaining = count_rx
+            .recv()
+            .map_err(|_| CacheServiceError::ControlDisconnected(source.shard))?;
+
+        Ok(CacheRemoteMigrationConvergence {
+            probe_id: *probe_id,
+            placement_epoch: *placement_epoch,
+            slot: *slot,
+            source: *source,
+            target: *target,
+            target_accepted: *accepted,
+            source_remaining,
+            target_live_entries: *live_entries,
+            target_import_fences: *import_fences,
+            target_conflicts: *conflicts,
+            target_wrong_slot: *wrong_slot,
+        })
     }
 
     /// Export one bounded source batch and send it to a remote migration target.
@@ -1958,6 +2053,34 @@ fn reject_cache_network_inbound(
                 target,
                 slot: batch.slot,
                 results: vec![CacheTransferImport::Conflict; batch.entries.len()],
+            };
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: reply.clone(),
+                },
+            );
+            return Some(reply);
+        }
+        CacheTransportMessage::MigrationProbeRequest {
+            probe_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+        } if target.node_id == local_node_id => {
+            let reply = CacheTransportMessage::MigrationProbeResponse {
+                probe_id,
+                placement_epoch,
+                source,
+                target,
+                slot,
+                accepted: false,
+                live_entries: 0,
+                import_fences: 0,
+                conflicts: 0,
+                wrong_slot: 0,
             };
             send_cache_transport_outbound(
                 sender,
