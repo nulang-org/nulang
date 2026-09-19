@@ -340,6 +340,21 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
     assert_eq!(report.stale_source_versions, 0);
     assert!(report.source_drained());
 
+    service_a
+        .send_remote_migration_probe(0, target, slot, 9002)
+        .unwrap();
+    let probe = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    let convergence = service_a
+        .complete_remote_migration_probe(&probe)
+        .unwrap();
+    assert_eq!(convergence.probe_id, 9002);
+    assert_eq!(convergence.source_remaining, 0);
+    assert_eq!(convergence.target_live_entries, 1);
+    assert_eq!(convergence.target_import_fences, 1);
+    assert_eq!(convergence.target_conflicts, 0);
+    assert_eq!(convergence.target_wrong_slot, 0);
+    assert!(convergence.ready_for_live_commit());
+
     // The source is drained but remains stable owner until commit, so it asks.
     source_client.write_all(&frame(&[b"GET", key])).unwrap();
     let ask = String::from_utf8(read_resp_line(&mut source_client)).unwrap();
