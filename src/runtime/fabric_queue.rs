@@ -155,6 +155,23 @@ impl FabricQueueConsumerGroupConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricQueueConsumerGroupInfo {
+    pub name: String,
+    pub max_concurrency: usize,
+    pub active: usize,
+}
+
+impl FabricQueueConsumerGroupInfo {
+    pub fn available(&self) -> usize {
+        self.max_concurrency.saturating_sub(self.active)
+    }
+
+    pub fn saturated(&self) -> bool {
+        self.active >= self.max_concurrency
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FabricQueueInfo {
     pub name: String,
     pub waiting: usize,
@@ -298,6 +315,19 @@ pub(crate) fn decode_queue_created_mutation(bytes: &[u8]) -> io::Result<FabricQu
             io::ErrorKind::InvalidData,
             "first Fabric queue mutation must be QueueCreated",
         )),
+    }
+}
+
+pub(crate) fn decode_queue_consumer_group_config(
+    bytes: &[u8],
+) -> io::Result<Option<FabricQueueConsumerGroupConfig>> {
+    let event: QueueMutation = serde_json::from_slice(bytes).map_err(json_error)?;
+    match event {
+        QueueMutation::ConsumerGroupConfigured { config } => {
+            config.validate()?;
+            Ok(Some(config))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1912,6 +1942,35 @@ impl Runtime {
         let mut store = self.fabric_queue_store()?;
         let state = store.load_committed_state(queue)?;
         Ok(state.consumer_groups.get(group).cloned())
+    }
+
+    pub(crate) fn fabric_queue_committed_consumer_group_info(
+        &mut self,
+        queue: &str,
+        group: &str,
+    ) -> io::Result<FabricQueueConsumerGroupInfo> {
+        validate_consumer_group_name(group)?;
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        let config = state.consumer_groups.get(group).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Fabric queue consumer group {group:?} is not configured"),
+            )
+        })?;
+        let active = state
+            .jobs
+            .values()
+            .filter(|job| {
+                job.status == FabricQueueJobStatus::Active
+                    && job.consumer_group.as_deref() == Some(group)
+            })
+            .count();
+        Ok(FabricQueueConsumerGroupInfo {
+            name: group.to_string(),
+            max_concurrency: config.max_concurrency,
+            active,
+        })
     }
 
     pub(crate) fn fabric_queue_committed_job_snapshot(
