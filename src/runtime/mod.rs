@@ -63,6 +63,7 @@ mod persistence;
 mod process_groups;
 mod registry;
 pub mod resp;
+pub mod resp_cache;
 mod spawn;
 #[cfg(feature = "native-codegen")]
 pub(crate) use spawn::spawn_from_module_with_authority;
@@ -101,6 +102,7 @@ pub use orca_cycle::*;
 pub use persistence::*;
 pub use process_groups::*;
 pub use registry::*;
+pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
