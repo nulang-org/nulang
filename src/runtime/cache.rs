@@ -877,7 +877,10 @@ impl CacheStore {
         assert!(redis_slot_id < REDIS_CLUSTER_SLOTS, "invalid Redis slot");
         assert!(max_entries > 0, "transfer batch size must be non-zero");
 
-        let mut index = cursor.map(|cursor| cursor.0).unwrap_or(0).min(self.slots.len());
+        let mut index = cursor
+            .map(|cursor| cursor.0)
+            .unwrap_or(0)
+            .min(self.slots.len());
         let start = index;
         let mut entries = Vec::with_capacity(max_entries);
 
@@ -972,11 +975,7 @@ impl CacheStore {
         CacheTransferImport::Imported
     }
 
-    fn transfer_token_for_key(
-        &mut self,
-        key: &[u8],
-        now_ms: u64,
-    ) -> Option<CacheTransferToken> {
+    fn transfer_token_for_key(&mut self, key: &[u8], now_ms: u64) -> Option<CacheTransferToken> {
         let slot_id = self.live_slot_id(key, now_ms)?;
         Some(CacheTransferToken {
             source_slot: slot_id,
@@ -1010,8 +1009,7 @@ impl CacheStore {
         }
 
         let current = &self.slots[slot_id as usize];
-        if slot_id != entry.token.source_slot
-            || current.generation != entry.token.source_generation
+        if slot_id != entry.token.source_slot || current.generation != entry.token.source_generation
         {
             return CacheTransferFinalize::StaleVersion;
         }
@@ -1114,7 +1112,10 @@ mod tests {
             target.get(b"a{move}", 1000),
             Some(CacheValueView::Bytes(b"bytes"))
         );
-        assert_eq!(target.get(b"b{move}", 1000), Some(CacheValueView::Integer(42)));
+        assert_eq!(
+            target.get(b"b{move}", 1000),
+            Some(CacheValueView::Integer(42))
+        );
         assert_eq!(target.ttl(b"a{move}", 1000), CacheTtl::RemainingMs(75));
         assert_eq!(target.ttl(b"b{move}", 1000), CacheTtl::Persistent);
     }
