@@ -1760,7 +1760,10 @@ impl Runtime {
         let Some((sequence, _)) = candidate else {
             return Ok(None);
         };
-        let job = state.jobs.get(&sequence).expect("expiry candidate must exist");
+        let job = state
+            .jobs
+            .get(&sequence)
+            .expect("expiry candidate must exist");
         let consumer = job.consumer.clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1781,9 +1784,7 @@ impl Runtime {
         } else {
             (FabricQueueJobStatus::Waiting, Some(now_ms))
         };
-        let operation_id = format!(
-            "__lease_expire:{queue_epoch}:{sequence}:{lease_token}"
-        );
+        let operation_id = format!("__lease_expire:{queue_epoch}:{sequence}:{lease_token}");
         let mutation_bytes = serde_json::to_vec(&QueueMutation::LeaseExpired {
             sequence,
             consumer: consumer.clone(),
