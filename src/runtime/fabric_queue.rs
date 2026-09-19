@@ -288,7 +288,6 @@ pub(crate) struct FabricQueueLeaseMutation {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FabricQueueLeasePlan {
-    pub mutation: FabricQueueLeaseMutation,
     pub mutation_bytes: Vec<u8>,
     pub delivery: FabricQueueDelivery,
 }
@@ -1349,15 +1348,6 @@ impl Runtime {
             io::Error::new(io::ErrorKind::Other, "Fabric queue lease token overflow")
         })?;
         let lease_until_ms = now_ms.saturating_add(state.config.visibility_timeout_ms);
-        let mutation = FabricQueueLeaseMutation {
-            sequence,
-            consumer: consumer.to_string(),
-            lease_token,
-            lease_until_ms,
-            deliveries,
-            queue_epoch,
-            operation_id: Some(operation_id.to_string()),
-        };
         let mutation_bytes = serde_json::to_vec(&QueueMutation::LeaseAcquired {
             sequence,
             consumer: consumer.to_string(),
@@ -1381,7 +1371,6 @@ impl Runtime {
             lease_until_ms,
         };
         Ok(Some(FabricQueueLeasePlan {
-            mutation,
             mutation_bytes,
             delivery,
         }))
