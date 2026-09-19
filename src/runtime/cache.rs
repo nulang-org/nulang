@@ -279,6 +279,62 @@ pub struct CacheMemoryStats {
     pub reusable_slots: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheTransferToken {
+    pub source_slot: u32,
+    pub source_generation: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheTransferValue {
+    Integer(i64),
+    Bytes(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheTransferEntry {
+    pub key: Vec<u8>,
+    pub value: CacheTransferValue,
+    /// Remaining TTL at export time. None means persistent.
+    pub ttl_ms: Option<u64>,
+    pub token: CacheTransferToken,
+}
+
+impl CacheTransferEntry {
+    pub fn payload_bytes(&self) -> usize {
+        let value_bytes = match &self.value {
+            CacheTransferValue::Integer(_) => std::mem::size_of::<i64>(),
+            CacheTransferValue::Bytes(value) => value.len(),
+        };
+        self.key.len() + value_bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheTransferCursor(pub usize);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheTransferBatch {
+    pub slot: u16,
+    pub entries: Vec<CacheTransferEntry>,
+    pub next_cursor: Option<CacheTransferCursor>,
+    pub scanned_slots: usize,
+    pub payload_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTransferFinalize {
+    Removed,
+    AlreadyAbsent,
+    StaleVersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTransferImport {
+    Imported,
+    ExpiredInTransit,
+}
+
 /// Shard-local compact cache storage.
 ///
 /// The owning runtime shard keeps `CacheStore` thread-confined by runtime
@@ -625,11 +681,23 @@ impl CacheStore {
         if let CacheValue::Bytes(bytes) = current {
             bytes.release(&mut self.arena);
         }
-        self.slots[slot_id as usize]
-            .entry
-            .as_mut()
-            .expect("live slot vanished")
-            .value = CacheValue::Integer(next);
+        let (generation, expires_at_ms) = {
+            let slot = &mut self.slots[slot_id as usize];
+            let entry = slot.entry.as_mut().expect("live slot vanished");
+            entry.value = CacheValue::Integer(next);
+            slot.generation = slot.generation.wrapping_add(1).max(1);
+            (slot.generation, entry.expires_at_ms)
+        };
+        if let Some(expires_at_ms) = expires_at_ms {
+            self.expiry.schedule(
+                ExpirationRef {
+                    slot: slot_id,
+                    generation,
+                    expires_at_ms,
+                },
+                now_ms,
+            );
+        }
         Ok(next)
     }
 
@@ -683,6 +751,155 @@ impl CacheStore {
         candidates.clear();
         self.expiry_scratch = candidates;
         expired
+    }
+
+    /// Export a bounded batch of live entries in one Redis logical slot.
+    ///
+    /// The cursor is an opaque scan position over the source store's entry
+    /// slots. Callers should restart from cursor zero after any stale
+    /// finalization result so keys modified during an earlier pass are
+    /// reconsidered.
+    pub fn export_slot_batch(
+        &mut self,
+        redis_slot_id: u16,
+        cursor: Option<CacheTransferCursor>,
+        max_entries: usize,
+        now_ms: u64,
+    ) -> CacheTransferBatch {
+        assert!(redis_slot_id < REDIS_CLUSTER_SLOTS, "invalid Redis slot");
+        assert!(max_entries > 0, "transfer batch size must be non-zero");
+
+        let mut index = cursor.map(|cursor| cursor.0).unwrap_or(0).min(self.slots.len());
+        let start = index;
+        let mut entries = Vec::with_capacity(max_entries);
+
+        while index < self.slots.len() && entries.len() < max_entries {
+            let slot_id = index as u32;
+            let expired = self.slots[index]
+                .entry
+                .as_ref()
+                .and_then(|entry| entry.expires_at_ms)
+                .is_some_and(|deadline| deadline <= now_ms);
+
+            if expired {
+                if self.remove_slot(slot_id) {
+                    self.stats.expirations += 1;
+                }
+                index += 1;
+                continue;
+            }
+
+            let transfer = self.slots[index].entry.as_ref().and_then(|entry| {
+                let key = entry.key.as_slice(&self.arena);
+                if redis_slot(key) != redis_slot_id {
+                    return None;
+                }
+
+                let value = match entry.value {
+                    CacheValue::Integer(value) => CacheTransferValue::Integer(value),
+                    CacheValue::Bytes(bytes) => {
+                        CacheTransferValue::Bytes(bytes.as_slice(&self.arena).to_vec())
+                    }
+                };
+                Some(CacheTransferEntry {
+                    key: key.to_vec(),
+                    value,
+                    ttl_ms: entry
+                        .expires_at_ms
+                        .map(|deadline| deadline.saturating_sub(now_ms)),
+                    token: CacheTransferToken {
+                        source_slot: slot_id,
+                        source_generation: self.slots[index].generation,
+                    },
+                })
+            });
+
+            if let Some(transfer) = transfer {
+                entries.push(transfer);
+            }
+            index += 1;
+        }
+
+        let payload_bytes = entries.iter().map(CacheTransferEntry::payload_bytes).sum();
+        CacheTransferBatch {
+            slot: redis_slot_id,
+            entries,
+            next_cursor: (index < self.slots.len()).then_some(CacheTransferCursor(index)),
+            scanned_slots: index.saturating_sub(start),
+            payload_bytes,
+        }
+    }
+
+    /// Apply one transferred entry to the target shard.
+    ///
+    /// elapsed_ms allows a migration transport to subtract time spent in
+    /// flight from a relative TTL. Passing zero is valid when the caller does
+    /// not have a transit measurement.
+    pub fn import_transfer_entry(
+        &mut self,
+        entry: &CacheTransferEntry,
+        elapsed_ms: u64,
+        now_ms: u64,
+    ) -> CacheTransferImport {
+        let ttl_ms = match entry.ttl_ms {
+            Some(ttl_ms) => {
+                let remaining = ttl_ms.saturating_sub(elapsed_ms);
+                if remaining == 0 {
+                    return CacheTransferImport::ExpiredInTransit;
+                }
+                Some(remaining)
+            }
+            None => None,
+        };
+
+        match &entry.value {
+            CacheTransferValue::Integer(value) => {
+                self.set_integer(&entry.key, *value, ttl_ms, now_ms);
+            }
+            CacheTransferValue::Bytes(value) => {
+                self.set_bytes(&entry.key, value, ttl_ms, now_ms);
+            }
+        }
+        CacheTransferImport::Imported
+    }
+
+    /// Delete the source copy only if it is still exactly the version that was
+    /// exported. A concurrent SET/INCR/EXPIRE changes the generation and turns
+    /// the ACK into StaleVersion, forcing another reconciliation pass.
+    pub fn finalize_transfer_entry(
+        &mut self,
+        entry: &CacheTransferEntry,
+        now_ms: u64,
+    ) -> CacheTransferFinalize {
+        let hash = Self::hash(&entry.key);
+        let Some(slot_id) = self.find_slot(&entry.key, hash) else {
+            return CacheTransferFinalize::AlreadyAbsent;
+        };
+
+        let expired = self.slots[slot_id as usize]
+            .entry
+            .as_ref()
+            .and_then(|current| current.expires_at_ms)
+            .is_some_and(|deadline| deadline <= now_ms);
+        if expired {
+            if self.remove_slot(slot_id) {
+                self.stats.expirations += 1;
+            }
+            return CacheTransferFinalize::AlreadyAbsent;
+        }
+
+        let current = &self.slots[slot_id as usize];
+        if slot_id != entry.token.source_slot
+            || current.generation != entry.token.source_generation
+        {
+            return CacheTransferFinalize::StaleVersion;
+        }
+
+        if self.remove_slot(slot_id) {
+            CacheTransferFinalize::Removed
+        } else {
+            CacheTransferFinalize::AlreadyAbsent
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -749,6 +966,136 @@ fn crc16_xmodem(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_transfer_preserves_values_and_remaining_ttl() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"a{move}", b"bytes", Some(100), 10);
+        source.set_integer(b"b{move}", 42, None, 10);
+        let slot = redis_slot(b"a{move}");
+        assert_eq!(redis_slot(b"b{move}"), slot);
+
+        let batch = source.export_slot_batch(slot, None, 16, 30);
+        assert_eq!(batch.entries.len(), 2);
+        assert_eq!(batch.next_cursor, None);
+        assert!(batch.payload_bytes > 0);
+
+        let mut target = CacheStore::new();
+        for entry in &batch.entries {
+            assert_eq!(
+                target.import_transfer_entry(entry, 5, 1000),
+                CacheTransferImport::Imported
+            );
+        }
+
+        assert_eq!(
+            target.get(b"a{move}", 1000),
+            Some(CacheValueView::Bytes(b"bytes"))
+        );
+        assert_eq!(target.get(b"b{move}", 1000), Some(CacheValueView::Integer(42)));
+        assert_eq!(target.ttl(b"a{move}", 1000), CacheTtl::RemainingMs(75));
+        assert_eq!(target.ttl(b"b{move}", 1000), CacheTtl::Persistent);
+    }
+
+    #[test]
+    fn stale_transfer_ack_cannot_delete_raced_set() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"k{move}", b"old", None, 0);
+        let slot = redis_slot(b"k{move}");
+        let batch = source.export_slot_batch(slot, None, 1, 0);
+        let entry = batch.entries.first().unwrap().clone();
+
+        source.set_bytes(b"k{move}", b"new", None, 1);
+
+        assert_eq!(
+            source.finalize_transfer_entry(&entry, 1),
+            CacheTransferFinalize::StaleVersion
+        );
+        assert_eq!(
+            source.get(b"k{move}", 1),
+            Some(CacheValueView::Bytes(b"new"))
+        );
+    }
+
+    #[test]
+    fn exact_transfer_ack_removes_source_copy_idempotently() {
+        let mut source = CacheStore::new();
+        source.set_integer(b"k{move}", 7, None, 0);
+        let slot = redis_slot(b"k{move}");
+        let entry = source
+            .export_slot_batch(slot, None, 1, 0)
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            source.finalize_transfer_entry(&entry, 0),
+            CacheTransferFinalize::Removed
+        );
+        assert_eq!(
+            source.finalize_transfer_entry(&entry, 0),
+            CacheTransferFinalize::AlreadyAbsent
+        );
+        assert!(!source.exists(b"k{move}", 0));
+    }
+
+    #[test]
+    fn increment_invalidates_transfer_token_without_losing_ttl_expiry() {
+        let mut source = CacheStore::new();
+        source.set_integer(b"k{move}", 1, Some(50), 0);
+        let slot = redis_slot(b"k{move}");
+        let entry = source
+            .export_slot_batch(slot, None, 1, 0)
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(source.increment(b"k{move}", 1, 10).unwrap(), 2);
+        assert_eq!(
+            source.finalize_transfer_entry(&entry, 10),
+            CacheTransferFinalize::StaleVersion
+        );
+
+        assert_eq!(source.purge_expired(60, 16), 1);
+        assert!(!source.exists(b"k{move}", 60));
+    }
+
+    #[test]
+    fn slot_transfer_batches_are_bounded_and_resumable() {
+        let mut source = CacheStore::new();
+        for key in [b"a{batch}".as_slice(), b"b{batch}", b"c{batch}"] {
+            source.set_bytes(key, b"value", None, 0);
+        }
+        let slot = redis_slot(b"a{batch}");
+
+        let first = source.export_slot_batch(slot, None, 2, 0);
+        assert_eq!(first.entries.len(), 2);
+        let second = source.export_slot_batch(slot, first.next_cursor, 2, 0);
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.next_cursor, None);
+    }
+
+    #[test]
+    fn transfer_import_does_not_resurrect_expired_in_transit_key() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"k{move}", b"value", Some(5), 0);
+        let slot = redis_slot(b"k{move}");
+        let entry = source
+            .export_slot_batch(slot, None, 1, 0)
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut target = CacheStore::new();
+
+        assert_eq!(
+            target.import_transfer_entry(&entry, 5, 100),
+            CacheTransferImport::ExpiredInTransit
+        );
+        assert!(!target.exists(b"k{move}", 100));
+    }
 
     #[test]
     fn inline_values_do_not_touch_arena() {
