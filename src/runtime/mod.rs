@@ -39,7 +39,9 @@ pub use distributed_context::{
 };
 pub use fabric_queue_cluster::{
     FabricQueuePlacement, FabricQueuePolicySyncReport, FabricQueueReplicatedAcquireResult,
-    FabricQueueReplicatedAddResult, FabricQueueReplicatedCreateResult,
+    FabricQueueReplicatedAckResult, FabricQueueReplicatedAddResult,
+    FabricQueueReplicatedCreateResult, FabricQueueReplicatedNackResult,
+    FabricQueueReplicatedRenewResult,
 };
 pub use fabric_queue::{
     FabricQueueAddOptions, FabricQueueAddResult, FabricQueueConfig, FabricQueueDelivery,
