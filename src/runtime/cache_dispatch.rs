@@ -261,8 +261,7 @@ impl CacheDispatcher {
             .owner_for_slot(slot)
             .ok_or(CacheDispatchError::UnknownSlot(slot))?;
 
-        let is_local_owner =
-            owner.node_id == self.local_node_id && owner.shard == self.local_shard;
+        let is_local_owner = owner.node_id == self.local_node_id && owner.shard == self.local_shard;
 
         if !is_local_owner && self.routing_mode == CacheRoutingMode::Redirect {
             let endpoint = self
