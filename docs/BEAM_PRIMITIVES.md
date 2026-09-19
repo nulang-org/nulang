@@ -74,7 +74,7 @@ type ExitReason =
 |----------------|---------------|-------------|-----------|
 | `Pid ! Message` | **IMPLEMENTED** | `send actor_ref behavior(args)` | Non-blocking, asynchronous → `Send` opcode (0x81) → `Runtime::send_message_by_id`. **Note:** the `<-` operator shown in earlier drafts is not Nulang syntax (the lexer tokenizes `<-` but the parser never uses it); `!` is unary-not. |
 | `Name ! Message` | **ADAPT — NOT IMPLEMENTED** | `registered_name <- message` | Send to registered name. Requires an explicit `whereis` lookup today (registry is Rust-only). |
-| `{Name, Node} ! Message` | **IMPLEMENTED (runtime API)** | `Runtime::send_distributed(ActorAddress, behavior, args)` | `ActorAddress::Local`/`Remote` give location-transparent routing. Remote sends carry the behavior **name** on the wire; the receiver resolves it to a behavior id on delivery (unknown names fall back to behavior 0, mirroring local sends). |
+| `{Name, Node} ! Message` | **IMPLEMENTED (runtime API)** | `Runtime::send_distributed(ActorAddress, behavior, args)` | `ActorAddress::Local`/`Remote` give location-transparent routing. Remote sends carry the behavior **name** on the wire; the receiver resolves it to a behavior id on delivery (unknown names are rejected and never alias behavior 0). |
 
 ### 2.2 Receive (Critical Addition)
 
@@ -399,7 +399,7 @@ Mnesia's complex transaction semantics and schema evolution are pain points. Nul
 
 | BEAM Primitive | Nulang Status | Nulang Form | Rationale |
 |----------------|---------------|-------------|-----------|
-| `{Name, Node} ! Message` | **IMPLEMENTED (runtime API)** | `Runtime::send_distributed(ActorAddress, behavior, args)` | Location-transparent routing via `AddressResolver` + LRU `RemoteActorCache` (10,000 entries). Remote `ActorMessage` packets carry the behavior **name**; the receiver resolves it via `Runtime::behavior_id_for` on delivery (unknown names fall back to behavior 0, mirroring local sends). The `RSend` opcode (0xD2) is a no-op in the VM. |
+| `{Name, Node} ! Message` | **IMPLEMENTED (runtime API)** | `Runtime::send_distributed(ActorAddress, behavior, args)` | Location-transparent routing via `AddressResolver` + LRU `RemoteActorCache` (10,000 entries). Remote `ActorMessage` packets carry the behavior **name**; the receiver resolves it via `Runtime::behavior_id_for` on delivery (unknown names are rejected and never alias behavior 0). The `RSend` opcode (0xD2) is a no-op in the VM. |
 | `rpc:call/4` | **IMPLEMENTED (partial)** | `RAsk` opcode (0xD3) → `DistributedVmCallbacks::remote_ask(target, behavior, args, 5000ms)` | Type-safe RPC. Only through the VM callback; returns `nil` when no distributed runtime is attached. |
 | `rpc:multicall/4` | **ADAPT — NOT IMPLEMENTED** | `cluster.multicall(nodes, behavior, args)` | Parallel RPC to multiple nodes. |
 | `rpc:cast/4` | **ADAPT — NOT IMPLEMENTED** | `cluster.cast(node, behavior, args)` | Fire-and-forget remote call. |

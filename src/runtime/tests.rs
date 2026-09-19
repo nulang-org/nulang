@@ -297,6 +297,14 @@ fn test_run_scheduler_processes_all_actors() {
     let mut rt = Runtime::new();
     let a1 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
     let a2 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&a1)
+        .unwrap()
+        .register_behavior("add", |_actor, _args| {});
+    rt.actors
+        .get_mut(&a2)
+        .unwrap()
+        .register_behavior("add", |_actor, _args| {});
     rt.send_message(a1, "add", &[Value::int(10)]);
     rt.send_message(a2, "add", &[Value::int(20)]);
     rt.run_scheduler();
@@ -372,6 +380,14 @@ fn test_actor_set_priority_changes_scheduling() {
     let mut rt = Runtime::new();
     let a = rt.spawn_actor(Box::new(|| vec![]));
     let b = rt.spawn_actor(Box::new(|| vec![]));
+    rt.actors
+        .get_mut(&a)
+        .unwrap()
+        .register_behavior("noop", |_actor, _args| {});
+    rt.actors
+        .get_mut(&b)
+        .unwrap()
+        .register_behavior("noop", |_actor, _args| {});
     // Drain the spawn-time queue entries (both enqueued at Normal).
     assert_eq!(rt.scheduler.dequeue(), Some(a));
     assert_eq!(rt.scheduler.dequeue(), Some(b));
@@ -1257,6 +1273,10 @@ fn test_distributed_remote_address_local_fallback() {
     // the distribution wrapper: distributed disabled → local delivery.
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_actor(Box::new(|| vec![("val".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("test", |_actor, _args| {});
 
     // Distributed is disabled by default: a remote address still delivers.
     let remote_addr = ActorAddress::remote(NodeId::LOCAL, actor_id);
@@ -2815,6 +2835,14 @@ fn test_runtime_scheduler_stats() {
 
     let a1 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
     let a2 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&a1)
+        .unwrap()
+        .register_behavior("add", |_actor, _args| {});
+    rt.actors
+        .get_mut(&a2)
+        .unwrap()
+        .register_behavior("add", |_actor, _args| {});
     rt.send_message(a1, "add", &[Value::int(10)]);
     rt.send_message(a2, "add", &[Value::int(20)]);
     rt.run_scheduler();
@@ -5958,6 +5986,10 @@ fn test_remote_ref_local_collision_prefers_local() {
     // Local actor (id from the global counter — never assume a value;
     // `fresh_actor_id` is process-global, so later tests see higher ids).
     let local_id = rt_a.spawn_actor(Box::new(|| vec![]));
+    rt_a.actors
+        .get_mut(&local_id)
+        .unwrap()
+        .register_behavior("whatever", |_actor, _args| {});
 
     // Simulate a colliding remote ref known to node B (e.g. an inbound
     // sender whose id collides with our local actor).
@@ -7062,5 +7094,87 @@ fn test_send_to_grain_cross_shard_routes_and_hydrates() {
         actor.get_state_field("count").and_then(|v| v.as_int()),
         Some(1),
         "inc message should be processed on shard 1"
+    );
+}
+
+#[test]
+fn p0_unknown_named_send_is_rejected() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let n = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(n + 1));
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", increment);
+
+    rt.send_message(actor_id, "does_not_exist", &[]);
+    assert!(rt.actors.get(&actor_id).unwrap().mailbox.is_empty());
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
+
+    rt.send_message(actor_id, "first", &[]);
+    rt.run_scheduler();
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1)
+    );
+}
+
+#[test]
+fn p0_unknown_numeric_ask_is_rejected_without_running_behavior_zero() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let n = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(n + 1));
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", increment);
+
+    let err = rt
+        .ask_actor_sync(actor_id, 99, &[])
+        .expect_err("unknown behavior id must fail closed");
+    assert!(err.to_string().contains("does not declare behavior id 99"));
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
+
+    rt.ask_actor_sync(actor_id, 0, &[])
+        .expect("declared behavior zero remains callable");
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1)
     );
 }
