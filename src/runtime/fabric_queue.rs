@@ -1933,17 +1933,6 @@ impl Runtime {
         .map_err(json_error)
     }
 
-    pub(crate) fn fabric_queue_find_consumer_group_config(
-        &mut self,
-        queue: &str,
-        group: &str,
-    ) -> io::Result<Option<FabricQueueConsumerGroupConfig>> {
-        validate_consumer_group_name(group)?;
-        let mut store = self.fabric_queue_store()?;
-        let state = store.load_committed_state(queue)?;
-        Ok(state.consumer_groups.get(group).cloned())
-    }
-
     pub(crate) fn fabric_queue_committed_consumer_group_info(
         &mut self,
         queue: &str,
