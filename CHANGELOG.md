@@ -82,6 +82,13 @@ two major versions.*
   `MOVED` immediately for keyed commands received by a non-owning shard or
   node, while transparent mode retains internal queue/transport routing.
   Missing endpoint metadata fails closed rather than silently proxying.
+- **Redis Cluster topology discovery and compact default placement**
+  (Experimental, `src/runtime/cache_cluster.rs`,
+  `src/runtime/cache_routing.rs`). `CLUSTER KEYSLOT`, `CLUSTER SHARDS`,
+  and legacy `CLUSTER SLOTS` are served from the routing snapshot without
+  entering CacheStore. Default local ownership now uses balanced contiguous
+  slot ranges instead of modulo striping, keeping discovery payloads compact
+  while CRC16 preserves expected key balance.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
