@@ -65,6 +65,11 @@ pub enum CacheNetworkTimeoutOperation {
         placement_epoch: u64,
         slot: u16,
     },
+    MigrationProbe {
+        probe_id: u64,
+        placement_epoch: u64,
+        slot: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +390,34 @@ impl CacheRemoteTransferReport {
 
     pub fn restart_scan_required(&self) -> bool {
         self.stale_source_versions != 0 || self.conflicts != 0 || self.wrong_slot != 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheRemoteMigrationConvergence {
+    pub probe_id: u64,
+    pub placement_epoch: u64,
+    pub slot: u16,
+    pub source: CacheShardOwner,
+    pub target: CacheShardOwner,
+    pub target_accepted: bool,
+    pub source_remaining: usize,
+    pub target_live_entries: u64,
+    pub target_import_fences: u64,
+    pub target_conflicts: u64,
+    pub target_wrong_slot: u64,
+}
+
+impl CacheRemoteMigrationConvergence {
+    /// Safe live-controller gate before publishing the ownership commit.
+    ///
+    /// This does not reconstruct lost controller history after process restart;
+    /// persisted migration intent/ACK state is required for restart recovery.
+    pub fn ready_for_live_commit(&self) -> bool {
+        self.target_accepted
+            && self.source_remaining == 0
+            && self.target_conflicts == 0
+            && self.target_wrong_slot == 0
     }
 }
 
@@ -1320,6 +1353,7 @@ impl Drop for CacheServiceHandle {
 enum CacheNetworkPendingKey {
     Command { peer: u64, request_id: u64 },
     Transfer { peer: u64, transfer_id: u64 },
+    MigrationProbe { peer: u64, probe_id: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -1392,6 +1426,12 @@ fn cache_pending_key(
                 transfer_id: *transfer_id,
             })
         }
+        CacheTransportMessage::MigrationProbeRequest { probe_id, .. } => {
+            Some(CacheNetworkPendingKey::MigrationProbe {
+                peer: peer.0,
+                probe_id: *probe_id,
+            })
+        }
         _ => None,
     }
 }
@@ -1411,6 +1451,12 @@ fn cache_completion_key(
             Some(CacheNetworkPendingKey::Transfer {
                 peer: peer.0,
                 transfer_id: *transfer_id,
+            })
+        }
+        CacheTransportMessage::MigrationProbeResponse { probe_id, .. } => {
+            Some(CacheNetworkPendingKey::MigrationProbe {
+                peer: peer.0,
+                probe_id: *probe_id,
             })
         }
         _ => None,
@@ -1438,6 +1484,16 @@ fn cache_timeout_for_pending(pending: &CacheNetworkPending) -> CacheNetworkTimeo
             transfer_id: *transfer_id,
             placement_epoch: *placement_epoch,
             slot: batch.slot,
+        },
+        CacheTransportMessage::MigrationProbeRequest {
+            probe_id,
+            placement_epoch,
+            slot,
+            ..
+        } => CacheNetworkTimeoutOperation::MigrationProbe {
+            probe_id: *probe_id,
+            placement_epoch: *placement_epoch,
+            slot: *slot,
         },
         _ => unreachable!("only request messages enter retry state"),
     };
@@ -1496,6 +1552,7 @@ fn retry_cache_network_pending(
 enum CacheNetworkDedupeKey {
     Command { peer: u64, request_id: u64 },
     Transfer { peer: u64, transfer_id: u64 },
+    MigrationProbe { peer: u64, probe_id: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -1640,6 +1697,12 @@ fn run_cache_network_coordinator(
                     Some(CacheNetworkDedupeKey::Transfer {
                         peer: inbound.from_node.0,
                         transfer_id: *transfer_id,
+                    })
+                }
+                CacheTransportMessage::MigrationProbeRequest { probe_id, .. } => {
+                    Some(CacheNetworkDedupeKey::MigrationProbe {
+                        peer: inbound.from_node.0,
+                        probe_id: *probe_id,
                     })
                 }
                 _ => None,
