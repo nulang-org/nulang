@@ -534,6 +534,9 @@ impl Runtime {
 
         self.fabric_queue_require_committed_creation(queue)?;
         let payload_stream = queue_stream_name(queue);
+        // Encode before dedup scanning so validation is identical for new and
+        // retried calls.
+        let bytes = encode_queue_envelope(queue, name, payload, &options, now_ms)?;
 
         if let Some(job_id) = options.job_id.as_deref() {
             let mut next = 1u64;
@@ -592,7 +595,6 @@ impl Runtime {
             }
         }
 
-        let bytes = encode_queue_envelope(queue, name, payload, &options, now_ms)?;
         let appended = self.fabric_stream_replicated_append(
             &payload_stream,
             partition,
