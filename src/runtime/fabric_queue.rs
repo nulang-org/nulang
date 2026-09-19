@@ -1605,7 +1605,7 @@ impl Runtime {
     /// Inspect a replicated queue using only quorum-committed payload and
     /// mutation prefixes. Uncommitted local tails are never decoded or exposed.
     pub fn fabric_queue_info_replicated(&mut self, queue: &str) -> io::Result<FabricQueueInfo> {
-        if !self.fabric_queue_has_replication_policy(queue)? {
+        if self.fabric_queue_replication_placement(queue)?.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Fabric queue {queue:?} does not have a replication policy"),
@@ -2232,7 +2232,7 @@ impl Runtime {
         queue: &str,
         now_ms: u64,
     ) -> io::Result<FabricQueueReadySignal> {
-        if !self.fabric_queue_has_replication_policy(queue)? {
+        if self.fabric_queue_replication_placement(queue)?.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Fabric queue {queue:?} does not have a replication policy"),
@@ -2270,7 +2270,7 @@ impl Runtime {
         queue: &str,
         job_id: &str,
     ) -> io::Result<Option<FabricQueueJobInfo>> {
-        if !self.fabric_queue_has_replication_policy(queue)? {
+        if self.fabric_queue_replication_placement(queue)?.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Fabric queue {queue:?} does not have a replication policy"),
