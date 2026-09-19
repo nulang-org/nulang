@@ -120,6 +120,23 @@ with a stable 40-hex-character Redis node id derived from its Nulang node/shard
 identity. Replicas will be added to these responses when cache replication is
 implemented.
 
+When built with the optional `cache-server` feature,
+`src/runtime/cache_server.rs` provides a dedicated Mio readiness reactor for
+one physical cache shard. The reactor owns the shard's listener, connections,
+`CacheStore`, expiration sweep, and ordered RESP pipelines on one thread. It
+does not call `Runtime::run_scheduler` and therefore does not inherit the
+actor runtime's distributed idle cadence. Cross-shard inbox work wakes the
+reactor through Mio's `Waker`; ordinary correctly routed GET/SET requests do
+not use that wake path.
+
+The first server surface deliberately requires `Redirect` mode. A connection
+that reaches a non-owning shard receives `MOVED` rather than turning the
+server into a transparent proxy. A shared `CacheServerClock` gives all shards
+in one process the same monotonic millisecond origin for local cross-shard TTL
+semantics; process-relative timestamps are not sent to remote nodes. Input,
+output, connection count, pipeline depth, inbox drain size, and expiry work are
+all bounded by configuration.
+
 ## Durability
 
 Durability is not implicit in the cache kernel. Add it above the mutation path
@@ -152,16 +169,16 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add ASK/ASKING and migration-state redirects when live slot migration is
+1. Add a multi-shard server builder that reserves/binds advertised endpoints,
+   shares one `CacheServerClock`, pins reactor threads when requested, and
+   starts/stops the shard set as one service.
+2. Add ASK/ASKING and migration-state redirects when live slot migration is
    implemented.
-2. Build the dedicated cache shard event loop around non-blocking connections,
-   inbox draining, ordered response flushing, and per-shard advertised
-   endpoints.
-3. Connect transparent-mode remote handoffs to a cache-specific cluster
-   transport.
-4. Wire TCP RESP listeners to shard event loops without a global store lock or
-   the actor scheduler's idle cadence.
-5. Add hierarchical expiration, packed aggregate structures, and durability
-   acknowledgement modes.
-6. Add broader RESP compatibility and Nulang-native coordination primitives
-   where they fit the product boundary.
+3. Add a separate transparent proxy endpoint only for non-cluster clients;
+   keep the per-shard production listeners redirect-only.
+4. Connect remote transparent handoffs to a cache-specific cluster transport.
+5. Promote expiration to a hierarchical timing wheel, then add packed
+   aggregate structures and durability acknowledgement modes.
+6. Expand RESP compatibility and add Nulang-native leases, locks, semaphores,
+   fencing tokens, queues, and stored functions where they fit the product
+   boundary.
