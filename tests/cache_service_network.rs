@@ -1,7 +1,8 @@
 #![cfg(feature = "cache-server")]
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream as StdTcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +45,18 @@ fn frame(parts: &[&[u8]]) -> Vec<u8> {
         out.extend_from_slice(b"\r\n");
     }
     out
+}
+
+fn read_resp_line(client: &mut StdTcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        client.read_exact(&mut byte).unwrap();
+        response.push(byte[0]);
+        if response.ends_with(b"\r\n") {
+            return response;
+        }
+    }
 }
 
 fn wait_event(
@@ -223,6 +236,146 @@ fn remote_cache_command_executes_on_owning_reactor_and_stale_epoch_fails_closed(
         }
         other => panic!("unexpected cache response: {other:?}"),
     }
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
+
+#[test]
+fn remote_slot_migration_moves_data_then_commits_ownership() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33401".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33402".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"remote-migrate-key";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let base = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+    assert_eq!(base.owner_for_slot(slot), Some(source));
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 73402))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, base.clone())
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 73401))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    // Seed the source before entering migration.
+    let mut source_client = StdTcpStream::connect(service_a.local_addrs()[0]).unwrap();
+    source_client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    source_client
+        .write_all(&frame(&[b"SET", key, b"value"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
+
+    let mut migrating = base;
+    migrating
+        .begin_migration(1, slot, source, target)
+        .unwrap();
+    service_a.install_placement(migrating.clone()).unwrap();
+    service_b.install_placement(migrating.clone()).unwrap();
+    wait_epoch(&service_a, 1);
+    wait_epoch(&service_b, 1);
+
+    let pending = service_a
+        .send_remote_slot_batch(0, target, slot, None, 8, 9001)
+        .unwrap();
+    assert_eq!(pending.batch.entries.len(), 1);
+
+    let ack = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    let report = service_a
+        .complete_remote_slot_batch(&pending, &ack)
+        .unwrap();
+    assert_eq!(report.imported, 1);
+    assert_eq!(report.finalized_removed, 1);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(report.stale_source_versions, 0);
+    assert!(report.source_drained());
+
+    // The source is drained but remains stable owner until commit, so it asks.
+    source_client.write_all(&frame(&[b"GET", key])).unwrap();
+    let ask = String::from_utf8(read_resp_line(&mut source_client)).unwrap();
+    assert!(ask.starts_with(&format!("-ASK {slot} ")));
+
+    // The target has the imported value but serves it only after ASKING.
+    let mut target_client = StdTcpStream::connect(service_b.local_addrs()[0]).unwrap();
+    target_client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    target_client
+        .write_all(&frame(&[b"ASKING"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut target_client), b"+OK\r\n");
+    target_client.write_all(&frame(&[b"GET", key])).unwrap();
+    let mut imported = [0u8; 11];
+    target_client.read_exact(&mut imported).unwrap();
+    assert_eq!(&imported, b"$5\r\nvalue\r\n");
+
+    migrating
+        .commit_migration(2, slot, source, target)
+        .unwrap();
+    service_a.install_placement(migrating.clone()).unwrap();
+    service_b.install_placement(migrating).unwrap();
+    wait_epoch(&service_a, 2);
+    wait_epoch(&service_b, 2);
+    service_b.clear_local_transfer_imports(0, slot).unwrap();
+
+    target_client.write_all(&frame(&[b"GET", key])).unwrap();
+    let mut stable = [0u8; 11];
+    target_client.read_exact(&mut stable).unwrap();
+    assert_eq!(&stable, b"$5\r\nvalue\r\n");
+
+    source_client.write_all(&frame(&[b"GET", key])).unwrap();
+    let moved = String::from_utf8(read_resp_line(&mut source_client)).unwrap();
+    assert!(moved.starts_with(&format!("-MOVED {slot} ")));
 
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
