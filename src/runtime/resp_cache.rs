@@ -17,6 +17,13 @@ const ERR_SET_EXPIRE: &[u8] = b"ERR invalid expire time in 'set' command";
 const ERR_CROSS_SLOT: &[u8] = b"CROSSSLOT Keys in request don't hash to the same slot";
 const ERR_UNKNOWN: &[u8] = b"ERR unknown command";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RespCommandSlot {
+    Unkeyed,
+    Slot(u16),
+    CrossSlot,
+}
+
 /// Parse and execute exactly one RESP command frame.
 ///
 /// Returns the number of bytes consumed from `input`. A pipelined caller can
@@ -33,6 +40,93 @@ pub fn execute_frame(
     };
     execute_command(store, command, now_ms, out);
     Ok(Some(consumed))
+}
+
+pub fn command_slot(command: RespCommand<'_>) -> RespCommandSlot {
+    let name = command.name();
+
+    if name.eq_ignore_ascii_case(b"GET")
+        || name.eq_ignore_ascii_case(b"INCR")
+        || name.eq_ignore_ascii_case(b"TTL")
+    {
+        return if command.argc() == 1 {
+            RespCommandSlot::Slot(redis_slot(
+                command.args().next().expect("validated routing key"),
+            ))
+        } else {
+            RespCommandSlot::Unkeyed
+        };
+    }
+
+    if name.eq_ignore_ascii_case(b"SET") {
+        return if command.argc() == 2 || command.argc() == 4 {
+            RespCommandSlot::Slot(redis_slot(
+                command.args().next().expect("validated routing key"),
+            ))
+        } else {
+            RespCommandSlot::Unkeyed
+        };
+    }
+
+    if name.eq_ignore_ascii_case(b"EXPIRE") {
+        return if command.argc() == 2 {
+            RespCommandSlot::Slot(redis_slot(
+                command.args().next().expect("validated routing key"),
+            ))
+        } else {
+            RespCommandSlot::Unkeyed
+        };
+    }
+
+    if name.eq_ignore_ascii_case(b"DEL")
+        || name.eq_ignore_ascii_case(b"EXISTS")
+        || name.eq_ignore_ascii_case(b"MGET")
+    {
+        return if command.argc() == 0 {
+            RespCommandSlot::Unkeyed
+        } else {
+            route_key_args(command.args())
+        };
+    }
+
+    if name.eq_ignore_ascii_case(b"MSET") {
+        return if command.argc() == 0 || command.argc() % 2 != 0 {
+            RespCommandSlot::Unkeyed
+        } else {
+            route_key_value_args(command.args())
+        };
+    }
+
+    RespCommandSlot::Unkeyed
+}
+
+fn route_key_args(mut keys: RespArgs<'_>) -> RespCommandSlot {
+    let Some(first) = keys.next() else {
+        return RespCommandSlot::Unkeyed;
+    };
+    let slot = redis_slot(first);
+    if keys.all(|key| redis_slot(key) == slot) {
+        RespCommandSlot::Slot(slot)
+    } else {
+        RespCommandSlot::CrossSlot
+    }
+}
+
+fn route_key_value_args(mut args: RespArgs<'_>) -> RespCommandSlot {
+    let Some(first_key) = args.next() else {
+        return RespCommandSlot::Unkeyed;
+    };
+    let _first_value = args.next();
+    let slot = redis_slot(first_key);
+
+    while let Some(key) = args.next() {
+        let _value = args.next();
+        if redis_slot(key) != slot {
+            return RespCommandSlot::CrossSlot;
+        }
+    }
+
+    RespCommandSlot::Slot(slot)
 }
 
 /// Execute a validated RESP command against one shard-local cache store.
@@ -424,6 +518,33 @@ mod tests {
             run(&mut store, b"*2\r\n$6\r\nEXISTS\r\n$4\r\nkey1\r\n", 1_000),
             b":0\r\n"
         );
+    }
+
+    #[test]
+    fn command_slot_distinguishes_keyed_unkeyed_and_cross_slot_commands() {
+        let (ping, _) = parse_command(b"*1\r\n$4\r\nPING\r\n").unwrap().unwrap();
+        assert_eq!(command_slot(ping), RespCommandSlot::Unkeyed);
+
+        let (get, _) = parse_command(b"*2\r\n$3\r\nGET\r\n$5\r\na{42}\r\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            command_slot(get),
+            RespCommandSlot::Slot(redis_slot(b"a{42}"))
+        );
+
+        let (mget, _) = parse_command(b"*3\r\n$4\r\nMGET\r\n$5\r\na{42}\r\n$5\r\nb{42}\r\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            command_slot(mget),
+            RespCommandSlot::Slot(redis_slot(b"a{42}"))
+        );
+
+        let (cross, _) = parse_command(b"*3\r\n$4\r\nMGET\r\n$1\r\na\r\n$1\r\nb\r\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(command_slot(cross), RespCommandSlot::CrossSlot);
     }
 
     #[test]

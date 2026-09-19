@@ -75,8 +75,15 @@ mutation. Same-slot MSET is atomic with respect to other commands because the
 owning shard executes one command to completion without yielding.
 
 The network server should retain ownership of the receive buffer until the
-local command finishes. Remote dispatch may then move/copy only the command
-payload required by the destination shard.
+local command finishes. `src/runtime/cache_dispatch.rs` classifies the parsed
+command before execution: same-shard commands call the cache kernel directly,
+other local shards receive one owned frame through a bounded cache-specific
+queue, and remote owners produce an explicit transport handoff containing the
+slot, node/shard owner, placement epoch, and exact command frame. Queue
+saturation is surfaced as backpressure rather than blocking the ingress thread.
+
+Only cross-shard or cross-node commands copy the RESP frame. The same-shard
+path remains borrowed and mailbox-free.
 
 ## Durability
 
@@ -110,10 +117,9 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add local-shard and remote-node dispatch channels around the slot-placement
-   snapshot, keeping same-shard commands direct.
-2. Wire the TCP RESP endpoint to the parser, placement lookup, and command
-   executor.
+1. Integrate cache inbox draining into the owning shard loop and connect remote
+   handoffs to a cache-specific cluster transport.
+2. Wire the TCP RESP endpoint to the parser, placement lookup, and dispatcher.
 3. Add hierarchical expiration and packed aggregate data structures.
 4. Add WAL/replication acknowledgement modes.
 5. Add RESP compatibility for hashes, sets, lists, sorted sets, and scripts or
