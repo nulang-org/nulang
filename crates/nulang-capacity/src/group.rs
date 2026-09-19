@@ -132,18 +132,16 @@ pub fn plan_placement_group(
             bundles,
             &request.placement_key,
             domain,
-            false,
             now_unix_ms,
             max_heartbeat_age_ms,
         )?,
-        PlacementGroupStrategy::StrictSpread(domain) => plan_spread(
+        PlacementGroupStrategy::StrictSpread(domain) => plan_strict_spread(
             topology,
             heartbeats,
-            usage,
-            bundles,
+            &usage,
+            &bundles,
             &request.placement_key,
             domain,
-            true,
             now_unix_ms,
             max_heartbeat_age_ms,
         )?,
@@ -293,9 +291,9 @@ fn choose_most_constrained<'a>(
     now_unix_ms: u64,
     max_heartbeat_age_ms: u64,
 ) -> Result<(&'a PlacementBundle, Vec<AllocationCandidate<'a>>), PlacementGroupError> {
-    let mut best: Option<(&PlacementBundle, Vec<AllocationCandidate<'a>>)> = None;
+    let mut best: Option<(&'a PlacementBundle, Vec<AllocationCandidate<'a>>)> = None;
 
-    for bundle in remaining {
+    for &bundle in remaining {
         let candidates = live_candidates(
             topology,
             heartbeats,
@@ -387,6 +385,149 @@ fn plan_pack(
     Ok(assignments)
 }
 
+
+struct StrictSpreadOptions<'a> {
+    bundle: &'a PlacementBundle,
+    options: Vec<(String, &'a ResourceProvider)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_strict_spread<'a>(
+    topology: &'a TopologySnapshot,
+    heartbeats: &CapacityHeartbeatBook,
+    usage: &BTreeMap<String, ProviderUsage>,
+    bundles: &[&'a PlacementBundle],
+    placement_key: &str,
+    domain: FailureDomain,
+    now_unix_ms: u64,
+    max_heartbeat_age_ms: u64,
+) -> Result<Vec<PlacementAssignment>, PlacementGroupError> {
+    let mut all_options = Vec::with_capacity(bundles.len());
+
+    for bundle in bundles {
+        let mut candidates = live_candidates(
+            topology,
+            heartbeats,
+            usage,
+            &bundle.request,
+            now_unix_ms,
+            max_heartbeat_age_ms,
+        )?;
+        candidates.retain(|candidate| candidate.provider.location.domain_value(domain).is_some());
+
+        if candidates.is_empty() {
+            return Err(PlacementGroupError::MissingFailureDomain {
+                bundle_id: bundle.bundle_id.clone(),
+                domain,
+            });
+        }
+
+        let key = format!("{placement_key}:{}", bundle.bundle_id);
+        let ordered = deterministic_provider_order(&key, &candidates);
+        let mut seen_domains = BTreeSet::new();
+        let mut options = Vec::new();
+
+        for provider in ordered {
+            let value = provider
+                .location
+                .domain_value(domain)
+                .expect("filtered candidate has failure domain")
+                .to_string();
+            if seen_domains.insert(value.clone()) {
+                options.push((value, provider));
+            }
+        }
+
+        all_options.push(StrictSpreadOptions {
+            bundle,
+            options,
+        });
+    }
+
+    all_options.sort_by(|left, right| {
+        left.options
+            .len()
+            .cmp(&right.options.len())
+            .then_with(|| left.bundle.bundle_id.cmp(&right.bundle.bundle_id))
+    });
+
+    fn augment<'a>(
+        bundle_index: usize,
+        all_options: &[StrictSpreadOptions<'a>],
+        domain_to_bundle: &mut BTreeMap<String, usize>,
+        provider_for_bundle: &mut BTreeMap<usize, &'a ResourceProvider>,
+        seen_domains: &mut BTreeSet<String>,
+    ) -> bool {
+        for (domain_value, provider) in &all_options[bundle_index].options {
+            if !seen_domains.insert(domain_value.clone()) {
+                continue;
+            }
+
+            let occupied_by = domain_to_bundle.get(domain_value).copied();
+            let available = match occupied_by {
+                None => true,
+                Some(other_bundle) => augment(
+                    other_bundle,
+                    all_options,
+                    domain_to_bundle,
+                    provider_for_bundle,
+                    seen_domains,
+                ),
+            };
+
+            if available {
+                domain_to_bundle.insert(domain_value.clone(), bundle_index);
+                provider_for_bundle.insert(bundle_index, *provider);
+                return true;
+            }
+        }
+        false
+    }
+
+    let mut domain_to_bundle = BTreeMap::new();
+    let mut provider_for_bundle = BTreeMap::new();
+
+    for bundle_index in 0..all_options.len() {
+        let mut seen_domains = BTreeSet::new();
+        if !augment(
+            bundle_index,
+            &all_options,
+            &mut domain_to_bundle,
+            &mut provider_for_bundle,
+            &mut seen_domains,
+        ) {
+            return Err(PlacementGroupError::StrictSpreadUnsatisfied {
+                bundle_id: all_options[bundle_index].bundle.bundle_id.clone(),
+                domain,
+                occupied: domain_to_bundle.len(),
+            });
+        }
+    }
+
+    let mut assignments = Vec::with_capacity(all_options.len());
+    for (bundle_index, entry) in all_options.iter().enumerate() {
+        let provider = provider_for_bundle
+            .get(&bundle_index)
+            .copied()
+            .expect("successful matching assigns provider");
+        let domain_value = domain_to_bundle
+            .iter()
+            .find_map(|(value, assigned_bundle)| {
+                (*assigned_bundle == bundle_index).then_some(value.clone())
+            })
+            .expect("successful matching assigns domain");
+
+        assignments.push(PlacementAssignment {
+            bundle_id: entry.bundle.bundle_id.clone(),
+            provider_id: provider.id.clone(),
+            failure_domain: Some(domain_value),
+        });
+    }
+
+    assignments.sort_by(|left, right| left.bundle_id.cmp(&right.bundle_id));
+    Ok(assignments)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_spread(
     topology: &TopologySnapshot,
@@ -395,7 +536,6 @@ fn plan_spread(
     mut remaining: Vec<&PlacementBundle>,
     placement_key: &str,
     domain: FailureDomain,
-    strict: bool,
     now_unix_ms: u64,
     max_heartbeat_age_ms: u64,
 ) -> Result<Vec<PlacementAssignment>, PlacementGroupError> {
@@ -432,16 +572,6 @@ fn plan_spread(
         let provider = candidates
             .iter()
             .map(|candidate| candidate.provider)
-            .filter(|provider| {
-                if !strict {
-                    return true;
-                }
-                let value = provider
-                    .location
-                    .domain_value(domain)
-                    .expect("filtered candidate has failure domain");
-                !domain_counts.contains_key(value)
-            })
             .min_by_key(|provider| {
                 let value = provider
                     .location
@@ -457,13 +587,7 @@ fn plan_spread(
                 )
             });
 
-        let Some(provider) = provider else {
-            return Err(PlacementGroupError::StrictSpreadUnsatisfied {
-                bundle_id: bundle.bundle_id.clone(),
-                domain,
-                occupied: domain_counts.len(),
-            });
-        };
+        let provider = provider.expect("non-empty candidates after domain filtering");
 
         let domain_value = provider
             .location
