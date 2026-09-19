@@ -84,9 +84,13 @@ impl PostgresAllocationLedgerStore {
         Self { client }
     }
 
-    /// Connect with tokio-postgres and return the connection driver separately
-    /// so the hosted control plane can monitor its lifecycle.
-    pub async fn connect(
+    /// Local/development convenience connector without TLS.
+    ///
+    /// Production control planes should establish a TLS-enabled
+    /// tokio-postgres Client appropriate for their database provider and pass
+    /// it to new(). The connection driver is returned so callers can monitor
+    /// its lifecycle rather than silently detaching database failures.
+    pub async fn connect_no_tls(
         database_url: &str,
     ) -> Result<(Self, JoinHandle<Result<(), tokio_postgres::Error>>), PostgresCapacityError> {
         let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
