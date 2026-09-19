@@ -330,6 +330,123 @@ pub(crate) fn decode_queue_lease_mutation(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FabricQueueOperationKind {
+    Acquire,
+    Ack,
+    Nack,
+    Renew,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FabricQueueOperation {
+    pub kind: FabricQueueOperationKind,
+    pub sequence: u64,
+    pub consumer: String,
+    pub lease_token: u64,
+    pub queue_epoch: u64,
+    pub operation_id: Option<String>,
+    pub status: Option<FabricQueueJobStatus>,
+    pub available_at_ms: Option<u64>,
+    pub lease_until_ms: Option<u64>,
+}
+
+pub(crate) fn decode_queue_operation(
+    bytes: &[u8],
+) -> io::Result<Option<FabricQueueOperation>> {
+    let event: QueueMutation = serde_json::from_slice(bytes).map_err(json_error)?;
+    let operation = match event {
+        QueueMutation::LeaseAcquired {
+            sequence,
+            consumer,
+            lease_token,
+            lease_until_ms,
+            queue_epoch,
+            operation_id,
+            ..
+        } => FabricQueueOperation {
+            kind: FabricQueueOperationKind::Acquire,
+            sequence,
+            consumer,
+            lease_token,
+            queue_epoch,
+            operation_id,
+            status: None,
+            available_at_ms: None,
+            lease_until_ms: Some(lease_until_ms),
+        },
+        QueueMutation::Completed {
+            sequence,
+            consumer,
+            lease_token,
+            queue_epoch,
+            operation_id,
+        } => FabricQueueOperation {
+            kind: FabricQueueOperationKind::Ack,
+            sequence,
+            consumer,
+            lease_token,
+            queue_epoch,
+            operation_id,
+            status: Some(FabricQueueJobStatus::Completed),
+            available_at_ms: None,
+            lease_until_ms: None,
+        },
+        QueueMutation::Nacked {
+            sequence,
+            consumer,
+            lease_token,
+            status,
+            available_at_ms,
+            queue_epoch,
+            operation_id,
+            ..
+        } => FabricQueueOperation {
+            kind: FabricQueueOperationKind::Nack,
+            sequence,
+            consumer,
+            lease_token,
+            queue_epoch,
+            operation_id,
+            status: Some(status),
+            available_at_ms,
+            lease_until_ms: None,
+        },
+        QueueMutation::LeaseRenewed {
+            sequence,
+            consumer,
+            lease_token,
+            lease_until_ms,
+            queue_epoch,
+            operation_id,
+        } => FabricQueueOperation {
+            kind: FabricQueueOperationKind::Renew,
+            sequence,
+            consumer,
+            lease_token,
+            queue_epoch,
+            operation_id,
+            status: None,
+            available_at_ms: None,
+            lease_until_ms: Some(lease_until_ms),
+        },
+        QueueMutation::QueueCreated { .. } | QueueMutation::LeaseExpired { .. } => {
+            return Ok(None);
+        }
+    };
+    Ok(Some(operation))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FabricQueueJobSnapshot {
+    pub status: FabricQueueJobStatus,
+    pub deliveries: u32,
+    pub lease_token: u64,
+    pub consumer: Option<String>,
+    pub available_at_ms: u64,
+    pub lease_until_ms: Option<u64>,
+}
+
 
 /// Queue state machine borrowing an existing Fabric stream store.
 ///
@@ -1436,6 +1553,165 @@ impl Runtime {
             deliveries: lease.deliveries,
             lease_token: lease.lease_token,
             lease_until_ms: lease.lease_until_ms,
+        })
+    }
+
+    pub(crate) fn fabric_queue_plan_committed_ack(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        now_ms: u64,
+    ) -> io::Result<Vec<u8>> {
+        validate_consumer_name(consumer)?;
+        validate_operation_id(operation_id)?;
+        if queue_epoch == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replicated Fabric queue ACK requires a non-zero queue epoch",
+            ));
+        }
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        validate_active_job(&state, sequence, consumer, lease_token, now_ms)?;
+        serde_json::to_vec(&QueueMutation::Completed {
+            sequence,
+            consumer: consumer.to_string(),
+            lease_token,
+            queue_epoch,
+            operation_id: Some(operation_id.to_string()),
+        })
+        .map_err(json_error)
+    }
+
+    pub(crate) fn fabric_queue_plan_committed_nack(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        delay_ms: u64,
+        error: Option<&str>,
+        now_ms: u64,
+    ) -> io::Result<(Vec<u8>, FabricQueueNackResult)> {
+        validate_consumer_name(consumer)?;
+        validate_operation_id(operation_id)?;
+        if queue_epoch == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replicated Fabric queue NACK requires a non-zero queue epoch",
+            ));
+        }
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        validate_active_job(&state, sequence, consumer, lease_token, now_ms)?;
+        let deliveries = state
+            .jobs
+            .get(&sequence)
+            .expect("validated queue job must exist")
+            .deliveries;
+        let (status, available_at_ms) = if deliveries >= state.config.max_attempts {
+            (
+                if state.config.dead_letter_queue.is_some() {
+                    FabricQueueJobStatus::DeadLettered
+                } else {
+                    FabricQueueJobStatus::Failed
+                },
+                None,
+            )
+        } else {
+            (
+                FabricQueueJobStatus::Waiting,
+                Some(now_ms.saturating_add(delay_ms)),
+            )
+        };
+        let bytes = serde_json::to_vec(&QueueMutation::Nacked {
+            sequence,
+            consumer: consumer.to_string(),
+            lease_token,
+            status,
+            available_at_ms,
+            last_error: error.map(ToOwned::to_owned),
+            queue_epoch,
+            operation_id: Some(operation_id.to_string()),
+        })
+        .map_err(json_error)?;
+        Ok((
+            bytes,
+            FabricQueueNackResult {
+                status,
+                deliveries,
+                available_at_ms,
+            },
+        ))
+    }
+
+    pub(crate) fn fabric_queue_plan_committed_renew(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        extension_ms: u64,
+        now_ms: u64,
+    ) -> io::Result<(Vec<u8>, u64)> {
+        if extension_ms == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric queue lease extension must be greater than zero",
+            ));
+        }
+        validate_consumer_name(consumer)?;
+        validate_operation_id(operation_id)?;
+        if queue_epoch == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replicated Fabric queue renew requires a non-zero queue epoch",
+            ));
+        }
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        validate_active_job(&state, sequence, consumer, lease_token, now_ms)?;
+        let lease_until_ms = now_ms.saturating_add(extension_ms);
+        let bytes = serde_json::to_vec(&QueueMutation::LeaseRenewed {
+            sequence,
+            consumer: consumer.to_string(),
+            lease_token,
+            lease_until_ms,
+            queue_epoch,
+            operation_id: Some(operation_id.to_string()),
+        })
+        .map_err(json_error)?;
+        Ok((bytes, lease_until_ms))
+    }
+
+    pub(crate) fn fabric_queue_committed_job_snapshot(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+    ) -> io::Result<FabricQueueJobSnapshot> {
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        let job = state.jobs.get(&sequence).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Fabric queue job {sequence} does not exist"),
+            )
+        })?;
+        Ok(FabricQueueJobSnapshot {
+            status: job.status,
+            deliveries: job.deliveries,
+            lease_token: job.lease_token,
+            consumer: job.consumer.clone(),
+            available_at_ms: job.available_at_ms,
+            lease_until_ms: job.lease_until_ms,
         })
     }
 
