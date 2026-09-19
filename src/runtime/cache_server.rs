@@ -31,6 +31,13 @@ use super::cache_dispatch::{
 };
 use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
 use super::cache_routing::{CachePlacementError, CacheShardOwner, CacheSlotMap};
+use super::cache_transport::{
+    CacheServiceTransportEndpoint, CacheServiceTransportSender, CacheTransportInbound,
+    CacheTransportMessage, CacheTransportOutbound,
+};
+use super::cluster::NodeId;
+use super::resp::{parse_command, RespParseError};
+use super::resp_cache::{command_slot, execute_command, RespCommandSlot};
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
@@ -158,7 +165,29 @@ impl CachePlacementPublisher {
 }
 
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheRemoteControlError {
+    TopologyChanged {
+        installed_epoch: u64,
+        requested_epoch: u64,
+    },
+    OwnerMismatch,
+    InvalidFrame,
+    Parse(RespParseError),
+}
+
 enum CacheShardControlRequest {
+    ExecuteRemoteCommand {
+        placement_epoch: u64,
+        slot: u16,
+        frame: Vec<u8>,
+        reply: SyncSender<Result<Vec<u8>, CacheRemoteControlError>>,
+    },
+    ImportRemoteBatch {
+        placement_epoch: u64,
+        batch: CacheTransferBatch,
+        reply: SyncSender<Result<Vec<CacheTransferImport>, CacheRemoteControlError>>,
+    },
     Export {
         slot: u16,
         cursor: Option<CacheTransferCursor>,
