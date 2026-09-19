@@ -132,6 +132,16 @@ pub struct FabricQueueReplicatedRenewResult {
     pub resumed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricQueueReplicatedReapResult {
+    pub policy: FabricQueuePolicySyncReport,
+    pub mutation_sequence: Option<u64>,
+    pub replication: Option<FabricStreamReplicationStatus>,
+    pub expired_sequence: Option<u64>,
+    pub result: Option<FabricQueueNackResult>,
+    pub resumed: bool,
+}
+
 #[derive(Debug, Clone)]
 struct PendingQueuePolicy {
     placement: FabricQueuePlacement,
@@ -1197,6 +1207,148 @@ impl Runtime {
             mutation_sequence: Some(appended.sequence),
             replication: Some(appended.status),
             lease_until_ms: appended.status.committed.then_some(lease_until_ms),
+            resumed: false,
+        })
+    }
+
+    /// Replicate the next due lease-expiry transition.
+    ///
+    /// Expiry is a queue metadata mutation, not a local wall-clock side effect.
+    /// The job remains Active until LeaseExpired reaches quorum, at which point
+    /// it becomes Waiting or terminal according to max_attempts/DLQ policy.
+    pub fn fabric_queue_reap_expired_replicated(
+        &mut self,
+        queue: &str,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedReapResult> {
+        let policy = self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        if !policy.ready {
+            return Ok(FabricQueueReplicatedReapResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                expired_sequence: None,
+                result: None,
+                resumed: false,
+            });
+        }
+
+        self.fabric_queue_require_committed_creation(queue)?;
+        let placement = self
+            .fabric_queue_replication_placement(queue)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing"))?;
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let info = self.fabric_stream_info(&mutation_stream)?;
+        let tail = info.last_sequence.unwrap_or(0);
+        let committed = info.committed_sequence;
+
+        if tail > committed {
+            if tail != committed.saturating_add(1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Fabric queue {queue:?} has more than one uncommitted metadata mutation"
+                    ),
+                ));
+            }
+            let record = self
+                .fabric_stream_read(&mutation_stream, committed.saturating_add(1), 1)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Fabric queue metadata tail disappeared during expiry recovery",
+                    )
+                })?;
+            let operation = decode_queue_operation(&record.payload)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Fabric queue has an uncommitted non-worker metadata mutation",
+                )
+            })?;
+            if operation.kind != FabricQueueOperationKind::Expire {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "Fabric queue {queue:?} has an uncommitted {:?} operation; retry it before lease expiry",
+                        operation.kind
+                    ),
+                ));
+            }
+            if operation.queue_epoch != placement.epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "pending Fabric queue expiry uses a stale queue epoch",
+                ));
+            }
+
+            let replication = self.fabric_queue_resume_metadata_replication(
+                &mutation_stream,
+                partition,
+                record.sequence,
+                committed,
+            )?;
+            let result = if replication.committed {
+                let snapshot =
+                    self.fabric_queue_committed_job_snapshot(queue, operation.sequence)?;
+                let expected_status = operation.status.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "committed Fabric queue expiry is missing target status",
+                    )
+                })?;
+                if snapshot.status != expected_status {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "committed Fabric queue state does not match lease expiry mutation",
+                    ));
+                }
+                Some(FabricQueueNackResult {
+                    status: snapshot.status,
+                    deliveries: snapshot.deliveries,
+                    available_at_ms: operation.available_at_ms,
+                })
+            } else {
+                None
+            };
+            return Ok(FabricQueueReplicatedReapResult {
+                policy,
+                mutation_sequence: Some(record.sequence),
+                replication: Some(replication),
+                expired_sequence: Some(operation.sequence),
+                result,
+                resumed: true,
+            });
+        }
+
+        let Some(plan) =
+            self.fabric_queue_plan_committed_expiry(queue, placement.epoch, now_ms)?
+        else {
+            return Ok(FabricQueueReplicatedReapResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                expired_sequence: None,
+                result: None,
+                resumed: false,
+            });
+        };
+
+        let appended = self.fabric_stream_replicated_append(
+            &mutation_stream,
+            partition,
+            replication_factor,
+            &plan.mutation_bytes,
+        )?;
+        Ok(FabricQueueReplicatedReapResult {
+            policy,
+            mutation_sequence: Some(appended.sequence),
+            replication: Some(appended.status),
+            expired_sequence: Some(plan.sequence),
+            result: appended.status.committed.then_some(plan.result),
             resumed: false,
         })
     }
