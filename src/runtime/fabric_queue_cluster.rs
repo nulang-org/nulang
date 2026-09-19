@@ -1422,6 +1422,64 @@ mod tests {
             assert_eq!(info.waiting, 1);
         }
 
+        // Worker delivery is withheld until the LeaseAcquired mutation is
+        // quorum committed. Same-operation retries resume sequence 2; a
+        // different acquire cannot race the in-flight metadata mutation.
+        let pending_lease = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("orders", "worker-a", "acquire-1", 0, 3, 200)
+            .unwrap();
+        assert_eq!(pending_lease.mutation_sequence, Some(2));
+        assert!(pending_lease.delivery.is_none());
+        assert!(!pending_lease.replication.unwrap().committed);
+
+        let retry_lease = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("orders", "worker-a", "acquire-1", 0, 3, 200)
+            .unwrap();
+        assert_eq!(retry_lease.mutation_sequence, Some(2));
+        assert!(retry_lease.resumed);
+        assert!(retry_lease.delivery.is_none());
+
+        let competing = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("orders", "worker-b", "acquire-2", 0, 3, 200)
+            .unwrap_err();
+        assert_eq!(competing.kind(), io::ErrorKind::WouldBlock);
+
+        cluster.run_rounds(12);
+        let committed_lease = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("orders", "worker-a", "acquire-1", 0, 3, 200)
+            .unwrap();
+        assert!(committed_lease.resumed);
+        assert!(committed_lease.replication.unwrap().committed);
+        let delivery = committed_lease.delivery.expect("lease must be visible after quorum");
+        assert_eq!(delivery.sequence, 1);
+        assert_eq!(delivery.queue_epoch, placement.epoch);
+        assert_eq!(delivery.job_id, "job-1");
+        assert_eq!(delivery.name, "render");
+        assert_eq!(delivery.payload, b"payload");
+        assert_eq!(delivery.deliveries, 1);
+        assert_eq!(delivery.lease_token, 1);
+
+        for index in 0..3 {
+            assert_eq!(
+                cluster
+                    .node_mut(index)
+                    .fabric_stream_committed_sequence(&queue_mutation_stream_name("orders"))
+                    .unwrap(),
+                2
+            );
+            let info = cluster
+                .node_mut(index)
+                .fabric_queue_info_replicated("orders")
+                .unwrap();
+            assert_eq!(info.total, 1);
+            assert_eq!(info.waiting, 0);
+            assert_eq!(info.active, 1);
+        }
+
         // Simulate leader-local torn/uncommitted tails. The replicated read
         // path must stop at each durable commit boundary and never attempt to
         // decode these malformed records.
@@ -1437,14 +1495,15 @@ mod tests {
                 .node_mut(leader_index)
                 .fabric_stream_append(&queue_mutation_stream_name("orders"), b"not-a-queue-mutation")
                 .unwrap(),
-            2
+            3
         );
         let committed_view = cluster
             .node_mut(leader_index)
             .fabric_queue_info_replicated("orders")
             .unwrap();
         assert_eq!(committed_view.total, 1);
-        assert_eq!(committed_view.waiting, 1);
+        assert_eq!(committed_view.waiting, 0);
+        assert_eq!(committed_view.active, 1);
 
         let _ = std::fs::remove_dir_all(base);
     }
