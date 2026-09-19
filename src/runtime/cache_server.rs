@@ -47,6 +47,36 @@ const CACHE_NETWORK_MAX_BATCH: usize = 64;
 const CACHE_NETWORK_IDLE_SLEEP: Duration = Duration::from_millis(1);
 const CACHE_NETWORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 const CACHE_NETWORK_DEDUPE_ENTRIES: usize = 4_096;
+const CACHE_NETWORK_DEDUPE_RETENTION: Duration = Duration::from_secs(5);
+const CACHE_NETWORK_PENDING_ENTRIES: usize = 4_096;
+const CACHE_NETWORK_RETRY_INITIAL: Duration = Duration::from_millis(10);
+const CACHE_NETWORK_RETRY_MAX: Duration = Duration::from_millis(250);
+const CACHE_NETWORK_RETRY_ATTEMPTS: u8 = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheNetworkTimeoutOperation {
+    Command {
+        request_id: u64,
+        placement_epoch: u64,
+        slot: u16,
+    },
+    Transfer {
+        transfer_id: u64,
+        placement_epoch: u64,
+        slot: u16,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheNetworkTimeout {
+    pub peer: NodeId,
+    pub attempts: u8,
+    /// A command timeout means the execution outcome is unknown: the remote
+    /// mutation may have committed while every response was lost. A transfer
+    /// timeout is safer because source finalization still requires its matching
+    /// application-level TransferAck.
+    pub operation: CacheNetworkTimeoutOperation,
+}
 
 #[derive(Debug, Clone)]
 pub struct CacheServerConfig {
@@ -385,6 +415,8 @@ pub enum CacheServiceError {
     TransportUnavailable,
     TransportBridge(CacheTransportBridgeError),
     NetworkEventDisconnected,
+    NetworkRetryQueueFull,
+    NetworkRequestIdInUse,
     RemoteTransferTargetMustBeRemote,
     RemoteTransferNotActive(u16),
     RemoteTransferAckMismatch,
@@ -589,7 +621,11 @@ impl CacheService {
             .as_ref()
             .map(CacheServiceTransportEndpoint::sender);
         let network_shutdown = Arc::new(AtomicBool::new(false));
+        let network_retry = Arc::new(Mutex::new(CacheNetworkRetryState::new(
+            CACHE_NETWORK_PENDING_ENTRIES,
+        )));
         let (network_event_tx, network_event_rx) = mpsc::sync_channel(CACHE_NETWORK_EVENT_CAPACITY);
+        let (network_timeout_tx, network_timeout_rx) = mpsc::channel();
         let mut threads: Vec<(u16, JoinHandle<Result<(), CacheServerError>>)> =
             Vec::with_capacity(self.servers.len());
 
@@ -628,6 +664,7 @@ impl CacheService {
             let coordinator_controls = controls.clone();
             let placement_publisher = self.placement_publisher.clone();
             let shutdown = network_shutdown.clone();
+            let retry_state = network_retry.clone();
             let local_node_id = self.local_node_id;
             match thread::Builder::new()
                 .name("nulang-cache-network".to_string())
@@ -638,6 +675,8 @@ impl CacheService {
                         coordinator_controls,
                         placement_publisher,
                         network_event_tx,
+                        network_timeout_tx,
+                        retry_state,
                         shutdown,
                     );
                 }) {
@@ -666,6 +705,8 @@ impl CacheService {
             placement_publisher: self.placement_publisher,
             transport_sender,
             network_events: has_transport.then_some(network_event_rx),
+            network_timeouts: has_transport.then_some(network_timeout_rx),
+            network_retry: has_transport.then_some(network_retry),
             network_thread,
             network_shutdown,
         })
@@ -681,6 +722,8 @@ pub struct CacheServiceHandle {
     placement_publisher: Arc<CachePlacementPublisher>,
     transport_sender: Option<CacheServiceTransportSender>,
     network_events: Option<Receiver<CacheTransportInbound>>,
+    network_timeouts: Option<Receiver<CacheNetworkTimeout>>,
+    network_retry: Option<Arc<Mutex<CacheNetworkRetryState>>>,
     network_thread: Option<JoinHandle<()>>,
     network_shutdown: Arc<AtomicBool>,
 }
@@ -717,9 +760,27 @@ impl CacheServiceHandle {
         message
             .validate_sender(NodeId(self.local_node_id))
             .map_err(|_| CacheServiceError::TransportUnavailable)?;
-        sender
-            .try_send(CacheTransportOutbound { to_node, message })
-            .map_err(CacheServiceError::from)
+
+        let outbound = CacheTransportOutbound { to_node, message };
+        let retry_key = cache_pending_key(outbound.to_node, &outbound.message);
+        if let Some(key) = retry_key {
+            let retry = self
+                .network_retry
+                .as_ref()
+                .ok_or(CacheServiceError::TransportUnavailable)?;
+            let mut retry = retry.lock();
+            retry.register(key, outbound.clone())?;
+        }
+
+        match sender.try_send(outbound) {
+            Ok(()) | Err(CacheTransportBridgeError::OutboundFull) => Ok(()),
+            Err(error) => {
+                if let (Some(key), Some(retry)) = (retry_key, self.network_retry.as_ref()) {
+                    retry.lock().remove(key);
+                }
+                Err(CacheServiceError::TransportBridge(error))
+            }
+        }
     }
 
     /// Receive an application-level remote command response or transfer ACK.
@@ -735,6 +796,26 @@ impl CacheServiceHandle {
             .ok_or(CacheServiceError::TransportUnavailable)?;
         match receiver.try_recv() {
             Ok(event) => Ok(Some(event)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(CacheServiceError::NetworkEventDisconnected),
+        }
+    }
+
+    /// Receive a terminal retry outcome.
+    ///
+    /// Command timeouts are deliberately not converted into RESP errors because
+    /// execution may have happened remotely before the reply was lost. Transfer
+    /// timeouts never finalize the source batch and are therefore safe to retry
+    /// later with a fresh controller decision.
+    pub fn try_recv_network_timeout(
+        &self,
+    ) -> Result<Option<CacheNetworkTimeout>, CacheServiceError> {
+        let receiver = self
+            .network_timeouts
+            .as_ref()
+            .ok_or(CacheServiceError::TransportUnavailable)?;
+        match receiver.try_recv() {
+            Ok(timeout) => Ok(Some(timeout)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(CacheServiceError::NetworkEventDisconnected),
         }
