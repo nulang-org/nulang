@@ -45,6 +45,16 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### RESP-compatible cache kernel — 2026-09-19
+- **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
+  `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
+  mailboxes, the VM heap, and ORCA: small values inline, larger keys/values use
+  reusable size-class arena blocks, the index is contiguous open addressing,
+  TTL references are generation-fenced, and routing preserves Redis Cluster's
+  16,384 logical slots and hash tags. RESP2 command frames are parsed into
+  borrowed slices without allocating an argument vector. Criterion coverage
+  tracks local GET/SET churn, arena reuse, and slot hashing.
+
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
 
