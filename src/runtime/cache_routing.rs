@@ -20,6 +20,18 @@ pub struct CacheSlotRange {
     pub owner: CacheShardOwner,
 }
 
+/// Two-phase slot movement. The stable owner remains `source` until commit.
+///
+/// Every node can carry the same transition snapshot. The source interprets it
+/// as MIGRATING; the target interprets it as IMPORTING. That avoids publishing
+/// node-relative migration state and makes epoch fencing deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheSlotMigration {
+    pub source: CacheShardOwner,
+    pub target: CacheShardOwner,
+    pub started_epoch: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachePlacementError {
     InvalidShardCount,
@@ -36,6 +48,22 @@ pub enum CachePlacementError {
     StaleEpoch {
         current: u64,
         proposed: u64,
+    },
+    InvalidSlot(u16),
+    MigrationInProgress(u16),
+    MigrationNotFound(u16),
+    MigrationSourceMismatch {
+        slot: u16,
+        expected: CacheShardOwner,
+        actual: CacheShardOwner,
+    },
+    MigrationTargetMatchesSource(u16),
+    MigrationMismatch {
+        slot: u16,
+        expected_source: CacheShardOwner,
+        expected_target: CacheShardOwner,
+        actual_source: CacheShardOwner,
+        actual_target: CacheShardOwner,
     },
 }
 
@@ -55,6 +83,7 @@ pub enum CacheRoute {
 pub struct CacheSlotMap {
     epoch: u64,
     owners: Vec<CacheShardOwner>,
+    migrations: Vec<Option<CacheSlotMigration>>,
 }
 
 impl CacheSlotMap {
@@ -76,7 +105,11 @@ impl CacheSlotMap {
             owners.push(CacheShardOwner { node_id, shard });
         }
 
-        Ok(Self { epoch: 0, owners })
+        Ok(Self {
+            epoch: 0,
+            owners,
+            migrations: vec![None; REDIS_CLUSTER_SLOTS as usize],
+        })
     }
 
     pub fn epoch(&self) -> u64 {
@@ -86,6 +119,18 @@ impl CacheSlotMap {
     pub fn owner_for_slot(&self, slot: u16) -> Option<CacheShardOwner> {
         self.owners.get(slot as usize).copied()
     }
+
+    pub fn migration_for_slot(&self, slot: u16) -> Option<CacheSlotMigration> {
+        self.migrations.get(slot as usize).copied().flatten()
+    }
+
+    pub fn migrations(&self) -> impl Iterator<Item = (u16, CacheSlotMigration)> + '_ {
+        self.migrations
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, migration)| migration.map(|migration| (slot as u16, migration)))
+    }
+
 
     pub fn owner_for_key(&self, key: &[u8]) -> CacheShardOwner {
         // redis_slot always returns 0..16383, so this index is guaranteed.
@@ -153,12 +198,7 @@ impl CacheSlotMap {
         proposed_epoch: u64,
         assignments: &[CacheSlotRange],
     ) -> Result<(), CachePlacementError> {
-        if proposed_epoch <= self.epoch {
-            return Err(CachePlacementError::StaleEpoch {
-                current: self.epoch,
-                proposed: proposed_epoch,
-            });
-        }
+        self.require_new_epoch(proposed_epoch)?;
 
         for assignment in assignments {
             if assignment.start > assignment.end || assignment.end >= REDIS_CLUSTER_SLOTS {
@@ -166,6 +206,14 @@ impl CacheSlotMap {
                     start: assignment.start,
                     end: assignment.end,
                 });
+            }
+        }
+
+        for assignment in assignments {
+            for slot in assignment.start..=assignment.end {
+                if self.migrations[slot as usize].is_some() {
+                    return Err(CachePlacementError::MigrationInProgress(slot));
+                }
             }
         }
 
@@ -187,7 +235,126 @@ impl CacheSlotMap {
                 self.owners[slot as usize] = assignment.owner;
             }
         }
+
         self.epoch = proposed_epoch;
+        Ok(())
+    }
+
+    /// Start a two-phase slot migration without changing stable ownership.
+    ///
+    /// `expected_source` fences stale controllers that planned against an old
+    /// topology snapshot. The target may begin accepting one-shot ASKING
+    /// traffic immediately, while the source remains the advertised owner.
+    pub fn begin_migration(
+        &mut self,
+        proposed_epoch: u64,
+        slot: u16,
+        expected_source: CacheShardOwner,
+        target: CacheShardOwner,
+    ) -> Result<(), CachePlacementError> {
+        self.require_new_epoch(proposed_epoch)?;
+        let Some(&actual_source) = self.owners.get(slot as usize) else {
+            return Err(CachePlacementError::InvalidSlot(slot));
+        };
+        if self.migrations[slot as usize].is_some() {
+            return Err(CachePlacementError::MigrationInProgress(slot));
+        }
+        if actual_source != expected_source {
+            return Err(CachePlacementError::MigrationSourceMismatch {
+                slot,
+                expected: expected_source,
+                actual: actual_source,
+            });
+        }
+        if target == actual_source {
+            return Err(CachePlacementError::MigrationTargetMatchesSource(slot));
+        }
+
+        self.migrations[slot as usize] = Some(CacheSlotMigration {
+            source: actual_source,
+            target,
+            started_epoch: proposed_epoch,
+        });
+        self.epoch = proposed_epoch;
+        Ok(())
+    }
+
+    /// Commit a migration and atomically make the target the stable owner.
+    pub fn commit_migration(
+        &mut self,
+        proposed_epoch: u64,
+        slot: u16,
+        expected_source: CacheShardOwner,
+        expected_target: CacheShardOwner,
+    ) -> Result<(), CachePlacementError> {
+        self.require_new_epoch(proposed_epoch)?;
+        let Some(current) = self.migration_for_slot(slot) else {
+            if slot >= REDIS_CLUSTER_SLOTS {
+                return Err(CachePlacementError::InvalidSlot(slot));
+            }
+            return Err(CachePlacementError::MigrationNotFound(slot));
+        };
+        if current.source != expected_source || current.target != expected_target {
+            return Err(CachePlacementError::MigrationMismatch {
+                slot,
+                expected_source,
+                expected_target,
+                actual_source: current.source,
+                actual_target: current.target,
+            });
+        }
+        let actual_owner = self.owners[slot as usize];
+        if actual_owner != expected_source {
+            return Err(CachePlacementError::MigrationSourceMismatch {
+                slot,
+                expected: expected_source,
+                actual: actual_owner,
+            });
+        }
+
+        self.owners[slot as usize] = expected_target;
+        self.migrations[slot as usize] = None;
+        self.epoch = proposed_epoch;
+        Ok(())
+    }
+
+    /// Abort a migration while keeping the source as stable owner.
+    pub fn cancel_migration(
+        &mut self,
+        proposed_epoch: u64,
+        slot: u16,
+        expected_source: CacheShardOwner,
+        expected_target: CacheShardOwner,
+    ) -> Result<(), CachePlacementError> {
+        self.require_new_epoch(proposed_epoch)?;
+        let Some(current) = self.migration_for_slot(slot) else {
+            if slot >= REDIS_CLUSTER_SLOTS {
+                return Err(CachePlacementError::InvalidSlot(slot));
+            }
+            return Err(CachePlacementError::MigrationNotFound(slot));
+        };
+        if current.source != expected_source || current.target != expected_target {
+            return Err(CachePlacementError::MigrationMismatch {
+                slot,
+                expected_source,
+                expected_target,
+                actual_source: current.source,
+                actual_target: current.target,
+            });
+        }
+
+        self.migrations[slot as usize] = None;
+        self.epoch = proposed_epoch;
+        Ok(())
+    }
+
+    fn require_new_epoch(&self, proposed_epoch: u64) -> Result<(), CachePlacementError> {
+        if proposed_epoch <= self.epoch {
+            return Err(CachePlacementError::StaleEpoch {
+                current: self.epoch,
+                proposed: proposed_epoch,
+            });
+        }
         Ok(())
     }
 }
@@ -389,6 +556,94 @@ mod tests {
         assert_eq!(map.epoch(), 0);
         assert_eq!(map.owner_for_slot(10), before_10);
         assert_eq!(map.owner_for_slot(12), before_12);
+    }
+
+
+    #[test]
+    fn migration_is_epoch_fenced_and_keeps_source_owner_until_commit() {
+        let mut map = CacheSlotMap::new_local(1, 2).unwrap();
+        let slot = 1234;
+        let source = map.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 9,
+            shard: 3,
+        };
+
+        map.begin_migration(1, slot, source, target).unwrap();
+
+        assert_eq!(map.epoch(), 1);
+        assert_eq!(map.owner_for_slot(slot), Some(source));
+        assert_eq!(
+            map.migration_for_slot(slot),
+            Some(CacheSlotMigration {
+                source,
+                target,
+                started_epoch: 1,
+            })
+        );
+        assert_eq!(
+            map.begin_migration(1, slot, source, target),
+            Err(CachePlacementError::StaleEpoch {
+                current: 1,
+                proposed: 1,
+            })
+        );
+
+        map.commit_migration(2, slot, source, target).unwrap();
+        assert_eq!(map.epoch(), 2);
+        assert_eq!(map.owner_for_slot(slot), Some(target));
+        assert_eq!(map.migration_for_slot(slot), None);
+    }
+
+    #[test]
+    fn generic_epoch_assignment_cannot_bypass_active_migration() {
+        let mut map = CacheSlotMap::new_local(1, 1).unwrap();
+        let slot = 77;
+        let source = map.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+        map.begin_migration(1, slot, source, target).unwrap();
+
+        assert_eq!(
+            map.apply_epoch(
+                2,
+                &[CacheSlotRange {
+                    start: slot,
+                    end: slot,
+                    owner: target,
+                }],
+            ),
+            Err(CachePlacementError::MigrationInProgress(slot))
+        );
+        assert_eq!(map.epoch(), 1);
+        assert_eq!(map.owner_for_slot(slot), Some(source));
+    }
+
+    #[test]
+    fn stale_or_mismatched_migration_controller_cannot_commit() {
+        let mut map = CacheSlotMap::new_local(1, 1).unwrap();
+        let slot = 88;
+        let source = map.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+        let wrong_target = CacheShardOwner {
+            node_id: 3,
+            shard: 0,
+        };
+
+        map.begin_migration(4, slot, source, target).unwrap();
+
+        assert!(matches!(
+            map.commit_migration(5, slot, source, wrong_target),
+            Err(CachePlacementError::MigrationMismatch { .. })
+        ));
+        assert_eq!(map.epoch(), 4);
+        assert_eq!(map.owner_for_slot(slot), Some(source));
+        assert_eq!(map.migration_for_slot(slot).unwrap().target, target);
     }
 
     #[test]
