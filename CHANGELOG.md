@@ -55,6 +55,15 @@ two major versions.*
   offset instead of its function-table slot** (`src/bytecode.rs`,
   `src/ffi/c_api.rs`). Non-first top-level functions no longer risk starting
   execution at an unrelated bytecode PC.
+### Package capability-preserving WASM builds and deploys — 2026-09-18
+- **`nula build-wasm` and deploy artifact compilation now preserve package
+  capability grants declared in `Nulang.toml`** (`src/package/commands.rs`).
+  Manifest capabilities are forwarded to compiler invocations consistently
+  with ordinary package builds, so changing the packaging/deploy path no
+  longer changes the package's compiler authority.
+- **Managed deployment packages include source alongside transition artifacts**
+  so isolated deployment admission/build systems can rebuild from source
+  rather than treating client-built bytecode or WASM as authoritative.
 ### Fabric confirmed-removal automatic failover — 2026-09-18
 - **Automatic ownership transition after confirmed leader removal**
   (Experimental, `src/runtime/fabric_stream_epoch.rs`,

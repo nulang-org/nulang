@@ -1209,6 +1209,51 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
     })
 }
 
+fn build_wasm_compiler_args(wasm_path: &str, entry: &str, capabilities: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "--backend".to_string(),
+        "wasm-aot".to_string(),
+        "--out".to_string(),
+        wasm_path.to_string(),
+        entry.to_string(),
+    ];
+    args.extend(capabilities.iter().cloned());
+    args
+}
+
+#[cfg(test)]
+mod build_wasm_capability_tests {
+    use super::build_wasm_compiler_args;
+
+    #[test]
+    fn compiler_args_preserve_manifest_capability_grants() {
+        let args = build_wasm_compiler_args(
+            ".nula/dist/demo.wasm",
+            "src/main.nula",
+            &[
+                "--with".to_string(),
+                "net".to_string(),
+                "--with".to_string(),
+                "storage".to_string(),
+            ],
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--backend",
+                "wasm-aot",
+                "--out",
+                ".nula/dist/demo.wasm",
+                "src/main.nula",
+                "--with",
+                "net",
+                "--with",
+                "storage",
+            ]
+        );
+    }
+}
+
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
 fn cmd_build_wasm() -> NuResult<()> {
@@ -1234,7 +1279,10 @@ fn cmd_build_wasm() -> NuResult<()> {
 
     eprintln!("Building {} (WASM AOT)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+    let caps = capability_args();
+    let args = build_wasm_compiler_args(&wasm_path_str, &entry_str, &caps);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    nulang_exe(&arg_refs)?;
     println!("WASM AOT build succeeded.");
     Ok(())
 }
@@ -2141,14 +2189,33 @@ fn cmd_publish(registry_url: Option<String>, token: Option<String>) -> NuResult<
     println!("Published {}-{} successfully.", name, version);
     Ok(())
 }
-/// Response from POST /api/v1/deploy on Nulang Cloud.
+const NULANG_CLOUD_PACKAGE_MEDIA_TYPE_V1: &str = "application/vnd.nulang.package+gzip;version=1";
+
+/// Asynchronous admission response from the managed Nulang package endpoint.
+/// A successful HTTP response means the deployment was accepted/admitted, not
+/// that runtime promotion has completed.
 #[cfg(feature = "ureq")]
 #[derive(serde::Deserialize)]
 struct DeployResponse {
-    #[allow(dead_code)]
     deployment_id: String,
-    url: String,
     status: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    status_url: Option<String>,
+}
+
+#[cfg(feature = "ureq")]
+fn cloud_deploy_error_message(code: u16, body: &str) -> String {
+    if code == 401 {
+        return "Authentication failed. Check your NULANG_CLOUD_TOKEN.".to_string();
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(error) = value.get("error").and_then(|value| value.as_str()) {
+            return format!("Deploy request rejected ({code}): {error}");
+        }
+    }
+    format!("Deploy request rejected ({code}): {body}")
 }
 
 /// `nula deploy [--wasm] [--url <url>] [--token <token>] [--adapter <kind>] [--dry-run]`
@@ -2226,20 +2293,35 @@ fn cmd_deploy(
         span: Span::default(),
     })?;
 
-    // Always build .nbc (native bytecode tier).
+    // Build every package artifact with the same manifest-declared capability
+    // grants used by `nula build` / `nula build-wasm`. Deploy must not be a
+    // semantically different compilation path merely because it also packages
+    // and uploads the outputs.
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
+    let caps = capability_args();
+    let cap_refs: Vec<&str> = caps.iter().map(String::as_str).collect();
+
+    // Always build .nbc (native bytecode tier).
     let nbc_path = nula_dist.join(format!("{}.nbc", name));
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
     eprintln!("Compiling {} to .nbc...", name);
-    nulang_exe(&["--emit-nbc", "--out", &nbc_path_str, &entry_str])?;
+    nulang_exe(
+        &[
+            &["--emit-nbc", "--out", &nbc_path_str, &entry_str],
+            &cap_refs[..],
+        ]
+        .concat(),
+    )?;
 
     // Optionally build .wasm + .cwasm (WASM tier).
     if wasm {
         let wasm_path = nula_dist.join(format!("{}.wasm", name));
         let wasm_path_str = wasm_path.to_string_lossy().into_owned();
         eprintln!("Compiling {} to .wasm + .cwasm...", name);
-        nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+        let args = build_wasm_compiler_args(&wasm_path_str, &entry_str, &caps);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        nulang_exe(&arg_refs)?;
     }
 
     // Bundle into .tar.gz: .nula/dist/ contents + dist/** + Nulang.toml + Nulang.lock.
@@ -2261,6 +2343,18 @@ fn cmd_deploy(
                     msg: format!("cannot package {}: {}", LOCKFILE_FILE, e),
                     span: Span::default(),
                 })?;
+        }
+
+        // Managed Cloud deployment is a server-side Build contract. Include the
+        // canonical Nulang source tree so Cloud can reproduce the production
+        // artifact instead of trusting client-built .nbc/.wasm outputs. Reuse
+        // the publish helper so only Nulang source files are swept into src/.
+        let src_dir = root.join("src");
+        if src_dir.is_dir() {
+            add_dir_to_tar(&mut ar, &src_dir, "src").map_err(|e| NuError::PackageError {
+                msg: format!("cannot package src/: {}", e),
+                span: Span::default(),
+            })?;
         }
 
         if dist_dir.is_dir() {
@@ -2321,12 +2415,12 @@ fn cmd_deploy(
         .or_else(|| std::env::var("NULANG_CLOUD_URL").ok())
         .unwrap_or_else(|| "https://deploy.nulang.cloud".to_string());
 
-    eprintln!("Deploying {} to {} ...", name, cloud_url);
+    eprintln!("Submitting {} to {} ...", name, cloud_url);
 
-    let url = format!("{}/api/v1/deploy", cloud_url.trim_end_matches('/'));
+    let url = format!("{}/api/v1/packages/deploy", cloud_url.trim_end_matches('/'));
     let response: ureq::Response = ureq::post(&url)
         .set("Authorization", &format!("Bearer {}", token))
-        .set("Content-Type", "application/gzip")
+        .set("Content-Type", NULANG_CLOUD_PACKAGE_MEDIA_TYPE_V1)
         .send_bytes(&tarball)
         .map_err(|e| match e {
             ureq::Error::Transport(inner) => NuError::PackageError {
@@ -2336,11 +2430,7 @@ fn cmd_deploy(
             ureq::Error::Status(code, resp) => {
                 let body = resp.into_string().unwrap_or_default();
                 NuError::PackageError {
-                    msg: if code == 401 {
-                        "Authentication failed. Check your NULANG_CLOUD_TOKEN.".to_string()
-                    } else {
-                        format!("Deploy failed: {} — {}", code, body)
-                    },
+                    msg: cloud_deploy_error_message(code, &body),
                     span: Span::default(),
                 }
             }
@@ -2356,8 +2446,36 @@ fn cmd_deploy(
             span: Span::default(),
         })?;
 
-    println!("Deployed! -> {} ({})", deploy.url, deploy.status);
+    println!(
+        "Deployment accepted: {} ({})",
+        deploy.deployment_id, deploy.status
+    );
+    if let Some(status_url) = deploy.status_url.as_deref().or(deploy.url.as_deref()) {
+        println!("Status: {}", status_url);
+    }
     Ok(())
+}
+
+#[cfg(all(test, feature = "ureq"))]
+mod deploy_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn structured_cloud_error_is_human_readable() {
+        let body = r#"{"code":"package_build_admission_unavailable","error":"durable Build admission is not yet enabled"}"#;
+        assert_eq!(
+            cloud_deploy_error_message(503, body),
+            "Deploy request rejected (503): durable Build admission is not yet enabled"
+        );
+    }
+
+    #[test]
+    fn auth_error_does_not_echo_response_body() {
+        assert_eq!(
+            cloud_deploy_error_message(401, r#"{"error":"internal detail"}"#),
+            "Authentication failed. Check your NULANG_CLOUD_TOKEN."
+        );
+    }
 }
 
 /// `nula deploy` — disabled without the `ureq` feature.
