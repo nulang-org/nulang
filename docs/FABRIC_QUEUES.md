@@ -77,6 +77,7 @@ let added = runtime.fabric_queue_add(
         job_id: Some("welcome:123".into()),
         priority: 10,
         delay_ms: 0,
+        max_attempts: Some(5),
     },
 )?;
 
@@ -111,9 +112,14 @@ Every successful acquisition increments the delivery count. Once
 - \`Failed\` when no DLQ is configured,
 - \`DeadLettered\` when a DLQ name is configured.
 
-The first slice records dead-letter terminal state but does not yet forward the
-payload into the configured DLQ. That forwarding must be added atomically with
-the terminal transition before the DLQ option is claimed as fully implemented.
+For replicated queues, exhausted jobs use a crash-safe target-first DLQ handoff:
+the destination payload must reach quorum before the source may commit its
+`DeadLettered` transition. The intermediate state “target durable + source
+still Active” is retryable; “source terminal + target missing” is not produced
+by the replicated path.
+
+A job may override the queue-wide `max_attempts`. The override is part of the
+immutable job envelope and therefore also part of stable job-id dedup fencing.
 
 Stable application job ids provide enqueue deduplication. This is not a claim
 of exactly-once external side effects. Processors must still use idempotency
@@ -141,30 +147,45 @@ Target package:
 @nulang/bullmq-backend
 \`\`\`
 
-Usage target:
+Current live transport:
 
-\`\`\`ts
+```sh
+nulang node \
+  --listen 127.0.0.1:9000 \
+  --plaintext \
+  --queue-api 127.0.0.1:9091 \
+  --queue-store .nulang/fabric
+```
+
+```ts
+import { Queue, Worker } from "bullmq";
 import {
-  Queue,
-  Worker,
-  setDefaultBackendFactory,
-} from "bullmq";
-import { createNulangBackend } from "@nulang/bullmq-backend";
+  NulangHttpQueueClient,
+  createNulangBackendFactory,
+} from "@nulang/bullmq-backend";
 
-setDefaultBackendFactory(
-  createNulangBackend({
-    endpoint: "https://us-east.nulang.cloud",
-    token: process.env.NULANG_TOKEN!,
-  }),
-);
-
-const queue = new Queue("emails");
-await queue.add("welcome", { userId: "123" });
-
-new Worker("emails", async job => {
-  // Existing BullMQ processor code.
+const client = new NulangHttpQueueClient({
+  endpoint: "http://127.0.0.1:9091",
+  replicationFactor: 1,
 });
-\`\`\`
+const backendFactory = createNulangBackendFactory(client);
+
+const queue = new Queue("emails", { connection: {} }, backendFactory);
+await queue.add("welcome", { userId: "123" }, {
+  jobId: "welcome:123",
+  attempts: 3,
+});
+
+new Worker(
+  "emails",
+  async job => sendWelcome(job.data),
+  { connection: {}, lockDuration: 30_000 },
+  backendFactory,
+);
+```
+
+The experimental HTTP gateway is loopback-only. A node refuses a non-loopback
+`--queue-api` bind until authentication/TLS is added.
 
 ### BullMQ semantic mapping
 
@@ -359,7 +380,10 @@ Replicated enqueue is exposed through `fabric_queue_add_replicated`:
   transport retries.
 
 Replicated worker acquisition is exposed through
-`fabric_queue_acquire_replicated`. It is leader-serialized and quorum-gated:
+`fabric_queue_acquire_replicated`, with
+`fabric_queue_acquire_replicated_with_lease_duration` for clients such as
+BullMQ that carry a per-worker visibility timeout. It is leader-serialized and
+quorum-gated:
 
 - candidate selection uses only the committed queue state,
 - priority ordering remains highest-priority first and FIFO within a priority,
@@ -388,6 +412,8 @@ mutation.
 Replicated worker completion and lease maintenance are also quorum-gated:
 
 - `fabric_queue_ack_replicated` appends a `Completed` mutation,
+- `fabric_queue_ack_replicated_with_result` durably records processor result
+  bytes and fences retry reuse against a different result,
 - `fabric_queue_nack_replicated` appends a `Nacked` mutation and only
   exposes the resulting Waiting/Failed/DeadLettered state after commit,
 - `fabric_queue_renew_replicated` appends a `LeaseRenewed` mutation and
@@ -485,22 +511,27 @@ Generic replicated NACK/expiry fail closed instead of directly marking a
 DLQ-configured job DeadLettered without forwarding.
 
 
-## Distributed follow-up
+## Remaining distributed / compatibility follow-up
 
-The current queue state machine is local to one Fabric stream store. Moving it
-to replicated production semantics requires:
+The core replicated queue state machine now covers queue-level ownership,
+policy synchronization, quorum creation/enqueue, epoch-fenced acquisition,
+ACK/NACK/renew, lease expiry/redelivery, consumer-group concurrency, per-job
+attempt caps, per-acquire lease duration, durable completion results, committed
+job/readiness views, and crash-safe DLQ forwarding.
 
-1. make queue mutable state a replicated/epoch-fenced state machine rather than
-   a local JSON index,
-2. assign consumer-group ownership under the installed stream epoch,
-3. make lease acquisition a quorum-safe compare-and-set,
-4. carry the existing monotonic lease fencing token through replicated consumer state,
-5. replicate delayed/priority indexes or derive them deterministically,
-6. atomically forward exhausted jobs to a DLQ,
-7. propagate queue events through a committed Fabric event stream,
-8. compact terminal job state without breaking deduplication windows,
-9. add per-queue retention, max age/bytes/jobs, and deduplication-window
-    policies.
+Remaining work is primarily compatibility and production hardening:
+
+1. add authenticated/TLS-protected remote queue API access and leader
+   discovery/redirect instead of the current loopback leader endpoint,
+2. add native replicated mutations for non-active promote/change-delay/manual
+   retry so the BullMQ HTTP client can implement those without approximation,
+3. expose richer committed indexes/counts for BullMQ delayed/prioritized/range
+   getters,
+4. add a committed queue event stream and QueueEvents mapping,
+5. add retention/compaction policies without breaking dedup windows,
+6. complete BullMQ B2 administration/events and B3 flows/schedulers,
+7. run the broader BullMQ backend/full-suite conformance matrix,
+8. implement Core NATS wire compatibility, then JetStream compatibility.
 
 ## Safety invariants
 
@@ -518,8 +549,9 @@ The compatibility layers must preserve these invariants:
 
 ## Next implementation slice
 
-1. Build the minimal BullMQ B1 backend against these APIs.
-2. Run BullMQ's adapter conformance suite and use failures to drive only the
-   missing generally useful native queue semantics.
-3. Then build Core NATS wire compatibility; JetStream follows after replicated
-   consumer semantics are proven.
+1. Finish the remaining BullMQ B1 non-active mutations and richer getters.
+2. Run BullMQ's broader backend/full-suite conformance and use failures to drive
+   only generally useful native queue semantics.
+3. Add authenticated remote/leader-aware queue transport for Nulang Cloud.
+4. Then build Core NATS wire compatibility; JetStream follows the durable
+   consumer semantics already proven by Fabric Queue.
