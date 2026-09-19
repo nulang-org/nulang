@@ -768,7 +768,7 @@ impl<'a> JournalReader<'a> {
 
     fn key(&mut self) -> io::Result<CacheMigrationKey> {
         Ok(CacheMigrationKey {
-            placement_epoch: self.u64()?,
+            started_epoch: self.u64()?,
             slot: self.u16()?,
             source: self.owner()?,
             target: self.owner()?,
