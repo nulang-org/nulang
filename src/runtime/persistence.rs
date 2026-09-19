@@ -9,6 +9,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::durable_effect::{DurableEffectId, DurableEffectRecord};
+use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::vm::Value;
 
 use tracing::warn;
@@ -251,6 +253,87 @@ impl WorkflowEvent {
     }
 }
 
+/// Merge two durable records for the same logical effect without allowing
+/// crash recovery or duplicate writes to regress a completed effect.
+///
+/// Durable-effect persistence is append-only. Readers fold the append history
+/// with this function so a stale `Prepared` record can never overwrite a
+/// durable `Completed` result, and conflicting completions fail closed.
+fn merge_durable_effect_record(
+    existing: DurableEffectPersistenceRecord,
+    incoming: DurableEffectPersistenceRecord,
+) -> io::Result<DurableEffectPersistenceRecord> {
+    if existing.effect_id() != incoming.effect_id()
+        || existing.original_effect_id() != incoming.original_effect_id()
+        || existing.compensation_ordinal() != incoming.compensation_ordinal()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable effect journal identity conflict",
+        ));
+    }
+
+    if existing.effect().spec() != incoming.effect().spec()
+        || existing.effect().request_digest() != incoming.effect().request_digest()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "durable effect journal request/spec conflict for {}",
+                existing.effect_id()
+            ),
+        ));
+    }
+
+    match (existing.effect(), incoming.effect()) {
+        (DurableEffectRecord::Prepared { .. }, DurableEffectRecord::Completed { .. }) => {
+            Ok(incoming)
+        }
+        (DurableEffectRecord::Completed { .. }, DurableEffectRecord::Prepared { .. }) => {
+            Ok(existing)
+        }
+        (
+            DurableEffectRecord::Completed {
+                result: existing_result,
+                ..
+            },
+            DurableEffectRecord::Completed {
+                result: incoming_result,
+                ..
+            },
+        ) if existing_result != incoming_result => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "durable effect journal has conflicting completed results for {}",
+                existing.effect_id()
+            ),
+        )),
+        _ => Ok(existing),
+    }
+}
+
+/// Fold one actor's durable-effect append history down to the latest monotonic
+/// state for each logical operation. The first-seen order is preserved.
+fn fold_durable_effect_records(
+    records: Vec<DurableEffectPersistenceRecord>,
+) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+    let mut folded: Vec<DurableEffectPersistenceRecord> = Vec::new();
+    let mut positions: HashMap<DurableEffectId, usize> = HashMap::new();
+
+    for record in records {
+        let id = record.effect_id();
+        if let Some(&idx) = positions.get(&id) {
+            let existing = folded[idx].clone();
+            folded[idx] = merge_durable_effect_record(existing, record)?;
+        } else {
+            positions.insert(id, folded.len());
+            folded.push(record);
+        }
+    }
+
+    Ok(folded)
+}
+
 /// Persistence backend trait. Implementations may be in-memory or disk-backed.
 pub trait PersistenceStore: Send + Sync {
     /// Persist a snapshot of durable actor state.
@@ -389,6 +472,47 @@ pub trait PersistenceStore: Send + Sync {
     /// Read all event-sourcing entries for an actor in order.
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry>;
 
+    /// Append one versioned durable-effect state transition.
+    ///
+    /// Implementations MUST preserve append semantics: a later stale
+    /// `Prepared` record must not erase a previously persisted completion.
+    fn append_durable_effect_record(
+        &mut self,
+        _actor_id: u64,
+        _record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable effect journal is not supported by this persistence backend",
+        ))
+    }
+
+    /// Read and validate the durable-effect append history for one actor.
+    ///
+    /// Corrupt or unsupported records return an error rather than being
+    /// silently skipped because recovery must fail closed.
+    fn read_durable_effect_records(
+        &self,
+        _actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable effect journal is not supported by this persistence backend",
+        ))
+    }
+
+    /// Load the monotonic state of one logical durable effect.
+    fn load_durable_effect_record(
+        &self,
+        actor_id: u64,
+        effect_id: DurableEffectId,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        let records = fold_durable_effect_records(self.read_durable_effect_records(actor_id)?)?;
+        Ok(records
+            .into_iter()
+            .find(|record| record.effect_id() == effect_id))
+    }
+
     /// Highest sequence number known for the actor.
     fn latest_sequence(&self, actor_id: u64) -> u64;
 
@@ -412,6 +536,7 @@ pub struct MemoryStore {
     journals: HashMap<u64, Vec<JournalEntry>>,
     workflow_events: HashMap<u64, Vec<WorkflowEvent>>,
     events: HashMap<u64, Vec<EventEntry>>,
+    durable_effects: HashMap<u64, Vec<Vec<u8>>>,
 }
 
 impl MemoryStore {
@@ -463,6 +588,36 @@ impl PersistenceStore for MemoryStore {
         self.events.get(&actor_id).cloned().unwrap_or_default()
     }
 
+    fn append_durable_effect_record(
+        &mut self,
+        actor_id: u64,
+        record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        let bytes = record
+            .to_json()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.durable_effects
+            .entry(actor_id)
+            .or_default()
+            .push(bytes);
+        Ok(())
+    }
+
+    fn read_durable_effect_records(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        self.durable_effects
+            .get(&actor_id)
+            .into_iter()
+            .flatten()
+            .map(|bytes| {
+                DurableEffectPersistenceRecord::from_json(bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect()
+    }
+
     fn latest_sequence(&self, actor_id: u64) -> u64 {
         let snapshot_seq = self
             .snapshots
@@ -495,6 +650,7 @@ impl PersistenceStore for MemoryStore {
         self.journals.remove(&actor_id);
         self.workflow_events.remove(&actor_id);
         self.events.remove(&actor_id);
+        self.durable_effects.remove(&actor_id);
         Ok(())
     }
 }
@@ -532,6 +688,10 @@ impl JsonFileStore {
 
     fn events_path(&self, actor_id: u64) -> PathBuf {
         self.actor_dir(actor_id).join("events.jsonl")
+    }
+
+    fn durable_effects_path(&self, actor_id: u64) -> PathBuf {
+        self.actor_dir(actor_id).join("durable_effects.jsonl")
     }
 }
 
@@ -660,6 +820,55 @@ impl PersistenceStore for JsonFileStore {
         data.lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
+    }
+
+    fn append_durable_effect_record(
+        &mut self,
+        actor_id: u64,
+        record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        let dir = self.actor_dir(actor_id);
+        fs::create_dir_all(&dir)?;
+        let path = self.durable_effects_path(actor_id);
+        let bytes = record
+            .to_json()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    }
+
+    fn read_durable_effect_records(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        let path = self.durable_effects_path(actor_id);
+        let data = match fs::read(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut records = Vec::new();
+        for (line_index, line) in data.split(|byte| *byte == b'\n').enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let record = DurableEffectPersistenceRecord::from_json(line).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid durable effect record for actor {actor_id} at line {}: {error}",
+                        line_index + 1
+                    ),
+                )
+            })?;
+            records.push(record);
+        }
+        Ok(records)
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
@@ -920,6 +1129,24 @@ impl LibsqlStore {
                     value TEXT NOT NULL DEFAULT '1',
                     PRIMARY KEY (actor_id, sequence)
                 )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_effects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor_id INTEGER NOT NULL,
+                    effect_id TEXT NOT NULL,
+                    record TEXT NOT NULL
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS durable_effects_actor_idx
+                 ON durable_effects(actor_id, id)",
                 (),
             )
             .await
@@ -1246,6 +1473,62 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn append_durable_effect_record(
+        &mut self,
+        actor_id: u64,
+        record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        let effect_id = record.effect_id().to_string();
+        let record_json = String::from_utf8(
+            record
+                .to_json()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            conn.execute(
+                "INSERT INTO durable_effects (actor_id, effect_id, record)
+                 VALUES (?1, ?2, ?3)",
+                libsql::params![actor_id as i64, effect_id, record_json],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })
+    }
+
+    fn read_durable_effect_records(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT record FROM durable_effects
+                     WHERE actor_id = ?1 ORDER BY id ASC",
+                    libsql::params![actor_id as i64],
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let mut records = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            {
+                let record_json: String = row
+                    .get(0)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                let record = DurableEffectPersistenceRecord::from_json(record_json.as_bytes())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                records.push(record);
+            }
+            Ok(records)
+        })
+    }
+
     fn latest_sequence(&self, actor_id: u64) -> u64 {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -1319,6 +1602,13 @@ impl PersistenceStore for LibsqlStore {
             .await
             .map(|_| ())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "DELETE FROM durable_effects WHERE actor_id = ?1",
+                libsql::params![actor_id as i64],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
@@ -1339,6 +1629,7 @@ impl RocksDbStore {
     const CF_JOURNAL: &'static str = "journal";
     const CF_WORKFLOW_EVENTS: &'static str = "workflow_events";
     const CF_EVENTS: &'static str = "events";
+    const CF_DURABLE_EFFECTS: &'static str = "durable_effects";
 
     /// Open (or create) a RocksDB-backed store at `path`.
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
@@ -1356,6 +1647,10 @@ impl RocksDbStore {
                 rocksdb::Options::default(),
             ),
             rocksdb::ColumnFamilyDescriptor::new(Self::CF_EVENTS, rocksdb::Options::default()),
+            rocksdb::ColumnFamilyDescriptor::new(
+                Self::CF_DURABLE_EFFECTS,
+                rocksdb::Options::default(),
+            ),
         ];
         let db = rocksdb::DB::open_cf_descriptors(&opts, path, cfs)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1370,6 +1665,23 @@ impl RocksDbStore {
         let mut key = [0u8; 16];
         key[..8].copy_from_slice(&actor_id.to_be_bytes());
         key[8..].copy_from_slice(&sequence.to_be_bytes());
+        key
+    }
+
+    /// Durable-effect keys preserve Prepared and Completed as distinct slots
+    /// for one logical effect, so writing a stale Prepared record can never
+    /// overwrite a Completed result in the LSM tree.
+    fn durable_effect_key(
+        actor_id: u64,
+        record: &DurableEffectPersistenceRecord,
+    ) -> [u8; 41] {
+        let mut key = [0u8; 41];
+        key[..8].copy_from_slice(&actor_id.to_be_bytes());
+        key[8..40].copy_from_slice(record.effect_id().as_bytes());
+        key[40] = match record.effect() {
+            DurableEffectRecord::Prepared { .. } => 0,
+            DurableEffectRecord::Completed { .. } => 1,
+        };
         key
     }
 
@@ -1516,6 +1828,75 @@ impl PersistenceStore for RocksDbStore {
         entries
     }
 
+    fn append_durable_effect_record(
+        &mut self,
+        actor_id: u64,
+        record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        let cf = self.cf(Self::CF_DURABLE_EFFECTS)?;
+        let key = Self::durable_effect_key(actor_id, &record);
+        let bytes = record
+            .to_json()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        if let Some(existing) = self
+            .db
+            .get_cf(cf, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        {
+            if existing.as_ref() != bytes.as_slice() {
+                let existing_record = DurableEffectPersistenceRecord::from_json(&existing)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                // Same state-kind key with different bytes is only legal if
+                // the semantic fold says the records are equivalent. For
+                // Prepared/Prepared and Completed/Completed, any meaningful
+                // disagreement is a corruption/conflict.
+                merge_durable_effect_record(existing_record.clone(), record.clone())?;
+                if existing_record != record {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "conflicting RocksDB durable effect record for {}",
+                            record.effect_id()
+                        ),
+                    ));
+                }
+            }
+            return Ok(());
+        }
+
+        self.db
+            .put_cf(cf, key, bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn read_durable_effect_records(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        let cf = self.cf(Self::CF_DURABLE_EFFECTS)?;
+        let actor_prefix = Self::actor_key(actor_id);
+        let mut records = Vec::new();
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&actor_prefix, rocksdb::Direction::Forward),
+        );
+        while let Some(item) = iter.next() {
+            let (key, value) =
+                item.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            if key.len() < 8 || key[..8] != actor_prefix {
+                break;
+            }
+            let record = DurableEffectPersistenceRecord::from_json(&value)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     fn latest_sequence(&self, actor_id: u64) -> u64 {
         let snapshot_seq = self
             .load_snapshot(actor_id)
@@ -1548,6 +1929,7 @@ impl PersistenceStore for RocksDbStore {
             Self::CF_JOURNAL,
             Self::CF_WORKFLOW_EVENTS,
             Self::CF_EVENTS,
+            Self::CF_DURABLE_EFFECTS,
         ] {
             let cf = self.cf(cf_name)?;
             // Start from the bare actor prefix.  Snapshot keys are exactly 8
@@ -1654,6 +2036,22 @@ impl PostgresStore {
                 value TEXT NOT NULL DEFAULT '1',
                 PRIMARY KEY (actor_id, sequence)
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS durable_effects (
+                id BIGSERIAL PRIMARY KEY,
+                actor_id BIGINT NOT NULL,
+                effect_id TEXT NOT NULL,
+                record TEXT NOT NULL
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS durable_effects_actor_idx
+             ON durable_effects(actor_id, id)",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1886,6 +2284,49 @@ impl PersistenceStore for PostgresStore {
             .collect()
     }
 
+    fn append_durable_effect_record(
+        &mut self,
+        actor_id: u64,
+        record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        let effect_id = record.effect_id().to_string();
+        let record_json = String::from_utf8(
+            record
+                .to_json()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO durable_effects (actor_id, effect_id, record)
+             VALUES ($1, $2, $3)",
+            &[&(actor_id as i64), &effect_id, &record_json],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    fn read_durable_effect_records(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        let mut conn = self.conn.lock().unwrap();
+        let rows = conn
+            .query(
+                "SELECT record FROM durable_effects
+                 WHERE actor_id = $1 ORDER BY id ASC",
+                &[&(actor_id as i64)],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                let record_json: String = row.get(0);
+                DurableEffectPersistenceRecord::from_json(record_json.as_bytes())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect()
+    }
+
     fn latest_sequence(&self, actor_id: u64) -> u64 {
         let mut conn = match self.conn.lock() {
             Ok(c) => c,
@@ -1932,7 +2373,13 @@ impl PersistenceStore for PostgresStore {
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        for table in ["snapshots", "journal", "workflow_events", "events"] {
+        for table in [
+            "snapshots",
+            "journal",
+            "workflow_events",
+            "events",
+            "durable_effects",
+        ] {
             conn.execute(
                 &format!("DELETE FROM {} WHERE actor_id = $1", table),
                 &[&(actor_id as i64)],
@@ -2014,6 +2461,137 @@ mod json_file_store_tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    fn durable_effect_pair(
+        actor_id: u64,
+    ) -> (
+        DurableEffectId,
+        DurableEffectPersistenceRecord,
+        DurableEffectPersistenceRecord,
+    ) {
+        let id = DurableEffectId::derive(actor_id, "persist-test", 0, "Storage.write");
+        let spec = crate::durable_effect::DurableEffectSpec::new(
+            id,
+            "Storage.write",
+            crate::primitives::EffectBoundary::BackendOwned,
+            crate::primitives::DeliverySemantics::EffectivelyOnceWithDeduplication,
+        );
+        let prepared = DurableEffectPersistenceRecord::from_effect(DurableEffectRecord::prepare(
+            spec.clone(),
+            b"key=orders/1",
+        ));
+        let completed = DurableEffectPersistenceRecord::from_effect(
+            DurableEffectRecord::prepare(spec, b"key=orders/1").complete(b"ok".to_vec()),
+        );
+        (id, prepared, completed)
+    }
+
+    #[test]
+    fn memory_store_folds_durable_effect_state_monotonically() {
+        let actor_id = 77;
+        let (id, prepared, completed) = durable_effect_pair(actor_id);
+        let mut store = MemoryStore::new();
+
+        store
+            .append_durable_effect_record(actor_id, prepared.clone())
+            .unwrap();
+        store
+            .append_durable_effect_record(actor_id, completed.clone())
+            .unwrap();
+        // A stale retry of the prepared append must not regress completion.
+        store
+            .append_durable_effect_record(actor_id, prepared)
+            .unwrap();
+
+        let loaded = store
+            .load_durable_effect_record(actor_id, id)
+            .unwrap()
+            .expect("effect should be persisted");
+        assert_eq!(loaded, completed);
+
+        let spec = loaded.effect().spec().clone();
+        store
+            .append_durable_effect_record(
+                actor_id,
+                DurableEffectPersistenceRecord::from_effect(
+                    DurableEffectRecord::prepare(spec, b"key=orders/1")
+                        .complete(b"different".to_vec()),
+                ),
+            )
+            .unwrap();
+        assert!(
+            store.load_durable_effect_record(actor_id, id).is_err(),
+            "conflicting completed results must fail closed"
+        );
+    }
+
+    #[test]
+    fn json_store_round_trips_versioned_durable_effect_history() {
+        let dir = fresh_dir("durable_effect");
+        let actor_id = 78;
+        let (id, prepared, completed) = durable_effect_pair(actor_id);
+        {
+            let mut store = JsonFileStore::new(&dir).unwrap();
+            store
+                .append_durable_effect_record(actor_id, prepared)
+                .unwrap();
+            store
+                .append_durable_effect_record(actor_id, completed.clone())
+                .unwrap();
+        }
+
+        let store = JsonFileStore::new(&dir).unwrap();
+        let history = store.read_durable_effect_records(actor_id).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            store.load_durable_effect_record(actor_id, id).unwrap(),
+            Some(completed)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_store_fails_closed_on_corrupt_durable_effect_record() {
+        let dir = fresh_dir("durable_effect_corrupt");
+        let actor_id = 79;
+        let store = JsonFileStore::new(&dir).unwrap();
+        fs::create_dir_all(store.actor_dir(actor_id)).unwrap();
+        fs::write(
+            store.durable_effects_path(actor_id),
+            b"{\"version\":999,\"record\":{}}\n",
+        )
+        .unwrap();
+
+        assert!(store.read_durable_effect_records(actor_id).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_durable_effect_keys_preserve_completed_state() {
+        let dir = fresh_dir("rocks_durable_effect");
+        let actor_id = 80;
+        let (id, prepared, completed) = durable_effect_pair(actor_id);
+        {
+            let mut store = RocksDbStore::new(&dir).unwrap();
+            store
+                .append_durable_effect_record(actor_id, prepared.clone())
+                .unwrap();
+            store
+                .append_durable_effect_record(actor_id, completed.clone())
+                .unwrap();
+            // This writes the Prepared slot again, not the Completed slot.
+            store
+                .append_durable_effect_record(actor_id, prepared)
+                .unwrap();
+
+            assert_eq!(
+                store.load_durable_effect_record(actor_id, id).unwrap(),
+                Some(completed)
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
