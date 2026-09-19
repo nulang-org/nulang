@@ -848,6 +848,43 @@ mod tests {
     }
 
     #[test]
+    fn test_c_api_call_function_uses_bytecode_offset_for_non_first_function() {
+        let rt = nulang_runtime_new();
+        let source = CString::new(
+            "fn first() -> Int { 7 } fn second() -> Int { 42 } first()",
+        )
+        .unwrap();
+
+        let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(handle >= 0, "compile failed");
+
+        // Prove this fixture would fail if the function-table index were
+        // accidentally passed to VM::call_function as a bytecode PC.
+        let runtime = unsafe { &*rt };
+        let module_index = runtime.module_handles[handle as usize];
+        let module = &runtime.modules[module_index];
+        let offset = module
+            .function_offset_by_name("second")
+            .expect("second function offset");
+        let table_index = module
+            .function_table
+            .iter()
+            .position(|&candidate| candidate == offset)
+            .expect("second function table entry");
+        assert_ne!(
+            offset, table_index,
+            "regression fixture requires bytecode offset != function-table index"
+        );
+
+        let name = CString::new("second").unwrap();
+        let result =
+            unsafe { nulang_call_function(rt, handle, name.as_ptr(), std::ptr::null(), 0) };
+        assert_eq!(nulang_value_int(result), 42);
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
     fn test_c_api_string_return_stabilized() {
         let rt = nulang_runtime_new();
         let source = CString::new(
