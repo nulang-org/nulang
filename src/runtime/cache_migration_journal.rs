@@ -34,7 +34,7 @@ const KIND_COMPLETED: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheMigrationKey {
-    pub placement_epoch: u64,
+    pub started_epoch: u64,
     pub slot: u16,
     pub source: CacheShardOwner,
     pub target: CacheShardOwner,
@@ -283,8 +283,15 @@ impl CacheMigrationJournal {
         key: CacheMigrationKey,
         message: &CacheTransportMessage,
     ) -> io::Result<()> {
-        let (transfer_id, message_key) = transfer_request_key(message)?;
-        require_same_key(key, message_key)?;
+        let (transfer_id, placement_epoch, slot, source, target) =
+            transfer_request_identity(message)?;
+        require_message_matches_migration(
+            key,
+            placement_epoch,
+            slot,
+            source,
+            target,
+        )?;
         let state = self.require_state(key)?;
         if let Some(existing) = state.transfers.get(&transfer_id) {
             if &existing.request == message {
@@ -321,8 +328,15 @@ impl CacheMigrationJournal {
         key: CacheMigrationKey,
         message: &CacheTransportMessage,
     ) -> io::Result<()> {
-        let (transfer_id, message_key) = transfer_ack_key(message)?;
-        require_same_key(key, message_key)?;
+        let (transfer_id, placement_epoch, slot, source, target) =
+            transfer_ack_identity(message)?;
+        require_message_matches_migration(
+            key,
+            placement_epoch,
+            slot,
+            source,
+            target,
+        )?;
         let state = self.require_state(key)?;
         let transfer = state
             .transfers
@@ -472,11 +486,18 @@ fn apply_record(
             reader.finish()?;
             let message = CacheTransportMessage::from_wire_bytes(&wire)
                 .map_err(|_| invalid_data("invalid transfer request in migration journal"))?;
-            let (decoded_id, decoded_key) = transfer_request_key(&message)?;
+            let (decoded_id, placement_epoch, slot, source, target) =
+                transfer_request_identity(&message)?;
             if decoded_id != transfer_id {
                 return Err(invalid_data("transfer request id mismatch in journal"));
             }
-            require_same_key(key, decoded_key)?;
+            require_message_matches_migration(
+                key,
+                placement_epoch,
+                slot,
+                source,
+                target,
+            )?;
             let state = states
                 .get_mut(&key)
                 .ok_or_else(|| invalid_data("transfer request precedes migration intent"))?;
@@ -501,11 +522,18 @@ fn apply_record(
             reader.finish()?;
             let message = CacheTransportMessage::from_wire_bytes(&wire)
                 .map_err(|_| invalid_data("invalid transfer ACK in migration journal"))?;
-            let (decoded_id, decoded_key) = transfer_ack_key(&message)?;
+            let (decoded_id, placement_epoch, slot, source, target) =
+                transfer_ack_identity(&message)?;
             if decoded_id != transfer_id {
                 return Err(invalid_data("transfer ACK id mismatch in journal"));
             }
-            require_same_key(key, decoded_key)?;
+            require_message_matches_migration(
+                key,
+                placement_epoch,
+                slot,
+                source,
+                target,
+            )?;
             let state = states
                 .get_mut(&key)
                 .ok_or_else(|| invalid_data("transfer ACK precedes migration intent"))?;
@@ -565,9 +593,9 @@ fn apply_record(
     Ok(())
 }
 
-fn transfer_request_key(
+fn transfer_request_identity(
     message: &CacheTransportMessage,
-) -> io::Result<(u64, CacheMigrationKey)> {
+) -> io::Result<(u64, u64, u16, CacheShardOwner, CacheShardOwner)> {
     match message {
         CacheTransportMessage::TransferBatch {
             transfer_id,
@@ -575,22 +603,14 @@ fn transfer_request_key(
             source,
             target,
             batch,
-        } => Ok((
-            *transfer_id,
-            CacheMigrationKey {
-                placement_epoch: *placement_epoch,
-                slot: batch.slot,
-                source: *source,
-                target: *target,
-            },
-        )),
+        } => Ok((*transfer_id, *placement_epoch, batch.slot, *source, *target)),
         _ => Err(invalid_data("journal transfer request is not TransferBatch")),
     }
 }
 
-fn transfer_ack_key(
+fn transfer_ack_identity(
     message: &CacheTransportMessage,
-) -> io::Result<(u64, CacheMigrationKey)> {
+) -> io::Result<(u64, u64, u16, CacheShardOwner, CacheShardOwner)> {
     match message {
         CacheTransportMessage::TransferAck {
             transfer_id,
@@ -599,16 +619,25 @@ fn transfer_ack_key(
             target,
             slot,
             ..
-        } => Ok((
-            *transfer_id,
-            CacheMigrationKey {
-                placement_epoch: *placement_epoch,
-                slot: *slot,
-                source: *source,
-                target: *target,
-            },
-        )),
+        } => Ok((*transfer_id, *placement_epoch, *slot, *source, *target)),
         _ => Err(invalid_data("journal transfer ACK is not TransferAck")),
+    }
+}
+
+fn require_message_matches_migration(
+    key: CacheMigrationKey,
+    placement_epoch: u64,
+    slot: u16,
+    source: CacheShardOwner,
+    target: CacheShardOwner,
+) -> io::Result<()> {
+    if placement_epoch < key.started_epoch {
+        return Err(invalid_data("cache transfer predates migration intent"));
+    }
+    if slot == key.slot && source == key.source && target == key.target {
+        Ok(())
+    } else {
+        Err(invalid_data("cache migration journal key mismatch"))
     }
 }
 
@@ -650,16 +679,8 @@ fn validate_ack_matches_request(
     Ok(())
 }
 
-fn require_same_key(expected: CacheMigrationKey, actual: CacheMigrationKey) -> io::Result<()> {
-    if expected == actual {
-        Ok(())
-    } else {
-        Err(invalid_data("cache migration journal key mismatch"))
-    }
-}
-
 fn write_key(out: &mut Vec<u8>, key: CacheMigrationKey) {
-    write_u64(out, key.placement_epoch);
+    write_u64(out, key.started_epoch);
     write_u16(out, key.slot);
     write_owner(out, key.source);
     write_owner(out, key.target);
@@ -790,7 +811,7 @@ mod tests {
 
     fn key() -> CacheMigrationKey {
         CacheMigrationKey {
-            placement_epoch: 7,
+            started_epoch: 7,
             slot: redis_slot(b"k{journal}"),
             source: CacheShardOwner {
                 node_id: 1,
@@ -806,7 +827,7 @@ mod tests {
     fn request(key: CacheMigrationKey, transfer_id: u64) -> CacheTransportMessage {
         CacheTransportMessage::TransferBatch {
             transfer_id,
-            placement_epoch: key.placement_epoch,
+            placement_epoch: key.started_epoch,
             source: key.source,
             target: key.target,
             batch: CacheTransferBatch {
@@ -831,7 +852,7 @@ mod tests {
     fn ack(key: CacheMigrationKey, transfer_id: u64) -> CacheTransportMessage {
         CacheTransportMessage::TransferAck {
             transfer_id,
-            placement_epoch: key.placement_epoch,
+            placement_epoch: key.started_epoch,
             source: key.source,
             target: key.target,
             slot: key.slot,
