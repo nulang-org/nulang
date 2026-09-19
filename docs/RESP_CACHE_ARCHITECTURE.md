@@ -94,6 +94,21 @@ replies are completed by request id. The sequencer emits only the longest
 contiguous completed prefix, preserving RESP ordering without serializing all
 commands through one worker.
 
+For Redis Cluster-aware clients, `cache_cluster.rs` supplies preformatted
+advertised endpoints keyed by physical shard owner. Dispatch has two explicit
+modes:
+
+- `Transparent`: preserve the internal local-shard queue and remote transport
+  handoff.
+- `Redirect`: when the current endpoint does not own a keyed command's slot,
+  return `-MOVED <slot> <host:port>` immediately. The command is not queued or
+  proxied.
+
+Redirect mode is the preferred steady-state deployment model for cluster-aware
+clients because a warmed client can connect directly to the physical slot
+owner. Missing endpoint metadata fails closed instead of silently falling back
+to proxying.
+
 ## Durability
 
 Durability is not implicit in the cache kernel. Add it above the mutation path
@@ -126,12 +141,17 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Build the dedicated cache shard event loop around non-blocking connections,
-   inbox draining, and ordered response flushing.
-2. Connect remote handoffs to a cache-specific cluster transport.
-3. Wire the TCP RESP listener to the shard event loops without a global store
-   lock or the actor scheduler's idle cadence.
-4. Add hierarchical expiration and packed aggregate data structures.
-5. Add WAL/replication acknowledgement modes.
-6. Add RESP compatibility and Nulang-native coordination primitives where they
-   fit the product boundary.
+1. Add Redis Cluster topology commands, prioritizing CLUSTER SHARDS while
+   retaining CLUSTER SLOTS compatibility, then ASK/ASKING when live slot
+   migration is implemented.
+2. Build the dedicated cache shard event loop around non-blocking connections,
+   inbox draining, ordered response flushing, and per-shard advertised
+   endpoints.
+3. Connect transparent-mode remote handoffs to a cache-specific cluster
+   transport.
+4. Wire TCP RESP listeners to shard event loops without a global store lock or
+   the actor scheduler's idle cadence.
+5. Add hierarchical expiration, packed aggregate structures, and durability
+   acknowledgement modes.
+6. Add broader RESP compatibility and Nulang-native coordination primitives
+   where they fit the product boundary.

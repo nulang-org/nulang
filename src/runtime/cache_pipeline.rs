@@ -108,7 +108,8 @@ impl CacheResponsePipeline {
         };
 
         let submit = match outcome {
-            CacheDispatchOutcome::Executed { consumed } => {
+            CacheDispatchOutcome::Executed { consumed }
+            | CacheDispatchOutcome::Redirected { consumed, .. } => {
                 if self.pending.is_empty() {
                     socket_out.extend_from_slice(&self.direct_scratch);
                 } else {
@@ -134,8 +135,7 @@ impl CacheResponsePipeline {
                 debug_assert!(self.direct_scratch.is_empty());
                 let request_id = self.next_request_id;
                 self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
-                self.pending
-                    .push_back(PendingResponse::Remote(request_id));
+                self.pending.push_back(PendingResponse::Remote(request_id));
                 CachePipelineSubmit {
                     consumed,
                     remote: Some(CacheSequencedRemoteRequest {
@@ -218,10 +218,10 @@ enum FrontAction {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::cache::redis_slot;
     use super::super::cache_dispatch::CacheDispatchChannels;
     use super::super::cache_routing::{CacheShardOwner, CacheSlotMap, CacheSlotRange};
+    use super::*;
 
     fn key_for_shard(map: &CacheSlotMap, shard: u16) -> Vec<u8> {
         for i in 0..10_000 {
@@ -277,25 +277,13 @@ mod tests {
 
         let set = frame(&[b"SET", &remote_local_key, b"value"]);
         pipeline
-            .submit_frame(
-                &dispatcher,
-                &mut ingress_store,
-                &set,
-                0,
-                &mut socket_out,
-            )
+            .submit_frame(&dispatcher, &mut ingress_store, &set, 0, &mut socket_out)
             .unwrap()
             .unwrap();
 
         let ping = frame(&[b"PING"]);
         pipeline
-            .submit_frame(
-                &dispatcher,
-                &mut ingress_store,
-                &ping,
-                0,
-                &mut socket_out,
-            )
+            .submit_frame(&dispatcher, &mut ingress_store, &ping, 0, &mut socket_out)
             .unwrap()
             .unwrap();
 
