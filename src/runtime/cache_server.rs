@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -19,7 +20,10 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use parking_lot::Mutex;
 
-use super::cache::CacheStore;
+use super::cache::{
+    CacheStore, CacheTransferBatch, CacheTransferCursor, CacheTransferEntry,
+    CacheTransferFinalize, CacheTransferImport, CacheTransferImportTracker,
+};
 use super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap, CacheRoutingMode};
 use super::cache_dispatch::{
     CacheDispatchChannels, CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher,
@@ -40,6 +44,8 @@ pub struct CacheServerConfig {
     pub max_pipeline_depth: usize,
     pub events_capacity: usize,
     pub max_inbox_batch: usize,
+    pub control_queue_capacity: usize,
+    pub max_control_batch: usize,
     pub expiry_sweep_interval: Duration,
     pub max_expiry_items_per_sweep: usize,
 }
@@ -53,6 +59,8 @@ impl Default for CacheServerConfig {
             max_pipeline_depth: 1024,
             events_capacity: 1024,
             max_inbox_batch: 256,
+            control_queue_capacity: 64,
+            max_control_batch: 32,
             expiry_sweep_interval: Duration::from_millis(100),
             max_expiry_items_per_sweep: 4096,
         }
@@ -149,11 +157,69 @@ impl CachePlacementPublisher {
     }
 }
 
+
+enum CacheShardControlRequest {
+    Export {
+        slot: u16,
+        cursor: Option<CacheTransferCursor>,
+        max_entries: usize,
+        reply: SyncSender<CacheTransferBatch>,
+    },
+    Import {
+        batch: CacheTransferBatch,
+        reply: SyncSender<Vec<CacheTransferImport>>,
+    },
+    Finalize {
+        entries: Vec<CacheTransferEntry>,
+        reply: SyncSender<Vec<CacheTransferFinalize>>,
+    },
+    CountSlot {
+        slot: u16,
+        reply: SyncSender<usize>,
+    },
+    ClearImportTracker {
+        slot: u16,
+        reply: SyncSender<()>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheLocalTransferReport {
+    pub slot: u16,
+    pub source_shard: u16,
+    pub target_shard: u16,
+    pub next_cursor: Option<CacheTransferCursor>,
+    pub scanned_slots: usize,
+    pub payload_bytes: usize,
+    pub exported_entries: usize,
+    pub imported: usize,
+    pub already_imported: usize,
+    pub expired_in_transit: usize,
+    pub conflicts: usize,
+    pub wrong_slot: usize,
+    pub finalized_removed: usize,
+    pub finalized_absent: usize,
+    pub stale_source_versions: usize,
+    pub source_remaining: usize,
+}
+
+impl CacheLocalTransferReport {
+    pub fn source_drained(&self) -> bool {
+        self.source_remaining == 0
+    }
+
+    pub fn restart_scan_required(&self) -> bool {
+        self.stale_source_versions != 0 || self.conflicts != 0
+    }
+}
+
 #[derive(Clone)]
 pub struct CacheShardServerControl {
+    shard: u16,
     shutdown: Arc<AtomicBool>,
     waker: Arc<Waker>,
     applied_placement_epoch: Arc<AtomicU64>,
+    control_tx: SyncSender<CacheShardControlRequest>,
 }
 
 impl CacheShardServerControl {
@@ -168,6 +234,23 @@ impl CacheShardServerControl {
 
     pub fn placement_epoch(&self) -> u64 {
         self.applied_placement_epoch.load(Ordering::Acquire)
+    }
+
+
+    fn request_control(
+        &self,
+        request: CacheShardControlRequest,
+    ) -> Result<(), CacheServiceError> {
+        match self.control_tx.try_send(request) {
+            Ok(()) => {
+                let _ = self.waker.wake();
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => Err(CacheServiceError::ControlQueueFull(self.shard)),
+            Err(TrySendError::Disconnected(_)) => {
+                Err(CacheServiceError::ControlDisconnected(self.shard))
+            }
+        }
     }
 }
 
@@ -224,6 +307,14 @@ pub enum CacheServiceError {
         current: u64,
         proposed: u64,
     },
+    InvalidTransferShard {
+        shard: u16,
+        shard_count: u16,
+    },
+    TransferSameShard(u16),
+    InvalidTransferBatchSize,
+    ControlQueueFull(u16),
+    ControlDisconnected(u16),
     ShardServer {
         shard: u16,
         source: CacheServerError,
@@ -486,6 +577,161 @@ impl CacheServiceHandle {
         Ok(())
     }
 
+
+    /// Move one bounded batch of a migrating logical slot between local shards.
+    ///
+    /// Source export, target import, source finalize, and progress counting all
+    /// execute on the owning reactor threads. The service handle only
+    /// orchestrates the fenced request/reply protocol.
+    pub fn transfer_local_slot_batch(
+        &self,
+        source_shard: u16,
+        target_shard: u16,
+        slot: u16,
+        cursor: Option<CacheTransferCursor>,
+        max_entries: usize,
+    ) -> Result<CacheLocalTransferReport, CacheServiceError> {
+        if max_entries == 0 {
+            return Err(CacheServiceError::InvalidTransferBatchSize);
+        }
+        if source_shard == target_shard {
+            return Err(CacheServiceError::TransferSameShard(source_shard));
+        }
+
+        let source = self.transfer_control(source_shard)?;
+        let target = self.transfer_control(target_shard)?;
+
+        let (export_tx, export_rx) = mpsc::sync_channel(1);
+        source.request_control(CacheShardControlRequest::Export {
+            slot,
+            cursor,
+            max_entries,
+            reply: export_tx,
+        })?;
+        let batch = export_rx
+            .recv()
+            .map_err(|_| CacheServiceError::ControlDisconnected(source_shard))?;
+
+        let exported_entries = batch.entries.len();
+        let next_cursor = batch.next_cursor;
+        let scanned_slots = batch.scanned_slots;
+        let payload_bytes = batch.payload_bytes;
+
+        let (import_tx, import_rx) = mpsc::sync_channel(1);
+        target.request_control(CacheShardControlRequest::Import {
+            batch: batch.clone(),
+            reply: import_tx,
+        })?;
+        let import_results = import_rx
+            .recv()
+            .map_err(|_| CacheServiceError::ControlDisconnected(target_shard))?;
+
+        let mut imported = 0;
+        let mut already_imported = 0;
+        let mut expired_in_transit = 0;
+        let mut conflicts = 0;
+        let mut wrong_slot = 0;
+        let mut finalize_entries = Vec::new();
+
+        for (entry, result) in batch.entries.into_iter().zip(import_results) {
+            match result {
+                CacheTransferImport::Imported => {
+                    imported += 1;
+                    finalize_entries.push(entry);
+                }
+                CacheTransferImport::AlreadyImported => {
+                    already_imported += 1;
+                    finalize_entries.push(entry);
+                }
+                CacheTransferImport::ExpiredInTransit => {
+                    expired_in_transit += 1;
+                    finalize_entries.push(entry);
+                }
+                CacheTransferImport::Conflict => conflicts += 1,
+                CacheTransferImport::WrongSlot => wrong_slot += 1,
+            }
+        }
+
+        let mut finalized_removed = 0;
+        let mut finalized_absent = 0;
+        let mut stale_source_versions = 0;
+        if !finalize_entries.is_empty() {
+            let (finalize_tx, finalize_rx) = mpsc::sync_channel(1);
+            source.request_control(CacheShardControlRequest::Finalize {
+                entries: finalize_entries,
+                reply: finalize_tx,
+            })?;
+            for result in finalize_rx
+                .recv()
+                .map_err(|_| CacheServiceError::ControlDisconnected(source_shard))?
+            {
+                match result {
+                    CacheTransferFinalize::Removed => finalized_removed += 1,
+                    CacheTransferFinalize::AlreadyAbsent => finalized_absent += 1,
+                    CacheTransferFinalize::StaleVersion => stale_source_versions += 1,
+                }
+            }
+        }
+
+        let (count_tx, count_rx) = mpsc::sync_channel(1);
+        source.request_control(CacheShardControlRequest::CountSlot {
+            slot,
+            reply: count_tx,
+        })?;
+        let source_remaining = count_rx
+            .recv()
+            .map_err(|_| CacheServiceError::ControlDisconnected(source_shard))?;
+
+        Ok(CacheLocalTransferReport {
+            slot,
+            source_shard,
+            target_shard,
+            next_cursor,
+            scanned_slots,
+            payload_bytes,
+            exported_entries,
+            imported,
+            already_imported,
+            expired_in_transit,
+            conflicts,
+            wrong_slot,
+            finalized_removed,
+            finalized_absent,
+            stale_source_versions,
+            source_remaining,
+        })
+    }
+
+    /// Release target-side replay fences after the migration has committed and
+    /// no transfer batch can still arrive for this slot.
+    pub fn clear_local_transfer_imports(
+        &self,
+        target_shard: u16,
+        slot: u16,
+    ) -> Result<(), CacheServiceError> {
+        let target = self.transfer_control(target_shard)?;
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        target.request_control(CacheShardControlRequest::ClearImportTracker {
+            slot,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .recv()
+            .map_err(|_| CacheServiceError::ControlDisconnected(target_shard))
+    }
+
+    fn transfer_control(
+        &self,
+        shard: u16,
+    ) -> Result<&CacheShardServerControl, CacheServiceError> {
+        self.controls.get(shard as usize).ok_or(
+            CacheServiceError::InvalidTransferShard {
+                shard,
+                shard_count: self.controls.len().min(u16::MAX as usize) as u16,
+            },
+        )
+    }
+
     pub fn request_shutdown(&self) {
         for control in &self.controls {
             control.shutdown();
@@ -614,6 +860,9 @@ pub struct CacheShardServer {
     next_expiry_sweep: Instant,
     placement_publisher: Option<Arc<CachePlacementPublisher>>,
     applied_placement_epoch: Arc<AtomicU64>,
+    control_tx: SyncSender<CacheShardControlRequest>,
+    control_rx: Receiver<CacheShardControlRequest>,
+    transfer_imports: HashMap<u16, CacheTransferImportTracker>,
 }
 
 impl CacheShardServer {
@@ -660,6 +909,7 @@ impl CacheShardServer {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let applied_placement_epoch = Arc::new(AtomicU64::new(dispatcher.placement().epoch()));
+        let (control_tx, control_rx) = mpsc::sync_channel(config.control_queue_capacity);
         let next_expiry_sweep = Instant::now() + config.expiry_sweep_interval;
 
         Ok(Self {
@@ -679,6 +929,9 @@ impl CacheShardServer {
             next_expiry_sweep,
             placement_publisher,
             applied_placement_epoch,
+            control_tx,
+            control_rx,
+            transfer_imports: HashMap::new(),
         })
     }
 
@@ -688,9 +941,11 @@ impl CacheShardServer {
 
     pub fn control(&self) -> CacheShardServerControl {
         CacheShardServerControl {
+            shard: self.inbox.shard(),
             shutdown: self.shutdown.clone(),
             waker: self.waker.clone(),
             applied_placement_epoch: self.applied_placement_epoch.clone(),
+            control_tx: self.control_tx.clone(),
         }
     }
 
@@ -793,9 +1048,75 @@ impl CacheShardServer {
 
     fn handle_wake(&mut self) -> Result<(), CacheServerError> {
         self.install_published_placement();
+        self.drain_control();
         self.inbox
             .drain(&mut self.store, self.config.max_inbox_batch);
         Ok(())
+    }
+
+    fn drain_control(&mut self) -> usize {
+        let mut processed = 0;
+        while processed < self.config.max_control_batch {
+            let request = match self.control_rx.try_recv() {
+                Ok(request) => request,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            self.handle_control(request);
+            processed += 1;
+        }
+
+        // A bounded drain protects socket/inbox work. If control work remains,
+        // re-wake this reactor so the next poll iteration continues promptly.
+        if processed == self.config.max_control_batch {
+            let _ = self.waker.wake();
+        }
+        processed
+    }
+
+    fn handle_control(&mut self, request: CacheShardControlRequest) {
+        let now_ms = self.clock.now_ms();
+        match request {
+            CacheShardControlRequest::Export {
+                slot,
+                cursor,
+                max_entries,
+                reply,
+            } => {
+                let batch = self
+                    .store
+                    .export_slot_batch(slot, cursor, max_entries, now_ms);
+                let _ = reply.send(batch);
+            }
+            CacheShardControlRequest::Import { batch, reply } => {
+                let elapsed_ms = now_ms.saturating_sub(batch.exported_at_ms);
+                let tracker = self
+                    .transfer_imports
+                    .entry(batch.slot)
+                    .or_insert_with(|| CacheTransferImportTracker::new(batch.slot));
+                let results = batch
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        tracker.import_entry(&mut self.store, entry, elapsed_ms, now_ms)
+                    })
+                    .collect();
+                let _ = reply.send(results);
+            }
+            CacheShardControlRequest::Finalize { entries, reply } => {
+                let results = entries
+                    .iter()
+                    .map(|entry| self.store.finalize_transfer_entry(entry, now_ms))
+                    .collect();
+                let _ = reply.send(results);
+            }
+            CacheShardControlRequest::CountSlot { slot, reply } => {
+                let _ = reply.send(self.store.live_entries_in_slot(slot, now_ms));
+            }
+            CacheShardControlRequest::ClearImportTracker { slot, reply } => {
+                self.transfer_imports.remove(&slot);
+                let _ = reply.send(());
+            }
+        }
     }
 
     fn install_published_placement(&mut self) {
@@ -1072,6 +1393,16 @@ fn validate_config(config: &CacheServerConfig) -> Result<(), CacheServerError> {
     if config.max_inbox_batch == 0 {
         return Err(CacheServerError::InvalidConfig(
             "max_inbox_batch must be non-zero",
+        ));
+    }
+    if config.control_queue_capacity == 0 {
+        return Err(CacheServerError::InvalidConfig(
+            "control_queue_capacity must be non-zero",
+        ));
+    }
+    if config.max_control_batch == 0 {
+        return Err(CacheServerError::InvalidConfig(
+            "max_control_batch must be non-zero",
         ));
     }
     if config.expiry_sweep_interval.is_zero() {
