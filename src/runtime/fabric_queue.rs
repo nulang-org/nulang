@@ -337,7 +337,6 @@ pub(crate) struct FabricQueueLeaseMutation {
     pub deliveries: u32,
     pub consumer_group: Option<String>,
     pub queue_epoch: u64,
-    pub consumer_group: Option<String>,
     pub operation_id: Option<String>,
 }
 
@@ -391,6 +390,7 @@ pub(crate) struct FabricQueueOperation {
     pub consumer: String,
     pub lease_token: u64,
     pub queue_epoch: u64,
+    pub consumer_group: Option<String>,
     pub operation_id: Option<String>,
     pub status: Option<FabricQueueJobStatus>,
     pub available_at_ms: Option<u64>,
@@ -642,6 +642,7 @@ impl<'a> FabricQueueStore<'a> {
                 lease_token: 0,
                 status: FabricQueueJobStatus::Waiting,
                 consumer: None,
+                consumer_group: None,
                 lease_until_ms: None,
                 last_error: None,
             },
@@ -1149,6 +1150,7 @@ impl<'a> FabricQueueStore<'a> {
                             lease_token: 0,
                             status: FabricQueueJobStatus::Waiting,
                             consumer: None,
+                            consumer_group: None,
                             lease_until_ms: None,
                             last_error: None,
                         },
