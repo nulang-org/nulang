@@ -1081,6 +1081,7 @@ impl CacheServiceHandle {
             target_import_fences: *import_fences,
             target_conflicts: *conflicts,
             target_wrong_slot: *wrong_slot,
+            durable_history_satisfied: self.migration_journal.is_none(),
         })
     }
 
