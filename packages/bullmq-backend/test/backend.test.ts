@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { JobJson } from 'bullmq';
+import { Queue, Worker, type JobJson } from 'bullmq';
 
 import {
   NulangQueueBackend,
   NulangQueueSession,
+  createNulangBackendFactory,
 } from '../src/backend.js';
 import {
   encodeBullMQJob,
@@ -461,5 +462,75 @@ test('shares a client session and closes it only after the last backend closes',
   await first.close();
   assert.equal(client.closeCount, 0);
   await second.close();
+  assert.equal(client.closeCount, 1);
+});
+
+
+test('runs the real BullMQ Queue -> Worker -> Job completion path without Redis', async () => {
+  const client = new FakeClient();
+  const factory = createNulangBackendFactory(client, { now: () => 1_000 });
+
+  const queue = new Queue(
+    'paint',
+    { connection: {} } as any,
+    factory,
+  );
+  await queue.waitUntilReady();
+
+  const queued = await queue.add(
+    'render',
+    { asset: 'hero' },
+    { jobId: 'integration-1', attempts: 2, priority: 5 },
+  );
+  assert.equal(queued.id, 'integration-1');
+  assert.equal(client.adds.length, 1);
+  assert.equal(client.adds[0]?.jobId, 'integration-1');
+
+  const native = client.adds[0];
+  assert.ok(native);
+  client.deliveries.push({
+    queue: 'paint',
+    sequence: 1,
+    jobId: 'integration-1',
+    name: 'render',
+    payload: native.payload,
+    priority: native.priority,
+    deliveries: 1,
+    queueEpoch: 9,
+    leaseToken: 21,
+    leaseUntilMs: 31_000,
+  });
+
+  const worker = new Worker(
+    'paint',
+    null,
+    {
+      connection: {},
+      autorun: false,
+      lockDuration: 30_000,
+    } as any,
+    factory,
+  );
+  await worker.waitUntilReady();
+
+  const active = await worker.getNextJob('worker:integration', { block: false });
+  assert.ok(active);
+  assert.equal(active.id, 'integration-1');
+  assert.deepEqual(active.data, { asset: 'hero' });
+  assert.equal(active.attemptsStarted, 1);
+
+  await active.moveToCompleted(
+    { rendered: true },
+    'worker:integration',
+    false,
+  );
+
+  assert.equal(client.completes.length, 1);
+  assert.equal(client.completes[0]?.queueEpoch, 9);
+  assert.equal(client.completes[0]?.leaseToken, 21);
+  assert.deepEqual(client.completes[0]?.returnValue, { rendered: true });
+
+  await worker.close();
+  await queue.close();
   assert.equal(client.closeCount, 1);
 });
