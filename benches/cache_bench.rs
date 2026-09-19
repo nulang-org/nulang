@@ -61,7 +61,7 @@ fn bench_resp_get_execute(c: &mut Criterion) {
     let mut group = c.benchmark_group("cache/resp_get_execute");
     group.throughput(Throughput::Elements(1));
 
-    let frame = b"*2\r\n$3\r\nGET\r\n$20\r\ntenant:{42}:profile\r\n";
+    let frame = b"*2\r\n$3\r\nGET\r\n$19\r\ntenant:{42}:profile\r\n";
     let mut store = CacheStore::new();
     store.set_bytes(b"tenant:{42}:profile", b"small-value", None, 0);
     let mut out = Vec::with_capacity(64);
