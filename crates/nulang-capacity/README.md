@@ -20,6 +20,8 @@ This crate is deliberately separated from the Nulang language/runtime and from c
 12. **Concrete topology is separate from provider offers.** Resource providers model allocatable hosts/devices with integer inventories, traits, parent relationships, and explicit host/rack/zone/region/provider failure domains.
 13. **Candidate generation precedes scoring.** Topology eligibility is a hard-constraint phase; economics and locality may rank only candidates that can actually satisfy the request.
 14. **Replica placement is deterministic and topology-aware.** A stable placement key can spread replicas across explicit failure domains without maintaining a central per-object placement table.
+15. **Heartbeats gate schedulability; they do not own reservations.** A fresh `Ready` heartbeat is required for live placement, while runtime-observed usage is reconciliation evidence only.
+16. **The allocation ledger is authoritative for promised capacity.** Allocation IDs are idempotent, ledger mutations are generation-fenced, and durable implementations use atomic compare-and-swap to prevent scheduler replicas from overcommitting the same provider.
 
 ## Current scope
 
@@ -42,6 +44,9 @@ Implemented:
 - concrete resource-provider topology with hierarchical parent links, integer inventories, required/forbidden traits, and generation-tagged snapshots
 - hard allocation-candidate generation separated from soft economic/locality scoring
 - deterministic replica ordering and fail-closed spreading across host, rack, zone, region, or provider failure domains
+- topology-bound monotonic capacity heartbeats with `ready` / `draining` / `unavailable` states and freshness gating
+- serializable allocation-ledger snapshots with idempotent commits/releases, expiry, generation fencing, and a provider-neutral durable CAS store boundary
+- aggregate heartbeat-vs-ledger usage drift detection for reconciliation without letting observed runtime state silently rewrite reservations
 - tests covering Spot economics, long-running interruption risk, egress, GPU/trust constraints, critical workload policy, cross-provider ranking, stale snapshots, provider health, interruption transitions, telemetry, and lease idempotency
 
 ## Adapter architecture
@@ -53,7 +58,7 @@ The capacity core must remain usable without any provider SDK dependency.
 ## Next slices
 
 - derive static node topology/traits from runtime registration metadata while reporting dynamic inventory/usage through a separate capacity heartbeat; do not bloat membership/failure-detection gossip
-- persist resource allocations and fence topology/allocation updates with durable generations/CAS
+- implement a production `AllocationLedgerStore` in the hosted control-plane datastore and exercise concurrent scheduler replicas against it
 - add nested request groups for host + GPU/NVMe/NIC child-resource allocation
 - add PACK/SPREAD placement groups for actor teams once concrete host topology is populated
 - add reconciliation/rebalancing loops with bounded recovery QoS so repair cannot starve foreground workloads
