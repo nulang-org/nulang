@@ -2567,6 +2567,33 @@ mod json_file_store_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_durable_effect_keys_preserve_completed_state() {
+        let dir = fresh_dir("rocks_durable_effect");
+        let actor_id = 80;
+        let (id, prepared, completed) = durable_effect_pair(actor_id);
+        {
+            let mut store = RocksDbStore::new(&dir).unwrap();
+            store
+                .append_durable_effect_record(actor_id, prepared.clone())
+                .unwrap();
+            store
+                .append_durable_effect_record(actor_id, completed.clone())
+                .unwrap();
+            // This writes the Prepared slot again, not the Completed slot.
+            store
+                .append_durable_effect_record(actor_id, prepared)
+                .unwrap();
+
+            assert_eq!(
+                store.load_durable_effect_record(actor_id, id).unwrap(),
+                Some(completed)
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_json_file_store_save_load_snapshot() {
         let dir = fresh_dir("snapshot");
