@@ -97,6 +97,21 @@ two major versions.*
   owning shard directly. Cross-shard inbox activity and shutdown wake blocked
   reactors through Mio Waker, while bounded connection/input/output/pipeline
   limits provide explicit resource backpressure.
+- **Multi-shard cache service lifecycle** (Experimental,
+  `src/runtime/cache_server.rs`). The process-level builder pre-binds every
+  local listener, publishes real ephemeral ports before topology construction,
+  shares one monotonic clock and dispatch-channel set, validates advertised
+  owners, optionally pins shard reactors to CPUs, and starts/stops the shard
+  set as one joined service.
+- **Epoch-fenced Redis slot migration with ASK/ASKING** (Experimental,
+  `src/runtime/cache_routing.rs`, `src/runtime/cache_dispatch.rs`,
+  `src/runtime/cache_pipeline.rs`). A two-phase transition keeps the source
+  as stable owner until an explicitly fenced commit. Migrating sources serve
+  resident keys, return `ASK` for fully absent keys, and return `TRYAGAIN`
+  for mixed-residency multi-key commands. Importing targets execute only after
+  connection-local `ASKING`, whose authorization is consumed by exactly one
+  subsequent command. Generic placement updates cannot bypass an active
+  migration, and service construction rejects unadvertised migration targets.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
