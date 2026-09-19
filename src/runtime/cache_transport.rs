@@ -1211,6 +1211,50 @@ mod tests {
     }
 
     #[test]
+    fn migration_probe_round_trips_and_authenticates_target_response() {
+        let mut map = CacheSlotMap::new_local(1, 1).unwrap();
+        let slot = redis_slot(b"k{probe}");
+        let source = owner(1, 0);
+        let target = owner(2, 0);
+        map.begin_migration(7, slot, source, target).unwrap();
+
+        let request = CacheTransportMessage::MigrationProbeRequest {
+            probe_id: 44,
+            placement_epoch: 7,
+            source,
+            target,
+            slot,
+        };
+        let encoded = request.to_wire_bytes().unwrap();
+        assert_eq!(
+            CacheTransportMessage::from_wire_bytes(&encoded).unwrap(),
+            request
+        );
+        assert_eq!(request.validate_sender(NodeId(1)), Ok(()));
+        assert_eq!(request.validate_for_node(2, &map), Ok(()));
+
+        let response = CacheTransportMessage::MigrationProbeResponse {
+            probe_id: 44,
+            placement_epoch: 7,
+            source,
+            target,
+            slot,
+            accepted: true,
+            live_entries: 3,
+            import_fences: 3,
+            conflicts: 0,
+            wrong_slot: 0,
+        };
+        let encoded = response.to_wire_bytes().unwrap();
+        assert_eq!(
+            CacheTransportMessage::from_wire_bytes(&encoded).unwrap(),
+            response
+        );
+        assert_eq!(response.validate_sender(NodeId(2)), Ok(()));
+        assert_eq!(response.validate_for_node(1, &map), Ok(()));
+    }
+
+    #[test]
     fn bridge_is_bounded_in_both_directions() {
         let (runtime, service) = cache_transport_bridge(1).unwrap();
         let message = CacheTransportMessage::CommandResponse {
