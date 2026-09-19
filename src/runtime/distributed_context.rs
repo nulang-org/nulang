@@ -1198,9 +1198,13 @@ mod tests {
             .expect("bounded actor should appear in metrics");
         assert_eq!(mailbox.depth, 1);
         assert_eq!(mailbox.capacity, 1);
+        assert_eq!(mailbox.rejected, 1);
 
         let prometheus = snapshot.to_prometheus_text();
         assert!(prometheus.contains("nulang_actor_mailbox_capacity{actor_id=\"9001\"} 1"));
+        assert!(
+            prometheus.contains("nulang_actor_mailbox_rejected_total{actor_id=\"9001\"} 1")
+        );
     }
     #[test]
     fn fabric_publish_report_exposes_cross_shard_channel_backpressure() {
