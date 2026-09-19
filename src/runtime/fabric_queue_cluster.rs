@@ -756,7 +756,9 @@ impl Runtime {
     ) -> io::Result<FabricQueueReplicatedAddResult> {
         let source_placement = self
             .fabric_queue_replication_placement(source_queue)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source queue policy missing"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "source queue policy missing")
+            })?;
         let target_placement = self
             .fabric_queue_replication_placement(&plan.target_queue)?
             .ok_or_else(|| {
@@ -772,8 +774,7 @@ impl Runtime {
             || source_placement.epoch != target_placement.epoch
             || source_placement.leader != target_placement.leader
             || source_placement.replicas != target_placement.replicas
-            || source_placement.membership_fingerprint
-                != target_placement.membership_fingerprint
+            || source_placement.membership_fingerprint != target_placement.membership_fingerprint
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -3632,7 +3633,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            source_terminal.result.expect("source terminalization must commit").status,
+            source_terminal
+                .result
+                .expect("source terminalization must commit")
+                .status,
             FabricQueueJobStatus::DeadLettered
         );
 
@@ -3652,15 +3656,7 @@ mod tests {
         assert!(
             cluster
                 .node_mut(leader_index)
-                .fabric_queue_add_replicated(
-                    source,
-                    "render",
-                    b"poison-2",
-                    add2,
-                    0,
-                    3,
-                    1_000,
-                )
+                .fabric_queue_add_replicated(source, "render", b"poison-2", add2, 0, 3, 1_000,)
                 .unwrap()
                 .enqueued
         );
