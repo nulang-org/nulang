@@ -345,6 +345,21 @@ test('routes immediate and delayed retries through non-terminal fenced failure',
   assert.equal(client.failures[1]?.failedReason, 'backoff');
 });
 
+test('maps changeDelay and promote to non-active queue reschedule operations', async () => {
+  const client = new FakeClient();
+  const b = backend(client, 1_000);
+
+  await b.changeDelay('job-delay', 750);
+  assert.deepEqual(client.delayed, [
+    { queue: 'paint', jobId: 'job-delay', availableAtMs: 1_750 },
+  ]);
+
+  await b.promote('job-delay');
+  assert.deepEqual(client.promoted, [
+    { queue: 'paint', jobId: 'job-delay' },
+  ]);
+});
+
 test('moveToFailed is terminal and preserves lease fencing', async () => {
   const client = new FakeClient();
   const source = job('job-fail');
