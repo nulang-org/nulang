@@ -21,7 +21,7 @@ This crate is deliberately separated from the Nulang language/runtime and from c
 13. **Candidate generation precedes scoring.** Topology eligibility is a hard-constraint phase; economics and locality may rank only candidates that can actually satisfy the request.
 14. **Replica placement is deterministic and topology-aware.** A stable placement key can spread replicas across explicit failure domains without maintaining a central per-object placement table.
 15. **Heartbeats gate schedulability; they do not own reservations.** A fresh `Ready` heartbeat is required for live placement, while runtime-observed usage is reconciliation evidence only.
-16. **The allocation ledger is authoritative for promised capacity.** Allocation IDs are idempotent, ledger mutations are generation-fenced, and durable implementations use atomic compare-and-swap to prevent scheduler replicas from overcommitting the same provider.
+16. **The allocation ledger is authoritative for promised capacity.** Allocation IDs are idempotent, per-provider generations avoid a fleet-wide lock, and durable implementations use atomic provider-scoped compare-and-swap to prevent scheduler replicas from overcommitting the same resource provider.
 
 ## Current scope
 
@@ -45,7 +45,7 @@ Implemented:
 - hard allocation-candidate generation separated from soft economic/locality scoring
 - deterministic replica ordering and fail-closed spreading across host, rack, zone, region, or provider failure domains
 - topology-bound monotonic capacity heartbeats with `ready` / `draining` / `unavailable` states and freshness gating
-- serializable allocation-ledger snapshots with idempotent commits/releases, expiry, generation fencing, and a provider-neutral durable CAS store boundary
+- serializable allocation-ledger state with idempotent commits/releases, expiry, per-provider generation fencing, and a provider-neutral provider-scoped durable CAS store boundary
 - aggregate heartbeat-vs-ledger usage drift detection for reconciliation without letting observed runtime state silently rewrite reservations
 - tests covering Spot economics, long-running interruption risk, egress, GPU/trust constraints, critical workload policy, cross-provider ranking, stale snapshots, provider health, interruption transitions, telemetry, and lease idempotency
 
