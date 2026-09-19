@@ -333,6 +333,15 @@ enum QueueMutation {
         #[serde(default)]
         operation_id: Option<String>,
     },
+    Requeued {
+        sequence: u64,
+        expected_status: FabricQueueJobStatus,
+        available_at_ms: u64,
+        #[serde(default)]
+        reset_deliveries: bool,
+        #[serde(default)]
+        operation_id: Option<String>,
+    },
 }
 
 pub(crate) fn encode_queue_created_mutation(config: &FabricQueueConfig) -> io::Result<Vec<u8>> {
@@ -478,6 +487,37 @@ pub(crate) fn decode_queue_reschedule_mutation(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FabricQueueRequeueMutation {
+    pub sequence: u64,
+    pub expected_status: FabricQueueJobStatus,
+    pub available_at_ms: u64,
+    pub reset_deliveries: bool,
+    pub operation_id: Option<String>,
+}
+
+pub(crate) fn decode_queue_requeue_mutation(
+    bytes: &[u8],
+) -> io::Result<Option<FabricQueueRequeueMutation>> {
+    let event: QueueMutation = serde_json::from_slice(bytes).map_err(json_error)?;
+    match event {
+        QueueMutation::Requeued {
+            sequence,
+            expected_status,
+            available_at_ms,
+            reset_deliveries,
+            operation_id,
+        } => Ok(Some(FabricQueueRequeueMutation {
+            sequence,
+            expected_status,
+            available_at_ms,
+            reset_deliveries,
+            operation_id,
+        })),
+        _ => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FabricQueueOperationKind {
     Acquire,
@@ -612,7 +652,8 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
         },
         QueueMutation::QueueCreated { .. }
         | QueueMutation::ConsumerGroupConfigured { .. }
-        | QueueMutation::Rescheduled { .. } => {
+        | QueueMutation::Rescheduled { .. }
+        | QueueMutation::Requeued { .. } => {
             return Ok(None);
         }
     };
@@ -2397,6 +2438,72 @@ impl Runtime {
         Ok((sequence, bytes))
     }
 
+    pub(crate) fn fabric_queue_plan_committed_requeue(
+        &mut self,
+        queue: &str,
+        job_id: &str,
+        operation_id: &str,
+        expected_status: FabricQueueJobStatus,
+        available_at_ms: u64,
+        reset_deliveries: bool,
+    ) -> io::Result<(u64, Vec<u8>)> {
+        validate_queue_name(queue)?;
+        validate_job_id(job_id)?;
+        validate_operation_id(operation_id)?;
+        if !matches!(
+            expected_status,
+            FabricQueueJobStatus::Completed | FabricQueueJobStatus::Failed
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric queue requeue supports Completed or Failed jobs only",
+            ));
+        }
+        let mut store = self.fabric_queue_store()?;
+        let state = store.load_committed_state(queue)?;
+        let mut sequence = None;
+        for (&candidate_sequence, job) in &state.jobs {
+            let candidate_id = job
+                .job_id
+                .as_deref()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| candidate_sequence.to_string());
+            if candidate_id == job_id {
+                if sequence.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Fabric queue {queue:?} contains duplicate committed job id {job_id:?}"),
+                    ));
+                }
+                if job.status != expected_status {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Fabric queue job {job_id:?} is {:?}, expected {:?} for requeue",
+                            job.status, expected_status
+                        ),
+                    ));
+                }
+                sequence = Some(candidate_sequence);
+            }
+        }
+        let sequence = sequence.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Fabric queue job {job_id:?} does not exist"),
+            )
+        })?;
+        let bytes = serde_json::to_vec(&QueueMutation::Requeued {
+            sequence,
+            expected_status,
+            available_at_ms,
+            reset_deliveries,
+            operation_id: Some(operation_id.to_string()),
+        })
+        .map_err(json_error)?;
+        Ok((sequence, bytes))
+    }
+
     pub(crate) fn fabric_queue_committed_job_snapshot(
         &mut self,
         queue: &str,
@@ -2632,6 +2739,49 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
             job.available_at_ms = available_at_ms.unwrap_or(job.available_at_ms);
             job.last_error = last_error.clone();
             job.result = None;
+        }
+        QueueMutation::Requeued {
+            sequence,
+            expected_status,
+            available_at_ms,
+            reset_deliveries,
+            ..
+        } => {
+            if !matches!(
+                expected_status,
+                FabricQueueJobStatus::Completed | FabricQueueJobStatus::Failed
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric queue Requeued mutation has invalid expected terminal state",
+                ));
+            }
+            let job = state.jobs.get_mut(sequence).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Fabric queue requeue references missing job {sequence}"),
+                )
+            })?;
+            if job.status != *expected_status {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Fabric queue requeue expected {:?} job {sequence}, found {:?}",
+                        expected_status, job.status
+                    ),
+                ));
+            }
+            job.status = FabricQueueJobStatus::Waiting;
+            job.available_at_ms = *available_at_ms;
+            job.consumer = None;
+            job.consumer_group = None;
+            job.lease_until_ms = None;
+            job.last_error = None;
+            job.result = None;
+            if *reset_deliveries {
+                job.deliveries = 0;
+                job.lease_token = 0;
+            }
         }
         QueueMutation::Rescheduled {
             sequence,
