@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Cloud resource-provider topology — 2026-09-19
+- **Provider-neutral topology and allocation candidates** (Experimental, `crates/nulang-capacity/src/topology.rs`). Adds hierarchical resource providers with integer inventories, required/forbidden traits, generation-tagged topology snapshots, and explicit host/rack/zone/region/provider failure domains. Hard candidate generation is kept separate from existing economic scoring, and stable rendezvous-style ordering can fail closed while spreading replicas across distinct failure domains without a central per-object placement table.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
