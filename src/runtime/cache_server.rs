@@ -1244,6 +1244,182 @@ impl Drop for CacheServiceHandle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CacheNetworkPendingKey {
+    Command { peer: u64, request_id: u64 },
+    Transfer { peer: u64, transfer_id: u64 },
+}
+
+#[derive(Debug, Clone)]
+struct CacheNetworkPending {
+    outbound: CacheTransportOutbound,
+    next_attempt: Instant,
+    backoff: Duration,
+    attempts: u8,
+}
+
+#[derive(Debug)]
+struct CacheNetworkRetryState {
+    capacity: usize,
+    pending: HashMap<CacheNetworkPendingKey, CacheNetworkPending>,
+}
+
+impl CacheNetworkRetryState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            pending: HashMap::with_capacity(capacity),
+        }
+    }
+
+    fn register(
+        &mut self,
+        key: CacheNetworkPendingKey,
+        outbound: CacheTransportOutbound,
+    ) -> Result<(), CacheServiceError> {
+        if let Some(existing) = self.pending.get(&key) {
+            if existing.outbound == outbound {
+                return Ok(());
+            }
+            return Err(CacheServiceError::NetworkRequestIdInUse);
+        }
+        if self.pending.len() >= self.capacity {
+            return Err(CacheServiceError::NetworkRetryQueueFull);
+        }
+        self.pending.insert(
+            key,
+            CacheNetworkPending {
+                outbound,
+                next_attempt: Instant::now() + CACHE_NETWORK_RETRY_INITIAL,
+                backoff: CACHE_NETWORK_RETRY_INITIAL,
+                attempts: 1,
+            },
+        );
+        Ok(())
+    }
+
+    fn remove(&mut self, key: CacheNetworkPendingKey) {
+        self.pending.remove(&key);
+    }
+}
+
+fn cache_pending_key(
+    peer: NodeId,
+    message: &CacheTransportMessage,
+) -> Option<CacheNetworkPendingKey> {
+    match message {
+        CacheTransportMessage::CommandRequest { request_id, .. } => {
+            Some(CacheNetworkPendingKey::Command {
+                peer: peer.0,
+                request_id: *request_id,
+            })
+        }
+        CacheTransportMessage::TransferBatch { transfer_id, .. } => {
+            Some(CacheNetworkPendingKey::Transfer {
+                peer: peer.0,
+                transfer_id: *transfer_id,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn cache_completion_key(
+    peer: NodeId,
+    message: &CacheTransportMessage,
+) -> Option<CacheNetworkPendingKey> {
+    match message {
+        CacheTransportMessage::CommandResponse { request_id, .. } => {
+            Some(CacheNetworkPendingKey::Command {
+                peer: peer.0,
+                request_id: *request_id,
+            })
+        }
+        CacheTransportMessage::TransferAck { transfer_id, .. } => {
+            Some(CacheNetworkPendingKey::Transfer {
+                peer: peer.0,
+                transfer_id: *transfer_id,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn cache_timeout_for_pending(pending: &CacheNetworkPending) -> CacheNetworkTimeout {
+    let operation = match &pending.outbound.message {
+        CacheTransportMessage::CommandRequest {
+            request_id,
+            placement_epoch,
+            slot,
+            ..
+        } => CacheNetworkTimeoutOperation::Command {
+            request_id: *request_id,
+            placement_epoch: *placement_epoch,
+            slot: *slot,
+        },
+        CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch,
+            batch,
+            ..
+        } => CacheNetworkTimeoutOperation::Transfer {
+            transfer_id: *transfer_id,
+            placement_epoch: *placement_epoch,
+            slot: batch.slot,
+        },
+        _ => unreachable!("only request messages enter retry state"),
+    };
+    CacheNetworkTimeout {
+        peer: pending.outbound.to_node,
+        attempts: pending.attempts,
+        operation,
+    }
+}
+
+fn retry_cache_network_pending(
+    sender: &CacheServiceTransportSender,
+    retry: &Arc<Mutex<CacheNetworkRetryState>>,
+    timeout_tx: &mpsc::Sender<CacheNetworkTimeout>,
+) {
+    let now = Instant::now();
+    let mut exhausted = Vec::new();
+    let mut retry = retry.lock();
+
+    for (key, pending) in retry.pending.iter_mut() {
+        if pending.next_attempt > now {
+            continue;
+        }
+        if pending.attempts >= CACHE_NETWORK_RETRY_ATTEMPTS {
+            exhausted.push((*key, cache_timeout_for_pending(pending)));
+            continue;
+        }
+
+        match sender.try_send(pending.outbound.clone()) {
+            Ok(()) | Err(CacheTransportBridgeError::OutboundFull) => {
+                pending.attempts = pending.attempts.saturating_add(1);
+                pending.backoff = pending
+                    .backoff
+                    .saturating_mul(2)
+                    .min(CACHE_NETWORK_RETRY_MAX);
+                pending.next_attempt = now + pending.backoff;
+            }
+            Err(CacheTransportBridgeError::OutboundDisconnected) => {
+                pending.attempts = CACHE_NETWORK_RETRY_ATTEMPTS;
+                exhausted.push((*key, cache_timeout_for_pending(pending)));
+            }
+            Err(_) => {
+                pending.attempts = pending.attempts.saturating_add(1);
+                pending.next_attempt = now + pending.backoff;
+            }
+        }
+    }
+
+    for (key, timeout) in exhausted {
+        retry.pending.remove(&key);
+        let _ = timeout_tx.send(timeout);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CacheNetworkDedupeKey {
     Command { peer: u64, request_id: u64 },
     Transfer { peer: u64, transfer_id: u64 },
@@ -1347,6 +1523,8 @@ fn run_cache_network_coordinator(
     controls: Vec<CacheShardServerControl>,
     placement_publisher: Arc<CachePlacementPublisher>,
     network_event_tx: SyncSender<CacheTransportInbound>,
+    network_timeout_tx: mpsc::Sender<CacheNetworkTimeout>,
+    retry_state: Arc<Mutex<CacheNetworkRetryState>>,
     shutdown: Arc<AtomicBool>,
 ) {
     let sender = endpoint.sender();
@@ -1354,6 +1532,7 @@ fn run_cache_network_coordinator(
     let mut dedupe = CacheNetworkDedupe::new(CACHE_NETWORK_DEDUPE_ENTRIES);
 
     while !shutdown.load(Ordering::Acquire) {
+        retry_cache_network_pending(&sender, &retry_state, &network_timeout_tx);
         if let Some(next) = placement_publisher.snapshot_if_newer(placement.epoch()) {
             placement = next;
         }
@@ -1447,6 +1626,7 @@ fn run_cache_network_coordinator(
                 &sender,
                 &controls,
                 &network_event_tx,
+                &retry_state,
                 inbound.clone(),
             ) {
                 if let Some(key) = dedupe_key {
@@ -1466,6 +1646,7 @@ fn handle_cache_network_inbound(
     sender: &CacheServiceTransportSender,
     controls: &[CacheShardServerControl],
     network_event_tx: &SyncSender<CacheTransportInbound>,
+    retry_state: &Arc<Mutex<CacheNetworkRetryState>>,
     inbound: CacheTransportInbound,
 ) -> Option<CacheTransportMessage> {
     let from_node = inbound.from_node;
@@ -1524,14 +1705,24 @@ fn handle_cache_network_inbound(
         }
         message @ (CacheTransportMessage::CommandResponse { .. }
         | CacheTransportMessage::TransferAck { .. }) => {
+            let completion = cache_completion_key(from_node, &message);
             match network_event_tx.try_send(CacheTransportInbound { from_node, message }) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Some(key) = completion {
+                        retry_state.lock().remove(key);
+                    }
+                }
                 Err(TrySendError::Full(_)) => tracing::warn!(
-                    "nulang-cache: dropping cache network event because event queue is full"
+                    "nulang-cache: cache network event queue is full; keeping retry active"
                 ),
-                Err(TrySendError::Disconnected(_)) => tracing::warn!(
-                    "nulang-cache: dropping cache network event because receiver disconnected"
-                ),
+                Err(TrySendError::Disconnected(_)) => {
+                    if let Some(key) = completion {
+                        retry_state.lock().remove(key);
+                    }
+                    tracing::warn!(
+                        "nulang-cache: dropping cache network event because receiver disconnected"
+                    );
+                }
             }
         }
     }
