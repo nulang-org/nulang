@@ -610,7 +610,13 @@ impl CacheServiceTransportSender {
         &self,
         outbound: CacheTransportOutbound,
     ) -> Result<(), CacheTransportBridgeError> {
-        self.sender().try_send(outbound)
+        match self.outbound_tx.try_send(outbound) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(CacheTransportBridgeError::OutboundFull),
+            Err(TrySendError::Disconnected(_)) => {
+                Err(CacheTransportBridgeError::OutboundDisconnected)
+            }
+        }
     }
 }
 
