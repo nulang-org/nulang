@@ -1013,6 +1013,15 @@ impl CacheServiceHandle {
             return Err(CacheServiceError::RemoteTransferNotActive(slot));
         }
 
+        if let Some(journal) = &self.migration_journal {
+            journal.lock().record_intent(CacheMigrationKey {
+                started_epoch: migration.started_epoch,
+                slot,
+                source,
+                target,
+            })?;
+        }
+
         self.send_network_message(
             NodeId(target.node_id),
             CacheTransportMessage::MigrationProbeRequest {
@@ -1051,11 +1060,13 @@ impl CacheServiceHandle {
         }
 
         let placement = self.placement_publisher.snapshot();
-        if placement.epoch() != *placement_epoch
-            || placement
-                .migration_for_slot(*slot)
-                .is_none_or(|migration| migration.source != *source || migration.target != *target)
-        {
+        if placement.epoch() != *placement_epoch {
+            return Err(CacheServiceError::RemoteMigrationProbeMismatch);
+        }
+        let Some(migration) = placement.migration_for_slot(*slot) else {
+            return Err(CacheServiceError::RemoteMigrationProbeMismatch);
+        };
+        if migration.source != *source || migration.target != *target {
             return Err(CacheServiceError::RemoteMigrationProbeMismatch);
         }
 
@@ -1069,6 +1080,34 @@ impl CacheServiceHandle {
             .recv()
             .map_err(|_| CacheServiceError::ControlDisconnected(source.shard))?;
 
+        let evidence = CacheMigrationConvergenceEvidence {
+            probe_id: *probe_id,
+            target_accepted: *accepted,
+            source_remaining,
+            target_live_entries: *live_entries,
+            target_import_fences: *import_fences,
+            target_conflicts: *conflicts,
+            target_wrong_slot: *wrong_slot,
+        };
+        let durable_history_satisfied = if let Some(journal) = &self.migration_journal {
+            let key = CacheMigrationKey {
+                started_epoch: migration.started_epoch,
+                slot: *slot,
+                source: *source,
+                target: *target,
+            };
+            let mut journal = journal.lock();
+            journal.record_intent(key)?;
+            journal.record_source_remaining(key, source_remaining)?;
+            let satisfied = journal
+                .recovery_state(key)
+                .is_some_and(|state| state.accepts_fresh_convergence(&evidence));
+            journal.record_convergence(key, evidence.clone())?;
+            satisfied
+        } else {
+            true
+        };
+
         Ok(CacheRemoteMigrationConvergence {
             probe_id: *probe_id,
             placement_epoch: *placement_epoch,
@@ -1081,7 +1120,7 @@ impl CacheServiceHandle {
             target_import_fences: *import_fences,
             target_conflicts: *conflicts,
             target_wrong_slot: *wrong_slot,
-            durable_history_satisfied: self.migration_journal.is_none(),
+            durable_history_satisfied,
         })
     }
 
@@ -1138,16 +1177,28 @@ impl CacheServiceHandle {
             target,
             batch,
         };
-        self.send_network_message(
-            NodeId(target.node_id),
-            CacheTransportMessage::TransferBatch {
-                transfer_id,
-                placement_epoch: pending.placement_epoch,
+        let message = CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch: pending.placement_epoch,
+            source,
+            target,
+            batch: pending.batch.clone(),
+        };
+        if let Some(journal) = &self.migration_journal {
+            let key = CacheMigrationKey {
+                started_epoch: migration.started_epoch,
+                slot,
                 source,
                 target,
-                batch: pending.batch.clone(),
-            },
-        )?;
+            };
+            let mut journal = journal.lock();
+            journal.record_intent(key)?;
+            // Durable-before-send: if the process fails after this fsync but
+            // before transport enqueue, recovery safely treats the batch as
+            // possibly sent and can retry the exact envelope.
+            journal.record_transfer_sent(key, &message)?;
+        }
+        self.send_network_message(NodeId(target.node_id), message)?;
         Ok(pending)
     }
 
@@ -1161,32 +1212,39 @@ impl CacheServiceHandle {
         pending: &CacheRemoteTransferPending,
     ) -> Result<(), CacheServiceError> {
         let placement = self.placement_publisher.snapshot();
-        if placement.epoch() != pending.placement_epoch {
-            return Err(CacheServiceError::RemoteTransferNotActive(
-                pending.batch.slot,
-            ));
-        }
         let Some(migration) = placement.migration_for_slot(pending.batch.slot) else {
             return Err(CacheServiceError::RemoteTransferNotActive(
                 pending.batch.slot,
             ));
         };
-        if migration.source != pending.source || migration.target != pending.target {
+        if migration.source != pending.source
+            || migration.target != pending.target
+            || pending.placement_epoch < migration.started_epoch
+        {
             return Err(CacheServiceError::RemoteTransferNotActive(
                 pending.batch.slot,
             ));
         }
 
-        self.send_network_message(
-            NodeId(pending.target.node_id),
-            CacheTransportMessage::TransferBatch {
-                transfer_id: pending.transfer_id,
-                placement_epoch: pending.placement_epoch,
+        let message = CacheTransportMessage::TransferBatch {
+            transfer_id: pending.transfer_id,
+            placement_epoch: pending.placement_epoch,
+            source: pending.source,
+            target: pending.target,
+            batch: pending.batch.clone(),
+        };
+        if let Some(journal) = &self.migration_journal {
+            let key = CacheMigrationKey {
+                started_epoch: migration.started_epoch,
+                slot: pending.batch.slot,
                 source: pending.source,
                 target: pending.target,
-                batch: pending.batch.clone(),
-            },
-        )
+            };
+            let mut journal = journal.lock();
+            journal.record_intent(key)?;
+            journal.record_transfer_sent(key, &message)?;
+        }
+        self.send_network_message(NodeId(pending.target.node_id), message)
     }
 
     /// Apply a matching remote TransferAck and generation-fence source deletion.
