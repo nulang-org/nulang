@@ -2391,6 +2391,16 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                         return;
                     }
                 };
+                let schema_name = actor
+                    .bytecode_module
+                    .as_ref()
+                    .and_then(|module| {
+                        super::schema_identity::canonical_schema_name_for_runtime_actor(
+                            module,
+                            &actor.name,
+                        )
+                    })
+                    .map(str::to_owned);
                 let snapshot = crate::runtime::persistence::ActorSnapshot {
                     actor_id,
                     sequence: actor.sequence,
@@ -2398,6 +2408,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,
                     crdt_field_map,
+                    schema_name,
                     authority_tokens,
                 };
 
