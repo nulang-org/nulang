@@ -1517,6 +1517,7 @@ impl Runtime {
             queue_epoch,
             lease_token,
             operation_id,
+            None,
             now_ms,
         )?;
         let appended = self.fabric_stream_replicated_append(
