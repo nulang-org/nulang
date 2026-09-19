@@ -91,7 +91,7 @@ impl Inventory {
         amount >= self.min_unit
             && amount <= self.max_unit
             && self.step_size > 0
-            && amount % self.step_size == 0
+            && amount.is_multiple_of(self.step_size)
     }
 
     fn validate(&self) -> Result<(), InventoryError> {
