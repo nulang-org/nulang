@@ -112,6 +112,34 @@ clients because a warmed client can connect directly to the physical slot
 owner. Missing endpoint metadata fails closed instead of silently falling back
 to proxying.
 
+## Slot migration
+
+Live slot movement is modeled as a two-phase transition in
+`CacheSlotMap`. The stable owner remains the source until an explicit
+epoch-fenced commit; a transition snapshot carries `source`, `target`, and
+the epoch that started the migration. Generic owner reassignment is rejected
+for slots with an active transition, so a stale controller cannot bypass the
+migration protocol with an ordinary placement update.
+
+In redirect mode the source follows Redis Cluster migration behavior:
+
+- if all command keys are still resident locally, execute on the source;
+- if all keys are absent, return `-ASK <slot> <target>`;
+- if a same-slot multi-key command mixes resident and absent keys, return
+  `TRYAGAIN` rather than splitting execution across owners.
+
+The target interprets the same transition as IMPORTING. It continues to return
+`MOVED` under ordinary traffic, but a connection that sends `ASKING`
+receives one-command authorization to execute the next request locally. The
+authorization lives in `CacheResponsePipeline`, making it connection-local
+and one-shot rather than a property of the shard.
+
+This establishes the data-plane and topology invariants for migration, but
+does not yet distribute a new placement snapshot into already-running reactor
+threads. The next control-plane slice must install monotonically newer
+snapshots on every local shard without putting synchronization on the GET/SET
+hot path.
+
 The same cluster layer serves topology discovery without touching CacheStore:
 `CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
 topology response, and legacy `CLUSTER SLOTS` is retained for older clients.
@@ -136,6 +164,14 @@ in one process the same monotonic millisecond origin for local cross-shard TTL
 semantics; process-relative timestamps are not sent to remote nodes. Input,
 output, connection count, pipeline depth, inbox drain size, and expiry work are
 all bounded by configuration.
+
+At process scope, `CacheServiceBuilder` reserves all local listeners before
+constructing the shard dispatchers. This ensures real bound ports, including
+ephemeral port allocations, are present in every redirect/topology snapshot.
+The builder shares one clock and bounded dispatch-channel set, validates both
+stable owners and migration targets, optionally pins each reactor to a logical
+CPU, and returns a service handle that shuts down and joins every shard thread
+as one unit.
 
 ## Durability
 
@@ -169,14 +205,15 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add a multi-shard server builder that reserves/binds advertised endpoints,
-   shares one `CacheServerClock`, pins reactor threads when requested, and
-   starts/stops the shard set as one service.
-2. Add ASK/ASKING and migration-state redirects when live slot migration is
-   implemented.
-3. Add a separate transparent proxy endpoint only for non-cluster clients;
+1. Add a reactor control-plane channel that installs newer placement/migration
+   snapshots across the running local shard set with monotonic epoch checks.
+2. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
-4. Connect remote transparent handoffs to a cache-specific cluster transport.
+3. Connect remote transparent handoffs to a cache-specific cluster transport
+   and validate the carried placement epoch on receipt.
+4. Add explicit key-transfer primitives and migration progress accounting so
+   ASK/ASKING can drive an end-to-end live slot move rather than only routing
+   an externally transferred key set.
 5. Promote expiration to a hierarchical timing wheel, then add packed
    aggregate structures and durability acknowledgement modes.
 6. Expand RESP compatibility and add Nulang-native leases, locks, semaphores,
