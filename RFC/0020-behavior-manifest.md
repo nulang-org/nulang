@@ -189,6 +189,46 @@ Effect metadata may classify:
 
 These classifications must describe the semantic boundary precisely. Local snapshot rollback must never be represented as undoing a remote commit.
 
+## Host effect ABI binding
+
+Artifacts that lower compiler-owned external effects may include a first-class
+`host_abi` binding. This is security-relevant manifest data, not an advisory
+extension.
+
+The binding contains:
+
+- the versioned compiler-owned host ABI schema;
+- the digest of the exact machine-readable host-effect descriptor used by the
+  compiler;
+- the canonical `effect_id + operation_id` identities required by the
+  artifact.
+
+It intentionally contains **no source-level operation spellings** such as
+`Storage.write`. A deployment host validates the schema and descriptor digest,
+authorizes the canonical operation identities, and fails closed on an unknown
+schema, unknown descriptor, or unknown required operation.
+
+Conceptual form:
+
+```json
+{
+  "host_abi": {
+    "schema": "nulang.host-effects/v0alpha1",
+    "descriptor_digest": "blake3:...",
+    "operations": [
+      {
+        "effect_id": "nulang:storage/string",
+        "operation_id": "Write"
+      }
+    ]
+  }
+}
+```
+
+When a program requires no compiler-owned host operation, `host_abi` may be
+omitted. When present, it is part of the manifest/artifact admission unit and
+must not be reconstructed from source names by the deployment platform.
+
 ## External authority
 
 The manifest serializes the program's **required authority shape**, not credentials.

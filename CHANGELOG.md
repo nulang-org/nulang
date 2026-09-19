@@ -45,6 +45,16 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Behavior Manifest host-ABI binding — 2026-09-19
+- **RFC 0020 manifests gain first-class compiler-owned host ABI metadata**
+  (Experimental, `src/behavior_manifest.rs`,
+  `spec/behavior/v0alpha1.schema.json`). The binding records the host ABI
+  schema, descriptor digest, and canonical host operation identities without
+  leaking dotted source spellings into deployment semantics.
+- **Host ABI admission fails closed** on an unknown ABI version, descriptor
+  digest, or operation identity; descriptor identity is content-bound with
+  BLAKE3.
+
 ### Runtime backend parity — 2026-09-17
 - **WASM guest-heap negation error parity** (`src/wasm_runtime.rs`,
   `src/mir_wasm.rs`): unary negation of a guest heap value now reports the

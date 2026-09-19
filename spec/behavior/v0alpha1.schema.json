@@ -61,6 +61,9 @@
     "provenance": {
       "$ref": "#/$defs/provenance"
     },
+    "host_abi": {
+      "$ref": "#/$defs/host_abi"
+    },
     "extensions": {
       "type": "object",
       "description": "Advisory namespaced extension data. Consumers MUST NOT use unknown extensions to widen authority or make security-critical admission decisions.",
@@ -224,6 +227,30 @@
           "items": { "type": "string", "minLength": 2, "maxLength": 64 }
         },
         "network_egress_class": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "host_abi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "descriptor_digest", "operations"],
+      "properties": {
+        "schema": { "const": "nulang.host-effects/v0alpha1" },
+        "descriptor_digest": { "$ref": "#/$defs/digest" },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/host_operation" }
+        }
+      }
+    },
+    "host_operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effect_id", "operation_id"],
+      "properties": {
+        "effect_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "operation_id": { "type": "string", "minLength": 1, "maxLength": 128 }
       }
     },
     "provenance": {
