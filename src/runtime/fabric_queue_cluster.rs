@@ -4417,6 +4417,259 @@ mod tests {
     }
 
     #[test]
+    fn replicated_requeue_is_terminal_fenced_and_quorum_visible() {
+        use crate::runtime::cluster_dst::DeterministicCluster;
+        use crate::runtime::FabricQueueJobStatus;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let addrs = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39501),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39502),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39503),
+        ];
+        let mut cluster = DeterministicCluster::new(&addrs, 0x5251515545);
+        cluster.run_rounds(30);
+        assert!(cluster.active_views_converged());
+
+        let base = std::env::temp_dir().join(format!(
+            "nulang-fabric-queue-requeue-rf3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for index in 0..3 {
+            cluster
+                .node_mut(index)
+                .fabric_stream_open(base.join(format!("node-{index}")))
+                .unwrap();
+        }
+
+        let placement = cluster
+            .node_mut(0)
+            .fabric_stream_placement(&queue_placement_key("requeue"), 0, 3)
+            .unwrap();
+        let leader_index = (0..3)
+            .find(|&index| cluster.id(index) == placement.leader)
+            .unwrap();
+
+        let config = FabricQueueConfig::default();
+        let first = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("requeue", config.clone(), 0, 3)
+            .unwrap();
+        assert!(!first.policy.ready);
+        cluster.run_rounds(8);
+        let pending_create = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("requeue", config.clone(), 0, 3)
+            .unwrap();
+        assert_eq!(pending_create.mutation_sequence, Some(1));
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_create_replicated("requeue", config, 0, 3)
+                .unwrap()
+                .created
+        );
+
+        let options = FabricQueueAddOptions {
+            job_id: Some("job-1".to_string()),
+            priority: 0,
+            delay_ms: 0,
+            max_attempts: Some(3),
+        };
+        assert!(
+            !cluster
+                .node_mut(leader_index)
+                .fabric_queue_add_replicated(
+                    "requeue",
+                    "work",
+                    b"payload",
+                    options.clone(),
+                    0,
+                    3,
+                    100,
+                )
+                .unwrap()
+                .enqueued
+        );
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_add_replicated(
+                    "requeue",
+                    "work",
+                    b"payload",
+                    options,
+                    0,
+                    3,
+                    100,
+                )
+                .unwrap()
+                .enqueued
+        );
+
+        let lease_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("requeue", "worker", "acquire-1", 0, 3, 200)
+            .unwrap();
+        assert!(lease_pending.delivery.is_none());
+        cluster.run_rounds(12);
+        let delivery = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("requeue", "worker", "acquire-1", 0, 3, 200)
+            .unwrap()
+            .delivery
+            .unwrap();
+
+        let ack_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_ack_replicated(
+                "requeue",
+                delivery.sequence,
+                "worker",
+                delivery.queue_epoch,
+                delivery.lease_token,
+                "ack-1",
+                0,
+                3,
+                300,
+            )
+            .unwrap();
+        assert!(!ack_pending.completed);
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_ack_replicated(
+                    "requeue",
+                    delivery.sequence,
+                    "worker",
+                    delivery.queue_epoch,
+                    delivery.lease_token,
+                    "ack-1",
+                    0,
+                    3,
+                    300,
+                )
+                .unwrap()
+                .completed
+        );
+
+        let pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_requeue_replicated(
+                "requeue",
+                "job-1",
+                "requeue-1",
+                FabricQueueJobStatus::Completed,
+                500,
+                true,
+                0,
+                3,
+            )
+            .unwrap();
+        assert!(!pending.updated);
+        assert_eq!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_job_replicated("requeue", "job-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            FabricQueueJobStatus::Completed
+        );
+
+        let retry = cluster
+            .node_mut(leader_index)
+            .fabric_queue_requeue_replicated(
+                "requeue",
+                "job-1",
+                "requeue-1",
+                FabricQueueJobStatus::Completed,
+                500,
+                true,
+                0,
+                3,
+            )
+            .unwrap();
+        assert!(retry.resumed);
+        assert!(!retry.updated);
+
+        let conflict = cluster
+            .node_mut(leader_index)
+            .fabric_queue_requeue_replicated(
+                "requeue",
+                "job-1",
+                "requeue-1",
+                FabricQueueJobStatus::Completed,
+                600,
+                true,
+                0,
+                3,
+            )
+            .unwrap_err();
+        assert_eq!(conflict.kind(), io::ErrorKind::InvalidData);
+
+        cluster.run_rounds(12);
+        let committed = cluster
+            .node_mut(leader_index)
+            .fabric_queue_requeue_replicated(
+                "requeue",
+                "job-1",
+                "requeue-1",
+                FabricQueueJobStatus::Completed,
+                500,
+                true,
+                0,
+                3,
+            )
+            .unwrap();
+        assert!(committed.updated);
+
+        for index in 0..3 {
+            let job = cluster
+                .node_mut(index)
+                .fabric_queue_job_replicated("requeue", "job-1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.status, FabricQueueJobStatus::Waiting);
+            assert_eq!(job.deliveries, 0);
+            assert_eq!(job.available_at_ms, 500);
+            assert!(job.result.is_none());
+        }
+
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_acquire_replicated("requeue", "worker-2", "acquire-2", 0, 3, 499)
+                .unwrap()
+                .delivery
+                .is_none()
+        );
+        let redelivery_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("requeue", "worker-2", "acquire-3", 0, 3, 500)
+            .unwrap();
+        assert!(redelivery_pending.delivery.is_none());
+        cluster.run_rounds(12);
+        let redelivery = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("requeue", "worker-2", "acquire-3", 0, 3, 500)
+            .unwrap()
+            .delivery
+            .unwrap();
+        assert_eq!(redelivery.deliveries, 1);
+        assert_eq!(redelivery.lease_token, 1);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn installed_policy_request_must_match_partition_and_replication_factor() {
         let policy = sample_policy();
         assert!(validate_requested_policy(&policy, 0, 3).is_ok());
