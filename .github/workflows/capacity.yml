@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "crates/nulang-capacity/**"
+      - "crates/nulang-capacity-postgres/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/capacity.yml"
@@ -11,6 +12,7 @@ on:
     branches: [main]
     paths:
       - "crates/nulang-capacity/**"
+      - "crates/nulang-capacity-postgres/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/capacity.yml"
@@ -20,7 +22,7 @@ env:
 
 jobs:
   capacity:
-    name: Format, Check, Test & Clippy
+    name: Capacity Core + Postgres Adapter
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -35,13 +37,22 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Format
-        run: cargo fmt --package nulang-capacity -- --check
+        run: cargo fmt --package nulang-capacity --package nulang-capacity-postgres -- --check
 
-      - name: Check
+      - name: Check core
         run: cargo check -p nulang-capacity --all-targets
 
-      - name: Test
+      - name: Check Postgres adapter
+        run: cargo check -p nulang-capacity-postgres --all-targets
+
+      - name: Test core
         run: cargo test -p nulang-capacity
 
-      - name: Clippy
+      - name: Test Postgres adapter
+        run: cargo test -p nulang-capacity-postgres
+
+      - name: Clippy core
         run: cargo clippy -p nulang-capacity --all-targets -- -D warnings
+
+      - name: Clippy Postgres adapter
+        run: cargo clippy -p nulang-capacity-postgres --all-targets -- -D warnings
