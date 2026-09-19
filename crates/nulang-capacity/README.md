@@ -45,7 +45,7 @@ Implemented:
 - hard allocation-candidate generation separated from soft economic/locality scoring
 - deterministic replica ordering and fail-closed spreading across host, rack, zone, region, or provider failure domains
 - topology-bound monotonic capacity heartbeats with `ready` / `draining` / `unavailable` states and freshness gating
-- serializable allocation-ledger state with idempotent commits/releases, expiry, per-provider generation fencing, and a provider-neutral provider-scoped durable CAS store boundary
+- serializable allocation-ledger state with idempotent commits/releases, release/expiry tombstones that prevent delayed-retry resurrection, per-provider generation fencing, and a provider-neutral provider-scoped durable CAS store boundary
 - aggregate heartbeat-vs-ledger usage drift detection for reconciliation without letting observed runtime state silently rewrite reservations
 - tests covering Spot economics, long-running interruption risk, egress, GPU/trust constraints, critical workload policy, cross-provider ranking, stale snapshots, provider health, interruption transitions, telemetry, and lease idempotency
 
