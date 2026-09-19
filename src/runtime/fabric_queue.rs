@@ -2712,6 +2712,69 @@ mod tests {
     }
 
     #[test]
+    fn per_job_max_attempts_override_queue_default() {
+        let root = test_dir("per-job-attempts");
+        let mut streams = FileFabricStreamStore::open(&root).unwrap();
+        let mut queues = FabricQueueStore::new(&mut streams);
+        queues
+            .create_queue(
+                "jobs",
+                FabricQueueConfig {
+                    visibility_timeout_ms: 100,
+                    max_attempts: 5,
+                    dead_letter_queue: None,
+                },
+            )
+            .unwrap();
+
+        queues
+            .add_at(
+                "jobs",
+                "single-attempt",
+                b"payload",
+                FabricQueueAddOptions {
+                    job_id: Some("one-shot".to_string()),
+                    priority: 0,
+                    delay_ms: 0,
+                    max_attempts: Some(1),
+                },
+                10,
+            )
+            .unwrap();
+
+        let delivery = queues
+            .acquire_at("jobs", "worker", 10)
+            .unwrap()
+            .expect("per-job attempt override should still allow first delivery");
+        let result = queues
+            .nack_at(
+                "jobs",
+                delivery.sequence,
+                "worker",
+                delivery.lease_token,
+                0,
+                Some("boom"),
+                11,
+            )
+            .unwrap();
+
+        assert_eq!(result.status, FabricQueueJobStatus::Failed);
+        assert_eq!(result.deliveries, 1);
+        let info = queues.info_at("jobs", 11).unwrap();
+        assert_eq!(info.failed, 1);
+        assert_eq!(info.waiting, 0);
+
+        drop(queues);
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        let mut queues = FabricQueueStore::new(&mut reopened);
+        let info = queues.info_at("jobs", 11).unwrap();
+        assert_eq!(info.failed, 1);
+        assert!(queues.acquire_at("jobs", "worker-2", 12).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn stale_same_consumer_delivery_cannot_ack_new_lease() {
         let root = test_dir("fencing");
         let mut streams = FileFabricStreamStore::open(&root).unwrap();
