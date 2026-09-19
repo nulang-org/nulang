@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import re
 import sys
@@ -185,6 +186,22 @@ def verify_files():
     return True
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Verify Nulang implementation invariants and executable checks."
+    )
+    parser.add_argument(
+        "--skip-tests",
+        action="store_true",
+        help=(
+            "Skip the duplicate cargo build/test phase. Intended for CI jobs "
+            "that already ran the full test suite; static invariants and "
+            "zero-warning checks still run."
+        ),
+    )
+    return parser.parse_args()
+
+
 def run_tests():
     """Run cargo test --lib (default features) and fail on any test failure.
 
@@ -237,7 +254,8 @@ def run_tests():
 
 
 if __name__ == "__main__":
-    if verify_files() and check_warnings() and run_tests():
-        sys.exit(0)
-    else:
-        sys.exit(1)
+    args = parse_args()
+    ok = verify_files() and check_warnings()
+    if ok and not args.skip_tests:
+        ok = run_tests()
+    sys.exit(0 if ok else 1)
