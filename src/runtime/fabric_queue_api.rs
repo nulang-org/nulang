@@ -44,7 +44,20 @@ impl FabricQueueApiServer {
                 Ok((mut stream, _)) => {
                     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
                     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-                    Self::handle_connection(runtime, &mut stream)?;
+                    if let Err(error) = Self::handle_connection(runtime, &mut stream) {
+                        let (_, response) = json_error_response(
+                            400,
+                            error_kind_name(error.kind()),
+                            error.to_string(),
+                        );
+                        let head = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            response.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&response);
+                        let _ = stream.flush();
+                    }
                     handled += 1;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -583,7 +596,7 @@ fn status_name(status: FabricQueueJobStatus) -> &'static str {
         FabricQueueJobStatus::Active => "active",
         FabricQueueJobStatus::Completed => "completed",
         FabricQueueJobStatus::Failed => "failed",
-        FabricQueueJobStatus::DeadLettered => "dead_lettered",
+        FabricQueueJobStatus::DeadLettered => "dead-lettered",
     }
 }
 
