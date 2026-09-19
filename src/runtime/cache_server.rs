@@ -48,7 +48,6 @@ const CACHE_NETWORK_IDLE_SLEEP: Duration = Duration::from_millis(1);
 const CACHE_NETWORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 const CACHE_NETWORK_DEDUPE_ENTRIES: usize = 4_096;
 const CACHE_NETWORK_DEDUPE_RETENTION: Duration = Duration::from_secs(120);
-const CACHE_NETWORK_DEDUPE_RETENTION: Duration = Duration::from_secs(5);
 const CACHE_NETWORK_PENDING_ENTRIES: usize = 4_096;
 const CACHE_NETWORK_RETRY_INITIAL: Duration = Duration::from_millis(10);
 const CACHE_NETWORK_RETRY_MAX: Duration = Duration::from_millis(250);
