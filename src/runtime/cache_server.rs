@@ -1776,8 +1776,55 @@ fn handle_cache_network_inbound(
             );
             return Some(reply);
         }
+        CacheTransportMessage::MigrationProbeRequest {
+            probe_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+        } => {
+            let snapshot = probe_remote_migration_on_reactor(
+                controls,
+                target,
+                placement_epoch,
+                slot,
+                source,
+            );
+            let (accepted, live_entries, import_fences, conflicts, wrong_slot) =
+                match snapshot {
+                    Some(snapshot) => (
+                        true,
+                        snapshot.live_entries.min(u64::MAX as usize) as u64,
+                        snapshot.import_fences.min(u64::MAX as usize) as u64,
+                        snapshot.conflicts,
+                        snapshot.wrong_slot,
+                    ),
+                    None => (false, 0, 0, 0, 0),
+                };
+            let reply = CacheTransportMessage::MigrationProbeResponse {
+                probe_id,
+                placement_epoch,
+                source,
+                target,
+                slot,
+                accepted,
+                live_entries,
+                import_fences,
+                conflicts,
+                wrong_slot,
+            };
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: from_node,
+                    message: reply.clone(),
+                },
+            );
+            return Some(reply);
+        }
         message @ (CacheTransportMessage::CommandResponse { .. }
-        | CacheTransportMessage::TransferAck { .. }) => {
+        | CacheTransportMessage::TransferAck { .. }
+        | CacheTransportMessage::MigrationProbeResponse { .. }) => {
             let completion = cache_completion_key(from_node, &message);
             match network_event_tx.try_send(CacheTransportInbound { from_node, message }) {
                 Ok(()) => {
@@ -2022,6 +2069,30 @@ fn import_remote_batch_on_reactor(
         .ok()?;
     match reply_rx.recv_timeout(CACHE_NETWORK_CONTROL_TIMEOUT) {
         Ok(Ok(results)) => Some(results),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+fn probe_remote_migration_on_reactor(
+    controls: &[CacheShardServerControl],
+    target: CacheShardOwner,
+    placement_epoch: u64,
+    slot: u16,
+    source: CacheShardOwner,
+) -> Option<CacheMigrationProbeSnapshot> {
+    let control = controls.get(target.shard as usize)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    control
+        .request_control(CacheShardControlRequest::MigrationProbe {
+            placement_epoch,
+            slot,
+            source,
+            target,
+            reply: reply_tx,
+        })
+        .ok()?;
+    match reply_rx.recv_timeout(CACHE_NETWORK_CONTROL_TIMEOUT) {
+        Ok(Ok(snapshot)) => Some(snapshot),
         Ok(Err(_)) | Err(_) => None,
     }
 }
