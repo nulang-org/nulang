@@ -45,6 +45,17 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Durable actor schema identity and recovery — 2026-09-18
+- **Actor snapshots persist canonical schema identity and recovery resolves exactly
+  one declared actor schema** (`src/runtime/schema_identity.rs`,
+  `src/runtime/persistence.rs`). Unknown persisted schemas fail closed; legacy
+  snapshots are accepted only when the module has one unambiguous actor schema.
+- Recovery, virtual-actor hydration, and migration derive workflow/agent role,
+  state models, defaults, workflow offsets, compensation layout, and actor type
+  hash from the selected schema instead of scanning unrelated actor metadata.
+- LibSQL/SQLite and PostgreSQL snapshot stores persist the nullable schema name
+  with backward-compatible migrations; JSON/RocksDB continue serializing the
+  complete snapshot.
 ### Runtime actor behavior ownership enforcement — 2026-09-18
 - **Behavior IDs and names are validated against the target actor's canonical
   schema before delivery** (`src/runtime/behavior_ownership.rs`,
