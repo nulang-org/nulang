@@ -45,6 +45,16 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Added since 1.0.0-frozen — 2026-09-16 (pattern coverage diagnostics)
+- **Finite-domain match coverage diagnostics** (Experimental, RFC 0020,
+  `src/pattern_coverage.rs`, `src/typechecker.rs`). After successful ordinary
+  type inference, matches over closed variant types and `Bool` emit `W0201`
+  for missing constructors/values and `W0202` for redundant arms. Guarded
+  arms do not prove exhaustiveness. Existing Nulang Core program validity and
+  the runtime non-exhaustive-match fallback remain unchanged;
+  `--deny-warnings` provides opt-in strictness. The LSP preserves the same
+  warning codes and source ranges.
+
 ### Durable actor schema identity and recovery — 2026-09-18
 - **Actor snapshots persist canonical schema identity and recovery resolves exactly
   one declared actor schema** (`src/runtime/schema_identity.rs`,
