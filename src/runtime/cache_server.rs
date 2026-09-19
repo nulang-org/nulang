@@ -8,7 +8,6 @@
 #![cfg(feature = "cache-server")]
 
 use std::collections::{HashMap, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,7 +19,6 @@ use std::time::{Duration, Instant};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use parking_lot::Mutex;
-use rustc_hash::FxHasher;
 
 use super::cache::{
     CacheStore, CacheTransferBatch, CacheTransferCursor, CacheTransferEntry, CacheTransferFinalize,
@@ -1171,7 +1169,7 @@ enum CacheNetworkDedupeKey {
 
 #[derive(Debug, Clone)]
 struct CacheNetworkDedupeRecord {
-    fingerprint: u64,
+    fingerprint: [u8; 32],
     reply: CacheTransportMessage,
 }
 
@@ -1194,7 +1192,7 @@ impl CacheNetworkDedupe {
     fn lookup(
         &self,
         key: CacheNetworkDedupeKey,
-        fingerprint: u64,
+        fingerprint: [u8; 32],
     ) -> Result<Option<CacheTransportMessage>, ()> {
         match self.records.get(&key) {
             Some(record) if record.fingerprint == fingerprint => Ok(Some(record.reply.clone())),
@@ -1206,7 +1204,7 @@ impl CacheNetworkDedupe {
     fn insert(
         &mut self,
         key: CacheNetworkDedupeKey,
-        fingerprint: u64,
+        fingerprint: [u8; 32],
         reply: CacheTransportMessage,
     ) {
         if self.records.contains_key(&key) {
@@ -1229,13 +1227,11 @@ impl CacheNetworkDedupe {
     }
 }
 
-fn cache_message_fingerprint(message: &CacheTransportMessage) -> u64 {
-    let mut hasher = FxHasher::default();
+fn cache_message_fingerprint(message: &CacheTransportMessage) -> [u8; 32] {
     match message.to_wire_bytes() {
-        Ok(bytes) => bytes.hash(&mut hasher),
-        Err(_) => std::mem::discriminant(message).hash(&mut hasher),
+        Ok(bytes) => *blake3::hash(&bytes).as_bytes(),
+        Err(_) => [0u8; 32],
     }
-    hasher.finish()
 }
 
 fn run_cache_network_coordinator(
