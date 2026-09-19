@@ -1,0 +1,29 @@
+{
+  "name": "@nulang/bullmq-backend",
+  "version": "0.0.0-alpha.0",
+  "description": "BullMQ v6 IQueueBackend adapter for Nulang Fabric Queue",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "check": "npm run build && npm test"
+  },
+  "peerDependencies": {
+    "bullmq": ">=6.3.8 <7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "bullmq": "6.3.8",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
