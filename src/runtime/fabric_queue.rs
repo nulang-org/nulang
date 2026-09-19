@@ -198,6 +198,10 @@ enum QueueMutation {
         sequence: u64,
         consumer: String,
         lease_token: u64,
+        #[serde(default)]
+        queue_epoch: u64,
+        #[serde(default)]
+        operation_id: Option<String>,
     },
     Nacked {
         sequence: u64,
@@ -206,12 +210,20 @@ enum QueueMutation {
         status: FabricQueueJobStatus,
         available_at_ms: Option<u64>,
         last_error: Option<String>,
+        #[serde(default)]
+        queue_epoch: u64,
+        #[serde(default)]
+        operation_id: Option<String>,
     },
     LeaseRenewed {
         sequence: u64,
         consumer: String,
         lease_token: u64,
         lease_until_ms: u64,
+        #[serde(default)]
+        queue_epoch: u64,
+        #[serde(default)]
+        operation_id: Option<String>,
     },
     LeaseExpired {
         sequence: u64,
@@ -565,6 +577,8 @@ impl<'a> FabricQueueStore<'a> {
             sequence,
             consumer: consumer.to_string(),
             lease_token,
+            queue_epoch: 0,
+            operation_id: None,
         };
         let event_sequence = self.append_mutation(queue, &event)?;
         apply_mutation(&mut state, &event)?;
@@ -633,6 +647,8 @@ impl<'a> FabricQueueStore<'a> {
             status,
             available_at_ms,
             last_error: error.map(ToOwned::to_owned),
+            queue_epoch: 0,
+            operation_id: None,
         };
         let event_sequence = self.append_mutation(queue, &event)?;
         apply_mutation(&mut state, &event)?;
@@ -687,6 +703,8 @@ impl<'a> FabricQueueStore<'a> {
             consumer: consumer.to_string(),
             lease_token,
             lease_until_ms,
+            queue_epoch: 0,
+            operation_id: None,
         };
         let event_sequence = self.append_mutation(queue, &event)?;
         apply_mutation(&mut state, &event)?;
@@ -1539,6 +1557,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
             sequence,
             consumer,
             lease_token,
+            ..
         } => {
             validate_mutation_lease(state, *sequence, consumer, *lease_token)?;
             let job = state.jobs.get_mut(sequence).expect("validated job must exist");
@@ -1554,6 +1573,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
             status,
             available_at_ms,
             last_error,
+            ..
         } => {
             validate_mutation_lease(state, *sequence, consumer, *lease_token)?;
             if !matches!(
@@ -1579,6 +1599,7 @@ fn apply_mutation(state: &mut QueueStateFile, event: &QueueMutation) -> io::Resu
             consumer,
             lease_token,
             lease_until_ms,
+            ..
         } => {
             validate_mutation_lease(state, *sequence, consumer, *lease_token)?;
             let job = state.jobs.get_mut(sequence).expect("validated job must exist");
@@ -1674,7 +1695,7 @@ pub(crate) fn validate_consumer_name(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_operation_id(operation_id: &str) -> io::Result<()> {
+pub(crate) fn validate_operation_id(operation_id: &str) -> io::Result<()> {
     if operation_id.is_empty() || operation_id.len() > 256 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
