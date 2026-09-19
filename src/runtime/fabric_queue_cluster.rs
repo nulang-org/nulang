@@ -133,6 +133,7 @@ impl Runtime {
             }
             (Some(installed), None) => {
                 validate_requested_policy(installed, partition, replication_factor)?;
+                require_empty_stream(self, &payload)?;
                 require_unowned_empty_stream(self, &mutations)?;
                 self.fabric_stream_establish_replication_policy(
                     &mutations,
@@ -142,6 +143,7 @@ impl Runtime {
             }
             (None, Some(installed)) => {
                 validate_requested_policy(installed, partition, replication_factor)?;
+                require_empty_stream(self, &mutations)?;
                 require_unowned_empty_stream(self, &payload)?;
                 self.fabric_stream_establish_replication_policy(
                     &payload,
@@ -203,12 +205,16 @@ fn require_unowned_empty_stream(runtime: &mut Runtime, stream: &str) -> io::Resu
             format!("Fabric stream {stream:?} already has a replication policy"),
         ));
     }
+    require_empty_stream(runtime, stream)
+}
+
+fn require_empty_stream(runtime: &mut Runtime, stream: &str) -> io::Result<()> {
     let info = runtime.fabric_stream_info(stream)?;
     if info.last_sequence.is_some() || info.committed_sequence > 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "Fabric stream {stream:?} has durable history without a replication policy; explicit queue migration is required"
+                "Fabric stream {stream:?} has durable history during queue policy bootstrap; explicit queue migration/recovery is required"
             ),
         ));
     }
