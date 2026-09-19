@@ -358,6 +358,28 @@ Replicated enqueue is exposed through `fabric_queue_add_replicated`:
   enqueue; compatibility adapters should generate stable operation IDs for
   transport retries.
 
+Replicated worker acquisition is exposed through
+`fabric_queue_acquire_replicated`. It is leader-serialized and quorum-gated:
+
+- candidate selection uses only the committed queue state,
+- priority ordering remains highest-priority first and FIFO within a priority,
+- every replicated lease carries the installed queue epoch and a monotonic
+  per-job lease token,
+- callers supply a stable acquire `operation_id`,
+- the first call appends one `LeaseAcquired` metadata mutation,
+- retries with the same operation id resume that exact mutation,
+- a different acquire is rejected with `WouldBlock` while metadata has an
+  uncommitted tail,
+- no `FabricQueueDelivery` is returned until the lease mutation quorum
+  commits,
+- replicated deliveries expose both `queue_epoch` and `lease_token` so
+  future ACK/NACK/renew operations can reject stale workers after either a
+  lease turnover or queue ownership epoch change.
+
+Expired active leases are intentionally not reassigned yet. Lease expiry must
+itself become a replicated metadata mutation before another worker can acquire
+the job; local wall-clock expiry is not allowed to bypass quorum state.
+
 
 ## Distributed follow-up
 
@@ -392,15 +414,14 @@ The compatibility layers must preserve these invariants:
 
 ## Next implementation slice
 
-1. Add replicated consumer-group ownership while preserving lease fencing tokens.
-2. Make lease acquisition a serialized quorum-safe compare-and-set against the
-   committed queue state and installed queue epoch.
-3. Include `epoch + lease_token` in every replicated delivery and require both
-   on ACK/NACK/renew.
-4. Replicate lease expiry/redelivery before a job can be reassigned.
-5. Implement atomic DLQ forwarding.
-6. Build the minimal BullMQ B1 backend against these APIs.
-7. Run BullMQ's adapter conformance suite and use failures to drive only the
+1. Require `queue_epoch + lease_token` on replicated ACK/NACK/renew and make
+   each operation retry-safe with a stable operation id.
+2. Replicate lease expiry/redelivery before a job can be reassigned.
+3. Add explicit replicated consumer-group ownership/concurrency limits on top of
+   the serialized lease path.
+4. Implement atomic DLQ forwarding.
+5. Build the minimal BullMQ B1 backend against these APIs.
+6. Run BullMQ's adapter conformance suite and use failures to drive only the
    missing generally useful native queue semantics.
-8. Then build Core NATS wire compatibility; JetStream follows after replicated
+7. Then build Core NATS wire compatibility; JetStream follows after replicated
    consumer semantics are proven.
