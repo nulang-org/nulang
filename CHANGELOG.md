@@ -45,6 +45,15 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Runtime actor behavior ownership enforcement — 2026-09-18
+- **Behavior IDs and names are validated against the target actor's canonical
+  schema before delivery** (`src/runtime/behavior_ownership.rs`,
+  `src/runtime/mod.rs`). A behavior belonging to another actor type can no
+  longer be executed merely because its numeric slot or short name exists.
+- Virtual actors resolve `Type@key` runtime names through the declared `Type`
+  schema; native/manual actors retain their native behavior-table semantics.
+- Cross-shard numeric delivery rejects foreign-schema behavior IDs before
+  mailbox publication.
 ### Runtime actor schema identity preservation — 2026-09-18
 - **Module-spawned actors retain their canonical `ActorMeta.name` schema
   identity** (`src/runtime/spawn.rs`) instead of discarding it in favor of
