@@ -94,6 +94,19 @@ impl MetricsSnapshot {
             ));
         }
 
+        // Gauge: per-actor mailbox capacity for the same top-depth actors.
+        // A value of 0 means the mailbox is intentionally unbounded.
+        out.push_str(
+            "# HELP nulang_actor_mailbox_capacity Configured per-actor mailbox capacity (0 = unbounded)\n",
+        );
+        out.push_str("# TYPE nulang_actor_mailbox_capacity gauge\n");
+        for m in sorted.iter().take(50) {
+            out.push_str(&format!(
+                "nulang_actor_mailbox_capacity{{actor_id=\"{}\"}} {}\n",
+                m.actor_id, m.capacity
+            ));
+        }
+
         // Scheduler counters
         let s = &self.scheduler;
         macro_rules! counter {
