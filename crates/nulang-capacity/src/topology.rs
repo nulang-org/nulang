@@ -596,8 +596,7 @@ mod tests {
                 host("b1", "az-b", "rack-c", &[]),
             ],
         };
-        let candidates =
-            allocation_candidates(&topology, &BTreeMap::new(), &request(100)).unwrap();
+        let candidates = allocation_candidates(&topology, &BTreeMap::new(), &request(100)).unwrap();
 
         assert_eq!(
             select_spread_replicas("stream:payments", &candidates, 3, FailureDomain::Zone),
