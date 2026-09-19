@@ -404,6 +404,18 @@ fn stress_scheduler_with_mixed_workload() {
             ("quota".into(), Value::int(1)),
         ]
     }));
+    rt.actors
+        .get_mut(&cpu_actor)
+        .unwrap()
+        .register_behavior("compute", |_actor, _args| {});
+    rt.actors
+        .get_mut(&io_actor)
+        .unwrap()
+        .register_behavior("io_op", |_actor, _args| {});
+    rt.actors
+        .get_mut(&sink)
+        .unwrap()
+        .register_behavior("collect", |_actor, _args| {});
 
     // Seed workloads: send messages to each actor type
     for i in 0..50 {
@@ -643,6 +655,14 @@ fn stress_reduction_quota_fairness() {
             ("quota".into(), Value::int(10)),
         ]
     }));
+    rt.actors
+        .get_mut(&actor_a)
+        .unwrap()
+        .register_behavior("work", |_actor, _args| {});
+    rt.actors
+        .get_mut(&actor_b)
+        .unwrap()
+        .register_behavior("work", |_actor, _args| {});
 
     const MSG_COUNT: usize = 100;
     for i in 0..MSG_COUNT {
@@ -684,6 +704,14 @@ fn stress_effect_resume_after_mailbox_pressure() {
             ("effect".into(), Value::int(41)), // 41 = "SimulatedRead"
         ]
     }));
+    rt.actors
+        .get_mut(&effect_actor)
+        .unwrap()
+        .register_behavior("start_effect", |_actor, _args| {});
+    rt.actors
+        .get_mut(&effect_actor)
+        .unwrap()
+        .register_behavior("flood", |_actor, _args| {});
 
     // Start an effect on the actor
     rt.send_message(effect_actor, "start_effect", &[]);
@@ -1153,6 +1181,10 @@ fn stress_gc_foreign_ref_churn() {
     let mut rt = Runtime::new();
     let source = rt.spawn_actor(Box::new(|| vec![("name".into(), Value::int(800))]));
     let target = rt.spawn_actor(Box::new(|| vec![("name".into(), Value::int(801))]));
+    rt.actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("ref", |_actor, _args| {});
 
     rt.current_actor = Some(source);
 
@@ -1193,6 +1225,10 @@ fn stress_gc_foreign_ref_churn() {
 fn stress_distribution_local_fallback_when_disabled() {
     let mut rt = Runtime::new();
     let actor = rt.spawn_actor(Box::new(|| vec![("name".into(), Value::int(900))]));
+    rt.actors
+        .get_mut(&actor)
+        .unwrap()
+        .register_behavior("ping", |_actor, _args| {});
 
     assert!(!rt.distributed.enabled);
 
@@ -1227,6 +1263,10 @@ fn stress_reduction_yield_under_pressure() {
                 ("quota".into(), Value::int(5)),
             ]
         }));
+        rt.actors
+            .get_mut(&id)
+            .unwrap()
+            .register_behavior("work", |_actor, _args| {});
         actors.push(id);
     }
 
@@ -1653,6 +1693,10 @@ fn stress_actor_ping_pong_messaging() {
     let pinger = rt.spawn_actor(Box::new(|| vec![("name".into(), Value::int(100))]));
 
     let ponger = rt.spawn_actor(Box::new(|| vec![("name".into(), Value::int(101))]));
+    rt.actors
+        .get_mut(&pinger)
+        .unwrap()
+        .register_behavior("pong", |_actor, _args| {});
 
     // Pre-load the pinger's mailbox with 10,000 "pong" messages
     // that each carry a decrementing counter.

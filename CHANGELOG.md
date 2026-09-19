@@ -45,6 +45,15 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fail-closed actor behavior-name dispatch — 2026-09-18
+- **Unknown actor behavior names no longer alias behavior slot 0**
+  (`src/runtime/mod.rs`, `src/runtime/distributed.rs`). Local sends/asks and
+  distributed destination-side resolution reject undeclared behavior names
+  explicitly while preserving a legitimately declared behavior at numeric
+  slot 0.
+- **Cross-shard name-based delivery resolves on the owning shard** rather than
+  manufacturing a numeric fallback on the source shard. Content-hash retry
+  remains available only when it can resolve the requested declared behavior.
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
