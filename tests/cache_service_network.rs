@@ -497,3 +497,158 @@ fn stale_remote_transfer_epoch_never_finalizes_source_key() {
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
 }
+
+
+#[test]
+fn duplicate_remote_command_replays_cached_response_without_reexecution() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33601".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33602".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"retry-counter";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let mut placement = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+    placement
+        .apply_epoch(
+            1,
+            &[nulang::runtime::CacheSlotRange {
+                start: slot,
+                end: slot,
+                owner: target,
+            }],
+        )
+        .unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, placement.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53602))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, placement)
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53601))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let set = CacheTransportMessage::CommandRequest {
+        request_id: 1,
+        placement_epoch: 1,
+        slot,
+        target,
+        frame: frame(&[b"SET", key, b"0"]),
+    };
+    service_a.send_network_message(node_b, set).unwrap();
+    let _ = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+
+    let increment = CacheTransportMessage::CommandRequest {
+        request_id: 77,
+        placement_epoch: 1,
+        slot,
+        target,
+        frame: frame(&[b"INCR", key]),
+    };
+    service_a
+        .send_network_message(node_b, increment.clone())
+        .unwrap();
+    let first = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match first.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(response, b":1\r\n");
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+
+    service_a
+        .send_network_message(node_b, increment)
+        .unwrap();
+    let duplicate = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match duplicate.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(response, b":1\r\n");
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+
+    let get = CacheTransportMessage::CommandRequest {
+        request_id: 78,
+        placement_epoch: 1,
+        slot,
+        target,
+        frame: frame(&[b"GET", key]),
+    };
+    service_a.send_network_message(node_b, get).unwrap();
+    let current = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match current.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(response, b"$1\r\n1\r\n");
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+
+    let reused_id = CacheTransportMessage::CommandRequest {
+        request_id: 77,
+        placement_epoch: 1,
+        slot,
+        target,
+        frame: frame(&[b"GET", key]),
+    };
+    service_a
+        .send_network_message(node_b, reused_id)
+        .unwrap();
+    let rejected = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match rejected.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(
+                response,
+                b"-ERR cache request id reused with different payload\r\n"
+            );
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
