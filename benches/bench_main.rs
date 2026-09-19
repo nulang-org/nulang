@@ -4,6 +4,7 @@
 //! Individual group: `cargo bench --bench bench_main -- vm_throughput`
 
 mod actor_bench;
+mod cache_bench;
 #[cfg(feature = "native-codegen")]
 mod aot_bench;
 mod dist_bench;
@@ -22,6 +23,7 @@ criterion_main!(
     vm_bench::benches,
     interp_bench::benches,
     actor_bench::benches,
+    cache_bench::benches,
     aot_bench::benches,
     jit_bench::benches,
     gc_bench::benches,
