@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use parking_lot::Mutex;
+use rand_core::{OsRng, RngCore};
 
 use super::cache::{
     CacheStore, CacheTransferBatch, CacheTransferCursor, CacheTransferEntry, CacheTransferFinalize,
@@ -679,6 +680,9 @@ impl CacheServiceBuilder {
 
         let placement_publisher = Arc::new(CachePlacementPublisher::new(self.placement.clone()));
         let clock = CacheServerClock::new();
+        let mut migration_incarnation = [0u8; 16];
+        let mut rng = OsRng;
+        rng.fill_bytes(&mut migration_incarnation);
         let mut servers = Vec::with_capacity(self.shards.len());
         let mut local_addrs = Vec::with_capacity(self.shards.len());
         let mut cpus = Vec::with_capacity(self.shards.len());
@@ -726,6 +730,7 @@ impl CacheServiceBuilder {
             placement_publisher,
             transport_endpoint: self.transport_endpoint,
             migration_journal,
+            migration_incarnation,
         })
     }
 }
@@ -739,6 +744,7 @@ pub struct CacheService {
     placement_publisher: Arc<CachePlacementPublisher>,
     transport_endpoint: Option<CacheServiceTransportEndpoint>,
     migration_journal: Option<CacheMigrationJournal>,
+    migration_incarnation: [u8; 16],
 }
 
 impl CacheService {
@@ -847,6 +853,7 @@ impl CacheService {
             network_timeouts: has_transport.then_some(network_timeout_rx),
             network_retry: has_transport.then_some(network_retry),
             migration_journal,
+            migration_incarnation: self.migration_incarnation,
             network_thread,
             network_shutdown,
         })
@@ -865,6 +872,7 @@ pub struct CacheServiceHandle {
     network_timeouts: Option<Receiver<CacheNetworkTimeout>>,
     network_retry: Option<Arc<Mutex<CacheNetworkRetryState>>>,
     migration_journal: Option<Arc<Mutex<CacheMigrationJournal>>>,
+    migration_incarnation: [u8; 16],
     network_thread: Option<JoinHandle<()>>,
     network_shutdown: Arc<AtomicBool>,
 }
@@ -880,6 +888,15 @@ impl CacheServiceHandle {
 
     pub fn published_placement_epoch(&self) -> u64 {
         self.placement_publisher.published_epoch()
+    }
+
+    /// Identifies the currently live source CacheStore incarnation.
+    ///
+    /// A new cache-service process gets a new value; durable migration history
+    /// from a different incarnation cannot be extended while CacheStore itself
+    /// remains ephemeral.
+    pub fn migration_incarnation(&self) -> [u8; 16] {
+        self.migration_incarnation
     }
 
     /// Durable unfinished/completed migration state reconstructed on journal open.
@@ -1104,12 +1121,15 @@ impl CacheServiceHandle {
         }
 
         if let Some(journal) = &self.migration_journal {
-            journal.lock().record_intent(CacheMigrationKey {
-                started_epoch: migration.started_epoch,
-                slot,
-                source,
-                target,
-            })?;
+            journal.lock().record_intent(
+                CacheMigrationKey {
+                    started_epoch: migration.started_epoch,
+                    slot,
+                    source,
+                    target,
+                },
+                self.migration_incarnation,
+            )?;
         }
 
         self.send_network_message(
@@ -1187,7 +1207,7 @@ impl CacheServiceHandle {
                 target: *target,
             };
             let mut journal = journal.lock();
-            journal.record_intent(key)?;
+            journal.record_intent(key, self.migration_incarnation)?;
             journal.record_source_remaining(key, source_remaining)?;
             let satisfied = journal
                 .recovery_state(key)
@@ -1282,7 +1302,7 @@ impl CacheServiceHandle {
                 target,
             };
             let mut journal = journal.lock();
-            journal.record_intent(key)?;
+            journal.record_intent(key, self.migration_incarnation)?;
             // Durable-before-send: if the process fails after this fsync but
             // before transport enqueue, recovery safely treats the batch as
             // possibly sent and can retry the exact envelope.
@@ -1331,7 +1351,7 @@ impl CacheServiceHandle {
                 target: pending.target,
             };
             let mut journal = journal.lock();
-            journal.record_intent(key)?;
+            journal.record_intent(key, self.migration_incarnation)?;
             journal.record_transfer_sent(key, &message)?;
         }
         self.send_network_message(NodeId(pending.target.node_id), message)
