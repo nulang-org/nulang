@@ -537,6 +537,9 @@ pub enum CacheServiceError {
     RemoteTransferNotActive(u16),
     RemoteTransferAckMismatch,
     RemoteMigrationProbeMismatch,
+    MigrationJournalUnavailable,
+    MigrationRecoveryNotFound,
+    MigrationRecoveryTransferNotFound(u64),
     ShardServer {
         shard: u16,
         source: CacheServerError,
@@ -990,6 +993,93 @@ impl CacheServiceHandle {
         Ok(())
     }
 
+    /// Re-send an exact durable transfer envelope after controller recovery.
+    ///
+    /// No source re-export occurs: the recovered request keeps the original
+    /// transfer id, source generation tokens, TTL snapshot, and wire epoch.
+    pub fn retry_recovered_remote_transfer(
+        &self,
+        key: CacheMigrationKey,
+        transfer_id: u64,
+    ) -> Result<CacheRemoteTransferPending, CacheServiceError> {
+        let journal = self
+            .migration_journal
+            .as_ref()
+            .ok_or(CacheServiceError::MigrationJournalUnavailable)?;
+        let state = journal
+            .lock()
+            .recovery_state(key)
+            .cloned()
+            .ok_or(CacheServiceError::MigrationRecoveryNotFound)?;
+        let transfer = state
+            .transfers
+            .get(&transfer_id)
+            .ok_or(CacheServiceError::MigrationRecoveryTransferNotFound(
+                transfer_id,
+            ))?;
+        let CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch,
+            source,
+            target,
+            batch,
+        } = &transfer.request
+        else {
+            return Err(CacheServiceError::MigrationRecoveryTransferNotFound(
+                transfer_id,
+            ));
+        };
+
+        let placement = self.placement_publisher.snapshot();
+        let Some(migration) = placement.migration_for_slot(key.slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
+        };
+        if migration.started_epoch != key.started_epoch
+            || migration.source != key.source
+            || migration.target != key.target
+            || *source != key.source
+            || *target != key.target
+        {
+            return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
+        }
+
+        let pending = CacheRemoteTransferPending {
+            transfer_id: *transfer_id,
+            placement_epoch: *placement_epoch,
+            source: *source,
+            target: *target,
+            batch: batch.clone(),
+        };
+        self.retry_remote_slot_batch(&pending)?;
+        Ok(pending)
+    }
+
+    /// Issue the mandatory fresh convergence probe for a recovered migration.
+    pub fn reprobe_recovered_remote_migration(
+        &self,
+        key: CacheMigrationKey,
+        probe_id: u64,
+    ) -> Result<(), CacheServiceError> {
+        let journal = self
+            .migration_journal
+            .as_ref()
+            .ok_or(CacheServiceError::MigrationJournalUnavailable)?;
+        if journal.lock().recovery_state(key).is_none() {
+            return Err(CacheServiceError::MigrationRecoveryNotFound);
+        }
+        let placement = self.placement_publisher.snapshot();
+        let Some(migration) = placement.migration_for_slot(key.slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
+        };
+        if migration.started_epoch != key.started_epoch
+            || migration.source != key.source
+            || migration.target != key.target
+        {
+            return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
+        }
+        self.send_remote_migration_probe(key.source.shard, key.target, key.slot, probe_id)
+    }
+
     /// Probe the target reactor for exact-epoch migration convergence state.
     pub fn send_remote_migration_probe(
         &self,
@@ -1276,6 +1366,35 @@ impl CacheServiceHandle {
             return Err(CacheServiceError::RemoteTransferAckMismatch);
         }
 
+        let placement = self.placement_publisher.snapshot();
+        let Some(migration) = placement.migration_for_slot(pending.batch.slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        };
+        if migration.source != pending.source
+            || migration.target != pending.target
+            || pending.placement_epoch < migration.started_epoch
+        {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        }
+
+        if let Some(journal) = &self.migration_journal {
+            let key = CacheMigrationKey {
+                started_epoch: migration.started_epoch,
+                slot: pending.batch.slot,
+                source: pending.source,
+                target: pending.target,
+            };
+            // Durable-before-delete: source generations cannot be finalized
+            // unless the matching application ACK is already fsynced.
+            journal
+                .lock()
+                .record_transfer_ack(key, &event.message)?;
+        }
+
         let mut imported = 0;
         let mut already_imported = 0;
         let mut expired_in_transit = 0;
@@ -1332,6 +1451,18 @@ impl CacheServiceHandle {
         let source_remaining = count_rx
             .recv()
             .map_err(|_| CacheServiceError::ControlDisconnected(pending.source.shard))?;
+
+        if let Some(journal) = &self.migration_journal {
+            journal.lock().record_source_remaining(
+                CacheMigrationKey {
+                    started_epoch: migration.started_epoch,
+                    slot: pending.batch.slot,
+                    source: pending.source,
+                    target: pending.target,
+                },
+                source_remaining,
+            )?;
+        }
 
         Ok(CacheRemoteTransferReport {
             transfer_id: pending.transfer_id,
