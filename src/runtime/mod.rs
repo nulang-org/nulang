@@ -45,7 +45,7 @@ pub use fabric_queue_cluster::{
     FabricQueuePlacement, FabricQueuePolicySyncReport, FabricQueueReplicatedAckResult,
     FabricQueueReplicatedAcquireResult, FabricQueueReplicatedAddResult,
     FabricQueueReplicatedCreateResult, FabricQueueReplicatedNackResult,
-    FabricQueueReplicatedRenewResult,
+    FabricQueueReplicatedReapResult, FabricQueueReplicatedRenewResult,
 };
 pub use fabric_stream::{
     FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
