@@ -127,11 +127,7 @@ impl CacheDispatchChannels {
         self.senders.len() as u16
     }
 
-    fn try_send(
-        &self,
-        shard: u16,
-        request: CacheShardRequest,
-    ) -> Result<(), CacheDispatchError> {
+    fn try_send(&self, shard: u16, request: CacheShardRequest) -> Result<(), CacheDispatchError> {
         let Some(sender) = self.senders.get(shard as usize) else {
             return Err(CacheDispatchError::UnknownLocalShard(shard));
         };
@@ -139,9 +135,7 @@ impl CacheDispatchChannels {
         match sender.try_send(request) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(CacheDispatchError::QueueFull(shard)),
-            Err(TrySendError::Disconnected(_)) => {
-                Err(CacheDispatchError::QueueDisconnected(shard))
-            }
+            Err(TrySendError::Disconnected(_)) => Err(CacheDispatchError::QueueDisconnected(shard)),
         }
     }
 }
@@ -284,9 +278,9 @@ impl CacheDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::cache::{redis_slot, CacheValueView};
     use super::super::cache_routing::CacheSlotRange;
+    use super::*;
 
     fn key_for_shard(map: &CacheSlotMap, shard: u16) -> Vec<u8> {
         for i in 0..10_000 {
