@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -222,6 +222,19 @@ impl CacheShardServer {
         config: CacheServerConfig,
         clock: CacheServerClock,
     ) -> Result<Self, CacheServerError> {
+        let listener = StdTcpListener::bind(bind_addr)?;
+        listener.set_nonblocking(true)?;
+        Self::from_std_listener(listener, dispatcher, inbox, store, config, clock)
+    }
+
+    pub fn from_std_listener(
+        listener: StdTcpListener,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        store: CacheStore,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+    ) -> Result<Self, CacheServerError> {
         validate_config(&config)?;
         if dispatcher.routing_mode() != CacheRoutingMode::Redirect {
             return Err(CacheServerError::RedirectModeRequired);
@@ -235,8 +248,9 @@ impl CacheShardServer {
             ));
         }
 
+        listener.set_nonblocking(true)?;
         let mut poll = Poll::new()?;
-        let mut listener = TcpListener::bind(bind_addr)?;
+        let mut listener = TcpListener::from_std(listener);
         poll.registry()
             .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)?;
 
@@ -277,6 +291,10 @@ impl CacheShardServer {
 
     pub fn connection_count(&self) -> usize {
         self.connections.len()
+    }
+
+    pub fn shard(&self) -> u16 {
+        self.dispatcher.local_shard()
     }
 
     pub fn store(&self) -> &CacheStore {
