@@ -640,8 +640,26 @@ export class NulangQueueBackend
   async moveToWaitingChildren(..._args: any[]): Promise<any> {
     return unsupported('moveToWaitingChildren');
   }
-  async retryFinishedJob(..._args: any[]): Promise<any> {
-    return unsupported('retryFinishedJob');
+  async retryFinishedJob<T = any, R = any, N extends string = string>(
+    job: MinimalJob<T, R, N>,
+    state: 'failed' | 'completed',
+    opts: {
+      resetAttemptsMade?: boolean;
+      resetAttemptsStarted?: boolean;
+    } = {},
+  ): Promise<void> {
+    const resetMade = opts.resetAttemptsMade ?? false;
+    const resetStarted = opts.resetAttemptsStarted ?? false;
+    if (resetMade !== resetStarted) {
+      unsupported('retryFinishedJob(asymmetric attempt reset)');
+    }
+    await this.session.client.requeue({
+      queue: this.queueName,
+      jobId: this.requireJobId(job.id),
+      expectedState: state,
+      availableAtMs: this.now(),
+      resetDeliveries: resetMade && resetStarted,
+    });
   }
   async retryFinishedJobs(..._args: any[]): Promise<any> {
     return unsupported('retryFinishedJobs');
