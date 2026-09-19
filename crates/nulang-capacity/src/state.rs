@@ -176,6 +176,10 @@ pub struct ResourceAllocation {
 pub struct AllocationLedgerSnapshot {
     pub provider_generations: BTreeMap<String, u64>,
     pub allocations: BTreeMap<String, ResourceAllocation>,
+    /// Released/expired allocation ids are retained so delayed retries cannot
+    /// resurrect a reservation. Production stores may garbage-collect these
+    /// after their idempotency retention window.
+    pub retired_allocations: BTreeMap<String, String>,
 }
 
 impl Default for AllocationLedgerSnapshot {
@@ -183,6 +187,7 @@ impl Default for AllocationLedgerSnapshot {
         Self {
             provider_generations: BTreeMap::new(),
             allocations: BTreeMap::new(),
+            retired_allocations: BTreeMap::new(),
         }
     }
 }
@@ -222,6 +227,8 @@ pub enum AllocationError {
     ZeroResource(ResourceClass),
     #[error("allocation id {0} is already committed with different contents")]
     AllocationIdConflict(String),
+    #[error("allocation id {0} has been retired and cannot be reused")]
+    AllocationRetired(String),
     #[error(
         "consumer {consumer} placement token {placement_token} is already bound to allocation {existing_allocation_id}"
     )]
@@ -317,6 +324,12 @@ impl AllocationLedgerSnapshot {
                 .filter(|(_, allocation)| allocation.provider_id == provider_id)
                 .map(|(id, allocation)| (id.clone(), allocation.clone()))
                 .collect(),
+            retired_allocation_ids: self
+                .retired_allocations
+                .iter()
+                .filter(|(_, retired_provider)| retired_provider.as_str() == provider_id)
+                .map(|(id, _)| id.clone())
+                .collect(),
         }
     }
 
@@ -362,9 +375,18 @@ impl AllocationLedgerSnapshot {
                 request.allocation.allocation_id.clone(),
             ));
         }
+        if self
+            .retired_allocations
+            .contains_key(&request.allocation.allocation_id)
+        {
+            return Err(AllocationError::AllocationRetired(
+                request.allocation.allocation_id.clone(),
+            ));
+        }
 
         if let Some(existing) = self.allocations.values().find(|existing| {
-            existing.consumer_id == request.allocation.consumer_id
+            existing.provider_id == request.allocation.provider_id
+                && existing.consumer_id == request.allocation.consumer_id
                 && existing.placement_token == request.allocation.placement_token
         }) {
             return Err(AllocationError::PlacementTokenConflict {
@@ -445,6 +467,15 @@ impl AllocationLedgerSnapshot {
     ) -> Result<AllocationReleaseResult, AllocationError> {
         let current_generation = self.provider_generation(provider_id);
         let Some(existing) = self.allocations.get(allocation_id) else {
+            if let Some(retired_provider) = self.retired_allocations.get(allocation_id) {
+                if retired_provider != provider_id {
+                    return Err(AllocationError::AllocationProviderMismatch {
+                        allocation_id: allocation_id.to_string(),
+                        requested_provider: provider_id.to_string(),
+                        actual_provider: retired_provider.clone(),
+                    });
+                }
+            }
             return Ok(AllocationReleaseResult::AlreadyAbsent {
                 generation: current_generation,
             });
@@ -465,6 +496,8 @@ impl AllocationLedgerSnapshot {
         }
 
         self.allocations.remove(allocation_id);
+        self.retired_allocations
+            .insert(allocation_id.to_string(), provider_id.to_string());
         let generation = self.advance_provider_generation(provider_id);
         Ok(AllocationReleaseResult::Released { generation })
     }
@@ -486,6 +519,8 @@ impl AllocationLedgerSnapshot {
         for id in expired_ids {
             if let Some(allocation) = self.allocations.remove(&id) {
                 affected_providers.insert(allocation.provider_id.clone());
+                self.retired_allocations
+                    .insert(id, allocation.provider_id.clone());
                 expired.push(allocation);
             }
         }
@@ -572,6 +607,7 @@ pub struct ProviderAllocationLedgerSnapshot {
     pub provider_id: String,
     pub generation: u64,
     pub allocations: BTreeMap<String, ResourceAllocation>,
+    pub retired_allocation_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -936,6 +972,38 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn released_allocation_id_cannot_be_resurrected_by_delayed_retry() {
+        let topology = topology();
+        let mut ledger = AllocationLedgerSnapshot::default();
+        let original = allocation("alloc-1", 500);
+        ledger
+            .commit(
+                &topology,
+                &AllocationCommitRequest {
+                    expected_provider_generation: 1,
+                    topology_generation: 9,
+                    allocation: original.clone(),
+                },
+            )
+            .unwrap();
+        ledger
+            .release("host-a", "alloc-1", 2)
+            .unwrap();
+
+        assert_eq!(
+            ledger.commit(
+                &topology,
+                &AllocationCommitRequest {
+                    expected_provider_generation: 3,
+                    topology_generation: 9,
+                    allocation: original,
+                }
+            ),
+            Err(AllocationError::AllocationRetired("alloc-1".into()))
+        );
     }
 
     #[test]
