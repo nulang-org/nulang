@@ -803,7 +803,6 @@ impl<'a> FabricQueueStore<'a> {
             consumer_group: None,
             queue_epoch: 0,
             operation_id: None,
-            result: None,
         };
         let event_sequence = self.append_mutation(queue, &event)?;
         apply_mutation(&mut state, &event)?;
@@ -851,6 +850,7 @@ impl<'a> FabricQueueStore<'a> {
             lease_token,
             queue_epoch: 0,
             operation_id: None,
+            result: None,
         };
         let event_sequence = self.append_mutation(queue, &event)?;
         apply_mutation(&mut state, &event)?;
