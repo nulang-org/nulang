@@ -15,9 +15,10 @@ use std::io;
 use serde::{Deserialize, Serialize};
 
 use super::fabric_queue::{
-    decode_queue_created_mutation, decode_queue_envelope_bytes, encode_queue_created_mutation,
-    encode_queue_envelope, queue_mutation_stream_name, queue_stream_name, validate_queue_name,
-    FabricQueueAddOptions, FabricQueueConfig,
+    decode_queue_created_mutation, decode_queue_envelope_bytes, decode_queue_lease_mutation,
+    encode_queue_created_mutation, encode_queue_envelope, queue_mutation_stream_name,
+    queue_stream_name, validate_consumer_name, validate_queue_name, FabricQueueAddOptions,
+    FabricQueueConfig, FabricQueueDelivery,
 };
 use super::fabric_stream::{
     FabricStreamReplicationPolicy, FABRIC_STREAM_INITIAL_EPOCH,
@@ -95,6 +96,15 @@ pub struct FabricQueueReplicatedAddResult {
     pub replication: Option<FabricStreamReplicationStatus>,
     pub deduplicated: bool,
     pub enqueued: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricQueueReplicatedAcquireResult {
+    pub policy: FabricQueuePolicySyncReport,
+    pub mutation_sequence: Option<u64>,
+    pub replication: Option<FabricStreamReplicationStatus>,
+    pub delivery: Option<FabricQueueDelivery>,
+    pub resumed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -607,6 +617,168 @@ impl Runtime {
             replication: Some(appended.status),
             deduplicated: false,
             enqueued: appended.status.committed,
+        })
+    }
+
+    /// Acquire one job through a quorum-committed, epoch-fenced lease.
+    ///
+    /// The leader serializes queue metadata mutations: while a lease mutation
+    /// is uncommitted, only a retry carrying the same operation_id may resume
+    /// it. A different acquire fails with WouldBlock rather than competing for
+    /// the same committed queue state.
+    pub fn fabric_queue_acquire_replicated(
+        &mut self,
+        queue: &str,
+        consumer: &str,
+        operation_id: &str,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAcquireResult> {
+        validate_consumer_name(consumer)?;
+        if operation_id.is_empty() || operation_id.len() > 256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric queue acquire operation ids must be 1..=256 bytes",
+            ));
+        }
+
+        let policy =
+            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        if !policy.ready {
+            return Ok(FabricQueueReplicatedAcquireResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                delivery: None,
+                resumed: false,
+            });
+        }
+        self.fabric_queue_require_committed_creation(queue)?;
+        let placement = self
+            .fabric_queue_replication_placement(queue)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Fabric queue replication policy disappeared during acquire",
+                )
+            })?;
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let info = self.fabric_stream_info(&mutation_stream)?;
+        let committed = info.committed_sequence;
+
+        let mut next = 2u64;
+        let mut matching = None;
+        loop {
+            let records = self.fabric_stream_read(&mutation_stream, next, 1024)?;
+            if records.is_empty() {
+                break;
+            }
+            for record in &records {
+                if let Some(lease) = decode_queue_lease_mutation(&record.payload)? {
+                    if lease.operation_id.as_deref() == Some(operation_id) {
+                        if matching.is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "Fabric queue {queue:?} contains duplicate acquire operation id {operation_id:?}"
+                                ),
+                            ));
+                        }
+                        if lease.consumer != consumer || lease.queue_epoch != placement.epoch {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Fabric queue acquire operation id was reused with different fencing inputs",
+                            ));
+                        }
+                        matching = Some((record.sequence, lease));
+                    }
+                }
+                next = record.sequence.saturating_add(1);
+            }
+            if records.len() < 1024 {
+                break;
+            }
+        }
+
+        if let Some((mutation_sequence, lease)) = matching {
+            if mutation_sequence > committed {
+                self.fabric_stream_retry_pending(&mutation_stream, partition)?;
+            }
+            let replication = self
+                .fabric_stream_replication_status(
+                    &mutation_stream,
+                    partition,
+                    mutation_sequence,
+                )
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::NotFound {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "uncommitted Fabric queue lease mutation {mutation_sequence} has no recoverable replication intent"
+                            ),
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+            let delivery = if replication.committed {
+                Some(self.fabric_queue_delivery_for_committed_lease(queue, &lease)?)
+            } else {
+                None
+            };
+            return Ok(FabricQueueReplicatedAcquireResult {
+                policy,
+                mutation_sequence: Some(mutation_sequence),
+                replication: Some(replication),
+                delivery,
+                resumed: true,
+            });
+        }
+
+        if info.last_sequence.unwrap_or(0) > committed {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue {queue:?} has an uncommitted metadata mutation; retry that operation before acquiring another job"
+                ),
+            ));
+        }
+
+        let Some(plan) = self.fabric_queue_plan_committed_lease(
+            queue,
+            consumer,
+            operation_id,
+            placement.epoch,
+            now_ms,
+        )? else {
+            return Ok(FabricQueueReplicatedAcquireResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                delivery: None,
+                resumed: false,
+            });
+        };
+
+        let appended = self.fabric_stream_replicated_append(
+            &mutation_stream,
+            partition,
+            replication_factor,
+            &plan.mutation_bytes,
+        )?;
+        let delivery = if appended.status.committed {
+            Some(plan.delivery)
+        } else {
+            None
+        };
+        Ok(FabricQueueReplicatedAcquireResult {
+            policy,
+            mutation_sequence: Some(appended.sequence),
+            replication: Some(appended.status),
+            delivery,
+            resumed: false,
         })
     }
 
