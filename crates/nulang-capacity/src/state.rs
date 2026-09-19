@@ -171,7 +171,7 @@ pub struct ResourceAllocation {
     pub expires_at_unix_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllocationLedgerSnapshot {
     pub provider_generations: BTreeMap<String, u64>,
     pub allocations: BTreeMap<String, ResourceAllocation>,
@@ -181,15 +181,6 @@ pub struct AllocationLedgerSnapshot {
     pub retired_allocations: BTreeMap<String, String>,
 }
 
-impl Default for AllocationLedgerSnapshot {
-    fn default() -> Self {
-        Self {
-            provider_generations: BTreeMap::new(),
-            allocations: BTreeMap::new(),
-            retired_allocations: BTreeMap::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocationCommitRequest {
