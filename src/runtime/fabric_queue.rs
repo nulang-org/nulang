@@ -462,6 +462,7 @@ pub(crate) struct FabricQueueOperation {
     pub status: Option<FabricQueueJobStatus>,
     pub available_at_ms: Option<u64>,
     pub lease_until_ms: Option<u64>,
+    pub result: Option<Vec<u8>>,
 }
 
 pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQueueOperation>> {
@@ -487,6 +488,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             status: None,
             available_at_ms: None,
             lease_until_ms: Some(lease_until_ms),
+            result: None,
         },
         QueueMutation::Completed {
             sequence,
@@ -494,7 +496,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             lease_token,
             queue_epoch,
             operation_id,
-            ..
+            result,
         } => FabricQueueOperation {
             kind: FabricQueueOperationKind::Ack,
             sequence,
@@ -506,6 +508,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             status: Some(FabricQueueJobStatus::Completed),
             available_at_ms: None,
             lease_until_ms: None,
+            result,
         },
         QueueMutation::Nacked {
             sequence,
@@ -527,6 +530,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             status: Some(status),
             available_at_ms,
             lease_until_ms: None,
+            result: None,
         },
         QueueMutation::LeaseRenewed {
             sequence,
@@ -546,6 +550,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             status: None,
             available_at_ms: None,
             lease_until_ms: Some(lease_until_ms),
+            result: None,
         },
         QueueMutation::LeaseExpired {
             sequence,
@@ -566,6 +571,7 @@ pub(crate) fn decode_queue_operation(bytes: &[u8]) -> io::Result<Option<FabricQu
             status: Some(status),
             available_at_ms,
             lease_until_ms: None,
+            result: None,
         },
         QueueMutation::QueueCreated { .. } | QueueMutation::ConsumerGroupConfigured { .. } => {
             return Ok(None);
