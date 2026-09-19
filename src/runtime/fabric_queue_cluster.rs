@@ -892,7 +892,7 @@ impl Runtime {
         self.fabric_queue_acquire_replicated_inner(
             queue,
             consumer,
-            consumer_group,
+            None,
             operation_id,
             partition,
             replication_factor,
