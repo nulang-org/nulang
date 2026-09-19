@@ -32,8 +32,8 @@ use super::cache_dispatch::{
 use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
 use super::cache_routing::{CachePlacementError, CacheShardOwner, CacheSlotMap};
 use super::cache_transport::{
-    CacheServiceTransportEndpoint, CacheServiceTransportSender, CacheTransportInbound,
-    CacheTransportMessage, CacheTransportOutbound,
+    CacheServiceTransportEndpoint, CacheServiceTransportSender, CacheTransportBridgeError,
+    CacheTransportInbound, CacheTransportMessage, CacheTransportOutbound,
 };
 use super::cluster::NodeId;
 use super::resp::{parse_command, RespParseError};
@@ -161,6 +161,10 @@ impl CachePlacementPublisher {
         }
         let snapshot = self.snapshot.lock();
         (snapshot.epoch() > installed_epoch).then(|| snapshot.clone())
+    }
+
+    fn snapshot(&self) -> CacheSlotMap {
+        self.snapshot.lock().clone()
     }
 }
 
@@ -344,6 +348,9 @@ pub enum CacheServiceError {
     InvalidTransferBatchSize,
     ControlQueueFull(u16),
     ControlDisconnected(u16),
+    TransportUnavailable,
+    TransportBridge(CacheTransportBridgeError),
+    NetworkEventDisconnected,
     ShardServer {
         shard: u16,
         source: CacheServerError,
@@ -369,6 +376,12 @@ impl From<CacheDispatchConfigError> for CacheServiceError {
     }
 }
 
+impl From<CacheTransportBridgeError> for CacheServiceError {
+    fn from(value: CacheTransportBridgeError) -> Self {
+        Self::TransportBridge(value)
+    }
+}
+
 pub struct CacheServiceBuilder {
     local_node_id: u64,
     placement: CacheSlotMap,
@@ -376,6 +389,7 @@ pub struct CacheServiceBuilder {
     shards: Vec<CacheServiceShardConfig>,
     queue_capacity: usize,
     server_config: CacheServerConfig,
+    transport_endpoint: Option<CacheServiceTransportEndpoint>,
 }
 
 impl CacheServiceBuilder {
@@ -387,6 +401,7 @@ impl CacheServiceBuilder {
             shards: Vec::new(),
             queue_capacity: 1024,
             server_config: CacheServerConfig::default(),
+            transport_endpoint: None,
         }
     }
 
@@ -405,6 +420,14 @@ impl CacheServiceBuilder {
 
     pub fn with_server_config(mut self, server_config: CacheServerConfig) -> Self {
         self.server_config = server_config;
+        self
+    }
+
+    pub fn with_transport_endpoint(
+        mut self,
+        endpoint: CacheServiceTransportEndpoint,
+    ) -> Self {
+        self.transport_endpoint = Some(endpoint);
         self
     }
 
@@ -496,21 +519,25 @@ impl CacheServiceBuilder {
         }
 
         Ok(CacheService {
+            local_node_id: self.local_node_id,
             servers,
             local_addrs,
             endpoints,
             cpus,
             placement_publisher,
+            transport_endpoint: self.transport_endpoint,
         })
     }
 }
 
 pub struct CacheService {
+    local_node_id: u64,
     servers: Vec<CacheShardServer>,
     local_addrs: Vec<SocketAddr>,
     endpoints: CacheEndpointMap,
     cpus: Vec<Option<usize>>,
     placement_publisher: Arc<CachePlacementPublisher>,
+    transport_endpoint: Option<CacheServiceTransportEndpoint>,
 }
 
 impl CacheService {
