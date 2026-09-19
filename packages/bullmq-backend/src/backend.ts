@@ -250,6 +250,7 @@ export class NulangQueueBackend
       operationId = this.operationId(
         'acquire',
         token,
+        String(this.lockDuration),
         String(this.acquireCounter++),
       );
       this.pendingAcquireIds.set(operationKey, operationId);
