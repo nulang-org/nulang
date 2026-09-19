@@ -19,7 +19,8 @@ use super::fabric_queue::{
     decode_queue_operation, encode_queue_created_mutation, encode_queue_envelope,
     queue_mutation_stream_name, queue_stream_name, validate_consumer_name, validate_operation_id,
     validate_queue_name, FabricQueueAddOptions, FabricQueueConfig, FabricQueueDelivery,
-    FabricQueueNackResult, FabricQueueOperation, FabricQueueOperationKind,
+    FabricQueueJobStatus, FabricQueueNackResult, FabricQueueOperation,
+    FabricQueueOperationKind,
 };
 use super::fabric_stream::{
     FabricStreamReplicationPolicy, FABRIC_STREAM_INITIAL_EPOCH,
