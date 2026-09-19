@@ -435,7 +435,55 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
         .expect("journal should survive service shutdown");
     assert_eq!(recovered.source_remaining, Some(0));
     assert!(recovered.all_sent_transfers_acked());
+    assert_eq!(recovered.pending_commit_epoch, None);
+    assert_eq!(recovered.completed_commit_epoch, Some(2));
     std::fs::remove_file(journal_path).unwrap();
+}
+
+#[test]
+fn remote_migration_commit_without_convergence_proof_is_rejected() {
+    let addr_a: SocketAddr = "127.0.0.1:33451".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33452".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+    let key = b"commit-gate-key";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let base = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+
+    let service = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53452))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut migrating = base;
+    migrating.begin_migration(1, slot, source, target).unwrap();
+    service.install_placement(migrating.clone()).unwrap();
+    wait_epoch(&service, 1);
+
+    migrating.commit_migration(2, slot, source, target).unwrap();
+    assert!(matches!(
+        service.install_placement(migrating),
+        Err(nulang::runtime::CacheServiceError::RemoteMigrationNotConverged(
+            rejected_slot
+        )) if rejected_slot == slot
+    ));
+    assert_eq!(service.published_placement_epoch(), 1);
+
+    service.shutdown().unwrap();
 }
 
 #[test]
