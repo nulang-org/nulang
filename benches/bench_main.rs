@@ -37,6 +37,7 @@ criterion_main!(
     vm_bench::benches,
     interp_bench::benches,
     actor_bench::benches,
+    cache_bench::benches,
     gc_bench::benches,
     dist_bench::benches,
     persist_bench::benches,
