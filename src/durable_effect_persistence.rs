@@ -47,6 +47,11 @@ impl DurableEffectPersistenceRecord {
         }
     }
 
+    /// Stable logical operation id used as the persistence lookup key.
+    pub fn effect_id(&self) -> DurableEffectId {
+        self.effect().spec().id
+    }
+
     pub fn original_effect_id(&self) -> Option<DurableEffectId> {
         match self {
             Self::Effect(_) => None,
