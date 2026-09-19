@@ -652,3 +652,132 @@ fn duplicate_remote_command_replays_cached_response_without_reexecution() {
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
 }
+
+
+#[test]
+fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33701".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33702".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"retry-transfer-key";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let base = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53702))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, base.clone())
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53701))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut source_client = StdTcpStream::connect(service_a.local_addrs()[0]).unwrap();
+    source_client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    source_client
+        .write_all(&frame(&[b"SET", key, b"value"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
+
+    let mut migrating = base;
+    migrating.begin_migration(1, slot, source, target).unwrap();
+    service_a.install_placement(migrating.clone()).unwrap();
+    service_b.install_placement(migrating).unwrap();
+    wait_epoch(&service_a, 1);
+    wait_epoch(&service_b, 1);
+
+    let pending = service_a
+        .send_remote_slot_batch(0, target, slot, None, 8, 9301)
+        .unwrap();
+    service_a.retry_remote_slot_batch(&pending).unwrap();
+
+    let first = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    let second = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+
+    let first_results = match &first.message {
+        CacheTransportMessage::TransferAck {
+            transfer_id,
+            results,
+            ..
+        } => {
+            assert_eq!(*transfer_id, 9301);
+            results.clone()
+        }
+        other => panic!("unexpected first transfer event: {other:?}"),
+    };
+    let second_results = match &second.message {
+        CacheTransportMessage::TransferAck {
+            transfer_id,
+            results,
+            ..
+        } => {
+            assert_eq!(*transfer_id, 9301);
+            results.clone()
+        }
+        other => panic!("unexpected second transfer event: {other:?}"),
+    };
+
+    assert_eq!(first_results, second_results);
+    assert_eq!(
+        first_results,
+        vec![nulang::runtime::CacheTransferImport::Imported]
+    );
+
+    let report = service_a
+        .complete_remote_slot_batch(&pending, &first)
+        .unwrap();
+    assert_eq!(report.imported, 1);
+    assert_eq!(report.finalized_removed, 1);
+    assert!(report.source_drained());
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+}
