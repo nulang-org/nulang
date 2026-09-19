@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 // Imports from sibling modules in the runtime
 // ---------------------------------------------------------------------------
 
+use super::cache_transport::{parse_cache_transport_packet, CacheTransportInbound};
 use super::fabric_stream_cluster::{
     FabricStreamCommitUpdate, FabricStreamReplicaAck, FabricStreamReplicaAppend,
     FABRIC_STREAM_COMMIT_BEHAVIOR, FABRIC_STREAM_REPLICA_ACK_BEHAVIOR,
@@ -1001,6 +1002,40 @@ pub fn process_network_packets(
 ) {
     let packets = transport.receive();
     for incoming in packets {
+        match parse_cache_transport_packet(&incoming.packet, incoming.from_node) {
+            Ok(Some(message)) => {
+                if let Some(bridge) = runtime.distributed.cache_transport.as_ref() {
+                    if let Err(error) = bridge.try_forward_inbound(CacheTransportInbound {
+                        from_node: incoming.from_node,
+                        message,
+                    }) {
+                        warn!(
+                            "nulang-cache: dropping inbound cache system message from {:?}: {:?}",
+                            incoming.from_node, error
+                        );
+                    }
+                } else {
+                    warn!(
+                        "nulang-cache: dropping inbound cache system message from {:?}: no cache transport bridge attached",
+                        incoming.from_node
+                    );
+                }
+                // NUL0 ACK confirms transport processing only. Cache command
+                // responses and transfer ACKs remain application-level.
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+                continue;
+            }
+            Err(error) => {
+                warn!(
+                    "nulang-cache: rejecting malformed/spoofed cache system message from {:?}: {:?}",
+                    incoming.from_node, error
+                );
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+                continue;
+            }
+            Ok(None) => {}
+        }
+
         match incoming.packet {
             Packet::Heartbeat { node_id, .. } => {
                 let cluster_node_id = NodeId(node_id.0);
