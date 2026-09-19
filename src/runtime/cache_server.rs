@@ -10,13 +10,14 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
+use parking_lot::Mutex;
 
 use super::cache::CacheStore;
 use super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap, CacheRoutingMode};
@@ -106,10 +107,53 @@ impl Default for CacheServerClock {
     }
 }
 
+
+struct CachePlacementPublisher {
+    published_epoch: AtomicU64,
+    snapshot: Mutex<CacheSlotMap>,
+}
+
+impl CachePlacementPublisher {
+    fn new(snapshot: CacheSlotMap) -> Self {
+        Self {
+            published_epoch: AtomicU64::new(snapshot.epoch()),
+            snapshot: Mutex::new(snapshot),
+        }
+    }
+
+    fn published_epoch(&self) -> u64 {
+        self.published_epoch.load(Ordering::Acquire)
+    }
+
+    fn publish(&self, next: CacheSlotMap) -> Result<(), CacheServiceError> {
+        let proposed = next.epoch();
+        let mut snapshot = self.snapshot.lock();
+        let current = snapshot.epoch();
+        if proposed <= current {
+            return Err(CacheServiceError::StalePlacementEpoch {
+                current,
+                proposed,
+            });
+        }
+        *snapshot = next;
+        self.published_epoch.store(proposed, Ordering::Release);
+        Ok(())
+    }
+
+    fn snapshot_if_newer(&self, installed_epoch: u64) -> Option<CacheSlotMap> {
+        if self.published_epoch() <= installed_epoch {
+            return None;
+        }
+        let snapshot = self.snapshot.lock();
+        (snapshot.epoch() > installed_epoch).then(|| snapshot.clone())
+    }
+}
+
 #[derive(Clone)]
 pub struct CacheShardServerControl {
     shutdown: Arc<AtomicBool>,
     waker: Arc<Waker>,
+    applied_placement_epoch: Arc<AtomicU64>,
 }
 
 impl CacheShardServerControl {
@@ -120,6 +164,10 @@ impl CacheShardServerControl {
 
     pub fn wake(&self) {
         let _ = self.waker.wake();
+    }
+
+    pub fn placement_epoch(&self) -> u64 {
+        self.applied_placement_epoch.load(Ordering::Acquire)
     }
 }
 
@@ -172,6 +220,10 @@ pub enum CacheServiceError {
     TooManyShards,
     MissingLocalShard(u16),
     MissingEndpoint(CacheShardOwner),
+    StalePlacementEpoch {
+        current: u64,
+        proposed: u64,
+    },
     ShardServer {
         shard: u16,
         source: CacheServerError,
@@ -287,23 +339,9 @@ impl CacheServiceBuilder {
             reserved.push((listener, local_addr, shard.cpu));
         }
 
-        // Fail closed before starting any reactor if the placement references
-        // an owner that cannot be advertised to a cluster-aware client.
-        for range in self.placement.slot_ranges() {
-            if endpoints.get(range.owner).is_none() {
-                return Err(CacheServiceError::MissingEndpoint(range.owner));
-            }
-        }
+        validate_placement_endpoints(&self.placement, &endpoints)?;
 
-        // Migration targets are not stable owners yet, so they do not appear
-        // in slot_ranges(). They still must be routable before a source can
-        // safely emit ASK.
-        for (_, migration) in self.placement.migrations() {
-            if endpoints.get(migration.target).is_none() {
-                return Err(CacheServiceError::MissingEndpoint(migration.target));
-            }
-        }
-
+        let placement_publisher = Arc::new(CachePlacementPublisher::new(self.placement.clone()));
         let clock = CacheServerClock::new();
         let mut servers = Vec::with_capacity(self.shards.len());
         let mut local_addrs = Vec::with_capacity(self.shards.len());
@@ -328,6 +366,7 @@ impl CacheServiceBuilder {
                 CacheStore::new(),
                 self.server_config.clone(),
                 clock.clone(),
+                Some(placement_publisher.clone()),
             )
             .map_err(|source| CacheServiceError::ShardServer { shard, source })?;
 
@@ -341,6 +380,7 @@ impl CacheServiceBuilder {
             local_addrs,
             endpoints,
             cpus,
+            placement_publisher,
         })
     }
 }
@@ -350,6 +390,7 @@ pub struct CacheService {
     local_addrs: Vec<SocketAddr>,
     endpoints: CacheEndpointMap,
     cpus: Vec<Option<usize>>,
+    placement_publisher: Arc<CachePlacementPublisher>,
 }
 
 impl CacheService {
@@ -398,6 +439,7 @@ impl CacheService {
             threads,
             local_addrs: self.local_addrs,
             endpoints: self.endpoints,
+            placement_publisher: self.placement_publisher,
         })
     }
 }
@@ -407,6 +449,7 @@ pub struct CacheServiceHandle {
     threads: Vec<(u16, JoinHandle<Result<(), CacheServerError>>)>,
     local_addrs: Vec<SocketAddr>,
     endpoints: CacheEndpointMap,
+    placement_publisher: Arc<CachePlacementPublisher>,
 }
 
 impl CacheServiceHandle {
@@ -416,6 +459,31 @@ impl CacheServiceHandle {
 
     pub fn endpoints(&self) -> &CacheEndpointMap {
         &self.endpoints
+    }
+
+    pub fn published_placement_epoch(&self) -> u64 {
+        self.placement_publisher.published_epoch()
+    }
+
+    pub fn shard_placement_epochs(&self) -> Vec<u64> {
+        self.controls
+            .iter()
+            .map(CacheShardServerControl::placement_epoch)
+            .collect()
+    }
+
+    /// Publish a newer immutable placement snapshot to every local reactor.
+    ///
+    /// Publication itself is a cold-path mutex operation. Reactors notice the
+    /// newer epoch on their Mio wake path, clone it once into their
+    /// thread-local dispatcher, and then return to lock-free indexed routing.
+    pub fn install_placement(&self, placement: CacheSlotMap) -> Result<(), CacheServiceError> {
+        validate_placement_endpoints(&placement, &self.endpoints)?;
+        self.placement_publisher.publish(placement)?;
+        for control in &self.controls {
+            control.wake();
+        }
+        Ok(())
     }
 
     pub fn request_shutdown(&self) {
@@ -544,6 +612,8 @@ pub struct CacheShardServer {
     shutdown: Arc<AtomicBool>,
     waker: Arc<Waker>,
     next_expiry_sweep: Instant,
+    placement_publisher: Option<Arc<CachePlacementPublisher>>,
+    applied_placement_epoch: Arc<AtomicU64>,
 }
 
 impl CacheShardServer {
@@ -556,7 +626,7 @@ impl CacheShardServer {
         clock: CacheServerClock,
     ) -> Result<Self, CacheServerError> {
         let listener = TcpListener::bind(bind_addr)?;
-        Self::from_listener(listener, dispatcher, inbox, store, config, clock)
+        Self::from_listener(listener, dispatcher, inbox, store, config, clock, None)
     }
 
     fn from_listener(
@@ -566,6 +636,7 @@ impl CacheShardServer {
         store: CacheStore,
         config: CacheServerConfig,
         clock: CacheServerClock,
+        placement_publisher: Option<Arc<CachePlacementPublisher>>,
     ) -> Result<Self, CacheServerError> {
         validate_config(&config)?;
         if dispatcher.routing_mode() != CacheRoutingMode::Redirect {
@@ -588,6 +659,7 @@ impl CacheShardServer {
         dispatcher.install_waker(inbox.shard(), waker.clone())?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let applied_placement_epoch = Arc::new(AtomicU64::new(dispatcher.placement().epoch()));
         let next_expiry_sweep = Instant::now() + config.expiry_sweep_interval;
 
         Ok(Self {
@@ -605,6 +677,8 @@ impl CacheShardServer {
             shutdown,
             waker,
             next_expiry_sweep,
+            placement_publisher,
+            applied_placement_epoch,
         })
     }
 
@@ -616,6 +690,7 @@ impl CacheShardServer {
         CacheShardServerControl {
             shutdown: self.shutdown.clone(),
             waker: self.waker.clone(),
+            applied_placement_epoch: self.applied_placement_epoch.clone(),
         }
     }
 
@@ -717,9 +792,23 @@ impl CacheShardServer {
     }
 
     fn handle_wake(&mut self) -> Result<(), CacheServerError> {
+        self.install_published_placement();
         self.inbox
             .drain(&mut self.store, self.config.max_inbox_batch);
         Ok(())
+    }
+
+    fn install_published_placement(&mut self) {
+        let Some(publisher) = self.placement_publisher.as_ref() else {
+            return;
+        };
+        let installed_epoch = self.dispatcher.placement().epoch();
+        let Some(snapshot) = publisher.snapshot_if_newer(installed_epoch) else {
+            return;
+        };
+        let epoch = snapshot.epoch();
+        self.dispatcher.install_placement(snapshot);
+        self.applied_placement_epoch.store(epoch, Ordering::Release);
     }
 
     fn connection_ready(
@@ -937,6 +1026,23 @@ enum ConnectionAction {
     Close,
 }
 
+fn validate_placement_endpoints(
+    placement: &CacheSlotMap,
+    endpoints: &CacheEndpointMap,
+) -> Result<(), CacheServiceError> {
+    for range in placement.slot_ranges() {
+        if endpoints.get(range.owner).is_none() {
+            return Err(CacheServiceError::MissingEndpoint(range.owner));
+        }
+    }
+    for (_, migration) in placement.migrations() {
+        if endpoints.get(migration.target).is_none() {
+            return Err(CacheServiceError::MissingEndpoint(migration.target));
+        }
+    }
+    Ok(())
+}
+
 fn validate_config(config: &CacheServerConfig) -> Result<(), CacheServerError> {
     if config.max_connections == 0 {
         return Err(CacheServerError::InvalidConfig(
@@ -988,6 +1094,35 @@ mod tests {
     use super::super::cache_routing::CacheSlotMap;
     use super::*;
     use std::net::TcpStream as StdTcpStream;
+
+    fn read_resp_line(client: &mut StdTcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            client.read_exact(&mut byte).unwrap();
+            response.push(byte[0]);
+            if response.ends_with(b"\r\n") {
+                return response;
+            }
+        }
+    }
+
+    fn wait_for_placement_epoch(handle: &CacheServiceHandle, epoch: u64) {
+        for _ in 0..100 {
+            if handle
+                .shard_placement_epochs()
+                .iter()
+                .all(|applied| *applied >= epoch)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "cache shards did not apply epoch {epoch}; observed {:?}",
+            handle.shard_placement_epochs()
+        );
+    }
 
     fn build_server() -> CacheShardServer {
         let placement = CacheSlotMap::new_local(1, 1).unwrap();
@@ -1069,6 +1204,82 @@ mod tests {
             result,
             Err(CacheServiceError::MissingEndpoint(owner)) if owner == target
         ));
+    }
+
+    #[test]
+    fn running_service_installs_migration_and_commit_epochs() {
+        let placement = CacheSlotMap::new_local(41, 2).unwrap();
+        let mut key = None;
+        for index in 0..10_000 {
+            let candidate = format!("live-topology-{index}").into_bytes();
+            if placement.owner_for_key(&candidate).shard == 0 {
+                key = Some(candidate);
+                break;
+            }
+        }
+        let key = key.expect("key for source shard");
+        let slot = super::super::cache::redis_slot(&key);
+        let source = placement.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 41,
+            shard: 1,
+        };
+
+        let service = CacheServiceBuilder::new(41, placement.clone())
+            .with_shard(CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            ))
+            .with_shard(CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            ))
+            .build()
+            .unwrap();
+        let handle = service.start().unwrap();
+        let target_port = handle.local_addrs()[1].port();
+
+        let mut migrating = placement;
+        migrating
+            .begin_migration(1, slot, source, target)
+            .unwrap();
+        handle.install_placement(migrating.clone()).unwrap();
+        wait_for_placement_epoch(&handle, 1);
+        assert_eq!(handle.published_placement_epoch(), 1);
+
+        let mut client = StdTcpStream::connect(handle.local_addrs()[0]).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut request = format!("*2\r\n$3\r\nGET\r\n${}\r\n", key.len()).into_bytes();
+        request.extend_from_slice(&key);
+        request.extend_from_slice(b"\r\n");
+        client.write_all(&request).unwrap();
+
+        let ask = read_resp_line(&mut client);
+        let expected_ask = format!("-ASK {} 127.0.0.1:{target_port}\r\n", slot);
+        assert_eq!(ask, expected_ask.as_bytes());
+
+        migrating
+            .commit_migration(2, slot, source, target)
+            .unwrap();
+        handle.install_placement(migrating.clone()).unwrap();
+        wait_for_placement_epoch(&handle, 2);
+
+        client.write_all(&request).unwrap();
+        let moved = read_resp_line(&mut client);
+        let expected_moved = format!("-MOVED {} 127.0.0.1:{target_port}\r\n", slot);
+        assert_eq!(moved, expected_moved.as_bytes());
+
+        assert!(matches!(
+            handle.install_placement(migrating),
+            Err(CacheServiceError::StalePlacementEpoch {
+                current: 2,
+                proposed: 2,
+            })
+        ));
+
+        handle.shutdown().unwrap();
     }
 
     #[test]
