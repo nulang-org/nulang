@@ -36,7 +36,13 @@ autobenches = false
 language-version = "1.0.0-frozen"
 
 [features]
-default = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+# Keep the default compiler/runtime lean: full-language bytecode execution,
+# networking/package operations, TLS, and native FFI. Heavy or experimental
+# toolchain integrations are opt-in.
+default = ["tls", "ffi", "tcp", "ureq"]
+# Restores the previous batteries-included developer profile without making
+# those dependencies part of every Nulang installation.
+extended = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
 # Cranelift-backed tiered JIT plus the current native/AOT backend.
 native-codegen = [
     "dep:cranelift",
