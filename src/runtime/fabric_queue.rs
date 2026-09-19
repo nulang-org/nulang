@@ -1233,15 +1233,15 @@ fn decode_envelope(record: &FabricStreamRecord) -> io::Result<QueueEnvelope> {
     serde_json::from_slice(&record.payload).map_err(json_error)
 }
 
-fn queue_stream_name(queue: &str) -> String {
+pub(crate) fn queue_stream_name(queue: &str) -> String {
     format!("{QUEUE_STREAM_PREFIX}{queue}")
 }
 
-fn queue_mutation_stream_name(queue: &str) -> String {
+pub(crate) fn queue_mutation_stream_name(queue: &str) -> String {
     format!("{QUEUE_MUTATION_STREAM_PREFIX}{queue}")
 }
 
-fn validate_queue_name(name: &str) -> io::Result<()> {
+pub(crate) fn validate_queue_name(name: &str) -> io::Result<()> {
     if name.is_empty()
         || name.len() > 96
         || !name
