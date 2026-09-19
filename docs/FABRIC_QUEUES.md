@@ -340,6 +340,25 @@ A deterministic three-node RF=3 test exercises the full policy install/ACK,
 retry, stream replica ACK, quorum commit and committed-boundary propagation
 path.
 
+Replicated queue inspection now reconstructs a transient state machine strictly
+from `read_committed` on both internal streams. It never reads
+`queue_state.json`, never decodes an uncommitted tail, and never performs
+local lease expiry. A regression test appends malformed uncommitted records to
+both logs and confirms they remain invisible to replicated queue info.
+
+Replicated enqueue is exposed through `fabric_queue_add_replicated`:
+
+- `QueueCreated` must already be quorum committed,
+- the immutable job envelope is replicated through the queue payload stream,
+- the job becomes visible only when that payload sequence is committed,
+- a stable `job_id` makes retries resume the same durable sequence and
+  replication intent,
+- duplicate durable records for one `job_id` fail closed,
+- without a stable `job_id`, each API invocation is intentionally a distinct
+  enqueue; compatibility adapters should generate stable operation IDs for
+  transport retries.
+
+
 ## Distributed follow-up
 
 The current queue state machine is local to one Fabric stream store. Moving it
@@ -373,13 +392,12 @@ The compatibility layers must preserve these invariants:
 
 ## Next implementation slice
 
-1. Replay queue metadata exclusively from the mutation stream's committed
-   prefix on replicas.
-2. Add a replicated enqueue path that commits the immutable payload before any
-   consumer-visible state references it.
-3. Add replicated consumer-group ownership while preserving lease fencing tokens.
-4. Make lease acquisition a quorum-safe compare-and-set against the installed
-   queue epoch and include `epoch + lease_token` in every delivery.
+1. Add replicated consumer-group ownership while preserving lease fencing tokens.
+2. Make lease acquisition a serialized quorum-safe compare-and-set against the
+   committed queue state and installed queue epoch.
+3. Include `epoch + lease_token` in every replicated delivery and require both
+   on ACK/NACK/renew.
+4. Replicate lease expiry/redelivery before a job can be reassigned.
 5. Implement atomic DLQ forwarding.
 6. Build the minimal BullMQ B1 backend against these APIs.
 7. Run BullMQ's adapter conformance suite and use failures to drive only the
