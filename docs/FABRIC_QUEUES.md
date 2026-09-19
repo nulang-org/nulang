@@ -405,6 +405,31 @@ Replicated worker completion and lease maintenance are also quorum-gated:
 This keeps delivery completion, retry scheduling, and lease extension in the
 same serialized quorum state machine as acquisition.
 
+Replicated worker concurrency domains are configured with
+`fabric_queue_configure_consumer_group_replicated` and consumed through
+`fabric_queue_acquire_consumer_group_replicated`.
+
+These groups are **not** fan-out subscriptions. They are durable worker-pool
+concurrency domains over one work queue:
+
+- configuration is journaled in the queue metadata stream,
+- `name + max_concurrency` is immutable in this slice,
+- retries resume the original configuration mutation,
+- conflicting reconfiguration fails closed,
+- grouped leases persist the group name with the lease,
+- replay rejects a committed mutation prefix that would exceed the configured
+  concurrency cap,
+- acquisition counts only quorum-committed Active leases in that group,
+- if `active >= max_concurrency`, acquire returns no delivery and appends no
+  lease mutation,
+- capacity reopens only after the prior grouped lease leaves Active through a
+  committed ACK, NACK, or LeaseExpired mutation,
+- `fabric_queue_consumer_group_info_replicated` reports committed
+  `active/max_concurrency` state.
+
+Ungrouped workers continue to use `fabric_queue_acquire_replicated`; grouped
+and ungrouped workers still compete for the same underlying jobs.
+
 
 ## Distributed follow-up
 
@@ -439,11 +464,10 @@ The compatibility layers must preserve these invariants:
 
 ## Next implementation slice
 
-1. Add explicit replicated consumer-group ownership/concurrency limits on top of
-   the serialized lease path.
-2. Implement atomic DLQ forwarding.
-3. Build the minimal BullMQ B1 backend against these APIs.
-4. Run BullMQ's adapter conformance suite and use failures to drive only the
+1. Implement atomic DLQ forwarding with explicit cross-queue durability
+   semantics.
+2. Build the minimal BullMQ B1 backend against these APIs.
+3. Run BullMQ's adapter conformance suite and use failures to drive only the
    missing generally useful native queue semantics.
-5. Then build Core NATS wire compatibility; JetStream follows after replicated
+4. Then build Core NATS wire compatibility; JetStream follows after replicated
    consumer semantics are proven.
