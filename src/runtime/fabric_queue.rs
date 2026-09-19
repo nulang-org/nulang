@@ -902,12 +902,29 @@ impl Runtime {
         Ok(FabricQueueStore::new(streams))
     }
 
+    fn fabric_queue_require_local_mode(&mut self, queue: &str) -> io::Result<()> {
+        if self.fabric_queue_has_replication_policy(queue)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "Fabric queue {queue:?} has a replication policy; local queue APIs are disabled until the replicated operation path is used"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn fabric_queue_local_store(&mut self, queue: &str) -> io::Result<FabricQueueStore<'_>> {
+        self.fabric_queue_require_local_mode(queue)?;
+        self.fabric_queue_store()
+    }
+
     pub fn fabric_queue_create(
         &mut self,
         name: &str,
         config: FabricQueueConfig,
     ) -> io::Result<()> {
-        self.fabric_queue_store()?.create_queue(name, config)
+        self.fabric_queue_local_store(name)?.create_queue(name, config)
     }
 
     pub fn fabric_queue_add(
@@ -917,7 +934,8 @@ impl Runtime {
         payload: &[u8],
         options: FabricQueueAddOptions,
     ) -> io::Result<FabricQueueAddResult> {
-        self.fabric_queue_store()?.add(queue, name, payload, options)
+        self.fabric_queue_local_store(queue)?
+            .add(queue, name, payload, options)
     }
 
     pub fn fabric_queue_add_at(
@@ -928,7 +946,7 @@ impl Runtime {
         options: FabricQueueAddOptions,
         now_ms: u64,
     ) -> io::Result<FabricQueueAddResult> {
-        self.fabric_queue_store()?
+        self.fabric_queue_local_store(queue)?
             .add_at(queue, name, payload, options, now_ms)
     }
 
@@ -937,7 +955,7 @@ impl Runtime {
         queue: &str,
         consumer: &str,
     ) -> io::Result<Option<FabricQueueDelivery>> {
-        self.fabric_queue_store()?.acquire(queue, consumer)
+        self.fabric_queue_local_store(queue)?.acquire(queue, consumer)
     }
 
     pub fn fabric_queue_acquire_at(
@@ -946,7 +964,8 @@ impl Runtime {
         consumer: &str,
         now_ms: u64,
     ) -> io::Result<Option<FabricQueueDelivery>> {
-        self.fabric_queue_store()?.acquire_at(queue, consumer, now_ms)
+        self.fabric_queue_local_store(queue)?
+            .acquire_at(queue, consumer, now_ms)
     }
 
     pub fn fabric_queue_ack(
@@ -956,7 +975,7 @@ impl Runtime {
         consumer: &str,
         lease_token: u64,
     ) -> io::Result<()> {
-        self.fabric_queue_store()?
+        self.fabric_queue_local_store(queue)?
             .ack(queue, sequence, consumer, lease_token)
     }
 
@@ -968,7 +987,7 @@ impl Runtime {
         lease_token: u64,
         now_ms: u64,
     ) -> io::Result<()> {
-        self.fabric_queue_store()?
+        self.fabric_queue_local_store(queue)?
             .ack_at(queue, sequence, consumer, lease_token, now_ms)
     }
 
@@ -981,7 +1000,7 @@ impl Runtime {
         delay_ms: u64,
         error: Option<&str>,
     ) -> io::Result<FabricQueueNackResult> {
-        self.fabric_queue_store()?
+        self.fabric_queue_local_store(queue)?
             .nack(queue, sequence, consumer, lease_token, delay_ms, error)
     }
 
@@ -995,7 +1014,7 @@ impl Runtime {
         error: Option<&str>,
         now_ms: u64,
     ) -> io::Result<FabricQueueNackResult> {
-        self.fabric_queue_store()?
+        self.fabric_queue_local_store(queue)?
             .nack_at(queue, sequence, consumer, lease_token, delay_ms, error, now_ms)
     }
 
@@ -1007,7 +1026,7 @@ impl Runtime {
         lease_token: u64,
         extension_ms: u64,
     ) -> io::Result<u64> {
-        self.fabric_queue_store()?
+        self.fabric_queue_local_store(queue)?
             .renew(queue, sequence, consumer, lease_token, extension_ms)
     }
 
@@ -1020,12 +1039,12 @@ impl Runtime {
         extension_ms: u64,
         now_ms: u64,
     ) -> io::Result<u64> {
-        self.fabric_queue_store()?
+        self.fabric_queue_local_store(queue)?
             .renew_at(queue, sequence, consumer, lease_token, extension_ms, now_ms)
     }
 
     pub fn fabric_queue_reap_expired(&mut self, queue: &str) -> io::Result<usize> {
-        self.fabric_queue_store()?.reap_expired(queue)
+        self.fabric_queue_local_store(queue)?.reap_expired(queue)
     }
 
     pub fn fabric_queue_reap_expired_at(
@@ -1033,11 +1052,12 @@ impl Runtime {
         queue: &str,
         now_ms: u64,
     ) -> io::Result<usize> {
-        self.fabric_queue_store()?.reap_expired_at(queue, now_ms)
+        self.fabric_queue_local_store(queue)?
+            .reap_expired_at(queue, now_ms)
     }
 
     pub fn fabric_queue_info(&mut self, queue: &str) -> io::Result<FabricQueueInfo> {
-        self.fabric_queue_store()?.info(queue)
+        self.fabric_queue_local_store(queue)?.info(queue)
     }
 
     pub fn fabric_queue_info_at(
@@ -1045,7 +1065,7 @@ impl Runtime {
         queue: &str,
         now_ms: u64,
     ) -> io::Result<FabricQueueInfo> {
-        self.fabric_queue_store()?.info_at(queue, now_ms)
+        self.fabric_queue_local_store(queue)?.info_at(queue, now_ms)
     }
 }
 
