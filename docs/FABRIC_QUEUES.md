@@ -380,6 +380,26 @@ Expired active leases are intentionally not reassigned yet. Lease expiry must
 itself become a replicated metadata mutation before another worker can acquire
 the job; local wall-clock expiry is not allowed to bypass quorum state.
 
+Replicated worker completion and lease maintenance are also quorum-gated:
+
+- `fabric_queue_ack_replicated` appends a `Completed` mutation,
+- `fabric_queue_nack_replicated` appends a `Nacked` mutation and only
+  exposes the resulting Waiting/Failed/DeadLettered state after commit,
+- `fabric_queue_renew_replicated` appends a `LeaseRenewed` mutation and
+  only exposes the renewed deadline after commit,
+- every operation requires the exact `queue_epoch + lease_token` from the
+  delivery plus a stable operation id,
+- retrying the same operation id resumes the same durable metadata sequence,
+- reusing an operation id for a different mutation, job, consumer, epoch or
+  lease token fails closed,
+- stale queue epochs and stale lease tokens are rejected before a new metadata
+  mutation is appended,
+- while any metadata mutation is uncommitted, a different worker mutation
+  returns `WouldBlock` rather than racing committed queue state.
+
+This keeps delivery completion, retry scheduling, and lease extension in the
+same serialized quorum state machine as acquisition.
+
 
 ## Distributed follow-up
 
@@ -414,14 +434,12 @@ The compatibility layers must preserve these invariants:
 
 ## Next implementation slice
 
-1. Require `queue_epoch + lease_token` on replicated ACK/NACK/renew and make
-   each operation retry-safe with a stable operation id.
-2. Replicate lease expiry/redelivery before a job can be reassigned.
-3. Add explicit replicated consumer-group ownership/concurrency limits on top of
+1. Replicate lease expiry/redelivery before a job can be reassigned.
+2. Add explicit replicated consumer-group ownership/concurrency limits on top of
    the serialized lease path.
-4. Implement atomic DLQ forwarding.
-5. Build the minimal BullMQ B1 backend against these APIs.
-6. Run BullMQ's adapter conformance suite and use failures to drive only the
+3. Implement atomic DLQ forwarding.
+4. Build the minimal BullMQ B1 backend against these APIs.
+5. Run BullMQ's adapter conformance suite and use failures to drive only the
    missing generally useful native queue semantics.
-7. Then build Core NATS wire compatibility; JetStream follows after replicated
+6. Then build Core NATS wire compatibility; JetStream follows after replicated
    consumer semantics are proven.
