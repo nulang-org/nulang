@@ -342,7 +342,10 @@ pub enum CacheTransferImport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CacheImportFence {
     source: CacheTransferToken,
-    target: CacheTransferToken,
+    /// Target generation created by this source version. None records an
+    /// accepted source version whose value had already expired in transit.
+    target: Option<CacheTransferToken>,
+    target_expires_at_ms: Option<u64>,
 }
 
 /// Migration-only target-side replay and conflict fencing.
@@ -393,20 +396,60 @@ impl CacheTransferImportTracker {
         }
 
         let current = store.transfer_token_for_key(&entry.key, now_ms);
+        let prior_fence = self.fences.get(&entry.key).copied();
 
-        if let Some(fence) = self.fences.get(&entry.key).copied() {
-            if current != Some(fence.target) {
-                return CacheTransferImport::Conflict;
-            }
+        if let Some(fence) = prior_fence {
             if fence.source == entry.token {
-                return CacheTransferImport::AlreadyImported;
+                match fence.target {
+                    Some(target) if current == Some(target) => {
+                        return CacheTransferImport::AlreadyImported;
+                    }
+                    Some(_) if current.is_none()
+                        && fence
+                            .target_expires_at_ms
+                            .is_some_and(|deadline| deadline <= now_ms) =>
+                    {
+                        return CacheTransferImport::ExpiredInTransit;
+                    }
+                    None if current.is_none() => {
+                        return CacheTransferImport::ExpiredInTransit;
+                    }
+                    _ => return CacheTransferImport::Conflict,
+                }
+            }
+
+            if current != fence.target {
+                return CacheTransferImport::Conflict;
             }
         } else if current.is_some() {
             // The target acquired this key outside this migration session.
             return CacheTransferImport::Conflict;
         }
 
+        let remaining_ttl = entry.ttl_ms.map(|ttl| ttl.saturating_sub(elapsed_ms));
+        if remaining_ttl == Some(0) {
+            // A newer source version may expire while an older imported version
+            // is still resident on the target. Leaving that older version would
+            // resurrect stale data after source finalization. It is safe to
+            // remove only when the current target generation still matches the
+            // prior migration fence; the checks above enforce that condition.
+            if current.is_some() {
+                let removed = store.delete_at(&entry.key, now_ms);
+                debug_assert!(removed, "fenced target entry vanished during expiry import");
+            }
+            self.fences.insert(
+                entry.key.clone(),
+                CacheImportFence {
+                    source: entry.token,
+                    target: None,
+                    target_expires_at_ms: Some(now_ms),
+                },
+            );
+            return CacheTransferImport::ExpiredInTransit;
+        }
+
         let result = store.apply_transfer_entry(entry, elapsed_ms, now_ms);
+        debug_assert_eq!(result, CacheTransferImport::Imported);
         if result != CacheTransferImport::Imported {
             return result;
         }
@@ -414,11 +457,14 @@ impl CacheTransferImportTracker {
         let target = store
             .transfer_token_for_key(&entry.key, now_ms)
             .expect("imported transfer entry must have a live target token");
+        let target_expires_at_ms =
+            remaining_ttl.map(|ttl| now_ms.saturating_add(ttl));
         self.fences.insert(
             entry.key.clone(),
             CacheImportFence {
                 source: entry.token,
-                target,
+                target: Some(target),
+                target_expires_at_ms,
             },
         );
         CacheTransferImport::Imported
@@ -1336,6 +1382,53 @@ mod tests {
             CacheTransferFinalize::Removed
         );
         assert_eq!(source.live_entries_in_slot(slot, 0), 0);
+    }
+
+    #[test]
+    fn newer_expired_source_version_removes_older_fenced_target_value() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"k{move}", b"old", None, 0);
+        let slot = redis_slot(b"k{move}");
+        let first = source
+            .export_slot_batch(slot, None, 1, 0)
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut target = CacheStore::new();
+        let mut imports = CacheTransferImportTracker::new(slot);
+        assert_eq!(
+            imports.import_entry(&mut target, &first, 0, 0),
+            CacheTransferImport::Imported
+        );
+        assert_eq!(
+            target.get(b"k{move}", 0),
+            Some(CacheValueView::Bytes(b"old"))
+        );
+
+        source.set_bytes(b"k{move}", b"new", Some(5), 1);
+        let second = source
+            .export_slot_batch(slot, None, 1, 1)
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_ne!(first.token, second.token);
+
+        assert_eq!(
+            imports.import_entry(&mut target, &second, 5, 6),
+            CacheTransferImport::ExpiredInTransit
+        );
+        assert!(!target.exists(b"k{move}", 6));
+
+        // Replaying the exact expired source version is idempotent and cannot
+        // resurrect the older imported value.
+        assert_eq!(
+            imports.import_entry(&mut target, &second, 5, 7),
+            CacheTransferImport::ExpiredInTransit
+        );
+        assert!(!target.exists(b"k{move}", 7));
     }
 
     #[test]
