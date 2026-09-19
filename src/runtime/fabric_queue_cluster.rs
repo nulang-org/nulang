@@ -116,6 +116,19 @@ pub struct FabricQueueReplicatedGroupConfigResult {
     pub resumed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricQueueReplicatedDeadLetterResult {
+    pub source_policy: FabricQueuePolicySyncReport,
+    pub target_queue: String,
+    pub target_sequence: Option<u64>,
+    pub target_replication: Option<FabricStreamReplicationStatus>,
+    pub source_mutation_sequence: Option<u64>,
+    pub source_replication: Option<FabricStreamReplicationStatus>,
+    pub result: Option<FabricQueueNackResult>,
+    pub forwarded: bool,
+    pub resumed: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FabricQueueReplicatedAckResult {
     pub policy: FabricQueuePolicySyncReport,
@@ -649,6 +662,262 @@ impl Runtime {
             replication: Some(appended.status),
             deduplicated: false,
             enqueued: appended.status.committed,
+        })
+    }
+
+    /// Prepare a DLQ target using the source queue's exact ownership policy.
+    ///
+    /// Co-ownership keeps source and target writes on one leader/replica set,
+    /// which is required for the crash-safe handoff protocol below.
+    pub fn fabric_queue_prepare_dead_letter_target_replicated(
+        &mut self,
+        source_queue: &str,
+        target_queue: &str,
+        target_config: FabricQueueConfig,
+        partition: u16,
+        replication_factor: usize,
+    ) -> io::Result<FabricQueueReplicatedCreateResult> {
+        validate_queue_name(source_queue)?;
+        validate_queue_name(target_queue)?;
+        if source_queue == target_queue {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric queue cannot use itself as its dead-letter target",
+            ));
+        }
+
+        let source_policy =
+            self.fabric_queue_begin_replication(source_queue, partition, replication_factor)?;
+        if !source_policy.ready {
+            return Ok(FabricQueueReplicatedCreateResult {
+                policy: source_policy,
+                mutation_sequence: None,
+                replication: None,
+                created: false,
+            });
+        }
+        let source_config = self.fabric_queue_require_committed_creation(source_queue)?;
+        if source_config.dead_letter_queue.as_deref() != Some(target_queue) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Fabric queue {source_queue:?} is not configured to dead-letter into {target_queue:?}"
+                ),
+            ));
+        }
+
+        let source_placement = self
+            .fabric_queue_replication_placement(source_queue)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "source Fabric queue replication policy disappeared",
+                )
+            })?;
+        let target_placement = FabricQueuePlacement {
+            queue: target_queue.to_string(),
+            partition: source_placement.partition,
+            epoch: source_placement.epoch,
+            leader: source_placement.leader,
+            replicas: source_placement.replicas.clone(),
+            membership_fingerprint: source_placement.membership_fingerprint,
+        };
+        self.fabric_queue_install_exact_policy(&target_placement)?;
+        self.fabric_queue_create_replicated(
+            target_queue,
+            target_config,
+            partition,
+            replication_factor,
+        )
+    }
+
+    /// Crash-safe DLQ handoff for an exhausted active delivery.
+    ///
+    /// This is deliberately not described as a cross-queue transaction. The
+    /// target payload reaches quorum first using a deterministic job id. Only
+    /// then may the source queue append its DeadLettered mutation. A crash
+    /// between those phases is retry-safe: target enqueue deduplicates, and the
+    /// source remains Active until terminalization itself reaches quorum.
+    pub fn fabric_queue_dead_letter_replicated(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        error: Option<&str>,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedDeadLetterResult> {
+        validate_consumer_name(consumer)?;
+        validate_operation_id(operation_id)?;
+        let source_policy =
+            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        let source_config = self.fabric_queue_require_committed_creation(queue)?;
+        let target_queue = source_config.dead_letter_queue.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Fabric queue {queue:?} has no dead-letter target"),
+            )
+        })?;
+
+        if let Some((mutation_sequence, operation)) =
+            self.fabric_queue_find_operation(&queue_mutation_stream_name(queue), operation_id)?
+        {
+            Self::fabric_queue_validate_operation_match(
+                &operation,
+                FabricQueueOperationKind::Nack,
+                sequence,
+                consumer,
+                queue_epoch,
+                lease_token,
+            )?;
+            if operation.status != Some(super::fabric_queue::FabricQueueJobStatus::DeadLettered) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric queue dead-letter operation id refers to a non-DLQ NACK",
+                ));
+            }
+            let info = self.fabric_stream_info(&queue_mutation_stream_name(queue))?;
+            let replication = self.fabric_queue_resume_metadata_replication(
+                &queue_mutation_stream_name(queue),
+                partition,
+                mutation_sequence,
+                info.committed_sequence,
+            )?;
+            return Ok(FabricQueueReplicatedDeadLetterResult {
+                source_policy,
+                target_queue,
+                target_sequence: None,
+                target_replication: None,
+                source_mutation_sequence: Some(mutation_sequence),
+                source_replication: Some(replication),
+                result: replication.committed.then_some(FabricQueueNackResult {
+                    status: super::fabric_queue::FabricQueueJobStatus::DeadLettered,
+                    deliveries: self
+                        .fabric_queue_committed_job_snapshot(queue, sequence)?
+                        .deliveries,
+                    available_at_ms: None,
+                }),
+                forwarded: replication.committed,
+                resumed: true,
+            });
+        }
+
+        if !source_policy.ready {
+            return Ok(FabricQueueReplicatedDeadLetterResult {
+                source_policy,
+                target_queue,
+                target_sequence: None,
+                target_replication: None,
+                source_mutation_sequence: None,
+                source_replication: None,
+                result: None,
+                forwarded: false,
+                resumed: false,
+            });
+        }
+
+        let plan = self
+            .fabric_queue_plan_committed_dead_letter_nack(
+                queue,
+                sequence,
+                consumer,
+                queue_epoch,
+                lease_token,
+                operation_id,
+                error,
+                now_ms,
+            )?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Fabric queue delivery has not exhausted attempts or has no DLQ target",
+                )
+            })?;
+
+        let source_placement = self
+            .fabric_queue_replication_placement(queue)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source queue policy missing"))?;
+        let target_placement = self
+            .fabric_queue_replication_placement(&plan.target_queue)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "Fabric DLQ target {:?} is not prepared; call fabric_queue_prepare_dead_letter_target_replicated first",
+                        plan.target_queue
+                    ),
+                )
+            })?;
+        if source_placement.partition != target_placement.partition
+            || source_placement.epoch != target_placement.epoch
+            || source_placement.leader != target_placement.leader
+            || source_placement.replicas != target_placement.replicas
+            || source_placement.membership_fingerprint
+                != target_placement.membership_fingerprint
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "Fabric DLQ target {:?} does not share source queue ownership",
+                    plan.target_queue
+                ),
+            ));
+        }
+        self.fabric_queue_require_committed_creation(&plan.target_queue)?;
+
+        let target = self.fabric_queue_add_replicated(
+            &plan.target_queue,
+            &plan.target_name,
+            &plan.target_payload,
+            plan.target_options.clone(),
+            partition,
+            replication_factor,
+            now_ms,
+        )?;
+        if !target.enqueued {
+            return Ok(FabricQueueReplicatedDeadLetterResult {
+                source_policy,
+                target_queue: plan.target_queue,
+                target_sequence: target.sequence,
+                target_replication: target.replication,
+                source_mutation_sequence: None,
+                source_replication: None,
+                result: None,
+                forwarded: false,
+                resumed: target.deduplicated,
+            });
+        }
+
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let source_info = self.fabric_stream_info(&mutation_stream)?;
+        if source_info.last_sequence.unwrap_or(0) > source_info.committed_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue {queue:?} has an uncommitted metadata mutation; retry it before finalizing DLQ handoff"
+                ),
+            ));
+        }
+        let appended = self.fabric_stream_replicated_append(
+            &mutation_stream,
+            partition,
+            replication_factor,
+            &plan.source_mutation_bytes,
+        )?;
+        Ok(FabricQueueReplicatedDeadLetterResult {
+            source_policy,
+            target_queue: plan.target_queue,
+            target_sequence: target.sequence,
+            target_replication: target.replication,
+            source_mutation_sequence: Some(appended.sequence),
+            source_replication: Some(appended.status),
+            result: appended.status.committed.then_some(plan.result),
+            forwarded: appended.status.committed,
+            resumed: target.deduplicated,
         })
     }
 
