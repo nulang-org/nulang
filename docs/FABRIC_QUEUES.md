@@ -305,11 +305,25 @@ Bootstrap is fail-closed:
 - divergent policies: reject,
 - unowned durable history: reject and require explicit migration.
 
-This bootstrap API remains crate-private until a queue-policy control message
-installs the policy on followers before ordinary replicated queue traffic.
-That follower propagation is required because ordinary per-stream first-contact
-bootstrap would recompute placement from the internal stream name and defeat the
-shared queue ownership invariant.
+Queue policy installation now propagates through reserved NUL0 system actor
+messages:
+
+- `__nulang_fabric_queue_policy_v1`
+- `__nulang_fabric_queue_policy_ack_v1`
+
+The leader persists the shared policy locally, sends that exact policy to every
+configured follower, and tracks application-level installation acknowledgements
+separately from transport ACKs. RF=1 is immediately ready; RF>1 remains gated
+until every configured replica has acknowledged the same queue, epoch,
+membership fingerprint, replication factor, leader and replica set.
+
+Followers install the exact policy onto both internal streams before replying.
+Conflicting policies, duplicate replicas, unauthorized senders, unknown
+replicas, partial-history repair and stale ACKs fail closed.
+
+The legacy local `fabric_queue_*` mutation/read APIs also reject any queue that
+already carries a replication policy. This prevents callers from accidentally
+bypassing the committed replicated path while that path is being completed.
 
 ## Distributed follow-up
 
@@ -344,14 +358,16 @@ The compatibility layers must preserve these invariants:
 
 ## Next implementation slice
 
-1. Replicate both queue payload and mutation streams under one queue ownership
-   policy, and expose only quorum-committed mutations to consumers.
-2. Add replicated consumer-group ownership while preserving lease fencing tokens.
-3. Make lease acquisition a quorum-safe compare-and-set against the installed
-   queue/stream epoch.
-4. Implement atomic DLQ forwarding.
-5. Build the minimal BullMQ B1 backend against these APIs.
-6. Run BullMQ's adapter conformance suite and use failures to drive only the
+1. Add a retry-safe replicated queue-creation operation whose `QueueCreated`
+   mutation becomes visible only after quorum commit.
+2. Replay queue metadata exclusively from the mutation stream's committed
+   prefix on replicas.
+3. Add replicated consumer-group ownership while preserving lease fencing tokens.
+4. Make lease acquisition a quorum-safe compare-and-set against the installed
+   queue epoch and include `epoch + lease_token` in every delivery.
+5. Implement atomic DLQ forwarding.
+6. Build the minimal BullMQ B1 backend against these APIs.
+7. Run BullMQ's adapter conformance suite and use failures to drive only the
    missing generally useful native queue semantics.
-7. Then build Core NATS wire compatibility; JetStream follows after replicated
+8. Then build Core NATS wire compatibility; JetStream follows after replicated
    consumer semantics are proven.
