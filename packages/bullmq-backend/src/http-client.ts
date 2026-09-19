@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type {
   NulangQueueAcquireRequest,
   NulangQueueAddRequest,
@@ -12,7 +13,6 @@ import type {
   NulangQueueState,
   NulangQueueWaitSignal,
 } from './client.js';
-import { unsupported } from './errors.js';
 
 export interface NulangHttpQueueClientOptions {
   endpoint: string;
@@ -270,19 +270,19 @@ export class NulangHttpQueueClient implements NulangQueueClient {
   }
 
   async delay(
-    _queue: string,
-    _jobId: string,
-    _availableAtMs: number,
+    queue: string,
+    jobId: string,
+    availableAtMs: number,
   ): Promise<void> {
-    return unsupported('NulangHttpQueueClient.delay(non-active job)');
+    await this.reschedule(queue, jobId, availableAtMs, 'delay');
   }
 
-  async retry(_queue: string, _jobId: string): Promise<void> {
-    return unsupported('NulangHttpQueueClient.retry(non-active job)');
+  async retry(queue: string, jobId: string): Promise<void> {
+    await this.reschedule(queue, jobId, Date.now(), 'retry');
   }
 
-  async promote(_queue: string, _jobId: string): Promise<void> {
-    return unsupported('NulangHttpQueueClient.promote');
+  async promote(queue: string, jobId: string): Promise<void> {
+    await this.reschedule(queue, jobId, Date.now(), 'promote');
   }
 
   async reapExpired(queue: string, nowMs: number): Promise<string[]> {
@@ -466,6 +466,40 @@ export class NulangHttpQueueClient implements NulangQueueClient {
 
   async reconnectBlocking(): Promise<void> {
     // A subsequent wait captures the new generation.
+  }
+
+  private async reschedule(
+    queue: string,
+    jobId: string,
+    availableAtMs: number,
+    kind: 'delay' | 'retry' | 'promote',
+  ): Promise<void> {
+    await this.ensureQueue(queue);
+    const operationId = `bull:reschedule:${createHash('sha256')
+      .update([queue, jobId, kind, String(availableAtMs)].join('\0'))
+      .digest('base64url')}`;
+
+    await this.retryUntil(
+      () =>
+        this.call<{
+          mutationSequence: number | null;
+          committed: boolean;
+          sequence: number | null;
+          availableAtMs: number;
+          updated: boolean;
+          resumed: boolean;
+        }>({
+          op: 'reschedule',
+          queue,
+          job_id: jobId,
+          operation_id: operationId,
+          available_at_ms: Math.max(0, Math.trunc(availableAtMs)),
+          partition: this.partition,
+          replication_factor: this.replicationFactor,
+        }),
+      value => value.committed && value.updated,
+      `${kind} ${queue}/${jobId}`,
+    );
   }
 
   private async ensureQueue(queue: string): Promise<void> {
