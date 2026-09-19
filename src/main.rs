@@ -1219,6 +1219,8 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
     let mut tls_key: Option<String> = None;
     let mut tls_ca: Option<String> = None;
     let mut plaintext = false;
+    let mut queue_api_addr: Option<String> = None;
+    let mut queue_store = ".nulang/fabric".to_string();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1277,6 +1279,24 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
                 }
             }
             "--plaintext" => plaintext = true,
+            "--queue-api" => {
+                i += 1;
+                if i < args.len() {
+                    queue_api_addr = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: --queue-api requires an address argument");
+                    std::process::exit(1);
+                }
+            }
+            "--queue-store" => {
+                i += 1;
+                if i < args.len() {
+                    queue_store = args[i].clone();
+                } else {
+                    eprintln!("Error: --queue-store requires a path argument");
+                    std::process::exit(1);
+                }
+            }
             "-h" | "--help" => {
                 println!("Usage: nulang node [OPTIONS]");
                 println!();
@@ -1288,6 +1308,8 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
                 println!("  --tls-key <PATH>      Server private key (PEM)");
                 println!("  --tls-ca <PATH>       CA certificate for mutual TLS");
                 println!("  --plaintext           Disable TLS (insecure, dev only)");
+                println!("  --queue-api <ADDR>    Enable loopback Fabric Queue HTTP API");
+                println!("  --queue-store <PATH>  Fabric Queue store (default: .nulang/fabric)");
                 println!("  -h, --help            Show this help message");
                 return Ok(());
             }
@@ -1366,6 +1388,54 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
         "Nulang node listening on {} (node_id: {:?})",
         bind_addr, runtime.distributed.node_id
     );
+
+    if let Some(queue_api_addr) = queue_api_addr {
+        let api_addr: std::net::SocketAddr =
+            queue_api_addr.parse().map_err(|e| NuError::RuntimeError {
+                msg: format!("invalid queue API address: {e}"),
+                span: Span::default(),
+            })?;
+        if !api_addr.ip().is_loopback() {
+            return Err(NuError::RuntimeError {
+                msg: "the experimental queue API is loopback-only until authentication/TLS is added"
+                    .to_string(),
+                span: Span::default(),
+            });
+        }
+        runtime
+            .fabric_stream_open(std::path::PathBuf::from(&queue_store))
+            .map_err(|e| NuError::RuntimeError {
+                msg: format!("failed to open Fabric Queue store: {e}"),
+                span: Span::default(),
+            })?;
+        let mut queue_api =
+            nulang::runtime::FabricQueueApiServer::bind(api_addr).map_err(|e| {
+                NuError::RuntimeError {
+                    msg: format!("failed to bind queue API: {e}"),
+                    span: Span::default(),
+                }
+            })?;
+        let actual_api_addr = queue_api.local_addr().map_err(|e| NuError::RuntimeError {
+            msg: format!("failed to read queue API address: {e}"),
+            span: Span::default(),
+        })?;
+        eprintln!(
+            "Fabric Queue API listening on http://{}/v1/queue (store: {})",
+            actual_api_addr, queue_store
+        );
+        loop {
+            runtime.process_network();
+            queue_api
+                .poll(&mut runtime)
+                .map_err(|e| NuError::RuntimeError {
+                    msg: format!("queue API error: {e}"),
+                    span: Span::default(),
+                })?;
+            runtime.run_scheduler();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     runtime.run_distributed_node();
     Ok(())
 }
