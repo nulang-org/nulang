@@ -2385,9 +2385,10 @@ mod json_file_store_tests {
             crate::primitives::EffectBoundary::BackendOwned,
             crate::primitives::DeliverySemantics::EffectivelyOnceWithDeduplication,
         );
-        let prepared = DurableEffectPersistenceRecord::from_effect(
-            DurableEffectRecord::prepare(spec.clone(), b"key=orders/1"),
-        );
+        let prepared = DurableEffectPersistenceRecord::from_effect(DurableEffectRecord::prepare(
+            spec.clone(),
+            b"key=orders/1",
+        ));
         let completed = DurableEffectPersistenceRecord::from_effect(
             DurableEffectRecord::prepare(spec, b"key=orders/1").complete(b"ok".to_vec()),
         );
