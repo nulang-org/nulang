@@ -70,6 +70,12 @@ two major versions.*
   with explicit backpressure, while remote ownership produces a transport
   handoff tagged with slot and placement epoch. RESP frames are copied only
   when crossing a shard or node boundary.
+- **Ordered RESP connection pipeline** (Experimental,
+  `src/runtime/cache_pipeline.rs`). Cross-shard and remote completions may
+  arrive out of order, but responses are buffered behind a bounded
+  per-connection sequencer and emitted only as the longest contiguous completed
+  prefix. Direct responses stay immediate when no earlier async request is
+  pending; pipeline saturation is explicit backpressure.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
