@@ -89,6 +89,14 @@ two major versions.*
   entering CacheStore. Default local ownership now uses balanced contiguous
   slot ranges instead of modulo striping, keeping discovery payloads compact
   while CRC16 preserves expected key balance.
+- **Dedicated per-shard RESP reactor** (Experimental, optional
+  `cache-server` feature, `src/runtime/cache_server.rs`). Mio readiness
+  polling keeps each physical shard's listener, connections, CacheStore,
+  expiration work, and RESP pipelines on one thread, independent of the actor
+  scheduler. Redirect mode is required so normal client traffic reaches the
+  owning shard directly. Cross-shard inbox activity and shutdown wake blocked
+  reactors through Mio Waker, while bounded connection/input/output/pipeline
+  limits provide explicit resource backpressure.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
