@@ -9,6 +9,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::durable_effect::{DurableEffectId, DurableEffectRecord};
+use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::vm::Value;
 
 use tracing::warn;
@@ -251,6 +253,87 @@ impl WorkflowEvent {
     }
 }
 
+/// Merge two durable records for the same logical effect without allowing
+/// crash recovery or duplicate writes to regress a completed effect.
+///
+/// Durable-effect persistence is append-only. Readers fold the append history
+/// with this function so a stale `Prepared` record can never overwrite a
+/// durable `Completed` result, and conflicting completions fail closed.
+fn merge_durable_effect_record(
+    existing: DurableEffectPersistenceRecord,
+    incoming: DurableEffectPersistenceRecord,
+) -> io::Result<DurableEffectPersistenceRecord> {
+    if existing.effect_id() != incoming.effect_id()
+        || existing.original_effect_id() != incoming.original_effect_id()
+        || existing.compensation_ordinal() != incoming.compensation_ordinal()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable effect journal identity conflict",
+        ));
+    }
+
+    if existing.effect().spec() != incoming.effect().spec()
+        || existing.effect().request_digest() != incoming.effect().request_digest()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "durable effect journal request/spec conflict for {}",
+                existing.effect_id()
+            ),
+        ));
+    }
+
+    match (existing.effect(), incoming.effect()) {
+        (DurableEffectRecord::Prepared { .. }, DurableEffectRecord::Completed { .. }) => {
+            Ok(incoming)
+        }
+        (DurableEffectRecord::Completed { .. }, DurableEffectRecord::Prepared { .. }) => {
+            Ok(existing)
+        }
+        (
+            DurableEffectRecord::Completed {
+                result: existing_result,
+                ..
+            },
+            DurableEffectRecord::Completed {
+                result: incoming_result,
+                ..
+            },
+        ) if existing_result != incoming_result => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "durable effect journal has conflicting completed results for {}",
+                existing.effect_id()
+            ),
+        )),
+        _ => Ok(existing),
+    }
+}
+
+/// Fold one actor's durable-effect append history down to the latest monotonic
+/// state for each logical operation. The first-seen order is preserved.
+fn fold_durable_effect_records(
+    records: Vec<DurableEffectPersistenceRecord>,
+) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+    let mut folded: Vec<DurableEffectPersistenceRecord> = Vec::new();
+    let mut positions: HashMap<DurableEffectId, usize> = HashMap::new();
+
+    for record in records {
+        let id = record.effect_id();
+        if let Some(&idx) = positions.get(&id) {
+            let existing = folded[idx].clone();
+            folded[idx] = merge_durable_effect_record(existing, record)?;
+        } else {
+            positions.insert(id, folded.len());
+            folded.push(record);
+        }
+    }
+
+    Ok(folded)
+}
+
 /// Persistence backend trait. Implementations may be in-memory or disk-backed.
 pub trait PersistenceStore: Send + Sync {
     /// Persist a snapshot of durable actor state.
@@ -388,6 +471,47 @@ pub trait PersistenceStore: Send + Sync {
 
     /// Read all event-sourcing entries for an actor in order.
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry>;
+
+    /// Append one versioned durable-effect state transition.
+    ///
+    /// Implementations MUST preserve append semantics: a later stale
+    /// `Prepared` record must not erase a previously persisted completion.
+    fn append_durable_effect_record(
+        &mut self,
+        _actor_id: u64,
+        _record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable effect journal is not supported by this persistence backend",
+        ))
+    }
+
+    /// Read and validate the durable-effect append history for one actor.
+    ///
+    /// Corrupt or unsupported records return an error rather than being
+    /// silently skipped because recovery must fail closed.
+    fn read_durable_effect_records(
+        &self,
+        _actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable effect journal is not supported by this persistence backend",
+        ))
+    }
+
+    /// Load the monotonic state of one logical durable effect.
+    fn load_durable_effect_record(
+        &self,
+        actor_id: u64,
+        effect_id: DurableEffectId,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        let records = fold_durable_effect_records(self.read_durable_effect_records(actor_id)?)?;
+        Ok(records
+            .into_iter()
+            .find(|record| record.effect_id() == effect_id))
+    }
 
     /// Highest sequence number known for the actor.
     fn latest_sequence(&self, actor_id: u64) -> u64;
