@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Durable effect persistence contract — 2026-09-19
+- **Versioned durable-effect records now plug into `PersistenceStore`** (`src/runtime/persistence.rs`, `src/durable_effect_persistence.rs`). Memory, JSON-file, libSQL/SQLite, and PostgreSQL stores persist append-only prepared/completed effect records using the existing v1 envelope; recovery folds each logical effect monotonically so stale `Prepared` records cannot erase a durable result, conflicting completions fail closed, and corrupt/unsupported envelopes surface as persistence errors rather than being silently skipped. RocksDB remains on the trait's explicit unsupported default pending an append-key design that preserves the same conflict semantics.
+
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
 
