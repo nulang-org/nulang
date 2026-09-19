@@ -4,11 +4,11 @@
 //! zero). Placement is generic over a partition id so the ownership contract
 //! does not change when physical multi-partition logs land later.
 //!
-//! Important safety property: placement uses the stable *known* membership set,
-//! including Suspicious/Failed nodes, and changes only after a node is confirmed
-//! removed or gracefully leaving. A transient partition therefore does not
-//! elect a second writer. If the designated leader is unavailable, writes fail
-//! closed until an explicit failover/epoch mechanism is introduced.
+//! Important safety property: current membership is used to compute candidate
+//! placement for bootstrap and explicit reconfiguration, while an established
+//! stream's normal data plane follows its durable replication policy exactly.
+//! Suspicious/Failed nodes remain candidate members until confirmed removed, so
+//! transient liveness disagreement cannot independently move leadership.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -43,6 +43,8 @@ pub struct FabricStreamReplicaAppend {
     pub leader: NodeId,
     pub membership_fingerprint: u64,
     pub replication_factor: usize,
+    /// Ordered replica set from the durable stream policy. The leader is first.
+    pub replicas: Vec<NodeId>,
     pub stream_config: FabricStreamConfig,
     pub sequence: u64,
     pub payload: Vec<u8>,
@@ -277,6 +279,10 @@ struct FabricStreamReplicaAppendWire {
     leader: u64,
     membership_fingerprint: u64,
     replication_factor: usize,
+    /// Additive field. Empty means an older sender that predates explicit
+    /// policy bootstrap and requires the legacy rendezvous bootstrap path.
+    #[serde(default)]
+    replicas: Vec<u64>,
     stream_config: FabricStreamConfig,
     sequence: u64,
     payload: Vec<u8>,
@@ -291,6 +297,7 @@ impl FabricStreamReplicaAppend {
             leader: self.leader.0,
             membership_fingerprint: self.membership_fingerprint,
             replication_factor: self.replication_factor,
+            replicas: self.replicas.iter().map(|node| node.0).collect(),
             stream_config: self.stream_config,
             sequence: self.sequence,
             payload: self.payload.clone(),
@@ -322,6 +329,11 @@ impl FabricStreamReplicaAppend {
             || wire.epoch == 0
             || wire.replication_factor == 0
             || wire.sequence == 0
+            || (!wire.replicas.is_empty()
+                && (wire.replicas.len() != wire.replication_factor
+                    || wire.replicas.first().copied() != Some(wire.leader)
+                    || wire.replicas.iter().copied().collect::<HashSet<_>>().len()
+                        != wire.replicas.len()))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -335,6 +347,7 @@ impl FabricStreamReplicaAppend {
             leader: NodeId(wire.leader),
             membership_fingerprint: wire.membership_fingerprint,
             replication_factor: wire.replication_factor,
+            replicas: wire.replicas.into_iter().map(NodeId).collect(),
             stream_config: wire.stream_config,
             sequence: wire.sequence,
             payload: wire.payload,
@@ -403,6 +416,65 @@ impl Runtime {
                 ),
             )),
         }
+    }
+
+    fn fabric_stream_bootstrap_placement_from_append(
+        &self,
+        append: &FabricStreamReplicaAppend,
+        cluster: Option<&ClusterState>,
+    ) -> io::Result<Option<FabricStreamPlacement>> {
+        if append.replicas.is_empty() {
+            return Ok(None);
+        }
+        if append.epoch != FABRIC_STREAM_INITIAL_EPOCH
+            || append.replicas.len() != append.replication_factor
+            || append.replicas.first().copied() != Some(append.leader)
+            || append
+                .replicas
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+                != append.replicas.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Fabric replica policy bootstrap metadata",
+            ));
+        }
+
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Fabric replica policy bootstrap requires distribution",
+            )
+        })?;
+        if !append.replicas.contains(&local) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "local node is not included in carried Fabric replica policy",
+            ));
+        }
+        if cluster.is_some_and(|cluster| {
+            append
+                .replicas
+                .iter()
+                .copied()
+                .any(|node| cluster.is_removed(node))
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stale Fabric replica policy bootstrap references a confirmed-removed node",
+            ));
+        }
+
+        Ok(Some(FabricStreamPlacement {
+            stream: append.stream.clone(),
+            partition: append.partition,
+            leader: append.leader,
+            replicas: append.replicas.clone(),
+            membership_fingerprint: append.membership_fingerprint,
+        }))
     }
 
     fn fabric_stream_placement_from_policy(
@@ -574,6 +646,7 @@ impl Runtime {
             leader: placement.leader,
             membership_fingerprint: placement.membership_fingerprint,
             replication_factor,
+            replicas: placement.replicas.clone(),
             stream_config,
             sequence,
             payload: payload.to_vec(),
@@ -846,6 +919,7 @@ impl Runtime {
                 leader: ticket.leader,
                 membership_fingerprint: ticket.membership_fingerprint,
                 replication_factor: ticket.replicas.len(),
+                replicas: placement.replicas.clone(),
                 stream_config,
                 sequence,
                 payload: record.payload,
@@ -1022,6 +1096,7 @@ impl Runtime {
                     leader: placement.leader,
                     membership_fingerprint: placement.membership_fingerprint,
                     replication_factor,
+                    replicas: placement.replicas.clone(),
                     stream_config,
                     sequence: record.sequence,
                     payload: record.payload,
@@ -1396,6 +1471,7 @@ impl Runtime {
             leader: local,
             membership_fingerprint: placement.membership_fingerprint,
             replication_factor,
+            replicas: placement.replicas.clone(),
             stream_config,
             sequence,
             payload: payload.to_vec(),
@@ -1418,6 +1494,7 @@ impl Runtime {
             || placement.leader != append.leader
             || placement.membership_fingerprint != append.membership_fingerprint
             || placement.replicas.len() != append.replication_factor
+            || (!append.replicas.is_empty() && append.replicas != placement.replicas)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1515,6 +1592,7 @@ impl Runtime {
         )?;
         if placement.leader != append.leader
             || placement.membership_fingerprint != append.membership_fingerprint
+            || (!append.replicas.is_empty() && append.replicas != placement.replicas)
             || !placement.replicas.contains(&target)
         {
             return Err(io::Error::new(
@@ -1673,6 +1751,11 @@ impl Runtime {
                 append.epoch,
             )?
             .0
+        } else if let Some(placement) = self.fabric_stream_bootstrap_placement_from_append(
+            append,
+            self.distributed.cluster.as_ref(),
+        )? {
+            placement
         } else {
             self.fabric_stream_placement(
                 &append.stream,
@@ -1746,6 +1829,10 @@ impl Runtime {
                 append.epoch,
             )?
             .0
+        } else if let Some(placement) =
+            self.fabric_stream_bootstrap_placement_from_append(append, Some(cluster))?
+        {
+            placement
         } else {
             let local = self.distributed.node_id.ok_or_else(|| {
                 io::Error::new(
@@ -1780,6 +1867,12 @@ impl Runtime {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "stale Fabric stream replica append: membership fingerprint changed",
+            ));
+        }
+        if !append.replicas.is_empty() && append.replicas != placement.replicas {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric stream replica append ordered policy differs from installed placement",
             ));
         }
         if placement.leader != append.leader {
@@ -2057,6 +2150,117 @@ mod tests {
     }
 
     #[test]
+    fn carried_policy_bootstraps_follower_after_membership_changes() {
+        let a_addr = addr(33351);
+        let b_addr = addr(33352);
+        let a_id = NodeId::new(&a_addr);
+        let b_id = NodeId::new(&b_addr);
+
+        let mut a = runtime_with_members(a_addr, &[b_addr]);
+        let mut b = runtime_with_members(b_addr, &[a_addr]);
+        let initial = a.fabric_stream_placement("bootstrap-policy", 0, 2).unwrap();
+        assert_eq!(
+            initial,
+            b.fabric_stream_placement("bootstrap-policy", 0, 2).unwrap()
+        );
+
+        let root_a = test_dir("bootstrap-policy-a");
+        let root_b = test_dir("bootstrap-policy-b");
+        a.fabric_stream_open(&root_a).unwrap();
+        b.fabric_stream_open(&root_b).unwrap();
+        a.fabric_stream_create("bootstrap-policy", FabricStreamConfig::default())
+            .unwrap();
+        b.fabric_stream_create("bootstrap-policy", FabricStreamConfig::default())
+            .unwrap();
+
+        let (leader, follower) = if initial.leader == a_id {
+            (&mut a, &mut b)
+        } else {
+            assert_eq!(initial.leader, b_id);
+            (&mut b, &mut a)
+        };
+
+        // Leader establishes epoch-1 policy and produces the first append,
+        // including the complete ordered replica set.
+        let (_, append) = leader
+            .fabric_stream_prepare_replica_append("bootstrap-policy", 0, 2, b"first")
+            .unwrap();
+        assert_eq!(append.replicas, initial.replicas);
+        assert_eq!(
+            leader.fabric_stream_epoch("bootstrap-policy").unwrap(),
+            Some(FABRIC_STREAM_INITIAL_EPOCH)
+        );
+        assert_eq!(
+            follower.fabric_stream_epoch("bootstrap-policy").unwrap(),
+            None
+        );
+
+        // Before first contact, change only the follower's cluster view until
+        // legacy rendezvous would disagree with the leader-established policy.
+        let mut dynamic_changed = false;
+        for port in 33360..33450 {
+            let peer = addr(port);
+            let peer_id = NodeId::new(&peer);
+            if peer_id == a_id || peer_id == b_id {
+                continue;
+            }
+            follower
+                .distributed
+                .cluster
+                .as_mut()
+                .unwrap()
+                .handle_heartbeat(peer_id, peer);
+            let dynamic = follower
+                .fabric_stream_placement("bootstrap-policy", 0, 2)
+                .unwrap();
+            if dynamic.replicas != initial.replicas
+                || dynamic.membership_fingerprint != initial.membership_fingerprint
+            {
+                dynamic_changed = true;
+                break;
+            }
+        }
+        assert!(
+            dynamic_changed,
+            "test must make follower rendezvous differ before first policy bootstrap"
+        );
+
+        // Carried policy, not the follower's changed global membership view,
+        // authenticates first contact and becomes the durable local policy.
+        assert!(follower.fabric_stream_apply_replica(&append).unwrap());
+        assert_eq!(
+            follower.fabric_stream_epoch("bootstrap-policy").unwrap(),
+            Some(FABRIC_STREAM_INITIAL_EPOCH)
+        );
+        let policy = follower
+            .fabric_stream_replication_policy("bootstrap-policy")
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.leader, initial.leader.0);
+        assert_eq!(
+            policy.replicas,
+            initial
+                .replicas
+                .iter()
+                .map(|node| node.0)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            policy.membership_fingerprint,
+            initial.membership_fingerprint
+        );
+
+        let records = follower
+            .fabric_stream_read("bootstrap-policy", 1, 10)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].payload, b"first");
+
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[test]
     fn installed_policy_stays_stable_when_new_members_change_rendezvous() {
         let a_addr = addr(33401);
         let b_addr = addr(33402);
@@ -2283,6 +2487,7 @@ mod tests {
             leader: NodeId(42),
             membership_fingerprint: 99,
             replication_factor: 3,
+            replicas: vec![NodeId(42), NodeId(43), NodeId(44)],
             stream_config: FabricStreamConfig::default(),
             sequence: 7,
             payload: b"hello".to_vec(),
@@ -2290,6 +2495,24 @@ mod tests {
         let bytes = append.to_wire_bytes().unwrap();
         let decoded = FabricStreamReplicaAppend::from_wire_bytes(&bytes).unwrap();
         assert_eq!(decoded, append);
+
+        // Older experimental senders did not include the additive ordered
+        // replica list. Decoding remains compatible and marks that condition
+        // with an empty list so receivers can use the legacy bootstrap path.
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        legacy
+            .as_object_mut()
+            .expect("replica envelope serializes as an object")
+            .remove("replicas");
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        let decoded_legacy = FabricStreamReplicaAppend::from_wire_bytes(&legacy_bytes).unwrap();
+        assert!(decoded_legacy.replicas.is_empty());
+        assert_eq!(decoded_legacy.stream, append.stream);
+        assert_eq!(decoded_legacy.leader, append.leader);
+        assert_eq!(
+            decoded_legacy.membership_fingerprint,
+            append.membership_fingerprint
+        );
     }
 
     #[test]
