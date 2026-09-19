@@ -9,8 +9,9 @@
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 
 use super::cache::CacheStore;
+use super::cache_cluster::{CacheEndpointMap, CacheRoutingMode};
 use super::cache_routing::{CacheShardOwner, CacheSlotMap};
-use super::resp::{parse_command, RespParseError};
+use super::resp::{parse_command, write_moved, RespParseError};
 use super::resp_cache::{command_slot, execute_command, execute_frame, RespCommandSlot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub enum CacheDispatchError {
     UnknownLocalShard(u16),
     QueueFull(u16),
     QueueDisconnected(u16),
+    MissingEndpoint(CacheShardOwner),
 }
 
 impl From<RespParseError> for CacheDispatchError {
@@ -86,6 +88,11 @@ pub enum CacheDispatchOutcome {
     Remote {
         consumed: usize,
         request: CacheRemoteRequest,
+    },
+    Redirected {
+        consumed: usize,
+        slot: u16,
+        owner: CacheShardOwner,
     },
 }
 
@@ -180,6 +187,8 @@ pub struct CacheDispatcher {
     local_shard: u16,
     placement: CacheSlotMap,
     channels: CacheDispatchChannels,
+    routing_mode: CacheRoutingMode,
+    endpoints: CacheEndpointMap,
 }
 
 impl CacheDispatcher {
@@ -201,7 +210,19 @@ impl CacheDispatcher {
             local_shard,
             placement,
             channels,
+            routing_mode: CacheRoutingMode::Transparent,
+            endpoints: CacheEndpointMap::new(),
         })
+    }
+
+    pub fn with_cluster_redirects(mut self, endpoints: CacheEndpointMap) -> Self {
+        self.routing_mode = CacheRoutingMode::Redirect;
+        self.endpoints = endpoints;
+        self
+    }
+
+    pub fn routing_mode(&self) -> CacheRoutingMode {
+        self.routing_mode
     }
 
     pub fn local_shard(&self) -> u16 {
@@ -239,6 +260,22 @@ impl CacheDispatcher {
             .placement
             .owner_for_slot(slot)
             .ok_or(CacheDispatchError::UnknownSlot(slot))?;
+
+        let is_local_owner =
+            owner.node_id == self.local_node_id && owner.shard == self.local_shard;
+
+        if !is_local_owner && self.routing_mode == CacheRoutingMode::Redirect {
+            let endpoint = self
+                .endpoints
+                .get(owner)
+                .ok_or(CacheDispatchError::MissingEndpoint(owner))?;
+            write_moved(out, slot, endpoint.target());
+            return Ok(Some(CacheDispatchOutcome::Redirected {
+                consumed,
+                slot,
+                owner,
+            }));
+        }
 
         if owner.node_id != self.local_node_id {
             return Ok(Some(CacheDispatchOutcome::Remote {
@@ -279,6 +316,7 @@ impl CacheDispatcher {
 #[cfg(test)]
 mod tests {
     use super::super::cache::{redis_slot, CacheValueView};
+    use super::super::cache_cluster::CacheAdvertisedEndpoint;
     use super::super::cache_routing::CacheSlotRange;
     use super::*;
 
@@ -435,6 +473,111 @@ mod tests {
             out,
             b"-CROSSSLOT Keys in request don't hash to the same slot\r\n"
         );
+    }
+
+    #[test]
+    fn redirect_mode_returns_moved_for_other_local_shard_without_queueing() {
+        let map = CacheSlotMap::new_local(1, 2).unwrap();
+        let key = key_for_shard(&map, 1);
+        let owner = map.owner_for_key(&key);
+        let (channels, mut inboxes) = CacheDispatchChannels::new(2, 8).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(owner, CacheAdvertisedEndpoint::new("127.0.0.1", 7001));
+        let dispatcher = CacheDispatcher::new(1, 0, map, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+        let command = frame(&[b"GET", &key]);
+        let mut store = CacheStore::new();
+        let mut out = Vec::new();
+
+        let outcome = dispatcher
+            .dispatch_frame(&mut store, &command, 0, &mut out)
+            .unwrap()
+            .unwrap();
+
+        let CacheDispatchOutcome::Redirected {
+            slot,
+            owner: redirected_owner,
+            ..
+        } = outcome
+        else {
+            panic!("expected MOVED redirect");
+        };
+        assert_eq!(slot, redis_slot(&key));
+        assert_eq!(redirected_owner, owner);
+
+        let expected = format!("-MOVED {} 127.0.0.1:7001\r\n", slot);
+        assert_eq!(out, expected.as_bytes());
+
+        let mut owner_store = CacheStore::new();
+        assert!(!inboxes[1].try_process_one(&mut owner_store));
+    }
+
+    #[test]
+    fn redirect_mode_returns_moved_for_remote_node() {
+        let mut map = CacheSlotMap::new_local(1, 2).unwrap();
+        let key = b"remote-redirect";
+        let slot = redis_slot(key);
+        let owner = CacheShardOwner {
+            node_id: 9,
+            shard: 3,
+        };
+        map.apply_epoch(
+            1,
+            &[CacheSlotRange {
+                start: slot,
+                end: slot,
+                owner,
+            }],
+        )
+        .unwrap();
+
+        let (channels, _inboxes) = CacheDispatchChannels::new(2, 8).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(owner, CacheAdvertisedEndpoint::new("cache-nine", 7003));
+        let dispatcher = CacheDispatcher::new(1, 0, map, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+        let command = frame(&[b"SET", key, b"value"]);
+        let mut store = CacheStore::new();
+        let mut out = Vec::new();
+
+        let outcome = dispatcher
+            .dispatch_frame(&mut store, &command, 0, &mut out)
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            CacheDispatchOutcome::Redirected {
+                slot: redirected_slot,
+                owner: redirected_owner,
+                ..
+            } if redirected_slot == slot && redirected_owner == owner
+        ));
+        let expected = format!("-MOVED {} cache-nine:7003\r\n", slot);
+        assert_eq!(out, expected.as_bytes());
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn redirect_mode_fails_closed_when_owner_has_no_endpoint() {
+        let map = CacheSlotMap::new_local(1, 2).unwrap();
+        let key = key_for_shard(&map, 1);
+        let owner = map.owner_for_key(&key);
+        let (channels, _inboxes) = CacheDispatchChannels::new(2, 8).unwrap();
+        let dispatcher = CacheDispatcher::new(1, 0, map, channels)
+            .unwrap()
+            .with_cluster_redirects(CacheEndpointMap::new());
+        let command = frame(&[b"GET", &key]);
+        let mut store = CacheStore::new();
+        let mut out = Vec::new();
+
+        assert!(matches!(
+            dispatcher.dispatch_frame(&mut store, &command, 0, &mut out),
+            Err(CacheDispatchError::MissingEndpoint(missing)) if missing == owner
+        ));
+        assert!(out.is_empty());
     }
 
     #[test]
