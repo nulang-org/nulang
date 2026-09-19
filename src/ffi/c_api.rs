@@ -891,10 +891,8 @@ mod tests {
     #[test]
     fn test_c_api_call_function_uses_bytecode_offset_for_non_first_function() {
         let rt = nulang_runtime_new();
-        let source = CString::new(
-            "fn first() -> Int { 7 } fn second() -> Int { 42 } first()",
-        )
-        .unwrap();
+        let source =
+            CString::new("fn first() -> Int { 7 } fn second() -> Int { 42 } first()").unwrap();
 
         let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
         assert!(handle >= 0, "compile failed");
