@@ -250,6 +250,44 @@ impl CacheLocalTransferReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheRemoteTransferPending {
+    pub transfer_id: u64,
+    pub placement_epoch: u64,
+    pub source: CacheShardOwner,
+    pub target: CacheShardOwner,
+    pub batch: CacheTransferBatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheRemoteTransferReport {
+    pub transfer_id: u64,
+    pub slot: u16,
+    pub source: CacheShardOwner,
+    pub target: CacheShardOwner,
+    pub next_cursor: Option<CacheTransferCursor>,
+    pub exported_entries: usize,
+    pub imported: usize,
+    pub already_imported: usize,
+    pub expired_in_transit: usize,
+    pub conflicts: usize,
+    pub wrong_slot: usize,
+    pub finalized_removed: usize,
+    pub finalized_absent: usize,
+    pub stale_source_versions: usize,
+    pub source_remaining: usize,
+}
+
+impl CacheRemoteTransferReport {
+    pub fn source_drained(&self) -> bool {
+        self.source_remaining == 0
+    }
+
+    pub fn restart_scan_required(&self) -> bool {
+        self.stale_source_versions != 0 || self.conflicts != 0 || self.wrong_slot != 0
+    }
+}
+
 #[derive(Clone)]
 pub struct CacheShardServerControl {
     shard: u16,
@@ -355,6 +393,9 @@ pub enum CacheServiceError {
     TransportUnavailable,
     TransportBridge(CacheTransportBridgeError),
     NetworkEventDisconnected,
+    RemoteTransferTargetMustBeRemote,
+    RemoteTransferNotActive(u16),
+    RemoteTransferAckMismatch,
     ShardServer {
         shard: u16,
         source: CacheServerError,
@@ -724,6 +765,177 @@ impl CacheServiceHandle {
         Ok(())
     }
 
+
+    /// Export one bounded source batch and send it to a remote migration target.
+    ///
+    /// Completion is application-level: callers wait for the matching
+    /// TransferAck via try_recv_network_event and then call
+    /// complete_remote_slot_batch. The source copy is never deleted merely
+    /// because the NUL0 transport acknowledged packet receipt.
+    pub fn send_remote_slot_batch(
+        &self,
+        source_shard: u16,
+        target: CacheShardOwner,
+        slot: u16,
+        cursor: Option<CacheTransferCursor>,
+        max_entries: usize,
+        transfer_id: u64,
+    ) -> Result<CacheRemoteTransferPending, CacheServiceError> {
+        if max_entries == 0 {
+            return Err(CacheServiceError::InvalidTransferBatchSize);
+        }
+        if target.node_id == self.local_node_id {
+            return Err(CacheServiceError::RemoteTransferTargetMustBeRemote);
+        }
+
+        let placement = self.placement_publisher.snapshot();
+        let source = CacheShardOwner {
+            node_id: self.local_node_id,
+            shard: source_shard,
+        };
+        let Some(migration) = placement.migration_for_slot(slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(slot));
+        };
+        if migration.source != source || migration.target != target {
+            return Err(CacheServiceError::RemoteTransferNotActive(slot));
+        }
+
+        let source_control = self.transfer_control(source_shard)?;
+        let (export_tx, export_rx) = mpsc::sync_channel(1);
+        source_control.request_control(CacheShardControlRequest::Export {
+            slot,
+            cursor,
+            max_entries,
+            reply: export_tx,
+        })?;
+        let batch = export_rx
+            .recv()
+            .map_err(|_| CacheServiceError::ControlDisconnected(source_shard))?;
+
+        let pending = CacheRemoteTransferPending {
+            transfer_id,
+            placement_epoch: placement.epoch(),
+            source,
+            target,
+            batch,
+        };
+        self.send_network_message(
+            NodeId(target.node_id),
+            CacheTransportMessage::TransferBatch {
+                transfer_id,
+                placement_epoch: pending.placement_epoch,
+                source,
+                target,
+                batch: pending.batch.clone(),
+            },
+        )?;
+        Ok(pending)
+    }
+
+    /// Apply a matching remote TransferAck and generation-fence source deletion.
+    pub fn complete_remote_slot_batch(
+        &self,
+        pending: &CacheRemoteTransferPending,
+        event: &CacheTransportInbound,
+    ) -> Result<CacheRemoteTransferReport, CacheServiceError> {
+        let CacheTransportMessage::TransferAck {
+            transfer_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+            results,
+        } = &event.message
+        else {
+            return Err(CacheServiceError::RemoteTransferAckMismatch);
+        };
+
+        if event.from_node.0 != pending.target.node_id
+            || *transfer_id != pending.transfer_id
+            || *placement_epoch != pending.placement_epoch
+            || *source != pending.source
+            || *target != pending.target
+            || *slot != pending.batch.slot
+            || results.len() != pending.batch.entries.len()
+        {
+            return Err(CacheServiceError::RemoteTransferAckMismatch);
+        }
+
+        let mut imported = 0;
+        let mut already_imported = 0;
+        let mut expired_in_transit = 0;
+        let mut conflicts = 0;
+        let mut wrong_slot = 0;
+        let mut finalize_entries = Vec::new();
+
+        for (entry, result) in pending.batch.entries.iter().zip(results.iter().copied()) {
+            match result {
+                CacheTransferImport::Imported => {
+                    imported += 1;
+                    finalize_entries.push(entry.clone());
+                }
+                CacheTransferImport::AlreadyImported => {
+                    already_imported += 1;
+                    finalize_entries.push(entry.clone());
+                }
+                CacheTransferImport::ExpiredInTransit => {
+                    expired_in_transit += 1;
+                    finalize_entries.push(entry.clone());
+                }
+                CacheTransferImport::Conflict => conflicts += 1,
+                CacheTransferImport::WrongSlot => wrong_slot += 1,
+            }
+        }
+
+        let source_control = self.transfer_control(pending.source.shard)?;
+        let mut finalized_removed = 0;
+        let mut finalized_absent = 0;
+        let mut stale_source_versions = 0;
+        if !finalize_entries.is_empty() {
+            let (finalize_tx, finalize_rx) = mpsc::sync_channel(1);
+            source_control.request_control(CacheShardControlRequest::Finalize {
+                entries: finalize_entries,
+                reply: finalize_tx,
+            })?;
+            for result in finalize_rx
+                .recv()
+                .map_err(|_| CacheServiceError::ControlDisconnected(pending.source.shard))?
+            {
+                match result {
+                    CacheTransferFinalize::Removed => finalized_removed += 1,
+                    CacheTransferFinalize::AlreadyAbsent => finalized_absent += 1,
+                    CacheTransferFinalize::StaleVersion => stale_source_versions += 1,
+                }
+            }
+        }
+
+        let (count_tx, count_rx) = mpsc::sync_channel(1);
+        source_control.request_control(CacheShardControlRequest::CountSlot {
+            slot: pending.batch.slot,
+            reply: count_tx,
+        })?;
+        let source_remaining = count_rx
+            .recv()
+            .map_err(|_| CacheServiceError::ControlDisconnected(pending.source.shard))?;
+
+        Ok(CacheRemoteTransferReport {
+            transfer_id: pending.transfer_id,
+            slot: pending.batch.slot,
+            source: pending.source,
+            target: pending.target,
+            next_cursor: pending.batch.next_cursor,
+            exported_entries: pending.batch.entries.len(),
+            imported,
+            already_imported,
+            expired_in_transit,
+            conflicts,
+            wrong_slot,
+            finalized_removed,
+            finalized_absent,
+            stale_source_versions,
+            source_remaining,
+        })
+    }
 
     /// Move one bounded batch of a migrating logical slot between local shards.
     ///
