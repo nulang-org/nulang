@@ -3542,9 +3542,18 @@ mod tests {
         let result = analyzer.infer_cap(&ctx2, &send);
         assert!(result.is_err(), "send with ref argument should fail");
         let diagnostic = analyzer.diagnostics.join("\n");
-        assert!(diagnostic.contains("why:"), "diagnostic should explain the isolation failure");
-        assert!(diagnostic.contains("alias mutable state"), "diagnostic should explain why ref is unsafe");
-        assert!(diagnostic.contains("help:"), "diagnostic should provide an actionable fix");
+        assert!(
+            diagnostic.contains("why:"),
+            "diagnostic should explain the isolation failure"
+        );
+        assert!(
+            diagnostic.contains("alias mutable state"),
+            "diagnostic should explain why ref is unsafe"
+        );
+        assert!(
+            diagnostic.contains("help:"),
+            "diagnostic should provide an actionable fix"
+        );
     }
 
     #[test]
@@ -3563,8 +3572,14 @@ mod tests {
         let result = analyzer.infer_cap(&ctx, &send);
         assert!(result.is_err(), "remote send with iso argument should fail");
         let diagnostic = analyzer.diagnostics.join("\n");
-        assert!(diagnostic.contains("serialization boundary"), "remote diagnostic should explain the boundary");
-        assert!(diagnostic.contains("immutable `val`"), "remote diagnostic should suggest the safe projection");
+        assert!(
+            diagnostic.contains("serialization boundary"),
+            "remote diagnostic should explain the boundary"
+        );
+        assert!(
+            diagnostic.contains("immutable `val`"),
+            "remote diagnostic should suggest the safe projection"
+        );
     }
 
     #[test]
