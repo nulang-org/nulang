@@ -15,13 +15,13 @@ use std::io;
 use serde::{Deserialize, Serialize};
 
 use super::fabric_queue::{
-    decode_queue_consumer_group_config, decode_queue_created_mutation,
-    decode_queue_envelope_bytes, decode_queue_lease_mutation, decode_queue_operation,
-    encode_queue_created_mutation, encode_queue_envelope, queue_mutation_stream_name,
-    queue_stream_name, validate_consumer_group_name, validate_consumer_name,
-    validate_operation_id, validate_queue_name, FabricQueueAddOptions, FabricQueueConfig,
-    FabricQueueConsumerGroupConfig, FabricQueueConsumerGroupInfo, FabricQueueDelivery,
-    FabricQueueNackResult, FabricQueueOperation, FabricQueueOperationKind,
+    decode_queue_consumer_group_config, decode_queue_created_mutation, decode_queue_envelope_bytes,
+    decode_queue_lease_mutation, decode_queue_operation, encode_queue_created_mutation,
+    encode_queue_envelope, queue_mutation_stream_name, queue_stream_name,
+    validate_consumer_group_name, validate_consumer_name, validate_operation_id,
+    validate_queue_name, FabricQueueAddOptions, FabricQueueConfig, FabricQueueConsumerGroupConfig,
+    FabricQueueConsumerGroupInfo, FabricQueueDelivery, FabricQueueNackResult, FabricQueueOperation,
+    FabricQueueOperationKind,
 };
 use super::fabric_stream::{FabricStreamReplicationPolicy, FABRIC_STREAM_INITIAL_EPOCH};
 use super::{
@@ -2718,26 +2718,14 @@ mod tests {
 
         let pending_group = cluster
             .node_mut(leader_index)
-            .fabric_queue_configure_consumer_group_replicated(
-                "grouped",
-                "renderers",
-                1,
-                0,
-                3,
-            )
+            .fabric_queue_configure_consumer_group_replicated("grouped", "renderers", 1, 0, 3)
             .unwrap();
         assert_eq!(pending_group.mutation_sequence, Some(2));
         assert!(!pending_group.configured);
 
         let retry_group = cluster
             .node_mut(leader_index)
-            .fabric_queue_configure_consumer_group_replicated(
-                "grouped",
-                "renderers",
-                1,
-                0,
-                3,
-            )
+            .fabric_queue_configure_consumer_group_replicated("grouped", "renderers", 1, 0, 3)
             .unwrap();
         assert_eq!(retry_group.mutation_sequence, Some(2));
         assert!(retry_group.resumed);
@@ -2746,18 +2734,15 @@ mod tests {
         cluster.run_rounds(12);
         let committed_group = cluster
             .node_mut(leader_index)
-            .fabric_queue_configure_consumer_group_replicated(
-                "grouped",
-                "renderers",
-                1,
-                0,
-                3,
-            )
+            .fabric_queue_configure_consumer_group_replicated("grouped", "renderers", 1, 0, 3)
             .unwrap();
         assert!(committed_group.configured);
         assert!(committed_group.resumed);
 
-        for (job_id, payload) in [("g-job-1", b"one".as_slice()), ("g-job-2", b"two".as_slice())] {
+        for (job_id, payload) in [
+            ("g-job-1", b"one".as_slice()),
+            ("g-job-2", b"two".as_slice()),
+        ] {
             let options = FabricQueueAddOptions {
                 job_id: Some(job_id.to_string()),
                 priority: 0,
@@ -2779,15 +2764,7 @@ mod tests {
             cluster.run_rounds(12);
             let committed = cluster
                 .node_mut(leader_index)
-                .fabric_queue_add_replicated(
-                    "grouped",
-                    "render",
-                    payload,
-                    options,
-                    0,
-                    3,
-                    100,
-                )
+                .fabric_queue_add_replicated("grouped", "render", payload, options, 0, 3, 100)
                 .unwrap();
             assert!(committed.enqueued);
         }
@@ -2985,13 +2962,7 @@ mod tests {
 
         let conflict = cluster
             .node_mut(leader_index)
-            .fabric_queue_configure_consumer_group_replicated(
-                "grouped",
-                "renderers",
-                2,
-                0,
-                3,
-            )
+            .fabric_queue_configure_consumer_group_replicated("grouped", "renderers", 2, 0, 3)
             .unwrap_err();
         assert_eq!(conflict.kind(), io::ErrorKind::AlreadyExists);
 
