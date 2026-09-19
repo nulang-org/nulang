@@ -536,6 +536,7 @@ pub struct MemoryStore {
     journals: HashMap<u64, Vec<JournalEntry>>,
     workflow_events: HashMap<u64, Vec<WorkflowEvent>>,
     events: HashMap<u64, Vec<EventEntry>>,
+    durable_effects: HashMap<u64, Vec<Vec<u8>>>,
 }
 
 impl MemoryStore {
@@ -587,6 +588,36 @@ impl PersistenceStore for MemoryStore {
         self.events.get(&actor_id).cloned().unwrap_or_default()
     }
 
+    fn append_durable_effect_record(
+        &mut self,
+        actor_id: u64,
+        record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        let bytes = record
+            .to_json()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.durable_effects
+            .entry(actor_id)
+            .or_default()
+            .push(bytes);
+        Ok(())
+    }
+
+    fn read_durable_effect_records(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        self.durable_effects
+            .get(&actor_id)
+            .into_iter()
+            .flatten()
+            .map(|bytes| {
+                DurableEffectPersistenceRecord::from_json(bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect()
+    }
+
     fn latest_sequence(&self, actor_id: u64) -> u64 {
         let snapshot_seq = self
             .snapshots
@@ -619,6 +650,7 @@ impl PersistenceStore for MemoryStore {
         self.journals.remove(&actor_id);
         self.workflow_events.remove(&actor_id);
         self.events.remove(&actor_id);
+        self.durable_effects.remove(&actor_id);
         Ok(())
     }
 }
@@ -656,6 +688,10 @@ impl JsonFileStore {
 
     fn events_path(&self, actor_id: u64) -> PathBuf {
         self.actor_dir(actor_id).join("events.jsonl")
+    }
+
+    fn durable_effects_path(&self, actor_id: u64) -> PathBuf {
+        self.actor_dir(actor_id).join("durable_effects.jsonl")
     }
 }
 
@@ -784,6 +820,55 @@ impl PersistenceStore for JsonFileStore {
         data.lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
+    }
+
+    fn append_durable_effect_record(
+        &mut self,
+        actor_id: u64,
+        record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        let dir = self.actor_dir(actor_id);
+        fs::create_dir_all(&dir)?;
+        let path = self.durable_effects_path(actor_id);
+        let bytes = record
+            .to_json()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    }
+
+    fn read_durable_effect_records(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        let path = self.durable_effects_path(actor_id);
+        let data = match fs::read(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut records = Vec::new();
+        for (line_index, line) in data.split(|byte| *byte == b'\n').enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let record = DurableEffectPersistenceRecord::from_json(line).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid durable effect record for actor {actor_id} at line {}: {error}",
+                        line_index + 1
+                    ),
+                )
+            })?;
+            records.push(record);
+        }
+        Ok(records)
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
