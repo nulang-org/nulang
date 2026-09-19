@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use super::fabric_queue::{
     decode_queue_created_mutation, decode_queue_envelope_bytes, decode_queue_lease_mutation,
-    encode_queue_created_mutation, encode_queue_envelope, queue_mutation_stream_name,
-    queue_stream_name, validate_consumer_name, validate_queue_name, FabricQueueAddOptions,
-    FabricQueueConfig, FabricQueueDelivery,
+    decode_queue_operation, encode_queue_created_mutation, encode_queue_envelope,
+    queue_mutation_stream_name, queue_stream_name, validate_consumer_name, validate_operation_id,
+    validate_queue_name, FabricQueueAddOptions, FabricQueueConfig, FabricQueueDelivery,
+    FabricQueueNackResult, FabricQueueOperation, FabricQueueOperationKind,
 };
 use super::fabric_stream::{
     FabricStreamReplicationPolicy, FABRIC_STREAM_INITIAL_EPOCH,
@@ -104,6 +105,33 @@ pub struct FabricQueueReplicatedAcquireResult {
     pub mutation_sequence: Option<u64>,
     pub replication: Option<FabricStreamReplicationStatus>,
     pub delivery: Option<FabricQueueDelivery>,
+    pub resumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FabricQueueReplicatedAckResult {
+    pub policy: FabricQueuePolicySyncReport,
+    pub mutation_sequence: Option<u64>,
+    pub replication: Option<FabricStreamReplicationStatus>,
+    pub completed: bool,
+    pub resumed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricQueueReplicatedNackResult {
+    pub policy: FabricQueuePolicySyncReport,
+    pub mutation_sequence: Option<u64>,
+    pub replication: Option<FabricStreamReplicationStatus>,
+    pub result: Option<FabricQueueNackResult>,
+    pub resumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FabricQueueReplicatedRenewResult {
+    pub policy: FabricQueuePolicySyncReport,
+    pub mutation_sequence: Option<u64>,
+    pub replication: Option<FabricStreamReplicationStatus>,
+    pub lease_until_ms: Option<u64>,
     pub resumed: bool,
 }
 
@@ -620,6 +648,92 @@ impl Runtime {
         })
     }
 
+    fn fabric_queue_find_operation(
+        &mut self,
+        mutation_stream: &str,
+        operation_id: &str,
+    ) -> io::Result<Option<(u64, FabricQueueOperation)>> {
+        let mut next = 2u64;
+        let mut matching = None;
+        loop {
+            let records = self.fabric_stream_read(mutation_stream, next, 1024)?;
+            if records.is_empty() {
+                break;
+            }
+            for record in &records {
+                if let Some(operation) = decode_queue_operation(&record.payload)? {
+                    if operation.operation_id.as_deref() == Some(operation_id) {
+                        if matching.is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "Fabric queue metadata contains duplicate operation id {operation_id:?}"
+                                ),
+                            ));
+                        }
+                        matching = Some((record.sequence, operation));
+                    }
+                }
+                next = record.sequence.saturating_add(1);
+            }
+            if records.len() < 1024 {
+                break;
+            }
+        }
+        Ok(matching)
+    }
+
+    fn fabric_queue_resume_metadata_replication(
+        &mut self,
+        mutation_stream: &str,
+        partition: u16,
+        mutation_sequence: u64,
+        committed: u64,
+    ) -> io::Result<FabricStreamReplicationStatus> {
+        if mutation_sequence > committed {
+            self.fabric_stream_retry_pending(mutation_stream, partition)?;
+        }
+        self.fabric_stream_replication_status(
+            mutation_stream,
+            partition,
+            mutation_sequence,
+        )
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "uncommitted Fabric queue metadata mutation {mutation_sequence} has no recoverable replication intent"
+                    ),
+                )
+            } else {
+                error
+            }
+        })
+    }
+
+    fn fabric_queue_validate_operation_match(
+        operation: &FabricQueueOperation,
+        expected_kind: FabricQueueOperationKind,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+    ) -> io::Result<()> {
+        if operation.kind != expected_kind
+            || operation.sequence != sequence
+            || operation.consumer != consumer
+            || operation.queue_epoch != queue_epoch
+            || operation.lease_token != lease_token
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric queue operation id was reused with different mutation or fencing inputs",
+            ));
+        }
+        Ok(())
+    }
+
     /// Acquire one job through a quorum-committed, epoch-fenced lease.
     ///
     /// The leader serializes queue metadata mutations: while a lease mutation
@@ -778,6 +892,325 @@ impl Runtime {
             mutation_sequence: Some(appended.sequence),
             replication: Some(appended.status),
             delivery,
+            resumed: false,
+        })
+    }
+
+    pub fn fabric_queue_ack_replicated(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedAckResult> {
+        validate_consumer_name(consumer)?;
+        validate_operation_id(operation_id)?;
+        let policy =
+            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        if !policy.ready {
+            return Ok(FabricQueueReplicatedAckResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                completed: false,
+                resumed: false,
+            });
+        }
+        let placement = self
+            .fabric_queue_replication_placement(queue)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing"))?;
+        if queue_epoch != placement.epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Fabric queue ACK uses a stale queue epoch",
+            ));
+        }
+        self.fabric_queue_require_committed_creation(queue)?;
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let info = self.fabric_stream_info(&mutation_stream)?;
+
+        if let Some((mutation_sequence, operation)) =
+            self.fabric_queue_find_operation(&mutation_stream, operation_id)?
+        {
+            Self::fabric_queue_validate_operation_match(
+                &operation,
+                FabricQueueOperationKind::Ack,
+                sequence,
+                consumer,
+                queue_epoch,
+                lease_token,
+            )?;
+            let replication = self.fabric_queue_resume_metadata_replication(
+                &mutation_stream,
+                partition,
+                mutation_sequence,
+                info.committed_sequence,
+            )?;
+            return Ok(FabricQueueReplicatedAckResult {
+                policy,
+                mutation_sequence: Some(mutation_sequence),
+                replication: Some(replication),
+                completed: replication.committed,
+                resumed: true,
+            });
+        }
+
+        if info.last_sequence.unwrap_or(0) > info.committed_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue {queue:?} has an uncommitted metadata mutation; retry it before ACK"
+                ),
+            ));
+        }
+        let bytes = self.fabric_queue_plan_committed_ack(
+            queue,
+            sequence,
+            consumer,
+            queue_epoch,
+            lease_token,
+            operation_id,
+            now_ms,
+        )?;
+        let appended = self.fabric_stream_replicated_append(
+            &mutation_stream,
+            partition,
+            replication_factor,
+            &bytes,
+        )?;
+        Ok(FabricQueueReplicatedAckResult {
+            policy,
+            mutation_sequence: Some(appended.sequence),
+            replication: Some(appended.status),
+            completed: appended.status.committed,
+            resumed: false,
+        })
+    }
+
+    pub fn fabric_queue_nack_replicated(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        delay_ms: u64,
+        error: Option<&str>,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedNackResult> {
+        validate_consumer_name(consumer)?;
+        validate_operation_id(operation_id)?;
+        let policy =
+            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        if !policy.ready {
+            return Ok(FabricQueueReplicatedNackResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                result: None,
+                resumed: false,
+            });
+        }
+        let placement = self
+            .fabric_queue_replication_placement(queue)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing"))?;
+        if queue_epoch != placement.epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Fabric queue NACK uses a stale queue epoch",
+            ));
+        }
+        self.fabric_queue_require_committed_creation(queue)?;
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let info = self.fabric_stream_info(&mutation_stream)?;
+
+        if let Some((mutation_sequence, operation)) =
+            self.fabric_queue_find_operation(&mutation_stream, operation_id)?
+        {
+            Self::fabric_queue_validate_operation_match(
+                &operation,
+                FabricQueueOperationKind::Nack,
+                sequence,
+                consumer,
+                queue_epoch,
+                lease_token,
+            )?;
+            let replication = self.fabric_queue_resume_metadata_replication(
+                &mutation_stream,
+                partition,
+                mutation_sequence,
+                info.committed_sequence,
+            )?;
+            let result = if replication.committed {
+                let snapshot = self.fabric_queue_committed_job_snapshot(queue, sequence)?;
+                let expected_status = operation.status.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "committed Fabric queue NACK is missing target status",
+                    )
+                })?;
+                if snapshot.status != expected_status {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "committed Fabric queue state does not match NACK mutation",
+                    ));
+                }
+                Some(FabricQueueNackResult {
+                    status: snapshot.status,
+                    deliveries: snapshot.deliveries,
+                    available_at_ms: operation.available_at_ms,
+                })
+            } else {
+                None
+            };
+            return Ok(FabricQueueReplicatedNackResult {
+                policy,
+                mutation_sequence: Some(mutation_sequence),
+                replication: Some(replication),
+                result,
+                resumed: true,
+            });
+        }
+
+        if info.last_sequence.unwrap_or(0) > info.committed_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue {queue:?} has an uncommitted metadata mutation; retry it before NACK"
+                ),
+            ));
+        }
+        let (bytes, planned_result) = self.fabric_queue_plan_committed_nack(
+            queue,
+            sequence,
+            consumer,
+            queue_epoch,
+            lease_token,
+            operation_id,
+            delay_ms,
+            error,
+            now_ms,
+        )?;
+        let appended = self.fabric_stream_replicated_append(
+            &mutation_stream,
+            partition,
+            replication_factor,
+            &bytes,
+        )?;
+        Ok(FabricQueueReplicatedNackResult {
+            policy,
+            mutation_sequence: Some(appended.sequence),
+            replication: Some(appended.status),
+            result: appended.status.committed.then_some(planned_result),
+            resumed: false,
+        })
+    }
+
+    pub fn fabric_queue_renew_replicated(
+        &mut self,
+        queue: &str,
+        sequence: u64,
+        consumer: &str,
+        queue_epoch: u64,
+        lease_token: u64,
+        operation_id: &str,
+        extension_ms: u64,
+        partition: u16,
+        replication_factor: usize,
+        now_ms: u64,
+    ) -> io::Result<FabricQueueReplicatedRenewResult> {
+        validate_consumer_name(consumer)?;
+        validate_operation_id(operation_id)?;
+        let policy =
+            self.fabric_queue_begin_replication(queue, partition, replication_factor)?;
+        if !policy.ready {
+            return Ok(FabricQueueReplicatedRenewResult {
+                policy,
+                mutation_sequence: None,
+                replication: None,
+                lease_until_ms: None,
+                resumed: false,
+            });
+        }
+        let placement = self
+            .fabric_queue_replication_placement(queue)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Fabric queue policy missing"))?;
+        if queue_epoch != placement.epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Fabric queue renew uses a stale queue epoch",
+            ));
+        }
+        self.fabric_queue_require_committed_creation(queue)?;
+        let mutation_stream = queue_mutation_stream_name(queue);
+        let info = self.fabric_stream_info(&mutation_stream)?;
+
+        if let Some((mutation_sequence, operation)) =
+            self.fabric_queue_find_operation(&mutation_stream, operation_id)?
+        {
+            Self::fabric_queue_validate_operation_match(
+                &operation,
+                FabricQueueOperationKind::Renew,
+                sequence,
+                consumer,
+                queue_epoch,
+                lease_token,
+            )?;
+            let replication = self.fabric_queue_resume_metadata_replication(
+                &mutation_stream,
+                partition,
+                mutation_sequence,
+                info.committed_sequence,
+            )?;
+            return Ok(FabricQueueReplicatedRenewResult {
+                policy,
+                mutation_sequence: Some(mutation_sequence),
+                replication: Some(replication),
+                lease_until_ms: replication
+                    .committed
+                    .then_some(operation.lease_until_ms)
+                    .flatten(),
+                resumed: true,
+            });
+        }
+
+        if info.last_sequence.unwrap_or(0) > info.committed_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Fabric queue {queue:?} has an uncommitted metadata mutation; retry it before renew"
+                ),
+            ));
+        }
+        let (bytes, lease_until_ms) = self.fabric_queue_plan_committed_renew(
+            queue,
+            sequence,
+            consumer,
+            queue_epoch,
+            lease_token,
+            operation_id,
+            extension_ms,
+            now_ms,
+        )?;
+        let appended = self.fabric_stream_replicated_append(
+            &mutation_stream,
+            partition,
+            replication_factor,
+            &bytes,
+        )?;
+        Ok(FabricQueueReplicatedRenewResult {
+            policy,
+            mutation_sequence: Some(appended.sequence),
+            replication: Some(appended.status),
+            lease_until_ms: appended.status.committed.then_some(lease_until_ms),
             resumed: false,
         })
     }
