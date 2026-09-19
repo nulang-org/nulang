@@ -713,6 +713,7 @@ fn duplicate_remote_command_replays_cached_response_without_reexecution() {
 
 #[test]
 fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
+    let journal_path = temp_journal_path("recovered-transfer");
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let addr_a: SocketAddr = "127.0.0.1:33701".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:33702".parse().unwrap();
@@ -752,6 +753,7 @@ fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
     runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
 
     let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_migration_journal_path(&journal_path)
         .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53702))
         .with_shard(CacheServiceShardConfig::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -794,7 +796,16 @@ fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
     let pending = service_a
         .send_remote_slot_batch(0, target, slot, None, 8, 9301)
         .unwrap();
-    service_a.retry_remote_slot_batch(&pending).unwrap();
+    let journal_key = CacheMigrationKey {
+        started_epoch: 1,
+        slot,
+        source,
+        target,
+    };
+    let recovered_pending = service_a
+        .retry_recovered_remote_transfer(journal_key, 9301)
+        .unwrap();
+    assert_eq!(recovered_pending, pending);
 
     let first = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
     let second = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
@@ -837,6 +848,7 @@ fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
 
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
+    std::fs::remove_file(journal_path).unwrap();
 }
 
 
