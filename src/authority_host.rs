@@ -71,10 +71,8 @@ impl HostAuthorityRequest {
 impl Actor {
     /// Require the exact authority needed for one external host action.
     ///
-    /// This delegates to `Actor::require_authority`, which first parses the
-    /// complete compatibility token set into a typed manifest. A malformed
-    /// sibling token therefore invalidates authorization instead of being
-    /// ignored.
+    /// This delegates to `Actor::require_authority`, which checks the actor's
+    /// already-validated structural manifest directly.
     pub fn require_host_authority(
         &self,
         request: &HostAuthorityRequest,
@@ -167,16 +165,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn malformed_runtime_manifest_still_fails_closed() {
-        let mut actor = actor_with(&["Fs::Read(/srv/data/report.csv)"]);
-        actor
-            .capabilities
-            .insert("Net::TcpOut(malformed)".to_string());
-
-        assert!(matches!(
-            actor.require_fs_read("/srv/data/report.csv"),
-            Err(RuntimeAuthorityError::InvalidManifest(_))
-        ));
-    }
 }

@@ -192,7 +192,7 @@ The semantic rule is fixed:
 
 ### Migration
 
-`src/authority.rs` provides the typed migration boundary while existing metadata still uses canonical tokens. The actor runtime bridge parses the legacy `BTreeSet<String>` into `AuthorityManifest`, fails closed if any persisted token is malformed, exposes typed exact-grant checks, and enforces exact-subset monotonic delegation.
+`src/authority.rs` provides the typed boundary while stable bytecode, persistence, and wire formats may still encode canonical tokens. Those tokens are parsed into `AuthorityManifest` before becoming actor state; actors store typed manifests directly, host checks use typed grants, and delegation enforces exact-subset monotonic authority.
 
 The migration sequence is:
 
@@ -204,7 +204,7 @@ The migration sequence is:
 6. have runtime host functions call the typed actor authorization boundary before external access;
 7. remove ad-hoc string matching from security-sensitive checks.
 
-Current plumbing gaps are explicit: the parser still initializes spawn capabilities to an empty vector; MIR codegen currently destructures `capabilities: _`, so it drops even programmatically constructed grants instead of filling `CodeModule::spawn_capability_grants`; and the current `spawn_actor` callback API carries no spawn-PC/grant argument for installing those grants on the child. The existence of AST/HIR/MIR fields or bytecode metadata therefore must not be treated as end-to-end enforcement yet.
+Current status: source grants are parsed into typed `AuthorityGrant` values and remain structural through AST → HIR → MIR → actor runtime state. Bytecode/native codegen canonicalizes them only at stable artifact compatibility boundaries; persistence and migration keep canonical tokens for format compatibility but validate the complete set before constructing an actor. Bytecode spawn metadata is bound to the exact spawn PC, the VM installs the selected manifest on the child actor, and host authorization checks typed grants directly. Remaining authority work is to extend the distributed spawn protocol so remote authority delegation can be represented structurally rather than rejected.
 
 ## Contract 5 — Protocol-typed actor references
 

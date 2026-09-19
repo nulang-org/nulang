@@ -4122,7 +4122,7 @@ impl Parser {
 
                 let grant = AuthorityGrant::from_parts(&namespace, &operation, argument.as_deref())
                     .map_err(|err| NuError::parse_error(err.to_string(), grant_span))?;
-                grants.push(grant.to_string());
+                grants.push(grant);
 
                 self.skip_newlines();
                 if !self.consume_if(&TokenKind::Comma) {
@@ -4131,8 +4131,8 @@ impl Parser {
                 self.skip_newlines();
             }
             self.expect(TokenKind::RBracket)?;
-            // Canonical metadata makes equivalent source produce identical
-            // artifact identity regardless of grant order or duplication.
+            // Canonical structural ordering makes equivalent source produce
+            // identical semantic input regardless of grant order or duplication.
             grants.sort_unstable();
             grants.dedup();
             grants

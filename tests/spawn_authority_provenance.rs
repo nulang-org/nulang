@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 #[cfg(feature = "native-codegen")]
 use nulang::aot::AotModule;
+use nulang::authority::AuthorityGrant;
 use nulang::bytecode::OpCode;
 use nulang::lexer::Lexer;
 use nulang::mir::{Module, RValue, Stmt};
@@ -32,7 +33,10 @@ fn set_spawn_grants(mir: &mut Module, site: usize, grants: &[&str]) {
                 } = stmt
                 {
                     if seen == site {
-                        *capabilities = grants.iter().map(|grant| (*grant).to_string()).collect();
+                        *capabilities = grants
+                        .iter()
+                        .map(|grant| grant.parse::<AuthorityGrant>().expect("valid test grant"))
+                        .collect();
                         return;
                     }
                     seen += 1;
@@ -199,11 +203,36 @@ fn empty_grants_emit_no_privilege_metadata() {
 }
 
 #[test]
-fn malformed_spawn_grant_fails_compilation() {
-    let mut mir = lower(two_spawn_source());
-    set_spawn_grants(&mut mir, 0, &["Net::TcpOut(api.example.com)"]);
-    let error = compile_mir(&mut mir, "authority-invalid").unwrap_err();
-    assert!(error.to_string().contains("invalid spawn authority grant"));
+fn mir_spawn_grants_are_structural_before_codegen() {
+    let mir = lower(
+        r#"
+actor Child { behavior ping() { 1 } }
+fn main() {
+    spawn Child {} with [Net::TcpOut("api.example.com:443")]
+}
+"#,
+    );
+    let grant = mir
+        .functions
+        .iter()
+        .chain(mir.behaviors.iter())
+        .flat_map(|func| func.blocks.iter())
+        .flat_map(|block| block.stmts.iter())
+        .find_map(|stmt| match stmt {
+            Stmt::Assign {
+                op: RValue::Spawn { capabilities, .. },
+                ..
+            } => capabilities.first().cloned(),
+            _ => None,
+        })
+        .expect("spawn authority grant");
+    assert_eq!(
+        grant,
+        AuthorityGrant::NetTcpOut {
+            host: "api.example.com".to_string(),
+            port: 443,
+        }
+    );
 }
 
 #[test]
@@ -241,7 +270,7 @@ fn vm_uses_exact_spawn_pc_even_for_same_target_behavior() {
         .borrow()
         .actors
         .values()
-        .map(|actor| actor.authority_manifest().unwrap().canonical_tokens())
+        .map(|actor| actor.authority_manifest().canonical_tokens())
         .collect();
     manifests.sort();
     assert_eq!(
@@ -289,7 +318,7 @@ fn sorted_actor_manifests(rt: &Runtime) -> Vec<Vec<String>> {
     let mut manifests: Vec<Vec<String>> = rt
         .actors
         .values()
-        .map(|actor| actor.authority_manifest().unwrap().canonical_tokens())
+        .map(|actor| actor.authority_manifest().canonical_tokens())
         .collect();
     manifests.sort();
     manifests
