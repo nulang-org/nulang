@@ -8,8 +8,8 @@ use std::collections::{HashMap, VecDeque};
 
 use super::cache::CacheStore;
 use super::cache_dispatch::{
-    CacheDispatchError, CacheDispatchOutcome, CacheDispatcher, CacheLocalReply, CacheRemoteRequest,
-    CacheReplyError,
+    CacheDispatchContext, CacheDispatchError, CacheDispatchOutcome, CacheDispatcher,
+    CacheLocalReply, CacheRemoteRequest, CacheReplyError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +62,7 @@ pub struct CacheResponsePipeline {
     pending: VecDeque<PendingResponse>,
     remote_ready: HashMap<u64, Vec<u8>>,
     direct_scratch: Vec<u8>,
+    dispatch_context: CacheDispatchContext,
 }
 
 impl CacheResponsePipeline {
@@ -73,6 +74,7 @@ impl CacheResponsePipeline {
             pending: VecDeque::new(),
             remote_ready: HashMap::new(),
             direct_scratch: Vec::with_capacity(128),
+            dispatch_context: CacheDispatchContext::default(),
         }
     }
 
@@ -101,8 +103,13 @@ impl CacheResponsePipeline {
         }
 
         self.direct_scratch.clear();
-        let Some(outcome) =
-            dispatcher.dispatch_frame(store, input, now_ms, &mut self.direct_scratch)?
+        let Some(outcome) = dispatcher.dispatch_frame_with_context(
+            store,
+            input,
+            now_ms,
+            &mut self.dispatch_context,
+            &mut self.direct_scratch,
+        )?
         else {
             return Ok(None);
         };
@@ -262,6 +269,61 @@ mod tests {
         assert!(submit.remote.is_none());
         assert_eq!(socket_out, b"+PONG\r\n");
         assert!(pipeline.is_empty());
+    }
+
+
+    #[test]
+    fn asking_state_is_connection_local_and_consumed_by_one_command() {
+        let mut placement = CacheSlotMap::new_local(1, 2).unwrap();
+        let key = key_for_shard(&placement, 0);
+        let slot = redis_slot(&key);
+        let source = placement.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 1,
+            shard: 1,
+        };
+        placement.begin_migration(1, slot, source, target).unwrap();
+
+        let (channels, _inboxes) = CacheDispatchChannels::new(2, 8).unwrap();
+        let mut endpoints = super::super::cache_cluster::CacheEndpointMap::new();
+        endpoints.insert(
+            source,
+            super::super::cache_cluster::CacheAdvertisedEndpoint::new("127.0.0.1", 7000),
+        );
+        endpoints.insert(
+            target,
+            super::super::cache_cluster::CacheAdvertisedEndpoint::new("127.0.0.1", 7001),
+        );
+        let dispatcher = CacheDispatcher::new(1, 1, placement, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+        let mut pipeline = CacheResponsePipeline::new(16);
+        let mut store = CacheStore::new();
+        let mut socket_out = Vec::new();
+
+        let asking = frame(&[b"ASKING"]);
+        pipeline
+            .submit_frame(&dispatcher, &mut store, &asking, 0, &mut socket_out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(socket_out, b"+OK\r\n");
+
+        socket_out.clear();
+        let set = frame(&[b"SET", &key, b"value"]);
+        pipeline
+            .submit_frame(&dispatcher, &mut store, &set, 0, &mut socket_out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(socket_out, b"+OK\r\n");
+
+        socket_out.clear();
+        let get = frame(&[b"GET", &key]);
+        pipeline
+            .submit_frame(&dispatcher, &mut store, &get, 0, &mut socket_out)
+            .unwrap()
+            .unwrap();
+        let moved = format!("-MOVED {} 127.0.0.1:7000\r\n", slot);
+        assert_eq!(socket_out, moved.as_bytes());
     }
 
     #[test]
