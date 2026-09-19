@@ -2231,6 +2231,201 @@ mod tests {
             assert_eq!(info.completed, 1);
         }
 
+        // A second job exercises replicated lease expiry. Expiry itself is a
+        // quorum mutation: until sequence 8 commits, the job remains Active
+        // and cannot be reassigned.
+        let job2_options = FabricQueueAddOptions {
+            job_id: Some("job-2".to_string()),
+            priority: 1,
+            delay_ms: 0,
+        };
+        let pending_job2 = cluster
+            .node_mut(leader_index)
+            .fabric_queue_add_replicated(
+                "orders",
+                "render",
+                b"payload-2",
+                job2_options.clone(),
+                0,
+                3,
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(pending_job2.sequence, Some(2));
+        assert!(!pending_job2.enqueued);
+        cluster.run_rounds(12);
+        let committed_job2 = cluster
+            .node_mut(leader_index)
+            .fabric_queue_add_replicated(
+                "orders",
+                "render",
+                b"payload-2",
+                job2_options,
+                0,
+                3,
+                1_000,
+            )
+            .unwrap();
+        assert!(committed_job2.enqueued);
+
+        let pending_job2_lease = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("orders", "worker-c", "acquire-job-2", 0, 3, 1_000)
+            .unwrap();
+        assert_eq!(pending_job2_lease.mutation_sequence, Some(7));
+        assert!(pending_job2_lease.delivery.is_none());
+        cluster.run_rounds(12);
+        let committed_job2_lease = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated("orders", "worker-c", "acquire-job-2", 0, 3, 1_000)
+            .unwrap();
+        let job2_delivery = committed_job2_lease
+            .delivery
+            .expect("second job lease must commit");
+        assert_eq!(job2_delivery.sequence, 2);
+        assert_eq!(job2_delivery.lease_token, 1);
+        assert_eq!(job2_delivery.lease_until_ms, 16_000);
+
+        let early_reap = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reap_expired_replicated("orders", 0, 3, 15_999)
+            .unwrap();
+        assert_eq!(early_reap.mutation_sequence, None);
+        assert_eq!(early_reap.expired_sequence, None);
+
+        let pending_expiry = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reap_expired_replicated("orders", 0, 3, 16_000)
+            .unwrap();
+        assert_eq!(pending_expiry.mutation_sequence, Some(8));
+        assert_eq!(pending_expiry.expired_sequence, Some(2));
+        assert!(pending_expiry.result.is_none());
+        assert!(!pending_expiry.replication.unwrap().committed);
+
+        let retry_expiry = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reap_expired_replicated("orders", 0, 3, 16_500)
+            .unwrap();
+        assert_eq!(retry_expiry.mutation_sequence, Some(8));
+        assert_eq!(retry_expiry.expired_sequence, Some(2));
+        assert!(retry_expiry.resumed);
+        assert!(retry_expiry.result.is_none());
+
+        let blocked_acquire = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated(
+                "orders",
+                "worker-d",
+                "acquire-job-2-redelivery",
+                0,
+                3,
+                16_500,
+            )
+            .unwrap_err();
+        assert_eq!(blocked_acquire.kind(), io::ErrorKind::WouldBlock);
+
+        for index in 0..3 {
+            let info = cluster
+                .node_mut(index)
+                .fabric_queue_info_replicated("orders")
+                .unwrap();
+            assert_eq!(info.total, 2);
+            assert_eq!(info.active, 1);
+            assert_eq!(info.waiting, 0);
+            assert_eq!(info.completed, 1);
+        }
+
+        cluster.run_rounds(12);
+        for index in 0..3 {
+            assert_eq!(
+                cluster
+                    .node_mut(index)
+                    .fabric_stream_committed_sequence(&queue_mutation_stream_name("orders"))
+                    .unwrap(),
+                8
+            );
+            let info = cluster
+                .node_mut(index)
+                .fabric_queue_info_replicated("orders")
+                .unwrap();
+            assert_eq!(info.total, 2);
+            assert_eq!(info.active, 0);
+            assert_eq!(info.waiting, 1);
+            assert_eq!(info.completed, 1);
+        }
+
+        let settled_reap = cluster
+            .node_mut(leader_index)
+            .fabric_queue_reap_expired_replicated("orders", 0, 3, 17_000)
+            .unwrap();
+        assert_eq!(settled_reap.mutation_sequence, None);
+        assert_eq!(settled_reap.expired_sequence, None);
+
+        let pending_redelivery = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated(
+                "orders",
+                "worker-d",
+                "acquire-job-2-redelivery",
+                0,
+                3,
+                17_000,
+            )
+            .unwrap();
+        assert_eq!(pending_redelivery.mutation_sequence, Some(9));
+        assert!(pending_redelivery.delivery.is_none());
+        cluster.run_rounds(12);
+        let committed_redelivery = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_replicated(
+                "orders",
+                "worker-d",
+                "acquire-job-2-redelivery",
+                0,
+                3,
+                17_000,
+            )
+            .unwrap();
+        let redelivery = committed_redelivery
+            .delivery
+            .expect("expired job must become redeliverable only after quorum");
+        assert_eq!(redelivery.sequence, 2);
+        assert_eq!(redelivery.deliveries, 2);
+        assert_eq!(redelivery.lease_token, 2);
+
+        let pending_job2_ack = cluster
+            .node_mut(leader_index)
+            .fabric_queue_ack_replicated(
+                "orders",
+                2,
+                "worker-d",
+                queue_epoch,
+                2,
+                "ack-job-2",
+                0,
+                3,
+                17_100,
+            )
+            .unwrap();
+        assert_eq!(pending_job2_ack.mutation_sequence, Some(10));
+        assert!(!pending_job2_ack.completed);
+        cluster.run_rounds(12);
+        let committed_job2_ack = cluster
+            .node_mut(leader_index)
+            .fabric_queue_ack_replicated(
+                "orders",
+                2,
+                "worker-d",
+                queue_epoch,
+                2,
+                "ack-job-2",
+                0,
+                3,
+                17_100,
+            )
+            .unwrap();
+        assert!(committed_job2_ack.completed);
+
         // Simulate leader-local torn/uncommitted tails. The replicated read
         // path must stop at each durable commit boundary and never attempt to
         // decode these malformed records.
@@ -2239,7 +2434,7 @@ mod tests {
                 .node_mut(leader_index)
                 .fabric_stream_append(&queue_stream_name("orders"), b"not-a-queue-envelope")
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             cluster
@@ -2249,16 +2444,16 @@ mod tests {
                     b"not-a-queue-mutation"
                 )
                 .unwrap(),
-            7
+            11
         );
         let committed_view = cluster
             .node_mut(leader_index)
             .fabric_queue_info_replicated("orders")
             .unwrap();
-        assert_eq!(committed_view.total, 1);
+        assert_eq!(committed_view.total, 2);
         assert_eq!(committed_view.waiting, 0);
         assert_eq!(committed_view.active, 0);
-        assert_eq!(committed_view.completed, 1);
+        assert_eq!(committed_view.completed, 2);
 
         let _ = std::fs::remove_dir_all(base);
     }
