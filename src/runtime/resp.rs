@@ -232,7 +232,14 @@ pub fn write_array_len(out: &mut Vec<u8>, len: usize) {
 pub fn write_bulk_integer(out: &mut Vec<u8>, value: i64) {
     let mut digits = [0u8; 20];
     let len = encode_i64_decimal(&mut digits, value);
-    out.push(b'fn write_i64_decimal(out: &mut Vec<u8>, value: i64) {
+    out.push(b'$');
+    write_u64_decimal(out, len as u64);
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&digits[..len]);
+    out.extend_from_slice(b"\r\n");
+}
+
+fn write_i64_decimal(out: &mut Vec<u8>, value: i64) {
     let mut buf = [0u8; 20];
     let len = encode_i64_decimal(&mut buf, value);
     out.extend_from_slice(&buf[..len]);
