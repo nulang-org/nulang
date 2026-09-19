@@ -676,8 +676,12 @@ export class NulangQueueBackend
   async clearLogs(..._args: any[]): Promise<any> {
     return unsupported('clearLogs');
   }
-  async changeDelay(..._args: any[]): Promise<any> {
-    return unsupported('changeDelay');
+  async changeDelay(jobId: string, delay: number): Promise<void> {
+    await this.session.client.delay(
+      this.queueName,
+      jobId,
+      this.now() + Math.max(0, delay),
+    );
   }
   async changePriority(..._args: any[]): Promise<any> {
     return unsupported('changePriority');
