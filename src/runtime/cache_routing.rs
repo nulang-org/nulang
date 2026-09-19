@@ -5,7 +5,7 @@
 //! applied in epoch-fenced batches after full validation, so readers never
 //! observe a partially validated topology.
 
-use super::cache::{default_physical_shard, redis_slot, REDIS_CLUSTER_SLOTS};
+use super::cache::{redis_slot, REDIS_CLUSTER_SLOTS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheShardOwner {
@@ -58,19 +58,22 @@ pub struct CacheSlotMap {
 }
 
 impl CacheSlotMap {
-    /// Build a local-only placement by distributing logical slots modulo the
-    /// number of physical cache shards.
+    /// Build a local-only placement with balanced contiguous slot ranges.
+    ///
+    /// CRC16 already spreads ordinary keys uniformly over the 16,384 logical
+    /// slots. Keeping each physical shard's default ownership contiguous makes
+    /// Redis Cluster topology compact and slot migration tractable without
+    /// sacrificing expected key distribution.
     pub fn new_local(node_id: u64, shard_count: u16) -> Result<Self, CachePlacementError> {
-        if shard_count == 0 {
+        if shard_count == 0 || shard_count > REDIS_CLUSTER_SLOTS {
             return Err(CachePlacementError::InvalidShardCount);
         }
 
         let mut owners = Vec::with_capacity(REDIS_CLUSTER_SLOTS as usize);
         for slot in 0..REDIS_CLUSTER_SLOTS {
-            owners.push(CacheShardOwner {
-                node_id,
-                shard: default_physical_shard(slot, shard_count as usize) as u16,
-            });
+            let shard =
+                (u32::from(slot) * u32::from(shard_count) / u32::from(REDIS_CLUSTER_SLOTS)) as u16;
+            owners.push(CacheShardOwner { node_id, shard });
         }
 
         Ok(Self { epoch: 0, owners })
@@ -194,7 +197,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_map_distributes_all_slots_across_shards() {
+    fn local_map_distributes_balanced_contiguous_ranges() {
         let map = CacheSlotMap::new_local(7, 4).unwrap();
 
         assert_eq!(
@@ -205,7 +208,14 @@ mod tests {
             })
         );
         assert_eq!(
-            map.owner_for_slot(1),
+            map.owner_for_slot(4_095),
+            Some(CacheShardOwner {
+                node_id: 7,
+                shard: 0
+            })
+        );
+        assert_eq!(
+            map.owner_for_slot(4_096),
             Some(CacheShardOwner {
                 node_id: 7,
                 shard: 1
@@ -218,6 +228,7 @@ mod tests {
                 shard: 3
             })
         );
+        assert_eq!(map.slot_ranges().len(), 4);
         assert_eq!(map.owner_for_slot(16_384), None);
     }
 
@@ -381,9 +392,13 @@ mod tests {
     }
 
     #[test]
-    fn zero_shards_are_rejected() {
+    fn invalid_shard_counts_are_rejected() {
         assert!(matches!(
             CacheSlotMap::new_local(1, 0),
+            Err(CachePlacementError::InvalidShardCount)
+        ));
+        assert!(matches!(
+            CacheSlotMap::new_local(1, REDIS_CLUSTER_SLOTS + 1),
             Err(CachePlacementError::InvalidShardCount)
         ));
     }
