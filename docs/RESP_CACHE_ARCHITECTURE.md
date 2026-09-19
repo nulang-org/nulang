@@ -170,9 +170,25 @@ The migration controller can use `live_entries_in_slot` plus stale-finalize
 results to decide when another source scan is required and when the source is
 fully drained.
 
-These are storage/control primitives, not yet a network protocol. A follow-up
-must drive export -> import -> ACK -> fenced finalize on the owning reactor
-threads and over the cache cluster transport for remote owners.
+Local same-process migration now drives these primitives through bounded,
+reactor-owned control queues. `CacheServiceHandle::transfer_local_slot_batch`
+requests a source export, submits that exact batch to the target reactor,
+finalizes only accepted/expired entries back on the source reactor, and then
+queries the source's remaining live-entry count. No `CacheStore` crosses a
+thread boundary and the coordinator never takes a store mutex.
+
+Each reactor processes at most a configured control batch per Mio wake, then
+re-wakes itself if more control work remains. This prevents a large migration
+from monopolizing the shard loop. The coordinator report distinguishes
+successful imports, idempotent replays, target conflicts, stale source
+versions, bytes moved, cursor progress, and source drain completion. If a
+source version raced or the importing target changed independently, the caller
+must reconcile rather than committing ownership.
+
+The same request/reply protocol still needs a remote-node transport envelope.
+That transport must carry slot, migration/placement epoch, source/target owner,
+and transfer batch identity, and must reject stale epochs before mutating a
+target store.
 
 The same cluster layer serves topology discovery without touching CacheStore:
 `CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
@@ -239,11 +255,11 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Drive export -> import -> ACK -> fenced finalize through reactor-owned
-   migration control messages, then carry the same protocol over the cache
-   cluster transport for remote owners.
-2. Connect remote transparent command handoffs to that cache-specific cluster
-   transport and reject stale carried placement epochs on receipt.
+1. Add a cache-specific inter-node transport envelope for transfer/import/ACK
+   and transparent remote command handoffs, rejecting stale placement epochs
+   before any mutation.
+2. Add remote migration orchestration on top of that transport with bounded
+   retries, transfer-batch identity, and source/target convergence checks.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 4. Allow topology publication to add/remove advertised remote endpoints without
