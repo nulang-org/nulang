@@ -604,6 +604,21 @@ impl Runtime {
                 for record in &records {
                     let envelope = decode_queue_envelope_bytes(&record.payload)?;
                     if envelope.job_id.as_deref() == Some(job_id) {
+                        let existing_delay = envelope
+                            .available_at_ms
+                            .saturating_sub(envelope.created_at_ms);
+                        if envelope.name != name
+                            || envelope.payload.as_slice() != payload
+                            || envelope.priority != options.priority
+                            || existing_delay != options.delay_ms
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "Fabric queue job id {job_id:?} was reused with different immutable job content"
+                                ),
+                            ));
+                        }
                         if found.is_some() {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
