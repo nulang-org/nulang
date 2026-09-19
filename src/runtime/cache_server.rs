@@ -2357,6 +2357,21 @@ impl CacheShardServer {
             } => {
                 let _ = reply.send(self.import_remote_batch(placement_epoch, &batch, now_ms));
             }
+            CacheShardControlRequest::MigrationProbe {
+                placement_epoch,
+                slot,
+                source,
+                target,
+                reply,
+            } => {
+                let _ = reply.send(self.probe_remote_migration(
+                    placement_epoch,
+                    slot,
+                    source,
+                    target,
+                    now_ms,
+                ));
+            }
             CacheShardControlRequest::Export {
                 slot,
                 cursor,
@@ -2370,15 +2385,12 @@ impl CacheShardServer {
             }
             CacheShardControlRequest::Import { batch, reply } => {
                 let elapsed_ms = now_ms.saturating_sub(batch.exported_at_ms);
-                let tracker = self
+                let state = self
                     .transfer_imports
                     .entry(batch.slot)
-                    .or_insert_with(|| CacheTransferImportTracker::new(batch.slot));
-                let results = batch
-                    .entries
-                    .iter()
-                    .map(|entry| tracker.import_entry(&mut self.store, entry, elapsed_ms, now_ms))
-                    .collect();
+                    .or_insert_with(|| CacheTransferImportState::new(batch.slot));
+                let results =
+                    state.import_batch(&mut self.store, &batch, elapsed_ms, now_ms);
                 let _ = reply.send(results);
             }
             CacheShardControlRequest::Finalize { entries, reply } => {
@@ -2460,19 +2472,53 @@ impl CacheShardServer {
             return Err(CacheRemoteControlError::OwnerMismatch);
         }
 
-        let tracker = self
+        let state = self
             .transfer_imports
             .entry(batch.slot)
-            .or_insert_with(|| CacheTransferImportTracker::new(batch.slot));
+            .or_insert_with(|| CacheTransferImportState::new(batch.slot));
 
         // Monotonic cache clocks are process-local. The source has already
         // reduced TTL for time spent before transport; cross-node wire time is
         // deliberately not inferred from unrelated clock origins.
-        Ok(batch
-            .entries
-            .iter()
-            .map(|entry| tracker.import_entry(&mut self.store, entry, 0, now_ms))
-            .collect())
+        Ok(state.import_batch(&mut self.store, batch, 0, now_ms))
+    }
+
+    fn probe_remote_migration(
+        &mut self,
+        placement_epoch: u64,
+        slot: u16,
+        source: CacheShardOwner,
+        target: CacheShardOwner,
+        now_ms: u64,
+    ) -> Result<CacheMigrationProbeSnapshot, CacheRemoteControlError> {
+        let placement = self.dispatcher.placement();
+        if placement.epoch() != placement_epoch {
+            return Err(CacheRemoteControlError::TopologyChanged {
+                installed_epoch: placement.epoch(),
+                requested_epoch: placement_epoch,
+            });
+        }
+
+        let local = CacheShardOwner {
+            node_id: self.dispatcher.local_node_id(),
+            shard: self.dispatcher.local_shard(),
+        };
+        let Some(migration) = placement.migration_for_slot(slot) else {
+            return Err(CacheRemoteControlError::OwnerMismatch);
+        };
+        if local != target || migration.source != source || migration.target != target {
+            return Err(CacheRemoteControlError::OwnerMismatch);
+        }
+
+        Ok(match self.transfer_imports.get(&slot) {
+            Some(state) => state.snapshot(&self.store, slot, now_ms),
+            None => CacheMigrationProbeSnapshot {
+                live_entries: self.store.live_entries_in_slot(slot, now_ms),
+                import_fences: 0,
+                conflicts: 0,
+                wrong_slot: 0,
+            },
+        })
     }
 
     fn install_published_placement(&mut self) {
