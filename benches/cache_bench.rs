@@ -4,7 +4,7 @@
 //! `cargo bench --bench bench_main -- cache`
 
 use criterion::{black_box, criterion_group, Criterion, Throughput};
-use nulang::runtime::{redis_slot, CacheStore, CacheValueView};
+use nulang::runtime::{execute_frame, redis_slot, CacheStore, CacheValueView};
 
 fn bench_get_hit_inline(c: &mut Criterion) {
     let mut group = c.benchmark_group("cache/get_hit_inline");
@@ -57,6 +57,28 @@ fn bench_set_large_reuse(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_resp_get_execute(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cache/resp_get_execute");
+    group.throughput(Throughput::Elements(1));
+
+    let frame = b"*2\r\n$3\r\nGET\r\n$19\r\ntenant:{42}:profile\r\n";
+    let mut store = CacheStore::new();
+    store.set_bytes(b"tenant:{42}:profile", b"small-value", None, 0);
+    let mut out = Vec::with_capacity(64);
+
+    group.bench_function("parse_and_execute", |b| {
+        b.iter(|| {
+            out.clear();
+            let consumed = execute_frame(&mut store, black_box(frame), 0, &mut out)
+                .unwrap()
+                .unwrap();
+            debug_assert_eq!(consumed, frame.len());
+            black_box(&out);
+        });
+    });
+    group.finish();
+}
+
 fn bench_redis_slot(c: &mut Criterion) {
     let mut group = c.benchmark_group("cache/redis_slot");
     group.throughput(Throughput::Elements(1));
@@ -72,5 +94,6 @@ criterion_group!(
     bench_get_hit_inline,
     bench_set_inline_churn,
     bench_set_large_reuse,
+    bench_resp_get_execute,
     bench_redis_slot
 );

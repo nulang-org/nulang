@@ -57,8 +57,7 @@ impl<'a> Iterator for RespArgs<'a> {
 
         // parse_command validates the complete frame first, so failure here
         // can only occur if RespArgs was constructed incorrectly.
-        let parsed = parse_bulk(&self.bytes[self.cursor..]).ok().flatten()?;
-        let (value, consumed) = parsed;
+        let (value, consumed) = parse_bulk(&self.bytes[self.cursor..]).ok().flatten()?;
         self.cursor += consumed;
         self.remaining -= 1;
         Some(value)
@@ -73,7 +72,7 @@ impl ExactSizeIterator for RespArgs<'_> {}
 
 /// Parse one RESP2 array-of-bulk-strings command.
 ///
-/// Ok(None) means the caller should read more bytes. On success the returned
+/// `Ok(None)` means the caller should read more bytes. On success the returned
 /// usize is the exact number of consumed bytes, allowing pipelined frames to
 /// remain in the socket buffer.
 pub fn parse_command(input: &[u8]) -> Result<Option<(RespCommand<'_>, usize)>, RespParseError> {
@@ -223,11 +222,51 @@ pub fn write_null_bulk(out: &mut Vec<u8>) {
     out.extend_from_slice(b"$-1\r\n");
 }
 
+pub fn write_array_len(out: &mut Vec<u8>, len: usize) {
+    out.push(b'*');
+    write_u64_decimal(out, len as u64);
+    out.extend_from_slice(b"\r\n");
+}
+
+pub fn write_bulk_integer(out: &mut Vec<u8>, value: i64) {
+    let mut digits = [0u8; 20];
+    let len = encode_i64_decimal(&mut digits, value);
+    out.push(b'$');
+    write_u64_decimal(out, len as u64);
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&digits[..len]);
+    out.extend_from_slice(b"\r\n");
+}
+
 fn write_i64_decimal(out: &mut Vec<u8>, value: i64) {
-    if value < 0 {
-        out.push(b'-');
+    let mut buf = [0u8; 20];
+    let len = encode_i64_decimal(&mut buf, value);
+    out.extend_from_slice(&buf[..len]);
+}
+
+fn encode_i64_decimal(buf: &mut [u8; 20], value: i64) -> usize {
+    let mut cursor = buf.len();
+    let mut magnitude = value.unsigned_abs();
+
+    if magnitude == 0 {
+        cursor -= 1;
+        buf[cursor] = b'0';
+    } else {
+        while magnitude != 0 {
+            cursor -= 1;
+            buf[cursor] = b'0' + (magnitude % 10) as u8;
+            magnitude /= 10;
+        }
     }
-    write_u64_decimal(out, value.unsigned_abs());
+
+    if value < 0 {
+        cursor -= 1;
+        buf[cursor] = b'-';
+    }
+
+    let len = buf.len() - cursor;
+    buf.copy_within(cursor.., 0);
+    len
 }
 
 fn write_u64_decimal(out: &mut Vec<u8>, mut value: u64) {
@@ -302,5 +341,13 @@ mod tests {
         out.clear();
         write_integer(&mut out, i64::MIN);
         assert_eq!(out, b":-9223372036854775808\r\n");
+
+        out.clear();
+        write_bulk_integer(&mut out, -42);
+        assert_eq!(out, b"$3\r\n-42\r\n");
+
+        out.clear();
+        write_array_len(&mut out, 3);
+        assert_eq!(out, b"*3\r\n");
     }
 }
