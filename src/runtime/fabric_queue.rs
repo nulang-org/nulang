@@ -79,6 +79,9 @@ pub struct FabricQueueAddOptions {
     pub priority: i32,
     /// Delay before the job becomes visible to workers.
     pub delay_ms: u64,
+    /// Optional per-job delivery-attempt cap. When omitted the queue-level
+    /// max_attempts remains authoritative.
+    pub max_attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +192,8 @@ pub(crate) struct QueueEnvelope {
     pub(crate) priority: i32,
     pub(crate) created_at_ms: u64,
     pub(crate) available_at_ms: u64,
+    #[serde(default)]
+    pub(crate) max_attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +201,8 @@ struct QueueJobState {
     job_id: Option<String>,
     available_at_ms: u64,
     priority: i32,
+    #[serde(default)]
+    max_attempts: Option<u32>,
     deliveries: u32,
     #[serde(default)]
     lease_token: u64,
@@ -342,6 +349,12 @@ pub(crate) fn encode_queue_envelope(
     if let Some(job_id) = options.job_id.as_deref() {
         validate_job_id(job_id)?;
     }
+    if options.max_attempts == Some(0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Fabric queue per-job max_attempts must be greater than zero",
+        ));
+    }
     serde_json::to_vec(&QueueEnvelope {
         name: name.to_string(),
         payload: payload.to_vec(),
@@ -349,6 +362,7 @@ pub(crate) fn encode_queue_envelope(
         priority: options.priority,
         created_at_ms: now_ms,
         available_at_ms: now_ms.saturating_add(options.delay_ms),
+        max_attempts: options.max_attempts,
     })
     .map_err(json_error)
 }
@@ -678,6 +692,7 @@ impl<'a> FabricQueueStore<'a> {
                 job_id: options.job_id.clone(),
                 available_at_ms,
                 priority: options.priority,
+                max_attempts: options.max_attempts,
                 deliveries: 0,
                 lease_token: 0,
                 status: FabricQueueJobStatus::Waiting,
@@ -719,7 +734,7 @@ impl<'a> FabricQueueStore<'a> {
         for (&sequence, job) in &state.jobs {
             if job.status != FabricQueueJobStatus::Waiting
                 || job.available_at_ms > now_ms
-                || job.deliveries >= state.config.max_attempts
+                || job.deliveries >= effective_max_attempts(&state, job)
             {
                 continue;
             }
@@ -848,12 +863,13 @@ impl<'a> FabricQueueStore<'a> {
         validate_consumer_name(consumer)?;
         let mut state = self.load_state(queue)?;
         validate_active_job(&state, sequence, consumer, lease_token, now_ms)?;
-        let deliveries = state
+        let job = state
             .jobs
             .get(&sequence)
-            .expect("validated queue job must exist")
-            .deliveries;
-        let (status, available_at_ms) = if deliveries >= state.config.max_attempts {
+            .expect("validated queue job must exist");
+        let deliveries = job.deliveries;
+        let max_attempts = effective_max_attempts(&state, job);
+        let (status, available_at_ms) = if deliveries >= max_attempts {
             if state.config.dead_letter_queue.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -1047,6 +1063,7 @@ impl<'a> FabricQueueStore<'a> {
                         job_id: envelope.job_id,
                         available_at_ms: envelope.available_at_ms,
                         priority: envelope.priority,
+                        max_attempts: envelope.max_attempts,
                         deliveries: 0,
                         lease_token: 0,
                         status: FabricQueueJobStatus::Waiting,
@@ -1291,7 +1308,9 @@ impl<'a> FabricQueueStore<'a> {
             .collect();
 
         for (sequence, consumer, lease_token, deliveries) in &expired {
-            let (status, available_at_ms) = if *deliveries >= state.config.max_attempts {
+            let job = state.jobs.get(sequence).expect("expired queue job must exist");
+            let max_attempts = effective_max_attempts(state, job);
+            let (status, available_at_ms) = if *deliveries >= max_attempts {
                 (
                     if state.config.dead_letter_queue.is_some() {
                         FabricQueueJobStatus::DeadLettered
@@ -1599,7 +1618,7 @@ impl Runtime {
         for (&sequence, job) in &state.jobs {
             if job.status != FabricQueueJobStatus::Waiting
                 || job.available_at_ms > now_ms
-                || job.deliveries >= state.config.max_attempts
+                || job.deliveries >= effective_max_attempts(&state, job)
             {
                 continue;
             }
@@ -1760,7 +1779,7 @@ impl Runtime {
             .jobs
             .get(&sequence)
             .expect("validated queue job must exist");
-        if job.deliveries < state.config.max_attempts {
+        if job.deliveries < effective_max_attempts(&state, job) {
             return Ok(None);
         }
         let Some(target_queue) = state.config.dead_letter_queue.clone() else {
@@ -1797,6 +1816,7 @@ impl Runtime {
                 job_id: Some(target_job_id),
                 priority: envelope.priority,
                 delay_ms: 0,
+                max_attempts: None,
             },
             source_mutation_bytes,
             result: FabricQueueNackResult {
@@ -1830,12 +1850,13 @@ impl Runtime {
         let mut store = self.fabric_queue_store()?;
         let state = store.load_committed_state(queue)?;
         validate_active_job(&state, sequence, consumer, lease_token, now_ms)?;
-        let deliveries = state
+        let job = state
             .jobs
             .get(&sequence)
-            .expect("validated queue job must exist")
-            .deliveries;
-        let (status, available_at_ms) = if deliveries >= state.config.max_attempts {
+            .expect("validated queue job must exist");
+        let deliveries = job.deliveries;
+        let max_attempts = effective_max_attempts(&state, job);
+        let (status, available_at_ms) = if deliveries >= max_attempts {
             if state.config.dead_letter_queue.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -1960,7 +1981,7 @@ impl Runtime {
             .jobs
             .get(&sequence)
             .expect("expiry candidate must exist");
-        if job.deliveries < state.config.max_attempts {
+        if job.deliveries < effective_max_attempts(&state, job) {
             return Ok(None);
         }
         let Some(target_queue) = state.config.dead_letter_queue.clone() else {
@@ -2005,6 +2026,7 @@ impl Runtime {
                 job_id: Some(target_job_id),
                 priority: envelope.priority,
                 delay_ms: 0,
+                max_attempts: None,
             },
             source_mutation_bytes,
             result: FabricQueueNackResult {
@@ -2072,7 +2094,8 @@ impl Runtime {
         })?;
         let lease_token = job.lease_token;
         let deliveries = job.deliveries;
-        let (status, available_at_ms) = if deliveries >= state.config.max_attempts {
+        let max_attempts = effective_max_attempts(&state, job);
+        let (status, available_at_ms) = if deliveries >= max_attempts {
             (
                 if state.config.dead_letter_queue.is_some() {
                     FabricQueueJobStatus::DeadLettered
@@ -2201,6 +2224,10 @@ fn queue_info_from_state(queue: &str, state: &QueueStateFile) -> FabricQueueInfo
         }
     }
     info
+}
+
+fn effective_max_attempts(state: &QueueStateFile, job: &QueueJobState) -> u32 {
+    job.max_attempts.unwrap_or(state.config.max_attempts)
 }
 
 fn validate_active_job(
