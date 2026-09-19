@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Topology-aware capacity placement groups — 2026-09-19
+- **Co-scheduled bundle placement over concrete resource providers** (Experimental, `crates/nulang-capacity/src/group.rs`). Adds deterministic `PACK`, `SPREAD`, `STRICT_PACK`, and `STRICT_SPREAD` strategies using live heartbeats, durable ledger usage, provisional in-plan reservations, and explicit host/rack/zone/region/provider failure domains. `STRICT_SPREAD` uses deterministic domain matching rather than greedy consumption so feasible placements are not rejected because of bundle ordering.
+
 ### Live capacity heartbeat and allocation ledger — 2026-09-19
 - **Fail-closed liveness gating and reservation accounting** (Experimental, `crates/nulang-capacity/src/state.rs`). Adds topology-bound monotonic provider heartbeats, `ready`/`draining`/`unavailable` scheduling state, heartbeat freshness checks, generation-fenced idempotent resource allocations, expiry/release semantics, aggregate runtime-vs-ledger drift evidence, and an atomic compare-and-swap persistence boundary for hosted control-plane implementations. Heartbeat-observed usage never silently replaces durable reservations.
 
