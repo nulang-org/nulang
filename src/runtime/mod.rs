@@ -38,8 +38,8 @@ pub use distributed_context::{
     DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot, FabricPublishReport,
 };
 pub use fabric_queue_cluster::{
-    FabricQueuePlacement, FabricQueuePolicySyncReport, FabricQueueReplicatedAddResult,
-    FabricQueueReplicatedCreateResult,
+    FabricQueuePlacement, FabricQueuePolicySyncReport, FabricQueueReplicatedAcquireResult,
+    FabricQueueReplicatedAddResult, FabricQueueReplicatedCreateResult,
 };
 pub use fabric_queue::{
     FabricQueueAddOptions, FabricQueueAddResult, FabricQueueConfig, FabricQueueDelivery,
