@@ -2654,6 +2654,351 @@ mod tests {
     }
 
     #[test]
+    fn replicated_consumer_group_enforces_committed_concurrency() {
+        use crate::runtime::cluster_dst::DeterministicCluster;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let addrs = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39201),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39202),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39203),
+        ];
+        let mut cluster = DeterministicCluster::new(&addrs, 0x47524f5550);
+        cluster.run_rounds(30);
+        assert!(cluster.active_views_converged());
+
+        let base = std::env::temp_dir().join(format!(
+            "nulang-fabric-queue-group-rf3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for index in 0..3 {
+            cluster
+                .node_mut(index)
+                .fabric_stream_open(base.join(format!("node-{index}")))
+                .unwrap();
+        }
+
+        let placement = cluster
+            .node_mut(0)
+            .fabric_stream_placement(&queue_placement_key("grouped"), 0, 3)
+            .unwrap();
+        let leader_index = (0..3)
+            .find(|&index| cluster.id(index) == placement.leader)
+            .unwrap();
+        let config = FabricQueueConfig {
+            visibility_timeout_ms: 30_000,
+            max_attempts: 3,
+            dead_letter_queue: None,
+        };
+
+        let first = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("grouped", config.clone(), 0, 3)
+            .unwrap();
+        assert!(!first.policy.ready);
+        cluster.run_rounds(8);
+
+        let pending_create = cluster
+            .node_mut(leader_index)
+            .fabric_queue_create_replicated("grouped", config.clone(), 0, 3)
+            .unwrap();
+        assert_eq!(pending_create.mutation_sequence, Some(1));
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_create_replicated("grouped", config, 0, 3)
+                .unwrap()
+                .created
+        );
+
+        let pending_group = cluster
+            .node_mut(leader_index)
+            .fabric_queue_configure_consumer_group_replicated(
+                "grouped",
+                "renderers",
+                1,
+                0,
+                3,
+            )
+            .unwrap();
+        assert_eq!(pending_group.mutation_sequence, Some(2));
+        assert!(!pending_group.configured);
+
+        let retry_group = cluster
+            .node_mut(leader_index)
+            .fabric_queue_configure_consumer_group_replicated(
+                "grouped",
+                "renderers",
+                1,
+                0,
+                3,
+            )
+            .unwrap();
+        assert_eq!(retry_group.mutation_sequence, Some(2));
+        assert!(retry_group.resumed);
+        assert!(!retry_group.configured);
+
+        cluster.run_rounds(12);
+        let committed_group = cluster
+            .node_mut(leader_index)
+            .fabric_queue_configure_consumer_group_replicated(
+                "grouped",
+                "renderers",
+                1,
+                0,
+                3,
+            )
+            .unwrap();
+        assert!(committed_group.configured);
+        assert!(committed_group.resumed);
+
+        for (job_id, payload) in [("g-job-1", b"one".as_slice()), ("g-job-2", b"two".as_slice())] {
+            let options = FabricQueueAddOptions {
+                job_id: Some(job_id.to_string()),
+                priority: 0,
+                delay_ms: 0,
+            };
+            let pending = cluster
+                .node_mut(leader_index)
+                .fabric_queue_add_replicated(
+                    "grouped",
+                    "render",
+                    payload,
+                    options.clone(),
+                    0,
+                    3,
+                    100,
+                )
+                .unwrap();
+            assert!(!pending.enqueued);
+            cluster.run_rounds(12);
+            let committed = cluster
+                .node_mut(leader_index)
+                .fabric_queue_add_replicated(
+                    "grouped",
+                    "render",
+                    payload,
+                    options,
+                    0,
+                    3,
+                    100,
+                )
+                .unwrap();
+            assert!(committed.enqueued);
+        }
+
+        let first_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_consumer_group_replicated(
+                "grouped",
+                "renderers",
+                "worker-a",
+                "group-acquire-1",
+                0,
+                3,
+                200,
+            )
+            .unwrap();
+        assert_eq!(first_pending.mutation_sequence, Some(3));
+        assert!(first_pending.delivery.is_none());
+
+        cluster.run_rounds(12);
+        let first_committed = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_consumer_group_replicated(
+                "grouped",
+                "renderers",
+                "worker-a",
+                "group-acquire-1",
+                0,
+                3,
+                200,
+            )
+            .unwrap();
+        let first_delivery = first_committed.delivery.expect("group lease must commit");
+        assert_eq!(first_delivery.sequence, 1);
+        assert_eq!(first_delivery.consumer_group.as_deref(), Some("renderers"));
+
+        for index in 0..3 {
+            let group = cluster
+                .node_mut(index)
+                .fabric_queue_consumer_group_info_replicated("grouped", "renderers")
+                .unwrap();
+            assert_eq!(group.max_concurrency, 1);
+            assert_eq!(group.active, 1);
+            assert_eq!(group.available(), 0);
+            assert!(group.saturated());
+        }
+
+        let saturated = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_consumer_group_replicated(
+                "grouped",
+                "renderers",
+                "worker-b",
+                "group-acquire-2",
+                0,
+                3,
+                300,
+            )
+            .unwrap();
+        assert_eq!(saturated.mutation_sequence, None);
+        assert!(saturated.delivery.is_none());
+        assert_eq!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_stream_info(&queue_mutation_stream_name("grouped"))
+                .unwrap()
+                .last_sequence,
+            Some(3)
+        );
+
+        let queue_epoch = first_delivery.queue_epoch;
+        let pending_ack = cluster
+            .node_mut(leader_index)
+            .fabric_queue_ack_replicated(
+                "grouped",
+                1,
+                "worker-a",
+                queue_epoch,
+                first_delivery.lease_token,
+                "group-ack-1",
+                0,
+                3,
+                400,
+            )
+            .unwrap();
+        assert_eq!(pending_ack.mutation_sequence, Some(4));
+        assert!(!pending_ack.completed);
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_ack_replicated(
+                    "grouped",
+                    1,
+                    "worker-a",
+                    queue_epoch,
+                    first_delivery.lease_token,
+                    "group-ack-1",
+                    0,
+                    3,
+                    400,
+                )
+                .unwrap()
+                .completed
+        );
+
+        let available = cluster
+            .node_mut(leader_index)
+            .fabric_queue_consumer_group_info_replicated("grouped", "renderers")
+            .unwrap();
+        assert_eq!(available.active, 0);
+        assert_eq!(available.available(), 1);
+        assert!(!available.saturated());
+
+        let second_pending = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_consumer_group_replicated(
+                "grouped",
+                "renderers",
+                "worker-b",
+                "group-acquire-2",
+                0,
+                3,
+                500,
+            )
+            .unwrap();
+        assert_eq!(second_pending.mutation_sequence, Some(5));
+        cluster.run_rounds(12);
+        let second = cluster
+            .node_mut(leader_index)
+            .fabric_queue_acquire_consumer_group_replicated(
+                "grouped",
+                "renderers",
+                "worker-b",
+                "group-acquire-2",
+                0,
+                3,
+                500,
+            )
+            .unwrap()
+            .delivery
+            .expect("second group lease must commit");
+        assert_eq!(second.sequence, 2);
+        assert_eq!(second.consumer_group.as_deref(), Some("renderers"));
+
+        let pending_ack2 = cluster
+            .node_mut(leader_index)
+            .fabric_queue_ack_replicated(
+                "grouped",
+                2,
+                "worker-b",
+                second.queue_epoch,
+                second.lease_token,
+                "group-ack-2",
+                0,
+                3,
+                600,
+            )
+            .unwrap();
+        assert_eq!(pending_ack2.mutation_sequence, Some(6));
+        cluster.run_rounds(12);
+        assert!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_queue_ack_replicated(
+                    "grouped",
+                    2,
+                    "worker-b",
+                    second.queue_epoch,
+                    second.lease_token,
+                    "group-ack-2",
+                    0,
+                    3,
+                    600,
+                )
+                .unwrap()
+                .completed
+        );
+
+        for index in 0..3 {
+            let group = cluster
+                .node_mut(index)
+                .fabric_queue_consumer_group_info_replicated("grouped", "renderers")
+                .unwrap();
+            assert_eq!(group.active, 0);
+            assert_eq!(group.available(), 1);
+            let info = cluster
+                .node_mut(index)
+                .fabric_queue_info_replicated("grouped")
+                .unwrap();
+            assert_eq!(info.total, 2);
+            assert_eq!(info.completed, 2);
+            assert_eq!(info.active, 0);
+        }
+
+        let conflict = cluster
+            .node_mut(leader_index)
+            .fabric_queue_configure_consumer_group_replicated(
+                "grouped",
+                "renderers",
+                2,
+                0,
+                3,
+            )
+            .unwrap_err();
+        assert_eq!(conflict.kind(), io::ErrorKind::AlreadyExists);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn installed_policy_request_must_match_partition_and_replication_factor() {
         let policy = sample_policy();
         assert!(validate_requested_policy(&policy, 0, 3).is_ok());
