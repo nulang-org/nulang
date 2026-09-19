@@ -24,6 +24,14 @@ pub enum RespCommandSlot {
     CrossSlot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RespCommandKeyPresence {
+    NoKeys,
+    AllPresent,
+    AllMissing,
+    Mixed,
+}
+
 /// Parse and execute exactly one RESP command frame.
 ///
 /// Returns the number of bytes consumed from `input`. A pipelined caller can
@@ -127,6 +135,91 @@ fn route_key_value_args(mut args: RespArgs<'_>) -> RespCommandSlot {
     }
 
     RespCommandSlot::Slot(slot)
+}
+
+/// Classify whether a routed command's keys are still resident on this shard.
+///
+/// Redis migration uses this distinction on the source owner: commands whose
+/// keys are all present execute locally, commands whose keys are all absent
+/// receive ASK, and a mixed multi-key command receives TRYAGAIN.
+pub fn command_key_presence(
+    store: &mut CacheStore,
+    command: RespCommand<'_>,
+    now_ms: u64,
+) -> RespCommandKeyPresence {
+    let name = command.name();
+
+    if name.eq_ignore_ascii_case(b"GET")
+        || name.eq_ignore_ascii_case(b"SET")
+        || name.eq_ignore_ascii_case(b"INCR")
+        || name.eq_ignore_ascii_case(b"EXPIRE")
+        || name.eq_ignore_ascii_case(b"TTL")
+    {
+        let Some(key) = command.args().next() else {
+            return RespCommandKeyPresence::NoKeys;
+        };
+        return if store.exists(key, now_ms) {
+            RespCommandKeyPresence::AllPresent
+        } else {
+            RespCommandKeyPresence::AllMissing
+        };
+    }
+
+    if name.eq_ignore_ascii_case(b"DEL")
+        || name.eq_ignore_ascii_case(b"EXISTS")
+        || name.eq_ignore_ascii_case(b"MGET")
+    {
+        return presence_for_keys(store, command.args(), now_ms);
+    }
+
+    if name.eq_ignore_ascii_case(b"MSET") {
+        let mut args = command.args();
+        let mut saw_present = false;
+        let mut saw_missing = false;
+        while let Some(key) = args.next() {
+            let _value = args.next();
+            if store.exists(key, now_ms) {
+                saw_present = true;
+            } else {
+                saw_missing = true;
+            }
+            if saw_present && saw_missing {
+                return RespCommandKeyPresence::Mixed;
+            }
+        }
+        return presence_from_flags(saw_present, saw_missing);
+    }
+
+    RespCommandKeyPresence::NoKeys
+}
+
+fn presence_for_keys(
+    store: &mut CacheStore,
+    keys: RespArgs<'_>,
+    now_ms: u64,
+) -> RespCommandKeyPresence {
+    let mut saw_present = false;
+    let mut saw_missing = false;
+    for key in keys {
+        if store.exists(key, now_ms) {
+            saw_present = true;
+        } else {
+            saw_missing = true;
+        }
+        if saw_present && saw_missing {
+            return RespCommandKeyPresence::Mixed;
+        }
+    }
+    presence_from_flags(saw_present, saw_missing)
+}
+
+fn presence_from_flags(saw_present: bool, saw_missing: bool) -> RespCommandKeyPresence {
+    match (saw_present, saw_missing) {
+        (false, false) => RespCommandKeyPresence::NoKeys,
+        (true, false) => RespCommandKeyPresence::AllPresent,
+        (false, true) => RespCommandKeyPresence::AllMissing,
+        (true, true) => RespCommandKeyPresence::Mixed,
+    }
 }
 
 /// Execute a validated RESP command against one shard-local cache store.
