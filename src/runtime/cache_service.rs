@@ -103,9 +103,11 @@ impl CacheService {
             let port = if base_port == 0 {
                 0
             } else {
-                base_port.checked_add(shard).ok_or(
-                    CacheServiceError::InvalidConfig("base_port + shard exceeds u16"),
-                )?
+                base_port
+                    .checked_add(shard)
+                    .ok_or(CacheServiceError::InvalidConfig(
+                        "base_port + shard exceeds u16",
+                    ))?
             };
             let listener = StdTcpListener::bind(SocketAddr::new(bind_ip, port))?;
             listener.set_nonblocking(true)?;
@@ -125,18 +127,11 @@ impl CacheService {
         }
 
         let mut servers = Vec::with_capacity(shard_count as usize);
-        for (shard, (listener, inbox)) in listeners
-            .into_iter()
-            .zip(inboxes.into_iter())
-            .enumerate()
+        for (shard, (listener, inbox)) in listeners.into_iter().zip(inboxes.into_iter()).enumerate()
         {
-            let dispatcher = CacheDispatcher::new(
-                node_id,
-                shard as u16,
-                placement.clone(),
-                channels.clone(),
-            )?
-            .with_cluster_redirects(endpoints.clone());
+            let dispatcher =
+                CacheDispatcher::new(node_id, shard as u16, placement.clone(), channels.clone())?
+                    .with_cluster_redirects(endpoints.clone());
 
             servers.push(CacheShardServer::from_std_listener(
                 listener,
@@ -306,8 +301,8 @@ impl Drop for CacheServiceHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::cache::redis_slot;
+    use super::*;
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpStream};
     use std::time::Duration;
@@ -355,10 +350,7 @@ mod tests {
         assert_eq!(service.placement().slot_ranges().len(), 2);
 
         for shard in 0..2u16 {
-            let owner = CacheShardOwner {
-                node_id: 42,
-                shard,
-            };
+            let owner = CacheShardOwner { node_id: 42, shard };
             let endpoint = service.endpoints().get(owner).unwrap();
             assert_eq!(endpoint.host(), b"127.0.0.1");
             assert_eq!(endpoint.port(), service.addresses()[shard as usize].port());
@@ -380,10 +372,7 @@ mod tests {
             .unwrap();
         wrong.write_all(&frame(&[b"GET", &key])).unwrap();
 
-        let expected_redirect = format!(
-            "-MOVED {} 127.0.0.1:{}\r\n",
-            slot, addresses[1].port()
-        );
+        let expected_redirect = format!("-MOVED {} 127.0.0.1:{}\r\n", slot, addresses[1].port());
         let mut redirect = vec![0u8; expected_redirect.len()];
         wrong.read_exact(&mut redirect).unwrap();
         assert_eq!(redirect, expected_redirect.as_bytes());
