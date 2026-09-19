@@ -47,6 +47,7 @@ const CACHE_NETWORK_MAX_BATCH: usize = 64;
 const CACHE_NETWORK_IDLE_SLEEP: Duration = Duration::from_millis(1);
 const CACHE_NETWORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 const CACHE_NETWORK_DEDUPE_ENTRIES: usize = 4_096;
+const CACHE_NETWORK_DEDUPE_RETENTION: Duration = Duration::from_secs(120);
 const CACHE_NETWORK_DEDUPE_RETENTION: Duration = Duration::from_secs(5);
 const CACHE_NETWORK_PENDING_ENTRIES: usize = 4_096;
 const CACHE_NETWORK_RETRY_INITIAL: Duration = Duration::from_millis(10);
@@ -1252,6 +1253,7 @@ enum CacheNetworkDedupeKey {
 struct CacheNetworkDedupeRecord {
     fingerprint: [u8; 32],
     reply: CacheTransportMessage,
+    expires_at: Instant,
 }
 
 #[derive(Debug)]
@@ -1270,11 +1272,30 @@ impl CacheNetworkDedupe {
         }
     }
 
+    fn prune_expired(&mut self, now: Instant) {
+        loop {
+            let Some(key) = self.order.front().copied() else {
+                break;
+            };
+            let expired = self
+                .records
+                .get(&key)
+                .is_none_or(|record| record.expires_at <= now);
+            if !expired {
+                break;
+            }
+            self.order.pop_front();
+            self.records.remove(&key);
+        }
+    }
+
     fn lookup(
-        &self,
+        &mut self,
         key: CacheNetworkDedupeKey,
         fingerprint: [u8; 32],
+        now: Instant,
     ) -> Result<Option<CacheTransportMessage>, ()> {
+        self.prune_expired(now);
         match self.records.get(&key) {
             Some(record) if record.fingerprint == fingerprint => Ok(Some(record.reply.clone())),
             Some(_) => Err(()),
@@ -1282,27 +1303,32 @@ impl CacheNetworkDedupe {
         }
     }
 
+    fn can_admit(&mut self, now: Instant) -> bool {
+        self.prune_expired(now);
+        self.records.len() < self.capacity
+    }
+
     fn insert(
         &mut self,
         key: CacheNetworkDedupeKey,
         fingerprint: [u8; 32],
         reply: CacheTransportMessage,
+        now: Instant,
     ) {
         if self.records.contains_key(&key) {
             return;
         }
-        while self.records.len() >= self.capacity {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.records.remove(&oldest);
-        }
+        debug_assert!(
+            self.records.len() < self.capacity,
+            "cache retry record inserted without admission"
+        );
         self.order.push_back(key);
         self.records.insert(
             key,
             CacheNetworkDedupeRecord {
                 fingerprint,
                 reply,
+                expires_at: now + CACHE_NETWORK_DEDUPE_RETENTION,
             },
         );
     }
@@ -1369,7 +1395,8 @@ fn run_cache_network_coordinator(
             let fingerprint = cache_message_fingerprint(&inbound.message);
 
             if let Some(key) = dedupe_key {
-                match dedupe.lookup(key, fingerprint) {
+                let dedupe_now = Instant::now();
+                match dedupe.lookup(key, fingerprint, dedupe_now) {
                     Ok(Some(reply)) => {
                         send_cache_transport_outbound(
                             &sender,
@@ -1388,7 +1415,16 @@ fn run_cache_network_coordinator(
                         reject_cache_network_id_reuse(local_node_id, &sender, inbound);
                         continue;
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if !dedupe.can_admit(dedupe_now) {
+                            tracing::warn!(
+                                "nulang-cache: retry dedupe window saturated; rejecting new cache operation from {:?}",
+                                inbound.from_node
+                            );
+                            reject_cache_network_saturated(local_node_id, &sender, inbound);
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -1401,7 +1437,7 @@ fn run_cache_network_coordinator(
                 let reply =
                     reject_cache_network_inbound(local_node_id, &sender, inbound.clone(), error);
                 if let (Some(key), Some(reply)) = (dedupe_key, reply) {
-                    dedupe.insert(key, fingerprint, reply);
+                    dedupe.insert(key, fingerprint, reply, Instant::now());
                 }
                 continue;
             }
@@ -1414,7 +1450,7 @@ fn run_cache_network_coordinator(
                 inbound.clone(),
             ) {
                 if let Some(key) = dedupe_key {
-                    dedupe.insert(key, fingerprint, reply);
+                    dedupe.insert(key, fingerprint, reply, Instant::now());
                 }
             }
         }
@@ -1586,6 +1622,59 @@ fn reject_cache_network_id_reuse(
                         slot,
                         responder: target,
                         response: b"-ERR cache request id reused with different payload\r\n".to_vec(),
+                    },
+                },
+            );
+        }
+        CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch,
+            source,
+            target,
+            batch,
+        } if target.node_id == local_node_id => {
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: CacheTransportMessage::TransferAck {
+                        transfer_id,
+                        placement_epoch,
+                        source,
+                        target,
+                        slot: batch.slot,
+                        results: vec![CacheTransferImport::Conflict; batch.entries.len()],
+                    },
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
+fn reject_cache_network_saturated(
+    local_node_id: u64,
+    sender: &CacheServiceTransportSender,
+    inbound: CacheTransportInbound,
+) {
+    match inbound.message {
+        CacheTransportMessage::CommandRequest {
+            request_id,
+            placement_epoch,
+            slot,
+            target,
+            ..
+        } if target.node_id == local_node_id => {
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: CacheTransportMessage::CommandResponse {
+                        request_id,
+                        placement_epoch,
+                        slot,
+                        responder: target,
+                        response: b"-TRYAGAIN cache retry window saturated\r\n".to_vec(),
                     },
                 },
             );
