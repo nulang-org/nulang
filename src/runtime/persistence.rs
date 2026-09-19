@@ -1133,6 +1133,24 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_effects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor_id INTEGER NOT NULL,
+                    effect_id TEXT NOT NULL,
+                    record TEXT NOT NULL
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS durable_effects_actor_idx
+                 ON durable_effects(actor_id, id)",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
@@ -1455,6 +1473,62 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn append_durable_effect_record(
+        &mut self,
+        actor_id: u64,
+        record: DurableEffectPersistenceRecord,
+    ) -> io::Result<()> {
+        let effect_id = record.effect_id().to_string();
+        let record_json = String::from_utf8(
+            record
+                .to_json()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            conn.execute(
+                "INSERT INTO durable_effects (actor_id, effect_id, record)
+                 VALUES (?1, ?2, ?3)",
+                libsql::params![actor_id as i64, effect_id, record_json],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })
+    }
+
+    fn read_durable_effect_records(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Vec<DurableEffectPersistenceRecord>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT record FROM durable_effects
+                     WHERE actor_id = ?1 ORDER BY id ASC",
+                    libsql::params![actor_id as i64],
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let mut records = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            {
+                let record_json: String = row
+                    .get(0)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                let record = DurableEffectPersistenceRecord::from_json(record_json.as_bytes())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                records.push(record);
+            }
+            Ok(records)
+        })
+    }
+
     fn latest_sequence(&self, actor_id: u64) -> u64 {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -1523,6 +1597,13 @@ impl PersistenceStore for LibsqlStore {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
                 "DELETE FROM events WHERE actor_id = ?1",
+                libsql::params![actor_id as i64],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "DELETE FROM durable_effects WHERE actor_id = ?1",
                 libsql::params![actor_id as i64],
             )
             .await
