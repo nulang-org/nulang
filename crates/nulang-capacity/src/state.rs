@@ -113,8 +113,7 @@ impl CapacityHeartbeatBook {
             }
         }
 
-        self.latest
-            .insert(heartbeat.provider_id.clone(), heartbeat);
+        self.latest.insert(heartbeat.provider_id.clone(), heartbeat);
         Ok(())
     }
 
@@ -266,17 +265,13 @@ pub enum AllocationError {
         provider: String,
         resource: ResourceClass,
     },
-    #[error(
-        "allocation amount {requested} for {resource} is not valid for provider {provider}"
-    )]
+    #[error("allocation amount {requested} for {resource} is not valid for provider {provider}")]
     InvalidAllocationUnit {
         provider: String,
         resource: ResourceClass,
         requested: u64,
     },
-    #[error(
-        "provider {provider} lacks {resource}: requested {requested}, available {available}"
-    )]
+    #[error("provider {provider} lacks {resource}: requested {requested}, available {available}")]
     InsufficientCapacity {
         provider: String,
         resource: ResourceClass,
@@ -310,7 +305,8 @@ impl AllocationLedgerSnapshot {
 
     fn advance_provider_generation(&mut self, provider_id: &str) -> u64 {
         let next = self.provider_generation(provider_id).saturating_add(1);
-        self.provider_generations.insert(provider_id.to_string(), next);
+        self.provider_generations
+            .insert(provider_id.to_string(), next);
         next
     }
 
@@ -338,17 +334,14 @@ impl AllocationLedgerSnapshot {
         for allocation in self.allocations.values() {
             let provider_usage = usage.entry(allocation.provider_id.clone()).or_default();
             for (resource, amount) in &allocation.resources {
-                let current = provider_usage
-                    .allocated
-                    .get(resource)
-                    .copied()
-                    .unwrap_or(0);
-                let next = current
-                    .checked_add(*amount)
-                    .ok_or_else(|| AllocationError::UsageOverflow {
-                        provider: allocation.provider_id.clone(),
-                        resource: resource.clone(),
-                    })?;
+                let current = provider_usage.allocated.get(resource).copied().unwrap_or(0);
+                let next =
+                    current
+                        .checked_add(*amount)
+                        .ok_or_else(|| AllocationError::UsageOverflow {
+                            provider: allocation.provider_id.clone(),
+                            resource: resource.clone(),
+                        })?;
                 provider_usage.allocated.insert(resource.clone(), next);
             }
         }
@@ -413,7 +406,9 @@ impl AllocationLedgerSnapshot {
 
         let provider = topology
             .provider(&request.allocation.provider_id)
-            .ok_or_else(|| AllocationError::UnknownProvider(request.allocation.provider_id.clone()))?;
+            .ok_or_else(|| {
+                AllocationError::UnknownProvider(request.allocation.provider_id.clone())
+            })?;
         if provider.disabled {
             return Err(AllocationError::ProviderDisabled(provider.id.clone()));
         }
@@ -616,9 +611,8 @@ pub enum LedgerCasResult {
     GenerationChanged,
 }
 
-pub type LedgerLoadFuture<'a> = Pin<
-    Box<dyn Future<Output = Result<ProviderAllocationLedgerSnapshot, String>> + Send + 'a>,
->;
+pub type LedgerLoadFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProviderAllocationLedgerSnapshot, String>> + Send + 'a>>;
 pub type LedgerCasFuture<'a> =
     Pin<Box<dyn Future<Output = Result<LedgerCasResult, String>> + Send + 'a>>;
 
@@ -676,7 +670,11 @@ mod tests {
         }
     }
 
-    fn heartbeat(sequence: u64, status: CapacityProviderStatus, observed: u64) -> CapacityHeartbeat {
+    fn heartbeat(
+        sequence: u64,
+        status: CapacityProviderStatus,
+        observed: u64,
+    ) -> CapacityHeartbeat {
         CapacityHeartbeat {
             provider_id: "host-a".into(),
             topology_generation: 9,
@@ -703,17 +701,11 @@ mod tests {
     fn heartbeat_is_topology_bound_and_monotonic() {
         let topology = topology();
         let mut book = CapacityHeartbeatBook::default();
-        book.apply(
-            &topology,
-            heartbeat(7, CapacityProviderStatus::Ready, 0),
-        )
-        .unwrap();
+        book.apply(&topology, heartbeat(7, CapacityProviderStatus::Ready, 0))
+            .unwrap();
 
         assert!(matches!(
-            book.apply(
-                &topology,
-                heartbeat(7, CapacityProviderStatus::Ready, 0)
-            ),
+            book.apply(&topology, heartbeat(7, CapacityProviderStatus::Ready, 0)),
             Err(HeartbeatError::StaleSequence { .. })
         ));
 
@@ -732,11 +724,8 @@ mod tests {
     fn heartbeat_sequence_can_restart_after_topology_generation_changes() {
         let mut topology = topology();
         let mut book = CapacityHeartbeatBook::default();
-        book.apply(
-            &topology,
-            heartbeat(99, CapacityProviderStatus::Ready, 0),
-        )
-        .unwrap();
+        book.apply(&topology, heartbeat(99, CapacityProviderStatus::Ready, 0))
+            .unwrap();
 
         topology.generation = 10;
         let mut next_generation = heartbeat(1, CapacityProviderStatus::Ready, 0);
@@ -757,22 +746,16 @@ mod tests {
         };
         let mut book = CapacityHeartbeatBook::default();
 
-        book.apply(
-            &topology,
-            heartbeat(1, CapacityProviderStatus::Draining, 0),
-        )
-        .unwrap();
+        book.apply(&topology, heartbeat(1, CapacityProviderStatus::Draining, 0))
+            .unwrap();
         assert!(
             live_allocation_candidates(&topology, &ledger, &book, &request, 1_000, 50)
                 .unwrap()
                 .is_empty()
         );
 
-        book.apply(
-            &topology,
-            heartbeat(2, CapacityProviderStatus::Ready, 0),
-        )
-        .unwrap();
+        book.apply(&topology, heartbeat(2, CapacityProviderStatus::Ready, 0))
+            .unwrap();
         assert_eq!(
             live_allocation_candidates(&topology, &ledger, &book, &request, 1_049, 50)
                 .unwrap()
@@ -989,9 +972,7 @@ mod tests {
                 },
             )
             .unwrap();
-        ledger
-            .release("host-a", "alloc-1", 2)
-            .unwrap();
+        ledger.release("host-a", "alloc-1", 2).unwrap();
 
         assert_eq!(
             ledger.commit(
