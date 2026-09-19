@@ -12,6 +12,7 @@ use tracing::warn;
 
 mod actor;
 mod behavior_ownership;
+mod schema_identity;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
@@ -3100,8 +3101,10 @@ impl Runtime {
     fn actor_module_hash(&self, actor_id: u64) -> [u8; 32] {
         self.actors
             .get(&actor_id)
-            .and_then(|a| a.bytecode_module.as_ref())
-            .and_then(|m| m.actor_metadata.iter().find_map(|m| m.type_hash))
+            .and_then(|actor| {
+                let module = actor.bytecode_module.as_ref()?;
+                behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)?.type_hash
+            })
             .unwrap_or([0u8; 32])
     }
 
@@ -3169,6 +3172,11 @@ impl Runtime {
                 .map(|((_, name), id)| (name.clone(), id.0))
                 .collect()
         });
+        let schema_name = self.actors.get(&actor_id).and_then(|actor| {
+            let module = actor.bytecode_module.as_ref()?;
+            schema_identity::canonical_schema_name_for_runtime_actor(module, &actor.name)
+                .map(str::to_owned)
+        });
         Some(ActorSnapshot {
             actor_id,
             sequence,
@@ -3176,6 +3184,7 @@ impl Runtime {
             waiting_signal,
             crdt_snapshot,
             crdt_field_map,
+            schema_name,
             authority_tokens,
         })
     }
@@ -4960,18 +4969,42 @@ impl Runtime {
                 }
             };
         let workflow_events = self.persistence.read_workflow_events(actor_id);
-        let is_workflow = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_workflow))
+        let recovery_schema_name = if let Some((module, _, _)) =
+            self.recovery_modules.get(&actor_id)
+        {
+            match schema_identity::resolve_snapshot_actor_meta(
+                module,
+                snapshot.schema_name.as_deref(),
+            ) {
+                Ok(meta) => Some(meta.name.clone()),
+                Err(err) => {
+                    warn!(
+                        "nulang-recover: refusing actor {} with invalid schema identity: {}",
+                        actor_id, err
+                    );
+                    return None;
+                }
+            }
+        } else {
+            snapshot.schema_name.clone()
+        };
+        let selected_meta = self.recovery_modules.get(&actor_id).and_then(|(module, _, _)| {
+            recovery_schema_name
+                .as_deref()
+                .and_then(|name| behavior_ownership::actor_meta_for_schema(module, name))
+        });
+        let is_workflow = selected_meta
+            .map(|meta| meta.is_workflow)
             .unwrap_or(!workflow_events.is_empty());
-        let is_agent = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_agent))
-            .unwrap_or(false);
+        let is_agent = selected_meta.map(|meta| meta.is_agent).unwrap_or(false);
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        let mut actor = Actor::new(
+            actor_id,
+            recovery_schema_name
+                .clone()
+                .unwrap_or_else(|| format!("actor_{}", actor_id)),
+            0,
+        );
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
@@ -5023,7 +5056,11 @@ impl Runtime {
                 .as_ref()
                 .or_else(|| self.recovery_modules.get(&actor_id).map(|(m, _, _)| m))
             {
-                for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+                for (name, c) in recovery_schema_name
+                    .as_deref()
+                    .and_then(|name| behavior_ownership::actor_meta_for_schema(module, name))
+                    .into_iter()
+                    .flat_map(|meta| &meta.state_defaults) {
                     if let crate::bytecode::Constant::String(json) = c {
                         if name == "retry_config" {
                             actor.retry_config = serde_json::from_str(&json).ok();
@@ -5072,7 +5109,11 @@ impl Runtime {
         // that's a separate, pre-existing question this fix doesn't
         // change.
         if let Some(module) = self.recovery_modules.get(&actor_id).map(|(m, _, _)| m) {
-            for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+            for (name, c) in recovery_schema_name
+                    .as_deref()
+                    .and_then(|name| behavior_ownership::actor_meta_for_schema(module, name))
+                    .into_iter()
+                    .flat_map(|meta| &meta.state_defaults) {
                 if actor.get_state_field(name).is_some() {
                     continue;
                 }
@@ -5099,10 +5140,11 @@ impl Runtime {
             // would drop Durable fields from the snapshot entirely, and
             // EventSourced fields would stop accumulating via emitted
             // events.
-            actor.state_models = module
-                .actor_metadata
-                .iter()
-                .flat_map(|m| &m.state_models)
+            actor.state_models = recovery_schema_name
+                .as_deref()
+                .and_then(|name| behavior_ownership::actor_meta_for_schema(module, name))
+                .into_iter()
+                .flat_map(|meta| &meta.state_models)
                 .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
                 .collect();
         }
@@ -5236,30 +5278,39 @@ impl Runtime {
         actor_id: u64,
         module: &crate::bytecode::CodeModule,
         snapshot: &ActorSnapshot,
-        is_workflow: bool,
-        is_agent: bool,
-    ) -> Result<Actor, crate::authority_runtime::RuntimeAuthorityError> {
+        expected_schema_name: Option<&str>,
+        runtime_name: Option<String>,
+    ) -> Result<Actor, String> {
+        let meta = match expected_schema_name {
+            Some(expected) => schema_identity::resolve_expected_snapshot_actor_meta(
+                module,
+                snapshot.schema_name.as_deref(),
+                expected,
+            ),
+            None => schema_identity::resolve_snapshot_actor_meta(
+                module,
+                snapshot.schema_name.as_deref(),
+            ),
+        }
+        .map_err(|err| err.to_string())?;
         let authority_manifest =
-            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)?;
-        let offsets: Vec<usize> = crate::runtime::spawn::bytecode_offsets_for(module, is_workflow);
-        let compensation_offsets: Vec<Option<usize>> = if is_workflow {
-            module
-                .actor_metadata
+            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)
+                .map_err(|err| err.to_string())?;
+        let is_workflow = meta.is_workflow;
+        let is_agent = meta.is_agent;
+        let offsets: Vec<usize> = if is_workflow {
+            meta.behavior_indices
                 .iter()
-                .find(|m| m.is_workflow)
-                .map(|meta| {
-                    meta.behavior_indices
-                        .iter()
-                        .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
-                        .collect()
-                })
-                .unwrap_or_else(|| {
-                    module
-                        .behaviors
-                        .iter()
-                        .map(|b| b.compensate_offset.map(|o| o as usize))
-                        .collect()
-                })
+                .map(|&i| module.behaviors[i].code_offset)
+                .collect()
+        } else {
+            module.behaviors.iter().map(|behavior| behavior.code_offset).collect()
+        };
+        let compensation_offsets: Vec<Option<usize>> = if is_workflow {
+            meta.behavior_indices
+                .iter()
+                .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
+                .collect()
         } else {
             module
                 .behaviors
@@ -5268,7 +5319,11 @@ impl Runtime {
                 .collect()
         };
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        let mut actor = Actor::new(
+            actor_id,
+            runtime_name.unwrap_or_else(|| meta.name.clone()),
+            0,
+        );
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
@@ -5279,15 +5334,12 @@ impl Runtime {
         actor.bytecode_offsets = offsets;
         actor.compensation_offsets = compensation_offsets;
 
-        // Restore per-field state-model tracking.
-        actor.state_models = module
-            .actor_metadata
+        actor.state_models = meta
+            .state_models
             .iter()
-            .flat_map(|m| &m.state_models)
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
 
-        // Restore durable state fields from the snapshot.
         for (name, value) in &snapshot.state {
             if name == "semantic_memory" || name == "procedural_memory" {
                 if let PersistedValue::String(json) = value {
@@ -5300,8 +5352,7 @@ impl Runtime {
             actor.set_state_field(name, v);
         }
 
-        // Fill in declared initial values for fields not touched above.
-        for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+        for (name, c) in &meta.state_defaults {
             if actor.get_state_field(name).is_some() {
                 continue;
             }
@@ -5310,6 +5361,18 @@ impl Runtime {
                 other => crate::vm::constant_to_value(other),
             };
             actor.set_state_field(name, v);
+        }
+
+        if is_agent {
+            for (name, c) in &meta.state_defaults {
+                if let crate::bytecode::Constant::String(json) = c {
+                    if name == "retry_config" {
+                        actor.retry_config = serde_json::from_str(json).ok();
+                    } else if name == "fallback_config" {
+                        actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
+                    }
+                }
+            }
         }
 
         Ok(actor)
@@ -5351,12 +5414,12 @@ impl Runtime {
                 stable_actor_id,
                 &grain_type.module,
                 snap,
-                false,
-                false,
+                Some(&grain_id.grain_type),
+                Some(grain_id.actor_name()),
             )
             .map_err(|err| NuError::RuntimeError {
                 msg: format!(
-                    "invalid authority snapshot for virtual actor {}: {}",
+                    "invalid durable snapshot for virtual actor {}: {}",
                     grain_id.actor_name(),
                     err
                 ),
@@ -5368,18 +5431,18 @@ impl Runtime {
             actor.bytecode_module = Some(grain_type.module.clone());
             actor.bytecode_offsets = grain_type.bytecode_offsets.clone();
             actor.compensation_offsets = grain_type.compensation_offsets.clone();
-            actor.state_models = grain_type
-                .default_models
+            let grain_meta = behavior_ownership::actor_meta_for_schema(
+                &grain_type.module,
+                &grain_id.grain_type,
+            )
+            .expect("registered grain type must retain its ActorMeta");
+            actor.state_models = grain_meta
+                .state_models
                 .iter()
-                .map(|(name, model)| (name.clone(), *model))
+                .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
                 .collect();
             // Fill declared initial values.
-            for (name, c) in grain_type
-                .module
-                .actor_metadata
-                .iter()
-                .flat_map(|m| &m.state_defaults)
-            {
+            for (name, c) in &grain_meta.state_defaults {
                 let v = match c {
                     crate::bytecode::Constant::String(s) => actor.allocate_string(&s),
                     other => crate::vm::constant_to_value(&other),
@@ -5467,20 +5530,32 @@ impl Runtime {
             }
         };
 
-        let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
-        let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
+        let schema_meta = match schema_identity::resolve_snapshot_actor_meta(
+            &module,
+            snapshot.schema_name.as_deref(),
+        ) {
+            Ok(meta) => meta,
+            Err(err) => {
+                warn!(
+                    "nulang-migrate: invalid schema identity for actor {}: {}",
+                    actor_id, err
+                );
+                return false;
+            }
+        };
+        let is_workflow = schema_meta.is_workflow;
 
         let actor = match Self::restore_actor_from_snapshot(
             actor_id,
             &module,
             &snapshot,
-            is_workflow,
-            is_agent,
+            None,
+            None,
         ) {
             Ok(actor) => actor,
             Err(err) => {
                 warn!(
-                    "nulang-migrate: invalid authority manifest for actor {}: {}",
+                    "nulang-migrate: invalid durable snapshot for actor {}: {}",
                     actor_id, err
                 );
                 return false;
@@ -5496,23 +5571,19 @@ impl Runtime {
         // Filter compensation_offsets to this actor's own behaviors using
         // behavior_indices from the first workflow ActorMeta (a migrated
         // actor module carries its own metadata).
-        let compensation_offsets: Vec<Option<usize>> = module
-            .actor_metadata
-            .iter()
-            .find(|m| m.is_workflow)
-            .map(|meta| {
-                meta.behavior_indices
-                    .iter()
-                    .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                module
-                    .behaviors
-                    .iter()
-                    .map(|b| b.compensate_offset.map(|o| o as usize))
-                    .collect()
-            });
+        let compensation_offsets: Vec<Option<usize>> = if is_workflow {
+            schema_meta
+                .behavior_indices
+                .iter()
+                .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
+                .collect()
+        } else {
+            module
+                .behaviors
+                .iter()
+                .map(|b| b.compensate_offset.map(|o| o as usize))
+                .collect()
+        };
         self.recovery_modules
             .insert(actor_id, (module, offsets, compensation_offsets));
 
