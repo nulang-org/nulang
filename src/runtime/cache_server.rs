@@ -592,6 +592,7 @@ impl CacheService {
             }
         }
 
+        let has_transport = transport_sender.is_some();
         let network_thread = if let Some(endpoint) = self.transport_endpoint {
             let coordinator_controls = controls.clone();
             let placement_publisher = self.placement_publisher.clone();
@@ -627,13 +628,14 @@ impl CacheService {
         };
 
         Ok(CacheServiceHandle {
+            local_node_id: self.local_node_id,
             controls,
             threads,
             local_addrs: self.local_addrs,
             endpoints: self.endpoints,
             placement_publisher: self.placement_publisher,
             transport_sender,
-            network_events: transport_sender.as_ref().map(|_| network_event_rx),
+            network_events: has_transport.then_some(network_event_rx),
             network_thread,
             network_shutdown,
         })
@@ -641,6 +643,7 @@ impl CacheService {
 }
 
 pub struct CacheServiceHandle {
+    local_node_id: u64,
     controls: Vec<CacheShardServerControl>,
     threads: Vec<(u16, JoinHandle<Result<(), CacheServerError>>)>,
     local_addrs: Vec<SocketAddr>,
@@ -670,6 +673,41 @@ impl CacheServiceHandle {
             .iter()
             .map(CacheShardServerControl::placement_epoch)
             .collect()
+    }
+
+    pub fn send_network_message(
+        &self,
+        to_node: NodeId,
+        message: CacheTransportMessage,
+    ) -> Result<(), CacheServiceError> {
+        let sender = self
+            .transport_sender
+            .as_ref()
+            .ok_or(CacheServiceError::TransportUnavailable)?;
+        message
+            .validate_sender(NodeId(self.local_node_id))
+            .map_err(|_| CacheServiceError::TransportUnavailable)?;
+        sender
+            .try_send(CacheTransportOutbound { to_node, message })
+            .map_err(CacheServiceError::from)
+    }
+
+    /// Receive an application-level remote command response or transfer ACK.
+    ///
+    /// Transport-level NUL0 ACKs are consumed by Runtime and never appear
+    /// here.
+    pub fn try_recv_network_event(
+        &self,
+    ) -> Result<Option<CacheTransportInbound>, CacheServiceError> {
+        let receiver = self
+            .network_events
+            .as_ref()
+            .ok_or(CacheServiceError::TransportUnavailable)?;
+        match receiver.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(CacheServiceError::NetworkEventDisconnected),
+        }
     }
 
     /// Publish a newer immutable placement snapshot to every local reactor.
@@ -885,6 +923,282 @@ impl Drop for CacheServiceHandle {
     fn drop(&mut self) {
         self.request_shutdown();
         let _ = self.join_threads();
+    }
+}
+
+fn run_cache_network_coordinator(
+    local_node_id: u64,
+    endpoint: CacheServiceTransportEndpoint,
+    controls: Vec<CacheShardServerControl>,
+    placement_publisher: Arc<CachePlacementPublisher>,
+    network_event_tx: SyncSender<CacheTransportInbound>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let sender = endpoint.sender();
+    let mut placement = placement_publisher.snapshot();
+
+    while !shutdown.load(Ordering::Acquire) {
+        if let Some(next) = placement_publisher.snapshot_if_newer(placement.epoch()) {
+            placement = next;
+        }
+
+        let mut processed = 0usize;
+        while processed < CACHE_NETWORK_MAX_BATCH {
+            let inbound = match endpoint.try_recv() {
+                Ok(Some(inbound)) => inbound,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        "nulang-cache: cache service transport receive failed: {:?}",
+                        error
+                    );
+                    return;
+                }
+            };
+            processed += 1;
+
+            if let Some(next) = placement_publisher.snapshot_if_newer(placement.epoch()) {
+                placement = next;
+            }
+
+            if let Err(error) = inbound
+                .message
+                .validate_for_node(local_node_id, &placement)
+            {
+                tracing::warn!(
+                    "nulang-cache: rejecting cache envelope from {:?}: {:?}",
+                    inbound.from_node,
+                    error
+                );
+                reject_cache_network_inbound(
+                    local_node_id,
+                    &sender,
+                    inbound,
+                    error,
+                );
+                continue;
+            }
+
+            handle_cache_network_inbound(
+                local_node_id,
+                &sender,
+                &controls,
+                &network_event_tx,
+                inbound,
+            );
+        }
+
+        if processed == 0 {
+            thread::sleep(CACHE_NETWORK_IDLE_SLEEP);
+        }
+    }
+}
+
+fn handle_cache_network_inbound(
+    local_node_id: u64,
+    sender: &CacheServiceTransportSender,
+    controls: &[CacheShardServerControl],
+    network_event_tx: &SyncSender<CacheTransportInbound>,
+    inbound: CacheTransportInbound,
+) {
+    let from_node = inbound.from_node;
+    match inbound.message {
+        CacheTransportMessage::CommandRequest {
+            request_id,
+            placement_epoch,
+            slot,
+            target,
+            frame,
+        } => {
+            let response = execute_remote_command_on_reactor(
+                controls,
+                target,
+                placement_epoch,
+                slot,
+                frame,
+            );
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: from_node,
+                    message: CacheTransportMessage::CommandResponse {
+                        request_id,
+                        placement_epoch,
+                        slot,
+                        responder: target,
+                        response,
+                    },
+                },
+            );
+        }
+        CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch,
+            source,
+            target,
+            batch,
+        } => {
+            let results = import_remote_batch_on_reactor(
+                controls,
+                target,
+                placement_epoch,
+                batch.clone(),
+            )
+            .unwrap_or_else(|| vec![CacheTransferImport::Conflict; batch.entries.len()]);
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: from_node,
+                    message: CacheTransportMessage::TransferAck {
+                        transfer_id,
+                        placement_epoch,
+                        source,
+                        target,
+                        slot: batch.slot,
+                        results,
+                    },
+                },
+            );
+        }
+        message @ (CacheTransportMessage::CommandResponse { .. }
+        | CacheTransportMessage::TransferAck { .. }) => {
+            match network_event_tx.try_send(CacheTransportInbound {
+                from_node,
+                message,
+            }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => tracing::warn!(
+                    "nulang-cache: dropping cache network event because event queue is full"
+                ),
+                Err(TrySendError::Disconnected(_)) => tracing::warn!(
+                    "nulang-cache: dropping cache network event because receiver disconnected"
+                ),
+            }
+        }
+    }
+
+    let _ = local_node_id;
+}
+
+fn reject_cache_network_inbound(
+    local_node_id: u64,
+    sender: &CacheServiceTransportSender,
+    inbound: CacheTransportInbound,
+    _error: super::cache_transport::CacheTransportValidationError,
+) {
+    match inbound.message {
+        CacheTransportMessage::CommandRequest {
+            request_id,
+            placement_epoch,
+            slot,
+            target,
+            ..
+        } if target.node_id == local_node_id => {
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: CacheTransportMessage::CommandResponse {
+                        request_id,
+                        placement_epoch,
+                        slot,
+                        responder: target,
+                        response: b"-TRYAGAIN cache topology changed\r\n".to_vec(),
+                    },
+                },
+            );
+        }
+        CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch,
+            source,
+            target,
+            batch,
+        } if target.node_id == local_node_id => {
+            send_cache_transport_outbound(
+                sender,
+                CacheTransportOutbound {
+                    to_node: inbound.from_node,
+                    message: CacheTransportMessage::TransferAck {
+                        transfer_id,
+                        placement_epoch,
+                        source,
+                        target,
+                        slot: batch.slot,
+                        results: vec![CacheTransferImport::Conflict; batch.entries.len()],
+                    },
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
+fn execute_remote_command_on_reactor(
+    controls: &[CacheShardServerControl],
+    target: CacheShardOwner,
+    placement_epoch: u64,
+    slot: u16,
+    frame: Vec<u8>,
+) -> Vec<u8> {
+    let Some(control) = controls.get(target.shard as usize) else {
+        return b"-TRYAGAIN cache target shard unavailable\r\n".to_vec();
+    };
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    if control
+        .request_control(CacheShardControlRequest::ExecuteRemoteCommand {
+            placement_epoch,
+            slot,
+            frame,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return b"-TRYAGAIN cache target shard busy\r\n".to_vec();
+    }
+
+    match reply_rx.recv_timeout(CACHE_NETWORK_CONTROL_TIMEOUT) {
+        Ok(Ok(response)) => response,
+        Ok(Err(CacheRemoteControlError::Parse(_)
+        | CacheRemoteControlError::InvalidFrame)) => {
+            b"-ERR invalid cache transport command\r\n".to_vec()
+        }
+        Ok(Err(CacheRemoteControlError::TopologyChanged { .. }
+        | CacheRemoteControlError::OwnerMismatch))
+        | Err(_) => b"-TRYAGAIN cache topology changed\r\n".to_vec(),
+    }
+}
+
+fn import_remote_batch_on_reactor(
+    controls: &[CacheShardServerControl],
+    target: CacheShardOwner,
+    placement_epoch: u64,
+    batch: CacheTransferBatch,
+) -> Option<Vec<CacheTransferImport>> {
+    let control = controls.get(target.shard as usize)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    control
+        .request_control(CacheShardControlRequest::ImportRemoteBatch {
+            placement_epoch,
+            batch,
+            reply: reply_tx,
+        })
+        .ok()?;
+    match reply_rx.recv_timeout(CACHE_NETWORK_CONTROL_TIMEOUT) {
+        Ok(Ok(results)) => Some(results),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+fn send_cache_transport_outbound(
+    sender: &CacheServiceTransportSender,
+    outbound: CacheTransportOutbound,
+) {
+    if let Err(error) = sender.try_send(outbound) {
+        tracing::warn!(
+            "nulang-cache: unable to enqueue cache response/ACK for NUL0: {:?}",
+            error
+        );
     }
 }
 
