@@ -237,8 +237,10 @@ impl ExpirationWheel {
         } else {
             // Include the current bucket even when no full tick elapsed so
             // sub-tick TTLs can be reaped by an explicit purge call.
-            let start = if elapsed == 0 { current } else { last + 1 };
-            for tick in start..=current {
+            // Revisit the previous tick as well. A sub-tick TTL may have
+            // been scheduled into that bucket after the prior purge and can
+            // become due before the clock advances into the next bucket.
+            for tick in last..=current {
                 let idx = (tick % bucket_count) as usize;
                 out.append(&mut self.buckets[idx]);
             }
@@ -266,8 +268,9 @@ pub struct CacheMemoryStats {
 
 /// Shard-local compact cache storage.
 ///
-/// `CacheStore` is intentionally `!Sync` by usage rather than by marker:
-/// the owning runtime shard keeps it thread-confined and calls methods directly.
+/// The owning runtime shard keeps `CacheStore` thread-confined by runtime
+/// contract and calls it directly; the type does not require synchronization
+/// internally.
 #[derive(Debug)]
 pub struct CacheStore {
     arena: ByteArena,
@@ -332,11 +335,13 @@ impl CacheStore {
     }
 
     fn ensure_index_capacity(&mut self) {
+        if self.tombstones > self.index_len && self.tombstones > 32 {
+            self.rehash(self.index.len());
+        }
+
         let used = self.index_len + self.tombstones + 1;
         if used * 10 >= self.index.len() * 7 {
             self.rehash(self.index.len() * 2);
-        } else if self.tombstones > self.index_len && self.tombstones > 32 {
-            self.rehash(self.index.len());
         }
     }
 
@@ -662,6 +667,36 @@ mod tests {
         store.set_integer(b"b", 9, Some(10), 200);
         assert_eq!(store.purge_expired(210, 100), 1);
         assert_eq!(store.get(b"b", 210), None);
+    }
+
+    #[test]
+    fn sub_tick_expiry_is_reaped_after_tick_advance() {
+        let mut store = CacheStore::new();
+        store.set_integer(b"short", 1, Some(5), 100);
+        assert_eq!(store.purge_expired(110, 100), 1);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn delete_churn_compacts_tombstones_before_growing_index() {
+        let mut store = CacheStore::new();
+        for i in 0..48u64 {
+            let key = i.to_le_bytes();
+            store.set_integer(&key, i as i64, None, 0);
+        }
+        let capacity = store.memory_stats().index_capacity;
+
+        for i in 0..40u64 {
+            let key = i.to_le_bytes();
+            assert!(store.delete(&key));
+        }
+
+        for i in 100..132u64 {
+            let key = i.to_le_bytes();
+            store.set_integer(&key, i as i64, None, 0);
+        }
+
+        assert_eq!(store.memory_stats().index_capacity, capacity);
     }
 
     #[test]
