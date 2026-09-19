@@ -1035,7 +1035,37 @@ mod tests {
                     .unwrap(),
                 1
             );
+            let info = cluster
+                .node_mut(index)
+                .fabric_queue_info_replicated("orders")
+                .unwrap();
+            assert_eq!(info.total, 0);
+            assert_eq!(info.waiting, 0);
         }
+
+        // Simulate leader-local torn/uncommitted tails. The replicated read
+        // path must stop at each durable commit boundary and never attempt to
+        // decode these malformed records.
+        assert_eq!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_stream_append(&queue_stream_name("orders"), b"not-a-queue-envelope")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            cluster
+                .node_mut(leader_index)
+                .fabric_stream_append(&queue_mutation_stream_name("orders"), b"not-a-queue-mutation")
+                .unwrap(),
+            2
+        );
+        let committed_view = cluster
+            .node_mut(leader_index)
+            .fabric_queue_info_replicated("orders")
+            .unwrap();
+        assert_eq!(committed_view.total, 0);
+        assert_eq!(committed_view.waiting, 0);
 
         let _ = std::fs::remove_dir_all(base);
     }
