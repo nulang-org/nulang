@@ -59,7 +59,18 @@ pub struct ProviderLocation {
     pub host: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct FailureDomainKey {
+    pub provider: String,
+    pub region: Option<String>,
+    pub zone: Option<String>,
+    pub rack: Option<String>,
+    pub host: Option<String>,
+}
+
 impl ProviderLocation {
+    /// Human-readable label for the requested level. This is not a globally
+    /// unique failure-domain identity; use domain_key for placement decisions.
     pub fn domain_value(&self, domain: FailureDomain) -> Option<&str> {
         match domain {
             FailureDomain::Host => self.host.as_deref(),
@@ -67,6 +78,51 @@ impl ProviderLocation {
             FailureDomain::Zone => self.zone.as_deref(),
             FailureDomain::Region => Some(self.region.as_str()),
             FailureDomain::Provider => Some(self.provider.as_str()),
+        }
+    }
+
+    /// Canonical hierarchical identity for failure-domain comparisons.
+    ///
+    /// Cloud region/zone/rack/host names are provider-local. Including the
+    /// parent scope prevents labels such as "us-east" or "az-a" from aliasing
+    /// across providers or sibling domains.
+    pub fn domain_key(&self, domain: FailureDomain) -> Option<FailureDomainKey> {
+        match domain {
+            FailureDomain::Provider => Some(FailureDomainKey {
+                provider: self.provider.clone(),
+                region: None,
+                zone: None,
+                rack: None,
+                host: None,
+            }),
+            FailureDomain::Region => Some(FailureDomainKey {
+                provider: self.provider.clone(),
+                region: Some(self.region.clone()),
+                zone: None,
+                rack: None,
+                host: None,
+            }),
+            FailureDomain::Zone => Some(FailureDomainKey {
+                provider: self.provider.clone(),
+                region: Some(self.region.clone()),
+                zone: Some(self.zone.clone()?),
+                rack: None,
+                host: None,
+            }),
+            FailureDomain::Rack => Some(FailureDomainKey {
+                provider: self.provider.clone(),
+                region: Some(self.region.clone()),
+                zone: self.zone.clone(),
+                rack: Some(self.rack.clone()?),
+                host: None,
+            }),
+            FailureDomain::Host => Some(FailureDomainKey {
+                provider: self.provider.clone(),
+                region: Some(self.region.clone()),
+                zone: self.zone.clone(),
+                rack: self.rack.clone(),
+                host: Some(self.host.clone()?),
+            }),
         }
     }
 }
@@ -411,10 +467,10 @@ pub fn select_spread_replicas<'a>(
     let mut domains = BTreeSet::new();
 
     for provider in deterministic_provider_order(placement_key, candidates) {
-        let Some(value) = provider.location.domain_value(domain) else {
+        let Some(key) = provider.location.domain_key(domain) else {
             continue;
         };
-        if domains.insert(value.to_string()) {
+        if domains.insert(key) {
             selected.push(provider);
             if selected.len() == replicas {
                 return Ok(selected);
@@ -584,6 +640,36 @@ mod tests {
             .map(|provider| provider.location.zone.as_deref().unwrap())
             .collect();
         assert_eq!(zones.len(), 3);
+    }
+
+    #[test]
+    fn failure_domain_identity_is_scoped_by_parent_topology() {
+        let mut aws = host("aws-a", "zone-a", "rack-1", &[]);
+        aws.location.provider = "aws".into();
+        let mut gcp = host("gcp-a", "zone-a", "rack-1", &[]);
+        gcp.location.provider = "gcp".into();
+
+        assert_ne!(
+            aws.location.domain_key(FailureDomain::Zone),
+            gcp.location.domain_key(FailureDomain::Zone)
+        );
+
+        let mut sibling = host("aws-b", "zone-b", "rack-1", &[]);
+        sibling.location.provider = "aws".into();
+        assert_ne!(
+            aws.location.domain_key(FailureDomain::Rack),
+            sibling.location.domain_key(FailureDomain::Rack)
+        );
+
+        let topology = TopologySnapshot {
+            generation: 1,
+            providers: vec![aws, gcp],
+        };
+        let candidates =
+            allocation_candidates(&topology, &BTreeMap::new(), &request(100)).unwrap();
+        let selected =
+            select_spread_replicas("replicas", &candidates, 2, FailureDomain::Zone).unwrap();
+        assert_eq!(selected.len(), 2);
     }
 
     #[test]
