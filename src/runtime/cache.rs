@@ -320,6 +320,7 @@ pub struct CacheTransferBatch {
     pub next_cursor: Option<CacheTransferCursor>,
     pub scanned_slots: usize,
     pub payload_bytes: usize,
+    pub exported_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -934,6 +935,7 @@ impl CacheStore {
             next_cursor: (index < self.slots.len()).then_some(CacheTransferCursor(index)),
             scanned_slots: index.saturating_sub(start),
             payload_bytes,
+            exported_at_ms: now_ms,
         }
     }
 
