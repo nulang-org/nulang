@@ -52,6 +52,7 @@ pub use fabric_queue_cluster::{
     FabricQueueReplicatedCreateResult, FabricQueueReplicatedDeadLetterResult,
     FabricQueueReplicatedGroupConfigResult, FabricQueueReplicatedNackResult,
     FabricQueueReplicatedReapResult, FabricQueueReplicatedRenewResult,
+    FabricQueueReplicatedRescheduleResult,
 };
 pub use fabric_stream::{
     FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
