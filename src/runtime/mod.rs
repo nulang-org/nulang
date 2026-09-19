@@ -11,6 +11,7 @@ use std::time::Instant;
 use tracing::warn;
 
 mod actor;
+pub mod cache;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
@@ -61,6 +62,7 @@ mod metrics;
 mod persistence;
 mod process_groups;
 mod registry;
+pub mod resp;
 mod spawn;
 #[cfg(feature = "native-codegen")]
 pub(crate) use spawn::spawn_from_module_with_authority;
@@ -79,6 +81,7 @@ mod cluster_sim;
 mod tests;
 
 pub use actor::*;
+pub use cache::*;
 pub use callbacks::RuntimeVmCallbacks;
 pub(crate) use callbacks::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks};
 pub use cluster::*;
