@@ -25,6 +25,13 @@ semantics. Logical slots map to a smaller set of physical Nulang cache shards.
 Cluster placement may move logical slots between physical owners without
 changing the client-visible hash function.
 
+`src/runtime/cache_routing.rs` holds the placement snapshot. Each slot maps
+directly to a `(node_id, shard)` owner, so the steady-state routing lookup is
+one indexed read after CRC16. Control-plane changes are installed as
+monotonically increasing epochs; an entire batch is validated for bounds and
+overlap before any slot owner changes. The routing table itself contains no
+mutex or mailbox hop.
+
 Multi-key behavior is intentionally tiered:
 
 1. Same-slot operations may be strongly atomic on one shard.
@@ -103,8 +110,10 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Wire a TCP RESP endpoint to the borrowed parser and direct local shard API.
-2. Add an explicit logical-slot placement table and remote shard dispatch.
+1. Add local-shard and remote-node dispatch channels around the slot-placement
+   snapshot, keeping same-shard commands direct.
+2. Wire the TCP RESP endpoint to the parser, placement lookup, and command
+   executor.
 3. Add hierarchical expiration and packed aggregate data structures.
 4. Add WAL/replication acknowledgement modes.
 5. Add RESP compatibility for hashes, sets, lists, sorted sets, and scripts or
