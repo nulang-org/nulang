@@ -14,8 +14,13 @@ use super::cache_cluster::{
     execute_cluster_command, CacheClusterCommandError, CacheEndpointMap, CacheRoutingMode,
 };
 use super::cache_routing::{CacheShardOwner, CacheSlotMap};
-use super::resp::{parse_command, write_moved, RespParseError};
-use super::resp_cache::{command_slot, execute_command, execute_frame, RespCommandSlot};
+use super::resp::{
+    parse_command, write_ask, write_error, write_moved, write_simple, RespParseError,
+};
+use super::resp_cache::{
+    command_key_presence, command_slot, execute_command, execute_frame, RespCommandKeyPresence,
+    RespCommandSlot,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheDispatchConfigError {
@@ -38,6 +43,17 @@ pub enum CacheDispatchError {
 impl From<RespParseError> for CacheDispatchError {
     fn from(value: RespParseError) -> Self {
         Self::Parse(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheDispatchContext {
+    asking: bool,
+}
+
+impl CacheDispatchContext {
+    pub fn asking(&self) -> bool {
+        self.asking
     }
 }
 
@@ -308,9 +324,35 @@ impl CacheDispatcher {
         now_ms: u64,
         out: &mut Vec<u8>,
     ) -> Result<Option<CacheDispatchOutcome>, CacheDispatchError> {
+        let mut context = CacheDispatchContext::default();
+        self.dispatch_frame_with_context(store, input, now_ms, &mut context, out)
+    }
+
+    pub fn dispatch_frame_with_context(
+        &self,
+        store: &mut CacheStore,
+        input: &[u8],
+        now_ms: u64,
+        context: &mut CacheDispatchContext,
+        out: &mut Vec<u8>,
+    ) -> Result<Option<CacheDispatchOutcome>, CacheDispatchError> {
         let Some((command, consumed)) = parse_command(input)? else {
             return Ok(None);
         };
+
+        if command.name().eq_ignore_ascii_case(b"ASKING") {
+            context.asking = false;
+            if command.argc() == 0 {
+                context.asking = true;
+                write_simple(out, b"OK");
+            } else {
+                write_error(out, b"ERR wrong number of arguments for 'asking' command");
+            }
+            return Ok(Some(CacheDispatchOutcome::Executed { consumed }));
+        }
+
+        // ASKING authorizes exactly one subsequent complete command.
+        let asking = std::mem::take(&mut context.asking);
 
         if let Some(result) =
             execute_cluster_command(command, &self.placement, &self.endpoints, out)
@@ -336,7 +378,48 @@ impl CacheDispatcher {
             .owner_for_slot(slot)
             .ok_or(CacheDispatchError::UnknownSlot(slot))?;
 
-        let is_local_owner = owner.node_id == self.local_node_id && owner.shard == self.local_shard;
+        let local = CacheShardOwner {
+            node_id: self.local_node_id,
+            shard: self.local_shard,
+        };
+        let is_local_owner = owner == local;
+
+        if self.routing_mode == CacheRoutingMode::Redirect {
+            if let Some(migration) = self.placement.migration_for_slot(slot) {
+                if local == migration.target && asking {
+                    execute_command(store, command, now_ms, out);
+                    return Ok(Some(CacheDispatchOutcome::Executed { consumed }));
+                }
+
+                if local == migration.source {
+                    match command_key_presence(store, command, now_ms) {
+                        RespCommandKeyPresence::AllPresent | RespCommandKeyPresence::NoKeys => {
+                            execute_command(store, command, now_ms, out);
+                            return Ok(Some(CacheDispatchOutcome::Executed { consumed }));
+                        }
+                        RespCommandKeyPresence::AllMissing => {
+                            let endpoint = self
+                                .endpoints
+                                .get(migration.target)
+                                .ok_or(CacheDispatchError::MissingEndpoint(migration.target))?;
+                            write_ask(out, slot, endpoint.target());
+                            return Ok(Some(CacheDispatchOutcome::Redirected {
+                                consumed,
+                                slot,
+                                owner: migration.target,
+                            }));
+                        }
+                        RespCommandKeyPresence::Mixed => {
+                            write_error(
+                                out,
+                                b"TRYAGAIN Multiple keys request during rehashing of slot",
+                            );
+                            return Ok(Some(CacheDispatchOutcome::Executed { consumed }));
+                        }
+                    }
+                }
+            }
+        }
 
         if !is_local_owner && self.routing_mode == CacheRoutingMode::Redirect {
             let endpoint = self
@@ -545,6 +628,169 @@ mod tests {
         assert_eq!(
             out,
             b"-CROSSSLOT Keys in request don't hash to the same slot\r\n"
+        );
+    }
+
+
+    #[test]
+    fn migrating_source_asks_target_for_missing_key() {
+        let mut map = CacheSlotMap::new_local(1, 2).unwrap();
+        let key = key_for_shard(&map, 0);
+        let slot = redis_slot(&key);
+        let source = map.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 1,
+            shard: 1,
+        };
+        map.begin_migration(1, slot, source, target).unwrap();
+
+        let (channels, _inboxes) = CacheDispatchChannels::new(2, 8).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(source, CacheAdvertisedEndpoint::new("127.0.0.1", 7000));
+        endpoints.insert(target, CacheAdvertisedEndpoint::new("127.0.0.1", 7001));
+        let dispatcher = CacheDispatcher::new(1, 0, map, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+        let command = frame(&[b"GET", &key]);
+        let mut store = CacheStore::new();
+        let mut out = Vec::new();
+
+        dispatcher
+            .dispatch_frame(&mut store, &command, 0, &mut out)
+            .unwrap()
+            .unwrap();
+
+        let expected = format!("-ASK {} 127.0.0.1:7001\r\n", slot);
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn migrating_source_serves_key_that_is_still_resident() {
+        let mut map = CacheSlotMap::new_local(1, 2).unwrap();
+        let key = key_for_shard(&map, 0);
+        let slot = redis_slot(&key);
+        let source = map.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 1,
+            shard: 1,
+        };
+        map.begin_migration(1, slot, source, target).unwrap();
+
+        let (channels, _inboxes) = CacheDispatchChannels::new(2, 8).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(source, CacheAdvertisedEndpoint::new("127.0.0.1", 7000));
+        endpoints.insert(target, CacheAdvertisedEndpoint::new("127.0.0.1", 7001));
+        let dispatcher = CacheDispatcher::new(1, 0, map, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+        let command = frame(&[b"GET", &key]);
+        let mut store = CacheStore::new();
+        store.set_bytes(&key, b"value", None, 0);
+        let mut out = Vec::new();
+
+        dispatcher
+            .dispatch_frame(&mut store, &command, 0, &mut out)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(out, b"$5\r\nvalue\r\n");
+    }
+
+    #[test]
+    fn importing_target_requires_one_shot_asking_context() {
+        let mut map = CacheSlotMap::new_local(1, 2).unwrap();
+        let key = key_for_shard(&map, 0);
+        let slot = redis_slot(&key);
+        let source = map.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 1,
+            shard: 1,
+        };
+        map.begin_migration(1, slot, source, target).unwrap();
+
+        let (channels, _inboxes) = CacheDispatchChannels::new(2, 8).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(source, CacheAdvertisedEndpoint::new("127.0.0.1", 7000));
+        endpoints.insert(target, CacheAdvertisedEndpoint::new("127.0.0.1", 7001));
+        let dispatcher = CacheDispatcher::new(1, 1, map, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+        let asking = frame(&[b"ASKING"]);
+        let set = frame(&[b"SET", &key, b"imported"]);
+        let get = frame(&[b"GET", &key]);
+        let mut store = CacheStore::new();
+        let mut context = CacheDispatchContext::default();
+        let mut out = Vec::new();
+
+        dispatcher
+            .dispatch_frame_with_context(&mut store, &set, 0, &mut context, &mut out)
+            .unwrap()
+            .unwrap();
+        let moved = format!("-MOVED {} 127.0.0.1:7000\r\n", slot);
+        assert_eq!(out, moved.as_bytes());
+
+        out.clear();
+        dispatcher
+            .dispatch_frame_with_context(&mut store, &asking, 0, &mut context, &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, b"+OK\r\n");
+        assert!(context.asking());
+
+        out.clear();
+        dispatcher
+            .dispatch_frame_with_context(&mut store, &set, 0, &mut context, &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, b"+OK\r\n");
+        assert!(!context.asking());
+
+        out.clear();
+        dispatcher
+            .dispatch_frame_with_context(&mut store, &get, 0, &mut context, &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, moved.as_bytes());
+        assert_eq!(
+            store.get(&key, 0),
+            Some(CacheValueView::Bytes(b"imported"))
+        );
+    }
+
+    #[test]
+    fn migrating_source_returns_tryagain_for_mixed_multikey_residency() {
+        let mut map = CacheSlotMap::new_local(1, 1).unwrap();
+        let key_a = b"a{migration}".to_vec();
+        let key_b = b"b{migration}".to_vec();
+        let slot = redis_slot(&key_a);
+        assert_eq!(redis_slot(&key_b), slot);
+        let source = map.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 9,
+            shard: 0,
+        };
+        map.begin_migration(1, slot, source, target).unwrap();
+
+        let (channels, _inboxes) = CacheDispatchChannels::new(1, 8).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(source, CacheAdvertisedEndpoint::new("127.0.0.1", 7000));
+        endpoints.insert(target, CacheAdvertisedEndpoint::new("cache-nine", 7000));
+        let dispatcher = CacheDispatcher::new(1, 0, map, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+        let command = frame(&[b"MGET", &key_a, &key_b]);
+        let mut store = CacheStore::new();
+        store.set_bytes(&key_a, b"value", None, 0);
+        let mut out = Vec::new();
+
+        dispatcher
+            .dispatch_frame(&mut store, &command, 0, &mut out)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            out,
+            b"-TRYAGAIN Multiple keys request during rehashing of slot\r\n"
         );
     }
 
