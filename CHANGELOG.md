@@ -97,6 +97,13 @@ two major versions.*
   owning shard directly. Cross-shard inbox activity and shutdown wake blocked
   reactors through Mio Waker, while bounded connection/input/output/pipeline
   limits provide explicit resource backpressure.
+- **Multi-shard cache service lifecycle** (Experimental, optional
+  `cache-server` feature, `src/runtime/cache_service.rs`). All shard
+  listeners are pre-bound so Redis Cluster endpoints advertise exact ports,
+  including OS-assigned ephemeral ports. Shards share one placement map,
+  channel set, endpoint map, and monotonic clock; the service spawns one named
+  reactor thread per shard, supports optional CPU pinning, and coordinates
+  wake-based shutdown/join across the shard set.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
