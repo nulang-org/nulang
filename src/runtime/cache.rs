@@ -619,7 +619,9 @@ impl CacheStore {
             }
         };
 
-        let next = base.checked_add(delta).ok_or(CacheIncrementError::Overflow)?;
+        let next = base
+            .checked_add(delta)
+            .ok_or(CacheIncrementError::Overflow)?;
         if let CacheValue::Bytes(bytes) = current {
             bytes.release(&mut self.arena);
         }
