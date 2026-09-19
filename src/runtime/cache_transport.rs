@@ -970,7 +970,8 @@ mod tests {
 
     #[test]
     fn placement_epoch_and_owner_are_validated_before_command_execution() {
-        let map = CacheSlotMap::new_local(2, 2).unwrap();
+        let mut map = CacheSlotMap::new_local(2, 2).unwrap();
+        map.apply_epoch(2, &[]).unwrap();
         let slot = 10;
         let target = map.owner_for_slot(slot).unwrap();
         let current = CacheTransportMessage::CommandRequest {
@@ -983,19 +984,26 @@ mod tests {
         assert_eq!(current.validate_for_node(2, &map), Ok(()));
 
         let stale = CacheTransportMessage::CommandRequest {
-            placement_epoch: map.epoch().saturating_sub(1),
-            ..current.clone()
+            request_id: 1,
+            placement_epoch: 1,
+            slot,
+            target,
+            frame: b"*1\r\n$4\r\nPING\r\n".to_vec(),
         };
-        if map.epoch() > 0 {
-            assert!(matches!(
-                stale.validate_for_node(2, &map),
-                Err(CacheTransportValidationError::StaleEpoch { .. })
-            ));
-        }
+        assert_eq!(
+            stale.validate_for_node(2, &map),
+            Err(CacheTransportValidationError::StaleEpoch {
+                current: 2,
+                received: 1,
+            })
+        );
 
         let wrong = CacheTransportMessage::CommandRequest {
+            request_id: 1,
+            placement_epoch: map.epoch(),
+            slot,
             target: owner(9, 0),
-            ..current
+            frame: b"*1\r\n$4\r\nPING\r\n".to_vec(),
         };
         assert!(matches!(
             wrong.validate_for_node(2, &map),
@@ -1030,8 +1038,14 @@ mod tests {
         assert_eq!(message.validate_for_node(2, &map), Ok(()));
 
         let stale = CacheTransportMessage::TransferBatch {
+            transfer_id: 1,
             placement_epoch: 0,
-            ..message
+            source,
+            target,
+            batch: match message {
+                CacheTransportMessage::TransferBatch { batch, .. } => batch,
+                _ => unreachable!(),
+            },
         };
         assert_eq!(
             stale.validate_for_node(2, &map),
