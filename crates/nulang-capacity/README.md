@@ -52,7 +52,7 @@ The capacity core must remain usable without any provider SDK dependency.
 
 ## Next slices
 
-- propagate concrete node topology/capacity from the distributed runtime into control-plane snapshots
+- derive static node topology/traits from runtime registration metadata while reporting dynamic inventory/usage through a separate capacity heartbeat; do not bloat membership/failure-detection gossip
 - persist resource allocations and fence topology/allocation updates with durable generations/CAS
 - add nested request groups for host + GPU/NVMe/NIC child-resource allocation
 - add PACK/SPREAD placement groups for actor teams once concrete host topology is populated
