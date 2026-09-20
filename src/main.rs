@@ -17,6 +17,7 @@
 //!   -c, --check <FILE>       Type-check a file (don't run)
 //!   --doc                    Generate Markdown API docs (docs/api.md)
 //!   --emit-stdlib-docs <dir> Generate per-effect stdlib docs into <dir>
+//!   --emit-wit <file>        Emit a WIT capability world from checked effect rows
 //!   --lsp                    Start Language Server (stdio)
 //!   --dap                    Start Debug Adapter (stdio); program from launch request or FILE
 //!   --backend <b>            Backend: bytecode (default, full language) | native
@@ -391,6 +392,15 @@ fn main() {
                     i += 1;
                 } else {
                     eprintln!("Error: --emit-stdlib-docs requires a directory argument");
+                    std::process::exit(1);
+                }
+            }
+            "--emit-wit" => {
+                if i + 1 < args.len() {
+                    opts.emit_wit = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --emit-wit requires a file path argument");
                     std::process::exit(1);
                 }
             }
@@ -843,6 +853,30 @@ fn main() {
             }
         };
 
+        // `--emit-wit`: compile the module through the normal frontend, then
+        // render a capability world from the compiler-checked effect rows.
+        if let Some(out) = opts.emit_wit.as_ref() {
+            match run_frontend(
+                &source,
+                Some(path),
+                opts.verbose,
+                &opts.with_capabilities,
+                opts.deny_warnings,
+            ) {
+                Ok((_ast, _type_checker, effect_checker)) => {
+                    if let Err(e) = emit_wit_contract(&effect_checker, out) {
+                        print_error(&e, use_color);
+                        std::process::exit(exit_code(&e));
+                    }
+                }
+                Err(e) => {
+                    print_error(&e, use_color);
+                    std::process::exit(exit_code(&e));
+                }
+            }
+            return;
+        }
+
         // `--emit-signals`: analyze the module and write the signal graph JSON.
         if let Some(out) = opts.emit_signals.as_ref() {
             match run_frontend(
@@ -852,11 +886,9 @@ fn main() {
                 &opts.with_capabilities,
                 opts.deny_warnings,
             ) {
-                Ok((ast, _)) => {
-                    let mut checker = nulang::effect_checker::EffectChecker::new();
-                    checker.set_resource_grants(&opts.with_capabilities);
-                    let _ = checker.check_module(&ast.decls);
-                    let graph = nulang::web::reactivity::analyze_module(&ast, Some(&checker));
+                Ok((ast, _, effect_checker)) => {
+                    let graph =
+                        nulang::web::reactivity::analyze_module(&ast, Some(&effect_checker));
                     if let Err(e) = std::fs::write(out, graph.to_json()) {
                         eprintln!("Error: Cannot write signal graph '{}': {}", out, e);
                         std::process::exit(1);
@@ -990,6 +1022,8 @@ struct Options {
     verify_source: Option<String>,
     /// Output directory for --emit-stdlib-docs.
     emit_stdlib_docs: Option<String>,
+    /// Output file for a WIT capability world generated from checked effect rows.
+    emit_wit: Option<String>,
     /// Output file for the compile-time signal graph (`.nula/dist/app.signals.json`).
     emit_signals: Option<String>,
     /// Output file for the client-side signal micro-runtime (`.nula/dist/app.client.js`).
@@ -1042,6 +1076,7 @@ impl Default for Options {
             emit_nbc: false,
             verify_source: None,
             emit_stdlib_docs: None,
+            emit_wit: None,
             emit_signals: None,
             rewrite_signals: None,
             color: "auto".to_string(),
@@ -1079,6 +1114,7 @@ fn print_help() {
     println!("  -c, --check      Type-check a file (don't run)");
     println!("  --doc            Generate Markdown API docs (docs/api.md)");
     println!("  --emit-stdlib-docs <dir>  Generate per-effect stdlib Markdown docs into <dir>");
+    println!("  --emit-wit <file>          Emit WIT from compiler-checked effect rows");
     println!("  --lsp            Start Language Server (stdio)");
     println!("  --dap            Start Debug Adapter (stdio; program via launch request)");
     print!("  --backend <b>    Backend: bytecode (default) | core-vm");
@@ -1557,7 +1593,11 @@ fn run_frontend(
     verbose: bool,
     with_capabilities: &[String],
     deny_warnings: bool,
-) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
+) -> NuResult<(
+    nulang::ast::AstModule,
+    nulang::typechecker::TypeChecker,
+    EffectChecker,
+)> {
     let ps = nulang::prelude_source::PRELUDE_SOURCE;
     let mut pl = Lexer::new(ps);
     nulang::types::set_source_map_with_file(ps, Some("<prelude>"));
@@ -1727,7 +1767,27 @@ fn run_frontend(
         }
     }
 
-    Ok((ast, type_checker))
+    Ok((ast, type_checker, effect_checker))
+}
+
+/// Render the module's compiler-checked effect rows as a closed WIT capability
+/// world. The WIT generator fails closed on open or unmapped rows.
+fn emit_wit_contract(effect_checker: &EffectChecker, out_path: &str) -> NuResult<()> {
+    let function_rows = effect_checker.function_rows();
+    let world = nulang::witgen::generate_wit_world_from_effect_rows(function_rows.values())
+        .map_err(|e| NuError::EffectError {
+            msg: format!("cannot emit WIT capability world: {e}"),
+            span: Span::default(),
+            missing_effects: None,
+            allowed_effects: None,
+        })?;
+    let wit = nulang::witgen::render_wit(&world);
+    std::fs::write(out_path, wit).map_err(|e| NuError::VMError {
+        msg: format!("failed to write WIT world to {out_path}: {e}"),
+        span: Span::default(),
+    })?;
+    println!("Wrote {out_path} (WIT capability world)");
+    Ok(())
 }
 
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
@@ -1743,7 +1803,7 @@ fn run_source(
     store_path: Option<&str>,
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (ast, type_checker) =
+    let (ast, type_checker, _effect_checker) =
         run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
     match backend {
         #[cfg(feature = "wasm-backend")]
@@ -2297,7 +2357,8 @@ fn check_source(
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+    let (_ast, _tc, _effect_checker) =
+        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
 
     if verbose {
         println!("Effect check passed.");
@@ -2388,18 +2449,13 @@ fn compile_source_to_nbc(
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (mut ast, type_checker) =
+    let (mut ast, type_checker, effect_checker) =
         run_frontend(source, None, false, with_capabilities, deny_warnings)?;
 
     // Optional web-framework pass: rewrite HTML for signals/actions and emit the
     // generic client-side micro-runtime. This runs after effect checking so
     // action placements are known.
     if let Some(client_js_path) = rewrite_signals {
-        let mut effect_checker = EffectChecker::new();
-        effect_checker.check_module(&ast.decls)?;
-        for msg in &effect_checker.diagnostics {
-            eprintln!("{}", msg);
-        }
         nulang::web::reactivity::rewrite_module(&mut ast, Some(&effect_checker));
         let client_js = nulang::web::reactivity::generate_client_runtime();
         std::fs::write(client_js_path, client_js).map_err(|e| nulang::types::NuError::VMError {
@@ -2634,8 +2690,9 @@ mod tests {
                 c
             }
         "#;
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
-            .expect("frontend should accept the actor program");
+        let (ast, type_checker, _effect_checker) =
+            run_frontend(source, None, false, &[], false)
+                .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
         let (_value, runtime) =
