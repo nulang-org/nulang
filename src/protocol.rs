@@ -137,6 +137,33 @@ pub struct ProtocolSchema {
     members: BTreeMap<String, ProtocolMember>,
 }
 
+/// Directional compatibility of a receiver/implementation protocol against a
+/// protocol required by an existing client/reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolCompatibility {
+    Exact,
+    ReceiverSuperset,
+    Incompatible,
+}
+
+impl ProtocolCompatibility {
+    pub fn is_compatible(self) -> bool {
+        !matches!(self, ProtocolCompatibility::Incompatible)
+    }
+}
+
+/// One stable behavior-level reason a receiver cannot satisfy a required
+/// protocol. Parameters and return types are surfaced separately for useful
+/// diagnostics; if those match but the authoritative signature hash differs,
+/// the remaining drift is effect/capability contract drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolCompatibilityIssue {
+    MissingBehavior(String),
+    ParameterContractChanged(String),
+    ResponseContractChanged(String),
+    EffectOrCapabilityContractChanged(String),
+}
+
 impl ProtocolSchema {
     pub fn new(
         name: impl Into<String>,
@@ -198,6 +225,65 @@ impl ProtocolSchema {
 
     pub fn id(&self) -> ProtocolId {
         ProtocolId::from_schema(self)
+    }
+
+    /// Classify whether this receiver/implementation can serve a client that
+    /// was compiled against `required`.
+    ///
+    /// Compatibility is directional: additive receiver behaviors are safe for
+    /// an older client, but removing or changing any required behavior is not.
+    pub fn compatibility_for_required(&self, required: &ProtocolSchema) -> ProtocolCompatibility {
+        if self.id() == required.id() {
+            return ProtocolCompatibility::Exact;
+        }
+        if self.compatibility_issues_for_required(required).is_empty() {
+            ProtocolCompatibility::ReceiverSuperset
+        } else {
+            ProtocolCompatibility::Incompatible
+        }
+    }
+
+    /// Explain incompatibilities using the compiler-owned behavior contract.
+    ///
+    /// V1 is intentionally invariant: no field defaults, record widening,
+    /// parameter variance, or implicit coercions are inferred here.
+    pub fn compatibility_issues_for_required(
+        &self,
+        required: &ProtocolSchema,
+    ) -> Vec<ProtocolCompatibilityIssue> {
+        let mut issues = Vec::new();
+
+        for (name, expected) in &required.members {
+            let Some(actual) = self.members.get(name) else {
+                issues.push(ProtocolCompatibilityIssue::MissingBehavior(name.clone()));
+                continue;
+            };
+
+            if actual.params != expected.params {
+                issues.push(ProtocolCompatibilityIssue::ParameterContractChanged(
+                    name.clone(),
+                ));
+            }
+            if actual.response != expected.response {
+                issues.push(ProtocolCompatibilityIssue::ResponseContractChanged(
+                    name.clone(),
+                ));
+            }
+            if actual.params == expected.params
+                && actual.response == expected.response
+                && actual.signature != expected.signature
+            {
+                issues.push(
+                    ProtocolCompatibilityIssue::EffectOrCapabilityContractChanged(name.clone()),
+                );
+            }
+        }
+
+        issues
+    }
+
+    pub fn can_serve(&self, required: &ProtocolSchema) -> bool {
+        self.compatibility_for_required(required).is_compatible()
     }
 }
 
@@ -281,9 +367,10 @@ impl ProtocolActorRef {
         self.protocol_id == expected
     }
 
-    /// Exact compatibility is the initial distributed protocol rule.
-    /// Subtyping/schema-evolution compatibility must be explicit later rather
-    /// than silently weakening this check.
+    /// Exact protocol-id validation. Rolling-upgrade compatibility is defined
+    /// structurally by `ProtocolSchema::compatibility_for_required`, because a
+    /// different digest alone cannot prove that the receiver is an additive
+    /// compatible superset.
     pub fn require_protocol(&self, expected: ProtocolId) -> Result<(), ProtocolMismatch> {
         if self.matches_protocol(expected) {
             Ok(())
@@ -760,6 +847,162 @@ mod tests {
                 actual: account,
             })
         );
+    }
+
+    #[test]
+    fn compatibility_is_exact_for_identical_compiler_protocols() {
+        let required =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let renamed =
+            ProtocolSchema::new("RenamedAccount", [member("Balance", vec![], money_ty())]).unwrap();
+
+        assert_eq!(
+            renamed.compatibility_for_required(&required),
+            ProtocolCompatibility::Exact
+        );
+        assert!(renamed.can_serve(&required));
+    }
+
+    #[test]
+    fn additive_receiver_upgrade_is_directionally_compatible() {
+        let old = ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let new = ProtocolSchema::new(
+            "Account",
+            [
+                member("Balance", vec![], money_ty()),
+                member("Deposit", vec![money_ty()], Type::unit()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            new.compatibility_for_required(&old),
+            ProtocolCompatibility::ReceiverSuperset
+        );
+        assert!(new.can_serve(&old));
+        assert_eq!(
+            old.compatibility_for_required(&new),
+            ProtocolCompatibility::Incompatible
+        );
+        assert_eq!(
+            old.compatibility_issues_for_required(&new),
+            vec![ProtocolCompatibilityIssue::MissingBehavior(
+                "Deposit".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn parameter_and_response_contract_changes_are_incompatible() {
+        let required = ProtocolSchema::new(
+            "Account",
+            [member("Withdraw", vec![money_ty()], receipt_ty())],
+        )
+        .unwrap();
+        let changed_param = ProtocolSchema::new(
+            "Account",
+            [member("Withdraw", vec![int_ty()], receipt_ty())],
+        )
+        .unwrap();
+        let changed_response = ProtocolSchema::new(
+            "Account",
+            [member("Withdraw", vec![money_ty()], money_ty())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            changed_param.compatibility_issues_for_required(&required),
+            vec![ProtocolCompatibilityIssue::ParameterContractChanged(
+                "Withdraw".into()
+            )]
+        );
+        assert_eq!(
+            changed_response.compatibility_issues_for_required(&required),
+            vec![ProtocolCompatibilityIssue::ResponseContractChanged(
+                "Withdraw".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn effect_or_capability_drift_is_incompatible() {
+        let required = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::behavior(
+                "Withdraw",
+                vec![money_ty()],
+                receipt_ty(),
+                EffectRow::empty(),
+                Capability::Ref,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let changed_effect = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::behavior(
+                "Withdraw",
+                vec![money_ty()],
+                receipt_ty(),
+                EffectRow::Closed(vec![Effect::IO]),
+                Capability::Ref,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let changed_cap = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::behavior(
+                "Withdraw",
+                vec![money_ty()],
+                receipt_ty(),
+                EffectRow::empty(),
+                Capability::Box,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+
+        for changed in [&changed_effect, &changed_cap] {
+            assert_eq!(
+                changed.compatibility_for_required(&required),
+                ProtocolCompatibility::Incompatible
+            );
+            assert_eq!(
+                changed.compatibility_issues_for_required(&required),
+                vec![
+                    ProtocolCompatibilityIssue::EffectOrCapabilityContractChanged(
+                        "Withdraw".into()
+                    )
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn compiler_generated_schemas_use_same_rolling_compatibility_rule() {
+        let get = behavior_sig(vec![], Type::int(), EffectRow::empty(), Capability::Ref);
+        let add = behavior_sig(
+            vec![Type::int()],
+            Type::unit(),
+            EffectRow::Closed(vec![Effect::Send]),
+            Capability::Ref,
+        );
+        let old =
+            ProtocolSchema::from_actor_type("Counter", &actor_type(vec![("get", get.clone())]))
+                .unwrap();
+        let new = ProtocolSchema::from_actor_type(
+            "Counter",
+            &actor_type(vec![("add", add), ("get", get)]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            new.compatibility_for_required(&old),
+            ProtocolCompatibility::ReceiverSuperset
+        );
+        assert!(new.can_serve(&old));
+        assert!(!old.can_serve(&new));
     }
 
     #[test]
