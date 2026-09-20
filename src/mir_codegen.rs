@@ -45,9 +45,12 @@ const SPILL_TEMP2: u8 = 13;
 #[allow(dead_code)]
 const SPILL_TEMP3: u8 = 14;
 
-/// Build the trusted entry facts used to seed bytecode JIT type inference.
+/// Build compiler-owned entry facts used to seed bytecode JIT type inference.
 ///
-/// Only incoming argument staging registers are seeded. Local static types are
+/// Only incoming argument staging registers are seeded. The tiered JIT guards
+/// these facts against live value tags before entering guard-stripped native
+/// code because public VM/FFI call boundaries can provide dynamic values.
+/// Local static types are
 /// not globally trusted as runtime representations because operations such as
 /// checked division can produce `nil` despite an `Int`/`Float` source type.
 /// MIR codegen immediately moves r0..rN into the function's fixed local
@@ -670,10 +673,10 @@ impl MirCodegen {
         let code_len = function_code.len();
         self.module.instructions.extend(function_code);
 
-        // Publish compiler-trusted entry representation facts for the tiered
-        // JIT. CodeModule deliberately skips these during serialization, so
-        // only bytecode produced by this compiler invocation can seed
-        // guard-stripped compilation.
+        // Publish compiler-owned entry representation facts for the tiered
+        // JIT. CodeModule deliberately skips these during serialization.
+        // Native execution additionally guards every assumed live type, so a
+        // dynamic VM/FFI caller with mismatched values deopts safely.
         let jit_seed = jit_entry_type_seed(func);
         if !jit_seed.is_empty() {
             self.module.jit_type_seeds.push((function_start, jit_seed));
