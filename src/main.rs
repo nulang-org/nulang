@@ -1141,7 +1141,9 @@ fn print_help() {
     println!("  --bench [N]      Benchmark: run N times (default 10), print timing stats");
     println!("  fmt [--check] [<file>]  Format file(s); no file → all src/**/*.nula");
     println!("  costs <FILE> [--json] [--deny-allocations]");
-    println!("                   Show static bytecode cost sites; optionally fail CI on allocations");
+    println!(
+        "                   Show static bytecode cost sites; optionally fail CI on allocations"
+    );
     println!("  -v, --verbose    Show bytecode and AST");
     println!("  --metrics-port <N>  Start Prometheus metrics server on port N");
     println!("  --emit-signals <file> Emit signal graph JSON for the web framework");
