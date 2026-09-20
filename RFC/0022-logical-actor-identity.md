@@ -74,6 +74,27 @@ Cross-process or cross-node enforcement is deliberately not claimed until the
 epoch is stored in the durable/distributed directory. Epoch history is keyed by
 the full `GrainId`, not solely by the compact 128-bit digest.
 
+### External authority handoff
+
+The local directory now also exposes an explicit bridge for a future Cloud or
+distributed ownership service:
+
+- `observe_authoritative_epoch(grain, epoch)` records a **strictly newer**
+  externally established epoch, invalidates any older live local activation,
+  and places the logical identity behind an external-authority fence.
+- while fenced, `resolve_or_activate` fails with `AuthorityRequired` instead of
+  autonomously inventing the next epoch;
+- `install_authoritative_activation(grain, epoch)` installs an epoch explicitly
+  granted by the ownership layer and rejects a grant older than the highest
+  epoch already observed.
+
+This is deliberately a **handoff API, not a consensus protocol**. The local
+runtime does not decide which node owns a logical actor. In particular, two
+nodes claiming the same epoch cannot be resolved by `ActivationDirectory`;
+lease/quorum/consensus policy above the runtime must select the owner before an
+activation grant is installed. Once a strictly newer epoch is observed, local
+work from an older epoch fails closed.
+
 ## Phase 1 implemented
 
 - Add canonical `GrainId` encoding.
@@ -81,6 +102,7 @@ the full `GrainId`, not solely by the compact 128-bit digest.
 - Add `ActivationHandle` with the current VM payload bound.
 - Add collision-free `ActivationDirectory` keyed by full `GrainId`.
 - Add local monotonic `ActivationEpoch` / `ActivationStamp` fencing across deactivation and reactivation.
+- Add an external-authority handoff that can fence an older local incarnation and require an explicit ownership grant before reactivation.
 - Preserve the historical `grain_actor_id` encoding exactly.
 - Add regression tests for canonical identity, stable logical IDs, handle bounds, directory bijection, and legacy-ID stability.
 
@@ -101,8 +123,11 @@ the full `GrainId`, not solely by the compact 128-bit digest.
 
 ### Phase 4 — distributed entity directory
 
-- Persist and replicate the last authoritative activation epoch with logical identity, node, and local activation handle.
-- Fence stale routes and stale commits using the replicated activation epoch.
+- Persist the authoritative ownership record keyed by full logical identity (or a collision-checked canonical representation), not the legacy 48-bit actor id.
+- Advance the ownership epoch only through the authoritative control-plane handoff and feed that grant into `install_authoritative_activation`.
+- Propagate strictly newer epochs to runtimes through `observe_authoritative_epoch` so stale local activations are invalidated before further work is admitted.
+- Carry the authoritative epoch on routes and durable commits and reject stale epochs at the persistence boundary.
+- Define an explicit equal-epoch conflicting-owner rule in the ownership service; local first-writer/arrival order is not sufficient distributed arbitration.
 - Re-resolve after node failure or migration rather than assuming actor-number permanence.
 
 ### Phase 5 — wire addressing
@@ -122,7 +147,10 @@ This RFC's first phase is additive. It does not change the NaN-boxed value ABI, 
 5. The legacy 48-bit FNV mapping remains byte-for-byte stable during the compatibility window.
 6. A reactivated full logical identity receives an epoch strictly greater than its prior local incarnation.
 7. A stale local activation stamp is rejected once a replacement activation becomes authoritative.
-8. Distributed routing must eventually persist and fence stale activations with generations/epochs.
+8. Once a runtime observes a strictly newer externally authoritative epoch, autonomous local reactivation is forbidden until an explicit authority grant is installed.
+9. An authority grant older than the highest observed epoch is rejected.
+10. Equal-epoch conflicting node claims are not resolved locally; the distributed ownership layer must select one owner before granting activation authority.
+11. Distributed routing and durable commits must eventually carry and enforce the authoritative epoch.
 
 ## Why not widen ActorRef immediately?
 
