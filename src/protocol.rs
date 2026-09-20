@@ -164,6 +164,104 @@ pub enum ProtocolCompatibilityIssue {
     EffectOrCapabilityContractChanged(String),
 }
 
+/// Trusted in-process catalog of canonical actor protocol schemas.
+///
+/// Exact protocol-id equality is self-authenticating for compatibility checks.
+/// Different ids require both canonical schemas so the runtime can prove a
+/// directional additive upgrade rather than guessing from names or versions.
+#[derive(Debug, Clone, Default)]
+pub struct ProtocolRegistry {
+    schemas: BTreeMap<ProtocolId, ProtocolSchema>,
+}
+
+impl ProtocolRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one canonical schema.
+    ///
+    /// Human-readable schema names are intentionally ignored for collision
+    /// detection because they are not part of ProtocolId. A pure rename of an
+    /// otherwise identical protocol therefore registers idempotently.
+    pub fn register(
+        &mut self,
+        schema: ProtocolSchema,
+    ) -> Result<ProtocolId, ProtocolRegistryError> {
+        let id = schema.id();
+        if let Some(existing) = self.schemas.get(&id) {
+            if existing.members != schema.members {
+                return Err(ProtocolRegistryError::HashCollision(id));
+            }
+            return Ok(id);
+        }
+        self.schemas.insert(id, schema);
+        Ok(id)
+    }
+
+    pub fn get(&self, id: ProtocolId) -> Option<&ProtocolSchema> {
+        self.schemas.get(&id)
+    }
+
+    pub fn contains(&self, id: ProtocolId) -> bool {
+        self.schemas.contains_key(&id)
+    }
+
+    /// Prove whether receiver can serve required.
+    ///
+    /// Exact ids need no registry lookup. Different ids require both schemas;
+    /// an unknown digest fails closed.
+    pub fn compatibility(
+        &self,
+        receiver: ProtocolId,
+        required: ProtocolId,
+    ) -> Result<ProtocolCompatibility, ProtocolRegistryError> {
+        if receiver == required {
+            return Ok(ProtocolCompatibility::Exact);
+        }
+
+        let receiver_schema = self
+            .schemas
+            .get(&receiver)
+            .ok_or(ProtocolRegistryError::UnknownProtocol(receiver))?;
+        let required_schema = self
+            .schemas
+            .get(&required)
+            .ok_or(ProtocolRegistryError::UnknownProtocol(required))?;
+
+        Ok(receiver_schema.compatibility_for_required(required_schema))
+    }
+
+    pub fn can_serve(
+        &self,
+        receiver: ProtocolId,
+        required: ProtocolId,
+    ) -> Result<bool, ProtocolRegistryError> {
+        Ok(self.compatibility(receiver, required)?.is_compatible())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolRegistryError {
+    UnknownProtocol(ProtocolId),
+    HashCollision(ProtocolId),
+}
+
+impl fmt::Display for ProtocolRegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtocolRegistryError::UnknownProtocol(id) => {
+                write!(f, "unknown actor protocol schema {id}")
+            }
+            ProtocolRegistryError::HashCollision(id) => {
+                write!(f, "actor protocol hash collision for {id}")
+            }
+        }
+    }
+}
+
+impl Error for ProtocolRegistryError {}
+
 impl ProtocolSchema {
     pub fn new(
         name: impl Into<String>,
@@ -1003,6 +1101,87 @@ mod tests {
         );
         assert!(new.can_serve(&old));
         assert!(!old.can_serve(&new));
+    }
+
+    #[test]
+    fn registry_exact_match_needs_no_schema_lookup() {
+        let schema =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let id = schema.id();
+        let registry = ProtocolRegistry::new();
+
+        assert_eq!(
+            registry.compatibility(id, id).unwrap(),
+            ProtocolCompatibility::Exact
+        );
+    }
+
+    #[test]
+    fn registry_proves_additive_receiver_compatibility() {
+        let old = ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let new = ProtocolSchema::new(
+            "Account",
+            [
+                member("Balance", vec![], money_ty()),
+                member("Deposit", vec![money_ty()], Type::unit()),
+            ],
+        )
+        .unwrap();
+
+        let old_id = old.id();
+        let new_id = new.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(old).unwrap();
+        registry.register(new).unwrap();
+
+        assert_eq!(
+            registry.compatibility(new_id, old_id).unwrap(),
+            ProtocolCompatibility::ReceiverSuperset
+        );
+        assert!(registry.can_serve(new_id, old_id).unwrap());
+        assert_eq!(
+            registry.compatibility(old_id, new_id).unwrap(),
+            ProtocolCompatibility::Incompatible
+        );
+    }
+
+    #[test]
+    fn registry_fails_closed_for_unknown_different_digest() {
+        let known =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let unknown = ProtocolSchema::new(
+            "Account",
+            [
+                member("Balance", vec![], money_ty()),
+                member("Deposit", vec![money_ty()], Type::unit()),
+            ],
+        )
+        .unwrap();
+
+        let known_id = known.id();
+        let unknown_id = unknown.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(known).unwrap();
+
+        assert_eq!(
+            registry.compatibility(known_id, unknown_id),
+            Err(ProtocolRegistryError::UnknownProtocol(unknown_id))
+        );
+    }
+
+    #[test]
+    fn registry_accepts_structurally_identical_schema_rename() {
+        let original =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let renamed =
+            ProtocolSchema::new("CustomerAccount", [member("Balance", vec![], money_ty())])
+                .unwrap();
+        assert_eq!(original.id(), renamed.id());
+
+        let mut registry = ProtocolRegistry::new();
+        let id = registry.register(original).unwrap();
+        assert_eq!(registry.register(renamed).unwrap(), id);
+        assert_eq!(registry.get(id).unwrap().name, "Account");
     }
 
     #[test]
