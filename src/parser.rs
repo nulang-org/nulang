@@ -899,6 +899,21 @@ impl Parser {
                     };
                     annotations.push(FunctionAnnotation::Placement(placement));
                 }
+                "hot" | "no_block" | "no_suspend" => {
+                    if !fields.is_empty() {
+                        return Err(NuError::parse_error(
+                            format!("@{} does not accept arguments", name),
+                            self.current_span(),
+                        ));
+                    }
+                    let contract = match name.as_str() {
+                        "hot" => PerformanceContract::Hot,
+                        "no_block" => PerformanceContract::NoBlock,
+                        "no_suspend" => PerformanceContract::NoSuspend,
+                        _ => unreachable!(),
+                    };
+                    annotations.push(FunctionAnnotation::Performance(contract));
+                }
                 _ => {
                     return Err(NuError::parse_error(
                         format!("Unknown function annotation: @{}", name),
