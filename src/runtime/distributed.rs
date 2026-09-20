@@ -2647,7 +2647,73 @@ fn intern_wire_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::network::IncomingPacket;
+    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Mutex;
+
+    struct QueueTransport {
+        node_id: NodeId,
+        listen_addr: SocketAddr,
+        incoming: Mutex<Vec<IncomingPacket>>,
+        sent: Mutex<Vec<Packet>>,
+    }
+
+    impl QueueTransport {
+        fn with_packet(node_id: NodeId, listen_addr: SocketAddr, packet: IncomingPacket) -> Self {
+            Self {
+                node_id,
+                listen_addr,
+                incoming: Mutex::new(vec![packet]),
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl NetworkTransport for QueueTransport {
+        fn connect(&mut self, _node_id: NodeId, _addr: SocketAddr) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn send(&mut self, _to_node: NodeId, _to_addr: SocketAddr, packet: Packet) {
+            self.sent.lock().unwrap().push(packet);
+        }
+
+        fn receive(&self) -> Vec<IncomingPacket> {
+            std::mem::take(&mut *self.incoming.lock().unwrap())
+        }
+
+        fn node_id(&self) -> NodeId {
+            self.node_id
+        }
+
+        fn listen_addr(&self) -> SocketAddr {
+            self.listen_addr
+        }
+
+        fn disconnect(&mut self, _node_id: NodeId) {}
+        fn shutdown(&mut self) {}
+        fn connection_count(&self) -> usize {
+            1
+        }
+        fn connection_addr(&self, _node_id: NodeId) -> Option<SocketAddr> {
+            Some(self.listen_addr)
+        }
+        fn set_partition(&mut self, _peers: HashSet<NodeId>) {}
+    }
+
+    fn compile_actor(source: &str) -> crate::bytecode::CodeModule {
+        let tokens = crate::lexer::Lexer::new(source).lex().expect("lex");
+        let ast = crate::parser::Parser::new(tokens)
+            .parse_module()
+            .expect("parse");
+        let mut typechecker = crate::typechecker::TypeChecker::new();
+        typechecker.check_module(&ast).expect("typecheck");
+        let hir = crate::hir_lower::lower_module(&ast, &typechecker.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir).expect("MIR lowering");
+        crate::mir_codegen::compile_mir(&mut mir, "distributed_protocol_test")
+            .expect("bytecode")
+    }
 
     /// Helper: create a loopback address on a given port.
     fn addr(port: u16) -> SocketAddr {
@@ -2998,6 +3064,112 @@ mod tests {
         assert!(string_table.is_empty());
         // The sender should now be in the cache.
         assert!(resolver.cache_mut().get(NodeId(9), 88).is_some());
+    }
+
+    #[test]
+    fn remote_protocol_gate_rejects_mismatch_before_mailbox_and_accepts_exact() {
+        let module = compile_actor(
+            r#"
+            actor Account {
+                behavior balance() -> Int { 0 }
+            }
+            "#,
+        );
+        let meta = module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Account")
+            .expect("Account metadata");
+        let target_protocol = meta.protocol_id.expect("target protocol");
+        let behavior_idx = meta.behavior_indices[0];
+
+        let wrong_module = compile_actor(
+            r#"
+            actor Inventory {
+                behavior count() -> Int { 0 }
+            }
+            "#,
+        );
+        let wrong_protocol = wrong_module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Inventory")
+            .and_then(|meta| meta.protocol_id)
+            .expect("wrong protocol");
+
+        let mut runtime = Runtime::new();
+        runtime.set_protocol_admission_policy(
+            crate::protocol::ProtocolAdmissionPolicy::StrictExact,
+        );
+        let target_actor = runtime
+            .spawn_from_module(&module, behavior_idx, vec![])
+            .as_actor_id()
+            .expect("actor id");
+        let before = runtime.actors.get(&target_actor).unwrap().mailbox.len();
+
+        let local_addr = addr(9400);
+        let local_node = NodeId::new(&local_addr);
+        let peer = NodeId(777);
+        let mut cluster = ClusterState::new(local_node, local_addr);
+        let mut resolver = AddressResolver::new(local_node);
+
+        let mismatch = Packet::ActorMessage {
+            target_actor,
+            behavior_name: "balance".into(),
+            content_hash: None,
+            protocol_id: Some(wrong_protocol),
+            payload: vec![],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 55,
+            sender_node: peer,
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        };
+        let mut transport = QueueTransport::with_packet(
+            local_node,
+            local_addr,
+            IncomingPacket {
+                from_node: peer,
+                seq: 1,
+                packet: mismatch,
+            },
+        );
+        process_network_packets(&mut runtime, &mut transport, &mut cluster, &mut resolver);
+        assert_eq!(
+            runtime.actors.get(&target_actor).unwrap().mailbox.len(),
+            before,
+            "protocol mismatch must be rejected before mailbox publication"
+        );
+
+        let exact = Packet::ActorMessage {
+            target_actor,
+            behavior_name: "balance".into(),
+            content_hash: None,
+            protocol_id: Some(target_protocol),
+            payload: vec![],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 55,
+            sender_node: peer,
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        };
+        let mut transport = QueueTransport::with_packet(
+            local_node,
+            local_addr,
+            IncomingPacket {
+                from_node: peer,
+                seq: 2,
+                packet: exact,
+            },
+        );
+        process_network_packets(&mut runtime, &mut transport, &mut cluster, &mut resolver);
+        assert_eq!(
+            runtime.actors.get(&target_actor).unwrap().mailbox.len(),
+            before + 1,
+            "exact protocol identity should admit the message"
+        );
     }
 
     // -- 12. DistributedRuntime trait compiles -------------------------------
