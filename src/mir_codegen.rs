@@ -2694,12 +2694,20 @@ mod tests {
         // honest error rather than silently aliasing onto an existing id.
         //
         // Each field name lives in its own top-level function's own tiny
-        // record literal, not a single 257-field record — a single record
-        // (or a chain of 257 `let`s) hits MIR's unrelated per-function local
-        // count cap first, which would mask the field_id check this test is
-        // actually targeting.
+        // record, not a single 257-field record — a single record (or a chain
+        // of 257 `let`s) hits MIR's unrelated per-function local count cap
+        // first, which would mask the field_id check this test is targeting.
+        //
+        // Keep the record in an ordinary named local so SROA deliberately
+        // preserves it for debugger visibility. Anonymous projection-only
+        // records are allowed to disappear completely and therefore should
+        // not consume a bytecode field id.
         let fns: Vec<String> = (0..257)
-            .map(|i| format!("fn g{i}() -> Int {{ {{ f{i}: {i} }}.f{i} }}"))
+            .map(|i| {
+                format!(
+                    "fn g{i}() -> Int {{ let record = {{ f{i}: {i} }} in record.f{i} }}"
+                )
+            })
             .collect();
         let source = format!("{}\ng0()", fns.join("\n"));
         let result = compile_mir_source(&source);
