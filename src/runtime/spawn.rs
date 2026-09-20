@@ -305,6 +305,7 @@ pub(crate) fn spawn_from_module(
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
         if let Some(meta) = meta {
+            actor.schema_version = meta.version;
             if matches!(role, ActorRole::Agent) {
                 // Legacy storage flag retained until the serialized role enum
                 // replaces the compatibility booleans.
