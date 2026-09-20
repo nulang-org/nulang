@@ -42,6 +42,10 @@ version + migration.*
 
 ## Stable tier
 
+### WASM FFI host authority — 2026-09-20
+- **Native FFI from the core Wasmtime runtime is now deny-by-default** (`src/wasm_runtime.rs`). `WasmRuntime::new` installs an empty authority manifest; `ffi_call_0..4` require an exact `FFI::Call(library::symbol)` grant before dynamic-library resolution. Embedders that have already validated an activation's authority can use `WasmRuntime::new_with_authority`. This preserves the existing guest import ABI while preventing ambient native FFI from bypassing the WASM sandbox.
+
+
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
