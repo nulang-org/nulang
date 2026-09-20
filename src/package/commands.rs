@@ -876,6 +876,30 @@ fn capability_args() -> Vec<String> {
     }
 }
 
+/// Build one canonical compiler argument vector for package-owned commands.
+///
+/// Every package build/run surface must use this helper (or intentionally
+/// document why it does not) so `[package].capabilities` has identical
+/// semantics across bytecode, JSON, WASM, web/dev, watch, and deployment
+/// compilation paths.
+fn package_compiler_args(args: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    out.extend(capability_args());
+    out
+}
+
+fn nulang_package_exe(args: &[&str]) -> NuResult<()> {
+    let owned = package_compiler_args(args);
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    nulang_exe(&refs)
+}
+
+fn nulang_package_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
+    let owned = package_compiler_args(args);
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    nulang_exe_output(&refs)
+}
+
 /// Try to find an already-built `nulang` CLI executable. Returns `None` if no
 /// standalone binary is available (e.g. during `cargo test --lib` where only
 /// the test harness exists).
@@ -1091,17 +1115,9 @@ fn cmd_build(json: bool) -> NuResult<()> {
 
     eprintln!("Building {}...", name);
     eprintln!("  Type-checking {}...", entry.display());
-    let caps = capability_args();
-    let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
-    nulang_exe(&[&["--check", &entry_str], &cap_refs[..]].concat())?;
+    nulang_package_exe(&["--check", &entry_str])?;
     eprintln!("  Compiling {} to .nbc...", name);
-    nulang_exe(
-        &[
-            &["--emit-nbc", "--out", &nbc_path_str, &entry_str],
-            &cap_refs[..],
-        ]
-        .concat(),
-    )?;
+    nulang_package_exe(&["--emit-nbc", "--out", &nbc_path_str, &entry_str])?;
     println!("Build succeeded.");
     Ok(())
 }
@@ -1117,7 +1133,7 @@ fn cmd_build_json(root: &Path, name: &str, entry_str: &str) -> NuResult<()> {
     // Step 1: type-check with JSON diagnostics, capturing the child's stdout.
     eprintln!("Building {}...", name);
     eprintln!("  Type-checking {}...", entry_str);
-    let check = nulang_exe_output(&["--json", "--check", entry_str])?;
+    let check = nulang_package_exe_output(&["--json", "--check", entry_str])?;
     if !check.status.success() {
         let stdout = String::from_utf8_lossy(&check.stdout);
         // Forward the child's structured diagnostics when parseable; fall
@@ -1157,7 +1173,8 @@ fn cmd_build_json(root: &Path, name: &str, entry_str: &str) -> NuResult<()> {
     let nbc_path = dist_dir.join(format!("{}.nbc", name));
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
     eprintln!("  Compiling {} to .nbc...", name);
-    let compile = nulang_exe_output(&["--emit-nbc", "--out", &nbc_path_str, entry_str])?;
+    let compile =
+        nulang_package_exe_output(&["--emit-nbc", "--out", &nbc_path_str, entry_str])?;
     if !compile.status.success() {
         let stderr = String::from_utf8_lossy(&compile.stderr).trim().to_string();
         let report = JsonReport::new(
@@ -1234,7 +1251,7 @@ fn cmd_build_wasm() -> NuResult<()> {
 
     eprintln!("Building {} (WASM AOT)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+    nulang_package_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
     println!("WASM AOT build succeeded.");
     Ok(())
 }
@@ -1244,9 +1261,7 @@ fn cmd_run() -> NuResult<()> {
     eprintln!("Building and running...");
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
-    let caps = capability_args();
-    let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
-    nulang_exe(&[&[entry_str.as_str()], &cap_refs[..]].concat())
+    nulang_package_exe(&[entry_str.as_str()])
 }
 
 /// `nula run --watch` (or `nula watch`): build, run, and re-run when source
@@ -1258,7 +1273,7 @@ fn cmd_run_watch() -> NuResult<()> {
 
     // Initial run
     eprintln!("Building and running...");
-    nulang_exe(&[&entry_str])?;
+    nulang_package_exe(&[&entry_str])?;
 
     // Collect initial mtimes for all .nula files under src/
     let src_dir = root.join("src");
@@ -1275,7 +1290,7 @@ fn cmd_run_watch() -> NuResult<()> {
             match prepare_package() {
                 Ok(entry) => {
                     let es = entry.to_string_lossy().into_owned();
-                    let _ = nulang_exe(&[&es]);
+                    let _ = nulang_package_exe(&[&es]);
                 }
                 Err(e) => {
                     let use_color = std::io::stderr().is_terminal();
@@ -1344,7 +1359,7 @@ fn cmd_build_web() -> NuResult<()> {
 
     eprintln!("Building {} (web)...", manifest.package.name);
     eprintln!("  Compiling {}...", entry.display());
-    nulang_exe(&[
+    nulang_package_exe(&[
         "--emit-nbc",
         "--out",
         &nbc_path_str,
@@ -1407,7 +1422,7 @@ fn cmd_build_web() -> NuResult<()> {
 
     // Emit compile-time signal graph if the entry uses `signal` declarations.
     let signals_path = output_dir.join("app.signals.json");
-    nulang_exe(&[
+    nulang_package_exe(&[
         "--emit-signals",
         &signals_path.to_string_lossy(),
         &entry_str,
@@ -1527,7 +1542,7 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
     let client_js_path = output_dir.join("app.client.js");
 
     eprintln!("Compiling {} for dev...", entry.display());
-    nulang_exe(&[
+    nulang_package_exe(&[
         "--emit-nbc",
         "--out",
         &nbc_path_str,
@@ -1561,7 +1576,7 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
             }
         })?;
 
-    nulang_exe(&[
+    nulang_package_exe(&[
         "--emit-signals",
         &signals_path.to_string_lossy(),
         &entry_str,
@@ -2232,14 +2247,14 @@ fn cmd_deploy(
     let nbc_path = nula_dist.join(format!("{}.nbc", name));
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
     eprintln!("Compiling {} to .nbc...", name);
-    nulang_exe(&["--emit-nbc", "--out", &nbc_path_str, &entry_str])?;
+    nulang_package_exe(&["--emit-nbc", "--out", &nbc_path_str, &entry_str])?;
 
     // Optionally build .wasm + .cwasm (WASM tier).
     if wasm {
         let wasm_path = nula_dist.join(format!("{}.wasm", name));
         let wasm_path_str = wasm_path.to_string_lossy().into_owned();
         eprintln!("Compiling {} to .wasm + .cwasm...", name);
-        nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+        nulang_package_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
     }
 
     // Bundle into .tar.gz: .nula/dist/ contents + dist/** + Nulang.toml + Nulang.lock.
