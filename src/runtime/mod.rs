@@ -1333,18 +1333,39 @@ impl Runtime {
             priority: MessagePriority::Normal,
             trace_id: trace_id.clone(),
         };
+        let overflow_policy = self
+            .actors
+            .get(&target_id)
+            .map(|actor| actor.mailbox.overflow_policy());
         if let Some(actor) = self.actors.get_mut(&target_id) {
-            if let Err(_dropped) = actor.mailbox.push_local(msg) {
-                self.route_to_dlq(
-                    &Message {
-                        behavior_id,
-                        payload: Arc::new(Vec::new()),
-                        sender,
-                        priority: MessagePriority::System,
-                        trace_id: None,
-                    },
-                    "mailbox full (cross-shard)",
-                );
+            if let Err(_rejected) = actor.mailbox.push_local(msg) {
+                match overflow_policy {
+                    Some(MailboxOverflowPolicy::DeadLetter) => {
+                        self.route_to_dlq(
+                            &Message {
+                                behavior_id,
+                                payload: Arc::new(Vec::new()),
+                                sender,
+                                priority: MessagePriority::System,
+                                trace_id: None,
+                            },
+                            "mailbox full (cross-shard)",
+                        );
+                    }
+                    Some(MailboxOverflowPolicy::RejectSender) => {
+                        // Cross-shard delivery is currently one-way, so this
+                        // rejection cannot yet be returned to the originating
+                        // shard. Keep it observable rather than silently
+                        // converting it into a DLQ delivery; an explicit
+                        // cross-shard admission reply is tracked by #456.
+                        warn!(
+                            target_id,
+                            behavior_id,
+                            "nulang-runtime: cross-shard mailbox rejected message under RejectSender policy"
+                        );
+                    }
+                    None => unreachable!("target actor existed when policy was read"),
+                }
             }
         } else {
             self.route_to_dlq(
@@ -2370,6 +2391,10 @@ impl Runtime {
             priority: MessagePriority::Normal,
             trace_id: out_trace.clone(),
         };
+        let overflow_policy = self
+            .actors
+            .get(&target_id)
+            .map(|actor| actor.mailbox.overflow_policy());
         let admission = if let Some(actor) = self.actors.get_mut(&target_id) {
             actor
                 .flight_recorder
@@ -2379,17 +2404,6 @@ impl Runtime {
                 actor.idle_ms = 0;
                 MessageAdmission::Accepted
             } else {
-                // Mailbox is full (capacity > 0). Route to DLQ with a simple notification.
-                self.route_to_dlq(
-                    &Message {
-                        behavior_id,
-                        payload: Arc::new(args.to_vec()),
-                        sender: self.current_actor.unwrap_or(0),
-                        priority: MessagePriority::System,
-                        trace_id: out_trace.clone(),
-                    },
-                    "mailbox full",
-                );
                 MessageAdmission::Backpressured
             }
         } else {
@@ -2405,6 +2419,21 @@ impl Runtime {
             );
             MessageAdmission::Rejected
         };
+
+        if admission == MessageAdmission::Backpressured
+            && overflow_policy == Some(MailboxOverflowPolicy::DeadLetter)
+        {
+            self.route_to_dlq(
+                &Message {
+                    behavior_id,
+                    payload: Arc::new(args.to_vec()),
+                    sender: self.current_actor.unwrap_or(0),
+                    priority: MessagePriority::System,
+                    trace_id: out_trace.clone(),
+                },
+                "mailbox full",
+            );
+        }
 
         if admission != MessageAdmission::Accepted {
             return admission;
