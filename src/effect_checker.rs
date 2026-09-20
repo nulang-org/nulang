@@ -1231,12 +1231,16 @@ impl EffectChecker {
                     PerformanceContract::Hot => false,
                     PerformanceContract::NoBlock => effect_may_block(effect),
                     PerformanceContract::NoSuspend => effect_may_suspend(effect),
+                    // Allocation freedom is a MIR property checked after
+                    // lowering and MIR optimization/inlining.
+                    PerformanceContract::NoAlloc => false,
                 });
                 if let Some(effect) = offending {
                     let contract_name = match contract {
                         PerformanceContract::Hot => "hot",
                         PerformanceContract::NoBlock => "no_block",
                         PerformanceContract::NoSuspend => "no_suspend",
+                        PerformanceContract::NoAlloc => "no_alloc",
                     };
                     return Err(NuError::EffectError {
                         msg: format!(
