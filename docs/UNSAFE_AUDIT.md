@@ -159,6 +159,30 @@ Excluded per instructions (findings noted only): `src/vm.rs` (F1, F2,
 F4-vm site), `src/aot/codegen.rs`, `src/mir_wasm.rs`,
 `src/integration_tests/mod.rs`.
 
+### F10 — LOW — direct JIT access to VM register storage
+`src/vm.rs::VM::try_jit_execute`, `src/backends/mod.rs::JitBackend::tiered_execute_value_regs`,
+and `src/jit/mod.rs`.
+
+**Status: MITIGATED (2026-09-20).** `Value` is now explicitly
+`#[repr(transparent)]` over one `u64`, allowing the built-in Cranelift ABI to
+operate directly on the current frame's 256-register storage without a
+copy-in/copy-out transition. The VM passes only a raw pointer; it does not
+construct a typed `&mut [u64; 256]` alias over `Value` objects.
+
+The direct pointer is sound only while the frame storage cannot move. Native
+direct Nulang calls are re-entrant and can push onto `VM::frames`, potentially
+reallocating that vector. `JitSession` therefore marks compiled regions with
+native direct calls as re-entrant and executes those regions against the
+legacy 256-word snapshot, copying results back after native execution.
+Non-reentrant regions use the direct pointer. Alternative `JitBackend`
+implementations inherit a copy-based default adapter unless they explicitly
+override the direct-register hook.
+
+**Invariant:** `tiered_execute_value_regs` receives a live, uniquely borrowed
+pointer to at least 256 `Value` slots for the duration of the call; direct
+execution is permitted only for regions that cannot re-enter the VM frame
+stack.
+
 ## Validation
 
 - `cargo test --no-default-features --lib`: baseline (pre-change) 1714
