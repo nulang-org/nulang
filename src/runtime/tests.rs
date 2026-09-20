@@ -13,6 +13,91 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+struct RuntimeForeignFake;
+
+impl crate::backends::ForeignInterop for RuntimeForeignFake {
+    fn call(
+        &mut self,
+        _module: &str,
+        _function: &str,
+        _args: &[Value],
+    ) -> Result<Value, String> {
+        Err("legacy path unused".to_string())
+    }
+
+    fn call_owned(&mut self, request: &ForeignCallRequest) -> ForeignCallResult {
+        Ok(OwnedForeignValue::String(format!(
+            "{}.{}",
+            request.module, request.function
+        )))
+    }
+
+    fn import(&mut self, _name: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn foreign_runtime_submission_routes_completion_to_actor() {
+    let mut rt = Runtime::new();
+    rt.install_foreign_executor(Box::new(RuntimeForeignFake), 4)
+        .unwrap();
+
+    let job_id = rt
+        .try_submit_foreign_call(
+            42,
+            ForeignCallRequest::new("math", "sqrt", vec![OwnedForeignValue::Float(81.0)]),
+        )
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let completion = loop {
+        if let Some(completion) = rt.poll_foreign_completions().into_iter().next() {
+            break completion;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "foreign completion did not arrive before deadline"
+        );
+        std::thread::yield_now();
+    };
+
+    assert_eq!(completion.job_id, job_id);
+    assert_eq!(completion.actor_id, Some(42));
+    assert_eq!(
+        completion.result,
+        Ok(OwnedForeignValue::String("math.sqrt".to_string()))
+    );
+}
+
+#[test]
+fn foreign_runtime_dispatch_fails_closed_when_unconfigured_or_reinstalled() {
+    let mut rt = Runtime::new();
+    let request = ForeignCallRequest::new("fake", "call", vec![]);
+    assert!(matches!(
+        rt.try_submit_foreign_call(1, request),
+        Err(ForeignDispatchError::NotConfigured)
+    ));
+
+    rt.install_foreign_executor(Box::new(RuntimeForeignFake), 1)
+        .unwrap();
+    assert!(matches!(
+        rt.install_foreign_executor(Box::new(RuntimeForeignFake), 1),
+        Err(ForeignDispatchError::AlreadyConfigured)
+    ));
+}
+
+#[test]
+fn foreign_runtime_rejects_invalid_executor_capacity() {
+    let mut rt = Runtime::new();
+    assert!(matches!(
+        rt.install_foreign_executor(Box::new(RuntimeForeignFake), 0),
+        Err(ForeignDispatchError::Config(
+            BlockingExecutorConfigError::ZeroQueueCapacity
+        ))
+    ));
+}
+
 #[test]
 fn test_authority_snapshot_round_trip_recovery() {
     let mut rt = Runtime::new();
