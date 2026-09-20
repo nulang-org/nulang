@@ -71,6 +71,55 @@ fn foreign_runtime_submission_routes_completion_to_actor() {
 }
 
 #[test]
+fn scheduler_waits_for_foreign_jobs_and_buffers_completion() {
+    let mut rt = Runtime::new();
+    rt.install_foreign_executor(Box::new(RuntimeForeignFake), 4)
+        .unwrap();
+
+    let job_id = rt
+        .try_submit_foreign_call(
+            77,
+            ForeignCallRequest::new("worker", "run", vec![]),
+        )
+        .unwrap();
+
+    assert_eq!(rt.foreign_inflight_count(), 1);
+    rt.run_scheduler();
+
+    assert_eq!(rt.foreign_inflight_count(), 0);
+    let completions = rt.poll_foreign_completions();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].job_id, job_id);
+    assert_eq!(completions[0].actor_id, Some(77));
+    assert_eq!(
+        completions[0].result,
+        Ok(OwnedForeignValue::String("worker.run".to_string()))
+    );
+}
+
+#[test]
+fn scheduler_completion_pump_is_non_destructive_until_consumer_poll() {
+    let mut rt = Runtime::new();
+    rt.install_foreign_executor(Box::new(RuntimeForeignFake), 4)
+        .unwrap();
+
+    rt.try_submit_foreign_call(
+        88,
+        ForeignCallRequest::new("worker", "buffer", vec![]),
+    )
+    .unwrap();
+
+    rt.run_scheduler();
+
+    // A scheduler pump has already consumed the worker channel, but the
+    // public poll must still receive the runtime-buffered completion.
+    let first = rt.poll_foreign_completions();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].actor_id, Some(88));
+    assert!(rt.poll_foreign_completions().is_empty());
+}
+
+#[test]
 fn foreign_runtime_dispatch_fails_closed_when_unconfigured_or_reinstalled() {
     let mut rt = Runtime::new();
     let request = ForeignCallRequest::new("fake", "call", vec![]);
