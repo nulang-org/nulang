@@ -52,6 +52,11 @@ two major versions.*
   behaviors are allowed. Parameter, return, effect, or capability changes are
   incompatible. V1 deliberately avoids implicit variance/default-field rules.
 
+- **Protocol schema registry** (Experimental, `src/protocol.rs`). A canonical
+  `ProtocolRegistry` maps structural `ProtocolId` values to trusted schemas so
+  different digests can be compared safely. Exact digest equality requires no
+  lookup; different digests require both schemas and unknown ids fail closed.
+
 ### Typed actor protocol checking — 2026-09-20
 - **Static protocol validation for known actor references** (Experimental,
   `src/actor_protocol.rs`, RFC 0023). Actor `send`/`ask` calls whose receiver
