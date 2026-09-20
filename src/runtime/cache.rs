@@ -1007,10 +1007,8 @@ impl CacheStore {
         }
         store.slots = (0..slot_len).map(|_| EntrySlot::default()).collect();
         store.free_slots.clear();
-        store.index = vec![
-            Bucket::EMPTY;
-            (live.len().max(DEFAULT_INDEX_CAPACITY) * 2).next_power_of_two()
-        ];
+        store.index =
+            vec![Bucket::EMPTY; (live.len().max(DEFAULT_INDEX_CAPACITY) * 2).next_power_of_two()];
         store.index_len = 0;
         store.tombstones = 0;
 
@@ -1024,9 +1022,9 @@ impl CacheStore {
                     CacheValue::Bytes(PackedBytes::pack(bytes, &mut store.arena))
                 }
             };
-            let expires_at_ms = durable.expires_unix_ms.map(|deadline| {
-                now_ms.saturating_add(deadline.saturating_sub(wall_now_unix_ms))
-            });
+            let expires_at_ms = durable
+                .expires_unix_ms
+                .map(|deadline| now_ms.saturating_add(deadline.saturating_sub(wall_now_unix_ms)));
             store.slots[slot_id as usize] = EntrySlot {
                 generation: durable.token.source_generation,
                 entry: Some(Entry {
@@ -1634,8 +1632,7 @@ mod tests {
         let ttl_token = store.transfer_token_for_key(b"ttl", 200).unwrap();
         let snapshot = store.export_durable_entries(200, 10_000);
 
-        let mut restored =
-            CacheStore::restore_durable_entries(&snapshot, 50, 11_000).unwrap();
+        let mut restored = CacheStore::restore_durable_entries(&snapshot, 50, 11_000).unwrap();
         assert_eq!(
             restored.get(b"persistent", 50),
             Some(CacheValueView::Bytes(b"value"))
@@ -1645,10 +1642,7 @@ mod tests {
             restored.transfer_token_for_key(b"persistent", 50),
             Some(persistent_token)
         );
-        assert_eq!(
-            restored.transfer_token_for_key(b"ttl", 50),
-            Some(ttl_token)
-        );
+        assert_eq!(restored.transfer_token_for_key(b"ttl", 50), Some(ttl_token));
         assert_eq!(restored.ttl(b"ttl", 50), CacheTtl::RemainingMs(3_900));
     }
 
@@ -1674,15 +1668,13 @@ mod tests {
             .unwrap();
         let snapshot = source.export_durable_entries(0, 10_000);
 
-        let mut restored =
-            CacheStore::restore_durable_entries(&snapshot, 0, 10_100).unwrap();
+        let mut restored = CacheStore::restore_durable_entries(&snapshot, 0, 10_100).unwrap();
         assert_eq!(
             restored.finalize_transfer_entry(&exported, 0),
             CacheTransferFinalize::Removed
         );
 
-        let mut restored =
-            CacheStore::restore_durable_entries(&snapshot, 0, 10_100).unwrap();
+        let mut restored = CacheStore::restore_durable_entries(&snapshot, 0, 10_100).unwrap();
         restored.set_bytes(b"k{durable}", b"new", None, 1);
         assert_eq!(
             restored.finalize_transfer_entry(&exported, 1),
