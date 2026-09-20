@@ -50,7 +50,7 @@ two major versions.*
   (Experimental, `src/witgen.rs`, `src/effect_checker.rs`, `src/main.rs`).
   `nulang --emit-wit <out.wit> <file.nula>` runs the normal frontend and
   derives component imports from checked effect rows instead of scanning source
-  text for `perform` strings. Authority collection includes module functions,
+  text for `perform` strings. Effect collection includes module functions,
   actor behaviors/initializers/state defaults, desugared state machines, and
   workflow steps/compensations. Open rows and effects without a complete WIT
   mapping fail closed rather than silently disappearing from the manifest.
