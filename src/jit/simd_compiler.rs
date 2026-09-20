@@ -1271,6 +1271,126 @@ mod simd_compiler_tests {
         }
     }
 
+    #[test]
+    fn test_simd_i64x2_executes_on_tagged_value_arrays() {
+        use crate::runtime::heap::{ActorHeap, TypeTag};
+        use crate::vm::Value as NuValue;
+
+        const LEN: usize = 4;
+        let mut heap = ActorHeap::new(4096);
+        heap.set_actor_id(0);
+
+        let bytes = LEN * std::mem::size_of::<NuValue>();
+        let lhs = heap.alloc(bytes, TypeTag::Array).expect("lhs array");
+        let rhs = heap.alloc(bytes, TypeTag::Array).expect("rhs array");
+        let dst = heap.alloc(bytes, TypeTag::Array).expect("dst array");
+
+        unsafe {
+            let lhs_slots = std::slice::from_raw_parts_mut(lhs as *mut NuValue, LEN);
+            let rhs_slots = std::slice::from_raw_parts_mut(rhs as *mut NuValue, LEN);
+            let dst_slots = std::slice::from_raw_parts_mut(dst as *mut NuValue, LEN);
+            for (idx, slot) in lhs_slots.iter_mut().enumerate() {
+                *slot = NuValue::int((idx as i64) + 1);
+            }
+            for (idx, slot) in rhs_slots.iter_mut().enumerate() {
+                *slot = NuValue::int(((idx as i64) + 1) * 10);
+            }
+            for slot in dst_slots.iter_mut() {
+                *slot = NuValue::int(-1);
+            }
+        }
+
+        let region = SimdRegion {
+            start_offset: 0,
+            num_instrs: 7,
+            pattern: VectorizablePattern::ElementWiseBinop {
+                op: BinopKind::IAdd,
+                lhs_arr_reg: 10,
+                rhs_arr_reg: 11,
+                dst_arr_reg: 12,
+                lhs_elem_reg: 4,
+                rhs_elem_reg: 5,
+                result_reg: 6,
+            },
+            width: SimdWidth::Width2,
+            elem_type: SimdElemType::Int64,
+            induction_var_reg: 3,
+            array_regs: vec![10, 11, 12],
+            trip_count_hint: Some(0),
+            trip_count_array_reg: Some(10),
+        };
+
+        let instructions = vec![
+            Instruction::new2(OpCode::ArrLen, 10, 13),
+            Instruction::new3(OpCode::ArrLoad, 10, 3, 4),
+            Instruction::new3(OpCode::ArrLoad, 11, 3, 5),
+            Instruction::new3(OpCode::IAdd, 4, 5, 6),
+            Instruction::new3(OpCode::ArrStore, 12, 3, 6),
+            Instruction::new1(OpCode::IInc, 3),
+            Instruction::new3(OpCode::ICmpLt, 3, 13, 7),
+        ];
+
+        let mut jit = make_jit();
+        let ptr = compile_simd_region(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_simd_i64x2_executes_tagged",
+            &instructions,
+            &region,
+        )
+        .expect("SIMD compile");
+
+        let mut regs = [NuValue::nil().to_bits(); 256];
+        regs[10] = unsafe { NuValue::ptr(lhs) }.to_bits();
+        regs[11] = unsafe { NuValue::ptr(rhs) }.to_bits();
+        regs[12] = unsafe { NuValue::ptr(dst) }.to_bits();
+        // Deliberately leave r13 nil. The old implementation tried to read
+        // the skipped ArrLen destination register here and therefore could
+        // not derive a valid trip count on a fresh frame.
+
+        let func: crate::jit::JitFunctionPtr = unsafe { std::mem::transmute(ptr) };
+        func(regs.as_mut_ptr(), std::ptr::null());
+
+        let values = unsafe { std::slice::from_raw_parts(dst as *const NuValue, LEN) };
+        let ints: Vec<i64> = values
+            .iter()
+            .map(|v| v.as_int().expect("SIMD output must stay TAG_INT"))
+            .collect();
+        assert_eq!(ints, vec![11, 22, 33, 44]);
+    }
+
+    #[test]
+    fn test_native_simd_support_matches_value_array_representation() {
+        let i64 = make_i64_binop_region(BinopKind::IAdd);
+        assert!(native_simd_codegen_supported(&i64));
+
+        let mut i32 = i64.clone();
+        i32.elem_type = SimdElemType::Int32;
+        i32.width = SimdWidth::Width4;
+        assert!(!native_simd_codegen_supported(&i32));
+
+        let mut div = i64.clone();
+        if let VectorizablePattern::ElementWiseBinop { op, .. } = &mut div.pattern {
+            *op = BinopKind::IDiv;
+        }
+        assert!(!native_simd_codegen_supported(&div));
+
+        let cmp = SimdRegion {
+            pattern: VectorizablePattern::ElementWiseCmp {
+                op: CmpKind::ICmpLt,
+                lhs_arr_reg: 10,
+                rhs_arr_reg: 11,
+                dst_arr_reg: 12,
+                lhs_elem_reg: 1,
+                rhs_elem_reg: 2,
+                result_reg: 3,
+            },
+            ..i64
+        };
+        assert!(!native_simd_codegen_supported(&cmp));
+    }
+
     // ------------------------------------------------------------------
     // Test 1: I64x2 (Int64) addition compiles
     // ------------------------------------------------------------------
