@@ -499,7 +499,8 @@ impl JitSession {
                 self.compiled
                     .insert((module_idx, start_offset), (ptr, num_instrs));
                 Some(std::mem::transmute(ptr))
-            }            Err(_) => self.compile_region_typed(
+            }
+            Err(_) => self.compile_region_typed(
                 module_idx,
                 start_offset,
                 num_instrs,
@@ -1009,7 +1010,8 @@ impl crate::backends::JitBackend for JitSession {
         }
         let row = &mut self.hot_counts[module_idx];
         if pc >= row.len() {
-            let new_len = (pc + 1).max(row.len().max(1) * 2);            row.resize(new_len, 0);
+            let new_len = (pc + 1).max(row.len().max(1) * 2);
+            row.resize(new_len, 0);
         }
         let count = &mut row[pc];
         *count += 1;
