@@ -12,17 +12,20 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 
 use super::cache::CacheStore;
-use super::cache_cluster::CacheRoutingMode;
+use super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap, CacheRoutingMode};
 use super::cache_dispatch::{
-    CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher, CacheShardInbox,
+    CacheDispatchChannels, CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher,
+    CacheShardInbox,
 };
 use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
+use super::cache_routing::{CachePlacementError, CacheShardOwner, CacheSlotMap};
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
@@ -126,6 +129,327 @@ impl CacheDispatchWake for Waker {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CacheServiceShardConfig {
+    pub bind_addr: SocketAddr,
+    pub advertised_host: String,
+    pub advertised_port: Option<u16>,
+    pub cpu: Option<usize>,
+}
+
+impl CacheServiceShardConfig {
+    pub fn new(bind_addr: SocketAddr, advertised_host: impl Into<String>) -> Self {
+        Self {
+            bind_addr,
+            advertised_host: advertised_host.into(),
+            advertised_port: None,
+            cpu: None,
+        }
+    }
+
+    /// Override the port published in MOVED / CLUSTER topology responses.
+    ///
+    /// By default the service publishes the listener's actual bound port,
+    /// which also makes bind port 0 useful for tests and dynamic allocation.
+    pub fn with_advertised_port(mut self, port: u16) -> Self {
+        self.advertised_port = Some(port);
+        self
+    }
+
+    /// Best-effort pin of this shard reactor to a logical CPU.
+    pub fn pin_to_cpu(mut self, cpu: usize) -> Self {
+        self.cpu = Some(cpu);
+        self
+    }
+}
+
+#[derive(Debug)]
+pub enum CacheServiceError {
+    Io(io::Error),
+    Placement(CachePlacementError),
+    DispatchConfig(CacheDispatchConfigError),
+    NoShards,
+    TooManyShards,
+    MissingLocalShard(u16),
+    MissingEndpoint(CacheShardOwner),
+    ShardServer {
+        shard: u16,
+        source: CacheServerError,
+    },
+    ThreadPanicked(u16),
+}
+
+impl From<io::Error> for CacheServiceError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<CachePlacementError> for CacheServiceError {
+    fn from(value: CachePlacementError) -> Self {
+        Self::Placement(value)
+    }
+}
+
+impl From<CacheDispatchConfigError> for CacheServiceError {
+    fn from(value: CacheDispatchConfigError) -> Self {
+        Self::DispatchConfig(value)
+    }
+}
+
+pub struct CacheServiceBuilder {
+    local_node_id: u64,
+    placement: CacheSlotMap,
+    endpoints: CacheEndpointMap,
+    shards: Vec<CacheServiceShardConfig>,
+    queue_capacity: usize,
+    server_config: CacheServerConfig,
+}
+
+impl CacheServiceBuilder {
+    pub fn new(local_node_id: u64, placement: CacheSlotMap) -> Self {
+        Self {
+            local_node_id,
+            placement,
+            endpoints: CacheEndpointMap::new(),
+            shards: Vec::new(),
+            queue_capacity: 1024,
+            server_config: CacheServerConfig::default(),
+        }
+    }
+
+    /// Convenience builder for a process that initially owns all Redis slots.
+    pub fn local(local_node_id: u64, shard_count: u16) -> Result<Self, CacheServiceError> {
+        Ok(Self::new(
+            local_node_id,
+            CacheSlotMap::new_local(local_node_id, shard_count)?,
+        ))
+    }
+
+    pub fn with_queue_capacity(mut self, queue_capacity: usize) -> Self {
+        self.queue_capacity = queue_capacity;
+        self
+    }
+
+    pub fn with_server_config(mut self, server_config: CacheServerConfig) -> Self {
+        self.server_config = server_config;
+        self
+    }
+
+    /// Register an already-known endpoint, normally for a remote shard.
+    pub fn with_endpoint(
+        mut self,
+        owner: CacheShardOwner,
+        endpoint: CacheAdvertisedEndpoint,
+    ) -> Self {
+        self.endpoints.insert(owner, endpoint);
+        self
+    }
+
+    /// Add one local physical shard. Vector order defines the local shard id.
+    pub fn with_shard(mut self, shard: CacheServiceShardConfig) -> Self {
+        self.shards.push(shard);
+        self
+    }
+
+    pub fn build(self) -> Result<CacheService, CacheServiceError> {
+        if self.shards.is_empty() {
+            return Err(CacheServiceError::NoShards);
+        }
+        let shard_count =
+            u16::try_from(self.shards.len()).map_err(|_| CacheServiceError::TooManyShards)?;
+
+        for range in self.placement.slot_ranges() {
+            if range.owner.node_id == self.local_node_id && range.owner.shard >= shard_count {
+                return Err(CacheServiceError::MissingLocalShard(range.owner.shard));
+            }
+        }
+
+        let (channels, inboxes) =
+            CacheDispatchChannels::new(shard_count, self.queue_capacity)?;
+
+        // Bind every listener before constructing any dispatcher. This makes
+        // actual port-0 allocations available to every shard's topology view.
+        let mut endpoints = self.endpoints;
+        let mut reserved = Vec::with_capacity(self.shards.len());
+        for (index, shard) in self.shards.iter().enumerate() {
+            let listener = TcpListener::bind(shard.bind_addr)?;
+            let local_addr = listener.local_addr()?;
+            let advertised_port = shard.advertised_port.unwrap_or(local_addr.port());
+            let owner = CacheShardOwner {
+                node_id: self.local_node_id,
+                shard: index as u16,
+            };
+            endpoints.insert(
+                owner,
+                CacheAdvertisedEndpoint::new(&shard.advertised_host, advertised_port),
+            );
+            reserved.push((listener, local_addr, shard.cpu));
+        }
+
+        // Fail closed before starting any reactor if the placement references
+        // an owner that cannot be advertised to a cluster-aware client.
+        for range in self.placement.slot_ranges() {
+            if endpoints.get(range.owner).is_none() {
+                return Err(CacheServiceError::MissingEndpoint(range.owner));
+            }
+        }
+
+        let clock = CacheServerClock::new();
+        let mut servers = Vec::with_capacity(self.shards.len());
+        let mut local_addrs = Vec::with_capacity(self.shards.len());
+        let mut cpus = Vec::with_capacity(self.shards.len());
+
+        for (index, ((listener, local_addr, cpu), inbox)) in
+            reserved.into_iter().zip(inboxes.into_iter()).enumerate()
+        {
+            let shard = index as u16;
+            let dispatcher = CacheDispatcher::new(
+                self.local_node_id,
+                shard,
+                self.placement.clone(),
+                channels.clone(),
+            )?
+            .with_cluster_redirects(endpoints.clone());
+
+            let server = CacheShardServer::from_listener(
+                listener,
+                dispatcher,
+                inbox,
+                CacheStore::new(),
+                self.server_config.clone(),
+                clock.clone(),
+            )
+            .map_err(|source| CacheServiceError::ShardServer { shard, source })?;
+
+            servers.push(server);
+            local_addrs.push(local_addr);
+            cpus.push(cpu);
+        }
+
+        Ok(CacheService {
+            servers,
+            local_addrs,
+            endpoints,
+            cpus,
+        })
+    }
+}
+
+pub struct CacheService {
+    servers: Vec<CacheShardServer>,
+    local_addrs: Vec<SocketAddr>,
+    endpoints: CacheEndpointMap,
+    cpus: Vec<Option<usize>>,
+}
+
+impl CacheService {
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.local_addrs
+    }
+
+    pub fn endpoints(&self) -> &CacheEndpointMap {
+        &self.endpoints
+    }
+
+    pub fn start(self) -> Result<CacheServiceHandle, CacheServiceError> {
+        let controls: Vec<_> = self.servers.iter().map(CacheShardServer::control).collect();
+        let mut threads: Vec<(u16, JoinHandle<Result<(), CacheServerError>>)> =
+            Vec::with_capacity(self.servers.len());
+
+        for (index, (mut server, cpu)) in
+            self.servers.into_iter().zip(self.cpus.into_iter()).enumerate()
+        {
+            let shard = index as u16;
+            let spawn = thread::Builder::new()
+                .name(format!("nulang-cache-{shard}"))
+                .spawn(move || {
+                    if let Some(cpu) = cpu {
+                        let _ = super::scheduler::pin_current_thread_to_cpu(cpu);
+                    }
+                    server.run()
+                });
+
+            match spawn {
+                Ok(handle) => threads.push((shard, handle)),
+                Err(error) => {
+                    for control in &controls {
+                        control.shutdown();
+                    }
+                    for (_, handle) in threads {
+                        let _ = handle.join();
+                    }
+                    return Err(CacheServiceError::Io(error));
+                }
+            }
+        }
+
+        Ok(CacheServiceHandle {
+            controls,
+            threads,
+            local_addrs: self.local_addrs,
+            endpoints: self.endpoints,
+        })
+    }
+}
+
+pub struct CacheServiceHandle {
+    controls: Vec<CacheShardServerControl>,
+    threads: Vec<(u16, JoinHandle<Result<(), CacheServerError>>)>,
+    local_addrs: Vec<SocketAddr>,
+    endpoints: CacheEndpointMap,
+}
+
+impl CacheServiceHandle {
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.local_addrs
+    }
+
+    pub fn endpoints(&self) -> &CacheEndpointMap {
+        &self.endpoints
+    }
+
+    pub fn request_shutdown(&self) {
+        for control in &self.controls {
+            control.shutdown();
+        }
+    }
+
+    /// Stop every shard and join every reactor thread.
+    ///
+    /// All threads are joined even when more than one fails; the first error
+    /// is returned after the full service has quiesced.
+    pub fn shutdown(mut self) -> Result<(), CacheServiceError> {
+        self.request_shutdown();
+        self.join_threads()
+    }
+
+    fn join_threads(&mut self) -> Result<(), CacheServiceError> {
+        let mut first_error = None;
+        for (shard, handle) in self.threads.drain(..) {
+            let result = match handle.join() {
+                Ok(Ok(())) => None,
+                Ok(Err(source)) => Some(CacheServiceError::ShardServer { shard, source }),
+                Err(_) => Some(CacheServiceError::ThreadPanicked(shard)),
+            };
+            if first_error.is_none() {
+                first_error = result;
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for CacheServiceHandle {
+    fn drop(&mut self) {
+        self.request_shutdown();
+        let _ = self.join_threads();
+    }
+}
+
 struct CacheConnection {
     stream: TcpStream,
     input: Vec<u8>,
@@ -222,6 +546,18 @@ impl CacheShardServer {
         config: CacheServerConfig,
         clock: CacheServerClock,
     ) -> Result<Self, CacheServerError> {
+        let listener = TcpListener::bind(bind_addr)?;
+        Self::from_listener(listener, dispatcher, inbox, store, config, clock)
+    }
+
+    fn from_listener(
+        mut listener: TcpListener,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        store: CacheStore,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+    ) -> Result<Self, CacheServerError> {
         validate_config(&config)?;
         if dispatcher.routing_mode() != CacheRoutingMode::Redirect {
             return Err(CacheServerError::RedirectModeRequired);
@@ -235,8 +571,7 @@ impl CacheShardServer {
             ));
         }
 
-        let mut poll = Poll::new()?;
-        let mut listener = TcpListener::bind(bind_addr)?;
+        let poll = Poll::new()?;
         poll.registry()
             .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)?;
 
@@ -667,6 +1002,93 @@ mod tests {
             CacheServerClock::new(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn service_builder_publishes_real_ephemeral_ports() {
+        let service = CacheServiceBuilder::local(11, 2)
+            .unwrap()
+            .with_shard(CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            ))
+            .with_shard(CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            ))
+            .build()
+            .unwrap();
+
+        assert_eq!(service.local_addrs().len(), 2);
+        assert_ne!(service.local_addrs()[0].port(), 0);
+        assert_ne!(service.local_addrs()[1].port(), 0);
+        assert_ne!(service.local_addrs()[0], service.local_addrs()[1]);
+
+        for shard in 0..2 {
+            let owner = CacheShardOwner {
+                node_id: 11,
+                shard,
+            };
+            let endpoint = service.endpoints().get(owner).unwrap();
+            assert_eq!(
+                endpoint.port(),
+                service.local_addrs()[shard as usize].port()
+            );
+        }
+    }
+
+    #[test]
+    fn service_redirects_to_the_reserved_peer_endpoint() {
+        let placement = CacheSlotMap::new_local(23, 2).unwrap();
+        let mut key = None;
+        for index in 0..10_000 {
+            let candidate = format!("peer-key-{index}").into_bytes();
+            if placement.owner_for_key(&candidate).shard == 1 {
+                key = Some(candidate);
+                break;
+            }
+        }
+        let key = key.expect("key for shard one");
+
+        let service = CacheServiceBuilder::new(23, placement)
+            .with_shard(CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            ))
+            .with_shard(CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            ))
+            .build()
+            .unwrap();
+        let expected_port = service.local_addrs()[1].port();
+        let handle = service.start().unwrap();
+
+        let mut client = StdTcpStream::connect(handle.local_addrs()[0]).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let mut request = format!("*2\r\n$3\r\nGET\r\n${}\r\n", key.len()).into_bytes();
+        request.extend_from_slice(&key);
+        request.extend_from_slice(b"\r\n");
+        client.write_all(&request).unwrap();
+
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            client.read_exact(&mut byte).unwrap();
+            response.push(byte[0]);
+            if response.ends_with(b"\r\n") {
+                break;
+            }
+        }
+
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("-MOVED "));
+        assert!(response.ends_with(&format!(" 127.0.0.1:{expected_port}\r\n")));
+
+        handle.shutdown().unwrap();
     }
 
     #[test]
