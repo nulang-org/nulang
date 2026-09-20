@@ -229,6 +229,7 @@ enum CacheRemoteControlError {
     OwnerMismatch,
     InvalidFrame,
     Parse(RespParseError),
+    Durability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2945,6 +2946,12 @@ fn send_cache_transport_outbound(
     }
 }
 
+#[derive(Debug)]
+struct CacheWalCapture {
+    wall_unix_ms: u64,
+    before: Vec<(Vec<u8>, Option<CacheDurableEntry>)>,
+}
+
 struct CacheConnection {
     stream: TcpStream,
     input: Vec<u8>,
@@ -3035,6 +3042,7 @@ pub struct CacheShardServer {
     control_tx: SyncSender<CacheShardControlRequest>,
     control_rx: Receiver<CacheShardControlRequest>,
     transfer_imports: HashMap<u16, CacheTransferImportState>,
+    wal: Option<CacheWal>,
 }
 
 impl CacheShardServer {
@@ -3047,7 +3055,16 @@ impl CacheShardServer {
         clock: CacheServerClock,
     ) -> Result<Self, CacheServerError> {
         let listener = TcpListener::bind(bind_addr)?;
-        Self::from_listener(listener, dispatcher, inbox, store, config, clock, None)
+        Self::from_listener(
+            listener,
+            dispatcher,
+            inbox,
+            store,
+            config,
+            clock,
+            None,
+            None,
+        )
     }
 
     fn from_listener(
@@ -3058,6 +3075,7 @@ impl CacheShardServer {
         config: CacheServerConfig,
         clock: CacheServerClock,
         placement_publisher: Option<Arc<CachePlacementPublisher>>,
+        wal: Option<CacheWal>,
     ) -> Result<Self, CacheServerError> {
         validate_config(&config)?;
         if dispatcher.routing_mode() != CacheRoutingMode::Redirect {
@@ -3104,6 +3122,7 @@ impl CacheShardServer {
             control_tx,
             control_rx,
             transfer_imports: HashMap::new(),
+            wal,
         })
     }
 
@@ -3314,9 +3333,95 @@ impl CacheShardServer {
                 let _ = reply.send(());
             }
             CacheShardControlRequest::WriteSnapshot { path, reply } => {
-                let _ = reply.send(write_cache_snapshot(path, &self.store, now_ms));
+                let checkpoint_lsn = self.wal.as_ref().map(CacheWal::last_lsn).unwrap_or(0);
+                let _ = reply.send(write_cache_snapshot_at_lsn(
+                    path,
+                    &self.store,
+                    now_ms,
+                    checkpoint_lsn,
+                ));
             }
         }
+    }
+
+    fn capture_wal_state(
+        &mut self,
+        command: super::resp::RespCommand<'_>,
+        now_ms: u64,
+    ) -> Result<Option<CacheWalCapture>, CacheWalError> {
+        if self.wal.is_none() {
+            return Ok(None);
+        }
+        let keys = command_mutation_keys(command);
+        if keys.is_empty() {
+            return Ok(None);
+        }
+
+        let wall_unix_ms = wal_current_unix_ms()?;
+        let mut before = Vec::with_capacity(keys.len());
+        for key in keys {
+            if before
+                .iter()
+                .any(|(existing, _): &(Vec<u8>, Option<CacheDurableEntry>)| {
+                    existing.as_slice() == key
+                })
+            {
+                continue;
+            }
+            before.push((
+                key.to_vec(),
+                self.store
+                    .durable_entry_for_key(key, now_ms, wall_unix_ms),
+            ));
+        }
+        Ok(Some(CacheWalCapture {
+            wall_unix_ms,
+            before,
+        }))
+    }
+
+    fn persist_wal_state(
+        &mut self,
+        capture: Option<CacheWalCapture>,
+        now_ms: u64,
+    ) -> Result<(), CacheWalError> {
+        let Some(capture) = capture else {
+            return Ok(());
+        };
+        let Some(wal) = self.wal.as_mut() else {
+            return Ok(());
+        };
+
+        let mut mutations = Vec::new();
+        for (key, before) in capture.before {
+            let after = self
+                .store
+                .durable_entry_for_key(&key, now_ms, capture.wall_unix_ms);
+            if before == after {
+                continue;
+            }
+            match (before, after) {
+                (_, Some(entry)) => mutations.push(CacheWalMutation::Upsert(entry)),
+                (Some(entry), None) => mutations.push(CacheWalMutation::Delete {
+                    key,
+                    token: entry.token,
+                }),
+                (None, None) => {}
+            }
+        }
+
+        if !mutations.is_empty() {
+            wal.append_batch(mutations, CacheWalSync::Fsync)?;
+        }
+        Ok(())
+    }
+
+    fn fail_durability(&self, error: &CacheWalError) {
+        tracing::error!(
+            "nulang-cache: fatal shard WAL failure; stopping reactor: {:?}",
+            error
+        );
+        self.shutdown.store(true, Ordering::Release);
     }
 
     fn execute_remote_command(
@@ -3351,8 +3456,18 @@ impl CacheShardServer {
             return Err(CacheRemoteControlError::InvalidFrame);
         }
 
+        let capture = self
+            .capture_wal_state(command, now_ms)
+            .map_err(|error| {
+                self.fail_durability(&error);
+                CacheRemoteControlError::Durability
+            })?;
         let mut out = Vec::with_capacity(128);
         execute_command(&mut self.store, command, now_ms, &mut out);
+        self.persist_wal_state(capture, now_ms).map_err(|error| {
+            self.fail_durability(&error);
+            CacheRemoteControlError::Durability
+        })?;
         Ok(out)
     }
 
