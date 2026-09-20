@@ -219,7 +219,7 @@ pub(crate) fn emit_yield_pc(
 /// runs on the interpreter frame stack). Any other `Call` in the region is a
 /// compile error — `find_compilable_region_with_calls` only accepts regions
 /// whose `Call` sites are all in this map.
-pub fn compile_bytecode_region(
+pub(crate) fn compile_bytecode_region(
     module: &mut JITModule,
     builder_context: &mut FunctionBuilderContext,
     ctx: &mut codegen::Context,
