@@ -1476,6 +1476,27 @@ impl NuWarning {
         }
     }
 
+    /// `W0201` — a statically-known closed variant match omits one or more
+    /// constructors. This remains a warning in v1.x because hard rejection
+    /// would invalidate programs accepted by the Frozen Core.
+    pub fn non_exhaustive_variant_match(span: Span, missing: &[String]) -> Self {
+        let plural = if missing.len() == 1 { "variant" } else { "variants" };
+        NuWarning {
+            code: "W0201",
+            msg: format!(
+                "non-exhaustive match: missing {} {}",
+                plural,
+                missing.join(", ")
+            ),
+            span,
+            help: Some(
+                "add the missing constructor arm(s) or an unguarded `_` catch-all; \
+                 use --deny-warnings when strict totality is required"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Plain-text one-line rendering, used when no SourceMap is installed.
     pub fn format_plain(&self) -> String {
         let mut out = format!("warning[{}]: {}", self.code, self.msg);
