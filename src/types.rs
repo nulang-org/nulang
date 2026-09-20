@@ -832,9 +832,11 @@ impl Type {
     /// protocol/state metadata collapse to the stable runtime actor shape.
     ///
     /// This is recursive so nested occurrences such as
-    /// `Option[ActorRef[P]]`, tuples, records, and function signatures cannot
-    /// leak protocol metadata into MIR, bytecode, persistence, or wire-facing
-    /// artifacts.
+    /// `Option[ActorRef[P]]`, tuples, records, and function signatures do not
+    /// carry the full structural protocol type into runtime-facing IR or
+    /// persistence. Send lowering may separately retain the canonical
+    /// 32-byte `ProtocolId` as site metadata for distributed admission; that
+    /// compact identity is intentionally not a runtime type representation.
     pub fn erase_actor_protocols(&self) -> Type {
         if self.actor_ref_protocol().is_some() {
             return Type::Actor {
