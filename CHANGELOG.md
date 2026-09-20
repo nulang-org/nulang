@@ -69,6 +69,15 @@ two major versions.*
   `LegacyCompatible` is explicit migration mode and relaxes only a missing
   incoming required protocol identity; typed mismatches remain fail-closed.
 
+### NUL0 required actor-protocol identity tail — 2026-09-20
+- **Additive typed delivery metadata** (Experimental, `src/runtime/network.rs`,
+  `src/runtime/distributed.rs`). Actor messages may carry the sender/client's
+  required `ProtocolId` in a self-identifying `PRT0` trailing extension.
+  Existing untyped send paths emit the historical NUL0-v1 payload unchanged;
+  current readers accept messages without the tail and ignore unrelated future
+  trailing extensions. The receiver's installed protocol remains local runtime
+  metadata and is deliberately not trusted from the wire.
+
 ### Typed actor protocol checking — 2026-09-20
 - **Static protocol validation for known actor references** (Experimental,
   `src/actor_protocol.rs`, RFC 0023). Actor `send`/`ask` calls whose receiver

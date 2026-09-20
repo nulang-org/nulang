@@ -55,6 +55,7 @@ use super::distributed_context::{FabricAdvertisement, FabricAdvertisementSnapsho
 use super::supervision::RemoteLink;
 use super::MessagePriority;
 use super::NodeId;
+use crate::protocol::ProtocolId;
 use crate::vm::Value;
 
 #[cfg(feature = "tcp")]
@@ -560,6 +561,11 @@ pub enum Packet {
         /// sender's module; the receiver MAY verify it against the local
         /// behavior table during delivery (see process_network_packets).
         content_hash: Option<[u8; 32]>,
+        /// Optional canonical protocol contract required by the sender/client.
+        /// This is carried in the additive PRT0 NUL0-v1 tail. It is not the
+        /// receiver's installed protocol; receivers obtain that locally before
+        /// admission.
+        required_protocol_id: Option<ProtocolId>,
         payload: Vec<Value>,
         /// UTF-8 content for every `Value::string(id)` in `payload`: on the
         /// wire a string-id value indexes **this table**, never the sender's
@@ -886,6 +892,7 @@ impl Packet {
                 target_actor,
                 behavior_name,
                 content_hash,
+                required_protocol_id,
                 payload,
                 string_table,
                 object_table,
@@ -926,6 +933,13 @@ impl Packet {
                         write_string(buf, tid);
                     }
                     None => buf.push(0),
+                }
+                // Additive NUL0-v1 required-protocol tail. Historical readers
+                // stop after trace_id and ignore trailing bytes. PRT0 keeps the
+                // extension self-identifying for current readers.
+                if let Some(required_protocol_id) = required_protocol_id {
+                    buf.extend_from_slice(b"PRT0");
+                    buf.extend_from_slice(required_protocol_id.as_bytes());
                 }
             }
             Packet::Heartbeat { node_id, timestamp } => {
@@ -1161,18 +1175,36 @@ impl Packet {
         }
         // trace_id: 1-byte flag + optional string content.
         let trace_id = if offset < payload.len() && payload[offset] == 1 {
-            let _ = offset.checked_add(1)?;
-            let (tid, consumed) = read_string(payload, offset + 1)?;
-            let _ = offset.checked_add(consumed + 1)?;
+            offset = offset.checked_add(1)?;
+            let (tid, consumed) = read_string(payload, offset)?;
+            offset = offset.checked_add(consumed)?;
             Some(tid)
         } else {
-            let _ = offset.checked_add(1)?;
+            if offset < payload.len() {
+                offset = offset.checked_add(1)?;
+            }
+            None
+        };
+
+        // Optional additive sender-required protocol tail. Unknown trailing
+        // extensions remain ignored for NUL0-v1 forward compatibility.
+        let required_protocol_id = if payload.len() >= offset.saturating_add(4)
+            && payload.get(offset..offset + 4)? == b"PRT0"
+        {
+            if payload.len() < offset.saturating_add(36) {
+                return None;
+            }
+            let mut id = [0u8; 32];
+            id.copy_from_slice(payload.get(offset + 4..offset + 36)?);
+            Some(ProtocolId::from_bytes(id))
+        } else {
             None
         };
         Some(Packet::ActorMessage {
             target_actor,
             behavior_name,
             content_hash,
+            required_protocol_id,
             payload: values,
             string_table,
             object_table,
@@ -2699,6 +2731,7 @@ mod tests {
             target_actor: 42,
             behavior_name: "handle_msg".to_string(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::int(123), Value::string(456)],
             string_table: vec![],
             object_table: vec![],
@@ -2719,11 +2752,109 @@ mod tests {
     // 2b. ActorMessage string table roundtrip
     // ------------------------------------------------------------------
     #[test]
+    fn test_packet_actor_message_required_protocol_tail_roundtrip() {
+        let required_protocol_id = ProtocolId::from_bytes([0xA5; 32]);
+        let packet = Packet::ActorMessage {
+            target_actor: 42,
+            behavior_name: "handle_msg".to_string(),
+            content_hash: None,
+            required_protocol_id: Some(required_protocol_id),
+            payload: vec![Value::int(7)],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 9,
+            sender_node: NodeId(11),
+            priority: MessagePriority::Normal,
+            trace_id: Some("trace-1".to_string()),
+        };
+
+        let bytes = packet.to_bytes(0xBEEF);
+        assert!(bytes.windows(4).any(|window| window == b"PRT0"));
+        let (seq, decoded) =
+            Packet::from_bytes(&bytes).expect("required protocol tail should decode");
+        assert_eq!(seq, 0xBEEF);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_actor_message_without_protocol_tail_preserves_legacy_bytes() {
+        let packet = Packet::ActorMessage {
+            target_actor: 5,
+            behavior_name: "ping".to_string(),
+            content_hash: None,
+            required_protocol_id: None,
+            payload: vec![],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 6,
+            sender_node: NodeId(7),
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        };
+
+        let bytes = packet.to_bytes(19);
+        assert!(!bytes.windows(4).any(|window| window == b"PRT0"));
+        let (_, decoded) = Packet::from_bytes(&bytes).expect("legacy actor message should decode");
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_actor_message_ignores_unknown_additive_tail() {
+        let packet = Packet::ActorMessage {
+            target_actor: 1,
+            behavior_name: "ping".to_string(),
+            content_hash: None,
+            required_protocol_id: None,
+            payload: vec![],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 2,
+            sender_node: NodeId(3),
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        };
+
+        let mut bytes = packet.to_bytes(23);
+        bytes.extend_from_slice(b"ZZZ0");
+        bytes.extend_from_slice(&[0x11; 32]);
+        let (seq, decoded) =
+            Packet::from_bytes(&bytes).expect("unknown additive tail must remain ignorable");
+        assert_eq!(seq, 23);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_actor_message_rejects_truncated_required_protocol_tail() {
+        let packet = Packet::ActorMessage {
+            target_actor: 1,
+            behavior_name: "ping".to_string(),
+            content_hash: None,
+            required_protocol_id: None,
+            payload: vec![],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 2,
+            sender_node: NodeId(3),
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        };
+
+        let mut bytes = packet.to_bytes(24);
+        bytes.extend_from_slice(b"PRT0");
+        bytes.extend_from_slice(&[0x22; 7]);
+        assert!(
+            Packet::from_bytes(&bytes).is_none(),
+            "a recognized PRT0 marker with a truncated digest must fail closed"
+        );
+    }
+
+    #[test]
     fn test_packet_actor_message_string_table_roundtrip() {
         let packet = Packet::ActorMessage {
             target_actor: 7,
             behavior_name: "store".to_string(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::string(0), Value::string(1), Value::string(0)],
             string_table: vec!["hello".to_string(), "wörld ✓".to_string()],
             object_table: vec![],
@@ -2750,6 +2881,7 @@ mod tests {
             target_actor: 8,
             behavior_name: "handle_bytes".to_string(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::object(0), Value::object(1), Value::object(0)],
             string_table: vec![],
             object_table: vec![(0, vec![1, 2, 3]), (1, vec![4, 5, 6, 7])],
@@ -2773,6 +2905,7 @@ mod tests {
             target_actor: 7,
             behavior_name: "store".to_string(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::string(0)],
             string_table: vec!["hello".to_string()],
             object_table: vec![],
@@ -3236,6 +3369,7 @@ mod tests {
             target_actor: 1,
             behavior_name: "h".into(),
             content_hash: None,
+            required_protocol_id: None,
             payload,
             string_table,
             object_table: vec![],
@@ -3325,6 +3459,7 @@ mod tests {
             target_actor: 1,
             behavior_name: "handle".into(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::string(42)],
             string_table: vec![],
             object_table: vec![],
@@ -3377,6 +3512,7 @@ mod tests {
             target_actor: 1,
             behavior_name: "handle".into(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::string(0), Value::int(7), Value::string(1)],
             string_table: vec!["hello".into(), "world".into()],
             object_table: vec![],
@@ -3433,6 +3569,7 @@ mod tests {
             target_actor: 1,
             behavior_name: "handle".into(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::int(123), Value::bool(true), Value::unit()],
             string_table: vec![],
             object_table: vec![],

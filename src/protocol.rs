@@ -532,6 +532,11 @@ impl ProtocolId {
         &self.0
     }
 
+    /// Construct a protocol identity from its canonical 32-byte wire digest.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     pub fn to_hex(self) -> String {
         encode_hex(&self.0)
     }
