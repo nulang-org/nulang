@@ -1832,3 +1832,151 @@ fn test_typed_region_guard_deopts_dynamic_type_mismatch() {
     let result = unsafe { Value::from_bits(regs[2]) };
     assert_eq!(result.as_int(), Some(42));
 }
+
+
+#[test]
+fn test_runtime_livein_refinement_recovers_nbc_parameter_type() {
+    use crate::jit::typed_compiler::{
+        infer_reg_types, refine_live_in_types_from_runtime, KnownType,
+    };
+    use crate::vm::Value;
+
+    // Simulate an artifact-loaded function: there is deliberately no
+    // jit_type_seeds entry. r0 is moved into the function's fixed local r15,
+    // then that local remains loop-invariant while r16 is the induction var.
+    let mut module = CodeModule::new("runtime_livein_stable");
+    module.function_table = vec![0];
+    module.emit(Instruction::new2(OpCode::Move, 0, 15)); // 0: param -> local
+    module.emit(Instruction::new1(OpCode::Const0, 16)); // 1: i = 0
+    module.emit(Instruction::new3(OpCode::ICmpLt, 16, 15, 17)); // 2: i < limit
+    module.emit(Instruction::new3(OpCode::JmpF, 17, 0, 3)); // 3 -> pc6
+    module.emit(Instruction::new1(OpCode::IInc, 16)); // 4: i++
+    let back: i16 = -3; // pc5 -> pc2
+    module.emit(Instruction::new3(
+        OpCode::Jmp,
+        ((back as u16) >> 8) as u8,
+        (back as u16 & 0xFF) as u8,
+        0,
+    ));
+    module.emit(Instruction::new1(OpCode::RetVal, 16)); // 6
+
+    let mut meta = infer_reg_types(&module, 2);
+    assert_eq!(
+        meta.get_type(15),
+        KnownType::Unknown,
+        "artifact-style bytecode has no static fact for the incoming parameter"
+    );
+    assert_eq!(meta.get_type(16), KnownType::Int);
+
+    let mut regs = [0u64; 256];
+    regs[15] = Value::int(100).to_bits();
+    regs[16] = Value::int(0).to_bits();
+    regs[17] = Value::bool(true).to_bits();
+
+    let refined =
+        refine_live_in_types_from_runtime(&module, 2, 4, &regs, &mut meta);
+
+    assert!(refined >= 1, "stable primitive live-in should be recovered");
+    assert_eq!(
+        meta.get_type(15),
+        KnownType::Int,
+        "loop-invariant runtime Int parameter should refine to Int"
+    );
+}
+
+#[test]
+fn test_runtime_livein_refinement_rejects_backedge_type_change() {
+    use crate::jit::typed_compiler::{
+        refine_live_in_types_from_runtime, KnownType, TypeMetadata,
+    };
+    use crate::vm::Value;
+
+    // r0 is Int at the VM -> native entry, but the loop body converts it to
+    // Float before the backedge. Guarding only the initial entry would be
+    // insufficient: the second native iteration would see a Float. The local
+    // must-analysis must therefore degrade r0 to Unknown.
+    let mut module = CodeModule::new("runtime_livein_unstable");
+    module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 2)); // 0
+    module.emit(Instruction::new2(OpCode::IToF, 0, 0)); // 1
+    let back: i16 = -2; // pc2 -> pc0
+    module.emit(Instruction::new3(
+        OpCode::Jmp,
+        ((back as u16) >> 8) as u8,
+        (back as u16 & 0xFF) as u8,
+        0,
+    ));
+
+    let mut meta = TypeMetadata::new();
+    meta.set_type(1, KnownType::Int);
+
+    let mut regs = [0u64; 256];
+    regs[0] = Value::int(7).to_bits();
+    regs[1] = Value::int(2).to_bits();
+
+    let _ = refine_live_in_types_from_runtime(&module, 0, 3, &regs, &mut meta);
+
+    assert_eq!(
+        meta.get_type(0),
+        KnownType::Unknown,
+        "a loop-carried value whose type changes on the backedge must not be specialized"
+    );
+    assert_eq!(
+        meta.get_type(1),
+        KnownType::Int,
+        "independent proven facts must remain intact"
+    );
+}
+
+
+#[test]
+fn test_nbc_hot_loop_recovers_typed_jit_from_runtime_liveins() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn accumulate(seed: Int, limit: Int) -> Int {
+            var sum = seed;
+            var i = 0;
+            while i < limit {
+                sum = sum + i;
+                i = i + 1
+            };
+            sum
+        }
+        fn main() -> Int { accumulate(1, 100000) }
+    "#;
+
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let compiled = compile_mir(&mut mir, "runtime_livein_nbc").expect("codegen");
+    assert!(
+        !compiled.jit_type_seeds.is_empty(),
+        "source compilation should have parameter hints before serialization"
+    );
+
+    // Frozen artifacts deliberately omit compiler-only type seeds.
+    let bytes = compiled.to_nbc(None).expect("encode nbc");
+    let artifact = CodeModule::from_nbc(&bytes).expect("decode nbc");
+    assert!(
+        artifact.module.jit_type_seeds.is_empty(),
+        "artifact must enter the JIT without compiler-owned type hints"
+    );
+
+    let mut vm = VM::new();
+    vm.load_module(artifact.module);
+    let result = vm.run().expect("artifact execution");
+    assert_eq!(result.as_int(), Some(4_999_950_001));
+    assert!(
+        vm.jit_typed_compiled_count() > 0,
+        "hot artifact loop should recover enough stable runtime live-ins to use the typed JIT"
+    );
+}

@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Guarded runtime JIT live-in specialization — 2026-09-20
+- **Hot typed regions can recover stable primitive live-in types at runtime, including from frozen `.nbc` artifacts** (`src/jit/typed_compiler.rs`, `src/jit/mod.rs`). Tier-up profiles only primitive registers read before their first write, refines only previously unknown facts, and runs speculative observations through a local must-analysis so internal branches and loop backedges can invalidate unstable types. Surviving facts compile through the existing typed Cranelift path and retain the compiled-region live-tag guard; a later mismatched VM/FFI/message entry deopts to the interpreter. No opcode, value-layout, or `.nbc` format change is required.
+
 ### Compiler-owned JIT type seeds — 2026-09-20
 - **Typed function arguments now seed tiered-JIT must-analysis without changing the bytecode format** (`src/bytecode.rs`, `src/mir_codegen.rs`, `src/jit/mod.rs`, `src/jit/typed_compiler.rs`). MIR codegen records primitive parameter facts for the incoming ABI registers (`r0..rN`) on the in-memory `CodeModule`; the existing conservative bytecode analysis then propagates those facts through the function prologue and invalidates them at nil-producing or otherwise unprovable operations exactly as before. Typed regions store compact live-register guards and deopt to the interpreter if a dynamic VM/FFI/message entry supplies a mismatched runtime tag. The seed table is crate-private and `#[serde(skip)]`, so frozen `.nbc` artifacts neither encode nor restore the optimization hints.
 

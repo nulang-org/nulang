@@ -233,6 +233,255 @@ pub fn infer_reg_types(module: &CodeModule, pc: usize) -> TypeMetadata {
     meta
 }
 
+/// Refine Unknown types at a hot region entry from the live register file.
+///
+/// This is speculative profile information, not a new trust boundary:
+/// `JitSession` stores a runtime tag guard alongside every typed region and
+/// deopts before native execution when the live values no longer match.
+///
+/// Only read-before-write primitive live-ins are considered. For regions with
+/// an internal backedge, the observations are then run through the same
+/// must-analysis transfer rules used by `infer_reg_types`; a candidate type
+/// survives only when every internal path back to the region entry preserves
+/// it. This prevents a one-time profile from incorrectly specializing a
+/// loop-carried value whose type can change on a later native iteration.
+///
+/// Returns the number of previously-Unknown entry registers refined.
+pub fn refine_live_in_types_from_runtime(
+    module: &CodeModule,
+    start_offset: usize,
+    num_instrs: usize,
+    regs: &[u64; 256],
+    meta: &mut TypeMetadata,
+) -> usize {
+    use crate::value_layout::{is_float_raw, TAG_BOOL, TAG_INT, TAG_MASK};
+
+    let end = (start_offset + num_instrs).min(module.instructions.len());
+    if start_offset >= end {
+        return 0;
+    }
+
+    let runtime_type = |bits: u64| -> KnownType {
+        if (bits & TAG_MASK) == TAG_INT {
+            KnownType::Int
+        } else if (bits & TAG_MASK) == TAG_BOOL {
+            KnownType::Bool
+        } else if is_float_raw(bits) {
+            KnownType::Float
+        } else {
+            KnownType::Unknown
+        }
+    };
+
+    let mut observed = [KnownType::Unknown; 256];
+    let mut written = [false; 256];
+
+    let observe = |reg: usize,
+                   expected: Option<KnownType>,
+                   observed: &mut [KnownType; 256],
+                   written: &[bool; 256]| {
+        if reg >= 256 || written[reg] || meta.get_type(reg) != KnownType::Unknown {
+            return;
+        }
+        let ty = runtime_type(regs[reg]);
+        if ty == KnownType::Unknown {
+            return;
+        }
+        if expected.is_some_and(|want| want != ty) {
+            return;
+        }
+        observed[reg] = ty;
+    };
+
+    let mark_write = |reg: usize, written: &mut [bool; 256]| {
+        if reg < 256 {
+            written[reg] = true;
+        }
+    };
+
+    for instr in &module.instructions[start_offset..end] {
+        let a = instr.op1 as usize;
+        let b = instr.op2 as usize;
+        let d = instr.op3 as usize;
+        match instr.opcode {
+            OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+                mark_write(a, &mut written);
+            }
+            OpCode::ConstU => {
+                mark_write(d, &mut written);
+            }
+            OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
+                observe(a, None, &mut observed, &written);
+                mark_write(b, &mut written);
+            }
+            OpCode::Swap => {
+                observe(a, None, &mut observed, &written);
+                observe(b, None, &mut observed, &written);
+                mark_write(a, &mut written);
+                mark_write(b, &mut written);
+            }
+            OpCode::IAdd
+            | OpCode::ISub
+            | OpCode::IMul
+            | OpCode::IDiv
+            | OpCode::IMod
+            | OpCode::ICmpEq
+            | OpCode::ICmpLt
+            | OpCode::ICmpGt
+            | OpCode::ICmpLe
+            | OpCode::ICmpGe => {
+                observe(a, Some(KnownType::Int), &mut observed, &written);
+                observe(b, Some(KnownType::Int), &mut observed, &written);
+                mark_write(d, &mut written);
+            }
+            OpCode::INeg => {
+                observe(a, Some(KnownType::Int), &mut observed, &written);
+                mark_write(b, &mut written);
+            }
+            OpCode::IInc | OpCode::IDec => {
+                observe(a, Some(KnownType::Int), &mut observed, &written);
+                mark_write(a, &mut written);
+            }
+            OpCode::FAdd
+            | OpCode::FSub
+            | OpCode::FMul
+            | OpCode::FDiv
+            | OpCode::FCmpEq
+            | OpCode::FCmpLt
+            | OpCode::FCmpGt => {
+                observe(a, Some(KnownType::Float), &mut observed, &written);
+                observe(b, Some(KnownType::Float), &mut observed, &written);
+                mark_write(d, &mut written);
+            }
+            OpCode::Not => {
+                observe(a, Some(KnownType::Bool), &mut observed, &written);
+                mark_write(b, &mut written);
+            }
+            OpCode::And | OpCode::Or => {
+                observe(a, Some(KnownType::Bool), &mut observed, &written);
+                observe(b, Some(KnownType::Bool), &mut observed, &written);
+                mark_write(d, &mut written);
+            }
+            OpCode::IToF => {
+                observe(a, Some(KnownType::Int), &mut observed, &written);
+                mark_write(b, &mut written);
+            }
+            OpCode::FToI => {
+                observe(a, Some(KnownType::Float), &mut observed, &written);
+                mark_write(b, &mut written);
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                observe(a, Some(KnownType::Bool), &mut observed, &written);
+            }
+            OpCode::Nop
+            | OpCode::Halt
+            | OpCode::Jmp
+            | OpCode::DbgPrint
+            | OpCode::Ret
+            | OpCode::RetVal => {}
+            _ => {
+                // The typed compiler rejects unsupported opcodes. Do not infer
+                // speculative facts through an operation whose reads/writes
+                // are not modeled here.
+                return 0;
+            }
+        }
+    }
+
+    let mut candidate = meta.regs;
+    let mut added_candidate = false;
+    for (reg, &ty) in observed.iter().enumerate() {
+        if ty != KnownType::Unknown && candidate[reg] == KnownType::Unknown {
+            candidate[reg] = ty;
+            added_candidate = true;
+        }
+    }
+    if !added_candidate {
+        return 0;
+    }
+
+    // Local fixed point over the native region. Entry observations are guarded
+    // by the VM; internal predecessors (notably loop backedges) must agree.
+    let n = end - start_offset;
+    let mut states: Vec<Option<[KnownType; 256]>> = vec![None; n];
+    let mut queue = std::collections::VecDeque::new();
+    let mut in_queue = vec![false; n];
+    states[0] = Some(candidate);
+    queue.push_back(start_offset);
+    in_queue[0] = true;
+
+    while let Some(at) = queue.pop_front() {
+        in_queue[at - start_offset] = false;
+        let instr = module.instructions[at];
+        let mut next = states[at - start_offset].unwrap_or([KnownType::Unknown; 256]);
+        apply_type_transfer(&instr, module, &mut next);
+
+        let push_succ = |succ: usize,
+                         states: &mut Vec<Option<[KnownType; 256]>>,
+                         queue: &mut std::collections::VecDeque<usize>,
+                         in_queue: &mut Vec<bool>,
+                         next: &[KnownType; 256]| {
+            if succ < start_offset || succ >= end {
+                return;
+            }
+            let slot = &mut states[succ - start_offset];
+            let changed = match slot {
+                None => {
+                    *slot = Some(*next);
+                    true
+                }
+                Some(cur) => {
+                    let mut changed = false;
+                    for (current, &incoming) in cur.iter_mut().zip(next.iter()) {
+                        if *current != incoming && *current != KnownType::Unknown {
+                            *current = KnownType::Unknown;
+                            changed = true;
+                        }
+                    }
+                    changed
+                }
+            };
+            if changed && !in_queue[succ - start_offset] {
+                queue.push_back(succ);
+                in_queue[succ - start_offset] = true;
+            }
+        };
+
+        match instr.opcode {
+            OpCode::Jmp => {
+                let target = (at as i64 + instr.simm16() as i64) as usize;
+                push_succ(target, &mut states, &mut queue, &mut in_queue, &next);
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                let target = (at as i64 + instr.offset16() as i64) as usize;
+                push_succ(target, &mut states, &mut queue, &mut in_queue, &next);
+                if at + 1 < end {
+                    push_succ(at + 1, &mut states, &mut queue, &mut in_queue, &next);
+                }
+            }
+            OpCode::Halt | OpCode::Ret | OpCode::RetVal => {}
+            _ => {
+                if at + 1 < end {
+                    push_succ(at + 1, &mut states, &mut queue, &mut in_queue, &next);
+                }
+            }
+        }
+    }
+
+    let stable_entry = states[0].unwrap_or(candidate);
+    let mut refined = 0;
+    for reg in 0..256 {
+        if meta.get_type(reg) == KnownType::Unknown
+            && observed[reg] != KnownType::Unknown
+            && stable_entry[reg] == observed[reg]
+        {
+            meta.set_type(reg, observed[reg]);
+            refined += 1;
+        }
+    }
+    refined
+}
+
 /// Apply one instruction's register-write effect to a type state.
 ///
 /// Only opcodes whose result type is guaranteed by the interpreter's

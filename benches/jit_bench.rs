@@ -116,6 +116,26 @@ fn bench_jit_typed_parameter_loop(c: &mut Criterion) {
             BatchSize::SmallInput,
         )
     });
+
+    // Frozen .nbc artifacts intentionally drop compiler-only JIT type seeds.
+    // This variant therefore measures guarded runtime live-in specialization,
+    // not the source-compilation fast path above.
+    let artifact_module = CodeModule::from_nbc(
+        &module.to_nbc(None).expect("encode benchmark module"),
+    )
+    .expect("decode benchmark module")
+    .module;
+    c.bench_function("jit/typed_parameter_loop_nbc_warm", |b| {
+        b.iter_batched(
+            || {
+                let mut vm = fresh_vm(&artifact_module);
+                let _ = vm.run();
+                vm
+            },
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
 }
 
 fn bench_jit_function_call_loop(c: &mut Criterion) {
