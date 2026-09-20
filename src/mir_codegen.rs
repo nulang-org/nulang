@@ -2820,6 +2820,48 @@ mod tests {
     }
 
     #[test]
+    fn test_actorref_send_emits_protocol_site_metadata() {
+        let module = compile_mir_source(
+            r#"
+            fn relay(target: ActorRef[{ ping: () -> Unit }]) -> Unit {
+                send target ping()
+            }
+            "#,
+        )
+        .expect("typed ActorRef send should compile");
+
+        assert_eq!(
+            module.actor_send_protocols.len(),
+            1,
+            "typed ActorRef send must retain one canonical protocol id"
+        );
+        let (pc, protocol_id) = module.actor_send_protocols[0];
+        assert_eq!(
+            module.instructions.get(pc).map(|instruction| instruction.opcode),
+            Some(OpCode::Send),
+            "protocol metadata must point at the exact Send instruction"
+        );
+        assert_ne!(protocol_id, [0; 32]);
+    }
+
+    #[test]
+    fn test_dynamic_actor_send_emits_no_protocol_site_metadata() {
+        let module = compile_mir_source(
+            r#"
+            fn relay(target) {
+                send target ping()
+            }
+            "#,
+        )
+        .expect("dynamic actor send remains compatible");
+
+        assert!(
+            module.actor_send_protocols.is_empty(),
+            "dynamic/unproven actor refs must not invent a protocol identity"
+        );
+    }
+
+    #[test]
     fn test_mir_codegen_actor_spawn_returns_actor_ref() {
         // Actors are now lowered by the HIR/MIR pipeline. Without a real
         // Runtime attached, spawn_actor's default stub always returns
