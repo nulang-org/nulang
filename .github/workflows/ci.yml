@@ -293,7 +293,7 @@ jobs:
     name: Benchmarks (regression-gated)
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Required to persist rolling benchmark history on main
+      contents: write  # Persist rolling benchmark history after regression checks pass
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
