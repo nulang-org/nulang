@@ -1035,9 +1035,7 @@ fn drained_ttl_migration_restart_replay_never_extends_expiry() {
         .reprobe_recovered_remote_migration(journal_key, 9702)
         .unwrap();
     let probe = wait_event(&mut runtime_a, &mut runtime_b, &service_a2);
-    let convergence = service_a2
-        .complete_remote_migration_probe(&probe)
-        .unwrap();
+    let convergence = service_a2.complete_remote_migration_probe(&probe).unwrap();
     assert!(convergence.durable_history_satisfied);
     assert_eq!(convergence.target_live_entries, 0);
     assert_eq!(convergence.target_import_fences, 1);
