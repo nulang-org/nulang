@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -1085,14 +1085,15 @@ impl CacheServiceHandle {
         Ok(())
     }
 
-    /// Rebind and replay a fully source-drained persistent migration after a
-    /// cache-service process restart.
+    /// Rebind and replay a fully source-drained migration after a cache-service
+    /// process restart.
     ///
     /// This is intentionally not general CacheStore recovery. The journal must
     /// prove that the old source was fully drained, every sent batch had a
-    /// durable application ACK, no ownership commit is pending/completed, and
-    /// every transferred entry was persistent (no relative TTL). The exact
-    /// durable TransferBatch envelopes are then resent in original append order.
+    /// durable application ACK, and no ownership commit is pending/completed.
+    /// Relative-TTL entries additionally require a durable pre-export wall-clock
+    /// anchor so replay can only reduce their remaining lifetime. Reconstructed
+    /// TransferBatch envelopes are resent in original append order.
     pub fn replay_drained_remote_migration_after_restart(
         &self,
         key: CacheMigrationKey,
@@ -1108,9 +1109,7 @@ impl CacheServiceHandle {
                 .recovery_state(key)
                 .cloned()
                 .ok_or(CacheServiceError::MigrationRecoveryNotFound)?;
-            state
-                .drained_restart_replay_plan()
-                .ok_or(CacheServiceError::MigrationRestartReplayUnsafe)?
+            state.drained_restart_replay_plan()?
         };
 
         // Validate the currently installed migration before mutating durable
@@ -1152,12 +1151,76 @@ impl CacheServiceHandle {
                 target,
                 batch,
             };
-            // The journal was rebound above, so this remains idempotent and
-            // uses the ordinary retry/correlation path.
-            self.retry_remote_slot_batch(&recovered)?;
+            // Restart reconstruction may reduce relative TTL from the
+            // immutable historical envelope. Send the reconstructed request
+            // directly through the normal retry/correlation transport without
+            // rewriting the durable TransferSent record.
+            self.send_network_message(
+                NodeId(recovered.target.node_id),
+                CacheTransportMessage::TransferBatch {
+                    transfer_id: recovered.transfer_id,
+                    placement_epoch: recovered.placement_epoch,
+                    source: recovered.source,
+                    target: recovered.target,
+                    batch: recovered.batch.clone(),
+                },
+            )?;
             pending.push(recovered);
         }
         Ok(pending)
+    }
+
+    /// Validate a target ACK produced by process-restart reconstruction.
+    ///
+    /// Historical TransferAck records remain immutable because their original
+    /// outcomes justified source deletion. A rebuilt TTL entry may legitimately
+    /// change from Imported to ExpiredInTransit after downtime. This method
+    /// validates correlation and returns the rebuild outcomes without rewriting
+    /// the historical ACK or finalizing an already-drained source.
+    pub fn complete_restart_replay_batch(
+        &self,
+        pending: &CacheRemoteTransferPending,
+        event: &CacheTransportInbound,
+    ) -> Result<Vec<CacheTransferImport>, CacheServiceError> {
+        let CacheTransportMessage::TransferAck {
+            transfer_id,
+            placement_epoch,
+            source,
+            target,
+            slot,
+            results,
+        } = &event.message
+        else {
+            return Err(CacheServiceError::RemoteTransferAckMismatch);
+        };
+
+        if event.from_node.0 != pending.target.node_id
+            || *transfer_id != pending.transfer_id
+            || *placement_epoch != pending.placement_epoch
+            || *source != pending.source
+            || *target != pending.target
+            || *slot != pending.batch.slot
+            || results.len() != pending.batch.entries.len()
+        {
+            return Err(CacheServiceError::RemoteTransferAckMismatch);
+        }
+
+        let placement = self.placement_publisher.snapshot();
+        let Some(migration) = placement.migration_for_slot(pending.batch.slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        };
+        if migration.source != pending.source
+            || migration.target != pending.target
+            || pending.placement_epoch < migration.started_epoch
+        {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        }
+
+        Ok(results.clone())
     }
 
     /// Re-send an exact durable transfer envelope after controller recovery.
@@ -1425,6 +1488,11 @@ impl CacheServiceHandle {
             return Err(CacheServiceError::RemoteTransferNotActive(slot));
         }
 
+        // Capture a process-independent wall anchor before export. The exported
+        // ttl_ms is observed slightly later, so subtracting from this earlier
+        // anchor is conservative: restart recovery may expire a key slightly
+        // early, but can never extend its original remaining TTL.
+        let export_wall_unix_ms = cache_wall_unix_ms()?;
         let source_control = self.transfer_control(source_shard)?;
         let (export_tx, export_rx) = mpsc::sync_channel(1);
         source_control.request_control(CacheShardControlRequest::Export {
@@ -1463,7 +1531,16 @@ impl CacheServiceHandle {
             // Durable-before-send: if the process fails after this fsync but
             // before transport enqueue, recovery safely treats the batch as
             // possibly sent and can retry the exact envelope.
-            journal.record_transfer_sent(key, &message)?;
+            let has_ttl = pending
+                .batch
+                .entries
+                .iter()
+                .any(|entry| entry.ttl_ms.is_some());
+            journal.record_transfer_sent_at(
+                key,
+                &message,
+                has_ttl.then_some(export_wall_unix_ms),
+            )?;
         }
         self.send_network_message(NodeId(target.node_id), message)?;
         Ok(pending)
@@ -3462,6 +3539,21 @@ impl CacheShardServer {
 #[derive(Debug, Clone, Copy)]
 enum ConnectionAction {
     Close,
+}
+
+fn cache_wall_unix_ms() -> io::Result<u64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "system wall clock before Unix epoch",
+        )
+    })?;
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "system wall clock milliseconds overflow",
+        )
+    })
 }
 
 fn validate_placement_endpoints(

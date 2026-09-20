@@ -224,6 +224,22 @@ two major versions.*
   9601 to prove replay follows causal append order rather than numeric id order.
   Relative-TTL batches, unacked transfers, non-drained sources, and ambiguous
   commit intents remain fail-closed.
+- **TTL-safe drained migration restart replay** (Experimental,
+  `src/runtime/cache_migration_journal.rs`, `src/runtime/cache_server.rs`).
+  Relative-TTL transfers now persist a process-independent Unix-millisecond wall
+  anchor captured before source export and fsynced before send. On cache-process
+  restart, replay subtracts elapsed wall time from the immutable exported
+  remaining TTL and never increases it. A zero remainder is sent as `ttl_ms=0`,
+  causing the target to record `ExpiredInTransit` instead of resurrecting the
+  value. A backward wall-clock observation fails recovery closed; a forward
+  clock jump may expire a value early but cannot extend its lifetime. Historical
+  TransferAck records remain immutable because they justified source deletion;
+  restart-rebuild ACKs are validated separately since an originally Imported
+  value may legitimately rebuild as ExpiredInTransit after downtime. If a crash
+  durably records a TTL TransferBatch but loses its wall-anchor record, that
+  transfer remains permanently restart-replay unsafe rather than accepting a
+  later anchor. End-to-end coverage verifies both expired and still-live TTL
+  values across full source+target cache-service restart.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
