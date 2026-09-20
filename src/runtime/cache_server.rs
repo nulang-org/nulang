@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -1487,6 +1487,11 @@ impl CacheServiceHandle {
             return Err(CacheServiceError::RemoteTransferNotActive(slot));
         }
 
+        // Capture a process-independent wall anchor before export. The exported
+        // ttl_ms is observed slightly later, so subtracting from this earlier
+        // anchor is conservative: restart recovery may expire a key slightly
+        // early, but can never extend its original remaining TTL.
+        let export_wall_unix_ms = cache_wall_unix_ms()?;
         let source_control = self.transfer_control(source_shard)?;
         let (export_tx, export_rx) = mpsc::sync_channel(1);
         source_control.request_control(CacheShardControlRequest::Export {
@@ -1525,7 +1530,12 @@ impl CacheServiceHandle {
             // Durable-before-send: if the process fails after this fsync but
             // before transport enqueue, recovery safely treats the batch as
             // possibly sent and can retry the exact envelope.
-            journal.record_transfer_sent(key, &message)?;
+            let has_ttl = pending.batch.entries.iter().any(|entry| entry.ttl_ms.is_some());
+            journal.record_transfer_sent_at(
+                key,
+                &message,
+                has_ttl.then_some(export_wall_unix_ms),
+            )?;
         }
         self.send_network_message(NodeId(target.node_id), message)?;
         Ok(pending)
@@ -3524,6 +3534,14 @@ impl CacheShardServer {
 #[derive(Debug, Clone, Copy)]
 enum ConnectionAction {
     Close,
+}
+
+fn cache_wall_unix_ms() -> io::Result<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "system wall clock before Unix epoch"))?;
+    u64::try_from(duration.as_millis())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "system wall clock milliseconds overflow"))
 }
 
 fn validate_placement_endpoints(
