@@ -6450,6 +6450,7 @@ impl Runtime {
         &mut self,
         actor_id: u64,
         snapshot: &crate::runtime::persistence::ActorSnapshot,
+        schema_version: u32,
     ) {
         let Some(&epoch) = self.respawn_opted.get(&actor_id) else {
             return;
@@ -6464,7 +6465,10 @@ impl Runtime {
         if shadow == home {
             return;
         }
-        let Ok(snapshot_json) = serde_json::to_vec(snapshot) else {
+        let Ok(snapshot_json) =
+            crate::persistence_schema::encode_record(snapshot, schema_version)
+                .map(String::into_bytes)
+        else {
             return;
         };
         let module = match self
