@@ -118,6 +118,49 @@ pub fn effect_resource_category(eff: &Effect) -> Option<&'static str> {
     }
 }
 
+/// Conservative classification used by `@no_block()`.
+///
+/// Effects are classified at the category level. For example, `Time` is
+/// considered blocking-capable because the category includes sleep/timer
+/// operations even though a clock read itself may not block.
+fn effect_may_block(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::IO
+            | Effect::Net
+            | Effect::FS
+            | Effect::Time
+            | Effect::Receive
+            | Effect::Migrate
+            | Effect::Async
+            | Effect::Inference
+            | Effect::FFI
+            | Effect::DB
+            | Effect::Python
+            | Effect::Process
+            | Effect::System
+            | Effect::Request
+            | Effect::Respond
+            | Effect::Realtime
+            | Effect::Client
+            | Effect::Web
+            | Effect::UserDefined(_)
+    )
+}
+
+/// Conservative classification used by `@no_suspend()`.
+fn effect_may_suspend(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Time
+            | Effect::Receive
+            | Effect::Migrate
+            | Effect::Async
+            | Effect::Inference
+            | Effect::UserDefined(_)
+    )
+}
+
 /// Flatten nested `module {}` blocks into a single declaration list.
 ///
 /// Mirrors `typechecker::flatten_decls`: modules are purely a namespacing
@@ -1151,12 +1194,66 @@ impl EffectChecker {
             self.emit_deprecation_warning(decl);
         }
         self.register_function_rows(&flat)?;
+        self.validate_performance_contracts(&flat)?;
         self.emit_placement_warnings(&flat);
         for decl in &flat {
             self.check_decl(decl)?;
         }
         check_durable_determinism(&flat)?;
         self.check_resource_grants()?;
+        Ok(())
+    }
+
+    /// Validate compile-time performance contracts against the function's
+    /// transitive effect row. This deliberately treats an effect category as
+    /// potentially blocking/suspending when any operation in that category can
+    /// do so; callers that need a stronger distinction should split the effect.
+    fn validate_performance_contracts(&self, decls: &[&Decl]) -> NuResult<()> {
+        for decl in decls {
+            let (name, annotations, span) = match decl {
+                Decl::Function {
+                    name,
+                    annotations,
+                    span,
+                    ..
+                } => (name, annotations, *span),
+                _ => continue,
+            };
+            let Some(row) = self.fn_rows.get(name) else {
+                continue;
+            };
+
+            for annotation in annotations {
+                let FunctionAnnotation::Performance(contract) = annotation else {
+                    continue;
+                };
+                let offending = row.effects().iter().find(|effect| match contract {
+                    PerformanceContract::Hot => false,
+                    PerformanceContract::NoBlock => effect_may_block(effect),
+                    PerformanceContract::NoSuspend => effect_may_suspend(effect),
+                });
+                if let Some(effect) = offending {
+                    let contract_name = match contract {
+                        PerformanceContract::Hot => "hot",
+                        PerformanceContract::NoBlock => "no_block",
+                        PerformanceContract::NoSuspend => "no_suspend",
+                    };
+                    return Err(NuError::EffectError {
+                        msg: format!(
+                            "function '{name}' violates @{contract_name}(): transitive effect '{effect}' may {}",
+                            if matches!(contract, PerformanceContract::NoSuspend) {
+                                "suspend"
+                            } else {
+                                "block"
+                            }
+                        ),
+                        span,
+                        missing_effects: None,
+                        allowed_effects: None,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
