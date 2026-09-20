@@ -121,10 +121,9 @@ struct CompiledRegion {
 pub struct JitSession {
     /// The Cranelift JIT module that owns compiled code memory.
     module: JITModule,
-    /// Map from `(module_idx, bytecode offset)` → (compiled function
-    /// pointer, region length in instructions). The length is recorded at
-    /// compile time so the VM can advance pc after a JIT run without
-    /// re-scanning the instruction stream.
+    /// Map from `(module_idx, bytecode offset)` to the compiled function,
+    /// region length, and optional live-type guard. Keeping all three in one
+    /// cache entry avoids a second hash lookup on every typed JIT execution.
     compiled: FxHashMap<(usize, usize), CompiledRegion>,
     /// Per-region execution counters for already-compiled code. When a
     /// region crosses TIER2_THRESHOLD, a more aggressive compilation is
