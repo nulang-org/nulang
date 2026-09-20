@@ -422,20 +422,6 @@ fn direct_noalloc_reason(module: &CodeModule, function_index: usize) -> Option<S
     None
 }
 
-/// Validate source-level `@noalloc` contracts against optimized MIR and the
-/// bytecode actually emitted from it.
-///
-/// The guarantee is intentionally stronger than the standalone
-/// `--deny-allocations` report: it rejects semantic operations whose runtime
-/// implementation can allocate indirectly (effects, FFI/Python, actor and
-/// distributed boundaries, I/O, capturing closure environments, and spills).
-/// Direct calls are checked transitively. Indirect/closure calls fail closed
-/// because their target cannot be proven allocation-free statically.
-///
-/// VM call-stack capacity itself is treated as stack machinery rather than a
-/// semantic heap allocation; this contract is about program-visible/runtime
-/// data allocation, not whether an internal Vec ever grows its reserved
-/// capacity.
 /// Run the canonical bytecode mechanical proof for any backend that consumes
 /// MIR directly. Backends call this only when a source-level `@noalloc`
 /// contract is present, so ordinary compilation pays no duplicate-codegen
@@ -459,6 +445,20 @@ pub fn prove_noalloc_contracts(mir: &crate::mir::Module) -> crate::types::NuResu
     crate::mir_codegen::compile_mir(&mut proof_mir, "<noalloc-proof>").map(|_| ())
 }
 
+/// Validate source-level `@noalloc` contracts against optimized MIR and the
+/// bytecode actually emitted from it.
+///
+/// The guarantee is intentionally stronger than the standalone
+/// `--deny-allocations` report: it rejects semantic operations whose runtime
+/// implementation can allocate indirectly (effects, FFI/Python, actor and
+/// distributed boundaries, I/O, capturing closure environments, and spills).
+/// Direct calls are checked transitively. Indirect/closure calls fail closed
+/// because their target cannot be proven allocation-free statically.
+///
+/// VM call-stack capacity itself is treated as stack machinery rather than a
+/// semantic heap allocation; this contract is about program-visible/runtime
+/// data allocation, not whether an internal Vec ever grows its reserved
+/// capacity.
 pub fn validate_noalloc_contracts(
     mir: &crate::mir::Module,
     module: &CodeModule,
