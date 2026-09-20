@@ -1244,7 +1244,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         }
     }
 
@@ -1267,7 +1267,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         }
     }
 
@@ -1416,7 +1416,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         };
         assert_eq!(vector_width(i32_region.elem_type), 4);
         assert_eq!(i32_region.width, SimdWidth::Width4);
@@ -1438,7 +1438,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         };
         assert_eq!(vector_width(f32_region.elem_type), 4);
         assert_eq!(f32_region.width, SimdWidth::Width4);
@@ -1469,7 +1469,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(5),
-            arr_len_reg: None, // 5 elements → 2-wide SIMD + 1 epilogue
+            trip_count_array_reg: None, // 5 elements → 2-wide SIMD + 1 epilogue
         };
 
         let instructions = vec![
@@ -1534,7 +1534,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         };
 
         let ptr2 = compile_simd_region(
@@ -1572,7 +1572,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         };
 
         let instructions = vec![
@@ -1654,7 +1654,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: None,
-            arr_len_reg: None, // No hint → fallback
+            trip_count_array_reg: None, // No hint → fallback
         };
 
         let instructions = vec![
