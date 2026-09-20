@@ -3173,7 +3173,104 @@ impl TypeChecker {
             final_subst = compose_subst(&s, &final_subst);
         }
 
+        let resolved_scrutinee = apply_subst(&scrut_ty, &final_subst);
+        Self::check_match_exhaustiveness(&resolved_scrutinee, arms, span)?;
+
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
+    }
+
+    /// Conservative exhaustiveness checking for statically-known closed
+    /// variants. Guards never contribute to coverage because they may reject
+    /// at runtime. Primitive/literal, tuple, record, and open/unknown matches
+    /// retain their existing runtime non-exhaustive behavior until the full
+    /// pattern-matrix checker lands.
+    fn check_match_exhaustiveness(
+        scrut_ty: &Type,
+        arms: &[(Pattern, Option<Expr>, Expr)],
+        span: Span,
+    ) -> NuResult<()> {
+        let Type::Variant(variants) = scrut_ty else {
+            return Ok(());
+        };
+
+        let mut covered: FxHashSet<String> = FxHashSet::default();
+
+        for (pattern, guard, _) in arms {
+            if guard.is_some() {
+                continue;
+            }
+
+            if Self::pattern_is_irrefutable(pattern) {
+                return Ok(());
+            }
+
+            if let Some(name) = Self::covered_variant_constructor(pattern, variants) {
+                covered.insert(name.to_string());
+            }
+        }
+
+        let missing: Vec<String> = variants
+            .iter()
+            .filter_map(|(name, _)| (!covered.contains(name)).then_some(name.clone()))
+            .collect();
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let plural = if missing.len() == 1 { "variant" } else { "variants" };
+        Err(NuError::TypeError {
+            msg: format!(
+                "non-exhaustive match: missing {} {}",
+                plural,
+                missing.join(", ")
+            ),
+            span,
+            expected_type: Some("all variants or an unguarded catch-all pattern".to_string()),
+            found_type: Some(format!("missing {}", missing.join(", "))),
+            similar_names: None,
+        })
+    }
+
+    /// Whether a pattern is guaranteed to accept every value of its expected
+    /// type. This intentionally recognizes only structurally irrefutable
+    /// forms; variant and literal patterns are refutable by definition.
+    fn pattern_is_irrefutable(pattern: &Pattern) -> bool {
+        match pattern {
+            Pattern::Wild | Pattern::Var(_) => true,
+            Pattern::Alias(_, inner) => Self::pattern_is_irrefutable(inner),
+            Pattern::Tuple(items) => items.iter().all(Self::pattern_is_irrefutable),
+            Pattern::Record(fields) => fields
+                .iter()
+                .all(|(_, pattern)| Self::pattern_is_irrefutable(pattern)),
+            Pattern::Lit(_) | Pattern::Variant(_, _) => false,
+        }
+    }
+
+    /// Return the constructor covered by one unguarded top-level variant arm
+    /// when its payload pattern is total for that constructor.
+    fn covered_variant_constructor<'a>(
+        pattern: &'a Pattern,
+        variants: &[(String, Option<Type>)],
+    ) -> Option<&'a str> {
+        match pattern {
+            Pattern::Alias(_, inner) => Self::covered_variant_constructor(inner, variants),
+            Pattern::Variant(name, payload_pattern) => {
+                let (_, declared_payload) = variants.iter().find(|(n, _)| n == name)?;
+                let covers_constructor = match (declared_payload, payload_pattern.as_deref()) {
+                    (None, None) => true,
+                    (Some(_), Some(inner)) => Self::pattern_is_irrefutable(inner),
+                    // A nullary pattern for a payload-carrying constructor is
+                    // not total: the current MIR representation stores those
+                    // values as { ctor, payload } records, while a nullary
+                    // variant pattern compares the scrutinee directly to the
+                    // bare constructor tag.
+                    _ => false,
+                };
+                covers_constructor.then_some(name.as_str())
+            }
+            _ => None,
+        }
     }
 
     /// Bind pattern variables into a new context.
@@ -4420,6 +4517,140 @@ mod tests {
             arms: vec![(Pattern::Var("x".to_string()), None, var("x"))],
             span: sp(),
         };
+        let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+
+    #[test]
+    fn test_closed_variant_match_requires_all_constructors() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with(
+            "color",
+            Type::Variant(vec![
+                ("Red".to_string(), None),
+                ("Green".to_string(), None),
+                ("Blue".to_string(), None),
+            ]),
+        );
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("color")),
+            arms: vec![
+                (
+                    Pattern::Variant("Red".to_string(), None),
+                    None,
+                    int_lit(1),
+                ),
+                (
+                    Pattern::Variant("Green".to_string(), None),
+                    None,
+                    int_lit(2),
+                ),
+            ],
+            span: sp(),
+        };
+
+        let err = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(err.to_string().contains("non-exhaustive match"));
+        assert!(err.to_string().contains("Blue"));
+    }
+
+    #[test]
+    fn test_closed_variant_match_all_constructors_is_exhaustive() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with(
+            "color",
+            Type::Variant(vec![
+                ("Red".to_string(), None),
+                ("Green".to_string(), None),
+                ("Blue".to_string(), None),
+            ]),
+        );
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("color")),
+            arms: vec![
+                (
+                    Pattern::Variant("Red".to_string(), None),
+                    None,
+                    int_lit(1),
+                ),
+                (
+                    Pattern::Variant("Green".to_string(), None),
+                    None,
+                    int_lit(2),
+                ),
+                (
+                    Pattern::Variant("Blue".to_string(), None),
+                    None,
+                    int_lit(3),
+                ),
+            ],
+            span: sp(),
+        };
+
+        let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+
+    #[test]
+    fn test_closed_variant_guarded_arm_does_not_count_as_total() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with(
+            "value",
+            Type::Variant(vec![
+                ("Some".to_string(), Some(Type::int())),
+                ("None".to_string(), None),
+            ]),
+        );
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("value")),
+            arms: vec![
+                (
+                    Pattern::Variant(
+                        "Some".to_string(),
+                        Some(Box::new(Pattern::Var("x".to_string()))),
+                    ),
+                    Some(bool_lit(true)),
+                    int_lit(1),
+                ),
+                (
+                    Pattern::Variant("None".to_string(), None),
+                    None,
+                    int_lit(0),
+                ),
+            ],
+            span: sp(),
+        };
+
+        let err = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(err.to_string().contains("Some"));
+    }
+
+    #[test]
+    fn test_closed_variant_wildcard_is_exhaustive() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with(
+            "value",
+            Type::Variant(vec![
+                ("Some".to_string(), Some(Type::int())),
+                ("None".to_string(), None),
+            ]),
+        );
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("value")),
+            arms: vec![
+                (
+                    Pattern::Variant(
+                        "Some".to_string(),
+                        Some(Box::new(Pattern::Lit(Literal::Int(1)))),
+                    ),
+                    None,
+                    int_lit(1),
+                ),
+                (Pattern::Wild, None, int_lit(0)),
+            ],
+            span: sp(),
+        };
+
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
         assert_eq!(apply_subst(&ty, &s), Type::int());
     }
