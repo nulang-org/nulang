@@ -10,9 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use nulang::runtime::{
     cache_transport_bridge, redis_slot, CacheAdvertisedEndpoint, CacheMigrationJournal,
     CacheMigrationKey, CacheServiceBuilder, CacheServiceHandle, CacheServiceShardConfig,
-    CacheShardOwner, CacheSlotMap,
-    CacheTransportInbound, CacheTransportMessage, DeterministicNetworkTransport, IncomingPacket,
-    NodeId, OutgoingPacket, Runtime,
+    CacheShardOwner, CacheSlotMap, CacheTransportInbound, CacheTransportMessage,
+    DeterministicNetworkTransport, IncomingPacket, NodeId, OutgoingPacket, Runtime,
 };
 
 type Bus = Arc<
@@ -234,9 +233,7 @@ fn remote_cache_command_executes_on_owning_reactor_and_stale_epoch_fails_closed(
         target,
         frame: frame(&[b"SET", key, b"stale"]),
     };
-    service_a
-        .send_network_message(node_b, stale_set)
-        .unwrap();
+    service_a.send_network_message(node_b, stale_set).unwrap();
     let response = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
     match response.message {
         CacheTransportMessage::CommandResponse {
@@ -332,9 +329,7 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
     assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
 
     let mut migrating = base;
-    migrating
-        .begin_migration(1, slot, source, target)
-        .unwrap();
+    migrating.begin_migration(1, slot, source, target).unwrap();
     service_a.install_placement(migrating.clone()).unwrap();
     service_b.install_placement(migrating.clone()).unwrap();
     wait_epoch(&service_a, 1);
@@ -359,9 +354,7 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
         .send_remote_migration_probe(0, target, slot, 9002)
         .unwrap();
     let probe = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
-    let convergence = service_a
-        .complete_remote_migration_probe(&probe)
-        .unwrap();
+    let convergence = service_a.complete_remote_migration_probe(&probe).unwrap();
     assert_eq!(convergence.probe_id, 9002);
     assert_eq!(convergence.source_remaining, 0);
     assert_eq!(convergence.target_live_entries, 1);
@@ -380,12 +373,18 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
     let recovered = service_a
         .recovered_remote_migration(journal_key)
         .expect("durable migration proof");
-    assert_eq!(recovered.source_incarnation, service_a.migration_incarnation());
+    assert_eq!(
+        recovered.source_incarnation,
+        service_a.migration_incarnation()
+    );
     assert_eq!(recovered.source_remaining, Some(0));
     assert!(recovered.all_sent_transfers_acked());
     assert_eq!(recovered.expected_import_fences(), 1);
     assert_eq!(
-        recovered.convergence.as_ref().map(|evidence| evidence.probe_id),
+        recovered
+            .convergence
+            .as_ref()
+            .map(|evidence| evidence.probe_id),
         Some(9002)
     );
 
@@ -399,18 +398,14 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
     target_client
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    target_client
-        .write_all(&frame(&[b"ASKING"]))
-        .unwrap();
+    target_client.write_all(&frame(&[b"ASKING"])).unwrap();
     assert_eq!(read_resp_line(&mut target_client), b"+OK\r\n");
     target_client.write_all(&frame(&[b"GET", key])).unwrap();
     let mut imported = [0u8; 11];
     target_client.read_exact(&mut imported).unwrap();
     assert_eq!(&imported, b"$5\r\nvalue\r\n");
 
-    migrating
-        .commit_migration(2, slot, source, target)
-        .unwrap();
+    migrating.commit_migration(2, slot, source, target).unwrap();
     service_a.install_placement(migrating.clone()).unwrap();
     service_b.install_placement(migrating).unwrap();
     wait_epoch(&service_a, 2);
@@ -560,9 +555,7 @@ fn stale_remote_transfer_epoch_never_finalizes_source_key() {
     assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
 
     let mut migrating = base;
-    migrating
-        .begin_migration(1, slot, source, target)
-        .unwrap();
+    migrating.begin_migration(1, slot, source, target).unwrap();
     service_a.install_placement(migrating.clone()).unwrap();
     service_b.install_placement(migrating.clone()).unwrap();
     wait_epoch(&service_a, 1);
@@ -602,7 +595,6 @@ fn stale_remote_transfer_epoch_never_finalizes_source_key() {
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
 }
-
 
 #[test]
 fn duplicate_remote_command_replays_cached_response_without_reexecution() {
@@ -706,9 +698,7 @@ fn duplicate_remote_command_replays_cached_response_without_reexecution() {
         other => panic!("unexpected cache response: {other:?}"),
     }
 
-    service_a
-        .send_network_message(node_b, increment)
-        .unwrap();
+    service_a.send_network_message(node_b, increment).unwrap();
     let duplicate = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
     match duplicate.message {
         CacheTransportMessage::CommandResponse { response, .. } => {
@@ -740,9 +730,7 @@ fn duplicate_remote_command_replays_cached_response_without_reexecution() {
         target,
         frame: frame(&[b"GET", key]),
     };
-    service_a
-        .send_network_message(node_b, reused_id)
-        .unwrap();
+    service_a.send_network_message(node_b, reused_id).unwrap();
     let rejected = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
     match rejected.message {
         CacheTransportMessage::CommandResponse { response, .. } => {
@@ -757,7 +745,6 @@ fn duplicate_remote_command_replays_cached_response_without_reexecution() {
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
 }
-
 
 #[test]
 fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
@@ -898,7 +885,6 @@ fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
     service_b.shutdown().unwrap();
     std::fs::remove_file(journal_path).unwrap();
 }
-
 
 #[test]
 fn automatic_remote_command_retry_recovers_after_partition_heals() {
@@ -1142,7 +1128,6 @@ fn exhausted_remote_command_retry_reports_unknown_execution_timeout() {
     service_b.shutdown().unwrap();
 }
 
-
 #[test]
 fn exhausted_remote_transfer_retry_preserves_source_without_ack() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -1271,7 +1256,6 @@ fn exhausted_remote_transfer_retry_preserves_source_without_ack() {
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
 }
-
 
 #[test]
 fn automatic_remote_transfer_retry_recovers_without_early_source_finalize() {
