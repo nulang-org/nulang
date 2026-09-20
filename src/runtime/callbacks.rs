@@ -698,6 +698,24 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         }
     }
 
+    fn send_message_with_protocol(
+        &mut self,
+        target: crate::vm::Value,
+        behavior_id: u16,
+        args: &[crate::vm::Value],
+        required_protocol: Option<[u8; 32]>,
+    ) {
+        if let Some(actor_id) = target.as_actor_id() {
+            let mut rt = self.runtime.borrow_mut();
+            rt.send_message_by_id_with_protocol(
+                actor_id,
+                behavior_id,
+                args,
+                required_protocol,
+            );
+        }
+    }
+
     fn ask_actor(
         &mut self,
         target: crate::vm::Value,
@@ -1506,6 +1524,26 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             // target; the receive-wait wake is deferred while the shared
             // VM is executing (see `Runtime::pending_receive_wakes`).
             unsafe { (*self.runtime).send_message_by_id(target_id, behavior_id, args) }
+        }
+    }
+
+    fn send_message_with_protocol(
+        &mut self,
+        target: crate::vm::Value,
+        behavior_id: u16,
+        args: &[crate::vm::Value],
+        required_protocol: Option<[u8; 32]>,
+    ) {
+        if let Some(target_id) = target.as_actor_id() {
+            // SAFETY: same single-scheduler-thread invariant as send_message.
+            unsafe {
+                (*self.runtime).send_message_by_id_with_protocol(
+                    target_id,
+                    behavior_id,
+                    args,
+                    required_protocol,
+                )
+            }
         }
     }
 
