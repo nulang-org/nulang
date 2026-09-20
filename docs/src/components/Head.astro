@@ -39,7 +39,7 @@ if (isHome) {
     '@type': 'SoftwareSourceCode',
     name: 'Nulang',
     description:
-      'A distributed, actor-based programming language with algebraic effects, row-polymorphic types, and reference capabilities. Built in Rust with a register-based VM, Cranelift JIT, WASM backend, and native AOT compilation.',
+      'An actor-based programming language with Hindley-Milner inference, algebraic effects, capability types, supervision, persistent actors, and multiple execution backends.',
     programmingLanguage: ['Nulang', 'Rust'],
     url: site,
     codeRepository: 'https://github.com/nulang-org/nulang',
@@ -48,7 +48,6 @@ if (isHome) {
     keywords:
       'programming language, actor model, algebraic effects, distributed systems, Rust, WASM, JIT, type inference, reference capabilities, BEAM, OTP',
     operatingSystem: 'Linux, macOS',
-    version: '1.0.0-frozen',
   });
 } else if (!is404) {
   const article: any = {
