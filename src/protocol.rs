@@ -111,6 +111,107 @@ impl ProtocolCompatibility {
         !matches!(self, ProtocolCompatibility::Incompatible)
     }
 }
+/// Trusted in-process catalog of canonical actor protocol schemas.
+///
+/// A protocol digest is sufficient for exact equality, but not for proving
+/// rolling-upgrade compatibility between two different digests. The registry
+/// retains the canonical schemas needed to evaluate that directional relation
+/// without sending source declarations over the wire.
+///
+/// Missing schemas fail closed: callers must not reinterpret an unknown digest
+/// as compatible merely because the behavior name being invoked happens to
+/// exist locally.
+#[derive(Debug, Clone, Default)]
+pub struct ProtocolRegistry {
+    schemas: BTreeMap<ProtocolId, ProtocolSchema>,
+}
+
+impl ProtocolRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(
+        &mut self,
+        schema: ProtocolSchema,
+    ) -> Result<ProtocolId, ProtocolRegistryError> {
+        let id = schema.id();
+        if let Some(existing) = self.schemas.get(&id) {
+            if existing != &schema {
+                return Err(ProtocolRegistryError::HashCollision(id));
+            }
+            return Ok(id);
+        }
+        self.schemas.insert(id, schema);
+        Ok(id)
+    }
+
+    pub fn get(&self, id: ProtocolId) -> Option<&ProtocolSchema> {
+        self.schemas.get(&id)
+    }
+
+    pub fn contains(&self, id: ProtocolId) -> bool {
+        self.schemas.contains_key(&id)
+    }
+
+    /// Evaluate whether the receiver implementation can serve a client that
+    /// requires the supplied protocol.
+    ///
+    /// Both schemas must be present. Unknown ids are explicit errors so a
+    /// runtime can reject before mailbox publication rather than silently
+    /// degrading to name-only dispatch.
+    pub fn compatibility(
+        &self,
+        receiver: ProtocolId,
+        required: ProtocolId,
+    ) -> Result<ProtocolCompatibility, ProtocolRegistryError> {
+        if receiver == required {
+            // Exact identity does not need a schema lookup; the content hash
+            // itself proves equality.
+            return Ok(ProtocolCompatibility::Exact);
+        }
+
+        let receiver_schema = self
+            .schemas
+            .get(&receiver)
+            .ok_or(ProtocolRegistryError::UnknownProtocol(receiver))?;
+        let required_schema = self
+            .schemas
+            .get(&required)
+            .ok_or(ProtocolRegistryError::UnknownProtocol(required))?;
+
+        Ok(receiver_schema.compatibility_for_required(required_schema))
+    }
+
+    pub fn can_serve(
+        &self,
+        receiver: ProtocolId,
+        required: ProtocolId,
+    ) -> Result<bool, ProtocolRegistryError> {
+        Ok(self.compatibility(receiver, required)?.is_compatible())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolRegistryError {
+    UnknownProtocol(ProtocolId),
+    HashCollision(ProtocolId),
+}
+
+impl fmt::Display for ProtocolRegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtocolRegistryError::UnknownProtocol(id) => {
+                write!(f, "unknown actor protocol schema {id}")
+            }
+            ProtocolRegistryError::HashCollision(id) => {
+                write!(f, "actor protocol hash collision for {id}")
+            }
+        }
+    }
+}
+
+impl Error for ProtocolRegistryError {}
 
 /// One concrete reason a receiver cannot satisfy a required actor protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
