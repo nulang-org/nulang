@@ -45,6 +45,15 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Mechanical cost inspection — 2026-09-20
+- **Static bytecode mechanical-cost reports** (Experimental, `src/cost_model.rs`,
+  `nulang costs`). Compiled modules can now report explicit VM heap-allocation
+  sites, string materialization, copies, calls, branches, effect/suspension
+  boundaries, FFI, actor/distributed operations, and I/O per function. The
+  `--json` form is machine-readable, and `--deny-allocations` provides a CI
+  gate for explicit heap/string allocation sites without claiming to model
+  dynamic execution frequency or hidden host allocations.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
