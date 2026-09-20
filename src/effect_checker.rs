@@ -3127,6 +3127,35 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn module_effect_rows_include_actor_behaviors_and_transitive_calls() {
+        let source = r#"
+            fn helper() {
+                perform IO.print("helper")
+            }
+
+            actor Worker {
+                state count: Int = 0
+
+                behavior work() {
+                    helper()
+                    perform FS.exists("/tmp")
+                }
+            }
+        "#;
+        let tokens = crate::lexer::Lexer::new(source).lex().unwrap();
+        let ast = crate::parser::Parser::new(tokens).parse_module().unwrap();
+        let mut checker = EffectChecker::new();
+        checker.check_module(&ast.decls).unwrap();
+
+        let rows = checker.module_effect_rows(&ast.decls).unwrap();
+        assert!(rows.iter().any(|row| row.contains(&Effect::IO)));
+        assert!(rows.iter().any(|row| row.contains(&Effect::FS)));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains(&Effect::IO) && row.contains(&Effect::FS)));
+    }
+
+    #[test]
     fn test_infer_literal_is_pure() {
         let mut checker = EffectChecker::new();
         let ctx = EffectContext::empty();
