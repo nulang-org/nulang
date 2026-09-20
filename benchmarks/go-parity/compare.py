@@ -41,18 +41,15 @@ def cargo_target_dir() -> Path:
 def criterion_results(target: Path) -> dict[str, float]:
     root = target / "criterion"
     found: dict[str, float] = {}
-    for meta in root.rglob("benchmark.json"):
+    for estimates in root.rglob("new/estimates.json"):
         try:
-            info = json.loads(meta.read_text())
-        except (OSError, json.JSONDecodeError):
+            rel = estimates.parent.parent.relative_to(root)
+            full_id = "/".join(rel.parts)
+            data = json.loads(estimates.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
             continue
-        full_id = info.get("full_id", "")
         if not full_id.startswith("go_parity/"):
             continue
-        estimates = meta.parent / "new" / "estimates.json"
-        if not estimates.exists():
-            continue
-        data = json.loads(estimates.read_text())
         # Criterion stores duration estimates in nanoseconds.
         found[full_id] = float(data["mean"]["point_estimate"])
     return found
