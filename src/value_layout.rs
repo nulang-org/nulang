@@ -29,10 +29,10 @@
 //! operations for tag extraction, the representation is fully deterministic
 //! across all targets: native, WASM, and any future backend.
 //!
-//! Floats are stored as their raw IEEE-754 bit pattern. Any bit pattern whose
-//! upper 16 bits do not match a known type tag is interpreted as a float
-//! (the current tag set occupies the quiet-NaN range 0x7FF6–0x7FFE, so no
-//! valid non-NaN float will collide).
+//! Finite floats and infinities retain their raw IEEE-754 bit pattern. NaNs
+//! are canonicalized to `CANONICAL_NAN_BITS`. Arbitrary NaN payloads are not
+//! accepted as floats because the runtime tags occupy reserved patterns in the
+//! IEEE-754 quiet-NaN range (currently 0x7FF5–0x7FFE).
 // ---------------------------------------------------------------------------
 // Stable ABI contract
 // ---------------------------------------------------------------------------
@@ -248,7 +248,7 @@ const MANTISSA_MASK: u64 = 0x000F_FFFF_FFFF_FFFF;
 /// reserved `CANONICAL_NAN_BITS` pattern, which `float_bits()` substitutes for
 /// any NaN result so that float NaNs survive in the boxed representation.
 ///
-/// All tagged values (0x7FF6–0x7FFE) occupy the quiet-NaN range, so this
+/// All tagged values (0x7FF5–0x7FFE) occupy the quiet-NaN range, so this
 /// integer bitmask test is equivalent to `!f64::from_bits(raw).is_nan()` (plus
 /// the canonical-NaN exception) but avoids the FPU domain-crossing penalty of
 /// `vmovq` + `ucomisd`.
