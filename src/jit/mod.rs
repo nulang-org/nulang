@@ -53,10 +53,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// before it becomes eligible for JIT compilation.
 pub const HOT_THRESHOLD: u64 = 1000;
 
-/// Threshold for tier-2 recompilation: after an already-compiled region
-/// has been executed this many additional times, a more aggressive
-/// compilation strategy is attempted (typed path if not already typed,
-/// or SIMD if the region is amenable).
+/// Threshold for tier-2 SIMD promotion: after an already-compiled region
+/// has been entered this many additional times, one conservative SIMD
+/// replacement attempt is made. Rejected regions remain on tier 1.
 pub const TIER2_THRESHOLD: u64 = 10_000;
 
 /// Minimum length for a STRAIGHT-LINE region (no internal loop back-edge) to
@@ -653,12 +652,12 @@ impl JitSession {
     /// type-directed scalar compiler if SIMD emission fails. Returns `None`
     /// when the region has no vectorizable pattern at all.
     ///
-    /// Wired into tier-2 promotion: when a typed region exceeds
-    /// `TIER2_THRESHOLD` executions, SIMD compilation is attempted.
-    /// Falls back to typed/scalar on any failure.  Element-wise array
-    /// ops store results to memory (no register write-back needed);
-    /// trip count must be a runtime `ArrLen` register (baked hints
-    /// are unsafe and rejected by the analyzer).
+    /// Standalone compile-once SIMD entry point. Tier-2 replacement uses
+    /// `promote_region_simd` instead so an already-cached tier-1 pointer does
+    /// not short-circuit recompilation. Unsupported patterns fall back to the
+    /// typed/scalar compiler. Production tier-2 additionally applies the
+    /// representation and scalar-state equivalence gates before calling the
+    /// SIMD compiler.
     ///
     /// # Safety
     /// Same safety requirements as `compile_region`.
