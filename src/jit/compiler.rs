@@ -30,6 +30,7 @@ use cranelift_jit::JITModule;
 use cranelift_module::{Linkage, Module};
 
 use crate::bytecode::{Instruction, OpCode};
+use crate::jit::NativeCallSite;
 use crate::runtime::heap::{ActorHeap, OrcaHeader, TypeTag};
 use crate::value_layout::{PAYLOAD_MASK, TAG_INT, TAG_MASK, TAG_NIL, TAG_PTR};
 
@@ -226,7 +227,7 @@ pub fn compile_bytecode_region(
     start_offset: usize,
     num_instrs: usize,
     instructions: &[Instruction],
-    native_calls: &HashMap<usize, usize>,
+    native_calls: &HashMap<usize, NativeCallSite>,
 ) -> Result<*const u8, CompileError> {
     ctx.clear();
 
@@ -497,8 +498,7 @@ pub fn compile_bytecode_region(
                 instr.op2 as usize,
                 instr.op3 as usize,
                 RuntimeHelper::FDiv,
-            ),
-            // Interpreter reads src from op1 and writes dst to op3 for FNeg.
+            ),            // Interpreter reads src from op1 and writes dst to op3 for FNeg.
             OpCode::FNeg => emit_unary(
                 &mut builder,
                 &helpers,
@@ -706,7 +706,14 @@ pub fn compile_bytecode_region(
                 // completion via the re-entrant `nulang_jit_direct_call`
                 // helper while this region stays resident in native code.
                 let func_idx = match native_calls.get(&pc) {
-                    Some(&idx) => idx as i64,
+                    Some(site) => {
+                        // caller_save is intentionally metadata-only in this
+                        // slice. The helper-backed call below already preserves
+                        // caller state through an interpreter frame; the next
+                        // native JIT-to-JIT ABI consumes this save set.
+                        let _ = site.caller_save;
+                        site.callee as i64
+                    }
                     None => {
                         return Err(CompileError::Internal(
                             "Call in compiled region without a native-call entry".into(),
@@ -997,8 +1004,7 @@ fn emit_self_unary(
     regs_ptr: Value,
     reg: usize,
     helper: RuntimeHelper,
-) {
-    emit_unary(builder, helpers, regs_ptr, reg, reg, helper);
+) {    emit_unary(builder, helpers, regs_ptr, reg, reg, helper);
 }
 
 fn emit_reg_call3(
