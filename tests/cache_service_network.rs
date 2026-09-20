@@ -2309,7 +2309,9 @@ fn journaled_shard_recovers_mutations_without_checkpoint() {
         .unwrap();
 
     client.write_all(&frame(&[b"GET", b"n"])).unwrap();
-    assert_eq!(read_resp_line(&mut client), b"$1\r\n2\r\n");
+    let mut n_value = [0u8; 7];
+    client.read_exact(&mut n_value).unwrap();
+    assert_eq!(&n_value, b"$1\r\n2\r\n");
 
     client.write_all(&frame(&[b"MGET", b"a{j}", b"b{j}"])).unwrap();
     let mut values = [0u8; 18];
@@ -2386,7 +2388,9 @@ fn journaled_checkpoint_replays_only_mutations_after_snapshot_lsn() {
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
     client.write_all(&frame(&[b"GET", b"k"])).unwrap();
-    assert_eq!(read_resp_line(&mut client), b"$1\r\n2\r\n");
+    let mut value = [0u8; 7];
+    client.read_exact(&mut value).unwrap();
+    assert_eq!(&value, b"$1\r\n2\r\n");
 
     restored.shutdown().unwrap();
     std::fs::remove_file(wal_path).unwrap();
