@@ -1172,7 +1172,7 @@ impl Runtime {
     /// Mirrors the structure of `resume_suspended_llm_step` but without
     /// LLM-specific logic: re-installs callbacks, restores VM state,
     /// resets the safepoint counter, and resumes execution.
-    #[cfg(feature = "native-aot")]
+    #[cfg(feature = "jit-codegen")]
     fn resume_suspended_jit_yield(&mut self, actor_id: u64) {
         let suspended = match self.actors.get_mut(&actor_id) {
             Some(actor) => actor.suspended_execution.take(),
@@ -3312,7 +3312,7 @@ impl Runtime {
         // behavior (clearing suspended_execution) or re-suspend (setting it
         // again), after which the normal suspended_execution guard below
         // prevents processing new messages while the behavior is live.
-        #[cfg(feature = "native-aot")]
+        #[cfg(feature = "jit-codegen")]
         {
             let jit_yield = self
                 .actors
@@ -4577,9 +4577,9 @@ impl Runtime {
 
             (*self_ptr).vm_exec_begin();
 
-            #[cfg(feature = "native-aot")]
+            #[cfg(feature = "jit-codegen")]
             {
-                // Reset native-codegen safepoint counter for this behavior.
+                // Reset JIT safepoint counter for this behavior.
                 if let Some(actor) = self.actors.get_mut(&actor_id) {
                     actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
                     crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
@@ -4588,7 +4588,7 @@ impl Runtime {
 
             let result = vm.run_from(module_idx, code_offset);
 
-            #[cfg(feature = "native-aot")]
+            #[cfg(feature = "jit-codegen")]
             {
                 // JIT safepoint yield: capture state for inline resume.
                 if vm.yield_pending {
@@ -4635,7 +4635,7 @@ impl Runtime {
             // suspend still needs. Runs on every path, so wakes of other
             // actors are not lost when THIS actor suspends.
             (*self_ptr).vm_exec_end();
-            #[cfg(feature = "native-aot")]
+            #[cfg(feature = "jit-codegen")]
             crate::jit::runtime::clear_jit_safepoint_ptr();
             // String-id values index into this runtime VM's constant pool. When
             // the result is returned to a different VM (e.g. the top-level VM
