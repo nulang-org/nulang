@@ -49,7 +49,9 @@ two major versions.*
 - **Static bytecode mechanical-cost reports** (Experimental, `src/cost_model.rs`,
   `nulang costs`). Compiled modules can now report explicit VM heap-allocation
   sites, string materialization, copies, calls, branches, effect/suspension
-  boundaries, FFI, actor/distributed operations, and I/O per function. The
+  boundaries, FFI, actor/distributed operations, and I/O per function. Heap
+  sites proven non-escaping by the existing iso-arena analysis are reported
+  separately as arena-eligible, without treating them as allocation-free. The
   `--json` form is machine-readable, and `--deny-allocations` provides a CI
   gate for explicit heap/string allocation sites without claiming to model
   dynamic execution frequency or hidden host allocations.
