@@ -1162,7 +1162,7 @@ impl EffectChecker {
 
     /// Return conservative effect rows for every executable module surface.
     ///
-    /// This is intended for authority manifests such as generated WIT worlds.
+    /// This is intended for component import manifests such as generated WIT worlds.
     /// Declared function/behavior rows are preserved as upper bounds (so the
     /// manifest may over-grant but never under-grants because of an annotation);
     /// unannotated behavior bodies, actor initializers/defaults, and workflow
