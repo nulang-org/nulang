@@ -119,6 +119,38 @@ pub enum ActorAddress {
     Remote { node_id: NodeId, actor_id: u64 },
 }
 
+/// A location-transparent actor address carrying the structural protocol
+/// required by the client/reference. This is the typed distributed-address
+/// form used to populate NUL0 actor protocol metadata without changing the
+/// compact Value::actor_ref ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProtocolActorAddress {
+    pub address: ActorAddress,
+    pub protocol_id: ProtocolId,
+}
+
+impl ProtocolActorAddress {
+    pub fn new(address: ActorAddress, protocol_id: ProtocolId) -> Self {
+        Self { address, protocol_id }
+    }
+
+    pub fn local(actor_id: u64, protocol_id: ProtocolId) -> Self {
+        Self::new(ActorAddress::local(actor_id), protocol_id)
+    }
+
+    pub fn remote(node_id: NodeId, actor_id: u64, protocol_id: ProtocolId) -> Self {
+        Self::new(ActorAddress::remote(node_id, actor_id), protocol_id)
+    }
+
+    pub fn actor_id(&self) -> u64 {
+        self.address.actor_id()
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.address.node_id()
+    }
+}
+
 impl ActorAddress {
     /// Create a local address.
     pub fn local(actor_id: u64) -> Self {
@@ -818,6 +850,52 @@ pub fn send_distributed(
     behavior: &str,
     args: &[Value],
 ) {
+    send_distributed_with_protocol(
+        runtime,
+        transport,
+        cluster,
+        resolver,
+        target,
+        behavior,
+        args,
+        None,
+    )
+}
+
+/// Send using a typed actor address. The required protocol identity is carried
+/// on the wire and therefore participates in receiver-side pre-mailbox
+/// admission.
+pub fn send_distributed_typed(
+    runtime: &mut Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    resolver: &mut AddressResolver,
+    target: ProtocolActorAddress,
+    behavior: &str,
+    args: &[Value],
+) {
+    send_distributed_with_protocol(
+        runtime,
+        transport,
+        cluster,
+        resolver,
+        target.address,
+        behavior,
+        args,
+        Some(target.protocol_id),
+    )
+}
+
+fn send_distributed_with_protocol(
+    runtime: &mut Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    resolver: &mut AddressResolver,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+    required_protocol: Option<ProtocolId>,
+) {
     match resolver.resolve(cluster, target) {
         ResolveResult::Local { actor_id } => {
             runtime.send_message(actor_id, behavior, args);
@@ -866,7 +944,7 @@ pub fn send_distributed(
             // (not a synthetic child) crosses because `traceparent` has no
             // parent field — the receiver creates its own child span.
             let trace_id = runtime.current_trace.as_ref().map(|t| t.to_traceparent());
-            let packet = resolver.build_packet(
+            let packet = resolver.build_packet_with_protocol(
                 actor_id,
                 behavior,
                 payload,
@@ -876,6 +954,7 @@ pub fn send_distributed(
                 object_table,
                 content_hash,
                 trace_id,
+                required_protocol.map(|id| *id.as_bytes()),
             );
 
             if let Some(node_info) = cluster.get_node(node_id) {
@@ -3016,6 +3095,65 @@ mod tests {
                 assert_eq!(trace_id.as_deref(), Some(trace));
             }
             other => panic!("expected ActorMessage packet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn typed_distributed_send_carries_required_protocol_identity() {
+        let local_addr = addr(9500);
+        let local_node = NodeId::new(&local_addr);
+        let peer_addr = addr(9501);
+        let peer_node = NodeId::new(&peer_addr);
+
+        let mut runtime = Runtime::new();
+        let mut cluster = ClusterState::new(local_node, local_addr);
+        cluster.handle_heartbeat(peer_node, peer_addr);
+        let mut resolver = AddressResolver::new(local_node);
+        let mut transport = QueueTransport {
+            node_id: local_node,
+            listen_addr: local_addr,
+            incoming: Mutex::new(Vec::new()),
+            sent: Mutex::new(Vec::new()),
+        };
+
+        let schema = crate::protocol::ProtocolSchema::new(
+            "RemoteAccount",
+            [crate::protocol::ProtocolMember::request_reply(
+                "balance",
+                vec![],
+                crate::protocol::ProtocolTypeId::from_type(
+                    &crate::types::Type::Primitive(crate::types::PrimitiveType::Int),
+                ),
+            )],
+        )
+        .unwrap();
+        let required = schema.id();
+        let target = ProtocolActorAddress::remote(peer_node, 77, required);
+
+        send_distributed_typed(
+            &mut runtime,
+            &mut transport,
+            &cluster,
+            &mut resolver,
+            target,
+            "balance",
+            &[],
+        );
+
+        let sent = transport.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        match &sent[0] {
+            Packet::ActorMessage {
+                target_actor,
+                protocol_id,
+                behavior_name,
+                ..
+            } => {
+                assert_eq!(*target_actor, 77);
+                assert_eq!(behavior_name, "balance");
+                assert_eq!(*protocol_id, Some(*required.as_bytes()));
+            }
+            packet => panic!("expected typed actor message, got {packet:?}"),
         }
     }
 
