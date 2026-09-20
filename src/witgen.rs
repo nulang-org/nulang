@@ -408,7 +408,7 @@ impl std::error::Error for WitGenError {}
 /// Map a compiler-level effect to the canonical WIT host interface.
 ///
 /// This is intentionally fail-closed: effects not listed here are not silently
-/// erased from the component's authority contract. A few legacy stdlib modules
+/// erased from the component's import contract. A few legacy stdlib modules
 /// are represented as user-defined effects until they receive dedicated
 /// `Effect` variants, so those names are mapped explicitly as well.
 pub fn effect_to_wit_interface_name(effect: &Effect) -> Option<&'static str> {
@@ -438,7 +438,7 @@ pub fn effect_to_wit_interface_name(effect: &Effect) -> Option<&'static str> {
 }
 
 /// Convert a closed compiler effect row into the exact WIT interfaces it
-/// requires. Open rows are rejected because their authority is not statically
+/// requires. Open rows are rejected because their dependency set is not statically
 /// closed; unmapped effects are rejected rather than silently under-granting.
 pub fn effect_row_to_wit_imports(row: &EffectRow) -> Result<BTreeSet<String>, WitGenError> {
     if matches!(row, EffectRow::Open(_, _)) {
