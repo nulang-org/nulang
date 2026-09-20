@@ -53,6 +53,12 @@ two major versions.*
   changing an existing signature is incompatible. V1 intentionally avoids
   implicit field/default/variance rules.
 
+- **Typed distributed actor address/send API** (Experimental,
+  `src/runtime/distributed.rs`). `ProtocolActorAddress` carries a canonical
+  required `ProtocolId` alongside location, and `send_distributed_typed`
+  emits that identity through the additive NUL0 protocol tail. This enables
+  end-to-end strict admission without changing the compact actor-ref value ABI.
+
 - **Distributed pre-mailbox protocol admission** (Experimental,
   `src/runtime/distributed.rs`). Incoming actor messages carrying structural
   protocol identity are checked before behavior lookup, payload interning, or
