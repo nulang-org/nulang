@@ -46,6 +46,7 @@ version + migration.*
 two major versions.*
 
 ### MIR scalar replacement — 2026-09-20
+- **Dominance-aware cross-block scalar replacement** (`src/mir_cfg.rs`, `src/mir_scalar_replace.rs`). The optimizer now computes explicit MIR dominators and can eliminate immutable tuple/record allocations when projections occur in dominated successor blocks. Cross-block substitution requires stable captured constituents and fails closed for non-dominating joins, later source reassignments, unreachable blocks, and functions with effect-handler tables whose implicit edges are not represented by the normal CFG.
 - **Projection-only compiler-generated tuples and records can now be eliminated before bytecode emission** (`src/mir_escape.rs`, `src/mir_scalar_replace.rs`, `src/mir_codegen.rs`). A conservative MIR escape proof identifies local immutable aggregates, and the first scalar-replacement pass rewrites same-basic-block field projections to their constituent locals so eligible values never emit `TupleMk`/`RecMk`. Aliases, mutation, cross-block uses, captured-value reassignment, and ordinary named source locals fail closed; the latter remain materialized to preserve debugger visibility. Criterion coverage includes a 1,000-iteration record hot loop, and bytecode regression tests pin allocation elimination.
 
 ### RESP-compatible cache kernel — 2026-09-19
