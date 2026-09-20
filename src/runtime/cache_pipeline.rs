@@ -108,7 +108,8 @@ impl CacheResponsePipeline {
         };
 
         let submit = match outcome {
-            CacheDispatchOutcome::Executed { consumed } => {
+            CacheDispatchOutcome::Executed { consumed }
+            | CacheDispatchOutcome::Redirected { consumed, .. } => {
                 if self.pending.is_empty() {
                     socket_out.extend_from_slice(&self.direct_scratch);
                 } else {
