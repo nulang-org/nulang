@@ -45,6 +45,14 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Actor dispatch soundness — 2026-09-20
+- **Fail-closed behavior-name resolution** (Stable runtime correction). Local,
+  cross-shard, and remote actor sends no longer map unknown behavior names to
+  behavior id 0. Name resolution remains on the owning runtime/shard, fetched
+  or hot-reloaded code must still declare the requested behavior, invalid
+  synchronous numeric asks fail explicitly, and genuinely declared behavior
+  id 0 remains valid.
+
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
   A receiver may serve an older required protocol when it preserves every
