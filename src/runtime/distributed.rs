@@ -2977,11 +2977,19 @@ mod tests {
         let result = resolver.parse_packet(packet);
         assert!(result.is_some());
 
-        let (target, behavior_name, msg, string_table, _object_table, content_hash) =
-            result.unwrap();
+        let (
+            target,
+            behavior_name,
+            msg,
+            string_table,
+            _object_table,
+            content_hash,
+            protocol_id,
+        ) = result.unwrap();
         assert_eq!(target, 77);
         assert_eq!(behavior_name, "inc");
         assert_eq!(content_hash, None);
+        assert_eq!(protocol_id, None);
         // behavior_id is resolved at delivery, not parse time.
         assert_eq!(msg.behavior_id, 0);
         assert_eq!(msg.sender, 88);
