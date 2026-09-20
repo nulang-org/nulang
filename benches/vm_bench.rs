@@ -123,7 +123,6 @@ fn bench_array_indexing(c: &mut Criterion) {
     });
 }
 
-
 fn bench_array_view_read_heavy(c: &mut Criterion) {
     // Compare the zero-copy view with an explicitly materialized equivalent.
     // The materialized case is a present-day control, not a historical claim.
@@ -160,6 +159,47 @@ fn bench_array_view_read_heavy(c: &mut Criterion) {
         )
     });
     group.bench_function("materialized_equivalent", |b| {
+        b.iter_batched(
+            || fresh_vm(&materialized),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+fn bench_array_view_repeated_mutation(c: &mut Criterion) {
+    let view_source = r#"
+        let base = [0, 1, 2, 3, 4, 5, 6, 7]
+        let xs = perform Array.slice(base, 1, 7)
+        var i = 0
+        while i < 1000 {
+            xs[i % 6] = i
+            i = i + 1
+        }
+        xs[0] + base[1]
+    "#;
+    let materialized_source = r#"
+        let base = [0, 1, 2, 3, 4, 5, 6, 7]
+        let xs = [base[1], base[2], base[3], base[4], base[5], base[6]]
+        var i = 0
+        while i < 1000 {
+            xs[i % 6] = i
+            i = i + 1
+        }
+        xs[0] + base[1]
+    "#;
+    let view = compile(view_source);
+    let materialized = compile(materialized_source);
+    let mut group = c.benchmark_group("vm/array_view/repeated_mutation");
+    group.bench_function("view_cow_then_writes", |b| {
+        b.iter_batched(
+            || fresh_vm(&view),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("materialized_writes", |b| {
         b.iter_batched(
             || fresh_vm(&materialized),
             |mut vm| black_box(vm.run().unwrap()),
@@ -279,6 +319,7 @@ criterion_group!(
     bench_array_indexing,
     bench_array_view_read_heavy,
     bench_array_view_cow_mutation,
+    bench_array_view_repeated_mutation,
     bench_perform_float_sqrt,
     bench_perform_int_to_float,
     bench_perform_array_length,

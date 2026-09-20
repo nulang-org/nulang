@@ -1670,16 +1670,11 @@ fn test_may_suspend_analysis() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // ArrayView native helper parity
 // ---------------------------------------------------------------------------
 
-fn make_array_view_fixture() -> (
-    crate::vm::StandaloneVmCallbacks,
-    crate::vm::Value,
-    *mut u8,
-) {
+fn make_array_view_fixture() -> (crate::vm::StandaloneVmCallbacks, crate::vm::Value, *mut u8) {
     use crate::runtime::heap::TypeTag as HeapTypeTag;
     use crate::vm::{perform_array_builtin, ActorVmCallbacks, Value};
 
