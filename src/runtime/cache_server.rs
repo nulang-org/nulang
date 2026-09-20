@@ -1530,7 +1530,11 @@ impl CacheServiceHandle {
             // Durable-before-send: if the process fails after this fsync but
             // before transport enqueue, recovery safely treats the batch as
             // possibly sent and can retry the exact envelope.
-            let has_ttl = pending.batch.entries.iter().any(|entry| entry.ttl_ms.is_some());
+            let has_ttl = pending
+                .batch
+                .entries
+                .iter()
+                .any(|entry| entry.ttl_ms.is_some());
             journal.record_transfer_sent_at(
                 key,
                 &message,
@@ -3537,11 +3541,18 @@ enum ConnectionAction {
 }
 
 fn cache_wall_unix_ms() -> io::Result<u64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "system wall clock before Unix epoch"))?;
-    u64::try_from(duration.as_millis())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "system wall clock milliseconds overflow"))
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "system wall clock before Unix epoch",
+        )
+    })?;
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "system wall clock milliseconds overflow",
+        )
+    })
 }
 
 fn validate_placement_endpoints(
