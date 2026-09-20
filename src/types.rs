@@ -1480,7 +1480,11 @@ impl NuWarning {
     /// constructors. This remains a warning in v1.x because hard rejection
     /// would invalidate programs accepted by the Frozen Core.
     pub fn non_exhaustive_variant_match(span: Span, missing: &[String]) -> Self {
-        let plural = if missing.len() == 1 { "variant" } else { "variants" };
+        let plural = if missing.len() == 1 {
+            "variant"
+        } else {
+            "variants"
+        };
         NuWarning {
             code: "W0201",
             msg: format!(
