@@ -1988,7 +1988,7 @@ fn run_source(
         }
         #[cfg(not(feature = "native-aot"))]
         "native" => Err(nulang::types::NuError::VMError {
-            msg: "native backend not compiled in (enable 'native-codegen' feature)".into(),
+            msg: "native backend not compiled in (enable 'native-aot' or compatibility 'native-codegen' feature)".into(),
             span: Span::default(),
         }),
         "bytecode" => {
