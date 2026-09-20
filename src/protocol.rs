@@ -262,6 +262,128 @@ impl fmt::Display for ProtocolRegistryError {
 
 impl Error for ProtocolRegistryError {}
 
+/// Policy applied before an incoming actor message is published to a mailbox.
+///
+/// StrictCompatible is the default: exact protocol ids are accepted directly,
+/// and differing typed ids must be proven directionally compatible through the
+/// trusted schema registry. LegacyCompatible is an explicit migration mode for
+/// untyped senders only; it never weakens checks for typed mismatches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolAdmissionPolicy {
+    StrictExact,
+    StrictCompatible,
+    LegacyCompatible,
+}
+
+impl Default for ProtocolAdmissionPolicy {
+    fn default() -> Self {
+        ProtocolAdmissionPolicy::StrictCompatible
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolAdmission {
+    Exact,
+    CompatibleUpgrade,
+    LegacyUntyped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolAdmissionError {
+    MissingRequiredProtocol,
+    MissingReceiverProtocol,
+    ExactMismatch {
+        receiver: ProtocolId,
+        required: ProtocolId,
+    },
+    Incompatible {
+        receiver: ProtocolId,
+        required: ProtocolId,
+    },
+    UnknownProtocol(ProtocolId),
+    RegistryHashCollision(ProtocolId),
+}
+
+impl fmt::Display for ProtocolAdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtocolAdmissionError::MissingRequiredProtocol => {
+                f.write_str("incoming actor message has no required protocol identity")
+            }
+            ProtocolAdmissionError::MissingReceiverProtocol => {
+                f.write_str("target actor has no protocol identity")
+            }
+            ProtocolAdmissionError::ExactMismatch { receiver, required } => write!(
+                f,
+                "actor protocol mismatch: receiver {receiver}, required {required}"
+            ),
+            ProtocolAdmissionError::Incompatible { receiver, required } => write!(
+                f,
+                "actor protocol is incompatible: receiver {receiver}, required {required}"
+            ),
+            ProtocolAdmissionError::UnknownProtocol(id) => {
+                write!(f, "unknown actor protocol schema {id}")
+            }
+            ProtocolAdmissionError::RegistryHashCollision(id) => {
+                write!(f, "actor protocol registry hash collision for {id}")
+            }
+        }
+    }
+}
+
+impl Error for ProtocolAdmissionError {}
+
+/// Decide whether an incoming message may proceed to mailbox publication.
+///
+/// This function is deliberately side-effect free. Runtimes should call it
+/// before queue capacity accounting, mailbox mutation, durable journaling, or
+/// delivery acknowledgements.
+pub fn admit_protocol(
+    registry: &ProtocolRegistry,
+    policy: ProtocolAdmissionPolicy,
+    receiver: Option<ProtocolId>,
+    required: Option<ProtocolId>,
+) -> Result<ProtocolAdmission, ProtocolAdmissionError> {
+    match (receiver, required) {
+        (Some(receiver), Some(required)) if receiver == required => Ok(ProtocolAdmission::Exact),
+        (Some(receiver), Some(required)) => match policy {
+            ProtocolAdmissionPolicy::StrictExact => {
+                Err(ProtocolAdmissionError::ExactMismatch { receiver, required })
+            }
+            ProtocolAdmissionPolicy::StrictCompatible
+            | ProtocolAdmissionPolicy::LegacyCompatible => {
+                let compatibility =
+                    registry
+                        .compatibility(receiver, required)
+                        .map_err(|error| match error {
+                            ProtocolRegistryError::UnknownProtocol(id) => {
+                                ProtocolAdmissionError::UnknownProtocol(id)
+                            }
+                            ProtocolRegistryError::HashCollision(id) => {
+                                ProtocolAdmissionError::RegistryHashCollision(id)
+                            }
+                        })?;
+                match compatibility {
+                    ProtocolCompatibility::Exact => Ok(ProtocolAdmission::Exact),
+                    ProtocolCompatibility::ReceiverSuperset => {
+                        Ok(ProtocolAdmission::CompatibleUpgrade)
+                    }
+                    ProtocolCompatibility::Incompatible => {
+                        Err(ProtocolAdmissionError::Incompatible { receiver, required })
+                    }
+                }
+            }
+        },
+        (None, Some(_)) => Err(ProtocolAdmissionError::MissingReceiverProtocol),
+        (_, None) => match policy {
+            ProtocolAdmissionPolicy::LegacyCompatible => Ok(ProtocolAdmission::LegacyUntyped),
+            ProtocolAdmissionPolicy::StrictExact | ProtocolAdmissionPolicy::StrictCompatible => {
+                Err(ProtocolAdmissionError::MissingRequiredProtocol)
+            }
+        },
+    }
+}
+
 impl ProtocolSchema {
     pub fn new(
         name: impl Into<String>,
@@ -1182,6 +1304,188 @@ mod tests {
         let id = registry.register(original).unwrap();
         assert_eq!(registry.register(renamed).unwrap(), id);
         assert_eq!(registry.get(id).unwrap().name, "Account");
+    }
+
+    #[test]
+    fn admission_exact_match_needs_no_registry_lookup() {
+        let schema =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let id = schema.id();
+        let registry = ProtocolRegistry::new();
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::StrictCompatible,
+                Some(id),
+                Some(id),
+            ),
+            Ok(ProtocolAdmission::Exact)
+        );
+    }
+
+    #[test]
+    fn admission_allows_proven_additive_receiver_upgrade() {
+        let old = ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let new = ProtocolSchema::new(
+            "Account",
+            [
+                member("Balance", vec![], money_ty()),
+                member("Deposit", vec![money_ty()], Type::unit()),
+            ],
+        )
+        .unwrap();
+
+        let old_id = old.id();
+        let new_id = new.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(old).unwrap();
+        registry.register(new).unwrap();
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::StrictCompatible,
+                Some(new_id),
+                Some(old_id),
+            ),
+            Ok(ProtocolAdmission::CompatibleUpgrade)
+        );
+    }
+
+    #[test]
+    fn admission_strict_exact_rejects_compatible_but_different_digest() {
+        let old = ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let new = ProtocolSchema::new(
+            "Account",
+            [
+                member("Balance", vec![], money_ty()),
+                member("Deposit", vec![money_ty()], Type::unit()),
+            ],
+        )
+        .unwrap();
+
+        let old_id = old.id();
+        let new_id = new.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(old).unwrap();
+        registry.register(new).unwrap();
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::StrictExact,
+                Some(new_id),
+                Some(old_id),
+            ),
+            Err(ProtocolAdmissionError::ExactMismatch {
+                receiver: new_id,
+                required: old_id,
+            })
+        );
+    }
+
+    #[test]
+    fn admission_rejects_incompatible_and_unknown_typed_protocols() {
+        let old = ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let changed =
+            ProtocolSchema::new("Account", [member("Balance", vec![], int_ty())]).unwrap();
+        let additive = ProtocolSchema::new(
+            "Account",
+            [
+                member("Balance", vec![], money_ty()),
+                member("Deposit", vec![money_ty()], Type::unit()),
+            ],
+        )
+        .unwrap();
+
+        let old_id = old.id();
+        let changed_id = changed.id();
+        let unknown_id = additive.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(old).unwrap();
+        registry.register(changed).unwrap();
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::StrictCompatible,
+                Some(changed_id),
+                Some(old_id),
+            ),
+            Err(ProtocolAdmissionError::Incompatible {
+                receiver: changed_id,
+                required: old_id,
+            })
+        );
+
+        for policy in [
+            ProtocolAdmissionPolicy::StrictCompatible,
+            ProtocolAdmissionPolicy::LegacyCompatible,
+        ] {
+            assert_eq!(
+                admit_protocol(&registry, policy, Some(changed_id), Some(unknown_id),),
+                Err(ProtocolAdmissionError::UnknownProtocol(unknown_id))
+            );
+        }
+    }
+
+    #[test]
+    fn admission_rejects_untyped_messages_by_default() {
+        let registry = ProtocolRegistry::new();
+        let typed =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let typed_id = typed.id();
+
+        assert_eq!(
+            admit_protocol(&registry, ProtocolAdmissionPolicy::default(), None, None,),
+            Err(ProtocolAdmissionError::MissingRequiredProtocol)
+        );
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::StrictCompatible,
+                None,
+                Some(typed_id),
+            ),
+            Err(ProtocolAdmissionError::MissingReceiverProtocol)
+        );
+    }
+
+    #[test]
+    fn admission_legacy_mode_only_relaxes_missing_incoming_identity() {
+        let registry = ProtocolRegistry::new();
+        let typed =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let typed_id = typed.id();
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::LegacyCompatible,
+                None,
+                None,
+            ),
+            Ok(ProtocolAdmission::LegacyUntyped)
+        );
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::LegacyCompatible,
+                Some(typed_id),
+                None,
+            ),
+            Ok(ProtocolAdmission::LegacyUntyped)
+        );
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::LegacyCompatible,
+                None,
+                Some(typed_id),
+            ),
+            Err(ProtocolAdmissionError::MissingReceiverProtocol)
+        );
     }
 
     #[test]
