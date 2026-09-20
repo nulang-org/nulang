@@ -227,6 +227,17 @@ mod tests {
     }
 
     #[test]
+    fn test_nbc_roundtrip_preserves_hot_function_ranges() {
+        let mut m = sample_module();
+        m.hot_function_ranges.push((0, 1));
+        let bytes = m.to_nbc(None).expect("encode");
+        let art = CodeModule::from_nbc(&bytes).expect("decode");
+        assert_eq!(art.module.hot_function_ranges, vec![(0, 1)]);
+        assert!(art.module.is_hot_pc(0));
+        assert!(!art.module.is_hot_pc(1));
+    }
+
+    #[test]
     fn test_nbc_roundtrip_with_source_hash() {
         let m = sample_module();
         let h = [0xAA; 32];
@@ -342,6 +353,10 @@ mod tests {
         assert!(
             module.function_local_counts.is_empty(),
             "missing function_local_counts must default to empty Vec"
+        );
+        assert!(
+            module.hot_function_ranges.is_empty(),
+            "missing hot_function_ranges must default to empty Vec"
         );
     }
 }

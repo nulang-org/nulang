@@ -283,6 +283,15 @@ impl MirCodegen {
             let offset = self.compile_function(func)?;
             self.module.function_table[idx] = offset;
             self.module.function_local_counts[idx] = LOCAL_BASE as usize + func.locals.len();
+            if func
+                .performance_contracts
+                .contains(&crate::ast::PerformanceContract::Hot)
+            {
+                self.module.hot_function_ranges.push((
+                    offset,
+                    self.module.instructions.len().saturating_sub(offset),
+                ));
+            }
             if func.name == "__main" {
                 main_idx = Some(idx);
             }
@@ -2948,6 +2957,7 @@ mod tests {
                 effect: crate::types::EffectRow::empty(),
                 cap: crate::types::Capability::Ref,
                 placement: None,
+                performance_contracts: vec![],
                 body: {
                     let mut b = crate::hir::Body::new();
                     b.push(crate::hir::Stmt::Let {
@@ -2992,6 +3002,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            performance_contracts: vec![],
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
@@ -3023,6 +3034,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            performance_contracts: vec![],
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(

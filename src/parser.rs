@@ -899,6 +899,22 @@ impl Parser {
                     };
                     annotations.push(FunctionAnnotation::Placement(placement));
                 }
+                "hot" | "no_block" | "no_suspend" | "no_alloc" => {
+                    if !fields.is_empty() {
+                        return Err(NuError::parse_error(
+                            format!("@{} does not accept arguments", name),
+                            self.current_span(),
+                        ));
+                    }
+                    let contract = match name.as_str() {
+                        "hot" => PerformanceContract::Hot,
+                        "no_block" => PerformanceContract::NoBlock,
+                        "no_suspend" => PerformanceContract::NoSuspend,
+                        "no_alloc" => PerformanceContract::NoAlloc,
+                        _ => unreachable!(),
+                    };
+                    annotations.push(FunctionAnnotation::Performance(contract));
+                }
                 _ => {
                     return Err(NuError::parse_error(
                         format!("Unknown function annotation: @{}", name),
@@ -906,6 +922,10 @@ impl Parser {
                     ));
                 }
             }
+            // Allow the normal declaration style of one annotation per line.
+            // Without this, only the first annotation is consumed and the next
+            // leading '@' is misparsed as a new declaration.
+            self.skip_newlines();
         }
         Ok(annotations)
     }

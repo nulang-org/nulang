@@ -3462,17 +3462,23 @@ impl VM {
         // BEFORE the `&mut self.jit_session` borrow below (the VM is stable
         // and single-threaded for the duration of this region execution).
         let self_ptr = self as *mut VM;
+        // Source-level @hot() metadata must participate in the cheap probe,
+        // otherwise the VM would not enter the tiering path until the normal
+        // threshold had already been reached.
+        let annotated_hot = self
+            .modules
+            .get(module_idx)
+            .map(|module| module.is_hot_pc(pc))
+            .unwrap_or(false);
+
         let jit = match &mut self.jit_session {
             Some(j) => j.as_mut(),
             None => return false,
         };
 
         // Check cheap: already compiled, or newly hot? Single probe call so
-        // the per-step cost is one vtable dispatch into inlined logic (a
-        // flat-array increment for cold code), not two dyn calls. The
-        // module/constants fetch below is deferred until AFTER the probe so
-        // a cold step (probe returns false) doesn't pay it at all.
-        if !jit.probe_and_maybe_hot(module_idx, pc) {
+        // the per-step cost remains one vtable dispatch into inlined logic.
+        if !jit.probe_and_maybe_hot(module_idx, pc, annotated_hot) {
             return false;
         }
 

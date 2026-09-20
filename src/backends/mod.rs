@@ -85,7 +85,8 @@ pub trait JitBackend {
     /// when the JIT is enabled, so it must be a single dyn-dispatch call
     /// (the default delegates to `is_compiled` + `record_and_check_hot` for
     /// alternative backends; `JitSession` overrides it with inlined logic).
-    fn probe_and_maybe_hot(&mut self, module_idx: usize, pc: usize) -> bool {
+    fn probe_and_maybe_hot(&mut self, module_idx: usize, pc: usize, annotated_hot: bool) -> bool {
+        let _ = annotated_hot;
         if self.is_compiled(module_idx, pc) {
             true
         } else {

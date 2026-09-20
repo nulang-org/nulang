@@ -52,6 +52,7 @@ pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
 
     let mut module = ctx.finish()?;
     crate::mir_inline::inline_local_closures(&mut module);
+    crate::performance::validate_performance_contracts(&module)?;
     Ok(module)
 }
 
@@ -388,6 +389,9 @@ impl ModuleCtx {
 fn lower_function_def(ctx: &mut ModuleCtx, f: &hir::FunctionDef) -> NuResult<mir::Function> {
     let mut lowerer = FnLowerer::new(ctx, &f.name, Some(f.ret.clone()));
     lowerer.b.set_placement(f.placement);
+    lowerer
+        .b
+        .set_performance_contracts(f.performance_contracts.clone());
     for (name, ty) in &f.params {
         let id = lowerer.b.add_param(name.clone(), ty.clone());
         lowerer.bind(name, id);

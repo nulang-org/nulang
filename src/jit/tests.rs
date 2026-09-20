@@ -32,6 +32,28 @@ fn test_hot_counter() {
 /// another session (the old global counter map made parallel tests that
 /// share module_idx 0 flaky).
 #[test]
+fn test_annotated_hot_threshold_is_lower_and_enforced_at_probe() {
+    assert!(ANNOTATED_HOT_THRESHOLD < HOT_THRESHOLD);
+    let mut jit = make_jit();
+    for _ in 1..ANNOTATED_HOT_THRESHOLD {
+        assert!(!crate::backends::JitBackend::probe_and_maybe_hot(
+            &mut jit, 0, 7, true
+        ));
+    }
+    assert!(crate::backends::JitBackend::probe_and_maybe_hot(
+        &mut jit, 0, 7, true
+    ));
+
+    // The same number of hits must not make an ordinary PC hot.
+    let mut cold = make_jit();
+    for _ in 0..ANNOTATED_HOT_THRESHOLD {
+        assert!(!crate::backends::JitBackend::probe_and_maybe_hot(
+            &mut cold, 0, 7, false
+        ));
+    }
+}
+
+#[test]
 fn test_hot_counters_are_per_session() {
     let mut jit_a = make_jit();
     let mut jit_b = make_jit();

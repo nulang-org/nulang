@@ -203,6 +203,13 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                 crate::ast::FunctionAnnotation::Placement(p) => Some(*p),
                 _ => None,
             });
+            let performance_contracts = annotations
+                .iter()
+                .filter_map(|annotation| match annotation {
+                    crate::ast::FunctionAnnotation::Performance(contract) => Some(*contract),
+                    _ => None,
+                })
+                .collect();
             // Default placement inference from declared effect row (only when the
             // user explicitly declared effects; inferred rows remain None here).
             let inferred_placement =
@@ -247,6 +254,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                 },
                 public: *public,
                 placement: inferred_placement,
+                performance_contracts,
                 span: *span,
             })
         }

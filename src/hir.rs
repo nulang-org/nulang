@@ -108,6 +108,8 @@ pub struct FunctionDef {
     pub public: bool,
     /// Web framework compile-time placement hint (None = infer from effect row).
     pub placement: Option<crate::types::Placement>,
+    /// Performance contracts preserved for MIR validation and backend policy.
+    pub performance_contracts: Vec<crate::ast::PerformanceContract>,
     pub span: Span,
 }
 
@@ -629,6 +631,7 @@ mod tests {
             body: Body::default(),
             public: true,
             placement: None,
+            performance_contracts: vec![],
             span: Span::default(),
         };
         assert_eq!(def.name, "f");
