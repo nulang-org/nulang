@@ -15,7 +15,8 @@ use super::cache::{
 };
 
 const MAGIC: &[u8; 4] = b"NCDS";
-const VERSION: u8 = 1;
+const VERSION_V1: u8 = 1;
+const VERSION: u8 = 2;
 const CHECKSUM_LEN: usize = 32;
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_ENTRIES: usize = 16_777_216;
@@ -54,6 +55,13 @@ pub struct CacheSnapshotReport {
     pub entries: usize,
     pub bytes: u64,
     pub captured_unix_ms: u64,
+    pub checkpoint_lsn: u64,
+}
+
+#[derive(Debug)]
+pub struct CacheSnapshotRestore {
+    pub store: CacheStore,
+    pub checkpoint_lsn: u64,
 }
 
 pub fn write_cache_snapshot(
@@ -61,10 +69,19 @@ pub fn write_cache_snapshot(
     store: &CacheStore,
     now_ms: u64,
 ) -> Result<CacheSnapshotReport, CacheSnapshotError> {
+    write_cache_snapshot_at_lsn(path, store, now_ms, 0)
+}
+
+pub fn write_cache_snapshot_at_lsn(
+    path: impl AsRef<Path>,
+    store: &CacheStore,
+    now_ms: u64,
+    checkpoint_lsn: u64,
+) -> Result<CacheSnapshotReport, CacheSnapshotError> {
     let path = path.as_ref();
     let captured_unix_ms = current_unix_ms()?;
     let entries = store.export_durable_entries(now_ms, captured_unix_ms);
-    let bytes = encode_snapshot(&entries)?;
+    let bytes = encode_snapshot_at_lsn(&entries, checkpoint_lsn)?;
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -95,6 +112,7 @@ pub fn write_cache_snapshot(
         entries: entries.len(),
         bytes: bytes.len() as u64,
         captured_unix_ms,
+        checkpoint_lsn,
     })
 }
 
@@ -102,6 +120,13 @@ pub fn restore_cache_snapshot(
     path: impl AsRef<Path>,
     now_ms: u64,
 ) -> Result<CacheStore, CacheSnapshotError> {
+    Ok(restore_cache_snapshot_with_lsn(path, now_ms)?.store)
+}
+
+pub fn restore_cache_snapshot_with_lsn(
+    path: impl AsRef<Path>,
+    now_ms: u64,
+) -> Result<CacheSnapshotRestore, CacheSnapshotError> {
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
     if metadata.len() > MAX_SNAPSHOT_BYTES as u64 {
@@ -109,14 +134,22 @@ pub fn restore_cache_snapshot(
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.read_to_end(&mut bytes)?;
-    let entries = decode_snapshot(&bytes)?;
+    let (checkpoint_lsn, entries) = decode_snapshot_with_lsn(&bytes)?;
     let wall_now = current_unix_ms()?;
-    Ok(CacheStore::restore_durable_entries(
-        &entries, now_ms, wall_now,
-    )?)
+    Ok(CacheSnapshotRestore {
+        store: CacheStore::restore_durable_entries(&entries, now_ms, wall_now)?,
+        checkpoint_lsn,
+    })
 }
 
 pub fn encode_snapshot(entries: &[CacheDurableEntry]) -> Result<Vec<u8>, CacheSnapshotError> {
+    encode_snapshot_at_lsn(entries, 0)
+}
+
+pub fn encode_snapshot_at_lsn(
+    entries: &[CacheDurableEntry],
+    checkpoint_lsn: u64,
+) -> Result<Vec<u8>, CacheSnapshotError> {
     if entries.len() > MAX_ENTRIES {
         return Err(CacheSnapshotError::TooManyEntries);
     }
@@ -151,9 +184,10 @@ pub fn encode_snapshot(entries: &[CacheDurableEntry]) -> Result<Vec<u8>, CacheSn
         }
     }
 
-    let mut out = Vec::with_capacity(5 + body.len() + CHECKSUM_LEN);
+    let mut out = Vec::with_capacity(13 + body.len() + CHECKSUM_LEN);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
+    write_u64(&mut out, checkpoint_lsn);
     out.extend_from_slice(&body);
     let checksum = blake3::hash(&out);
     out.extend_from_slice(checksum.as_bytes());
@@ -164,13 +198,23 @@ pub fn encode_snapshot(entries: &[CacheDurableEntry]) -> Result<Vec<u8>, CacheSn
 }
 
 pub fn decode_snapshot(bytes: &[u8]) -> Result<Vec<CacheDurableEntry>, CacheSnapshotError> {
+    Ok(decode_snapshot_with_lsn(bytes)?.1)
+}
+
+pub fn decode_snapshot_with_lsn(
+    bytes: &[u8],
+) -> Result<(u64, Vec<CacheDurableEntry>), CacheSnapshotError> {
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(CacheSnapshotError::TooLarge);
     }
     if bytes.len() < 5 + CHECKSUM_LEN {
         return Err(CacheSnapshotError::Truncated);
     }
-    if &bytes[..4] != MAGIC || bytes[4] != VERSION {
+    if &bytes[..4] != MAGIC {
+        return Err(CacheSnapshotError::InvalidHeader);
+    }
+    let version = bytes[4];
+    if version != VERSION_V1 && version != VERSION {
         return Err(CacheSnapshotError::InvalidHeader);
     }
     let data_end = bytes.len() - CHECKSUM_LEN;
@@ -179,7 +223,18 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Vec<CacheDurableEntry>, CacheSnap
         return Err(CacheSnapshotError::ChecksumMismatch);
     }
 
-    let mut reader = Reader::new(&bytes[5..data_end]);
+    let (checkpoint_lsn, body_start) = if version == VERSION_V1 {
+        (0, 5)
+    } else {
+        if data_end < 13 {
+            return Err(CacheSnapshotError::Truncated);
+        }
+        (
+            u64::from_be_bytes(bytes[5..13].try_into().expect("checkpoint lsn slice")),
+            13,
+        )
+    };
+    let mut reader = Reader::new(&bytes[body_start..data_end]);
     let count = reader.u32()? as usize;
     if count > MAX_ENTRIES {
         return Err(CacheSnapshotError::TooManyEntries);
@@ -210,7 +265,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Vec<CacheDurableEntry>, CacheSnap
         });
     }
     reader.finish()?;
-    Ok(entries)
+    Ok((checkpoint_lsn, entries))
 }
 
 fn current_unix_ms() -> Result<u64, CacheSnapshotError> {
@@ -350,6 +405,50 @@ mod tests {
     }
 
     #[test]
+    fn v2_snapshot_round_trip_preserves_checkpoint_lsn() {
+        let entries = vec![CacheDurableEntry {
+            key: b"lsn".to_vec(),
+            value: CacheTransferValue::Integer(9),
+            expires_unix_ms: None,
+            token: CacheTransferToken {
+                source_slot: 2,
+                source_generation: 4,
+            },
+        }];
+        let encoded = encode_snapshot_at_lsn(&entries, 42).unwrap();
+        let (lsn, decoded) = decode_snapshot_with_lsn(&encoded).unwrap();
+        assert_eq!(lsn, 42);
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn v1_snapshot_decodes_with_zero_checkpoint_lsn() {
+        let entries = vec![CacheDurableEntry {
+            key: b"old".to_vec(),
+            value: CacheTransferValue::Integer(1),
+            expires_unix_ms: None,
+            token: CacheTransferToken {
+                source_slot: 0,
+                source_generation: 1,
+            },
+        }];
+        // Build the previous v1 container from the same entry body by stripping
+        // the v2 LSN field and recomputing integrity.
+        let v2 = encode_snapshot_at_lsn(&entries, 99).unwrap();
+        let body_end = v2.len() - CHECKSUM_LEN;
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(MAGIC);
+        v1.push(VERSION_V1);
+        v1.extend_from_slice(&v2[13..body_end]);
+        let checksum = blake3::hash(&v1);
+        v1.extend_from_slice(checksum.as_bytes());
+
+        let (lsn, decoded) = decode_snapshot_with_lsn(&v1).unwrap();
+        assert_eq!(lsn, 0);
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
     fn checksum_corruption_fails_closed() {
         let entries = vec![CacheDurableEntry {
             key: b"k".to_vec(),
@@ -383,6 +482,7 @@ mod tests {
             .unwrap();
         let report = write_cache_snapshot(&path, &source, 0).unwrap();
         assert_eq!(report.entries, 2);
+        assert_eq!(report.checkpoint_lsn, 0);
         assert!(report.bytes > 0);
 
         std::thread::sleep(Duration::from_millis(5));

@@ -256,6 +256,20 @@ two major versions.*
   values, and verifies downtime reduces TTL. This is a checkpoint primitive,
   not mutation durability: writes after the last checkpoint are still volatile
   until WAL/replication acknowledgement modes are implemented.
+- **Exact-state cache mutation WAL and checkpoint LSN boundary**
+  (Experimental, `src/runtime/cache_wal.rs`,
+  `src/runtime/cache_durable_store.rs`, `src/runtime/cache.rs`). WAL records
+  carry exact post-mutation upsert state or generation-fenced delete tombstones
+  instead of RESP command text, preserving physical slot/generation identities
+  required by migration ACK fencing. Records use strictly increasing LSNs,
+  bounded payloads, BLAKE3 checksums, buffered or fsynced append, complete
+  corruption rejection, and crash-truncated-tail recovery. Snapshot v2 embeds a
+  checkpoint LSN while retaining read compatibility with v1 snapshots as LSN 0;
+  recovery replays only WAL records newer than that boundary. Exact-delta replay
+  reconstructs absolute TTLs without resetting lifetime and refuses stale delete
+  tombstones from removing newer generations. This slice provides the durable
+  format/replay substrate only; command acknowledgement modes are stacked
+  separately so fsync-failure outcome semantics remain explicit.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.

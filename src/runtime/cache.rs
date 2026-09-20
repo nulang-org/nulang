@@ -910,6 +910,159 @@ impl CacheStore {
         expired
     }
 
+    /// Return the exact durable physical state for one live key.
+    ///
+    /// Used by WAL-enabled callers after a successful mutation. The returned
+    /// token is the post-mutation slot/generation identity.
+    pub fn durable_entry_for_key(
+        &mut self,
+        key: &[u8],
+        now_ms: u64,
+        wall_anchor_unix_ms: u64,
+    ) -> Option<CacheDurableEntry> {
+        let slot_id = self.live_slot_id(key, now_ms)?;
+        let slot = &self.slots[slot_id as usize];
+        let entry = slot.entry.as_ref().expect("live slot vanished");
+        let value = match entry.value {
+            CacheValue::Integer(value) => CacheTransferValue::Integer(value),
+            CacheValue::Bytes(bytes) => {
+                CacheTransferValue::Bytes(bytes.as_slice(&self.arena).to_vec())
+            }
+        };
+        let expires_unix_ms = entry.expires_at_ms.map(|deadline| {
+            wall_anchor_unix_ms.saturating_add(deadline.saturating_sub(now_ms))
+        });
+        Some(CacheDurableEntry {
+            key: entry.key.as_slice(&self.arena).to_vec(),
+            value,
+            expires_unix_ms,
+            token: CacheTransferToken {
+                source_slot: slot_id,
+                source_generation: slot.generation,
+            },
+        })
+    }
+
+    /// Apply one exact post-mutation durable state during WAL replay.
+    ///
+    /// This cold path preserves the recorded physical token rather than
+    /// allocating through normal SET semantics. The target slot must either be
+    /// empty or already contain this key; a different live key in the slot is
+    /// treated as corrupt replay state.
+    pub fn apply_durable_entry(
+        &mut self,
+        durable: &CacheDurableEntry,
+        now_ms: u64,
+        wall_now_unix_ms: u64,
+    ) -> Result<(), CacheDurableRestoreError> {
+        if durable.token.source_generation == 0 {
+            return Err(CacheDurableRestoreError::InvalidGeneration(0));
+        }
+        let slot_id = durable.token.source_slot as usize;
+        if slot_id >= MAX_DURABLE_RESTORE_SLOTS {
+            return Err(CacheDurableRestoreError::TooManySlots(slot_id + 1));
+        }
+        if durable
+            .expires_unix_ms
+            .is_some_and(|deadline| deadline <= wall_now_unix_ms)
+        {
+            // An expired WAL upsert is equivalent to its value no longer being
+            // present at recovery time. Remove the recorded version only when
+            // it is still the version currently occupying that slot/key.
+            let _ = self.delete_durable_token(&durable.key, durable.token);
+            return Ok(());
+        }
+
+        if self.slots.len() <= slot_id {
+            self.slots
+                .resize_with(slot_id + 1, EntrySlot::default);
+        }
+
+        if let Some(existing_id) = self.find_slot(&durable.key, Self::hash(&durable.key)) {
+            if existing_id as usize != slot_id {
+                self.remove_slot(existing_id);
+            }
+        }
+
+        if let Some(existing) = self.slots[slot_id].entry.as_ref() {
+            if existing.key.as_slice(&self.arena) != durable.key.as_slice() {
+                return Err(CacheDurableRestoreError::DuplicateSlot(
+                    durable.token.source_slot,
+                ));
+            }
+        }
+
+        if let Some(existing) = self.slots[slot_id].entry.take() {
+            self.remove_bucket(existing.hash, durable.token.source_slot);
+            existing.key.release(&mut self.arena);
+            existing.value.release(&mut self.arena);
+        } else if let Some(pos) = self
+            .free_slots
+            .iter()
+            .position(|free| *free == durable.token.source_slot)
+        {
+            self.free_slots.swap_remove(pos);
+        }
+
+        self.ensure_index_capacity();
+        let hash = Self::hash(&durable.key);
+        let key = PackedBytes::pack(&durable.key, &mut self.arena);
+        let value = match &durable.value {
+            CacheTransferValue::Integer(value) => CacheValue::Integer(*value),
+            CacheTransferValue::Bytes(bytes) => {
+                CacheValue::Bytes(PackedBytes::pack(bytes, &mut self.arena))
+            }
+        };
+        let expires_at_ms = durable
+            .expires_unix_ms
+            .map(|deadline| now_ms.saturating_add(deadline.saturating_sub(wall_now_unix_ms)));
+        let was_empty = self.slots[slot_id].entry.is_none();
+        self.slots[slot_id] = EntrySlot {
+            generation: durable.token.source_generation,
+            entry: Some(Entry {
+                hash,
+                key,
+                value,
+                expires_at_ms,
+            }),
+        };
+        self.insert_bucket_raw(hash, durable.token.source_slot);
+        if was_empty {
+            self.index_len += 1;
+        }
+        if let Some(expires_at_ms) = expires_at_ms {
+            self.expiry.schedule(
+                ExpirationRef {
+                    slot: durable.token.source_slot,
+                    generation: durable.token.source_generation,
+                    expires_at_ms,
+                },
+                now_ms,
+            );
+        }
+        Ok(())
+    }
+
+    /// Apply an exact delete tombstone during WAL replay.
+    ///
+    /// A newer generation is never deleted by an older tombstone.
+    pub fn delete_durable_token(
+        &mut self,
+        key: &[u8],
+        token: CacheTransferToken,
+    ) -> bool {
+        let hash = Self::hash(key);
+        let Some(slot_id) = self.find_slot(key, hash) else {
+            return false;
+        };
+        if slot_id != token.source_slot
+            || self.slots[slot_id as usize].generation != token.source_generation
+        {
+            return false;
+        }
+        self.remove_slot(slot_id)
+    }
+
     /// Export every live entry for a cold-path durable snapshot.
     ///
     /// wall_anchor_unix_ms should be captured before now_ms. Combining that
@@ -1716,6 +1869,33 @@ mod tests {
             CacheStore::restore_durable_entries(&[zero_generation], 0, 0),
             Err(CacheDurableRestoreError::InvalidGeneration(0))
         ));
+    }
+
+    #[test]
+    fn durable_delta_replay_preserves_exact_generation_and_delete_fencing() {
+        let mut store = CacheStore::new();
+        store.set_bytes(b"k", b"one", None, 0);
+        let first = store.durable_entry_for_key(b"k", 0, 10_000).unwrap();
+
+        store.set_bytes(b"k", b"two", None, 1);
+        let second = store.durable_entry_for_key(b"k", 1, 10_001).unwrap();
+        assert_ne!(first.token, second.token);
+
+        let mut replay = CacheStore::new();
+        replay.apply_durable_entry(&first, 0, 10_000).unwrap();
+        replay.apply_durable_entry(&second, 1, 10_001).unwrap();
+        assert_eq!(
+            replay.get(b"k", 1),
+            Some(CacheValueView::Bytes(b"two"))
+        );
+        assert_eq!(
+            replay.transfer_token_for_key(b"k", 1),
+            Some(second.token)
+        );
+
+        assert!(!replay.delete_durable_token(b"k", first.token));
+        assert!(replay.delete_durable_token(b"k", second.token));
+        assert!(!replay.exists(b"k", 1));
     }
 
     #[test]
