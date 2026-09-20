@@ -41,6 +41,7 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
         return;
     }
     let seq = next_sequence(rt, actor_id);
+    let schema_version = actor.schema_version;
     let mut state = std::collections::HashMap::new();
     for (name, value) in &actor.state_data {
         let model = actor
@@ -98,8 +99,10 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
     // RFC 0014 §3: re-spawn-opted actors replicate the snapshot to their
     // deterministic shadow node before the local save, so the replica is a
     // byte-identical copy of exactly what the local store will hold.
-    rt.maybe_shadow_replicate(actor_id, &snapshot);
-    let _ = rt.persistence.save_snapshot(snapshot);
+    rt.maybe_shadow_replicate(actor_id, &snapshot, schema_version);
+    let _ = rt
+        .persistence
+        .save_snapshot_versioned(snapshot, schema_version);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = seq;
         actor.dirty_fields.clear();
