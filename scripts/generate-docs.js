@@ -37,11 +37,11 @@ function main() {
 
   // Step 1: Generate per-effect stdlib Markdown docs
   console.log('[1/2] Extracting built-in effect operations from src/stdlib.rs...');
-  run(`cargo run -- --emit-stdlib-docs ${STDLIB_DOCS_DIR}`);
+  run(`cargo run --bin nulang -- --emit-stdlib-docs ${STDLIB_DOCS_DIR}`);
 
   // Step 2: Regenerate the full API reference (docs/api.md)
   console.log('\n[2/2] Regenerating full API reference...');
-  run('cargo run -- --doc');
+  run('cargo run --bin nulang -- --doc');
 
   console.log('\n=== Docs generated successfully ===');
   console.log(`  Stdlib pages: ${STDLIB_DOCS_DIR}/`);

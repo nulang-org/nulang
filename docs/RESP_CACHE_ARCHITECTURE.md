@@ -22,8 +22,11 @@ for cross-shard and cross-node coordination.
 
 The RESP surface preserves Redis Cluster's 16,384 logical slots and hash-tag
 semantics. Logical slots map to a smaller set of physical Nulang cache shards.
-Cluster placement may move logical slots between physical owners without
-changing the client-visible hash function.
+The default local placement assigns balanced contiguous ranges to physical
+shards; CRC16 already spreads ordinary keys across the logical slot space, so
+contiguous ownership keeps cluster topology compact without giving up expected
+key balance. Cluster placement may move logical slots between physical owners
+without changing the client-visible hash function.
 
 `src/runtime/cache_routing.rs` holds the placement snapshot. Each slot maps
 directly to a `(node_id, shard)` owner, so the steady-state routing lookup is
@@ -85,6 +88,55 @@ saturation is surfaced as backpressure rather than blocking the ingress thread.
 Only cross-shard or cross-node commands copy the RESP frame. The same-shard
 path remains borrowed and mailbox-free.
 
+RESP pipelining adds a second constraint: replies must remain in request order
+even when cross-shard or remote work completes later. `cache_pipeline.rs`
+keeps a bounded per-connection response queue. Direct responses flush
+immediately when no earlier async request exists; otherwise they wait behind
+that request. Local replies are polled from shard reply channels and remote
+replies are completed by request id. The sequencer emits only the longest
+contiguous completed prefix, preserving RESP ordering without serializing all
+commands through one worker.
+
+For Redis Cluster-aware clients, `cache_cluster.rs` supplies preformatted
+advertised endpoints keyed by physical shard owner. Dispatch has two explicit
+modes:
+
+- `Transparent`: preserve the internal local-shard queue and remote transport
+  handoff.
+- `Redirect`: when the current endpoint does not own a keyed command's slot,
+  return `-MOVED <slot> <host:port>` immediately. The command is not queued or
+  proxied.
+
+Redirect mode is the preferred steady-state deployment model for cluster-aware
+clients because a warmed client can connect directly to the physical slot
+owner. Missing endpoint metadata fails closed instead of silently falling back
+to proxying.
+
+The same cluster layer serves topology discovery without touching CacheStore:
+`CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
+topology response, and legacy `CLUSTER SLOTS` is retained for older clients.
+Each current Nulang physical cache owner is advertised as one online master
+with a stable 40-hex-character Redis node id derived from its Nulang node/shard
+identity. Replicas will be added to these responses when cache replication is
+implemented.
+
+When built with the optional `cache-server` feature,
+`src/runtime/cache_server.rs` provides a dedicated Mio readiness reactor for
+one physical cache shard. The reactor owns the shard's listener, connections,
+`CacheStore`, expiration sweep, and ordered RESP pipelines on one thread. It
+does not call `Runtime::run_scheduler` and therefore does not inherit the
+actor runtime's distributed idle cadence. Cross-shard inbox work wakes the
+reactor through Mio's `Waker`; ordinary correctly routed GET/SET requests do
+not use that wake path.
+
+The first server surface deliberately requires `Redirect` mode. A connection
+that reaches a non-owning shard receives `MOVED` rather than turning the
+server into a transparent proxy. A shared `CacheServerClock` gives all shards
+in one process the same monotonic millisecond origin for local cross-shard TTL
+semantics; process-relative timestamps are not sent to remote nodes. Input,
+output, connection count, pipeline depth, inbox drain size, and expiry work are
+all bounded by configuration.
+
 ## Durability
 
 Durability is not implicit in the cache kernel. Add it above the mutation path
@@ -117,12 +169,16 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Integrate cache inbox draining into the owning shard loop and connect remote
-   handoffs to a cache-specific cluster transport.
-2. Wire the TCP RESP endpoint to the parser, placement lookup, and dispatcher.
-3. Add hierarchical expiration and packed aggregate data structures.
-4. Add WAL/replication acknowledgement modes.
-5. Add RESP compatibility for hashes, sets, lists, sorted sets, and scripts or
-   stored functions where they align with the product boundary.
-6. Add Nulang-native coordination primitives: leases, locks, semaphores,
-   fencing tokens, durable queues, and stored functions.
+1. Add a multi-shard server builder that reserves/binds advertised endpoints,
+   shares one `CacheServerClock`, pins reactor threads when requested, and
+   starts/stops the shard set as one service.
+2. Add ASK/ASKING and migration-state redirects when live slot migration is
+   implemented.
+3. Add a separate transparent proxy endpoint only for non-cluster clients;
+   keep the per-shard production listeners redirect-only.
+4. Connect remote transparent handoffs to a cache-specific cluster transport.
+5. Promote expiration to a hierarchical timing wheel, then add packed
+   aggregate structures and durability acknowledgement modes.
+6. Expand RESP compatibility and add Nulang-native leases, locks, semaphores,
+   fencing tokens, queues, and stored functions where they fit the product
+   boundary.

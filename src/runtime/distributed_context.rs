@@ -400,6 +400,7 @@ impl FabricRegistry {
         Ok(targets)
     }
 
+    #[cfg(test)]
     fn route(&mut self, topic: &str) -> Result<Vec<FabricTarget>, String> {
         self.route_scored(topic, |_| Some(FabricPlacementScore::default()))
     }
