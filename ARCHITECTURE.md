@@ -152,8 +152,12 @@ Core surface forms (`src/ast.rs`, `src/parser.rs`):
   §6.3).
 
 There is no `switch` and no `case` keyword — `match` arms are introduced by
-`|`. Pattern matching is typed but **not** exhaustiveness-checked today: a
-non-exhaustive `match` compiles and may fail at runtime.
+`|`. Pattern matching is typed. For a statically-known closed `Type::Variant`,
+the typechecker now performs a conservative totality check and emits `W0201`
+when constructor coverage is incomplete. The warning is deliberately non-fatal
+in language version 1.x so Frozen-Core source validity is preserved; an
+executed non-exhaustive match still reaches the existing runtime failure.
+Primitive/literal and general structural exhaustiveness remain future work.
 
 ### 2.2 HM Type Inference
 
@@ -186,11 +190,14 @@ Pony-style lattice (`iso`, `lineariso`, `trn`, `ref`, `val`, `box`, `tag`;
 subtyping computed via `join`). `LinearIso` adds exactly-once linear
 consumption tracking. Capabilities are compile-time only — see §2.4.
 
-**What does not exist:** no type classes or constrained types
-(`fn f[T: Serializable]` is not valid Nulang), no `protocol` construct, and
-no exhaustiveness checking for `match`. Type inference deliberately does not
-cross actor boundaries — behavior signatures are explicit annotations — so
-actors remain separately checkable units.
+**Current limits:** the typeclass/constrained-generic surface remains
+experimental, there is no first-class actor `protocol` construct yet, and
+exhaustiveness analysis is currently conservative rather than a full
+pattern-matrix checker. Closed variants get `W0201`; primitive/literal,
+tuple/record, nested-payload totality, and unreachable/redundant-arm analysis
+are not yet complete. Type inference deliberately does not cross actor
+boundaries — behavior signatures are explicit annotations — so actors remain
+separately checkable units.
 
 ### 2.3 Effects: Static Rows, Runtime Handler Stack
 
