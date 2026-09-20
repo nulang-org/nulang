@@ -208,6 +208,22 @@ two major versions.*
   durable restoration. The transfer replay fence also now removes an older
   imported target value when a newer source version expires in transit, avoiding
   stale-value resurrection after source finalization.
+- **Drained persistent migration recovery across cache-service restart**
+  (Experimental, `src/runtime/cache_migration_journal.rs`,
+  `src/runtime/cache_server.rs`). A migration whose source was durably
+  observed fully drained, whose every sent transfer has a durable application
+  ACK, whose ownership commit is neither pending nor complete, and whose
+  transferred entries are all persistent can now survive both source and target
+  cache-service processes restarting. The journal preserves transfer append
+  order separately from request ids; recovery validates the currently installed
+  migration before rebinding the source-data incarnation, then replays the exact
+  durable TransferBatch envelopes in original order to rebuild the target. A
+  fresh convergence probe remains mandatory before commit. Deterministic
+  two-node coverage restarts both cache services and verifies value recovery,
+  and a multi-generation same-key case deliberately uses transfer ids 9602 then
+  9601 to prove replay follows causal append order rather than numeric id order.
+  Relative-TTL batches, unacked transfers, non-drained sources, and ambiguous
+  commit intents remain fail-closed.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.

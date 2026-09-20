@@ -285,15 +285,43 @@ record is appended. If the process fails after publication but before the
 completion append, replay exposes a pending commit epoch: the outcome is
 explicitly ambiguous and must be reconciled rather than assumed.
 
-This makes **controller recovery** durable, but deliberately does not pretend
-that an ephemeral CacheStore can survive a cache-service process restart. Each
-service build generates a random source-data incarnation and every migration
-intent is bound to it. Reopening an old journal from a different incarnation
-fails closed. Likewise, a restarted target loses its import-fence state; a
-fresh convergence probe then reports fewer fences than the source journal
-expects and durable convergence fails. Full cache-process restart recovery
-therefore requires a durable CacheStore/target-import-state mode in addition to
-this controller journal.
+The default rule remains that a different source-data incarnation cannot
+continue arbitrary migration history. There is, however, one narrower case in
+which the migration journal itself contains enough data to reconstruct both
+sides safely after cache-service process restart: the source was durably
+observed at zero live entries, every sent transfer has a matching durable
+application ACK, no ownership commit is pending or complete, and every durable
+transfer entry is persistent (no relative TTL).
+
+For that case, the journal preserves an explicit transfer append-order vector.
+This is independent of transfer ids because multiple generations of one key can
+be exported under ids that are not numerically ordered. Restart recovery first
+validates that the currently installed migration has the exact same started
+epoch, slot, source, and target. Only after that topology check does it append a
+source-incarnation rebound record. It then resends each exact durable
+TransferBatch envelope in original append order. The restarted target therefore
+reconstructs the migration-owned generations and import fences from the same
+payloads that originally received application ACKs. The restarted source is
+allowed to report AlreadyAbsent during re-finalization only because the durable
+journal already proved the prior source incarnation was fully drained.
+
+After replay, recovery still requires a new exact-epoch convergence probe.
+Ownership publication remains gated on a drained source, target acceptance,
+zero target conflict/wrong-slot history, sufficient target import-fence count,
+and durable-history agreement. End-to-end deterministic tests stop both cache
+services, detach and replace their Runtime cache bridges, recreate empty
+CacheStores, replay the source journal, re-probe, commit, and verify the target
+value. A second test migrates one key twice with transfer ids 9602 then 9601 and
+proves restart replay restores the newer generation by durable append order,
+not request-id sorting.
+
+This is still **not general CacheStore restart recovery**. A non-drained source
+may contain versions that were never exported, and an unacked durable send has
+an unknown target outcome, so both remain fail-closed. Relative TTLs are also
+excluded from this restart-replay path: replaying an old `ttl_ms` after an
+arbitrary outage would extend expiry and could resurrect data. Full restart
+support for those cases needs a process-independent expiry durability contract
+and, for non-drained migrations, a durable CacheStore/WAL or snapshot.
 
 The same cluster layer serves topology discovery without touching CacheStore:
 `CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
@@ -360,16 +388,17 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add an explicit durable CacheStore mode (WAL/snapshot plus target import-fence
-   restoration) before supporting full cache-process restart during migration.
-2. Reconcile journaled pending commit intents against durable placement/control
-   state after a process restart; never infer the outcome from an empty source.
-3. Add a separate transparent proxy endpoint only for non-cluster clients;
+1. Define a process-independent expiry durability contract so fully drained
+   TTL-bearing migrations can restart-replay without extending or resurrecting
+   expired data.
+2. Add general durable CacheStore WAL/snapshot recovery for non-drained
+   migrations and ordinary cache durability modes.
+3. Reconcile journaled pending commit intents against durable placement/control
+   state after process restart; never infer the outcome from an empty source.
+4. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
-4. Allow topology publication to add/remove advertised remote endpoints without
+5. Allow topology publication to add/remove advertised remote endpoints without
    restarting local reactors.
-5. Promote expiration to a hierarchical timing wheel, then add packed
-   aggregate structures and durability acknowledgement modes.
-6. Expand RESP compatibility and add Nulang-native leases, locks, semaphores,
-   fencing tokens, queues, and stored functions where they fit the product
-   boundary.
+6. Promote expiration to a hierarchical timing wheel, then expand packed
+   aggregates, RESP compatibility, leases, locks, semaphores, queues, and
+   stored functions where they fit the product boundary.
