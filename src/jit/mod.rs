@@ -1008,7 +1008,12 @@ impl crate::backends::JitBackend for JitSession {
         JitSession::record_and_check_hot(self, module_idx, pc)
     }
 
-    fn probe_and_maybe_hot(&mut self, module_idx: usize, pc: usize) -> bool {
+    fn probe_and_maybe_hot(
+        &mut self,
+        module_idx: usize,
+        pc: usize,
+        annotated_hot: bool,
+    ) -> bool {
         // Fast path: check if this is the last compiled PC we saw
         // This avoids HashMap lookups for sequential execution in hot loops
         if self.last_compiled_probe == Some((module_idx, pc)) {
@@ -1032,9 +1037,14 @@ impl crate::backends::JitBackend for JitSession {
         }
         let count = &mut row[pc];
         *count += 1;
+        let threshold = if annotated_hot {
+            ANNOTATED_HOT_THRESHOLD
+        } else {
+            HOT_THRESHOLD
+        };
 
         // Return true if just became hot (will trigger compilation)
-        u64::from(*count) >= HOT_THRESHOLD
+        u64::from(*count) >= threshold
     }
 
     fn compiled_region_len(&self, module_idx: usize, pc: usize) -> Option<usize> {
