@@ -6132,11 +6132,18 @@ impl Runtime {
             .unwrap_or_default();
         let dlq = self.dlq_depth();
         let mailboxes: Vec<ActorMailboxMetric> = self
-            .mailbox_depths()
-            .into_iter()
-            .map(|(id, depth)| ActorMailboxMetric {
-                actor_id: id,
-                depth,
+            .actors
+            .iter()
+            .map(|(id, actor)| {
+                let pressure = actor.mailbox.pressure_snapshot();
+                ActorMailboxMetric {
+                    actor_id: *id,
+                    depth: pressure.depth,
+                    capacity: pressure.capacity,
+                    high_watermark: pressure.high_watermark,
+                    backpressured_total: pressure.backpressured_total,
+                    utilization: pressure.utilization,
+                }
             })
             .collect();
 
@@ -6602,6 +6609,10 @@ pub struct MetricsSnapshot {
 pub struct ActorMailboxMetric {
     pub actor_id: u64,
     pub depth: usize,
+    pub capacity: usize,
+    pub high_watermark: usize,
+    pub backpressured_total: u64,
+    pub utilization: Option<f64>,
 }
 
 /// One supervisor in the topology snapshot.
