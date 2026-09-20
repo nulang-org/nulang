@@ -127,6 +127,47 @@ pub trait JitBackend {
         regs: &mut [u64; 256],
         constants: &[u64],
     ) -> TieredAction;
+
+    /// Execute against the VM's native `Value` register file.
+    ///
+    /// Backends that do not override this method retain the old copy-in /
+    /// copy-out behavior, preserving source compatibility with existing
+    /// `JitBackend` implementations. The built-in Cranelift backend
+    /// overrides it and operates directly on the register file.
+    ///
+    /// # Safety
+    ///
+    /// `regs` must point to at least 256 live, uniquely-borrowed `Value`
+    /// slots for the duration of this call.
+    unsafe fn tiered_execute_value_regs(
+        &mut self,
+        module_idx: usize,
+        pc: usize,
+        module: &CodeModule,
+        regs: *mut Value,
+        constants: &[u64],
+    ) -> TieredAction {
+        let mut raw = [0u64; 256];
+        for (index, slot) in raw.iter_mut().enumerate() {
+            // SAFETY: guaranteed by this method's contract.
+            *slot = unsafe { (*regs.add(index)).to_bits() };
+        }
+
+        let action =
+            self.tiered_execute_step_typed(module_idx, pc, module, &mut raw, constants);
+
+        if action != TieredAction::Interpret {
+            for (index, bits) in raw.iter().copied().enumerate() {
+                // SAFETY: guaranteed by this method's contract. Every u64 bit
+                // pattern is representable by Value's raw tagged-word layout.
+                unsafe {
+                    *regs.add(index) = Value::from_bits(bits);
+                }
+            }
+        }
+
+        action
+    }
 }
 
 // ---------------------------------------------------------------------------
