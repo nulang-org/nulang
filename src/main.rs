@@ -2728,6 +2728,60 @@ mod tests {
     }
 
     #[test]
+    fn test_nbc_persistent_actor_uses_requested_store() {
+        let source = r#"
+            persistent actor BankAccount {
+                state durable balance: Int = 0
+                behavior deposit(amount: Int) { self.balance = self.balance + amount }
+            }
+            let acc = spawn BankAccount {} in {
+                send acc deposit(50)
+                acc
+            }
+        "#;
+
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+            .expect("frontend should accept persistent actor program");
+        let module = compile_with_new_pipeline(&ast, "test", &type_checker)
+            .expect("persistent actor program should compile");
+        let source_hash = blake3::hash(source.as_bytes());
+        let bytes = module
+            .to_nbc(Some(*source_hash.as_bytes()))
+            .expect("persistent actor module should serialize");
+        let artifact = nulang::bytecode::CodeModule::from_nbc(&bytes)
+            .expect("persistent actor artifact should deserialize");
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let store_dir = std::env::temp_dir().join(format!(
+            "nulang-nbc-persist-{}-{unique}",
+            std::process::id()
+        ));
+        let store_str = store_dir.to_string_lossy().into_owned();
+
+        let (_value, runtime) = run_nbc_module(artifact.module, Some(&store_str))
+            .expect("persistent nbc actor program should run");
+        let runtime = runtime.expect("persistent actor nbc must use Runtime");
+        let rt = runtime.borrow();
+        let (actor_id, actor) = rt.actors.iter().next().expect("one actor should exist");
+        assert_eq!(
+            actor.get_state_field("balance").and_then(|v| v.as_int()),
+            Some(50)
+        );
+        let snapshot = store_dir
+            .join(format!("actor_{actor_id}"))
+            .join("snapshot.json");
+        assert!(
+            snapshot.exists(),
+            "durable nbc actor must checkpoint to the requested store"
+        );
+        drop(rt);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[test]
     fn test_run_source_actor_program_schedules_and_delivers() {
         let source = r#"
             actor Counter {
