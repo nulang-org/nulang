@@ -38,6 +38,28 @@ pub enum MessagePriority {
     Bulk = 2,
 }
 
+/// Policy applied by the runtime when a bounded mailbox cannot reserve a
+/// normal/bulk slot.
+///
+/// The mailbox itself never blocks a scheduler thread and never owns the
+/// dead-letter queue. It reports admission failure; the runtime consults this
+/// policy to decide whether the sender observes backpressure only or whether
+/// the rejected message is additionally routed to the DLQ.
+///
+/// `DropOldest` is intentionally not offered yet: safely removing an older
+/// message must preserve selective-receive staging order and ORCA/reference
+/// accounting, so that policy requires a separate implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MailboxOverflowPolicy {
+    /// Preserve the current runtime default: reject mailbox admission and route
+    /// the rejected message to the dead-letter queue.
+    #[default]
+    DeadLetter,
+    /// Reject mailbox admission without implicit DLQ routing. Callers that use
+    /// an admission-aware API can retry, shed load, or choose another target.
+    RejectSender,
+}
+
 /// MPSC mailbox with priority bands and optional capacity.
 ///
 /// Concurrent producers may call [`Mailbox::push`] through shared references;
@@ -65,6 +87,7 @@ pub struct Mailbox {
     /// access it; concurrent producers never touch it.
     local_queue: VecDeque<Message>,
     capacity: usize,
+    overflow_policy: MailboxOverflowPolicy,
     queued_count: AtomicUsize,
     /// System messages already observed by a selective receive. They remain
     /// logically queued until a successful pattern+guard commits exactly one.
@@ -86,11 +109,24 @@ impl Mailbox {
     /// `capacity`: maximum total messages allowed. `0` = unbounded.
     /// `System` messages always bypass the limit.
     pub fn new(capacity: usize) -> Self {
+        Self::with_overflow_policy(capacity, MailboxOverflowPolicy::default())
+    }
+
+    /// Create a mailbox with an explicit overflow policy.
+    ///
+    /// Capacity admission is identical for every policy: system messages bypass
+    /// the bound, while normal/bulk messages fail admission when full. The
+    /// runtime owns the policy side effect (for example DLQ routing).
+    pub fn with_overflow_policy(
+        capacity: usize,
+        overflow_policy: MailboxOverflowPolicy,
+    ) -> Self {
         Mailbox {
             system_queue: SegQueue::new(),
             normal_queue: SegQueue::new(),
             local_queue: VecDeque::new(),
             capacity,
+            overflow_policy,
             queued_count: AtomicUsize::new(0),
             system_skip_buffer: VecDeque::new(),
             local_skip_buffer: VecDeque::new(),
@@ -292,6 +328,19 @@ impl Mailbox {
         self.capacity
     }
 
+    /// Runtime action to take when normal/bulk admission fails.
+    pub fn overflow_policy(&self) -> MailboxOverflowPolicy {
+        self.overflow_policy
+    }
+
+    /// Change the runtime overflow policy without disturbing queued messages.
+    ///
+    /// This is a scheduler-owned configuration operation; it does not alter the
+    /// mailbox capacity or logical message accounting.
+    pub fn set_overflow_policy(&mut self, policy: MailboxOverflowPolicy) {
+        self.overflow_policy = policy;
+    }
+
     fn clear_tried_flags(&mut self) {
         for (_, tried) in self.system_skip_buffer.iter_mut() {
             *tried = false;
@@ -394,6 +443,25 @@ mod tests {
         let accepted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(accepted, 100);
         assert_eq!(mb.len(), 100);
+    }
+
+    #[test]
+    fn overflow_policy_is_explicit_and_mutable_without_touching_capacity() {
+        let mut mb = Mailbox::new(2);
+        assert_eq!(mb.overflow_policy(), MailboxOverflowPolicy::DeadLetter);
+        assert_eq!(mb.capacity(), 2);
+
+        mb.set_overflow_policy(MailboxOverflowPolicy::RejectSender);
+        assert_eq!(mb.overflow_policy(), MailboxOverflowPolicy::RejectSender);
+        assert_eq!(mb.capacity(), 2);
+
+        let configured =
+            Mailbox::with_overflow_policy(3, MailboxOverflowPolicy::RejectSender);
+        assert_eq!(
+            configured.overflow_policy(),
+            MailboxOverflowPolicy::RejectSender
+        );
+        assert_eq!(configured.capacity(), 3);
     }
 
     #[test]
