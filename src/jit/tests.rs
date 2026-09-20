@@ -14,6 +14,30 @@ fn test_jit_session_creation() {
 }
 
 #[test]
+fn test_dense_compiled_slots_are_module_scoped() {
+    let mut jit = make_jit();
+    let ptr = std::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8;
+
+    jit.store_compiled(2, 17, ptr, 9);
+
+    assert_eq!(jit.compiled_count(), 1);
+    assert!(jit.is_compiled(2, 17));
+    assert_eq!(jit.compiled_region_len(2, 17), Some(9));
+    assert!(!jit.is_compiled(1, 17));
+    assert!(!jit.is_compiled(2, 16));
+
+    // Replacing an occupied slot must not inflate the region count.
+    jit.store_compiled(2, 17, ptr, 11);
+    assert_eq!(jit.compiled_count(), 1);
+    assert_eq!(jit.compiled_region_len(2, 17), Some(11));
+
+    // The same PC in another module is a distinct slot.
+    jit.store_compiled(3, 17, ptr, 5);
+    assert_eq!(jit.compiled_count(), 2);
+    assert_eq!(jit.compiled_region_len(3, 17), Some(5));
+}
+
+#[test]
 fn test_hot_counter() {
     let mut jit = make_jit();
     assert!(!jit.record_and_check_hot(0, 0));
