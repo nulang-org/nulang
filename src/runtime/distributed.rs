@@ -504,10 +504,42 @@ impl AddressResolver {
         content_hash: Option<[u8; 32]>,
         trace_id: Option<String>,
     ) -> Packet {
+        self.build_packet_with_protocol(
+            target_actor,
+            behavior_name,
+            payload,
+            sender_actor,
+            priority,
+            string_table,
+            object_table,
+            content_hash,
+            trace_id,
+            None,
+        )
+    }
+
+    /// Build an actor-message packet with an optional canonical actor protocol id.
+    ///
+    /// Keeping this as a separate method preserves the existing call surface while
+    /// allowing protocol-aware send paths to opt into the additive NUL0 PRT0 tail.
+    pub fn build_packet_with_protocol(
+        &self,
+        target_actor: u64,
+        behavior_name: &str,
+        payload: Vec<Value>,
+        sender_actor: u64,
+        priority: MessagePriority,
+        string_table: Vec<String>,
+        object_table: Vec<(u64, Vec<u8>)>,
+        content_hash: Option<[u8; 32]>,
+        trace_id: Option<String>,
+        protocol_id: Option<[u8; 32]>,
+    ) -> Packet {
         Packet::ActorMessage {
             target_actor,
             behavior_name: behavior_name.to_string(),
             content_hash,
+            protocol_id,
             payload,
             string_table,
             object_table,
@@ -542,12 +574,14 @@ impl AddressResolver {
         Vec<String>,
         Vec<(u64, Vec<u8>)>,
         Option<[u8; 32]>,
+        Option<[u8; 32]>,
     )> {
         match packet {
             Packet::ActorMessage {
                 target_actor,
                 behavior_name,
                 content_hash,
+                protocol_id,
                 payload,
                 string_table,
                 object_table,
@@ -574,6 +608,7 @@ impl AddressResolver {
                     string_table,
                     object_table,
                     content_hash,
+                    protocol_id,
                 ))
             }
             // Non-actor-message packets are not parsed here.
@@ -1550,6 +1585,7 @@ pub fn process_network_packets(
                                 target_actor: 0,
                                 behavior_name: FABRIC_STREAM_REPLICA_ACK_BEHAVIOR.to_string(),
                                 content_hash: None,
+            protocol_id: None,
                                 payload: Vec::new(),
                                 string_table: Vec::new(),
                                 object_table: vec![(0, bytes)],
@@ -1642,6 +1678,7 @@ pub fn process_network_packets(
                                                 behavior_name:
                                                     FABRIC_STREAM_COMMIT_BEHAVIOR.to_string(),
                                                 content_hash: None,
+            protocol_id: None,
                                                 payload: Vec::new(),
                                                 string_table: Vec::new(),
                                                 object_table: vec![(0, update_bytes)],
@@ -1762,6 +1799,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
                                         content_hash: None,
+            protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -1835,6 +1873,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR.to_string(),
                                         content_hash: None,
+            protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -1949,6 +1988,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
                                         content_hash: None,
+            protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -2029,6 +2069,7 @@ pub fn process_network_packets(
                                                     FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR
                                                         .to_string(),
                                                 content_hash: None,
+            protocol_id: None,
                                                 payload: Vec::new(),
                                                 string_table: Vec::new(),
                                                 object_table: vec![(
@@ -2103,6 +2144,7 @@ pub fn process_network_packets(
                     string_table,
                     object_table,
                     content_hash,
+                    _protocol_id,
                 )) = resolver.parse_packet(incoming.packet)
                 {
                     // Record the wire sender (bare id → node) so the
@@ -2878,6 +2920,7 @@ mod tests {
                 target_actor,
                 behavior_name,
                 content_hash,
+                protocol_id,
                 payload,
                 string_table,
                 sender_actor,
@@ -2889,6 +2932,7 @@ mod tests {
                 assert_eq!(target_actor, 42);
                 assert_eq!(behavior_name, "handle_msg");
                 assert_eq!(content_hash, None);
+                assert_eq!(protocol_id, None);
                 assert_eq!(sender_actor, 100);
                 assert_eq!(sender_node.0, local_node.0); // Same underlying u64
                 assert_eq!(priority, MessagePriority::Normal);
@@ -2912,6 +2956,7 @@ mod tests {
             target_actor: 77,
             behavior_name: "inc".to_string(),
             content_hash: None,
+            protocol_id: None,
             payload: vec![Value::int(123)],
             string_table: vec![],
             object_table: vec![],
@@ -2923,11 +2968,19 @@ mod tests {
         let result = resolver.parse_packet(packet);
         assert!(result.is_some());
 
-        let (target, behavior_name, msg, string_table, _object_table, content_hash) =
-            result.unwrap();
+        let (
+            target,
+            behavior_name,
+            msg,
+            string_table,
+            _object_table,
+            content_hash,
+            protocol_id,
+        ) = result.unwrap();
         assert_eq!(target, 77);
         assert_eq!(behavior_name, "inc");
         assert_eq!(content_hash, None);
+        assert_eq!(protocol_id, None);
         // behavior_id is resolved at delivery, not parse time.
         assert_eq!(msg.behavior_id, 0);
         assert_eq!(msg.sender, 88);
