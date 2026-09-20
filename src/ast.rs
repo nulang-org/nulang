@@ -565,6 +565,7 @@ pub enum PerformanceContract {
     Hot,
     NoBlock,
     NoSuspend,
+    NoAlloc,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -578,7 +579,7 @@ pub enum FunctionAnnotation {
     /// `@placement(static|server|edge|client|actor|workflow)` marks a web
     /// framework function's compile-time execution target.
     Placement(crate::types::Placement),
-    /// `@hot()`, `@no_block()`, and `@no_suspend()` performance contracts.
+    /// `@hot()`, `@no_block()`, `@no_suspend()`, and `@no_alloc()` contracts.
     Performance(PerformanceContract),
     /// Contextual parameter syntax such as `limit: Int from query`.
     RequestBinding {
