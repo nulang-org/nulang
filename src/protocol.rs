@@ -968,6 +968,196 @@ mod tests {
     }
 
     #[test]
+    fn admission_exact_match_succeeds_without_registry_schema() {
+        let schema = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Balance", vec![], money())],
+        )
+        .unwrap();
+        let id = schema.id();
+        let registry = ProtocolRegistry::new();
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::StrictCompatible,
+                Some(id),
+                Some(id),
+            ),
+            Ok(ProtocolAdmission::Exact)
+        );
+    }
+
+    #[test]
+    fn admission_allows_additive_receiver_upgrade_in_compatible_mode() {
+        let old = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Balance", vec![], money())],
+        )
+        .unwrap();
+        let new = ProtocolSchema::new(
+            "Account",
+            [
+                ProtocolMember::request_reply("Balance", vec![], money()),
+                ProtocolMember::message("Deposit", vec![money()]),
+            ],
+        )
+        .unwrap();
+        let old_id = old.id();
+        let new_id = new.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(old).unwrap();
+        registry.register(new).unwrap();
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::StrictCompatible,
+                Some(new_id),
+                Some(old_id),
+            ),
+            Ok(ProtocolAdmission::CompatibleUpgrade)
+        );
+    }
+
+    #[test]
+    fn admission_strict_exact_rejects_different_compatible_digest() {
+        let old = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Balance", vec![], money())],
+        )
+        .unwrap();
+        let new = ProtocolSchema::new(
+            "Account",
+            [
+                ProtocolMember::request_reply("Balance", vec![], money()),
+                ProtocolMember::message("Deposit", vec![money()]),
+            ],
+        )
+        .unwrap();
+        let old_id = old.id();
+        let new_id = new.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(old).unwrap();
+        registry.register(new).unwrap();
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::StrictExact,
+                Some(new_id),
+                Some(old_id),
+            ),
+            Err(ProtocolAdmissionError::ExactMismatch {
+                receiver: new_id,
+                required: old_id,
+            })
+        );
+    }
+
+    #[test]
+    fn admission_rejects_incompatible_and_unknown_protocols() {
+        let old = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Balance", vec![], money())],
+        )
+        .unwrap();
+        let changed = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Balance", vec![], int())],
+        )
+        .unwrap();
+        let additive = ProtocolSchema::new(
+            "Account",
+            [
+                ProtocolMember::request_reply("Balance", vec![], money()),
+                ProtocolMember::message("Deposit", vec![money()]),
+            ],
+        )
+        .unwrap();
+
+        let old_id = old.id();
+        let changed_id = changed.id();
+        let unknown_id = additive.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(old).unwrap();
+        registry.register(changed).unwrap();
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::StrictCompatible,
+                Some(changed_id),
+                Some(old_id),
+            ),
+            Err(ProtocolAdmissionError::Incompatible {
+                receiver: changed_id,
+                required: old_id,
+            })
+        );
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::StrictCompatible,
+                Some(changed_id),
+                Some(unknown_id),
+            ),
+            Err(ProtocolAdmissionError::UnknownProtocol(unknown_id))
+        );
+    }
+
+    #[test]
+    fn admission_rejects_untyped_messages_by_default() {
+        let registry = ProtocolRegistry::new();
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::default(),
+                None,
+                None,
+            ),
+            Err(ProtocolAdmissionError::MissingRequiredProtocol)
+        );
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::StrictCompatible,
+                None,
+                Some(ProtocolId([1; 32])),
+            ),
+            Err(ProtocolAdmissionError::MissingReceiverProtocol)
+        );
+    }
+
+    #[test]
+    fn admission_legacy_mode_is_explicit_and_only_relaxes_missing_sender_identity() {
+        let registry = ProtocolRegistry::new();
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::LegacyCompatible,
+                None,
+                None,
+            ),
+            Ok(ProtocolAdmission::LegacyUntyped)
+        );
+
+        assert_eq!(
+            admit_protocol(
+                &registry,
+                ProtocolAdmissionPolicy::LegacyCompatible,
+                None,
+                Some(ProtocolId([2; 32])),
+            ),
+            Err(ProtocolAdmissionError::MissingReceiverProtocol)
+        );
+    }
+
+    #[test]
     fn protocol_id_hex_round_trips() {
         let schema = ProtocolSchema::new(
             "Account",
