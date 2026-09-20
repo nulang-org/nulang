@@ -99,6 +99,15 @@ two major versions.*
   and migration/forwarding retain the selected schema instead of flattening
   module-global metadata.
 
+### Actor protocol wire identity — 2026-09-20
+- **Additive NUL0-v1 actor protocol metadata** (Experimental,
+  `src/runtime/network.rs`, `src/runtime/distributed.rs`). Actor messages may
+  carry a self-identifying `PRT0` tail containing the canonical 32-byte
+  structural protocol digest. Existing callers emit no tail, older v1 peers
+  may ignore trailing bytes, and new peers preserve the identity for later
+  runtime compatibility enforcement. No handshake or packet discriminant
+  version changes in this slice.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
