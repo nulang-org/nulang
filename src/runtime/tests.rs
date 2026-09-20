@@ -5538,6 +5538,7 @@ fn test_message_retry_after_bytecode_fetch() {
         target_actor: actor_id,
         behavior_name: "store".to_string(),
         content_hash: Some(correct_hash),
+        protocol_id: None,
         payload: vec![Value::int(42)],
         string_table: vec![],
         object_table: vec![],
