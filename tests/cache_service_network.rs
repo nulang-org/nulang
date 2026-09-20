@@ -2142,6 +2142,31 @@ fn automatic_remote_transfer_retry_recovers_without_early_source_finalize() {
 
 
 #[test]
+fn configured_missing_snapshot_fails_closed() {
+    let missing = temp_journal_path("missing-shard-checkpoint").with_extension("snapshot");
+    let node_id = 4241u64;
+    let placement = CacheSlotMap::new_local(node_id, 1).unwrap();
+
+    let error = CacheServiceBuilder::new(node_id, placement)
+        .with_shard(
+            CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            )
+            .restore_from_snapshot(&missing),
+        )
+        .build()
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        nulang::runtime::CacheServiceError::Snapshot(
+            nulang::runtime::CacheSnapshotError::Io(ref io_error)
+        ) if io_error.kind() == std::io::ErrorKind::NotFound
+    ));
+}
+
+#[test]
 fn shard_checkpoint_restores_resp_values_and_reduces_ttl() {
     let snapshot_path = temp_journal_path("shard-checkpoint").with_extension("snapshot");
     let node_id = 4242u64;
