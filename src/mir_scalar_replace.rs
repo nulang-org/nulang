@@ -5,19 +5,23 @@
 //!
 //! - immutable Tuple / Record aggregates;
 //! - no aliases of the aggregate local;
-//! - all projections occur later in the same basic block;
-//! - projected source locals are not reassigned between construction and use;
+//! - same-block projections occur after construction;
+//! - cross-block projections are dominated by the construction block;
+//! - cross-block projected values are stable parameters/captures or are
+//!   defined immediately before construction in the same block;
 //! - the aggregate local is anonymous or compiler-generated, preserving the
 //!   optimizer's existing debugger policy for ordinary named source locals.
 //!
-//! Cross-block replacement is intentionally deferred until MIR has an explicit
-//! dominator/value-numbering analysis. Mutable aggregates are also deferred.
+//! Cross-block replacement uses explicit MIR dominance and deliberately opts
+//! out when effect-handler tables are present because handler dispatch adds
+//! implicit control-flow edges. Mutable aggregates are still deferred.
 
 use crate::mir::{BlockId, FuncRef, Function, LocalId, RValue, Stmt, Terminator};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
 struct ProjectionRewrite {
+    block: BlockId,
     stmt_index: usize,
     source: LocalId,
 }
@@ -34,6 +38,7 @@ struct ReplacementPlan {
 /// Returns the number of aggregate allocations eliminated.
 pub fn scalar_replace_function(function: &mut Function) -> usize {
     let summaries = crate::mir_escape::analyze_function(function);
+    let dominators = crate::mir_cfg::Dominators::compute(function);
     let mut plans = Vec::new();
 
     for summary in summaries {
@@ -43,7 +48,7 @@ pub fn scalar_replace_function(function: &mut Function) -> usize {
         if !debug_safe_local(function, summary.site.dst) {
             continue;
         }
-        if let Some(plan) = build_plan(function, summary.site) {
+        if let Some(plan) = build_plan(function, summary.site, &dominators) {
             plans.push(plan);
         }
     }
@@ -55,8 +60,8 @@ pub fn scalar_replace_function(function: &mut Function) -> usize {
     // Rewrite projections before removing definitions so statement indices are
     // still the ones reported by the analysis.
     for plan in &plans {
-        let block = &mut function.blocks[plan.block.0 as usize];
         for rewrite in &plan.projections {
+            let block = &mut function.blocks[rewrite.block.0 as usize];
             if let Stmt::Assign { op, .. } = &mut block.stmts[rewrite.stmt_index] {
                 *op = RValue::Load(rewrite.source);
             }
@@ -99,6 +104,7 @@ fn debug_safe_local(function: &Function, local: LocalId) -> bool {
 fn build_plan(
     function: &Function,
     site: crate::mir_escape::AggregateSite,
+    dominators: &crate::mir_cfg::Dominators,
 ) -> Option<ReplacementPlan> {
     let block = function.blocks.get(site.block.0 as usize)?;
     let definition = block.stmts.get(site.stmt_index)?;
@@ -133,16 +139,36 @@ fn build_plan(
             }
 
             if let Some(source) = projection_source(stmt, site.dst, &fields) {
-                if other.id != site.block
-                    || stmt_index <= site.stmt_index
-                    || projection_writes_root(stmt, site.dst)
-                {
+                if projection_writes_root(stmt, site.dst) || source == site.dst {
                     return None;
                 }
-                if source == site.dst {
-                    return None;
+
+                let same_block = other.id == site.block;
+                if same_block {
+                    if stmt_index <= site.stmt_index
+                        || source_reassigned_in_same_block(
+                            block,
+                            source,
+                            site.stmt_index,
+                            stmt_index,
+                        )
+                    {
+                        return None;
+                    }
+                } else {
+                    if !function.handler_tables.is_empty()
+                        || !dominators.strict_dominates(site.block, other.id)
+                        || !source_stable_across_blocks(function, block, site.stmt_index, source)
+                    {
+                        return None;
+                    }
                 }
-                projections.push(ProjectionRewrite { stmt_index, source });
+
+                projections.push(ProjectionRewrite {
+                    block: other.id,
+                    stmt_index,
+                    source,
+                });
                 continue;
             }
 
@@ -160,21 +186,6 @@ fn build_plan(
         return None;
     }
 
-    // Substituting a field projection with Load(source) is only correct while
-    // source still holds the value captured at aggregate construction.
-    for projection in &projections {
-        for stmt in block
-            .stmts
-            .iter()
-            .take(projection.stmt_index)
-            .skip(site.stmt_index + 1)
-        {
-            if matches!(stmt, Stmt::Assign { dst, .. } if *dst == projection.source) {
-                return None;
-            }
-        }
-    }
-
     Some(ReplacementPlan {
         block: site.block,
         allocation_stmt: site.stmt_index,
@@ -184,6 +195,52 @@ fn build_plan(
 
 fn projection_writes_root(stmt: &Stmt, root: LocalId) -> bool {
     matches!(stmt, Stmt::Assign { dst, .. } if *dst == root)
+}
+
+fn source_reassigned_in_same_block(
+    block: &crate::mir::Block,
+    source: LocalId,
+    allocation_stmt: usize,
+    projection_stmt: usize,
+) -> bool {
+    block
+        .stmts
+        .iter()
+        .take(projection_stmt)
+        .skip(allocation_stmt + 1)
+        .any(|stmt| matches!(stmt, Stmt::Assign { dst, .. } if *dst == source))
+}
+
+fn source_stable_across_blocks(
+    function: &Function,
+    allocation_block: &crate::mir::Block,
+    allocation_stmt: usize,
+    source: LocalId,
+) -> bool {
+    let explicit_defs: Vec<(BlockId, usize)> = function
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .stmts
+                .iter()
+                .enumerate()
+                .filter_map(move |(stmt_index, stmt)| {
+                    matches!(stmt, Stmt::Assign { dst, .. } if *dst == source)
+                        .then_some((block.id, stmt_index))
+                })
+        })
+        .collect();
+
+    if function.params.contains(&source) || function.captures.contains(&source) {
+        return explicit_defs.is_empty();
+    }
+
+    matches!(
+        explicit_defs.as_slice(),
+        [(block, stmt_index)]
+            if *block == allocation_block.id && *stmt_index < allocation_stmt
+    )
 }
 
 fn projection_source(
@@ -455,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_block_projection_is_deferred() {
+    fn cross_block_projection_is_replaced_when_dominated() {
         let mut builder = mir::FunctionBuilder::new("cross_block", Some(Type::int()));
         let value = builder.add_temp(Type::int());
         builder.assign(value, RValue::Const(Constant::Int(1)));
@@ -475,6 +532,82 @@ mod tests {
         builder.terminate(Terminator::Return(Some(projected)));
         let mut function = builder.build();
 
+        assert_eq!(scalar_replace_function(&mut function), 1);
+        assert!(!function.blocks[0]
+            .stmts
+            .iter()
+            .any(|stmt| matches!(stmt, Stmt::Assign { op: RValue::Tuple(_), .. })));
+        assert!(matches!(
+            function.blocks[next.0 as usize].stmts.first(),
+            Some(Stmt::Assign {
+                op: RValue::Load(source),
+                ..
+            }) if *source == value
+        ));
+    }
+
+    #[test]
+    fn cross_block_projection_rejects_non_dominating_definition() {
+        let mut builder = mir::FunctionBuilder::new("diamond_reject", Some(Type::int()));
+        let cond = builder.add_temp(Type::bool());
+        builder.assign(cond, RValue::Const(Constant::Bool(true)));
+        let left = builder.create_block();
+        let right = builder.create_block();
+        let join = builder.create_block();
+        builder.terminate(Terminator::Branch {
+            cond,
+            then_: left,
+            else_: right,
+        });
+
+        builder.switch_to(left);
+        let value = builder.add_temp(Type::int());
+        builder.assign(value, RValue::Const(Constant::Int(1)));
+        let tuple = builder.add_temp(Type::unit());
+        builder.assign(tuple, RValue::Tuple(vec![value]));
+        builder.terminate(Terminator::Jump(join));
+
+        builder.switch_to(right);
+        builder.terminate(Terminator::Jump(join));
+
+        builder.switch_to(join);
+        let projected = builder.add_temp(Type::int());
+        builder.assign(
+            projected,
+            RValue::LoadFieldPos {
+                obj: tuple,
+                index: 0,
+            },
+        );
+        builder.terminate(Terminator::Return(Some(projected)));
+
+        let mut function = builder.build();
+        assert_eq!(scalar_replace_function(&mut function), 0);
+    }
+
+    #[test]
+    fn cross_block_projection_rejects_unstable_source() {
+        let mut builder = mir::FunctionBuilder::new("unstable_source", Some(Type::int()));
+        let value = builder.add_temp(Type::int());
+        builder.assign(value, RValue::Const(Constant::Int(1)));
+        let tuple = builder.add_temp(Type::unit());
+        builder.assign(tuple, RValue::Tuple(vec![value]));
+
+        let next = builder.create_block();
+        builder.terminate(Terminator::Jump(next));
+        builder.switch_to(next);
+        builder.assign(value, RValue::Const(Constant::Int(2)));
+        let projected = builder.add_temp(Type::int());
+        builder.assign(
+            projected,
+            RValue::LoadFieldPos {
+                obj: tuple,
+                index: 0,
+            },
+        );
+        builder.terminate(Terminator::Return(Some(projected)));
+
+        let mut function = builder.build();
         assert_eq!(scalar_replace_function(&mut function), 0);
     }
 }
