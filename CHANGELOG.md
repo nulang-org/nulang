@@ -62,6 +62,17 @@ two major versions.*
   while requiring every requested behavior/signature. Calls through
   `ActorRef[P]` are checked directly from `P`. The type is compile-time-only
   and does not change runtime actor representation or stable formats.
+- **Directional ActorRef attenuation** (Experimental). Already-abstract
+  `ActorRef<P>` values may flow to narrower `ActorRef<Q>` requirements when
+  every required behavior/signature is present. Widening to claim missing
+  behaviors is rejected. The check is applied at value-to-expected-type
+  boundaries without making general HM unification asymmetric.
+- **Compiler-owned protocol fingerprints** (Experimental, `src/protocol.rs`).
+  `ProtocolSchema::from_actor_type` derives structural protocol identity from
+  the typechecker's canonical actor behavior record. Full behavior signatures
+  include parameter packs, return types, effects, and capabilities; unresolved
+  or open contracts fail closed. Protocol type hashes now use the canonical
+  content encoding rather than information-erasing NTIR.
 
 ### Zero-copy array slices — 2026-09-20
 - **Constant-size `ArrayView` slices** (Experimental, `src/vm.rs`,

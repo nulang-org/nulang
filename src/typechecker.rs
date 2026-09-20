@@ -353,6 +353,56 @@ fn protocol_param_types(param: &Type) -> Vec<Type> {
     }
 }
 
+fn unify_actor_ref_attenuation(
+    advertised: &Type,
+    required: &Type,
+    span: Span,
+) -> NuResult<Substitution> {
+    let Type::Record(advertised_fields) = advertised else {
+        return Err(NuError::type_error(
+            "ActorRef advertised protocol must be a record of behavior signatures".to_string(),
+            span,
+        ));
+    };
+    let Type::Record(required_fields) = required else {
+        return Err(NuError::type_error(
+            "ActorRef required protocol must be a record of behavior signatures".to_string(),
+            span,
+        ));
+    };
+
+    let mut subst = Vec::new();
+    for (name, required_sig) in required_fields {
+        let Some((_, advertised_sig)) = advertised_fields.iter().find(|(n, _)| n == name) else {
+            let available = advertised_fields.iter().map(|(n, _)| n.clone()).collect();
+            return Err(NuError::field_not_found(
+                name.clone(),
+                span,
+                Some(available),
+            ));
+        };
+
+        let advertised_sig = normalize_required_actor_behavior_sig(advertised_sig);
+        let required_sig = normalize_required_actor_behavior_sig(required_sig);
+        let s = mgu(
+            &apply_subst(&advertised_sig, &subst),
+            &apply_subst(&required_sig, &subst),
+            span,
+        )?;
+        subst = compose_subst(&s, &subst);
+    }
+    Ok(subst)
+}
+
+fn mgu_assignable(found: &Type, expected: &Type, span: Span) -> NuResult<Substitution> {
+    if let (Some(advertised), Some(required)) =
+        (found.actor_ref_protocol(), expected.actor_ref_protocol())
+    {
+        return unify_actor_ref_attenuation(advertised, required, span);
+    }
+    mgu(found, expected, span)
+}
+
 fn normalize_required_actor_behavior_sig(sig: &Type) -> Type {
     let Type::Function {
         param,
@@ -1556,7 +1606,7 @@ impl TypeChecker {
                     Some(rt) => {
                         let body_subst = apply_subst(&body_ty, &s1);
                         let rt_subst = apply_subst(rt, &s1);
-                        mgu(&body_subst, &rt_subst, *span)?
+                        mgu_assignable(&body_subst, &rt_subst, *span)?
                     }
                     None => vec![],
                 };
@@ -2047,7 +2097,7 @@ impl TypeChecker {
             // Type annotation
             Expr::TypeAnnotate { expr, ty, span } => {
                 let (s1, inferred) = self.infer_expr(ctx, expr)?;
-                let s2 = mgu(&apply_subst(&inferred, &s1), ty, *span)?;
+                let s2 = mgu_assignable(&apply_subst(&inferred, &s1), ty, *span)?;
                 Ok((
                     compose_subst(&s2, &s1),
                     apply_subst(ty, &compose_subst(&s2, &s1)),
@@ -2339,6 +2389,41 @@ impl TypeChecker {
             }
         }
 
+        // ActorRef attenuation is directional: an actual value may expose
+        // more behaviors than the callee requires, but never fewer. Perform
+        // this check while the callee parameter type is known; generic HM
+        // unification remains symmetric for every other type.
+        if let Type::Function {
+            param: fn_param, ..
+        } = &func_ty_subst
+        {
+            let expected_params: Vec<&Type> = match fn_param.as_ref() {
+                Type::Tuple(items) if arg_types.len() == items.len() => items.iter().collect(),
+                other if arg_types.len() == 1 => vec![other],
+                _ => Vec::new(),
+            };
+            if expected_params.len() == arg_types.len() {
+                for (found, expected) in arg_types.iter_mut().zip(expected_params) {
+                    if found.actor_ref_protocol().is_some()
+                        && expected.actor_ref_protocol().is_some()
+                    {
+                        let s_att = mgu_assignable(
+                            &apply_subst(found, &subst),
+                            &apply_subst(expected, &subst),
+                            span,
+                        )?;
+                        subst = compose_subst(&s_att, &subst);
+                        // The directional check above proved that this wider
+                        // reference is safe at the required narrower view.
+                        // Feed that view into ordinary symmetric function
+                        // unification so it cannot reject the width difference
+                        // a second time.
+                        *found = apply_subst(expected, &subst);
+                    }
+                }
+            }
+        }
+
         // Create a fresh result type
         let result_ty = Type::Var(TypeVar::fresh());
 
@@ -2399,7 +2484,8 @@ impl TypeChecker {
             let mut s_combined = compose_subst(&s2, &s1);
             // An explicit annotation must unify with the inferred value type.
             if let Some(ann_ty) = ann {
-                let s_ann = mgu(&apply_subst(&val_ty, &s_combined), ann_ty, Span::default())?;
+                let s_ann =
+                    mgu_assignable(&apply_subst(&val_ty, &s_combined), ann_ty, Span::default())?;
                 s_combined = compose_subst(&s_ann, &s_combined);
             }
             let gen_ty = self.do_generalize(ctx, &apply_subst(&val_ty, &s_combined));
@@ -2414,7 +2500,7 @@ impl TypeChecker {
 
         // An explicit annotation must unify with the inferred value type.
         let s1 = if let Some(ann_ty) = ann {
-            let s_ann = mgu(&apply_subst(&val_ty, &s1), ann_ty, Span::default())?;
+            let s_ann = mgu_assignable(&apply_subst(&val_ty, &s1), ann_ty, Span::default())?;
             compose_subst(&s_ann, &s1)
         } else {
             s1
@@ -3437,7 +3523,7 @@ impl TypeChecker {
                 // statically-known actor calls keep the Phase-1 compatibility
                 // behavior from actor_protocol.rs.
                 let unspecified = || Type::Nominal {
-                    name: "__UnspecifiedActorProtocolType".to_string(),
+                    name: crate::types::UNSPECIFIED_ACTOR_PROTOCOL_TYPE_NAME.to_string(),
                     underlying: Box::new(Type::unit()),
                 };
                 let params: Vec<Type> = behavior

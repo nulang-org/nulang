@@ -111,9 +111,39 @@ This phase does not change runtime actor values or any stable format. Structural
 subtyping between two already-abstract `ActorRef` values and distributed
 protocol fingerprints remain follow-up work.
 
+## Phase 3: abstract-reference attenuation
+
+Already-abstract actor references support directional width attenuation. A value
+of type `ActorRef[P]` may flow to `ActorRef[Q]` when every behavior required
+by `Q` exists in `P` with a compatible argument-pack, return, effect, and
+capability signature. This is checked at value-to-expected-type boundaries
+(function arguments, explicit annotations, let annotations, and declared
+returns) rather than by making ordinary HM unification asymmetric.
+
+The reverse is rejected: a reference cannot be widened to claim behaviors it
+does not expose. This makes protocol narrowing a capability attenuation
+operation rather than an unchecked cast.
+
+## Phase 4: canonical compiler protocol identity
+
+The compiler-owned `Type::Actor.behavior` record is now the source of truth for
+runtime/distributed protocol identity. `ProtocolSchema::from_actor_type`
+normalizes each behavior to its message argument pack and fingerprints the full
+canonical function contract: parameter types, return type, effect row, and
+capability.
+
+Protocol type identity uses `canonical_type_bytes`, not NTIR. NTIR intentionally
+erases distinctions that are acceptable for compiler equality fast paths but
+unsafe for persistent/distributed identity. Schema generation fails closed for
+unresolved type variables, open effect rows, open record rows, and unannotated
+behavior sentinels.
+
+`send` versus `ask` is delivery metadata rather than a property of a behavior
+declaration, so delivery mode is intentionally excluded from `ProtocolId`.
+
 ## Future phases
 
-1. Generalize structural compatibility between `ActorRef` values (protocol attenuation/intersection).
+1. Add explicit protocol intersection/composition syntax for reusable named capabilities.
 2. Introduce a user-facing structural protocol type (`ActorRef[P]` or equivalent) for parameters, fields, collections, and public APIs.
 3. Support protocol intersection and capability attenuation, e.g. `ActorRef[Readable & Observable]`.
 4. Include protocol/version metadata in distributed actor references and wire negotiation.
