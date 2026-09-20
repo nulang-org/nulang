@@ -15,7 +15,7 @@
 //!   recycled slot;
 //! - Redis Cluster compatible 16,384-slot hashing and hash tags.
 
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::Hasher;
 
 pub const REDIS_CLUSTER_SLOTS: u16 = 16_384;
@@ -28,6 +28,7 @@ const FREE_LIST_COUNT: usize = MAX_ARENA_EXP - MIN_ARENA_EXP + 1;
 const DEFAULT_INDEX_CAPACITY: usize = 64;
 const DEFAULT_WHEEL_BUCKETS: usize = 4_096;
 const DEFAULT_WHEEL_TICK_MS: u64 = 10;
+const MAX_DURABLE_RESTORE_SLOTS: usize = 16_777_216;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArenaSlice {
@@ -298,6 +299,26 @@ pub struct CacheTransferEntry {
     /// Remaining TTL at export time. None means persistent.
     pub ttl_ms: Option<u64>,
     pub token: CacheTransferToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheDurableEntry {
+    pub key: Vec<u8>,
+    pub value: CacheTransferValue,
+    /// Process-independent absolute expiry. None means persistent.
+    pub expires_unix_ms: Option<u64>,
+    /// Exact source slot/generation identity. Preserving this across restore is
+    /// required so pre-restart migration ACKs still fence the intended version.
+    pub token: CacheTransferToken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheDurableRestoreError {
+    DuplicateSlot(u32),
+    DuplicateKey,
+    SlotOverflow,
+    TooManySlots(usize),
+    InvalidGeneration(u32),
 }
 
 impl CacheTransferEntry {
@@ -889,6 +910,155 @@ impl CacheStore {
         expired
     }
 
+    /// Export every live entry for a cold-path durable snapshot.
+    ///
+    /// wall_anchor_unix_ms should be captured before now_ms. Combining that
+    /// earlier wall anchor with a later monotonic remaining TTL is conservative:
+    /// an expiry can move slightly earlier after restore, never later.
+    pub fn export_durable_entries(
+        &self,
+        now_ms: u64,
+        wall_anchor_unix_ms: u64,
+    ) -> Vec<CacheDurableEntry> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot_id, slot)| {
+                let entry = slot.entry.as_ref()?;
+                if entry
+                    .expires_at_ms
+                    .is_some_and(|deadline| deadline <= now_ms)
+                {
+                    return None;
+                }
+                let key = entry.key.as_slice(&self.arena).to_vec();
+                let value = match entry.value {
+                    CacheValue::Integer(value) => CacheTransferValue::Integer(value),
+                    CacheValue::Bytes(bytes) => {
+                        CacheTransferValue::Bytes(bytes.as_slice(&self.arena).to_vec())
+                    }
+                };
+                let expires_unix_ms = entry.expires_at_ms.map(|deadline| {
+                    wall_anchor_unix_ms.saturating_add(deadline.saturating_sub(now_ms))
+                });
+                Some(CacheDurableEntry {
+                    key,
+                    value,
+                    expires_unix_ms,
+                    token: CacheTransferToken {
+                        source_slot: slot_id as u32,
+                        source_generation: slot.generation,
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Restore a cold-path durable snapshot while preserving exact slot and
+    /// generation identities.
+    ///
+    /// Entries already expired by wall_now_unix_ms are omitted. Their old slot
+    /// generations are intentionally not reusable in this restored incarnation;
+    /// free-slot reuse advances generation before any future allocation.
+    pub fn restore_durable_entries(
+        entries: &[CacheDurableEntry],
+        now_ms: u64,
+        wall_now_unix_ms: u64,
+    ) -> Result<Self, CacheDurableRestoreError> {
+        let mut live = Vec::new();
+        let mut seen_slots = FxHashSet::default();
+        let mut seen_keys = FxHashSet::default();
+        let mut max_slot = None;
+
+        for entry in entries {
+            if entry
+                .expires_unix_ms
+                .is_some_and(|deadline| deadline <= wall_now_unix_ms)
+            {
+                continue;
+            }
+            if entry.token.source_generation == 0 {
+                return Err(CacheDurableRestoreError::InvalidGeneration(0));
+            }
+            if !seen_slots.insert(entry.token.source_slot) {
+                return Err(CacheDurableRestoreError::DuplicateSlot(
+                    entry.token.source_slot,
+                ));
+            }
+            if !seen_keys.insert(entry.key.clone()) {
+                return Err(CacheDurableRestoreError::DuplicateKey);
+            }
+            max_slot = Some(max_slot.map_or(entry.token.source_slot, |current: u32| {
+                current.max(entry.token.source_slot)
+            }));
+            live.push(entry);
+        }
+
+        let mut store = CacheStore::new();
+        let Some(max_slot) = max_slot else {
+            return Ok(store);
+        };
+        let slot_len = usize::try_from(max_slot)
+            .ok()
+            .and_then(|slot| slot.checked_add(1))
+            .ok_or(CacheDurableRestoreError::SlotOverflow)?;
+        if slot_len > MAX_DURABLE_RESTORE_SLOTS {
+            return Err(CacheDurableRestoreError::TooManySlots(slot_len));
+        }
+        store.slots = (0..slot_len).map(|_| EntrySlot::default()).collect();
+        store.free_slots.clear();
+        store.index =
+            vec![Bucket::EMPTY; (live.len().max(DEFAULT_INDEX_CAPACITY) * 2).next_power_of_two()];
+        store.index_len = 0;
+        store.tombstones = 0;
+
+        for durable in live {
+            let slot_id = durable.token.source_slot;
+            let hash = Self::hash(&durable.key);
+            let packed_key = PackedBytes::pack(&durable.key, &mut store.arena);
+            let value = match &durable.value {
+                CacheTransferValue::Integer(value) => CacheValue::Integer(*value),
+                CacheTransferValue::Bytes(bytes) => {
+                    CacheValue::Bytes(PackedBytes::pack(bytes, &mut store.arena))
+                }
+            };
+            let expires_at_ms = durable
+                .expires_unix_ms
+                .map(|deadline| now_ms.saturating_add(deadline.saturating_sub(wall_now_unix_ms)));
+            store.slots[slot_id as usize] = EntrySlot {
+                generation: durable.token.source_generation,
+                entry: Some(Entry {
+                    hash,
+                    key: packed_key,
+                    value,
+                    expires_at_ms,
+                }),
+            };
+            store.insert_bucket_raw(hash, slot_id);
+            store.index_len += 1;
+            if let Some(expires_at_ms) = expires_at_ms {
+                store.expiry.schedule(
+                    ExpirationRef {
+                        slot: slot_id,
+                        generation: durable.token.source_generation,
+                        expires_at_ms,
+                    },
+                    now_ms,
+                );
+            }
+        }
+
+        for (slot_id, slot) in store.slots.iter_mut().enumerate() {
+            if slot.entry.is_none() {
+                // Advance from zero on first reuse, ensuring no historical token
+                // for an omitted/expired entry can match a future allocation.
+                slot.generation = 0;
+                store.free_slots.push(slot_id as u32);
+            }
+        }
+        Ok(store)
+    }
+
     /// Count live entries currently resident in one Redis logical slot.
     ///
     /// This is a cold migration-control scan and deliberately does not add a
@@ -1450,6 +1620,102 @@ mod tests {
             CacheTransferImport::ExpiredInTransit
         );
         assert!(!target.exists(b"k{move}", 100));
+    }
+
+    #[test]
+    fn durable_snapshot_restore_preserves_source_tokens_and_ttl() {
+        let mut store = CacheStore::new();
+        store.set_bytes(b"persistent", b"value", None, 100);
+        store.set_integer(b"ttl", 42, Some(5_000), 100);
+
+        let persistent_token = store.transfer_token_for_key(b"persistent", 200).unwrap();
+        let ttl_token = store.transfer_token_for_key(b"ttl", 200).unwrap();
+        let snapshot = store.export_durable_entries(200, 10_000);
+
+        let mut restored = CacheStore::restore_durable_entries(&snapshot, 50, 11_000).unwrap();
+        assert_eq!(
+            restored.get(b"persistent", 50),
+            Some(CacheValueView::Bytes(b"value"))
+        );
+        assert_eq!(restored.get(b"ttl", 50), Some(CacheValueView::Integer(42)));
+        assert_eq!(
+            restored.transfer_token_for_key(b"persistent", 50),
+            Some(persistent_token)
+        );
+        assert_eq!(restored.transfer_token_for_key(b"ttl", 50), Some(ttl_token));
+        assert_eq!(restored.ttl(b"ttl", 50), CacheTtl::RemainingMs(3_900));
+    }
+
+    #[test]
+    fn durable_snapshot_restore_drops_wall_expired_entries() {
+        let mut store = CacheStore::new();
+        store.set_bytes(b"short", b"value", Some(100), 0);
+        let snapshot = store.export_durable_entries(10, 1_000);
+        let restored = CacheStore::restore_durable_entries(&snapshot, 0, 1_200).unwrap();
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn restored_source_token_still_generation_fences_old_transfer_ack() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"k{durable}", b"old", None, 0);
+        let slot = redis_slot(b"k{durable}");
+        let exported = source
+            .export_slot_batch(slot, None, 1, 0)
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+        let snapshot = source.export_durable_entries(0, 10_000);
+
+        let mut restored = CacheStore::restore_durable_entries(&snapshot, 0, 10_100).unwrap();
+        assert_eq!(
+            restored.finalize_transfer_entry(&exported, 0),
+            CacheTransferFinalize::Removed
+        );
+
+        let mut restored = CacheStore::restore_durable_entries(&snapshot, 0, 10_100).unwrap();
+        restored.set_bytes(b"k{durable}", b"new", None, 1);
+        assert_eq!(
+            restored.finalize_transfer_entry(&exported, 1),
+            CacheTransferFinalize::StaleVersion
+        );
+        assert_eq!(
+            restored.get(b"k{durable}", 1),
+            Some(CacheValueView::Bytes(b"new"))
+        );
+    }
+
+    #[test]
+    fn durable_restore_rejects_sparse_allocation_bomb_and_zero_generation() {
+        let huge = CacheDurableEntry {
+            key: b"huge".to_vec(),
+            value: CacheTransferValue::Integer(1),
+            expires_unix_ms: None,
+            token: CacheTransferToken {
+                source_slot: u32::MAX,
+                source_generation: 1,
+            },
+        };
+        assert!(matches!(
+            CacheStore::restore_durable_entries(&[huge], 0, 0),
+            Err(CacheDurableRestoreError::TooManySlots(_))
+                | Err(CacheDurableRestoreError::SlotOverflow)
+        ));
+
+        let zero_generation = CacheDurableEntry {
+            key: b"zero".to_vec(),
+            value: CacheTransferValue::Integer(1),
+            expires_unix_ms: None,
+            token: CacheTransferToken {
+                source_slot: 0,
+                source_generation: 0,
+            },
+        };
+        assert!(matches!(
+            CacheStore::restore_durable_entries(&[zero_generation], 0, 0),
+            Err(CacheDurableRestoreError::InvalidGeneration(0))
+        ));
     }
 
     #[test]

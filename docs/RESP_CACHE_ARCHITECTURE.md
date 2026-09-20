@@ -384,8 +384,30 @@ as one unit.
 
 ## Durability
 
-Durability is not implicit in the cache kernel. Add it above the mutation path
-as explicit acknowledgement classes:
+Durability is not implicit in the default cache hot path. The first storage
+primitive is now an explicit **checkpoint** rather than a hidden mutation tax.
+`CacheStore::export_durable_entries` captures live entries with exact source
+slot/generation identities and converts monotonic expiry deadlines into absolute
+Unix-millisecond deadlines using a wall anchor captured no later than the
+snapshot scan. `CacheStore::restore_durable_entries` drops already wall-expired
+entries, reconstructs values and expiry scheduling, and preserves generation
+tokens so a pre-restart migration ACK still fences the intended restored
+version.
+
+`cache_durable_store.rs` wraps those entries in a versioned, length-bounded
+binary snapshot with BLAKE3 integrity. Checkpoints are written to a same-path
+temporary file, fsynced, atomically renamed, and (on supported filesystems)
+published as the shard's restore image. Malformed duplicate slot/key records,
+zero live generations, excessive sparse slot ids, oversized payloads, and
+checksum corruption fail closed. A shard can opt into restore-on-start with
+`CacheServiceShardConfig::restore_from_snapshot`, while
+`CacheServiceHandle::checkpoint_shard` executes the snapshot on the owning
+reactor thread.
+
+This checkpoint does **not** make normal writes crash durable. Any mutation after
+the last completed checkpoint is still volatile. The next durability layer must
+therefore log mutations after the checkpoint boundary. Keep acknowledgement
+classes explicit:
 
 - memory: acknowledge after local mutation;
 - async journal: enqueue WAL append before acknowledgement;
@@ -393,7 +415,8 @@ as explicit acknowledgement classes:
 - replica: acknowledge after a configured replica;
 - quorum: acknowledge after consensus/quorum.
 
-The default cache path must remain able to run without WAL or consensus work.
+The default memory path must remain able to run without WAL, snapshot, or
+consensus work.
 
 ## Performance gates
 
@@ -414,15 +437,17 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add general durable CacheStore WAL/snapshot recovery for non-drained
-   migrations and ordinary cache durability modes.
-2. Reconcile journaled pending commit intents against durable placement/control
+1. Add a bounded mutation WAL above the token-preserving checkpoint boundary,
+   with explicit memory/async-journal/journal acknowledgement modes and
+   checksum/truncated-tail recovery.
+2. Use snapshot + WAL replay to recover non-drained migrations, preserving
+   source generations and reconciling in-flight migration journal state.
+3. Reconcile journaled pending commit intents against durable placement/control
    state after process restart; never infer the outcome from an empty source.
-3. Add a separate transparent proxy endpoint only for non-cluster clients;
+4. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
-4. Allow topology publication to add/remove advertised remote endpoints without
+5. Allow topology publication to add/remove advertised remote endpoints without
    restarting local reactors.
-5. Promote expiration to a hierarchical timing wheel and benchmark TTL churn
-   against the current single-level wheel.
-6. Expand packed aggregates, RESP compatibility, leases, locks, semaphores,
-   queues, stored functions, and explicit durability acknowledgement classes.
+6. Promote expiration to a hierarchical timing wheel, then expand packed
+   aggregates, RESP compatibility, coordination primitives, and replication
+   acknowledgement modes.
