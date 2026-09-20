@@ -41,13 +41,13 @@ pub(crate) fn spawn_actor_with_models(
 fn preflight_persistent_snapshot(
     rt: &Runtime,
     actor_id: u64,
-) -> Result<Option<(ActorSnapshot, AuthorityManifest)>, RuntimeAuthorityError> {
-    let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
+) -> Result<Option<(u32, ActorSnapshot, AuthorityManifest)>, RuntimeAuthorityError> {
+    let Some((schema_version, snapshot)) = rt.persistence.load_snapshot_versioned(actor_id) else {
         return Ok(None);
     };
     let manifest =
         AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))?;
-    Ok(Some((snapshot, manifest)))
+    Ok(Some((schema_version, snapshot, manifest)))
 }
 
 /// Spawn an actor with a pre-assigned id. `Runtime::spawn_actor_near` uses
@@ -153,14 +153,15 @@ pub(crate) fn spawn_actor_with_id(
 fn restore_persistent_state(
     rt: &Runtime,
     actor: &mut Actor,
-    snapshot: Option<(ActorSnapshot, AuthorityManifest)>,
+    snapshot: Option<(u32, ActorSnapshot, AuthorityManifest)>,
 ) {
     // Event-sourced-only actors may have an event log but no snapshot
     // (EventSourced fields are excluded from snapshots by design), so both
     // halves run independently. Authority was parsed in the preflight phase
     // before the actor was initialized or made observable.
-    if let Some((snapshot, authority)) = snapshot {
+    if let Some((schema_version, snapshot, authority)) = snapshot {
         actor.install_authority_manifest(&authority);
+        actor.schema_version = schema_version;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal;
         for (name, value) in snapshot.state {
