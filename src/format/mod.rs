@@ -11,8 +11,10 @@
 //!
 //! - [`constants`] — magic bytes, version numbers, [`constants::FormatError`].
 //! - [`nbc`] — `CodeModule::to_nbc` / `from_nbc` and [`nbc::NbcArtifact`].
+//! - `nul0_v1` — private byte-level codec for the frozen NUL0 v1 handshake.
 //! - [`migrate`] — the only legal place format-version upgrades live.
 
 pub mod constants;
 pub mod migrate;
 pub mod nbc;
+pub(crate) mod nul0_v1;

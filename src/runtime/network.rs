@@ -466,9 +466,8 @@ const CHANNEL_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 /// Write the 16-byte NUL0 versioned handshake to a stream.
 #[cfg(feature = "tcp")]
 fn write_handshake<W: Write>(w: &mut W, node_id: NodeId) -> io::Result<()> {
-    w.write_all(&crate::format::constants::WIRE_MAGIC)?;
-    w.write_all(&crate::format::constants::WIRE_VERSION.to_be_bytes())?;
-    w.write_all(&node_id.0.to_be_bytes())?;
+    let bytes = crate::format::nul0_v1::encode_handshake(node_id.0);
+    w.write_all(&bytes)?;
     w.flush()
 }
 
@@ -478,32 +477,28 @@ fn write_handshake<W: Write>(w: &mut W, node_id: NodeId) -> io::Result<()> {
 /// rather than the peer's packets being reinterpreted under the wrong layout.
 #[cfg(feature = "tcp")]
 fn read_handshake<R: Read>(r: &mut R) -> io::Result<NodeId> {
+    use crate::format::nul0_v1::HandshakeError;
+
     let mut buf = [0u8; crate::format::constants::WIRE_HANDSHAKE_LEN];
     r.read_exact(&mut buf)?;
-    if &buf[0..4] != crate::format::constants::WIRE_MAGIC {
-        return Err(io::Error::new(
+    match crate::format::nul0_v1::decode_handshake(&buf) {
+        Ok(node_id) => Ok(NodeId(node_id)),
+        Err(HandshakeError::BadMagic { got }) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "wire handshake: bad magic, expected {:?}, got {:?}",
                 crate::format::constants::WIRE_MAGIC,
-                &buf[0..4]
+                got
             ),
-        ));
-    }
-    let version = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    if version != crate::format::constants::WIRE_VERSION {
-        return Err(io::Error::new(
+        )),
+        Err(HandshakeError::UnsupportedVersion { found }) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "wire handshake: peer speaks wire version {version}, this runtime speaks {}",
+                "wire handshake: peer speaks wire version {found}, this runtime speaks {}",
                 crate::format::constants::WIRE_VERSION
             ),
-        ));
+        )),
     }
-    let node_id = NodeId(u64::from_be_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ]));
-    Ok(node_id)
 }
 
 /// Maximum length (in bytes) of a single packet payload we are willing to
