@@ -5210,6 +5210,13 @@ impl Runtime {
         } else {
             let mut actor = Actor::new(stable_actor_id, grain_id.actor_name(), 0);
             actor.persistent = true;
+            actor.schema_version = grain_type
+                .module
+                .actor_metadata
+                .iter()
+                .find(|meta| meta.name == grain_id.grain_type)
+                .map(|meta| meta.version)
+                .unwrap_or(crate::persistence_schema::LEGACY_SCHEMA_VERSION);
             actor.bytecode_module = Some(grain_type.module.clone());
             actor.bytecode_offsets = grain_type.bytecode_offsets.clone();
             actor.compensation_offsets = grain_type.compensation_offsets.clone();
