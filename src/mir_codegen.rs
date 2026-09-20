@@ -28,6 +28,7 @@ use crate::bytecode::{
     Instruction, OpCode,
 };
 use crate::mir;
+use crate::type_metadata::{type_to_known_type, KnownType, TypeMetadata};
 use crate::types::{NuError, NuResult, PrimitiveType, Span, Type};
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
@@ -43,6 +44,28 @@ const SPILL_TEMP: u8 = 12;
 const SPILL_TEMP2: u8 = 13;
 #[allow(dead_code)]
 const SPILL_TEMP3: u8 = 14;
+
+/// Build the trusted entry facts used to seed bytecode JIT type inference.
+///
+/// Only incoming argument staging registers are seeded. Local static types are
+/// not globally trusted as runtime representations because operations such as
+/// checked division can produce `nil` despite an `Int`/`Float` source type.
+/// MIR codegen immediately moves r0..rN into the function's fixed local
+/// registers, so the normal bytecode must-analysis propagates these facts from
+/// the call boundary without weakening its conservative transfer rules.
+fn jit_entry_type_seed(func: &mir::Function) -> TypeMetadata {
+    let mut meta = TypeMetadata::new();
+    for (arg_reg, param) in func.params.iter().enumerate() {
+        let Some(local) = func.locals.iter().find(|local| local.id == *param) else {
+            continue;
+        };
+        let known = type_to_known_type(&local.ty);
+        if known != KnownType::Unknown {
+            meta.set_type(arg_reg, known);
+        }
+    }
+    meta
+}
 
 fn not_yet_implemented(feature: &str, span: Span) -> NuError {
     NuError::NotYetImplemented {
@@ -646,6 +669,15 @@ impl MirCodegen {
         self.module.instructions = saved_instructions;
         let code_len = function_code.len();
         self.module.instructions.extend(function_code);
+
+        // Publish compiler-trusted entry representation facts for the tiered
+        // JIT. CodeModule deliberately skips these during serialization, so
+        // only bytecode produced by this compiler invocation can seed
+        // guard-stripped compilation.
+        let jit_seed = jit_entry_type_seed(func);
+        if !jit_seed.is_empty() {
+            self.module.jit_type_seeds.push((function_start, jit_seed));
+        }
 
         // Publish the debugger's pc<->line map and per-function debug info.
         for (rel, line) in func_lines {
