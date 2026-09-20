@@ -38,10 +38,10 @@ impl GrainId {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let type_bytes = self.grain_type.as_bytes();
         let key_bytes = self.key.as_bytes();
-        let mut out = Vec::with_capacity(8 + type_bytes.len() + key_bytes.len());
-        out.extend_from_slice(&(type_bytes.len() as u32).to_be_bytes());
+        let mut out = Vec::with_capacity(16 + type_bytes.len() + key_bytes.len());
+        out.extend_from_slice(&(type_bytes.len() as u64).to_be_bytes());
         out.extend_from_slice(type_bytes);
-        out.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(key_bytes.len() as u64).to_be_bytes());
         out.extend_from_slice(key_bytes);
         out
     }
