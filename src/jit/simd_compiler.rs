@@ -106,7 +106,11 @@ pub(crate) fn native_simd_codegen_supported(region: &SimdRegion) -> bool {
     // Generic Nulang arrays store one 8-byte Value per slot. 32-bit SIMD
     // lanes would use the wrong stride until an explicitly unboxed array
     // representation exists.
-    if !matches!(region.elem_type, SimdElemType::Int64 | SimdElemType::Float64) {
+    // Start with Int64 only. Float SIMD needs an explicit per-lane NaN
+    // canonicalization contract before native stores can be equivalent to the
+    // boxed Value representation, and 32-bit lanes do not match the 8-byte
+    // generic array slot layout.
+    if region.elem_type != SimdElemType::Int64 {
         return false;
     }
 
@@ -1364,6 +1368,11 @@ mod simd_compiler_tests {
     fn test_native_simd_support_matches_value_array_representation() {
         let i64 = make_i64_binop_region(BinopKind::IAdd);
         assert!(native_simd_codegen_supported(&i64));
+
+        let mut f64 = i64.clone();
+        f64.elem_type = SimdElemType::Float64;
+        f64.width = SimdWidth::Width2;
+        assert!(!native_simd_codegen_supported(&f64));
 
         let mut i32 = i64.clone();
         i32.elem_type = SimdElemType::Int32;
