@@ -154,7 +154,7 @@ python3 verify_report.py                          # gate: validates codebase_ana
 - **Linker**: GNU `bfd` forced on x86_64 Linux via `.cargo/config.toml` (not `lld`) for Cranelift/PyO3 compatibility.
 - **Python**: PyO3 0.29 abi3 limited-API; `build.rs` symlinks `libpythonX.Y.so` for Fedora.
 - **Allocator**: mimalloc (`#[global_allocator]` in `main.rs`).
-- **Cargo features**: `default = ["python", "sqlite", "lsp", "ai-runtime"]` (PyO3 interop, libsql/Turso persistence, tower-lsp server, AI runtime). `wasm-backend` is optional (off by default) — enables `wasm-encoder` WASM compiler, `wasmtime` host runtime, and `--backend wasm|wasm-run|wasm-aot` CLI modes. All features are optional; `--no-default-features --features <subset>` builds a leaner binary.
+- **Cargo features**: the default development build enables `native-codegen`, `python`, `sqlite`, `lsp`, `ai-runtime`, `tls`, `ffi`, `tcp`, and `ureq`. `standard-runtime` is the dependency-gated standalone profile (`native-codegen` + `tls` + `tcp` + `ureq`) and must remain free of Python, SQLite, LSP, AI, FFI, Wasmtime, RocksDB/Postgres, and OpenTelemetry dependency families. `wasm-backend` is opt-in and enables the WASM compiler/Wasmtime host. `--no-default-features` remains the smallest interpreter-oriented build.
 - **No external test/criterion/proptest crates** — standard `#[test]` only.
 
 ## Testing & QA
