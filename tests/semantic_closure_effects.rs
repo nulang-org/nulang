@@ -5,65 +5,65 @@
 //! 2. a restricted backend must reject unsupported continuation forms
 //!    deterministically rather than silently changing semantics.
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 use nulang::aot::AotModule;
 #[cfg(any(
-    feature = "native-codegen",
+    feature = "native-aot",
     feature = "wasm-backend",
     feature = "wasmfx-backend"
 ))]
 use nulang::hir_lower;
 #[cfg(any(
-    feature = "native-codegen",
+    feature = "native-aot",
     feature = "wasm-backend",
     feature = "wasmfx-backend"
 ))]
 use nulang::lexer::Lexer;
 #[cfg(any(
-    feature = "native-codegen",
+    feature = "native-aot",
     feature = "wasm-backend",
     feature = "wasmfx-backend"
 ))]
 use nulang::mir;
 #[cfg(any(
-    feature = "native-codegen",
+    feature = "native-aot",
     feature = "wasm-backend",
     feature = "wasmfx-backend"
 ))]
 use nulang::mir_codegen;
 #[cfg(any(
-    feature = "native-codegen",
+    feature = "native-aot",
     feature = "wasm-backend",
     feature = "wasmfx-backend"
 ))]
 use nulang::mir_lower;
 #[cfg(any(
-    feature = "native-codegen",
+    feature = "native-aot",
     feature = "wasm-backend",
     feature = "wasmfx-backend"
 ))]
 use nulang::parser::Parser;
 #[cfg(any(
-    feature = "native-codegen",
+    feature = "native-aot",
     feature = "wasm-backend",
     feature = "wasmfx-backend"
 ))]
 use nulang::typechecker::TypeChecker;
 #[cfg(any(
-    feature = "native-codegen",
+    feature = "native-aot",
     feature = "wasm-backend",
     feature = "wasmfx-backend"
 ))]
 use nulang::types::NuError;
 #[cfg(any(
-    feature = "native-codegen",
+    feature = "native-aot",
     feature = "wasm-backend",
     feature = "wasmfx-backend"
 ))]
 use nulang::vm::{Value, VM};
 
 #[cfg(any(
-    feature = "native-codegen",
+    feature = "native-aot",
     feature = "wasm-backend",
     feature = "wasmfx-backend"
 ))]
@@ -80,7 +80,7 @@ fn main() -> Int {
 }
 "#;
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 const ABORTIVE_HANDLER: &str = r#"
 effect Tick { next: Int -> Int }
 
@@ -94,7 +94,7 @@ fn main() -> Int {
 }
 "#;
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 const NESTED_INNERMOST_HANDLER: &str = r#"
 effect Shared { get: Int -> Int }
 
@@ -111,7 +111,7 @@ fn main() -> Int {
 }
 "#;
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 const SEQUENTIAL_RESUMES: &str = r#"
 effect Math { double: Int -> Int }
 
@@ -128,7 +128,7 @@ fn main() -> Int {
 "#;
 
 #[cfg(any(
-    feature = "native-codegen",
+    feature = "native-aot",
     feature = "wasm-backend",
     feature = "wasmfx-backend"
 ))]
@@ -145,7 +145,7 @@ fn lower(source: &str) -> Result<mir::Module, NuError> {
     mir_lower::lower_module(&hir)
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 fn run_bytecode(source: &str) -> Result<Value, NuError> {
     let mut mir = lower(source)?;
     let module = mir_codegen::compile_mir(&mut mir, "semantic-closure-effects")?;
@@ -154,7 +154,7 @@ fn run_bytecode(source: &str) -> Result<Value, NuError> {
     vm.run()
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 fn run_native(source: &str) -> Result<Value, NuError> {
     let mir = lower(source)?;
     let module = AotModule::compile(&mir)?;
@@ -165,7 +165,7 @@ fn run_native(source: &str) -> Result<Value, NuError> {
     module.run().map(|raw| unsafe { Value::from_raw(raw) })
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 fn explicit_resume_mir() -> mir::Module {
     use nulang::bytecode::Constant;
     use nulang::types::Type;
@@ -187,7 +187,7 @@ fn explicit_resume_mir() -> mir::Module {
     module
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 fn assert_bytecode_native_int(source: &str, expected: i64) {
     let bytecode = run_bytecode(source).expect("bytecode should execute semantic-closure case");
     let native = run_native(source).expect("native should execute supported semantic-closure case");
@@ -201,13 +201,13 @@ fn assert_bytecode_native_int(source: &str, expected: i64) {
     );
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 #[test]
 fn resumable_handler_matches_bytecode_and_native() {
     assert_bytecode_native_int(IMPLICIT_RESUME, 43);
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 #[test]
 fn abortive_handler_matches_bytecode_and_native() {
     // A non-resuming arm aborts the captured continuation. The expression
@@ -215,7 +215,7 @@ fn abortive_handler_matches_bytecode_and_native() {
     assert_bytecode_native_int(ABORTIVE_HANDLER, 41);
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 #[test]
 fn nested_same_effect_uses_innermost_handler_on_both_backends() {
     // Handler lookup is dynamically nested: the inner Shared.get arm must win
@@ -223,7 +223,7 @@ fn nested_same_effect_uses_innermost_handler_on_both_backends() {
     assert_bytecode_native_int(NESTED_INNERMOST_HANDLER, 1);
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 #[test]
 fn sequential_performs_capture_fresh_continuations_on_both_backends() {
     // This formerly stressed the native multi-perform resuming-handler path.
@@ -232,7 +232,7 @@ fn sequential_performs_capture_fresh_continuations_on_both_backends() {
     assert_bytecode_native_int(SEQUENTIAL_RESUMES, 52);
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 #[test]
 fn explicit_resume_rvalue_is_a_deterministic_native_restriction() {
     let mir = explicit_resume_mir();
