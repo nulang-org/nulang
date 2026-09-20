@@ -146,6 +146,59 @@ fn test_mailbox_push_pop() {
 }
 
 #[test]
+fn test_default_mailbox_overflow_routes_to_dlq() {
+    let mut rt = Runtime::new();
+    let actor_id = 92_001;
+    let mut actor = Actor::new(actor_id, "bounded-default", 1);
+    actor.state = ActorState::Running;
+    rt.actors.insert(actor_id, actor);
+
+    rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+    assert_eq!(rt.actors.get(&actor_id).unwrap().mailbox.len(), 1);
+    assert_eq!(rt.dlq_depth(), 0);
+
+    rt.send_message_by_id(actor_id, 0, &[Value::int(2)]);
+    assert_eq!(
+        rt.actors.get(&actor_id).unwrap().mailbox.len(),
+        1,
+        "overflow must not exceed bounded mailbox capacity"
+    );
+    assert_eq!(
+        rt.dlq_depth(),
+        1,
+        "DeadLetter remains the backwards-compatible default overflow policy"
+    );
+}
+
+#[test]
+fn test_reject_sender_mailbox_overflow_does_not_route_to_dlq() {
+    let mut rt = Runtime::new();
+    let actor_id = 92_002;
+    let mut actor = Actor::new(actor_id, "bounded-reject-sender", 1);
+    actor.state = ActorState::Running;
+    actor
+        .mailbox
+        .set_overflow_policy(MailboxOverflowPolicy::RejectSender);
+    rt.actors.insert(actor_id, actor);
+
+    assert_eq!(
+        rt.deliver_local_message(actor_id, 0, &[Value::int(1)], None),
+        MessageAdmission::Accepted
+    );
+    assert_eq!(
+        rt.deliver_local_message(actor_id, 0, &[Value::int(2)], None),
+        MessageAdmission::Backpressured
+    );
+
+    assert_eq!(rt.actors.get(&actor_id).unwrap().mailbox.len(), 1);
+    assert_eq!(
+        rt.dlq_depth(),
+        0,
+        "RejectSender must expose backpressure without an implicit DLQ side effect"
+    );
+}
+
+#[test]
 fn test_send_carries_current_trace_span() {
     let mut rt = Runtime::new();
     let b = rt.spawn_actor(Box::new(|| vec![]));
