@@ -555,6 +555,18 @@ pub enum WebRequestParamSource {
     Form,
 }
 
+/// Compile-time performance contracts for functions.
+///
+/// These are semantic promises, not optimizer hints. Contracts that can be
+/// proven from the effect row are checked by `EffectChecker`; `Hot` is
+/// metadata for tiering/profile-guided optimization passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PerformanceContract {
+    Hot,
+    NoBlock,
+    NoSuspend,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FunctionAnnotation {
     /// `@tool(description: "...")` marks a function as an LLM-callable tool.
@@ -566,6 +578,8 @@ pub enum FunctionAnnotation {
     /// `@placement(static|server|edge|client|actor|workflow)` marks a web
     /// framework function's compile-time execution target.
     Placement(crate::types::Placement),
+    /// `@hot()`, `@no_block()`, and `@no_suspend()` performance contracts.
+    Performance(PerformanceContract),
     /// Contextual parameter syntax such as `limit: Int from query`.
     RequestBinding {
         param: String,
