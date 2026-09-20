@@ -631,6 +631,7 @@ mod tests {
             body: Body::default(),
             public: true,
             placement: None,
+            no_alloc: false,
             span: Span::default(),
         };
         assert_eq!(def.name, "f");
