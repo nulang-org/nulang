@@ -1212,6 +1212,32 @@ pub unsafe extern "C" fn nulang_arr_len(regs: *mut u64, arr_reg: u32, dst_reg: u
     *regs.add(dst_reg as usize) = tag_int(len as i64);
 }
 
+/**
+ * Return the logical length of a tagged Array value for SIMD guards.
+ *
+ * u64::MAX is an invalid sentinel so compiled code can distinguish an empty
+ * valid array from a non-array value. The successful path intentionally uses
+ * the same length calculation as nulang_arr_len.
+ *
+ * # Safety
+ * raw must be a trusted VM register value. Pointer-tagged values therefore
+ * retain the runtime heap provenance required by ActorHeap::header_of.
+ */
+#[no_mangle]
+pub unsafe extern "C" fn nulang_simd_array_len(raw: u64) -> u64 {
+    let arr_ptr = val_ptr(raw);
+    if arr_ptr.is_null() {
+        return u64::MAX;
+    }
+
+    let header = &*ActorHeap::header_of(arr_ptr);
+    if header.type_tag != HeapTypeTag::Array {
+        return u64::MAX;
+    }
+
+    (header.size.saturating_sub(ActorHeap::HEADER_SIZE) / std::mem::size_of::<Value>()) as u64
+}
+
 /// # Safety
 /// `regs` must point to a valid `[u64; 256]` array.
 #[no_mangle]
@@ -1924,6 +1950,7 @@ mod tests {
         // they are only called from JIT-compiled code.
         let _ = super::nulang_arr_store as unsafe extern "C" fn(_, _, _, _);
         let _ = super::nulang_arr_len as unsafe extern "C" fn(_, _, _);
+        let _ = super::nulang_simd_array_len as unsafe extern "C" fn(u64) -> u64;
         let _ = super::nulang_field_load as unsafe extern "C" fn(_, _, _, _);
         let _ = super::nulang_safepoint_yield as unsafe extern "C" fn(u64) -> u64;
         let _ = super::nulang_jit_safepoint_check as extern "C" fn(u64) -> u64;
