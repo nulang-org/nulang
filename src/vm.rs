@@ -1921,6 +1921,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
 ///
 /// All non-float values are encoded in the quiet-NaN payload of an f64.
 /// The high 16 bits hold the type tag; the low 48 bits hold the payload.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Value {
     raw: u64,
@@ -3486,11 +3487,10 @@ impl VM {
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
 
-        // Snapshot registers into a flat array for the JIT ABI.
-        let mut regs: [u64; 256] = [0; 256];
-        for (i, r) in self.frames[frame_idx].regs.iter().enumerate() {
-            regs[i] = r.to_bits();
-        }
+        // Cranelift can operate directly on the VM register file because
+        // Value is a transparent single-u64 tagged word. Alternative JIT
+        // backends retain a copy-based default through JitBackend.
+        let regs = self.frames[frame_idx].regs.as_mut_ptr();
         // SAFETY: The `&mut dyn ActorVmCallbacks` reference is valid for the
         // duration of this function call. `set_jit_callbacks` stores it in a
         // thread-local; `with_callbacks` restores `&mut` provenance before use.
@@ -3511,16 +3511,16 @@ impl VM {
         unsafe {
             crate::jit::runtime::set_jit_vm(self_ptr);
         }
-        let action = jit.tiered_execute_step_typed(module_idx, pc, module, &mut regs, constants);
+        // SAFETY: regs points to this frame's uniquely borrowed 256-element
+        // register array for the duration of the JIT call.
+        let action = unsafe {
+            jit.tiered_execute_value_regs(module_idx, pc, module, regs, constants)
+        };
         crate::jit::runtime::clear_jit_vm();
         crate::jit::runtime::clear_jit_constants();
         crate::jit::runtime::clear_jit_callbacks();
 
         if action != TieredAction::Interpret {
-            for (i, bits) in regs.iter().enumerate() {
-                self.frames[frame_idx].regs[i] = unsafe { Value::from_bits(*bits) };
-            }
-
             // A re-entrant callee raised a runtime error (e.g. step-limit
             // exceeded); the compiled region exited early via its error path.
             // Stash it on the VM so `step` can surface it (this fn returns
