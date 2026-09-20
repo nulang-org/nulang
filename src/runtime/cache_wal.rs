@@ -575,6 +575,62 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_lsn_boundary_prevents_double_applying_wal_prefix() {
+        let snapshot_path = temp_path("checkpoint-boundary").with_extension("snapshot");
+        let wal_path = temp_path("checkpoint-boundary");
+        let wall = current_unix_ms().unwrap();
+
+        let mut store = CacheStore::new();
+        let mut wal = CacheWal::open(&wal_path).unwrap();
+
+        store.set_bytes(b"k", b"one", None, 0);
+        let first = store.durable_entry_for_key(b"k", 0, wall).unwrap();
+        assert_eq!(
+            wal.append_upsert(&first, CacheWalSync::Fsync).unwrap(),
+            1
+        );
+
+        super::super::cache_durable_store::write_cache_snapshot_at_lsn(
+            &snapshot_path,
+            &store,
+            0,
+            wal.last_lsn(),
+        )
+        .unwrap();
+
+        store.set_bytes(b"k", b"two", None, 1);
+        let second = store.durable_entry_for_key(b"k", 1, wall + 1).unwrap();
+        assert_eq!(
+            wal.append_upsert(&second, CacheWalSync::Fsync).unwrap(),
+            2
+        );
+
+        let restored =
+            super::super::cache_durable_store::restore_cache_snapshot_with_lsn(&snapshot_path, 0)
+                .unwrap();
+        assert_eq!(restored.checkpoint_lsn, 1);
+        let mut recovered = restored.store;
+        let applied = wal
+            .replay_into(&mut recovered, restored.checkpoint_lsn, 0, wall + 2)
+            .unwrap();
+        assert_eq!(applied, 2);
+        assert_eq!(
+            recovered.get(b"k", 0),
+            Some(CacheValueView::Bytes(b"two"))
+        );
+        assert_eq!(
+            recovered
+                .durable_entry_for_key(b"k", 0, wall + 2)
+                .unwrap()
+                .token,
+            second.token
+        );
+
+        fs::remove_file(snapshot_path).unwrap();
+        fs::remove_file(wal_path).unwrap();
+    }
+
+    #[test]
     fn wal_recovery_truncates_crash_tail_but_rejects_complete_corruption() {
         let path = temp_path("tail");
         {
