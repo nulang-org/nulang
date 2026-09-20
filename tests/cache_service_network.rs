@@ -252,6 +252,143 @@ fn remote_cache_command_executes_on_owning_reactor_and_stale_epoch_fails_closed(
 }
 
 #[test]
+fn journaled_remote_increment_recovers_after_target_cache_restart() {
+    let wal_path = temp_journal_path("remote-journal").with_extension("wal");
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33311".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33312".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"remote-journal-counter";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let mut placement = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+    placement
+        .apply_epoch(
+            1,
+            &[nulang::runtime::CacheSlotRange {
+                start: slot,
+                end: slot,
+                owner: target,
+            }],
+        )
+        .unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, placement.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 7110))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let service_b = CacheServiceBuilder::new(node_b.0, placement.clone())
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 7210))
+        .with_shard(
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .journaled(&wal_path),
+        )
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    service_a
+        .send_network_message(
+            node_b,
+            CacheTransportMessage::CommandRequest {
+                request_id: 11,
+                placement_epoch: 1,
+                slot,
+                target,
+                frame: frame(&[b"INCR", key]),
+            },
+        )
+        .unwrap();
+    let response = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match response.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(response, b":1\r\n");
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+
+    service_b.shutdown().unwrap();
+    runtime_b.detach_cache_transport();
+
+    let (runtime_bridge_b2, service_bridge_b2) = cache_transport_bridge(64).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b2).unwrap();
+    let service_b2 = CacheServiceBuilder::new(node_b.0, placement)
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 7211))
+        .with_shard(
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .journaled(&wal_path),
+        )
+        .with_transport_endpoint(service_bridge_b2)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    service_a
+        .send_network_message(
+            node_b,
+            CacheTransportMessage::CommandRequest {
+                request_id: 12,
+                placement_epoch: 1,
+                slot,
+                target,
+                frame: frame(&[b"GET", key]),
+            },
+        )
+        .unwrap();
+    let response = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    match response.message {
+        CacheTransportMessage::CommandResponse { response, .. } => {
+            assert_eq!(response, b"$1\r\n1\r\n");
+        }
+        other => panic!("unexpected cache response: {other:?}"),
+    }
+
+    service_a.shutdown().unwrap();
+    service_b2.shutdown().unwrap();
+    std::fs::remove_file(wal_path).unwrap();
+}
+
+#[test]
 fn remote_slot_migration_moves_data_then_commits_ownership() {
     let journal_path = temp_journal_path("full-migration");
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -2233,5 +2370,155 @@ fn shard_checkpoint_restores_resp_values_and_reduces_ttl() {
     );
 
     restored.shutdown().unwrap();
+    std::fs::remove_file(snapshot_path).unwrap();
+}
+
+#[test]
+fn journaled_shard_recovers_mutations_without_checkpoint() {
+    let wal_path = temp_journal_path("journal-only").with_extension("wal");
+    let node_id = 5251u64;
+    let placement = CacheSlotMap::new_local(node_id, 1).unwrap();
+
+    let service = CacheServiceBuilder::new(node_id, placement.clone())
+        .with_shard(
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .journaled(&wal_path),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut client = StdTcpStream::connect(service.local_addrs()[0]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+
+    client.write_all(&frame(&[b"SET", b"n", b"1"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+    client.write_all(&frame(&[b"INCR", b"n"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b":2\r\n");
+
+    client
+        .write_all(&frame(&[b"MSET", b"a{j}", b"A", b"b{j}", b"B"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+
+    client.write_all(&frame(&[b"SET", b"gone", b"x"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+    client.write_all(&frame(&[b"DEL", b"gone"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b":1\r\n");
+
+    client
+        .write_all(&frame(&[b"SET", b"ttl", b"live"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+    client
+        .write_all(&frame(&[b"EXPIRE", b"ttl", b"10"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut client), b":1\r\n");
+
+    service.shutdown().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+
+    let restored = CacheServiceBuilder::new(node_id, placement)
+        .with_shard(
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .journaled(&wal_path),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut client = StdTcpStream::connect(restored.local_addrs()[0]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+
+    client.write_all(&frame(&[b"GET", b"n"])).unwrap();
+    let mut n_value = [0u8; 7];
+    client.read_exact(&mut n_value).unwrap();
+    assert_eq!(&n_value, b"$1\r\n2\r\n");
+
+    client
+        .write_all(&frame(&[b"MGET", b"a{j}", b"b{j}"]))
+        .unwrap();
+    let mut values = [0u8; 18];
+    client.read_exact(&mut values).unwrap();
+    assert_eq!(&values, b"*2\r\n$1\r\nA\r\n$1\r\nB\r\n");
+
+    client.write_all(&frame(&[b"GET", b"gone"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b"$-1\r\n");
+
+    client.write_all(&frame(&[b"GET", b"ttl"])).unwrap();
+    let mut ttl_value = [0u8; 10];
+    client.read_exact(&mut ttl_value).unwrap();
+    assert_eq!(&ttl_value, b"$4\r\nlive\r\n");
+    client.write_all(&frame(&[b"TTL", b"ttl"])).unwrap();
+    let ttl_reply = read_resp_line(&mut client);
+    let ttl_secs: i64 = std::str::from_utf8(&ttl_reply[1..ttl_reply.len() - 2])
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((8..=9).contains(&ttl_secs));
+
+    restored.shutdown().unwrap();
+    std::fs::remove_file(wal_path).unwrap();
+}
+
+#[test]
+fn journaled_checkpoint_replays_only_mutations_after_snapshot_lsn() {
+    let wal_path = temp_journal_path("journal-checkpoint").with_extension("wal");
+    let snapshot_path = temp_journal_path("journal-checkpoint").with_extension("snapshot");
+    let node_id = 5252u64;
+    let placement = CacheSlotMap::new_local(node_id, 1).unwrap();
+
+    let service = CacheServiceBuilder::new(node_id, placement.clone())
+        .with_shard(
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .journaled(&wal_path),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut client = StdTcpStream::connect(service.local_addrs()[0]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+
+    client.write_all(&frame(&[b"SET", b"k", b"1"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+    let checkpoint = service.checkpoint_shard(0, &snapshot_path).unwrap();
+    assert_eq!(checkpoint.checkpoint_lsn, 1);
+
+    client.write_all(&frame(&[b"INCR", b"k"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b":2\r\n");
+    service.shutdown().unwrap();
+
+    let restored = CacheServiceBuilder::new(node_id, placement)
+        .with_shard(
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .restore_from_snapshot(&snapshot_path)
+                .journaled(&wal_path),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut client = StdTcpStream::connect(restored.local_addrs()[0]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    client.write_all(&frame(&[b"GET", b"k"])).unwrap();
+    let mut value = [0u8; 7];
+    client.read_exact(&mut value).unwrap();
+    assert_eq!(&value, b"$1\r\n2\r\n");
+
+    restored.shutdown().unwrap();
+    std::fs::remove_file(wal_path).unwrap();
     std::fs::remove_file(snapshot_path).unwrap();
 }
