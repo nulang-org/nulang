@@ -397,6 +397,9 @@ two major versions.*
   now reject `NaN`/`inf` instead of passing non-finite values to
   handlers.
 
+### Added since 1.0.0-frozen — 2026-09-20 (backend feature separation)
+- **Independent JIT/AOT feature ownership** (`Cargo.toml`, `src/lib.rs`, `src/backends/`, `src/vm.rs`, `src/runtime/`): `jit-codegen` now owns the register-VM Cranelift JIT and `native-aot` owns the experimental MIR-to-native backend. `native-codegen` remains a backward-compatible umbrella enabling both. The `wasm-backend` feature no longer enables Nulang's native JIT/AOT implementation, so portable WASM builds can evolve independently from the frozen AOT surface.
+
 ### Added since 1.0.0-frozen — 2026-09-13 (mobile runtime boundary)
 - **Interpreter-only mobile runtime profile** (`Cargo.toml`, `src/runtime/`, `src/backends/`, `src/vm.rs`): native Cranelift/AOT code generation is now owned by the optional `native-codegen` feature while remaining enabled in default builds. The `mobile-runtime` profile excludes executable-code-generation and dynamic-loader dependencies, gates native backend wiring and benchmarks, and keeps Wasm support independently selectable. `scripts/check_mobile_runtime_profile.sh` provides the release gate for dependency-graph isolation and interpreter-only correctness.
 
