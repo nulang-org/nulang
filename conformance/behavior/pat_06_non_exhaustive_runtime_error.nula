@@ -1,4 +1,6 @@
-// Closed variant matches are checked for exhaustiveness at compile time.
+// Closed variant matches emit W0201 in v1.x but remain valid by default.
+// If an omitted constructor reaches the match at runtime, the existing
+// non-exhaustive-match failure semantics are unchanged.
 type Color = Red | Green | Blue
 
 fn name(c: Color) -> String {
