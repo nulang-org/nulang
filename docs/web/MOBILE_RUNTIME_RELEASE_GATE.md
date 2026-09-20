@@ -9,8 +9,9 @@ Every change must preserve all of the following:
 2. Library tests pass under the same feature set.
 3. The normal/build dependency tree contains no Cranelift crates, Wasmtime, or
    `libloading`.
-4. Cranelift and `target-lexicon` root dependencies remain owned by the
-   `jit-codegen` / `native-aot` features.
+4. Cranelift and `target-lexicon` root dependencies remain owned by
+   `jit-codegen`; `native-aot` depends one-way on that JIT machinery rather
+   than owning a second native-codegen dependency stack.
 5. `mobile-runtime` does not enable `native-codegen`, `jit-codegen`, `native-aot`, or dynamic FFI loading.
 6. Default builds retain the backward-compatible `native-codegen` umbrella until that public default changes
    intentionally.
