@@ -240,6 +240,22 @@ two major versions.*
   transfer remains permanently restart-replay unsafe rather than accepting a
   later anchor. End-to-end coverage verifies both expired and still-live TTL
   values across full source+target cache-service restart.
+- **Token-preserving durable CacheStore checkpoints** (Experimental,
+  `src/runtime/cache.rs`, `src/runtime/cache_durable_store.rs`,
+  `src/runtime/cache_server.rs`). CacheStore can now export a cold-path
+  durable image that preserves exact entry slot/generation tokens while
+  converting process-relative TTL deadlines into process-independent absolute
+  Unix-millisecond expiries. Restore recreates the same live source token
+  identities, drops wall-expired entries, rebuilds the expiry wheel, and
+  rejects duplicate slots/keys, zero generations, and sparse-allocation bombs.
+  A versioned binary snapshot container uses bounded key/value/entry sizes,
+  BLAKE3 whole-file integrity, fsynced temp-file writes, atomic rename, and
+  optional restore-on-start per shard. Reactor-owned `checkpoint_shard`
+  snapshots the store without reading CacheStore off-thread. End-to-end coverage
+  checkpoints a running RESP shard, restarts it, restores persistent and TTL
+  values, and verifies downtime reduces TTL. This is a checkpoint primitive,
+  not mutation durability: writes after the last checkpoint are still volatile
+  until WAL/replication acknowledgement modes are implemented.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
