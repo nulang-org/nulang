@@ -38,7 +38,7 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::repl::type_to_string;
 use crate::typechecker::TypeChecker;
-use crate::types::NuError;
+use crate::types::{NuError, NuWarning};
 
 /// Convert an LSP position column (UTF-16 code units) into a byte offset
 /// within `line`, clamped to a char boundary.
@@ -1846,8 +1846,12 @@ impl NulangLanguageServer {
         let mut tc = TypeChecker::new();
         tc.collect_errors = true;
         let _ = tc.check_module(&ast);
-        for err in tc.collected_errors {
+        let type_warnings = tc.take_warnings();
+        for err in std::mem::take(&mut tc.collected_errors) {
             diagnostics.extend(nu_error_to_diagnostic(err));
+        }
+        for warning in type_warnings {
+            diagnostics.push(nu_warning_to_diagnostic(warning));
         }
         let inferred_decl_types = tc.inferred_decl_types.clone();
 
@@ -2363,6 +2367,34 @@ fn nu_error_to_diagnostic(err: NuError) -> Vec<Diagnostic> {
             diags
         }
         other => vec![single_diagnostic(other)],
+    }
+}
+
+/// Build an LSP warning from a non-fatal compiler warning.
+fn nu_warning_to_diagnostic(warning: NuWarning) -> Diagnostic {
+    let start = Position::new(
+        warning.span.line().saturating_sub(1) as u32,
+        warning.span.column().saturating_sub(1) as u32,
+    );
+    let end = Position::new(
+        warning.span.end_line().saturating_sub(1) as u32,
+        warning.span.end_column().saturating_sub(1) as u32,
+    );
+    let message = match warning.help {
+        Some(help) => format!("{}\nhelp: {}", warning.msg, help),
+        None => warning.msg,
+    };
+
+    Diagnostic {
+        range: Range::new(start, end),
+        severity: Some(DiagnosticSeverity::WARNING),
+        code: Some(NumberOrString::String(warning.code.to_string())),
+        code_description: None,
+        source: Some("nulang".to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
     }
 }
 
