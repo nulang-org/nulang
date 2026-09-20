@@ -2401,8 +2401,11 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                     authority_tokens,
                 };
 
-                let snapshot_json = match serde_json::to_vec(&snapshot) {
-                    Ok(json) => json,
+                let snapshot_json = match crate::persistence_schema::encode_record(
+                    &snapshot,
+                    actor.schema_version,
+                ) {
+                    Ok(json) => json.into_bytes(),
                     Err(e) => {
                         tracing::warn!(
                             "nulang-migrate: failed to serialize snapshot for actor {}: {}",
