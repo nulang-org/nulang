@@ -1149,7 +1149,20 @@ impl crate::backends::JitBackend for JitSession {
             let (region_len, native_calls) =
                 find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
             if region_len >= 3 {
-                let meta = typed_compiler::infer_reg_types(module, pc);
+                let mut meta = typed_compiler::infer_reg_types(module, pc);
+                // Frozen .nbc artifacts intentionally do not carry compiler
+                // type seeds. Recover safe primitive live-ins at the hot
+                // boundary from the current register file, then run those
+                // observations through a local must-analysis so loop
+                // backedges can invalidate unstable guesses. Any surviving
+                // facts are still runtime-guarded by the CompiledRegion.
+                typed_compiler::refine_live_in_types_from_runtime(
+                    module,
+                    pc,
+                    region_len,
+                    regs,
+                    &mut meta,
+                );
                 let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
                 if let Some(func) = unsafe {
                     self.compile_region_typed(
