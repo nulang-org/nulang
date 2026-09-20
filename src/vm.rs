@@ -189,6 +189,28 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Return the number of elements in an array allocated on the actor heap.
     fn array_len(&self, ptr: *mut u8) -> Option<usize>;
 
+    /// Store immutable bytes in the current execution domain and return an
+    /// object-tagged handle. Backends without an object store return nil.
+    fn object_put(&mut self, _bytes: Box<[u8]>) -> Value {
+        Value::nil()
+    }
+
+    /// Create an immutable zero-copy subview of an existing object value.
+    /// Returns nil when the handle/range is invalid or unsupported.
+    fn object_slice(&mut self, _object: Value, _start: usize, _end: usize) -> Value {
+        Value::nil()
+    }
+
+    /// Return the logical byte length of an object-store value.
+    fn object_len(&self, _object: Value) -> Option<usize> {
+        None
+    }
+
+    /// Read one byte from an object-store value without materializing a copy.
+    fn object_get_byte(&self, _object: Value, _index: usize) -> Option<u8> {
+        None
+    }
+
     /// Allocate a fresh heap string via `self.alloc`, copy `s` into it,
     /// and null-terminate. Default implementation works for any callback
     /// with a working `alloc`; callers may override for specialization.
@@ -404,6 +426,9 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
 pub(crate) struct StandaloneVmCallbacks {
     heap: ActorHeap,
     gc: crate::runtime::OrcaGc,
+    /// Immutable object values use the same handle representation as the actor
+    /// runtime even when executing without a Runtime.
+    object_store: crate::runtime::object_store::ObjectStore,
     /// Test hook: when set, `IO.print` output is recorded here instead of
     /// written to stdout.
     io_output: Option<std::rc::Rc<std::cell::RefCell<Vec<String>>>>,
@@ -419,6 +444,7 @@ impl StandaloneVmCallbacks {
         Self {
             heap,
             gc: crate::runtime::OrcaGc::new(0),
+            object_store: crate::runtime::object_store::ObjectStore::new(),
             io_output: None,
             routes: Vec::new(),
         }
@@ -979,6 +1005,32 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                 None
             }
         }
+    }
+
+    fn object_put(&mut self, bytes: Box<[u8]>) -> Value {
+        Value::object(self.object_store.put(bytes))
+    }
+
+    fn object_slice(&mut self, object: Value, start: usize, end: usize) -> Value {
+        object
+            .as_object_id()
+            .and_then(|id| self.object_store.slice(id, start, end))
+            .map(Value::object)
+            .unwrap_or_else(Value::nil)
+    }
+
+    fn object_len(&self, object: Value) -> Option<usize> {
+        let id = object.as_object_id()?;
+        self.object_store.get(id).map(|entry| entry.len())
+    }
+
+    fn object_get_byte(&self, object: Value, index: usize) -> Option<u8> {
+        let id = object.as_object_id()?;
+        self.object_store
+            .get(id)?
+            .as_bytes()
+            .get(index)
+            .copied()
     }
 
     fn spawn_actor(
