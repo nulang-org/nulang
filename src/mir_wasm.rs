@@ -3381,6 +3381,23 @@ mod tests {
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_canonical_string_result_preserves_json_escapes_and_utf8() {
+        let wasm = compile_source(r#"perform Storage.read("greeting")"#).expect("compile");
+        let mut rt = crate::wasm_runtime::WasmRuntime::new(&wasm, None).unwrap();
+        rt.set_dispatch_result(Some(
+            br#""quote: \" slash: \\ newline:\n snowman: ☃""#.to_vec(),
+        ));
+
+        let value = rt.run().expect("run");
+        assert_eq!(
+            rt.string_value(&value).as_deref(),
+            Some("quote: \" slash: \\ newline:\n snowman: ☃"),
+            "canonical host results must be decoded by the host before becoming a tagged string"
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_storage_read_maps_to_pool_builtin() {
         // `perform Storage.read(key)` emits the canonical host id + argv;
         // the host resolves the string-contract storage EffectId and unwraps the
