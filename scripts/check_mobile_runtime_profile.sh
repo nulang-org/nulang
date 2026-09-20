@@ -31,16 +31,22 @@ required = {
     "dep:cranelift-native", "dep:cranelift-frontend", "dep:cranelift-codegen",
     "dep:target-lexicon",
 }
-missing = sorted(required - set(features.get("native-codegen", [])))
-if missing:
-    raise SystemExit("native-codegen missing dependency ownership: " + ", ".join(missing))
+for feature in ("jit-codegen", "native-aot"):
+    missing = sorted(required - set(features.get(feature, [])))
+    if missing:
+        raise SystemExit(f"{feature} missing dependency ownership: " + ", ".join(missing))
+if set(features.get("native-codegen", [])) != {"jit-codegen", "native-aot"}:
+    raise SystemExit("native-codegen must remain the compatibility umbrella for jit-codegen + native-aot")
 mobile = set(features.get("mobile-runtime", []))
-forbidden = sorted(x for x in mobile if x == "native-codegen" or x == "ffi" or x.startswith("dep:cranelift") or x in {"dep:wasmtime", "dep:libloading"})
+forbidden_names = {"native-codegen", "jit-codegen", "native-aot", "ffi"}
+forbidden = sorted(x for x in mobile if x in forbidden_names or x.startswith("dep:cranelift") or x in {"dep:wasmtime", "dep:libloading"})
 if forbidden:
     raise SystemExit("mobile-runtime enables forbidden features: " + ", ".join(forbidden))
 if "native-codegen" not in set(features.get("default", [])):
-    raise SystemExit("default builds must retain native-codegen")
-print("mobile-runtime feature ownership: OK")
+    raise SystemExit("default builds must retain native-codegen compatibility umbrella")
+if "native-codegen" in set(features.get("wasm-backend", [])):
+    raise SystemExit("wasm-backend must not enable native-codegen")
+print("mobile-runtime and backend feature ownership: OK")
 PY
 
 echo "mobile-runtime profile: OK"
