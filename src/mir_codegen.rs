@@ -1464,13 +1464,14 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
 // ===========================================================================
 //
 // A lightweight, conservative MIR→MIR optimizer that runs on every function
-// and behavior before bytecode emission. Scalar replacement runs once first,
+// and behavior before bytecode emission. Mutable and immutable scalar
+// replacement run once first,
 // followed by four transforms in a fixpoint loop (capped at
 // MAX_OPT_ITERATIONS rounds):
 //
-//   0. scalar replacement   — projection-only compiler-generated immutable
-//                             tuple/record aggregates are replaced by their
-//                             constituent locals, eliminating allocation;
+//   0. scalar replacement   — compiler-generated records/tuples are replaced
+//                             by scalar field versions when escape/use proofs
+//                             make materialization unnecessary;
 //   1. constant folding     — arithmetic/comparison on Const operands
 //                             (int, float, bool, string concat) and Unary;
 //   2. identity folding     — x+0, x*1, x|0, x&&true, x*0, ... collapses;
@@ -1502,6 +1503,7 @@ const MAX_OPT_ITERATIONS: usize = 10;
 /// Optimize one MIR function in place. `_module_consts` reserves space for
 /// module-level constant pooling; unused by the current transforms.
 fn optimize_function(func: &mut mir::Function, _module_consts: &mut Vec<mir::RValue>) {
+    crate::mir_mutable_sroa::scalar_replace_mutable_records(func);
     crate::mir_scalar_replace::scalar_replace_function(func);
     for _ in 0..MAX_OPT_ITERATIONS {
         let const_locals = collect_const_locals(func);
@@ -3298,6 +3300,24 @@ mod optimize_tests {
         assert!(
             !has_opcode(&module, OpCode::RecMk),
             "record constructed before a dominated branch should be scalar-replaced"
+        );
+    }
+
+    #[test]
+    fn test_mutable_record_sroa_removes_record_and_field_store() {
+        let source =
+            "fn main() { let __r = { x: 1, y: 2 } :cap ref; __r.x = __r.x + 10; __r.x + __r.y }";
+        let value = run_source(source).unwrap();
+        assert_eq!(value.as_int(), Some(13));
+
+        let module = compile_source(source).unwrap();
+        assert!(
+            !has_opcode(&module, OpCode::RecMk),
+            "scalar-replaced mutable record should not allocate"
+        );
+        assert!(
+            !has_opcode(&module, OpCode::FieldS),
+            "scalar-replaced mutable record should not emit a field store"
         );
     }
 
