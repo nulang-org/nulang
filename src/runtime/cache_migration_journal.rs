@@ -157,7 +157,9 @@ impl CacheMigrationRecoveryState {
         for transfer in self.ordered_transfers() {
             let mut message = transfer.request.clone();
             let CacheTransportMessage::TransferBatch { batch, .. } = &mut message else {
-                return Err(invalid_data("durable restart replay record is not TransferBatch"));
+                return Err(invalid_data(
+                    "durable restart replay record is not TransferBatch",
+                ));
             };
             if batch.entries.iter().any(|entry| entry.ttl_ms.is_some()) {
                 let anchor = transfer
