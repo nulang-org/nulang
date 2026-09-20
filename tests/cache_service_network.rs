@@ -641,9 +641,7 @@ fn drained_persistent_migration_recovers_after_both_cache_services_restart() {
         .reprobe_recovered_remote_migration(journal_key, 9502)
         .unwrap();
     let probe = wait_event(&mut runtime_a, &mut runtime_b, &service_a2);
-    let convergence = service_a2
-        .complete_remote_migration_probe(&probe)
-        .unwrap();
+    let convergence = service_a2.complete_remote_migration_probe(&probe).unwrap();
     assert!(convergence.durable_history_satisfied);
     assert_eq!(convergence.target_live_entries, 1);
     assert_eq!(convergence.target_import_fences, 1);
@@ -681,13 +679,29 @@ fn drained_restart_replay_preserves_multiple_source_generations() {
 
     let mut runtime_a = distributed_runtime(addr_a, bus.clone());
     let mut runtime_b = distributed_runtime(addr_b, bus);
-    runtime_a.distributed.cluster.as_mut().unwrap().handle_heartbeat(node_b, addr_b);
-    runtime_b.distributed.cluster.as_mut().unwrap().handle_heartbeat(node_a, addr_a);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
 
     let key = b"restart-generation-key";
     let slot = redis_slot(key);
-    let source = CacheShardOwner { node_id: node_a.0, shard: 0 };
-    let target = CacheShardOwner { node_id: node_b.0, shard: 0 };
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
     let base = CacheSlotMap::new_local(node_a.0, 1).unwrap();
 
     let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
@@ -698,18 +712,34 @@ fn drained_restart_replay_preserves_multiple_source_generations() {
     let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
         .with_migration_journal_path(&journal_path)
         .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53482))
-        .with_shard(CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1"))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
         .with_transport_endpoint(service_bridge_a)
-        .build().unwrap().start().unwrap();
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
     let service_b = CacheServiceBuilder::new(node_b.0, base.clone())
         .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53481))
-        .with_shard(CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1"))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
         .with_transport_endpoint(service_bridge_b)
-        .build().unwrap().start().unwrap();
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
 
     let mut source_client = StdTcpStream::connect(service_a.local_addrs()[0]).unwrap();
-    source_client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-    source_client.write_all(&frame(&[b"SET", key, b"old"])).unwrap();
+    source_client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    source_client
+        .write_all(&frame(&[b"SET", key, b"old"]))
+        .unwrap();
     assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
 
     let mut migrating = base;
@@ -726,7 +756,9 @@ fn drained_restart_replay_preserves_multiple_source_generations() {
 
     // Advance the source generation before applying the first ACK. Finalizing
     // the first transfer must therefore fail stale-version and preserve "new".
-    source_client.write_all(&frame(&[b"SET", key, b"new"])).unwrap();
+    source_client
+        .write_all(&frame(&[b"SET", key, b"new"]))
+        .unwrap();
     assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
     let first_report = service_a
         .complete_remote_slot_batch(&first, &first_ack)
@@ -772,25 +804,42 @@ fn drained_restart_replay_preserves_multiple_source_generations() {
     let service_a2 = CacheServiceBuilder::new(node_a.0, migrating.clone())
         .with_migration_journal_path(&journal_path)
         .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 54482))
-        .with_shard(CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1"))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
         .with_transport_endpoint(service_bridge_a2)
-        .build().unwrap().start().unwrap();
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
     let service_b2 = CacheServiceBuilder::new(node_b.0, migrating.clone())
         .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 54481))
-        .with_shard(CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1"))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
         .with_transport_endpoint(service_bridge_b2)
-        .build().unwrap().start().unwrap();
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
 
     let replayed = service_a2
         .replay_drained_remote_migration_after_restart(journal_key)
         .unwrap();
     assert_eq!(
-        replayed.iter().map(|pending| pending.transfer_id).collect::<Vec<_>>(),
+        replayed
+            .iter()
+            .map(|pending| pending.transfer_id)
+            .collect::<Vec<_>>(),
         vec![9602, 9601]
     );
     for pending in &replayed {
         let ack = wait_event(&mut runtime_a, &mut runtime_b, &service_a2);
-        service_a2.complete_remote_slot_batch(pending, &ack).unwrap();
+        service_a2
+            .complete_remote_slot_batch(pending, &ack)
+            .unwrap();
     }
 
     service_a2
@@ -807,7 +856,9 @@ fn drained_restart_replay_preserves_multiple_source_generations() {
     wait_epoch(&service_b2, 2);
 
     let mut target_client = StdTcpStream::connect(service_b2.local_addrs()[0]).unwrap();
-    target_client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    target_client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
     target_client.write_all(&frame(&[b"GET", key])).unwrap();
     let mut value = [0u8; 9];
     target_client.read_exact(&mut value).unwrap();
