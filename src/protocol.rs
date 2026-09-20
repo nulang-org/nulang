@@ -86,6 +86,39 @@ pub struct ProtocolSchema {
     pub name: String,
     members: BTreeMap<String, ProtocolMember>,
 }
+/// Directional compatibility of a receiver/implementation protocol against a
+/// protocol required by an existing client/reference.
+///
+/// The direction matters for rolling upgrades:
+/// - Exact: both structural protocols are identical.
+/// - ReceiverSuperset: the receiver preserves every required behavior with
+///   the exact same signature and only adds behaviors. Old clients remain safe.
+/// - Incompatible: a required behavior is missing or any existing behavior
+///   signature changed.
+///
+/// V1 deliberately uses invariant behavior signatures. Richer evolution
+/// (field defaults, variant widening, parameter variance) must be introduced
+/// explicitly rather than inferred from hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolCompatibility {
+    Exact,
+    ReceiverSuperset,
+    Incompatible,
+}
+
+impl ProtocolCompatibility {
+    pub fn is_compatible(self) -> bool {
+        !matches!(self, ProtocolCompatibility::Incompatible)
+    }
+}
+
+/// One concrete reason a receiver cannot satisfy a required actor protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolCompatibilityIssue {
+    MissingBehavior(String),
+    ParameterContractChanged(String),
+    ResponseContractChanged(String),
+}
 
 impl ProtocolSchema {
     pub fn new(
@@ -115,6 +148,58 @@ impl ProtocolSchema {
 
     pub fn id(&self) -> ProtocolId {
         ProtocolId::from_schema(self)
+    }
+
+    /// Classify whether this schema, acting as the receiver/implementation,
+    /// can safely serve a client compiled against `required`.
+    ///
+    /// This is directional. If a new receiver adds behavior B, then
+    /// new.compatibility_for_required(old) is ReceiverSuperset, while
+    /// old.compatibility_for_required(new) is Incompatible.
+    pub fn compatibility_for_required(
+        &self,
+        required: &ProtocolSchema,
+    ) -> ProtocolCompatibility {
+        if self.id() == required.id() {
+            return ProtocolCompatibility::Exact;
+        }
+
+        if self.compatibility_issues_for_required(required).is_empty() {
+            ProtocolCompatibility::ReceiverSuperset
+        } else {
+            ProtocolCompatibility::Incompatible
+        }
+    }
+
+    /// Explain incompatibilities using stable behavior-level reasons.
+    pub fn compatibility_issues_for_required(
+        &self,
+        required: &ProtocolSchema,
+    ) -> Vec<ProtocolCompatibilityIssue> {
+        let mut issues = Vec::new();
+
+        for (name, expected) in &required.members {
+            let Some(actual) = self.members.get(name) else {
+                issues.push(ProtocolCompatibilityIssue::MissingBehavior(name.clone()));
+                continue;
+            };
+            if actual.params != expected.params {
+                issues.push(ProtocolCompatibilityIssue::ParameterContractChanged(
+                    name.clone(),
+                ));
+            }
+            if actual.response != expected.response {
+                issues.push(ProtocolCompatibilityIssue::ResponseContractChanged(
+                    name.clone(),
+                ));
+            }
+        }
+
+        issues
+    }
+
+    pub fn can_serve(&self, required: &ProtocolSchema) -> bool {
+        self.compatibility_for_required(required).is_compatible()
     }
 }
 
@@ -209,9 +294,10 @@ impl ProtocolActorRef {
         self.protocol_id == expected
     }
 
-    /// Exact compatibility is the initial distributed protocol rule.
-    /// Subtyping/schema-evolution compatibility must be explicit later rather
-    /// than silently weakening this check.
+    /// Exact protocol-id validation. Rolling-upgrade compatibility is defined
+    /// structurally by ProtocolSchema::compatibility_for_required, because a
+    /// digest alone cannot prove that a different schema is an additive
+    /// superset without access to both schemas.
     pub fn require_protocol(&self, expected: ProtocolId) -> Result<(), ProtocolMismatch> {
         if self.matches_protocol(expected) {
             Ok(())
