@@ -39,6 +39,7 @@ impl RegisterSet {
         }
     }
 
+    #[allow(dead_code)] // consumed by the native-call lowering slice; tests use it now
     pub(crate) fn contains(&self, reg: usize) -> bool {
         reg < REG_COUNT && (self.0[reg / 64] & (1u64 << (reg % 64))) != 0
     }
