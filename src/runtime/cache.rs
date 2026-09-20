@@ -404,10 +404,11 @@ impl CacheTransferImportTracker {
                     Some(target) if current == Some(target) => {
                         return CacheTransferImport::AlreadyImported;
                     }
-                    Some(_) if current.is_none()
-                        && fence
-                            .target_expires_at_ms
-                            .is_some_and(|deadline| deadline <= now_ms) =>
+                    Some(_)
+                        if current.is_none()
+                            && fence
+                                .target_expires_at_ms
+                                .is_some_and(|deadline| deadline <= now_ms) =>
                     {
                         return CacheTransferImport::ExpiredInTransit;
                     }
@@ -457,8 +458,7 @@ impl CacheTransferImportTracker {
         let target = store
             .transfer_token_for_key(&entry.key, now_ms)
             .expect("imported transfer entry must have a live target token");
-        let target_expires_at_ms =
-            remaining_ttl.map(|ttl| now_ms.saturating_add(ttl));
+        let target_expires_at_ms = remaining_ttl.map(|ttl| now_ms.saturating_add(ttl));
         self.fences.insert(
             entry.key.clone(),
             CacheImportFence {
