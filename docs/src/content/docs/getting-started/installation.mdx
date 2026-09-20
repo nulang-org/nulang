@@ -32,7 +32,7 @@ Nulang supports optional features for leaner builds:
 # Minimal build (no Python, SQLite, LSP, AI runtime, or networking)
 cargo build --release --no-default-features
 
-# With WASM backend
+# Recommended standalone runtime: JIT + TCP/TLS + HTTP/deploy, without Python/SQLite/LSP/AI/FFI\ncargo build --release --no-default-features --features standard-runtime\n\n# With WASM backend
 cargo build --release --features wasm-backend
 
 # All features
@@ -41,7 +41,7 @@ cargo build --release --all-features
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `native-codegen` | On | Cranelift-backed tiered JIT and the native/AOT backend |
+| `standard-runtime` | Off | Recommended lean standalone profile: `native-codegen` + `tls` + `tcp` + `ureq` |\n| `native-codegen` | On | Cranelift-backed tiered JIT and the native/AOT backend |
 | `python` | On | PyO3 Python interop |
 | `sqlite` | On | libsql/Turso persistence |
 | `lsp` | On | tower-lsp language server |
