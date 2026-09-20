@@ -1111,8 +1111,7 @@ impl CacheServiceHandle {
             let plan = state
                 .drained_restart_replay_plan()
                 .ok_or(CacheServiceError::MigrationRestartReplayUnsafe)?;
-            journal
-                .rebind_drained_source_incarnation(key, self.migration_incarnation)?;
+            journal.rebind_drained_source_incarnation(key, self.migration_incarnation)?;
             plan
         };
 
