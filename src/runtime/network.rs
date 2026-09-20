@@ -2739,6 +2739,78 @@ mod tests {
         assert_eq!(decoded, packet);
     }
 
+    #[test]
+    fn test_packet_actor_message_protocol_id_tail_roundtrip() {
+        let protocol_id = [0xA5; 32];
+        let packet = Packet::ActorMessage {
+            target_actor: 42,
+            behavior_name: "handle_msg".to_string(),
+            content_hash: None,
+            protocol_id: Some(protocol_id),
+            payload: vec![Value::int(7)],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 9,
+            sender_node: NodeId(11),
+            priority: MessagePriority::Normal,
+            trace_id: Some("trace-1".to_string()),
+        };
+
+        let bytes = packet.to_bytes(0xBEEF);
+        assert!(bytes.windows(4).any(|window| window == b"PRT0"));
+        let (seq, decoded) = Packet::from_bytes(&bytes).expect("protocol tail should decode");
+        assert_eq!(seq, 0xBEEF);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_actor_message_without_protocol_tail_preserves_legacy_bytes() {
+        let packet = Packet::ActorMessage {
+            target_actor: 5,
+            behavior_name: "ping".to_string(),
+            content_hash: None,
+            protocol_id: None,
+            payload: vec![],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 6,
+            sender_node: NodeId(7),
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        };
+
+        let bytes = packet.to_bytes(19);
+        assert!(!bytes.windows(4).any(|window| window == b"PRT0"));
+        let (_, decoded) = Packet::from_bytes(&bytes).expect("legacy actor message should decode");
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_actor_message_ignores_unknown_additive_tail() {
+        let packet = Packet::ActorMessage {
+            target_actor: 1,
+            behavior_name: "ping".to_string(),
+            content_hash: None,
+            protocol_id: None,
+            payload: vec![],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 2,
+            sender_node: NodeId(3),
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        };
+
+        let mut bytes = packet.to_bytes(23);
+        bytes.extend_from_slice(b"ZZZ0");
+        bytes.extend_from_slice(&[0x11; 32]);
+
+        let (seq, decoded) =
+            Packet::from_bytes(&bytes).expect("unknown additive tail must remain ignorable");
+        assert_eq!(seq, 23);
+        assert_eq!(decoded, packet);
+    }
+
     // ------------------------------------------------------------------
     // 2b. ActorMessage string table roundtrip
     // ------------------------------------------------------------------
