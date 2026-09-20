@@ -36,4 +36,29 @@ reported as skipped, not failed, until enough history accumulates.
 This intentionally does not need a dedicated non-shared runner: the
 noise-adaptive threshold is the fix, not the infrastructure change.
 
+## Interpretation rules
+
+Benchmark names describe the operation actually timed. Do not convert a result
+into a broader throughput claim unless the timed body covers that broader
+operation end to end.
+
+Examples:
+- `actor/message_enqueue/*` measures local mailbox admission/enqueue only.
+- `actor/message_drain/*` measures scheduler + registered native-handler
+  execution for messages already queued in setup.
+- `actor/lifecycle_spawn_send_receive_gc` is an end-to-end lifecycle cost and
+  is intentionally not a message-throughput benchmark.
+- `dist/crdt_delta_compute` and `dist/gossip_membership_merge_4` are local
+  algorithmic microbenchmarks, not network synchronization/convergence.
+- `dist/nul0_actor_message_{encode,decode}/*` measures wire codec work only,
+  excluding sockets, TLS, routing, queueing, and remote mailbox admission.
+- `persist/checkpoint_json_{encode,decode}/*` measures real
+  `ActorSnapshot` JSON codec work over logical payload sizes.
+
+Setup that is not part of the operation under test should use Criterion
+`iter_batched` (or equivalent) so runtime construction, fixture creation, and
+preloading do not contaminate the timed body. Benchmark inputs and outputs must
+be observable through `black_box` or a semantic assertion so the optimizer
+cannot erase the work.
+
 `docs/PERFORMANCE_ANALYSIS.md` should cite numbers from here, not estimates.
