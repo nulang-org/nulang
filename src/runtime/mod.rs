@@ -289,15 +289,35 @@ enum CrossShardMsg {
     },
 }
 
-/// Admission result for a local-process actor delivery.
+/// Admission result for a non-blocking actor send.
 ///
-/// Fabric uses this to distinguish successful mailbox/channel admission from
-/// bounded-capacity backpressure without changing the public actor-send API.
+/// `Accepted` proves local mailbox/channel admission. `Forwarded` only proves
+/// handoff to cross-node routing; the remote mailbox may still reject or
+/// backpressure the message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MessageAdmission {
+pub enum MessageAdmission {
     Accepted,
+    Forwarded,
     Backpressured,
     Rejected,
+}
+
+impl MessageAdmission {
+    /// True only when this process admitted the message to a local mailbox or
+    /// cross-shard delivery queue.
+    pub const fn locally_accepted(self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+
+    /// True when this process either admitted the message locally or handed it
+    /// to remote routing. This is intentionally weaker than delivery success.
+    pub const fn handed_off(self) -> bool {
+        matches!(self, Self::Accepted | Self::Forwarded)
+    }
+
+    pub const fn retryable(self) -> bool {
+        matches!(self, Self::Backpressured)
+    }
 }
 
 pub struct Runtime {
@@ -1695,14 +1715,19 @@ impl Runtime {
     /// Behavior-name resolution is fail-closed: an undeclared name is
     /// rejected and never aliases behavior id 0. Numeric id 0 remains an
     /// ordinary valid behavior only when the target actually declares it.
-    pub fn send_message(&mut self, target_id: u64, behavior: &str, args: &[Value]) {
+    pub fn send_message(
+        &mut self,
+        target_id: u64,
+        behavior: &str,
+        args: &[Value],
+    ) -> MessageAdmission {
         // Name-based sends already carry the wire behavior name, so route
         // remote refs directly (same local-existence guard as
         // `send_message_by_id`; see RFC-0007 note there).
         if !self.actors.contains_key(&target_id) {
             if let Some(node) = self.remote_refs.get(&target_id).copied() {
                 self.route_ref_send(target_id, node, behavior, args);
-                return;
+                return MessageAdmission::Forwarded;
             }
         }
 
@@ -1712,13 +1737,12 @@ impl Runtime {
             let target_shard = (target_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
                 let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
-                let _ = self.send_cross_shard_named_message(
+                return self.send_cross_shard_named_message(
                     target_id,
                     behavior,
                     args.to_vec(),
                     out_trace,
                 );
-                return;
             }
         }
 
@@ -1727,9 +1751,9 @@ impl Runtime {
                 "nulang-runtime: rejecting message to actor {}: unknown behavior '{}'",
                 target_id, behavior
             );
-            return;
+            return MessageAdmission::Rejected;
         };
-        self.send_message_by_id(target_id, behavior_id, args);
+        self.send_message_by_id(target_id, behavior_id, args)
     }
 
     /// Route a message to a KNOWN remote ref (hosting node already
@@ -2399,7 +2423,12 @@ impl Runtime {
     }
 
     #[tracing::instrument(level = "trace", skip(self, args))]
-    pub fn send_message_by_id(&mut self, target_id: u64, behavior_id: u16, args: &[Value]) {
+    pub fn send_message_by_id(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+    ) -> MessageAdmission {
         // Stamp the outgoing message with the current handler's trace span (if
         // any), so the receiver's child span links directly to it and causal
         // chains continue across actor, shard, and node boundaries. The W3C
@@ -2430,29 +2459,37 @@ impl Runtime {
                         "nulang-net: dropping message to remote actor {} on node {:?}: cannot resolve behavior name (no sender module context)",
                         target_id, node
                     );
-                    return;
+                    return MessageAdmission::Rejected;
                 };
                 self.route_ref_send(target_id, node, &behavior_name, args);
-                return;
+                return MessageAdmission::Forwarded;
             }
         }
         // Forwarding for migrated actors: if this actor has been relocated
         // to another node, route the message there instead of bouncing it.
         if let Some(&(target_node, _migrated_at)) = self.migrated_actors.get(&target_id) {
-            // Look up the behavior name from the recovery module.
-            let behavior_name = self
+            // A migrated send must retain a real wire behavior name. Inventing
+            // `behavior_<id>` would claim successful forwarding for a route the
+            // receiver cannot resolve.
+            let Some(behavior_name) = self
                 .recovery_modules
                 .get(&target_id)
                 .and_then(|(module, _, _)| {
                     module
                         .behaviors
                         .get(behavior_id as usize)
-                        .map(|b| b.name.clone())
+                        .map(|behavior| behavior.name.clone())
                 })
-                .unwrap_or_else(|| format!("behavior_{}", behavior_id));
+            else {
+                warn!(
+                    "nulang-net: refusing migrated forwarding for actor {} behavior {}: missing recovery behavior name",
+                    target_id, behavior_id
+                );
+                return MessageAdmission::Rejected;
+            };
             let target = ActorAddress::remote(target_node, target_id);
             self.send_distributed(target, &behavior_name, args);
-            return;
+            return MessageAdmission::Forwarded;
         }
         // Cross-shard routing: if the target actor lives on another shard,
         // forward via the cross-shard channel. The receiving shard delivers it
@@ -2460,14 +2497,13 @@ impl Runtime {
         if self.shard_count > 1 {
             let target_shard = (target_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
-                self.send_cross_shard_message(
+                return self.send_cross_shard_message(
                     target_id,
                     behavior_id,
                     args.to_vec(),
                     out_trace.clone(),
                     None,
                 );
-                return;
             }
         }
         // Grain hydration: a resident grain actor that is hibernated should be
@@ -2511,27 +2547,26 @@ impl Runtime {
                         },
                         "grain hydration failed",
                     );
-                    return;
+                    return MessageAdmission::Rejected;
                 }
                 if self.actors.contains_key(&target_id) {
-                    self.deliver_local_message(target_id, behavior_id, args, out_trace);
-                } else {
-                    self.route_to_dlq(
-                        &Message {
-                            behavior_id,
-                            payload: Arc::new(args.to_vec()),
-                            sender: self.current_actor.unwrap_or(0),
-                            priority: MessagePriority::System,
-                            trace_id: out_trace.clone(),
-                        },
-                        "grain hydration failed",
-                    );
+                    return self.deliver_local_message(target_id, behavior_id, args, out_trace);
                 }
-                return;
+                self.route_to_dlq(
+                    &Message {
+                        behavior_id,
+                        payload: Arc::new(args.to_vec()),
+                        sender: self.current_actor.unwrap_or(0),
+                        priority: MessagePriority::System,
+                        trace_id: out_trace.clone(),
+                    },
+                    "grain hydration failed",
+                );
+                return MessageAdmission::Rejected;
             }
         }
 
-        self.deliver_local_message(target_id, behavior_id, args, out_trace);
+        self.deliver_local_message(target_id, behavior_id, args, out_trace)
     }
 
     /// Deliver a message to a local actor's mailbox, track cross-actor
