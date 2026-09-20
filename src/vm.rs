@@ -6141,6 +6141,74 @@ mod vm_tests {
         assert_eq!(s, "hello ffi");
     }
 
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_jit_deopt_bypasses_same_pc_once() {
+        struct DeoptJit;
+
+        impl JitBackend for DeoptJit {
+            fn is_compiled(&self, _module_idx: usize, _pc: usize) -> bool {
+                true
+            }
+
+            fn record_and_check_hot(&mut self, _module_idx: usize, _pc: usize) -> bool {
+                true
+            }
+
+            fn probe_and_maybe_hot(&mut self, _module_idx: usize, _pc: usize) -> bool {
+                true
+            }
+
+            fn compiled_region_len(&self, _module_idx: usize, _pc: usize) -> Option<usize> {
+                Some(1)
+            }
+
+            fn compiled_count(&self) -> usize {
+                1
+            }
+
+            fn typed_compiled_count(&self) -> usize {
+                0
+            }
+
+            fn reset_hot_counters(&mut self) {}
+
+            fn tiered_execute_step_typed(
+                &mut self,
+                _module_idx: usize,
+                _pc: usize,
+                _module: &CodeModule,
+                _regs: &mut [u64; 256],
+                _constants: &[u64],
+            ) -> TieredAction {
+                crate::jit::runtime::nulang_jit_set_deopt_pc(0);
+                TieredAction::RanJit
+            }
+        }
+
+        let mut vm = VM::new_without_jit();
+        vm.jit_session = Some(Box::new(DeoptJit));
+
+        let mut module = CodeModule::new("deopt-once");
+        module.emit(Instruction::new0(OpCode::Nop));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+        vm.load_module(module);
+
+        vm.frames.push(Frame::new(None, 0));
+        vm.current_frame_idx = Some(0);
+
+        assert!(vm.try_jit_execute(0), "mock JIT should request deopt");
+        assert_eq!(vm.frames[0].pc, 0);
+        assert_eq!(vm.jit_bypass_once, Some((0, 0)));
+
+        assert!(
+            !vm.try_jit_execute(0),
+            "the deopt target must bypass JIT exactly once"
+        );
+        assert_eq!(vm.jit_bypass_once, None);
+    }
+
     /// Test 1: Basic integer arithmetic.
     #[test]
     fn test_basic_arithmetic() {
