@@ -675,6 +675,48 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         }
     }
 
+    fn object_put(&mut self, bytes: Box<[u8]>) -> crate::vm::Value {
+        let id = self.runtime.borrow_mut().object_store.put(bytes);
+        crate::vm::Value::object(id)
+    }
+
+    fn object_slice(
+        &mut self,
+        object: crate::vm::Value,
+        start: usize,
+        end: usize,
+    ) -> crate::vm::Value {
+        let Some(id) = object.as_object_id() else {
+            return crate::vm::Value::nil();
+        };
+        self.runtime
+            .borrow_mut()
+            .object_store
+            .slice(id, start, end)
+            .map(crate::vm::Value::object)
+            .unwrap_or_else(crate::vm::Value::nil)
+    }
+
+    fn object_len(&self, object: crate::vm::Value) -> Option<usize> {
+        let id = object.as_object_id()?;
+        self.runtime
+            .borrow()
+            .object_store
+            .get(id)
+            .map(|entry| entry.len())
+    }
+
+    fn object_get_byte(&self, object: crate::vm::Value, index: usize) -> Option<u8> {
+        let id = object.as_object_id()?;
+        self.runtime
+            .borrow()
+            .object_store
+            .get(id)?
+            .as_bytes()
+            .get(index)
+            .copied()
+    }
+
     fn spawn_actor(
         &mut self,
         module: &crate::bytecode::CodeModule,
@@ -1475,6 +1517,48 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             } else {
                 None
             }
+        }
+    }
+
+    fn object_put(&mut self, bytes: Box<[u8]>) -> crate::vm::Value {
+        unsafe {
+            let id = (*self.runtime).object_store.put(bytes);
+            crate::vm::Value::object(id)
+        }
+    }
+
+    fn object_slice(
+        &mut self,
+        object: crate::vm::Value,
+        start: usize,
+        end: usize,
+    ) -> crate::vm::Value {
+        let Some(id) = object.as_object_id() else {
+            return crate::vm::Value::nil();
+        };
+        unsafe {
+            (*self.runtime)
+                .object_store
+                .slice(id, start, end)
+                .map(crate::vm::Value::object)
+                .unwrap_or_else(crate::vm::Value::nil)
+        }
+    }
+
+    fn object_len(&self, object: crate::vm::Value) -> Option<usize> {
+        let id = object.as_object_id()?;
+        unsafe { (*self.runtime).object_store.get(id).map(|entry| entry.len()) }
+    }
+
+    fn object_get_byte(&self, object: crate::vm::Value, index: usize) -> Option<u8> {
+        let id = object.as_object_id()?;
+        unsafe {
+            (*self.runtime)
+                .object_store
+                .get(id)?
+                .as_bytes()
+                .get(index)
+                .copied()
         }
     }
 
