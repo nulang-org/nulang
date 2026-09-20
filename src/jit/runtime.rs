@@ -2,8 +2,8 @@
 
 use crate::bytecode::Constant;
 use crate::value_layout::{
-    is_float_raw, sext48, tag_int, INT48_MAX, INT48_MIN, PAYLOAD_MASK, TAG_CLOSURE, TAG_INT,
-    TAG_MASK, TAG_PTR, TAG_STRING,
+    as_int_or_zero, is_float_raw, sext48, tag_int, INT48_MAX, INT48_MIN, PAYLOAD_MASK,
+    TAG_CLOSURE, TAG_INT, TAG_MASK, TAG_PTR, TAG_STRING,
 };
 use crate::vm::Value;
 use std::cell::{Cell, UnsafeCell};
@@ -140,16 +140,6 @@ pub(crate) fn as_int_or_one(v: u64) -> i64 {
         sext48(v & PAYLOAD_MASK)
     } else {
         1
-    }
-}
-
-/// Extract the integer payload like the interpreter's `as_int().unwrap_or(0)`:
-/// non-int-tagged values contribute 0.
-pub(crate) fn as_int_or_zero(v: u64) -> i64 {
-    if (v & TAG_MASK) == TAG_INT {
-        sext48(v & PAYLOAD_MASK)
-    } else {
-        0
     }
 }
 
