@@ -63,7 +63,7 @@ Nulang is organized into five strictly layered subsystems. Each layer communicat
 +==========================================================================+
 |                       LAYER 1: LANGUAGE                                   |
 |  Lexer | Parser | HM Type Checker | Effect & Capability Analysis | HIR   |
-|  MIR | Register-Bytecode Compiler | NaN-Boxed VM | Cranelift JIT Tier    |
+|  MIR | Register-Bytecode Compiler | Tagged-Value VM | Cranelift JIT Tier |
 +==========================================================================+
 ```
 
@@ -335,21 +335,23 @@ block), `actor_metadata` (`ActorMeta`, incl. the agent flags in §6.3),
 | 0xF0–0xF4 | Debug & meta | 5 | `DbgBreak/Print/Stack`, `MetaType/Cap` |
 | 0xF5–0xF6 | Register spill | 2 | `SpillLoad`, `SpillStore` |
 
-**Value representation:** NaN-boxed `u64` (`Value { raw: u64 }`, `src/vm.rs`).
-The canonical layout lives in **`src/value_layout.rs`** — the single source
-of truth imported by the VM, the JIT runtime helpers, the typed JIT compiler,
-and the Python marshalling layer (the constants are *not* duplicated across
-those files):
+**Value representation:** canonical tagged `u64` (`Value { raw: u64 }`,
+`src/vm.rs`). The public contract is `nulang.value/i64-tagged-v1`; the
+canonical layout lives in **`src/value_layout.rs`** and is imported by the VM,
+JIT runtime helpers, typed JIT compiler, WASM backend, and Python marshalling
+layer:
 
-- Non-float values are quiet NaNs: upper 16 bits = tag
-  (`TAG_MASK = 0xFFFF_0000_0000_0000`), low 48 bits = payload
-  (`PAYLOAD_MASK = 0x0000_FFFF_FFFF_FFFF`). Any bit pattern that is not a
-  quiet NaN is a real IEEE-754 `f64`.
-- Tags: `TAG_NIL 0x7FF8`, `TAG_UNIT 0x7FF9`, `TAG_BOOL 0x7FFA`,
-  `TAG_INT 0x7FFB` (48-bit signed payload, sign-extended by `sext48`),
-  `TAG_PTR 0x7FFC` (heap pointer), `TAG_ACTOR 0x7FFD`, `TAG_STRING 0x7FFE`
-  (interned string id), `TAG_CLOSURE 0x7FF7`. `TAG_PYTHON 0x7FF6` lives in
-  `src/python/bridge.rs` behind the `python` feature.
+- Tagged values reserve the upper 16 bits for the tag
+  (`TAG_MASK = 0xFFFF_0000_0000_0000`) and the low 48 bits for payload
+  (`PAYLOAD_MASK = 0x0000_FFFF_FFFF_FFFF`).
+- Finite floats and infinities retain raw IEEE-754 bits. Every NaN-producing
+  path canonicalizes to `CANONICAL_NAN_BITS = 0xFFF8_0000_0000_0001`, which
+  cannot alias a runtime tag.
+- Tags: `TAG_OBJECT 0x7FF5`, `TAG_CLOSURE 0x7FF7`, `TAG_NIL 0x7FF8`,
+  `TAG_UNIT 0x7FF9`, `TAG_BOOL 0x7FFA`, `TAG_INT 0x7FFB` (signed i48),
+  `TAG_PTR 0x7FFC`, `TAG_ACTOR 0x7FFD`, and `TAG_STRING 0x7FFE`.
+  `TAG_PYTHON 0x7FF6` lives in `src/python/bridge.rs` behind the `python`
+  feature.
 
 **Frames:** a `Frame` holds `[Value; 256]` registers, `pc`, `module_idx`,
 `return_dst`, `caller_idx`, and an optional `closure_env`. Frames live in a
@@ -405,11 +407,11 @@ calls `jit::tiered_execute_step_typed`:
 4. The **typed path is live**: at tier-up, `typed_compiler::infer_reg_types`
    recovers register types from the enclosing function's bytecode (a
    conservative forward must-analysis), and hot regions compile through
-   `compile_region_typed` with NaN-tag guards stripped when types are
+   `compile_region_typed` with tag guards stripped when types are
    provable — falling back to the scalar path on absent/empty metadata or
    compile error.
 5. Helpers callable from JIT code are `extern "C"` functions in
-   `src/jit/runtime.rs`, NaN-tag-aware (e.g. division by zero yields `nil`).
+   `src/jit/runtime.rs`, tag-aware (e.g. division by zero yields `nil`).
 
 Cold code always interprets; there is no whole-module AOT compilation.
 
