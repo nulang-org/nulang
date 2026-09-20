@@ -1780,11 +1780,11 @@ fn emit_wit_contract(
 ) -> NuResult<()> {
     let effect_rows = effect_checker.module_effect_rows(&ast.decls)?;
     let world = nulang::witgen::generate_wit_world_from_effect_rows(effect_rows.iter())
-        .map_err(|e| NuError::EffectError {
-            msg: format!("cannot emit WIT capability world: {e}"),
-            span: Span::default(),
-            missing_effects: None,
-            allowed_effects: None,
+        .map_err(|e| {
+            NuError::effect_error(
+                format!("cannot emit WIT capability world: {e}"),
+                Span::default(),
+            )
         })?;
     let wit = nulang::witgen::render_wit(&world);
     std::fs::write(out_path, wit).map_err(|e| NuError::VMError {
@@ -2678,6 +2678,31 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_typed_wit_world_uses_frontend_effect_rows() {
+        let source = r#"
+            fn clock() {
+                perform Time.now()
+            }
+
+            fn main() {
+                perform IO.print(clock())
+            }
+        "#;
+        let (ast, _type_checker, mut effect_checker) =
+            run_frontend(source, None, false, &[], false)
+                .expect("frontend should accept WIT test program");
+        let rows = effect_checker
+            .module_effect_rows(&ast.decls)
+            .expect("module effect rows should be available");
+        let world = nulang::witgen::generate_wit_world_from_effect_rows(rows.iter())
+            .expect("IO and Time have complete WIT mappings");
+        let wit = nulang::witgen::render_wit(&world);
+        assert!(wit.contains("import io: interface"));
+        assert!(wit.contains("import time: interface"));
+        assert!(wit.contains("now: func() -> s64"));
+    }
 
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub
