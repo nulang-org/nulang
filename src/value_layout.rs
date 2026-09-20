@@ -158,6 +158,17 @@ pub fn as_int_raw(raw: u64) -> i64 {
     sext48(raw & PAYLOAD_MASK)
 }
 
+/// Extract an integer payload using the interpreter's permissive arithmetic
+/// coercion: non-integer values contribute zero.
+#[inline]
+pub fn as_int_or_zero(raw: u64) -> i64 {
+    if is_int_raw(raw) {
+        as_int_raw(raw)
+    } else {
+        0
+    }
+}
+
 /// Extract the heap-pointer payload from a tagged value (assumes `is_ptr_raw`).
 #[inline]
 pub fn as_ptr_raw(raw: u64) -> u32 {
