@@ -61,8 +61,22 @@ pub fn write_cache_snapshot(
     store: &CacheStore,
     now_ms: u64,
 ) -> Result<CacheSnapshotReport, CacheSnapshotError> {
-    let path = path.as_ref();
     let captured_unix_ms = current_unix_ms()?;
+    write_cache_snapshot_at(path, store, now_ms, captured_unix_ms)
+}
+
+/// Write a snapshot with an explicit wall-clock anchor captured no later than
+/// the supplied monotonic `now_ms` observation.
+///
+/// Reactor callers should capture wall time first, then monotonic time, so
+/// downtime reconstruction can only shorten TTL rather than extend it.
+pub fn write_cache_snapshot_at(
+    path: impl AsRef<Path>,
+    store: &CacheStore,
+    now_ms: u64,
+    captured_unix_ms: u64,
+) -> Result<CacheSnapshotReport, CacheSnapshotError> {
+    let path = path.as_ref();
     let entries = store.export_durable_entries(now_ms, captured_unix_ms);
     let bytes = encode_snapshot(&entries)?;
 
