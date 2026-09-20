@@ -415,10 +415,7 @@ mod tests {
             }
         );
         assert_eq!(grant.to_string(), "Process::Run(echo hello)");
-        assert_eq!(
-            grant.to_source_syntax(),
-            "Process::Run(\"echo hello\")"
-        );
+        assert_eq!(grant.to_source_syntax(), "Process::Run(\"echo hello\")");
     }
 
     #[test]
