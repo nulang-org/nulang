@@ -1547,7 +1547,12 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
 
     fn object_len(&self, object: crate::vm::Value) -> Option<usize> {
         let id = object.as_object_id()?;
-        unsafe { (*self.runtime).object_store.get(id).map(|entry| entry.len()) }
+        unsafe {
+            (*self.runtime)
+                .object_store
+                .get(id)
+                .map(|entry| entry.len())
+        }
     }
 
     fn object_get_byte(&self, object: crate::vm::Value, index: usize) -> Option<u8> {
