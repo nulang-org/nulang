@@ -1926,3 +1926,57 @@ fn test_runtime_livein_refinement_rejects_backedge_type_change() {
         "independent proven facts must remain intact"
     );
 }
+
+
+#[test]
+fn test_nbc_hot_loop_recovers_typed_jit_from_runtime_liveins() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn accumulate(seed: Int, limit: Int) -> Int {
+            var sum = seed;
+            var i = 0;
+            while i < limit {
+                sum = sum + i;
+                i = i + 1
+            };
+            sum
+        }
+        fn main() -> Int { accumulate(1, 100000) }
+    "#;
+
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let compiled = compile_mir(&mut mir, "runtime_livein_nbc").expect("codegen");
+    assert!(
+        !compiled.jit_type_seeds.is_empty(),
+        "source compilation should have parameter hints before serialization"
+    );
+
+    // Frozen artifacts deliberately omit compiler-only type seeds.
+    let bytes = compiled.to_nbc(None).expect("encode nbc");
+    let artifact = CodeModule::from_nbc(&bytes).expect("decode nbc");
+    assert!(
+        artifact.module.jit_type_seeds.is_empty(),
+        "artifact must enter the JIT without compiler-owned type hints"
+    );
+
+    let mut vm = VM::new();
+    vm.load_module(artifact.module);
+    let result = vm.run().expect("artifact execution");
+    assert_eq!(result.as_int(), Some(4_999_950_001));
+    assert!(
+        vm.jit_typed_compiled_count() > 0,
+        "hot artifact loop should recover enough stable runtime live-ins to use the typed JIT"
+    );
+}
