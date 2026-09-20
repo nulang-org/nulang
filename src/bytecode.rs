@@ -685,7 +685,7 @@ pub struct CodeModule {
     /// serialized .nbc artifacts must not be able to forge facts used by the
     /// guard-stripped JIT path.
     #[serde(skip)]
-    pub jit_type_seeds: Vec<(usize, crate::type_metadata::TypeMetadata)>,
+    pub(crate) jit_type_seeds: Vec<(usize, crate::type_metadata::TypeMetadata)>,
     pub exports: Vec<(String, usize)>, // name -> constant/function index
     /// Entry point for inline __main (None if no __main, defaults to 0 in VM)
     pub entry_point: Option<usize>,
