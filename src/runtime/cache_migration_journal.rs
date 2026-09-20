@@ -85,7 +85,9 @@ impl CacheMigrationRecoveryState {
     }
 
     pub fn all_sent_transfers_acked(&self) -> bool {
-        self.transfers.values().all(|transfer| transfer.ack.is_some())
+        self.transfers
+            .values()
+            .all(|transfer| transfer.ack.is_some())
     }
 
     pub fn unfinished_transfer_ids(&self) -> Vec<u64> {
@@ -139,10 +141,7 @@ impl CacheMigrationRecoveryState {
     ///
     /// Old journaled convergence is informational only; callers must obtain a
     /// new exact-epoch target probe after restart and pass it here.
-    pub fn accepts_fresh_convergence(
-        &self,
-        evidence: &CacheMigrationConvergenceEvidence,
-    ) -> bool {
+    pub fn accepts_fresh_convergence(&self, evidence: &CacheMigrationConvergenceEvidence) -> bool {
         self.restart_reprobe_candidate()
             && self
                 .convergence
@@ -239,11 +238,7 @@ impl CacheMigrationJournal {
                 ));
             }
 
-            apply_record(
-                &mut states,
-                kind,
-                &bytes[payload_start..payload_end],
-            )?;
+            apply_record(&mut states, kind, &bytes[payload_start..payload_end])?;
             cursor = record_end;
             valid_end = cursor;
         }
@@ -261,16 +256,11 @@ impl CacheMigrationJournal {
         &self.path
     }
 
-    pub fn recovery_states(
-        &self,
-    ) -> impl Iterator<Item = &CacheMigrationRecoveryState> {
+    pub fn recovery_states(&self) -> impl Iterator<Item = &CacheMigrationRecoveryState> {
         self.states.values()
     }
 
-    pub fn recovery_state(
-        &self,
-        key: CacheMigrationKey,
-    ) -> Option<&CacheMigrationRecoveryState> {
+    pub fn recovery_state(&self, key: CacheMigrationKey) -> Option<&CacheMigrationRecoveryState> {
         self.states.get(&key)
     }
 
@@ -305,13 +295,7 @@ impl CacheMigrationJournal {
     ) -> io::Result<()> {
         let (transfer_id, placement_epoch, slot, source, target) =
             transfer_request_identity(message)?;
-        require_message_matches_migration(
-            key,
-            placement_epoch,
-            slot,
-            source,
-            target,
-        )?;
+        require_message_matches_migration(key, placement_epoch, slot, source, target)?;
         let state = self.require_state(key)?;
         if let Some(existing) = state.transfers.get(&transfer_id) {
             if &existing.request == message {
@@ -348,15 +332,8 @@ impl CacheMigrationJournal {
         key: CacheMigrationKey,
         message: &CacheTransportMessage,
     ) -> io::Result<()> {
-        let (transfer_id, placement_epoch, slot, source, target) =
-            transfer_ack_identity(message)?;
-        require_message_matches_migration(
-            key,
-            placement_epoch,
-            slot,
-            source,
-            target,
-        )?;
+        let (transfer_id, placement_epoch, slot, source, target) = transfer_ack_identity(message)?;
+        require_message_matches_migration(key, placement_epoch, slot, source, target)?;
         let state = self.require_state(key)?;
         let transfer = state
             .transfers
@@ -447,7 +424,9 @@ impl CacheMigrationJournal {
             return Ok(());
         }
         if state.pending_commit_epoch.is_some() {
-            return Err(invalid_data("different cache migration commit is already pending"));
+            return Err(invalid_data(
+                "different cache migration commit is already pending",
+            ));
         }
         let mut payload = Vec::with_capacity(38);
         write_key(&mut payload, key);
@@ -467,7 +446,9 @@ impl CacheMigrationJournal {
     ) -> io::Result<()> {
         let state = self.require_state(key)?;
         if state.pending_commit_epoch != Some(commit_epoch) {
-            return Err(invalid_data("cache migration commit abort does not match pending intent"));
+            return Err(invalid_data(
+                "cache migration commit abort does not match pending intent",
+            ));
         }
         let mut payload = Vec::with_capacity(38);
         write_key(&mut payload, key);
@@ -499,10 +480,7 @@ impl CacheMigrationJournal {
         Ok(())
     }
 
-    fn require_state(
-        &self,
-        key: CacheMigrationKey,
-    ) -> io::Result<&CacheMigrationRecoveryState> {
+    fn require_state(&self, key: CacheMigrationKey) -> io::Result<&CacheMigrationRecoveryState> {
         self.states
             .get(&key)
             .ok_or_else(|| invalid_data("migration intent is not durable"))
@@ -573,13 +551,7 @@ fn apply_record(
             if decoded_id != transfer_id {
                 return Err(invalid_data("transfer request id mismatch in journal"));
             }
-            require_message_matches_migration(
-                key,
-                placement_epoch,
-                slot,
-                source,
-                target,
-            )?;
+            require_message_matches_migration(key, placement_epoch, slot, source, target)?;
             let state = states
                 .get_mut(&key)
                 .ok_or_else(|| invalid_data("transfer request precedes migration intent"))?;
@@ -609,13 +581,7 @@ fn apply_record(
             if decoded_id != transfer_id {
                 return Err(invalid_data("transfer ACK id mismatch in journal"));
             }
-            require_message_matches_migration(
-                key,
-                placement_epoch,
-                slot,
-                source,
-                target,
-            )?;
+            require_message_matches_migration(key, placement_epoch, slot, source, target)?;
             let state = states
                 .get_mut(&key)
                 .ok_or_else(|| invalid_data("transfer ACK precedes migration intent"))?;
@@ -666,7 +632,9 @@ fn apply_record(
                 .pending_commit_epoch
                 .is_some_and(|pending| pending != commit_epoch)
             {
-                return Err(invalid_data("completion does not match pending commit intent"));
+                return Err(invalid_data(
+                    "completion does not match pending commit intent",
+                ));
             }
             state.pending_commit_epoch = None;
             state.completed_commit_epoch = Some(commit_epoch);
@@ -684,7 +652,9 @@ fn apply_record(
             {
                 state.pending_commit_epoch = Some(commit_epoch);
             } else {
-                return Err(invalid_data("conflicting commit intents in migration journal"));
+                return Err(invalid_data(
+                    "conflicting commit intents in migration journal",
+                ));
             }
         }
         KIND_COMMIT_ABORTED => {
@@ -720,7 +690,9 @@ fn transfer_request_identity(
             target,
             batch,
         } => Ok((*transfer_id, *placement_epoch, batch.slot, *source, *target)),
-        _ => Err(invalid_data("journal transfer request is not TransferBatch")),
+        _ => Err(invalid_data(
+            "journal transfer request is not TransferBatch",
+        )),
     }
 }
 
@@ -903,18 +875,19 @@ impl<'a> JournalReader<'a> {
         if self.cursor == self.bytes.len() {
             Ok(())
         } else {
-            Err(invalid_data("trailing bytes in cache migration journal record"))
+            Err(invalid_data(
+                "trailing bytes in cache migration journal record",
+            ))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::cache::{
-        redis_slot, CacheTransferBatch, CacheTransferEntry, CacheTransferToken,
-        CacheTransferValue,
+        redis_slot, CacheTransferBatch, CacheTransferEntry, CacheTransferToken, CacheTransferValue,
     };
+    use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -922,7 +895,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("nulang-{name}-{}-{nonce}.journal", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "nulang-{name}-{}-{nonce}.journal",
+            std::process::id()
+        ))
     }
 
     fn incarnation() -> [u8; 16] {
@@ -1014,8 +990,8 @@ mod tests {
         let state = journal.recovery_state(migration).unwrap();
         assert!(state.restart_reprobe_candidate());
         assert_eq!(state.expected_import_fences(), 1);
-        assert!(state.accepts_fresh_convergence(
-            &CacheMigrationConvergenceEvidence {
+        assert!(
+            state.accepts_fresh_convergence(&CacheMigrationConvergenceEvidence {
                 probe_id: 51,
                 target_accepted: true,
                 source_remaining: 0,
@@ -1023,11 +999,9 @@ mod tests {
                 target_import_fences: 1,
                 target_conflicts: 0,
                 target_wrong_slot: 0,
-            }
-        ));
-        assert!(!state.accepts_fresh_convergence(
-            state.convergence.as_ref().unwrap()
-        ));
+            })
+        );
+        assert!(!state.accepts_fresh_convergence(state.convergence.as_ref().unwrap()));
 
         fs::remove_file(path).unwrap();
     }
@@ -1087,9 +1061,7 @@ mod tests {
         }
 
         let mut journal = CacheMigrationJournal::open(&path).unwrap();
-        let error = journal
-            .record_intent(migration, [0xa5; 16])
-            .unwrap_err();
+        let error = journal.record_intent(migration, [0xa5; 16]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         fs::remove_file(path).unwrap();
     }
