@@ -769,6 +769,82 @@ mod tests {
     }
 
     #[test]
+    fn protocol_registry_exact_match_needs_no_schema_lookup() {
+        let schema = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Balance", vec![], money())],
+        )
+        .unwrap();
+        let id = schema.id();
+        let registry = ProtocolRegistry::new();
+
+        assert_eq!(
+            registry.compatibility(id, id).unwrap(),
+            ProtocolCompatibility::Exact
+        );
+    }
+
+    #[test]
+    fn protocol_registry_proves_additive_receiver_compatibility() {
+        let old = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Balance", vec![], money())],
+        )
+        .unwrap();
+        let new = ProtocolSchema::new(
+            "Account",
+            [
+                ProtocolMember::request_reply("Balance", vec![], money()),
+                ProtocolMember::message("Deposit", vec![money()]),
+            ],
+        )
+        .unwrap();
+
+        let old_id = old.id();
+        let new_id = new.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(old).unwrap();
+        registry.register(new).unwrap();
+
+        assert_eq!(
+            registry.compatibility(new_id, old_id).unwrap(),
+            ProtocolCompatibility::ReceiverSuperset
+        );
+        assert!(registry.can_serve(new_id, old_id).unwrap());
+        assert_eq!(
+            registry.compatibility(old_id, new_id).unwrap(),
+            ProtocolCompatibility::Incompatible
+        );
+    }
+
+    #[test]
+    fn protocol_registry_fails_closed_for_unknown_different_digest() {
+        let known = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Balance", vec![], money())],
+        )
+        .unwrap();
+        let unknown = ProtocolSchema::new(
+            "Account",
+            [
+                ProtocolMember::request_reply("Balance", vec![], money()),
+                ProtocolMember::message("Deposit", vec![money()]),
+            ],
+        )
+        .unwrap();
+
+        let known_id = known.id();
+        let unknown_id = unknown.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(known).unwrap();
+
+        assert_eq!(
+            registry.compatibility(known_id, unknown_id),
+            Err(ProtocolRegistryError::UnknownProtocol(unknown_id))
+        );
+    }
+
+    #[test]
     fn protocol_id_hex_round_trips() {
         let schema = ProtocolSchema::new(
             "Account",
