@@ -829,6 +829,14 @@ impl Parser {
                     ));
                 }
             };
+            // Marker annotations such as `@noalloc` intentionally do not
+            // require an empty parenthesized argument list. Keep accepting
+            // `@noalloc()` as well for tooling that normalizes annotations.
+            if name == "noalloc" && !self.match_token(&TokenKind::LParen) {
+                annotations.push(FunctionAnnotation::NoAlloc);
+                self.skip_newlines();
+                continue;
+            }
             self.expect(TokenKind::LParen)?;
             let mut fields: FxHashMap<String, String> = FxHashMap::default();
             self.skip_newlines();
@@ -877,6 +885,15 @@ impl Parser {
                         .map(|(k, v)| if k.is_empty() { v } else { k })
                         .collect();
                     annotations.push(FunctionAnnotation::Derive(names));
+                }
+                "noalloc" => {
+                    if !fields.is_empty() {
+                        return Err(NuError::parse_error(
+                            "@noalloc does not accept arguments".to_string(),
+                            self.current_span(),
+                        ));
+                    }
+                    annotations.push(FunctionAnnotation::NoAlloc);
                 }
                 "placement" => {
                     let value = fields.remove("").unwrap_or_default();
