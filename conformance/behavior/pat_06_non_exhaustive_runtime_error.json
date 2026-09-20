@@ -1,1 +1,1 @@
-{"exit_code": 5, "stdout": "", "stderr": "non-exhaustive match"}
+{"exit_code": 4, "stdout": "", "stderr": "non-exhaustive match: missing variant Blue", "proves": "A statically-known closed variant match that omits a constructor is rejected by the typechecker before MIR/runtime execution."}
