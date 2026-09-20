@@ -89,7 +89,7 @@ fn bench_jit_straight_line_entry(c: &mut Criterion) {
     // STRAIGHT_LINE_MIN-sized arithmetic body: after warming, each run enters
     // one already-compiled non-reentrant region exactly once. This isolates
     // the JIT transition path that direct frame-register execution optimizes.
-    let source = "var x = 1; x = x + 1; x = x * 2; x = x - 1; x = x + 3; x = x * 2; x = x - 4; x = x + 5; x";
+    let source = "fn work(x: Int) -> Int { var y = x; y = y + 1; y = y * 2; y = y - 1; y = y + 3; y = y * 2; y = y - 4; y = y + 5; y = y * 3; y }; work(1)";
     let module = compile(source);
 
     c.bench_function("jit/straight_line_warm_entry", |b| {
