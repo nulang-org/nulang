@@ -250,6 +250,7 @@ pub enum ProtocolAdmissionError {
         required: ProtocolId,
     },
     UnknownProtocol(ProtocolId),
+    RegistryHashCollision(ProtocolId),
 }
 
 impl fmt::Display for ProtocolAdmissionError {
@@ -271,6 +272,9 @@ impl fmt::Display for ProtocolAdmissionError {
             ),
             ProtocolAdmissionError::UnknownProtocol(id) => {
                 write!(f, "unknown actor protocol schema {id}")
+            }
+            ProtocolAdmissionError::RegistryHashCollision(id) => {
+                write!(f, "actor protocol registry hash collision for {id}")
             }
         }
     }
@@ -306,7 +310,7 @@ pub fn admit_protocol(
                             ProtocolAdmissionError::UnknownProtocol(id)
                         }
                         ProtocolRegistryError::HashCollision(id) => {
-                            ProtocolAdmissionError::UnknownProtocol(id)
+                            ProtocolAdmissionError::RegistryHashCollision(id)
                         }
                     },
                 )?;
