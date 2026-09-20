@@ -3159,8 +3159,8 @@ mod tests {
             "remote send must dispatch the named behavior \"inc\""
         );
 
-        // Unknown behavior name: falls back to behavior 0, mirroring
-        // `Runtime::send_message`'s `unwrap_or(0)` for local sends.
+        // Unknown behavior name: reject it without enqueueing or executing
+        // any target handler.
         send_distributed(
             &mut runtime_a,
             &mut transport_a,
@@ -3185,8 +3185,8 @@ mod tests {
             .and_then(|v| v.as_int())
             .unwrap();
         assert_eq!(
-            count, 4,
-            "unknown behavior name must fall back to behavior 0 (\"dec\")"
+            count, 5,
+            "unknown behavior name must leave target state unchanged"
         );
 
         transport_a.shutdown();
