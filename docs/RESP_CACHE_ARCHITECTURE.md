@@ -22,8 +22,11 @@ for cross-shard and cross-node coordination.
 
 The RESP surface preserves Redis Cluster's 16,384 logical slots and hash-tag
 semantics. Logical slots map to a smaller set of physical Nulang cache shards.
-Cluster placement may move logical slots between physical owners without
-changing the client-visible hash function.
+The default local placement assigns balanced contiguous ranges to physical
+shards; CRC16 already spreads ordinary keys across the logical slot space, so
+contiguous ownership keeps cluster topology compact without giving up expected
+key balance. Cluster placement may move logical slots between physical owners
+without changing the client-visible hash function.
 
 `src/runtime/cache_routing.rs` holds the placement snapshot. Each slot maps
 directly to a `(node_id, shard)` owner, so the steady-state routing lookup is
@@ -109,6 +112,14 @@ clients because a warmed client can connect directly to the physical slot
 owner. Missing endpoint metadata fails closed instead of silently falling back
 to proxying.
 
+The same cluster layer serves topology discovery without touching CacheStore:
+`CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
+topology response, and legacy `CLUSTER SLOTS` is retained for older clients.
+Each current Nulang physical cache owner is advertised as one online master
+with a stable 40-hex-character Redis node id derived from its Nulang node/shard
+identity. Replicas will be added to these responses when cache replication is
+implemented.
+
 ## Durability
 
 Durability is not implicit in the cache kernel. Add it above the mutation path
@@ -141,9 +152,8 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add Redis Cluster topology commands, prioritizing CLUSTER SHARDS while
-   retaining CLUSTER SLOTS compatibility, then ASK/ASKING when live slot
-   migration is implemented.
+1. Add ASK/ASKING and migration-state redirects when live slot migration is
+   implemented.
 2. Build the dedicated cache shard event loop around non-blocking connections,
    inbox draining, ordered response flushing, and per-shard advertised
    endpoints.

@@ -9,7 +9,9 @@
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 
 use super::cache::CacheStore;
-use super::cache_cluster::{CacheEndpointMap, CacheRoutingMode};
+use super::cache_cluster::{
+    execute_cluster_command, CacheClusterCommandError, CacheEndpointMap, CacheRoutingMode,
+};
 use super::cache_routing::{CacheShardOwner, CacheSlotMap};
 use super::resp::{parse_command, write_moved, RespParseError};
 use super::resp_cache::{command_slot, execute_command, execute_frame, RespCommandSlot};
@@ -215,6 +217,11 @@ impl CacheDispatcher {
         })
     }
 
+    pub fn with_endpoints(mut self, endpoints: CacheEndpointMap) -> Self {
+        self.endpoints = endpoints;
+        self
+    }
+
     pub fn with_cluster_redirects(mut self, endpoints: CacheEndpointMap) -> Self {
         self.routing_mode = CacheRoutingMode::Redirect;
         self.endpoints = endpoints;
@@ -247,6 +254,17 @@ impl CacheDispatcher {
         let Some((command, consumed)) = parse_command(input)? else {
             return Ok(None);
         };
+
+        if let Some(result) =
+            execute_cluster_command(command, &self.placement, &self.endpoints, out)
+        {
+            match result {
+                Ok(()) => return Ok(Some(CacheDispatchOutcome::Executed { consumed })),
+                Err(CacheClusterCommandError::MissingEndpoint(owner)) => {
+                    return Err(CacheDispatchError::MissingEndpoint(owner));
+                }
+            }
+        }
 
         let slot = match command_slot(command) {
             RespCommandSlot::Unkeyed | RespCommandSlot::CrossSlot => {
@@ -577,6 +595,33 @@ mod tests {
             Err(CacheDispatchError::MissingEndpoint(missing)) if missing == owner
         ));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cluster_topology_commands_execute_locally_from_routing_snapshot() {
+        let map = CacheSlotMap::new_local(1, 1).unwrap();
+        let owner = map.owner_for_slot(0).unwrap();
+        let (channels, _inboxes) = CacheDispatchChannels::new(1, 8).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(owner, CacheAdvertisedEndpoint::new("cache.local", 7000));
+        let dispatcher = CacheDispatcher::new(1, 0, map, channels)
+            .unwrap()
+            .with_endpoints(endpoints);
+        let mut store = CacheStore::new();
+        let mut out = Vec::new();
+
+        let slots = frame(&[b"CLUSTER", b"SLOTS"]);
+        let outcome = dispatcher
+            .dispatch_frame(&mut store, &slots, 0, &mut out)
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(outcome, CacheDispatchOutcome::Executed { .. }));
+        assert!(out.starts_with(b"*1\r\n"));
+        assert!(out
+            .windows(b"cache.local".len())
+            .any(|window| window == b"cache.local"));
+        assert!(store.is_empty());
     }
 
     #[test]
