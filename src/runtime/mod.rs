@@ -311,6 +311,16 @@ pub struct Runtime {
 
     // Distributed actor system (v0.5)
     pub distributed: DistributedContext,
+    /// Canonical actor protocol schemas known to this runtime. Exact protocol
+    /// identity does not require registry lookup; different digests require
+    /// both schemas to prove rolling-upgrade compatibility.
+    pub protocol_registry: crate::protocol::ProtocolRegistry,
+    /// Admission policy for remote actor messages. Runtime defaults to
+    /// LegacyCompatible during the migration period because existing remote
+    /// actor references do not yet carry ProtocolId automatically. Typed
+    /// messages are still checked and incompatible/unknown identities fail
+    /// closed.
+    pub protocol_admission_policy: crate::protocol::ProtocolAdmissionPolicy,
     // Operator cluster configuration (split-brain resolver, probe interval),
     // applied when distribution is enabled.
     pub cluster_config: ClusterConfig,
@@ -425,8 +435,17 @@ pub struct Runtime {
     /// Messages pending retry after a bytecode fetch completes.
     /// Keyed by content hash; drained when the matching FetchBehaviorResponse
     /// arrives and the module is cached.
-    pub(crate) pending_fetched_messages:
-        HashMap<[u8; 32], Vec<(u64, String, Message, Vec<String>, Vec<(u64, Vec<u8>)>)>>,
+    pub(crate) pending_fetched_messages: HashMap<
+        [u8; 32],
+        Vec<(
+            u64,
+            String,
+            Message,
+            Vec<String>,
+            Vec<(u64, Vec<u8>)>,
+            Option<[u8; 32]>,
+        )>,
+    >,
     // Pipelines and debates (v0.9 AI Runtime) - extracted into a registry so
     // the god-object shrinks and the subsystems can evolve independently.
     #[cfg(feature = "ai-runtime")]
@@ -563,6 +582,25 @@ impl Runtime {
         protocol_identity::protocol_id_for_actor(self, actor_id)
     }
 
+    /// Register a canonical actor protocol schema for rolling-upgrade
+    /// admission. Different protocol digests can only be accepted when both
+    /// schemas are present and the receiver is a proven compatible superset.
+    pub fn register_protocol_schema(
+        &mut self,
+        schema: crate::protocol::ProtocolSchema,
+    ) -> Result<crate::protocol::ProtocolId, crate::protocol::ProtocolRegistryError> {
+        self.protocol_registry.register(schema)
+    }
+
+    /// Select how remote actor protocol identities are admitted before
+    /// mailbox publication.
+    pub fn set_protocol_admission_policy(
+        &mut self,
+        policy: crate::protocol::ProtocolAdmissionPolicy,
+    ) {
+        self.protocol_admission_policy = policy;
+    }
+
     pub fn new() -> Self {
         Runtime {
             actors: HashMap::new(),
@@ -583,6 +621,8 @@ impl Runtime {
             suspend_enabled: false,
             retired_heaps: Vec::new(),
             distributed: DistributedContext::new(),
+            protocol_registry: crate::protocol::ProtocolRegistry::new(),
+            protocol_admission_policy: crate::protocol::ProtocolAdmissionPolicy::LegacyCompatible,
             cluster_config: ClusterConfig::default(),
             acked_packets: HashSet::new(),
             remote_links: supervision::RemoteLinkRegistry::new(),

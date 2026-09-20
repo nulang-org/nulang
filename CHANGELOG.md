@@ -53,6 +53,15 @@ two major versions.*
   changing an existing signature is incompatible. V1 intentionally avoids
   implicit field/default/variance rules.
 
+- **Distributed pre-mailbox protocol admission** (Experimental,
+  `src/runtime/distributed.rs`). Incoming actor messages carrying structural
+  protocol identity are checked before behavior lookup, payload interning, or
+  mailbox publication. Exact ids are admitted directly; compatible upgrades
+  require registry proof; incompatible or unknown typed protocols are rejected.
+  Deferred bytecode-fetch retries re-check admission after hot reload. Runtime
+  defaults to explicit legacy-compatible migration mode until outbound actor
+  references carry protocol identity automatically.
+
 - **Runtime actor protocol identity lookup** (Experimental,
   `src/runtime/protocol_identity.rs`). Live actors resolve their canonical
   compiler-emitted `ActorMeta.protocol_id` through their own module metadata;
