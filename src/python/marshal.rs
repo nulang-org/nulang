@@ -251,6 +251,112 @@ pub fn python_object_id_to_value(obj_id: PythonObjectId) -> Result<Value, String
 }
 
 // ---------------------------------------------------------------------------
+// Owned worker-thread boundary
+// ---------------------------------------------------------------------------
+
+/// Convert an owned foreign value to a Python registry handle.
+///
+/// This path never needs access to a VM, actor heap, or module string pool.
+pub fn owned_foreign_to_python_object_id(
+    value: &crate::runtime::OwnedForeignValue,
+) -> Result<PythonObjectId, String> {
+    use crate::runtime::OwnedForeignValue;
+
+    match value {
+        OwnedForeignValue::OpaqueHandle { backend, id } => {
+            if *backend != "python" {
+                return Err(format!(
+                    "opaque {backend} handle cannot be consumed by the Python backend"
+                ));
+            }
+            let id = PythonObjectId(*id);
+            get_object(id)
+                .map(|_| id)
+                .ok_or_else(|| format!("Python object ID {:?} not found in registry", id))
+        }
+        OwnedForeignValue::Int(value) => Python::attach(|py| {
+            let obj: Py<PyAny> = (*value)
+                .into_pyobject(py)
+                .map_err(|e| e.to_string())?
+                .unbind()
+                .into_any();
+            Ok(register_object(obj))
+        }),
+        OwnedForeignValue::Float(value) => Python::attach(|py| {
+            let obj: Py<PyAny> = (*value)
+                .into_pyobject(py)
+                .map_err(|e| e.to_string())?
+                .unbind()
+                .into_any();
+            Ok(register_object(obj))
+        }),
+        OwnedForeignValue::Bool(value) => Python::attach(|py| {
+            let obj: Py<PyAny> = (*value)
+                .into_pyobject(py)
+                .map_err(|e| e.to_string())?
+                .to_owned()
+                .unbind()
+                .into_any();
+            Ok(register_object(obj))
+        }),
+        OwnedForeignValue::Unit | OwnedForeignValue::Nil => {
+            Ok(register_object(Python::attach(|py| py.None())))
+        }
+        OwnedForeignValue::String(value) => Python::attach(|py| {
+            let obj: Py<PyAny> = value
+                .as_str()
+                .into_pyobject(py)
+                .map_err(|e| e.to_string())?
+                .unbind()
+                .into_any();
+            Ok(register_object(obj))
+        }),
+    }
+}
+
+/// Convert a Python registry handle into an owned result that can cross back
+/// to the runtime thread without carrying a GIL-bound/raw Python pointer.
+pub fn python_object_id_to_owned_foreign(
+    obj_id: PythonObjectId,
+) -> Result<crate::runtime::OwnedForeignValue, String> {
+    use crate::runtime::OwnedForeignValue;
+
+    let py_obj = get_object(obj_id)
+        .ok_or_else(|| format!("Python object ID {:?} not found in registry", obj_id))?;
+
+    Python::attach(|py| {
+        let obj = py_obj.bind(py);
+        if obj.is_none() {
+            return Ok(OwnedForeignValue::Unit);
+        }
+        if let Ok(value) = obj.cast::<PyBool>() {
+            let value: bool = value.extract().map_err(|e| e.to_string())?;
+            return Ok(OwnedForeignValue::Bool(value));
+        }
+        if let Ok(value) = obj.cast::<PyInt>() {
+            let value: i64 = value.extract().unwrap_or_else(|_| {
+                let text = value.str().map(|s| s.to_string()).unwrap_or_default();
+                if text.starts_with('-') { i64::MIN } else { i64::MAX }
+            });
+            return Ok(OwnedForeignValue::Int(value));
+        }
+        if let Ok(value) = obj.cast::<PyFloat>() {
+            let value: f64 = value.extract().map_err(|e| e.to_string())?;
+            return Ok(OwnedForeignValue::Float(value));
+        }
+        if let Ok(value) = obj.cast::<PyString>() {
+            let value: String = value.extract().map_err(|e| e.to_string())?;
+            return Ok(OwnedForeignValue::String(value));
+        }
+
+        Ok(OwnedForeignValue::OpaqueHandle {
+            backend: "python",
+            id: obj_id.0,
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Compatibility wrappers (bridge parameter ignored — uses global registry)
 // ---------------------------------------------------------------------------
 
@@ -282,6 +388,32 @@ mod tests {
     // Helper: ensure Python is initialized
     fn ensure_python() {
         let _ = Python::attach(|_py| ());
+    }
+
+    #[test]
+    fn test_owned_foreign_string_roundtrip() {
+        ensure_python();
+        let source = crate::runtime::OwnedForeignValue::String("owned text".to_string());
+        let id = owned_foreign_to_python_object_id(&source).unwrap();
+        let restored = python_object_id_to_owned_foreign(id).unwrap();
+        assert_eq!(restored, source);
+    }
+
+    #[test]
+    fn test_owned_foreign_complex_value_returns_opaque_handle() {
+        ensure_python();
+        let id = Python::attach(|py| {
+            let list = PyList::new(py, [1, 2, 3]).unwrap();
+            register_object(list.unbind().into_any())
+        });
+        let restored = python_object_id_to_owned_foreign(id).unwrap();
+        assert_eq!(
+            restored,
+            crate::runtime::OwnedForeignValue::OpaqueHandle {
+                backend: "python",
+                id: id.0,
+            }
+        );
     }
 
     // ------------------------------------------------------------------

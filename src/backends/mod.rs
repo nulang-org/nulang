@@ -459,11 +459,28 @@ pub trait CryptoProvider: Send + Sync {
 /// this with a JavaScript engine, a WASM component model host, or whatever
 /// foreign runtime exists in 2125.
 pub trait ForeignInterop: Send {
-    /// Call a named foreign function with the given arguments.
-    /// Returns the marshalled result on success, or an error string.
+    /// Call a named foreign function with the given VM values.
+    ///
+    /// This compatibility path executes on the caller thread and therefore
+    /// must not be used by scheduler-isolated worker execution.
     fn call(&mut self, module: &str, function: &str, args: &[Value]) -> Result<Value, String>;
 
-    /// Import a foreign module, making its exports available via `call`.
+    /// Execute a fully-owned foreign call.
+    ///
+    /// The default fails closed so existing/custom backends do not silently
+    /// claim worker-thread safety. Backends may opt in once they can consume
+    /// OwnedForeignValue without touching VM or actor state.
+    fn call_owned(
+        &mut self,
+        request: &crate::runtime::ForeignCallRequest,
+    ) -> crate::runtime::ForeignCallResult {
+        Err(format!(
+            "foreign backend does not support owned off-thread calls: {}.{}",
+            request.module, request.function
+        ))
+    }
+
+    /// Import a foreign module, making its exports available via call.
     /// Returns an error string if the module cannot be loaded.
     fn import(&mut self, name: &str) -> Result<(), String>;
 }
@@ -513,6 +530,24 @@ impl ForeignInterop for DefaultForeignInterop {
             .collect();
         let result_id = self.bridge.call(func_id, py_args?)?;
         crate::python::python_object_id_to_value(result_id)
+    }
+
+    fn call_owned(
+        &mut self,
+        request: &crate::runtime::ForeignCallRequest,
+    ) -> crate::runtime::ForeignCallResult {
+        let module_id = *self
+            .modules
+            .get(&request.module)
+            .ok_or_else(|| format!("module '{}' not imported", request.module))?;
+        let func_id = self.bridge.get_attr(module_id, &request.function)?;
+        let py_args: Result<Vec<_>, String> = request
+            .args
+            .iter()
+            .map(crate::python::owned_foreign_to_python_object_id)
+            .collect();
+        let result_id = self.bridge.call(func_id, py_args?)?;
+        crate::python::python_object_id_to_owned_foreign(result_id)
     }
 }
 
@@ -667,6 +702,23 @@ mod tests {
         let pk: [u8; 32] = verifying_key.to_bytes();
         assert!(cp.verify(&pk, msg, &sig));
         assert!(!cp.verify(&pk, b"wrong message", &sig));
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_foreign_interop_owned_python_roundtrip() {
+        let _ = pyo3::Python::attach(|_py| ());
+
+        let mut fi = DefaultForeignInterop::new().expect("failed to create DefaultForeignInterop");
+        fi.import("math").expect("failed to import math");
+
+        let request = crate::runtime::ForeignCallRequest::new(
+            "math",
+            "sqrt",
+            vec![crate::runtime::OwnedForeignValue::Float(81.0)],
+        );
+        let result = fi.call_owned(&request).expect("owned Python call failed");
+        assert_eq!(result, crate::runtime::OwnedForeignValue::Float(9.0));
     }
 
     #[cfg(feature = "python")]
