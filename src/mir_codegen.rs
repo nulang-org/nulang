@@ -3290,6 +3290,74 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_noalloc_pure_function_compiles() {
+        let source = r#"
+@noalloc
+fn add(a: Int, b: Int) -> Int { a + b }
+
+fn main() -> Int { add(20, 22) }
+"#;
+        let module = compile_source(source).expect("pure @noalloc function should compile");
+        assert!(
+            module.debug_functions.iter().any(|f| f.name == "add"),
+            "expected add in compiled module"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_direct_heap_allocation() {
+        let source = r#"
+@noalloc
+fn make() { [1, 2, 3] }
+
+fn main() -> Int { 0 }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc function with an array allocation must fail")
+            .to_string();
+        assert!(
+            err.contains("noalloc contract violation") && err.contains("ArrAlloc"),
+            "unexpected @noalloc diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_transitive_allocating_callee() {
+        let source = r#"
+fn make() { [1, 2] }
+
+@noalloc
+fn wrapper() { make() }
+
+fn main() -> Int { 0 }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc must be transitive across direct calls")
+            .to_string();
+        assert!(
+            err.contains("wrapper") && err.contains("make"),
+            "unexpected transitive @noalloc diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_indirect_call_target() {
+        let source = r#"
+@noalloc
+fn apply(f, x) { f(x) }
+
+fn main() -> Int { 0 }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc must fail closed for indirect calls")
+            .to_string();
+        assert!(
+            err.contains("indirect/closure call target cannot be proven allocation-free"),
+            "unexpected indirect-call @noalloc diagnostic: {err}"
+        );
+    }
+
+    #[test]
     fn test_fold_const_add() {
         // `1 + 2` folds to a single constant; no IAdd survives.
         let value = run_source("1 + 2").unwrap();
