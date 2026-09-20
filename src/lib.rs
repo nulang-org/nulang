@@ -58,6 +58,7 @@ pub mod mir;
 pub mod mir_codegen;
 pub mod mir_escape;
 pub mod mir_inline;
+pub mod mir_scalar_replace;
 pub mod mir_lower;
 #[cfg(feature = "wasm-backend")]
 pub mod mir_wasm;
