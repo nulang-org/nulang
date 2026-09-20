@@ -20,6 +20,9 @@ pub struct MechanicalCostSummary {
     /// Heap allocation sites proven eligible for the activation-local iso arena.
     /// This is a strategy opportunity, not an allocation-free guarantee.
     pub arena_eligible_allocation_sites: usize,
+    /// Heap sites that cannot use the current iso arena and therefore remain
+    /// on the general actor heap/ORCA path.
+    pub general_heap_allocation_sites: usize,
     pub string_materialization_sites: usize,
     pub copy_sites: usize,
     pub call_sites: usize,
@@ -205,10 +208,15 @@ impl MechanicalCostReport {
                     .map(|line| format!(" line {line}"))
                     .unwrap_or_default();
                 out.push_str(&format!(
-                    "  pc {:>5}  {:<12} {:<22} {}{}\n",
+                    "  pc {:>5}  {:<12} {:<22} {:<14} {}{}\n",
                     site.pc,
                     site.opcode,
                     format!("{:?}", site.class),
+                    if site.arena_eligible {
+                        "arena-eligible"
+                    } else {
+                        "general"
+                    },
                     owner,
                     line
                 ));
@@ -221,12 +229,13 @@ impl MechanicalCostReport {
 
 fn format_summary(name: &str, summary: &MechanicalCostSummary) -> String {
     format!(
-        "  {:<24} instr={:<5} alloc={:<4} heap={:<4} arena={:<4} strings={:<4} copies={:<4} calls={:<4} branches={:<4} effects={:<4} suspend={:<4} ffi={:<4} actor={:<4} dist={:<4} io={}\n",
+        "  {:<24} instr={:<5} alloc={:<4} heap={:<4} arena={:<4} general_heap={:<4} strings={:<4} copies={:<4} calls={:<4} branches={:<4} effects={:<4} suspend={:<4} ffi={:<4} actor={:<4} dist={:<4} io={}\n",
         name,
         summary.instructions,
         summary.allocation_sites,
         summary.heap_allocation_sites,
         summary.arena_eligible_allocation_sites,
+        summary.general_heap_allocation_sites,
         summary.string_materialization_sites,
         summary.copy_sites,
         summary.call_sites,
@@ -255,6 +264,9 @@ fn summary_for_range(
             summary.arena_eligible_allocation_sites += 1;
         }
     }
+    summary.general_heap_allocation_sites = summary
+        .heap_allocation_sites
+        .saturating_sub(summary.arena_eligible_allocation_sites);
     summary
 }
 
@@ -329,6 +341,10 @@ pub fn analyze_module(module: &CodeModule) -> MechanicalCostReport {
             }
         }
     }
+
+    unattributed.general_heap_allocation_sites = unattributed
+        .heap_allocation_sites
+        .saturating_sub(unattributed.arena_eligible_allocation_sites);
 
     let allocation_sites = module
         .instructions
@@ -645,6 +661,34 @@ mod tests {
         assert_eq!(report.total.arena_eligible_allocation_sites, 1);
         assert_eq!(report.allocation_sites.len(), 1);
         assert!(report.allocation_sites[0].arena_eligible);
+    }
+
+    #[test]
+    fn reports_iso_arena_eligible_heap_site() {
+        let mut module = CodeModule::new("arena-eligible");
+        module.emit(Instruction::new2(OpCode::ArrAlloc, 0, 1));
+        module.emit(Instruction::new2(OpCode::ArrLen, 1, 2));
+        module.emit(Instruction::new1(OpCode::Drop, 1));
+        module.emit(Instruction::new0(OpCode::Halt));
+
+        let report = analyze_module(&module);
+        assert_eq!(report.total.heap_allocation_sites, 1);
+        assert_eq!(report.total.arena_eligible_allocation_sites, 1);
+        assert_eq!(report.total.general_heap_allocation_sites, 0);
+        assert!(report.allocation_sites[0].arena_eligible);
+    }
+
+    #[test]
+    fn reports_escaping_heap_site_as_general_heap() {
+        let mut module = CodeModule::new("general-heap");
+        module.emit(Instruction::new2(OpCode::ArrAlloc, 0, 1));
+        module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+        let report = analyze_module(&module);
+        assert_eq!(report.total.heap_allocation_sites, 1);
+        assert_eq!(report.total.arena_eligible_allocation_sites, 0);
+        assert_eq!(report.total.general_heap_allocation_sites, 1);
+        assert!(!report.allocation_sites[0].arena_eligible);
     }
 
     #[test]
