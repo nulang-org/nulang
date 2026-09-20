@@ -406,12 +406,37 @@ impl CacheMigrationJournal {
         key: CacheMigrationKey,
         message: &CacheTransportMessage,
     ) -> io::Result<()> {
+        let has_ttl = message_has_relative_ttl(message);
+        let wall_anchor = has_ttl.then(current_unix_ms).transpose()?;
+        self.record_transfer_sent_at(key, message, wall_anchor)
+    }
+
+    /// Record an exact transfer request with a conservative wall-clock anchor
+    /// captured by the caller before source export. TTL-bearing requests require
+    /// the anchor; persistent-only requests do not.
+    pub fn record_transfer_sent_at(
+        &mut self,
+        key: CacheMigrationKey,
+        message: &CacheTransportMessage,
+        wall_anchor_unix_ms: Option<u64>,
+    ) -> io::Result<()> {
         let (transfer_id, placement_epoch, slot, source, target) =
             transfer_request_identity(message)?;
         require_message_matches_migration(key, placement_epoch, slot, source, target)?;
         let state = self.require_state(key)?;
+        let has_ttl = message_has_relative_ttl(message);
+        if has_ttl && wall_anchor_unix_ms.is_none() {
+            return Err(invalid_data(
+                "TTL transfer requires a durable pre-export wall-clock anchor",
+            ));
+        }
         if let Some(existing) = state.transfers.get(&transfer_id) {
             if &existing.request == message {
+                if has_ttl && existing.wall_anchor_unix_ms.is_none() {
+                    return Err(invalid_data(
+                        "durable TTL transfer is missing its wall-clock anchor",
+                    ));
+                }
                 return Ok(());
             }
             return Err(invalid_data("transfer id reused with different request"));
@@ -444,14 +469,7 @@ impl CacheMigrationJournal {
             .transfer_order
             .push(transfer_id);
 
-        let has_ttl = match message {
-            CacheTransportMessage::TransferBatch { batch, .. } => {
-                batch.entries.iter().any(|entry| entry.ttl_ms.is_some())
-            }
-            _ => false,
-        };
-        if has_ttl {
-            let anchor = current_unix_ms()?;
+        if let Some(anchor) = wall_anchor_unix_ms {
             let mut anchor_payload = Vec::with_capacity(46);
             write_key(&mut anchor_payload, key);
             write_u64(&mut anchor_payload, transfer_id);
@@ -968,6 +986,15 @@ fn write_blob(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
     Ok(())
+}
+
+fn message_has_relative_ttl(message: &CacheTransportMessage) -> bool {
+    match message {
+        CacheTransportMessage::TransferBatch { batch, .. } => {
+            batch.entries.iter().any(|entry| entry.ttl_ms.is_some())
+        }
+        _ => false,
+    }
 }
 
 fn current_unix_ms() -> io::Result<u64> {
