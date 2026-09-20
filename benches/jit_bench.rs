@@ -85,6 +85,28 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
 /// quantifies the real-world JIT gap for call-heavy loops — the largest
 /// remaining coverage hole — against the pure-interpreter `interp/function_call`
 /// baseline and the no-call `jit/hot_loop_warm` ceiling.
+fn bench_jit_straight_line_entry(c: &mut Criterion) {
+    // STRAIGHT_LINE_MIN-sized arithmetic body: after warming, each run enters
+    // one already-compiled non-reentrant region exactly once. This isolates
+    // the JIT transition path that direct frame-register execution optimizes.
+    let source = "var x = 1; x = x + 1; x = x * 2; x = x - 1; x = x + 3; x = x * 2; x = x - 4; x = x + 5; x";
+    let module = compile(source);
+
+    c.bench_function("jit/straight_line_warm_entry", |b| {
+        b.iter_batched(
+            || {
+                let mut vm = fresh_vm(&module);
+                for _ in 0..1100 {
+                    let _ = vm.run();
+                }
+                vm
+            },
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 fn bench_jit_function_call_loop(c: &mut Criterion) {
     let source = "fn add(x: Int, y: Int) -> Int { x + y }; var sum = 0; var i = 0; while i < 100000 { sum = add(sum, i); i = i + 1; }; sum";
     let module = compile(source);
@@ -116,4 +138,9 @@ fn bench_jit_function_call_loop(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_jit_hot_loop, bench_jit_function_call_loop);
+criterion_group!(
+    benches,
+    bench_jit_hot_loop,
+    bench_jit_straight_line_entry,
+    bench_jit_function_call_loop
+);
