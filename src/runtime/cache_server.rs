@@ -724,8 +724,8 @@ impl CacheServiceBuilder {
             .with_cluster_redirects(endpoints.clone());
 
             let store = match restore_snapshot_path {
-                Some(path) if path.exists() => restore_cache_snapshot(&path, clock.now_ms())?,
-                Some(_) | None => CacheStore::new(),
+                Some(path) => restore_cache_snapshot(&path, clock.now_ms())?,
+                None => CacheStore::new(),
             };
 
             let server = CacheShardServer::from_listener(
