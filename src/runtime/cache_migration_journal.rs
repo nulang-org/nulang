@@ -104,7 +104,6 @@ impl CacheMigrationRecoveryState {
         ids
     }
 
-
     /// Exact transfer envelopes in durable append order.
     ///
     /// Order matters when multiple source generations of the same key were
@@ -1199,9 +1198,13 @@ mod tests {
             let mut journal = CacheMigrationJournal::open(&path).unwrap();
             journal.record_intent(migration, incarnation()).unwrap();
             journal.record_transfer_sent(migration, &first).unwrap();
-            journal.record_transfer_ack(migration, &ack(migration, 20)).unwrap();
+            journal
+                .record_transfer_ack(migration, &ack(migration, 20))
+                .unwrap();
             journal.record_transfer_sent(migration, &second).unwrap();
-            journal.record_transfer_ack(migration, &ack(migration, 10)).unwrap();
+            journal
+                .record_transfer_ack(migration, &ack(migration, 10))
+                .unwrap();
             journal.record_source_remaining(migration, 0).unwrap();
 
             let state = journal.recovery_state(migration).unwrap();
