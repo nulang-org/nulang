@@ -10,6 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use parking_lot::Mutex;
+use rand_core::{OsRng, RngCore};
 
 use super::cache::{
     CacheStore, CacheTransferBatch, CacheTransferCursor, CacheTransferEntry, CacheTransferFinalize,
@@ -28,6 +30,10 @@ use super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap, CacheRouti
 use super::cache_dispatch::{
     CacheDispatchChannels, CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher,
     CacheShardInbox,
+};
+use super::cache_migration_journal::{
+    CacheMigrationConvergenceEvidence, CacheMigrationJournal, CacheMigrationKey,
+    CacheMigrationRecoveryState,
 };
 use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
 use super::cache_routing::{CachePlacementError, CacheShardOwner, CacheSlotMap};
@@ -250,9 +256,7 @@ impl CacheTransferImportState {
             .entries
             .iter()
             .map(|entry| {
-                let result = self
-                    .tracker
-                    .import_entry(store, entry, elapsed_ms, now_ms);
+                let result = self.tracker.import_entry(store, entry, elapsed_ms, now_ms);
                 match result {
                     CacheTransferImport::Conflict => {
                         self.conflicts = self.conflicts.saturating_add(1);
@@ -267,12 +271,7 @@ impl CacheTransferImportState {
             .collect()
     }
 
-    fn snapshot(
-        &self,
-        store: &CacheStore,
-        slot: u16,
-        now_ms: u64,
-    ) -> CacheMigrationProbeSnapshot {
+    fn snapshot(&self, store: &CacheStore, slot: u16, now_ms: u64) -> CacheMigrationProbeSnapshot {
         CacheMigrationProbeSnapshot {
             live_entries: store.live_entries_in_slot(slot, now_ms),
             import_fences: self.tracker.len(),
@@ -406,6 +405,9 @@ pub struct CacheRemoteMigrationConvergence {
     pub target_import_fences: u64,
     pub target_conflicts: u64,
     pub target_wrong_slot: u64,
+    /// True when configured durable migration history agrees that every sent
+    /// transfer has a durable application ACK and this probe is fresh.
+    pub durable_history_satisfied: bool,
 }
 
 impl CacheRemoteMigrationConvergence {
@@ -418,6 +420,7 @@ impl CacheRemoteMigrationConvergence {
             && self.source_remaining == 0
             && self.target_conflicts == 0
             && self.target_wrong_slot == 0
+            && self.durable_history_satisfied
     }
 }
 
@@ -528,6 +531,10 @@ pub enum CacheServiceError {
     RemoteTransferNotActive(u16),
     RemoteTransferAckMismatch,
     RemoteMigrationProbeMismatch,
+    RemoteMigrationNotConverged(u16),
+    MigrationJournalUnavailable,
+    MigrationRecoveryNotFound,
+    MigrationRecoveryTransferNotFound(u64),
     ShardServer {
         shard: u16,
         source: CacheServerError,
@@ -567,6 +574,7 @@ pub struct CacheServiceBuilder {
     queue_capacity: usize,
     server_config: CacheServerConfig,
     transport_endpoint: Option<CacheServiceTransportEndpoint>,
+    migration_journal_path: Option<PathBuf>,
 }
 
 impl CacheServiceBuilder {
@@ -579,6 +587,7 @@ impl CacheServiceBuilder {
             queue_capacity: 1024,
             server_config: CacheServerConfig::default(),
             transport_endpoint: None,
+            migration_journal_path: None,
         }
     }
 
@@ -602,6 +611,12 @@ impl CacheServiceBuilder {
 
     pub fn with_transport_endpoint(mut self, endpoint: CacheServiceTransportEndpoint) -> Self {
         self.transport_endpoint = Some(endpoint);
+        self
+    }
+
+    /// Enable fsynced source-controller migration proof journaling.
+    pub fn with_migration_journal_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.migration_journal_path = Some(path.into());
         self
     }
 
@@ -659,6 +674,9 @@ impl CacheServiceBuilder {
 
         let placement_publisher = Arc::new(CachePlacementPublisher::new(self.placement.clone()));
         let clock = CacheServerClock::new();
+        let mut migration_incarnation = [0u8; 16];
+        let mut rng = OsRng;
+        rng.fill_bytes(&mut migration_incarnation);
         let mut servers = Vec::with_capacity(self.shards.len());
         let mut local_addrs = Vec::with_capacity(self.shards.len());
         let mut cpus = Vec::with_capacity(self.shards.len());
@@ -691,6 +709,12 @@ impl CacheServiceBuilder {
             cpus.push(cpu);
         }
 
+        let migration_journal = self
+            .migration_journal_path
+            .as_ref()
+            .map(CacheMigrationJournal::open)
+            .transpose()?;
+
         Ok(CacheService {
             local_node_id: self.local_node_id,
             servers,
@@ -699,6 +723,8 @@ impl CacheServiceBuilder {
             cpus,
             placement_publisher,
             transport_endpoint: self.transport_endpoint,
+            migration_journal,
+            migration_incarnation,
         })
     }
 }
@@ -711,6 +737,8 @@ pub struct CacheService {
     cpus: Vec<Option<usize>>,
     placement_publisher: Arc<CachePlacementPublisher>,
     transport_endpoint: Option<CacheServiceTransportEndpoint>,
+    migration_journal: Option<CacheMigrationJournal>,
+    migration_incarnation: [u8; 16],
 }
 
 impl CacheService {
@@ -728,6 +756,9 @@ impl CacheService {
             .transport_endpoint
             .as_ref()
             .map(CacheServiceTransportEndpoint::sender);
+        let migration_journal = self
+            .migration_journal
+            .map(|journal| Arc::new(Mutex::new(journal)));
         let network_shutdown = Arc::new(AtomicBool::new(false));
         let network_retry = Arc::new(Mutex::new(CacheNetworkRetryState::new(
             CACHE_NETWORK_PENDING_ENTRIES,
@@ -815,6 +846,9 @@ impl CacheService {
             network_events: has_transport.then_some(network_event_rx),
             network_timeouts: has_transport.then_some(network_timeout_rx),
             network_retry: has_transport.then_some(network_retry),
+            migration_journal,
+            migration_incarnation: self.migration_incarnation,
+            migration_proofs: Mutex::new(HashMap::new()),
             network_thread,
             network_shutdown,
         })
@@ -832,6 +866,9 @@ pub struct CacheServiceHandle {
     network_events: Option<Receiver<CacheTransportInbound>>,
     network_timeouts: Option<Receiver<CacheNetworkTimeout>>,
     network_retry: Option<Arc<Mutex<CacheNetworkRetryState>>>,
+    migration_journal: Option<Arc<Mutex<CacheMigrationJournal>>>,
+    migration_incarnation: [u8; 16],
+    migration_proofs: Mutex<HashMap<CacheMigrationKey, CacheRemoteMigrationConvergence>>,
     network_thread: Option<JoinHandle<()>>,
     network_shutdown: Arc<AtomicBool>,
 }
@@ -847,6 +884,32 @@ impl CacheServiceHandle {
 
     pub fn published_placement_epoch(&self) -> u64 {
         self.placement_publisher.published_epoch()
+    }
+
+    /// Identifies the currently live source CacheStore incarnation.
+    ///
+    /// A new cache-service process gets a new value; durable migration history
+    /// from a different incarnation cannot be extended while CacheStore itself
+    /// remains ephemeral.
+    pub fn migration_incarnation(&self) -> [u8; 16] {
+        self.migration_incarnation
+    }
+
+    /// Durable unfinished/completed migration state reconstructed on journal open.
+    pub fn recovered_remote_migrations(&self) -> Vec<CacheMigrationRecoveryState> {
+        self.migration_journal
+            .as_ref()
+            .map(|journal| journal.lock().recovery_states().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn recovered_remote_migration(
+        &self,
+        key: CacheMigrationKey,
+    ) -> Option<CacheMigrationRecoveryState> {
+        self.migration_journal
+            .as_ref()
+            .and_then(|journal| journal.lock().recovery_state(key).cloned())
     }
 
     pub fn shard_placement_epochs(&self) -> Vec<u64> {
@@ -936,11 +999,173 @@ impl CacheServiceHandle {
     /// thread-local dispatcher, and then return to lock-free indexed routing.
     pub fn install_placement(&self, placement: CacheSlotMap) -> Result<(), CacheServiceError> {
         validate_placement_endpoints(&placement, &self.endpoints)?;
-        self.placement_publisher.publish(placement)?;
+        let current = self.placement_publisher.snapshot();
+        if placement.epoch() <= current.epoch() {
+            return Err(CacheServiceError::StalePlacementEpoch {
+                current: current.epoch(),
+                proposed: placement.epoch(),
+            });
+        }
+
+        let mut committing = Vec::new();
+        {
+            let proofs = self.migration_proofs.lock();
+            for (slot, migration) in current.migrations() {
+                // Only the source service owns the destructive commit proof for
+                // a remote migration. Target/observer nodes may install the
+                // already-decided topology without duplicating source state.
+                if migration.source.node_id != self.local_node_id
+                    || migration.target.node_id == self.local_node_id
+                {
+                    continue;
+                }
+                let commits_to_target = placement.migration_for_slot(slot).is_none()
+                    && placement.owner_for_slot(slot) == Some(migration.target);
+                if !commits_to_target {
+                    continue;
+                }
+
+                let key = CacheMigrationKey {
+                    started_epoch: migration.started_epoch,
+                    slot,
+                    source: migration.source,
+                    target: migration.target,
+                };
+                let Some(proof) = proofs.get(&key) else {
+                    return Err(CacheServiceError::RemoteMigrationNotConverged(slot));
+                };
+                if proof.placement_epoch != current.epoch() || !proof.ready_for_live_commit() {
+                    return Err(CacheServiceError::RemoteMigrationNotConverged(slot));
+                }
+                committing.push(key);
+            }
+        }
+
+        let mut journaled_intents = Vec::new();
+        if let Some(journal) = &self.migration_journal {
+            let mut journal = journal.lock();
+            for key in &committing {
+                if let Err(error) = journal.record_commit_intent(*key, placement.epoch()) {
+                    for written in journaled_intents.drain(..) {
+                        let _ = journal.record_commit_aborted(written, placement.epoch());
+                    }
+                    return Err(CacheServiceError::Io(error));
+                }
+                journaled_intents.push(*key);
+            }
+        }
+
+        if let Err(error) = self.placement_publisher.publish(placement.clone()) {
+            if let Some(journal) = &self.migration_journal {
+                let mut journal = journal.lock();
+                for key in journaled_intents {
+                    let _ = journal.record_commit_aborted(key, placement.epoch());
+                }
+            }
+            return Err(error);
+        }
+
+        if let Some(journal) = &self.migration_journal {
+            let mut journal = journal.lock();
+            for key in &committing {
+                journal.record_completed(*key, placement.epoch())?;
+            }
+        }
+        if !committing.is_empty() {
+            let mut proofs = self.migration_proofs.lock();
+            for key in &committing {
+                proofs.remove(key);
+            }
+        }
+
         for control in &self.controls {
             control.wake();
         }
         Ok(())
+    }
+
+    /// Re-send an exact durable transfer envelope after controller recovery.
+    ///
+    /// No source re-export occurs: the recovered request keeps the original
+    /// transfer id, source generation tokens, TTL snapshot, and wire epoch.
+    pub fn retry_recovered_remote_transfer(
+        &self,
+        key: CacheMigrationKey,
+        transfer_id: u64,
+    ) -> Result<CacheRemoteTransferPending, CacheServiceError> {
+        let journal = self
+            .migration_journal
+            .as_ref()
+            .ok_or(CacheServiceError::MigrationJournalUnavailable)?;
+        let state = journal
+            .lock()
+            .recovery_state(key)
+            .cloned()
+            .ok_or(CacheServiceError::MigrationRecoveryNotFound)?;
+        let transfer = state.transfers.get(&transfer_id).ok_or(
+            CacheServiceError::MigrationRecoveryTransferNotFound(transfer_id),
+        )?;
+        let CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch,
+            source,
+            target,
+            batch,
+        } = &transfer.request
+        else {
+            return Err(CacheServiceError::MigrationRecoveryTransferNotFound(
+                transfer_id,
+            ));
+        };
+
+        let placement = self.placement_publisher.snapshot();
+        let Some(migration) = placement.migration_for_slot(key.slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
+        };
+        if migration.started_epoch != key.started_epoch
+            || migration.source != key.source
+            || migration.target != key.target
+            || *source != key.source
+            || *target != key.target
+        {
+            return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
+        }
+
+        let pending = CacheRemoteTransferPending {
+            transfer_id: *transfer_id,
+            placement_epoch: *placement_epoch,
+            source: *source,
+            target: *target,
+            batch: batch.clone(),
+        };
+        self.retry_remote_slot_batch(&pending)?;
+        Ok(pending)
+    }
+
+    /// Issue the mandatory fresh convergence probe for a recovered migration.
+    pub fn reprobe_recovered_remote_migration(
+        &self,
+        key: CacheMigrationKey,
+        probe_id: u64,
+    ) -> Result<(), CacheServiceError> {
+        let journal = self
+            .migration_journal
+            .as_ref()
+            .ok_or(CacheServiceError::MigrationJournalUnavailable)?;
+        if journal.lock().recovery_state(key).is_none() {
+            return Err(CacheServiceError::MigrationRecoveryNotFound);
+        }
+        let placement = self.placement_publisher.snapshot();
+        let Some(migration) = placement.migration_for_slot(key.slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
+        };
+        if migration.started_epoch != key.started_epoch
+            || migration.source != key.source
+            || migration.target != key.target
+        {
+            return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
+        }
+        self.send_remote_migration_probe(key.source.shard, key.target, key.slot, probe_id)
     }
 
     /// Probe the target reactor for exact-epoch migration convergence state.
@@ -964,6 +1189,18 @@ impl CacheServiceHandle {
         };
         if migration.source != source || migration.target != target {
             return Err(CacheServiceError::RemoteTransferNotActive(slot));
+        }
+
+        if let Some(journal) = &self.migration_journal {
+            journal.lock().record_intent(
+                CacheMigrationKey {
+                    started_epoch: migration.started_epoch,
+                    slot,
+                    source,
+                    target,
+                },
+                self.migration_incarnation,
+            )?;
         }
 
         self.send_network_message(
@@ -1004,11 +1241,13 @@ impl CacheServiceHandle {
         }
 
         let placement = self.placement_publisher.snapshot();
-        if placement.epoch() != *placement_epoch
-            || placement
-                .migration_for_slot(*slot)
-                .is_none_or(|migration| migration.source != *source || migration.target != *target)
-        {
+        if placement.epoch() != *placement_epoch {
+            return Err(CacheServiceError::RemoteMigrationProbeMismatch);
+        }
+        let Some(migration) = placement.migration_for_slot(*slot) else {
+            return Err(CacheServiceError::RemoteMigrationProbeMismatch);
+        };
+        if migration.source != *source || migration.target != *target {
             return Err(CacheServiceError::RemoteMigrationProbeMismatch);
         }
 
@@ -1022,7 +1261,35 @@ impl CacheServiceHandle {
             .recv()
             .map_err(|_| CacheServiceError::ControlDisconnected(source.shard))?;
 
-        Ok(CacheRemoteMigrationConvergence {
+        let evidence = CacheMigrationConvergenceEvidence {
+            probe_id: *probe_id,
+            target_accepted: *accepted,
+            source_remaining,
+            target_live_entries: *live_entries,
+            target_import_fences: *import_fences,
+            target_conflicts: *conflicts,
+            target_wrong_slot: *wrong_slot,
+        };
+        let durable_history_satisfied = if let Some(journal) = &self.migration_journal {
+            let key = CacheMigrationKey {
+                started_epoch: migration.started_epoch,
+                slot: *slot,
+                source: *source,
+                target: *target,
+            };
+            let mut journal = journal.lock();
+            journal.record_intent(key, self.migration_incarnation)?;
+            journal.record_source_remaining(key, source_remaining)?;
+            let satisfied = journal
+                .recovery_state(key)
+                .is_some_and(|state| state.accepts_fresh_convergence(&evidence));
+            journal.record_convergence(key, evidence.clone())?;
+            satisfied
+        } else {
+            true
+        };
+
+        let report = CacheRemoteMigrationConvergence {
             probe_id: *probe_id,
             placement_epoch: *placement_epoch,
             slot: *slot,
@@ -1034,7 +1301,18 @@ impl CacheServiceHandle {
             target_import_fences: *import_fences,
             target_conflicts: *conflicts,
             target_wrong_slot: *wrong_slot,
-        })
+            durable_history_satisfied,
+        };
+        self.migration_proofs.lock().insert(
+            CacheMigrationKey {
+                started_epoch: migration.started_epoch,
+                slot: *slot,
+                source: *source,
+                target: *target,
+            },
+            report.clone(),
+        );
+        Ok(report)
     }
 
     /// Export one bounded source batch and send it to a remote migration target.
@@ -1090,16 +1368,28 @@ impl CacheServiceHandle {
             target,
             batch,
         };
-        self.send_network_message(
-            NodeId(target.node_id),
-            CacheTransportMessage::TransferBatch {
-                transfer_id,
-                placement_epoch: pending.placement_epoch,
+        let message = CacheTransportMessage::TransferBatch {
+            transfer_id,
+            placement_epoch: pending.placement_epoch,
+            source,
+            target,
+            batch: pending.batch.clone(),
+        };
+        if let Some(journal) = &self.migration_journal {
+            let key = CacheMigrationKey {
+                started_epoch: migration.started_epoch,
+                slot,
                 source,
                 target,
-                batch: pending.batch.clone(),
-            },
-        )?;
+            };
+            let mut journal = journal.lock();
+            journal.record_intent(key, self.migration_incarnation)?;
+            // Durable-before-send: if the process fails after this fsync but
+            // before transport enqueue, recovery safely treats the batch as
+            // possibly sent and can retry the exact envelope.
+            journal.record_transfer_sent(key, &message)?;
+        }
+        self.send_network_message(NodeId(target.node_id), message)?;
         Ok(pending)
     }
 
@@ -1113,32 +1403,39 @@ impl CacheServiceHandle {
         pending: &CacheRemoteTransferPending,
     ) -> Result<(), CacheServiceError> {
         let placement = self.placement_publisher.snapshot();
-        if placement.epoch() != pending.placement_epoch {
-            return Err(CacheServiceError::RemoteTransferNotActive(
-                pending.batch.slot,
-            ));
-        }
         let Some(migration) = placement.migration_for_slot(pending.batch.slot) else {
             return Err(CacheServiceError::RemoteTransferNotActive(
                 pending.batch.slot,
             ));
         };
-        if migration.source != pending.source || migration.target != pending.target {
+        if migration.source != pending.source
+            || migration.target != pending.target
+            || pending.placement_epoch < migration.started_epoch
+        {
             return Err(CacheServiceError::RemoteTransferNotActive(
                 pending.batch.slot,
             ));
         }
 
-        self.send_network_message(
-            NodeId(pending.target.node_id),
-            CacheTransportMessage::TransferBatch {
-                transfer_id: pending.transfer_id,
-                placement_epoch: pending.placement_epoch,
+        let message = CacheTransportMessage::TransferBatch {
+            transfer_id: pending.transfer_id,
+            placement_epoch: pending.placement_epoch,
+            source: pending.source,
+            target: pending.target,
+            batch: pending.batch.clone(),
+        };
+        if let Some(journal) = &self.migration_journal {
+            let key = CacheMigrationKey {
+                started_epoch: migration.started_epoch,
+                slot: pending.batch.slot,
                 source: pending.source,
                 target: pending.target,
-                batch: pending.batch.clone(),
-            },
-        )
+            };
+            let mut journal = journal.lock();
+            journal.record_intent(key, self.migration_incarnation)?;
+            journal.record_transfer_sent(key, &message)?;
+        }
+        self.send_network_message(NodeId(pending.target.node_id), message)
     }
 
     /// Apply a matching remote TransferAck and generation-fence source deletion.
@@ -1168,6 +1465,33 @@ impl CacheServiceHandle {
             || results.len() != pending.batch.entries.len()
         {
             return Err(CacheServiceError::RemoteTransferAckMismatch);
+        }
+
+        let placement = self.placement_publisher.snapshot();
+        let Some(migration) = placement.migration_for_slot(pending.batch.slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        };
+        if migration.source != pending.source
+            || migration.target != pending.target
+            || pending.placement_epoch < migration.started_epoch
+        {
+            return Err(CacheServiceError::RemoteTransferNotActive(
+                pending.batch.slot,
+            ));
+        }
+
+        if let Some(journal) = &self.migration_journal {
+            let key = CacheMigrationKey {
+                started_epoch: migration.started_epoch,
+                slot: pending.batch.slot,
+                source: pending.source,
+                target: pending.target,
+            };
+            // Durable-before-delete: source generations cannot be finalized
+            // unless the matching application ACK is already fsynced.
+            journal.lock().record_transfer_ack(key, &event.message)?;
         }
 
         let mut imported = 0;
@@ -1226,6 +1550,18 @@ impl CacheServiceHandle {
         let source_remaining = count_rx
             .recv()
             .map_err(|_| CacheServiceError::ControlDisconnected(pending.source.shard))?;
+
+        if let Some(journal) = &self.migration_journal {
+            journal.lock().record_source_remaining(
+                CacheMigrationKey {
+                    started_epoch: migration.started_epoch,
+                    slot: pending.batch.slot,
+                    source: pending.source,
+                    target: pending.target,
+                },
+                source_remaining,
+            )?;
+        }
 
         Ok(CacheRemoteTransferReport {
             transfer_id: pending.transfer_id,
@@ -1941,24 +2277,18 @@ fn handle_cache_network_inbound(
             target,
             slot,
         } => {
-            let snapshot = probe_remote_migration_on_reactor(
-                controls,
-                target,
-                placement_epoch,
-                slot,
-                source,
-            );
-            let (accepted, live_entries, import_fences, conflicts, wrong_slot) =
-                match snapshot {
-                    Some(snapshot) => (
-                        true,
-                        snapshot.live_entries.min(u64::MAX as usize) as u64,
-                        snapshot.import_fences.min(u64::MAX as usize) as u64,
-                        snapshot.conflicts,
-                        snapshot.wrong_slot,
-                    ),
-                    None => (false, 0, 0, 0, 0),
-                };
+            let snapshot =
+                probe_remote_migration_on_reactor(controls, target, placement_epoch, slot, source);
+            let (accepted, live_entries, import_fences, conflicts, wrong_slot) = match snapshot {
+                Some(snapshot) => (
+                    true,
+                    snapshot.live_entries.min(u64::MAX as usize) as u64,
+                    snapshot.import_fences.min(u64::MAX as usize) as u64,
+                    snapshot.conflicts,
+                    snapshot.wrong_slot,
+                ),
+                None => (false, 0, 0, 0, 0),
+            };
             let reply = CacheTransportMessage::MigrationProbeResponse {
                 probe_id,
                 placement_epoch,
@@ -2118,7 +2448,8 @@ fn reject_cache_network_id_reuse(
                         placement_epoch,
                         slot,
                         responder: target,
-                        response: b"-ERR cache request id reused with different payload\r\n".to_vec(),
+                        response: b"-ERR cache request id reused with different payload\r\n"
+                            .to_vec(),
                     },
                 },
             );
@@ -2698,8 +3029,7 @@ impl CacheShardServer {
                     .transfer_imports
                     .entry(batch.slot)
                     .or_insert_with(|| CacheTransferImportState::new(batch.slot));
-                let results =
-                    state.import_batch(&mut self.store, &batch, elapsed_ms, now_ms);
+                let results = state.import_batch(&mut self.store, &batch, elapsed_ms, now_ms);
                 let _ = reply.send(results);
             }
             CacheShardControlRequest::Finalize { entries, reply } => {

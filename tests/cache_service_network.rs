@@ -3,14 +3,15 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdTcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nulang::runtime::{
-    cache_transport_bridge, redis_slot, CacheAdvertisedEndpoint, CacheServiceBuilder,
-    CacheServiceHandle, CacheServiceShardConfig, CacheShardOwner, CacheSlotMap,
-    CacheTransportInbound, CacheTransportMessage, DeterministicNetworkTransport, IncomingPacket,
-    NodeId, OutgoingPacket, Runtime,
+    cache_transport_bridge, redis_slot, CacheAdvertisedEndpoint, CacheMigrationJournal,
+    CacheMigrationKey, CacheServiceBuilder, CacheServiceHandle, CacheServiceShardConfig,
+    CacheShardOwner, CacheSlotMap, CacheTransportInbound, CacheTransportMessage,
+    DeterministicNetworkTransport, IncomingPacket, NodeId, OutgoingPacket, Runtime,
 };
 
 type Bus = Arc<
@@ -24,6 +25,17 @@ type Bus = Arc<
         >,
     >,
 >;
+
+fn temp_journal_path(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "nulang-cache-{name}-{}-{nonce}.journal",
+        std::process::id()
+    ))
+}
 
 fn distributed_runtime(addr: SocketAddr, bus: Bus) -> Runtime {
     let mut runtime = Runtime::new();
@@ -221,9 +233,7 @@ fn remote_cache_command_executes_on_owning_reactor_and_stale_epoch_fails_closed(
         target,
         frame: frame(&[b"SET", key, b"stale"]),
     };
-    service_a
-        .send_network_message(node_b, stale_set)
-        .unwrap();
+    service_a.send_network_message(node_b, stale_set).unwrap();
     let response = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
     match response.message {
         CacheTransportMessage::CommandResponse {
@@ -243,6 +253,7 @@ fn remote_cache_command_executes_on_owning_reactor_and_stale_epoch_fails_closed(
 
 #[test]
 fn remote_slot_migration_moves_data_then_commits_ownership() {
+    let journal_path = temp_journal_path("full-migration");
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let addr_a: SocketAddr = "127.0.0.1:33401".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:33402".parse().unwrap();
@@ -283,6 +294,7 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
     runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
 
     let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_migration_journal_path(&journal_path)
         .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53402))
         .with_shard(CacheServiceShardConfig::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -317,9 +329,7 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
     assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
 
     let mut migrating = base;
-    migrating
-        .begin_migration(1, slot, source, target)
-        .unwrap();
+    migrating.begin_migration(1, slot, source, target).unwrap();
     service_a.install_placement(migrating.clone()).unwrap();
     service_b.install_placement(migrating.clone()).unwrap();
     wait_epoch(&service_a, 1);
@@ -344,16 +354,39 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
         .send_remote_migration_probe(0, target, slot, 9002)
         .unwrap();
     let probe = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
-    let convergence = service_a
-        .complete_remote_migration_probe(&probe)
-        .unwrap();
+    let convergence = service_a.complete_remote_migration_probe(&probe).unwrap();
     assert_eq!(convergence.probe_id, 9002);
     assert_eq!(convergence.source_remaining, 0);
     assert_eq!(convergence.target_live_entries, 1);
     assert_eq!(convergence.target_import_fences, 1);
     assert_eq!(convergence.target_conflicts, 0);
     assert_eq!(convergence.target_wrong_slot, 0);
+    assert!(convergence.durable_history_satisfied);
     assert!(convergence.ready_for_live_commit());
+
+    let journal_key = CacheMigrationKey {
+        started_epoch: 1,
+        slot,
+        source,
+        target,
+    };
+    let recovered = service_a
+        .recovered_remote_migration(journal_key)
+        .expect("durable migration proof");
+    assert_eq!(
+        recovered.source_incarnation,
+        service_a.migration_incarnation()
+    );
+    assert_eq!(recovered.source_remaining, Some(0));
+    assert!(recovered.all_sent_transfers_acked());
+    assert_eq!(recovered.expected_import_fences(), 1);
+    assert_eq!(
+        recovered
+            .convergence
+            .as_ref()
+            .map(|evidence| evidence.probe_id),
+        Some(9002)
+    );
 
     // The source is drained but remains stable owner until commit, so it asks.
     source_client.write_all(&frame(&[b"GET", key])).unwrap();
@@ -365,18 +398,14 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
     target_client
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    target_client
-        .write_all(&frame(&[b"ASKING"]))
-        .unwrap();
+    target_client.write_all(&frame(&[b"ASKING"])).unwrap();
     assert_eq!(read_resp_line(&mut target_client), b"+OK\r\n");
     target_client.write_all(&frame(&[b"GET", key])).unwrap();
     let mut imported = [0u8; 11];
     target_client.read_exact(&mut imported).unwrap();
     assert_eq!(&imported, b"$5\r\nvalue\r\n");
 
-    migrating
-        .commit_migration(2, slot, source, target)
-        .unwrap();
+    migrating.commit_migration(2, slot, source, target).unwrap();
     service_a.install_placement(migrating.clone()).unwrap();
     service_b.install_placement(migrating).unwrap();
     wait_epoch(&service_a, 2);
@@ -394,6 +423,62 @@ fn remote_slot_migration_moves_data_then_commits_ownership() {
 
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
+
+    let journal = CacheMigrationJournal::open(&journal_path).unwrap();
+    let recovered = journal
+        .recovery_state(journal_key)
+        .expect("journal should survive service shutdown");
+    assert_eq!(recovered.source_remaining, Some(0));
+    assert!(recovered.all_sent_transfers_acked());
+    assert_eq!(recovered.pending_commit_epoch, None);
+    assert_eq!(recovered.completed_commit_epoch, Some(2));
+    std::fs::remove_file(journal_path).unwrap();
+}
+
+#[test]
+fn remote_migration_commit_without_convergence_proof_is_rejected() {
+    let addr_a: SocketAddr = "127.0.0.1:33451".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33452".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+    let key = b"commit-gate-key";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let base = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+
+    let service = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53452))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut migrating = base;
+    migrating.begin_migration(1, slot, source, target).unwrap();
+    service.install_placement(migrating.clone()).unwrap();
+    wait_epoch(&service, 1);
+
+    migrating.commit_migration(2, slot, source, target).unwrap();
+    assert!(matches!(
+        service.install_placement(migrating),
+        Err(nulang::runtime::CacheServiceError::RemoteMigrationNotConverged(
+            rejected_slot
+        )) if rejected_slot == slot
+    ));
+    assert_eq!(service.published_placement_epoch(), 1);
+
+    service.shutdown().unwrap();
 }
 
 #[test]
@@ -470,9 +555,7 @@ fn stale_remote_transfer_epoch_never_finalizes_source_key() {
     assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
 
     let mut migrating = base;
-    migrating
-        .begin_migration(1, slot, source, target)
-        .unwrap();
+    migrating.begin_migration(1, slot, source, target).unwrap();
     service_a.install_placement(migrating.clone()).unwrap();
     service_b.install_placement(migrating.clone()).unwrap();
     wait_epoch(&service_a, 1);
@@ -512,7 +595,6 @@ fn stale_remote_transfer_epoch_never_finalizes_source_key() {
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
 }
-
 
 #[test]
 fn duplicate_remote_command_replays_cached_response_without_reexecution() {
@@ -616,9 +698,7 @@ fn duplicate_remote_command_replays_cached_response_without_reexecution() {
         other => panic!("unexpected cache response: {other:?}"),
     }
 
-    service_a
-        .send_network_message(node_b, increment)
-        .unwrap();
+    service_a.send_network_message(node_b, increment).unwrap();
     let duplicate = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
     match duplicate.message {
         CacheTransportMessage::CommandResponse { response, .. } => {
@@ -650,9 +730,7 @@ fn duplicate_remote_command_replays_cached_response_without_reexecution() {
         target,
         frame: frame(&[b"GET", key]),
     };
-    service_a
-        .send_network_message(node_b, reused_id)
-        .unwrap();
+    service_a.send_network_message(node_b, reused_id).unwrap();
     let rejected = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
     match rejected.message {
         CacheTransportMessage::CommandResponse { response, .. } => {
@@ -668,9 +746,9 @@ fn duplicate_remote_command_replays_cached_response_without_reexecution() {
     service_b.shutdown().unwrap();
 }
 
-
 #[test]
 fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
+    let journal_path = temp_journal_path("recovered-transfer");
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let addr_a: SocketAddr = "127.0.0.1:33701".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:33702".parse().unwrap();
@@ -710,6 +788,7 @@ fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
     runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
 
     let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_migration_journal_path(&journal_path)
         .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53702))
         .with_shard(CacheServiceShardConfig::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -752,7 +831,16 @@ fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
     let pending = service_a
         .send_remote_slot_batch(0, target, slot, None, 8, 9301)
         .unwrap();
-    service_a.retry_remote_slot_batch(&pending).unwrap();
+    let journal_key = CacheMigrationKey {
+        started_epoch: 1,
+        slot,
+        source,
+        target,
+    };
+    let recovered_pending = service_a
+        .retry_recovered_remote_transfer(journal_key, 9301)
+        .unwrap();
+    assert_eq!(recovered_pending, pending);
 
     let first = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
     let second = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
@@ -795,8 +883,8 @@ fn duplicate_remote_transfer_replays_original_ack_without_reimport() {
 
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
+    std::fs::remove_file(journal_path).unwrap();
 }
-
 
 #[test]
 fn automatic_remote_command_retry_recovers_after_partition_heals() {
@@ -1040,7 +1128,6 @@ fn exhausted_remote_command_retry_reports_unknown_execution_timeout() {
     service_b.shutdown().unwrap();
 }
 
-
 #[test]
 fn exhausted_remote_transfer_retry_preserves_source_without_ack() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -1169,7 +1256,6 @@ fn exhausted_remote_transfer_retry_preserves_source_without_ack() {
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
 }
-
 
 #[test]
 fn automatic_remote_transfer_retry_recovers_without_early_source_finalize() {
