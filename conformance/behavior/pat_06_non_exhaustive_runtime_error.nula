@@ -1,8 +1,11 @@
+// Closed variant matches are checked for exhaustiveness at compile time.
 type Color = Red | Green | Blue
+
 fn name(c: Color) -> String {
     match c {
         | Red => "red"
         | Green => "green"
     }
 }
+
 perform IO.print(name(Blue))
