@@ -72,6 +72,10 @@ ffi = ["dep:libloading", "dep:libffi"]
 # (their entry points return errors) while keeping the wire protocol, packet
 # types, and the in-memory deterministic transport.
 tcp = []
+# Dedicated RESP cache reactor. Kept separate from the existing std-only TCP
+# surfaces so embedders do not pay for an OS readiness reactor unless they
+# actually serve the cache protocol.
+cache-server = ["tcp", "dep:mio"]
 # Synchronous HTTP client for `Http.get`/`Http.post` builtin effects, the
 # package registry client, and `nula deploy`. Disable for a minimal build
 # without the `ureq` dependency.
@@ -88,6 +92,7 @@ difffuzz = ["native-codegen"]
 mimalloc = "0.1"
 crossbeam = "0.8"
 parking_lot = "0.12"
+mio = { version = "1.2", features = ["os-poll", "net"], optional = true }
 # OS primitives (core affinity for thread-per-core pinning, unix-only)
 libc = "0.2"
 httparse = "1"

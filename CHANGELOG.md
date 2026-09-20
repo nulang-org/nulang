@@ -45,6 +45,85 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Typed actor protocol checking — 2026-09-20
+- **Static protocol validation for known actor references** (Experimental,
+  `src/actor_protocol.rs`, RFC 0023). Actor `send`/`ask` calls whose receiver
+  resolves statically to an actor declaration now reject unknown behaviors and
+  wrong arity, constrain behavior arguments through the existing HM checker,
+  and propagate conservatively known `ask` return types. Dynamic/opaque actor
+  references retain the previous compatibility behavior. The implementation is
+  a compiler pre-pass integrated directly into `TypeChecker::check_module`; it
+  does not alter runtime dispatch, persistence, or wire formats.
+- **Structural `ActorRef[P]` protocols** (Experimental). Public/generic actor
+  APIs can require a behavior record such as
+  `ActorRef[{ get: () -> Int, add: Int -> Unit }]`. Concrete actors advertise
+  declared behavior signatures through the existing `Type::Actor.behavior`
+  slot; concrete-to-`ActorRef` unification permits extra concrete behaviors
+  while requiring every requested behavior/signature. Calls through
+  `ActorRef[P]` are checked directly from `P`. The type is compile-time-only
+  and does not change runtime actor representation or stable formats.
+- **Directional ActorRef attenuation** (Experimental). Already-abstract
+  `ActorRef<P>` values may flow to narrower `ActorRef<Q>` requirements when
+  every required behavior/signature is present. Widening to claim missing
+  behaviors is rejected. The check is applied at value-to-expected-type
+  boundaries without making general HM unification asymmetric.
+
+### RESP-compatible cache kernel — 2026-09-19
+- **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
+  `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
+  mailboxes, the VM heap, and ORCA: small values inline, larger keys/values use
+  reusable size-class arena blocks, the index is contiguous open addressing,
+  TTL references are generation-fenced, and routing preserves Redis Cluster's
+  16,384 logical slots and hash tags. RESP2 command frames are parsed into
+  borrowed slices without allocating an argument vector. Criterion coverage
+  tracks local GET/SET churn, arena reuse, and slot hashing.
+- **Initial RESP command execution layer** (Experimental,
+  `src/runtime/resp_cache.rs`). PING/GET/SET/DEL/EXISTS/INCR/EXPIRE/TTL/MGET/MSET
+  execute directly against the shard-local cache. SET supports EX/PX, INCR
+  preserves TTL while promoting numeric byte strings to the packed integer
+  representation, and multi-key operations reject CROSSSLOT before mutation.
+- **Epoch-fenced Redis-slot placement table** (Experimental,
+  `src/runtime/cache_routing.rs`). All 16,384 logical slots resolve by direct
+  indexed lookup to a physical node/shard owner. Placement changes validate the
+  complete range batch before mutation and reject stale epochs or overlapping
+  assignments, keeping topology coordination off the GET/SET hot path.
+- **Cache-specific local/remote dispatch boundary** (Experimental,
+  `src/runtime/cache_dispatch.rs`). Same-shard commands execute directly on
+  the owning `CacheStore`; other local shards use bounded request/reply queues
+  with explicit backpressure, while remote ownership produces a transport
+  handoff tagged with slot and placement epoch. RESP frames are copied only
+  when crossing a shard or node boundary.
+- **Ordered RESP connection pipeline** (Experimental,
+  `src/runtime/cache_pipeline.rs`). Cross-shard and remote completions may
+  arrive out of order, but responses are buffered behind a bounded
+  per-connection sequencer and emitted only as the longest contiguous completed
+  prefix. Direct responses stay immediate when no earlier async request is
+  pending; pipeline saturation is explicit backpressure.
+- **Redis Cluster MOVED redirect mode** (Experimental,
+  `src/runtime/cache_cluster.rs`, `src/runtime/cache_dispatch.rs`). Physical
+  cache owners can advertise preformatted RESP endpoints. Redirect mode sends
+  `MOVED` immediately for keyed commands received by a non-owning shard or
+  node, while transparent mode retains internal queue/transport routing.
+  Missing endpoint metadata fails closed rather than silently proxying.
+- **Redis Cluster topology discovery and compact default placement**
+  (Experimental, `src/runtime/cache_cluster.rs`,
+  `src/runtime/cache_routing.rs`). `CLUSTER KEYSLOT`, `CLUSTER SHARDS`,
+  and legacy `CLUSTER SLOTS` are served from the routing snapshot without
+  entering CacheStore. Default local ownership now uses balanced contiguous
+  slot ranges instead of modulo striping, keeping discovery payloads compact
+  while CRC16 preserves expected key balance.
+- **Dedicated per-shard RESP reactor** (Experimental, optional
+  `cache-server` feature, `src/runtime/cache_server.rs`). Mio readiness
+  polling keeps each physical shard's listener, connections, CacheStore,
+  expiration work, and RESP pipelines on one thread, independent of the actor
+  scheduler. Redirect mode is required so normal client traffic reaches the
+  owning shard directly. Cross-shard inbox activity and shutdown wake blocked
+  reactors through Mio Waker, while bounded connection/input/output/pipeline
+  limits provide explicit resource backpressure.
+
+### Progressive capability diagnostics — 2026-09-19
+- **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
+
 ### C embedding handle and function dispatch correctness — 2026-09-18
 - **Public module handles now resolve through the runtime handle table before
   accessing deduplicated compiled modules** (`src/ffi/c_api.rs`). Repeated

@@ -795,7 +795,113 @@ fn write_canonical_effect_row(row: &EffectRow, out: &mut Vec<u8>) {
 /// check, and generalization all handle it with no special casing.
 pub const RECORD_ROW_TAIL_FIELD: &str = "..";
 
+/// Reserved nominal constructor used by the source-level `ActorRef[P]` type.
+///
+/// This is a compile-time-only type constructor. Runtime actor values remain
+/// `Type::Actor`; unification checks a concrete actor's advertised behavior
+/// protocol against the required `ActorRef` protocol.
+pub const ACTOR_REF_TYPE_NAME: &str = "ActorRef";
+
 impl Type {
+    /// Construct the compile-time-only structural actor-reference type
+    /// `ActorRef[P]`. `P` is expected to be a record whose fields map
+    /// behavior names to function signatures.
+    pub fn actor_ref(protocol: Type) -> Type {
+        Type::App {
+            constructor: Box::new(Type::Nominal {
+                name: ACTOR_REF_TYPE_NAME.to_string(),
+                underlying: Box::new(Type::unit()),
+            }),
+            args: vec![protocol],
+        }
+    }
+
+    /// Return the required structural behavior protocol for `ActorRef[P]`.
+    pub fn actor_ref_protocol(&self) -> Option<&Type> {
+        match self {
+            Type::App { constructor, args } if args.len() == 1 => match constructor.as_ref() {
+                Type::Nominal { name, .. } if name == ACTOR_REF_TYPE_NAME => args.first(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Erase compile-time actor protocol information before HIR/runtime
+    /// lowering. Both explicit `ActorRef[P]` and concrete `Type::Actor`
+    /// protocol/state metadata collapse to the stable runtime actor shape.
+    ///
+    /// This is recursive so nested occurrences such as
+    /// `Option[ActorRef[P]]`, tuples, records, and function signatures cannot
+    /// leak protocol metadata into MIR, bytecode, persistence, or wire-facing
+    /// artifacts.
+    pub fn erase_actor_protocols(&self) -> Type {
+        if self.actor_ref_protocol().is_some() {
+            return Type::Actor {
+                state: Box::new(Type::unit()),
+                behavior: Box::new(Type::unit()),
+            };
+        }
+
+        match self {
+            Type::Var(v) => Type::Var(*v),
+            Type::Primitive(p) => Type::Primitive(p.clone()),
+            Type::Tuple(items) => {
+                Type::Tuple(items.iter().map(Type::erase_actor_protocols).collect())
+            }
+            Type::Record(fields) => Type::Record(
+                fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), ty.erase_actor_protocols()))
+                    .collect(),
+            ),
+            Type::Variant(variants) => Type::Variant(
+                variants
+                    .iter()
+                    .map(|(name, payload)| {
+                        (
+                            name.clone(),
+                            payload.as_ref().map(Type::erase_actor_protocols),
+                        )
+                    })
+                    .collect(),
+            ),
+            Type::Array(inner) => Type::Array(Box::new(inner.erase_actor_protocols())),
+            Type::Function {
+                param,
+                ret,
+                effect,
+                cap,
+            } => Type::Function {
+                param: Box::new(param.erase_actor_protocols()),
+                ret: Box::new(ret.erase_actor_protocols()),
+                effect: effect.clone(),
+                cap: *cap,
+            },
+            Type::Actor { .. } => Type::Actor {
+                state: Box::new(Type::unit()),
+                behavior: Box::new(Type::unit()),
+            },
+            Type::App { constructor, args } => Type::App {
+                constructor: Box::new(constructor.erase_actor_protocols()),
+                args: args.iter().map(Type::erase_actor_protocols).collect(),
+            },
+            Type::Reference { cap, inner } => Type::Reference {
+                cap: *cap,
+                inner: Box::new(inner.erase_actor_protocols()),
+            },
+            Type::Scheme { vars, body } => Type::Scheme {
+                vars: vars.clone(),
+                body: Box::new(body.erase_actor_protocols()),
+            },
+            Type::Nominal { name, underlying } => Type::Nominal {
+                name: name.clone(),
+                underlying: Box::new(underlying.erase_actor_protocols()),
+            },
+            Type::Skolem(id) => Type::Skolem(*id),
+        }
+    }
+
     /// Convert to an NTIR structural representation for content-addressed hashing.
     pub fn to_ntir(&self) -> NtirNode {
         self.to_ntir_with_stack(&mut Vec::new())
@@ -2016,13 +2122,17 @@ impl NuError {
                 }
             }
             NuError::CapError { msg, .. } => {
-                if msg.contains("cannot be sent")
+                if msg.contains("remote send argument") {
+                    Some("remote messages accept only `val`, `tag`, and serializable `linear` values — project local/unique state into immutable data before crossing the network boundary")
+                } else if msg.contains("used after being moved") {
+                    Some("the `iso` value has already transferred ownership — stop using the original binding, or create an immutable `val` snapshot before the move if both sides need the data")
+                } else if msg.contains("cannot be sent")
                     || msg.contains("sendable")
                     || msg.contains("send argument")
                 {
-                    Some("only `val`, `iso`, `tag`, and `linear` capabilities are sendable between actors — use `val` for immutable shared data, `iso` for transfer-only ownership")
+                    Some("use `val` for immutable shared data, or move uniquely owned `iso`/linear data exactly once; `ref`, `trn`, and `box` must stay actor-local")
                 } else if msg.contains("linear") && msg.contains("consumed") {
-                    Some("linear values can only be used once — use `.clone()` to make a copy, or restructure to avoid the second use")
+                    Some("linear values must be moved or explicitly consumed exactly once — if multiple paths need the data, create a separate immutable value before consuming the linear binding")
                 } else if msg.contains("downgrade") {
                     Some("capability downgrade is not allowed here — the value must keep its current or stronger capability")
                 } else if msg.contains("Not a subtype") {

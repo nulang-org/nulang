@@ -1819,16 +1819,15 @@ impl CapabilityAnalyzer {
             if let Some(fs) = first_span {
                 msg.push_str(&format!(" (first moved at line {}:{})", fs.start, fs.end));
             }
-            msg.push_str("\nhelp: iso bindings transfer ownership on send/ask");
-            msg.push_str(&format!(
-                "\nhelp: use `consume {}` to explicitly discharge the iso before the move, or restructure to avoid the second use",
-                name
-            ));
+            msg.push_str("\nwhy: `iso` means unique ownership; send/ask/closure capture transfers that ownership to the receiver");
+            msg.push_str(
+                "\nhelp: move the value exactly once and stop using the original binding; if the sender still needs the data, create an immutable `val` snapshot before the move",
+            );
             self.diagnostics.push(msg.clone());
             return Err(NuError::cap_error_explained(
                 msg,
                 span,
-                "an iso binding transfers ownership on send/ask/closure-capture and cannot be moved twice",
+                "an `iso` value has exactly one owner; after ownership transfer, accessing the original binding would create a second alias to actor-isolated mutable state",
             ));
         }
         self.first_consumed.insert(name.to_string(), span);
@@ -1878,9 +1877,14 @@ impl CapabilityAnalyzer {
                     if let Some(fs) = first_span {
                         msg.push_str(&format!(" (first moved at line {}:{})", fs.start, fs.end));
                     }
-                    msg.push_str("\nhelp: iso bindings transfer ownership on send/ask and may be used at most once thereafter");
+                    msg.push_str("\nwhy: `iso` denotes unique ownership, and a prior send/ask/closure capture transferred that ownership away from this actor");
+                    msg.push_str("\nhelp: stop using the original binding after the move; if both sides need the data, send an immutable `val` snapshot instead");
                     self.diagnostics.push(msg.clone());
-                    return Err(NuError::cap_error(msg, *span));
+                    return Err(NuError::cap_error_explained(
+                        msg,
+                        *span,
+                        "using a moved `iso` value would reintroduce an alias to state whose ownership was already transferred",
+                    ));
                 }
                 Ok(cap)
             }
@@ -2254,26 +2258,45 @@ impl CapabilityAnalyzer {
                     if *remote {
                         if !arg_cap.is_remote_sendable() {
                             let span = expr_span(arg);
-                            self.diagnostics.push(format!(
-                                "remote send argument with capability {} is not network-sendable",
+                            let msg = format!(
+                                "remote send argument with capability {} is not network-sendable\nwhy: remote messages cross a serialization boundary, so actor-local aliases and transferable local ownership cannot be reconstructed safely on another node\nhelp: send deeply immutable `val` data, an opaque `tag`, or a serializable `linear` value; for `iso`, first project the data into an immutable value",
                                 arg_cap
-                            ));
-                            return Err(NuError::cap_error(format!(
-                                    "remote send argument must be val, tag, or linear (serializable), got {}",
+                            );
+                            self.diagnostics.push(msg.clone());
+                            return Err(NuError::cap_error_explained(
+                                msg,
+                                span,
+                                format!(
+                                    "`{}` does not satisfy the remote-send contract; remote sends accept only val, tag, or linear values",
                                     arg_cap
-                                ), span));
+                                ),
+                            ));
                         }
                     } else {
                         if !arg_cap.is_sendable() {
                             let span = expr_span(arg);
-                            self.diagnostics.push(format!(
-                                "send argument with capability {} is not sendable",
-                                arg_cap
+                            let reason = match arg_cap {
+                                Capability::Ref | Capability::Trn => {
+                                    "this capability may alias mutable state owned by the sending actor"
+                                }
+                                Capability::Box => {
+                                    "this capability is a borrowed/opaque view whose lifetime and ownership stay with the sending actor"
+                                }
+                                _ => "this capability does not satisfy Nulang's actor-isolation send contract",
+                            };
+                            let msg = format!(
+                                "send argument with capability {} is not sendable\nwhy: {}\nhelp: use `val` for immutable shared data, or transfer a uniquely owned `iso`/linear value exactly once",
+                                arg_cap, reason
+                            );
+                            self.diagnostics.push(msg.clone());
+                            return Err(NuError::cap_error_explained(
+                                msg,
+                                span,
+                                format!(
+                                    "only lineariso, iso, linear, val, and tag may cross an actor boundary; `{}` cannot because {}",
+                                    arg_cap, reason
+                                ),
                             ));
-                            return Err(NuError::cap_error(format!(
-                                    "send argument must be sendable (lineariso, iso, linear, val, or tag), got {}",
-                                    arg_cap
-                                ), span));
                         }
                     }
                     // Consume Iso bindings on send: passing an iso value
@@ -2614,17 +2637,26 @@ impl CapabilityAnalyzer {
         if cap.is_sendable() {
             Ok(())
         } else {
+            let reason = match cap {
+                Capability::Ref | Capability::Trn => {
+                    "it may alias mutable state that remains owned by the current actor"
+                }
+                Capability::Box => {
+                    "it is a borrowed/opaque view whose lifetime remains tied to the current actor"
+                }
+                _ => "it does not satisfy the actor-isolation send contract",
+            };
             let msg = format!(
-                "capability {} is not sendable (must be lineariso, iso, linear, val, or tag)",
-                cap
+                "capability {} is not sendable\nwhy: {}\nhelp: freeze/copy the data into `val`, or transfer uniquely owned data as `iso`/linear exactly once",
+                cap, reason
             );
             self.diagnostics.push(msg.clone());
             Err(NuError::cap_error_explained(
                 msg,
                 span,
                 format!(
-                    "only lineariso, iso, linear, val, and tag may cross an actor boundary; `{}` cannot",
-                    cap
+                    "only lineariso, iso, linear, val, and tag may cross an actor boundary; `{}` cannot because {}",
+                    cap, reason
                 ),
             ))
         }
@@ -3509,6 +3541,19 @@ mod tests {
         let ctx2 = ctx.with_binding("ref_var", Capability::Ref);
         let result = analyzer.infer_cap(&ctx2, &send);
         assert!(result.is_err(), "send with ref argument should fail");
+        let diagnostic = analyzer.diagnostics.join("\n");
+        assert!(
+            diagnostic.contains("why:"),
+            "diagnostic should explain the isolation failure"
+        );
+        assert!(
+            diagnostic.contains("alias mutable state"),
+            "diagnostic should explain why ref is unsafe"
+        );
+        assert!(
+            diagnostic.contains("help:"),
+            "diagnostic should provide an actionable fix"
+        );
     }
 
     #[test]
@@ -3526,6 +3571,15 @@ mod tests {
         };
         let result = analyzer.infer_cap(&ctx, &send);
         assert!(result.is_err(), "remote send with iso argument should fail");
+        let diagnostic = analyzer.diagnostics.join("\n");
+        assert!(
+            diagnostic.contains("serialization boundary"),
+            "remote diagnostic should explain the boundary"
+        );
+        assert!(
+            diagnostic.contains("immutable `val`"),
+            "remote diagnostic should suggest the safe projection"
+        );
     }
 
     #[test]
