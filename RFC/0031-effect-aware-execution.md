@@ -1,6 +1,6 @@
 # RFC 0031: Effect-Aware Execution Classes
 
-- **Status:** Draft — Phase 1 implemented
+- **Status:** Draft — Phase 1 implemented on current main
 - **Tier:** Experimental runtime metadata; no source syntax change
 - **Created:** 2026-09-20
 - **Depends on:** RFC 0017 (unified runtime primitives)
