@@ -1103,4 +1103,54 @@ impl crate::backends::JitBackend for JitSession {
 
         crate::backends::TieredAction::Interpret
     }
+
+    unsafe fn tiered_execute_value_regs(
+        &mut self,
+        module_idx: usize,
+        pc: usize,
+        module: &crate::bytecode::CodeModule,
+        regs: *mut crate::vm::Value,
+        constants: &[u64],
+    ) -> crate::backends::TieredAction {
+        // Value is #[repr(transparent)] over one u64 tagged word, so the
+        // native JIT ABI can use the frame register storage in place.
+        let raw_regs = regs.cast::<u64>();
+        let instructions = &module.instructions;
+
+        if let Some(func) = unsafe { self.get_compiled(module_idx, pc) } {
+            func(raw_regs, constants.as_ptr());
+            self.record_tier2_and_maybe_promote(module_idx, pc, instructions);
+            return crate::backends::TieredAction::RanJit;
+        }
+
+        if self.record_and_check_hot(module_idx, pc) {
+            let ms = self.may_suspend_for(module_idx, module).to_vec();
+            let rc = self.recursive_for(module_idx, module).to_vec();
+            let (region_len, native_calls) =
+                find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
+            if region_len >= 3 {
+                let meta = typed_compiler::infer_reg_types(module, pc);
+                let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
+                if let Some(func) = unsafe {
+                    self.compile_region_typed(
+                        module_idx,
+                        pc,
+                        region_len,
+                        instructions,
+                        meta_ref,
+                        &native_calls,
+                    )
+                } {
+                    func(raw_regs, constants.as_ptr());
+                    return crate::backends::TieredAction::RanJit;
+                }
+            }
+
+            if module_idx < self.hot_counts.len() && pc < self.hot_counts[module_idx].len() {
+                self.hot_counts[module_idx][pc] = 0;
+            }
+        }
+
+        crate::backends::TieredAction::Interpret
+    }
 }
