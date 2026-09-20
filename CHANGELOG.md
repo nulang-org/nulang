@@ -75,6 +75,12 @@ two major versions.*
   or hot-reloaded code must still declare the requested behavior, invalid
   synchronous numeric asks fail explicitly, and a genuinely declared behavior
   id 0 remains valid.
+- **Nominal actor behavior identity** (Stable compiler correction). Statically
+  proven actor references now preserve their actor schema through HIR lowering,
+  so duplicate short behavior names resolve to the receiver's exact
+  `Actor.behavior` identity. Opaque local actor references may use a short
+  behavior name only when it is globally unique; ambiguous dispatch fails
+  closed instead of selecting the first suffix match.
 
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
