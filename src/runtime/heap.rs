@@ -131,6 +131,11 @@ pub enum TypeTag {
     Raw = 7,
     /// Remote actor reference (node_id + actor_id).
     RemoteActor = 8,
+    /// Zero-copy logical window over a backing Array.
+    ///
+    /// Payload layout is three Value slots:
+    /// [backing_array, absolute_start, logical_len].
+    ArrayView = 9,
 }
 
 // ---------------------------------------------------------------------------

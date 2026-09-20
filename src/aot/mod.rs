@@ -1132,18 +1132,8 @@ impl crate::vm::ActorVmCallbacks for AotActorCallbacks {
     }
 
     fn array_len(&self, ptr: *mut u8) -> Option<usize> {
-        // SAFETY: `ptr` is a valid heap pointer from this actor's heap.
-        unsafe {
-            let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
-            if header.type_tag == HeapTypeTag::Array {
-                let payload = header
-                    .size
-                    .saturating_sub(crate::runtime::heap::ActorHeap::HEADER_SIZE);
-                Some(payload / std::mem::size_of::<crate::vm::Value>())
-            } else {
-                None
-            }
-        }
+        // SAFETY: ptr is a live VM/AOT heap pointer.
+        unsafe { crate::vm::heap_array_len(ptr) }
     }
 
     fn get_state_field(&self, field: &str) -> crate::vm::Value {
@@ -1282,18 +1272,8 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
     }
 
     fn array_len(&self, ptr: *mut u8) -> Option<usize> {
-        unsafe {
-            let _actor = (*self.runtime).actors.get(&self.actor_id)?;
-            let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
-            if header.type_tag == HeapTypeTag::Array {
-                let payload_size = header
-                    .size
-                    .saturating_sub(crate::runtime::heap::ActorHeap::HEADER_SIZE);
-                Some(payload_size / std::mem::size_of::<crate::vm::Value>())
-            } else {
-                None
-            }
-        }
+        // SAFETY: ptr is a live VM/AOT heap pointer.
+        unsafe { crate::vm::heap_array_len(ptr) }
     }
 
     fn spawn_actor(
@@ -1532,18 +1512,8 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
     }
 
     fn array_len(&self, ptr: *mut u8) -> Option<usize> {
-        unsafe {
-            let _rt = &*self.runtime;
-            let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
-            if header.type_tag == HeapTypeTag::Array {
-                let payload_size = header
-                    .size
-                    .saturating_sub(crate::runtime::heap::ActorHeap::HEADER_SIZE);
-                Some(payload_size / std::mem::size_of::<crate::vm::Value>())
-            } else {
-                None
-            }
-        }
+        // SAFETY: ptr is a live VM/AOT heap pointer.
+        unsafe { crate::vm::heap_array_len(ptr) }
     }
 
     fn spawn_actor(

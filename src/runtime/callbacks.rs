@@ -296,23 +296,29 @@ pub(crate) fn perform_web_builtin(
     regs: &[crate::vm::Value],
 ) -> Option<crate::vm::Value> {
     fn read_array(
-        _callbacks: &dyn crate::vm::ActorVmCallbacks,
+        callbacks: &dyn crate::vm::ActorVmCallbacks,
         value: crate::vm::Value,
     ) -> Vec<crate::vm::Value> {
-        if let Some(ptr) = value.as_ptr() {
-            unsafe {
-                let header = &*ActorHeap::header_of(ptr);
-                if header.type_tag == HeapTypeTag::Array || header.type_tag == HeapTypeTag::Tuple {
-                    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
-                    let len = payload_size / std::mem::size_of::<crate::vm::Value>();
-                    if len > 0 {
-                        return std::slice::from_raw_parts(ptr as *const crate::vm::Value, len)
-                            .to_vec();
-                    }
-                }
+        let Some(ptr) = value.as_ptr() else {
+            return Vec::new();
+        };
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag == HeapTypeTag::Tuple {
+                let len = header.payload_size / std::mem::size_of::<crate::vm::Value>();
+                return std::slice::from_raw_parts(ptr as *const crate::vm::Value, len).to_vec();
             }
         }
-        Vec::new()
+        let Some(len) = callbacks.array_len(ptr) else {
+            return Vec::new();
+        };
+        (0..len)
+            .map(|idx| {
+                callbacks
+                    .array_get(ptr, idx)
+                    .unwrap_or_else(crate::vm::Value::nil)
+            })
+            .collect()
     }
     fn resolve(constants: &[crate::bytecode::Constant], value: crate::vm::Value) -> String {
         crate::vm::resolve_value_string(constants, value)
@@ -662,17 +668,8 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
     // context to be reading from.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn array_len(&self, ptr: *mut u8) -> Option<usize> {
-        unsafe {
-            let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
-            if header.type_tag == crate::runtime::heap::TypeTag::Array {
-                let payload_size = header
-                    .size
-                    .saturating_sub(crate::runtime::heap::ActorHeap::HEADER_SIZE);
-                Some(payload_size / std::mem::size_of::<crate::vm::Value>())
-            } else {
-                None
-            }
-        }
+        // SAFETY: ptr is a live VM heap pointer owned by this callback context.
+        unsafe { crate::vm::heap_array_len(ptr) }
     }
 
     fn spawn_actor(
@@ -791,6 +788,9 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         constants: &[crate::bytecode::Constant],
         regs: &[crate::vm::Value],
     ) -> Option<crate::vm::Value> {
+        if effect_name == "Array" {
+            return crate::vm::perform_array_builtin(self, op_name, regs);
+        }
         if effect_name == "Workflow" && op_name == Some("query") {
             let workflow_id = regs.get(0)?.as_actor_id()?;
             let string_id = regs.get(1)?.as_string_id()?;
@@ -1464,18 +1464,8 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     }
 
     fn array_len(&self, ptr: *mut u8) -> Option<usize> {
-        unsafe {
-            let _actor = (*self.runtime).actors.get(&self.actor_id)?;
-            let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
-            if header.type_tag == crate::runtime::heap::TypeTag::Array {
-                let payload_size = header
-                    .size
-                    .saturating_sub(crate::runtime::heap::ActorHeap::HEADER_SIZE);
-                Some(payload_size / std::mem::size_of::<crate::vm::Value>())
-            } else {
-                None
-            }
-        }
+        // SAFETY: ptr is a live VM heap pointer owned by this callback context.
+        unsafe { crate::vm::heap_array_len(ptr) }
     }
 
     fn spawn_actor(
@@ -1599,6 +1589,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         constants: &[crate::bytecode::Constant],
         regs: &[crate::vm::Value],
     ) -> Option<crate::vm::Value> {
+        if effect_name == "Array" {
+            return crate::vm::perform_array_builtin(self, op_name, regs);
+        }
         unsafe {
             if effect_name == "Workflow" && op_name == Some("query") {
                 let workflow_id = regs.get(0)?.as_actor_id()?;

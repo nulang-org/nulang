@@ -740,6 +740,7 @@ pub fn compile_bytecode_region(
             OpCode::ArrLoad => {
                 emit_arr_load(
                     &mut builder,
+                    helpers[&RuntimeHelper::ObjGet],
                     regs_ptr,
                     instr.op1 as usize,
                     instr.op2 as usize,
@@ -857,6 +858,7 @@ use crate::jit::typed_compiler::{emit_const, load_reg, store_reg};
 
 pub(crate) fn emit_arr_load(
     builder: &mut FunctionBuilder,
+    obj_get_ref: FuncRef,
     regs_ptr: Value,
     arr_reg: usize,
     idx_reg: usize,
@@ -908,7 +910,25 @@ pub(crate) fn emit_arr_load(
     let is_array = builder
         .ins()
         .icmp_imm(IntCC::Equal, type_tag, TypeTag::Array as i64);
-    builder.ins().brif(is_array, bounds_blk, &[], nil_blk, &[]);
+    let view_blk = builder.create_block();
+    let not_array_blk = builder.create_block();
+    builder
+        .ins()
+        .brif(is_array, bounds_blk, &[], not_array_blk, &[]);
+
+    builder.switch_to_block(not_array_blk);
+    let is_view = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, type_tag, TypeTag::ArrayView as i64);
+    builder.ins().brif(is_view, view_blk, &[], nil_blk, &[]);
+
+    // Views take the shared object helper. Ordinary Array remains on the
+    // existing direct-load fast path.
+    builder.switch_to_block(view_blk);
+    let call = builder.ins().call(obj_get_ref, &[arr_val, idx_val]);
+    let result = builder.inst_results(call)[0];
+    store_reg(builder, regs_ptr, dst, result);
+    builder.ins().jump(merge_blk, &[]);
 
     // Bounds check: len = (header.size - header_size) / 8. The unsigned
     // compare also rejects negative indices (huge when viewed unsigned),
@@ -949,6 +969,8 @@ pub(crate) fn emit_arr_load(
     // Every predecessor edge is emitted now; the caller adds the
     // fallthrough jump out of merge_blk.
     builder.seal_block(header_blk);
+    builder.seal_block(not_array_blk);
+    builder.seal_block(view_blk);
     builder.seal_block(bounds_blk);
     builder.seal_block(load_blk);
     builder.seal_block(nil_blk);

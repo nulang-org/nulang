@@ -45,6 +45,24 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Zero-copy array slices — 2026-09-20
+- **Constant-size `ArrayView` slices** (Experimental, `src/vm.rs`,
+  `src/runtime/heap.rs`). `Array.slice` now returns a three-slot runtime view
+  `[backing, start, len]` that retains one backing-array reference instead of
+  allocating and retaining a copied element buffer. Nested slices flatten to
+  the original backing array.
+- **Transparent reads and copy-on-write mutation** (Experimental,
+  `src/runtime/callbacks.rs`, `src/jit/runtime.rs`, `src/jit/compiler.rs`,
+  `src/jit/typed_compiler.rs`, `src/aot/mod.rs`). Interpreter, actor runtime,
+  JIT, and AOT paths all understand logical array regions. Ordinary arrays
+  keep their direct JIT load fast path; view writes detach into a private
+  Array so slicing preserves value semantics.
+- **GC and durable-continuation safety** (Experimental, `src/runtime/gc.rs`,
+  `src/runtime/heap_serialize.rs`). ORCA traces the view's backing reference.
+  NLCS v1 does not expose the internal `ArrayView` heap tag: views are
+  materialized as ordinary logical Arrays during continuation serialization,
+  preserving the existing durable wire format.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor

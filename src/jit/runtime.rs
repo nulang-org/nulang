@@ -751,14 +751,6 @@ pub unsafe extern "C" fn nulang_safepoint_yield(resume_offset: u64) -> u64 {
     nulang_jit_set_yield_pc(resume_offset)
 }
 
-unsafe fn with_callbacks<R>(f: impl FnOnce(&mut dyn crate::vm::ActorVmCallbacks) -> R) -> R {
-    JIT_CALLBACKS.with(|cell| {
-        let pair = *cell.get();
-        assert!(!pair.is_null(), "JIT_CALLBACKS not set");
-        f(&mut *pair.to_ptr())
-    })
-}
-
 use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
 
 // ---------------------------------------------------------------------------
@@ -908,11 +900,15 @@ pub unsafe extern "C" fn nulang_obj_get(obj: u64, idx: u64) -> u64 {
         return Value::nil().as_raw();
     }
     let header = &*ActorHeap::header_of(obj_ptr);
-    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
-    let len = payload_size / std::mem::size_of::<Value>();
     // idx may be a raw slot index (records/tuples, unboxed arrays) or a tagged
     // Int (boxed arrays) — mask off any tag bits to get the slot position.
     let i = (idx & PAYLOAD_MASK) as usize;
+    if header.type_tag == HeapTypeTag::ArrayView {
+        return crate::vm::heap_array_get(obj_ptr, i)
+            .unwrap_or_else(Value::nil)
+            .as_raw();
+    }
+    let len = header.payload_size / std::mem::size_of::<Value>();
     if i < len {
         (*((obj_ptr as *const Value).add(i))).as_raw()
     } else {
@@ -927,13 +923,49 @@ pub unsafe extern "C" fn nulang_obj_set(obj: u64, idx: u64, val: u64) {
     if obj_ptr.is_null() {
         return;
     }
-    let val = unsafe { Value::from_raw(val) };
+    let val = Value::from_raw(val);
     let header = &*ActorHeap::header_of(obj_ptr);
-    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
-    let len = payload_size / std::mem::size_of::<Value>();
     // idx may be a raw slot index (records/tuples, unboxed arrays) or a tagged
     // Int (boxed arrays) — mask off any tag bits to get the slot position.
     let i = (idx & PAYLOAD_MASK) as usize;
+
+    if header.type_tag == HeapTypeTag::ArrayView {
+        let Some((base, start, len)) = crate::vm::heap_array_region(obj_ptr) else {
+            return;
+        };
+        if i >= len {
+            return;
+        }
+        let Some(bytes) = len.checked_mul(std::mem::size_of::<Value>()) else {
+            return;
+        };
+        let Some(new_ptr) = alloc_obj(bytes, HeapTypeTag::Array) else {
+            return;
+        };
+        let dst = std::slice::from_raw_parts_mut(new_ptr as *mut Value, len);
+        for slot_idx in 0..len {
+            let item = if slot_idx == i {
+                val
+            } else {
+                *((base as *const Value).add(start + slot_idx))
+            };
+            dst[slot_idx] = item;
+            if let Some(child) = item.as_ptr() {
+                retain_obj(child);
+            }
+        }
+        let slots = std::slice::from_raw_parts_mut(obj_ptr as *mut Value, 3);
+        let old_backing = slots[0].as_ptr();
+        slots[0] = Value::ptr(new_ptr);
+        slots[1] = Value::int(0);
+        slots[2] = Value::int(len as i64);
+        if let Some(old_backing) = old_backing {
+            drop_obj(old_backing);
+        }
+        return;
+    }
+
+    let len = header.payload_size / std::mem::size_of::<Value>();
     if i < len {
         if let Some(ptr) = val.as_ptr() {
             retain_obj(ptr);
@@ -956,8 +988,11 @@ pub unsafe extern "C" fn nulang_obj_len(obj: u64) -> u64 {
         return Value::int(0).as_raw();
     }
     let header = &*ActorHeap::header_of(obj_ptr);
-    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
-    let len = payload_size / std::mem::size_of::<Value>();
+    let len = if matches!(header.type_tag, HeapTypeTag::Array | HeapTypeTag::ArrayView) {
+        crate::vm::heap_array_len(obj_ptr).unwrap_or(0)
+    } else {
+        header.payload_size / std::mem::size_of::<Value>()
+    };
     Value::int(len as i64).as_raw()
 }
 
@@ -1143,26 +1178,12 @@ pub unsafe extern "C" fn nulang_arr_store(
     let arr_ptr_val = *regs.add(arr_reg as usize);
     let idx_val = *regs.add(idx_reg as usize);
     let val = unsafe { Value::from_raw(*regs.add(src_reg as usize)) };
-    let arr_ptr = val_ptr(arr_ptr_val);
-    if arr_ptr.is_null() {
+    if val_ptr(arr_ptr_val).is_null() {
         return;
     }
-    let idx = as_int_or_zero(idx_val) as usize;
-    with_callbacks(|cb| {
-        if let Some(len) = cb.array_len(arr_ptr) {
-            if idx < len {
-                if let Some(ptr) = val.as_ptr() {
-                    cb.retain_ref(ptr);
-                }
-                let slot = (arr_ptr as *mut Value).add(idx);
-                let old = *slot;
-                *slot = val;
-                if let Some(old_ptr) = old.as_ptr() {
-                    cb.drop_ref(old_ptr);
-                }
-            }
-        }
-    });
+    // Share the value-based helper so ArrayView copy-on-write semantics stay
+    // identical between JIT, AOT, and the interpreter.
+    nulang_obj_set(arr_ptr_val, idx_val, val.as_raw());
 }
 
 /// # Safety
@@ -1172,12 +1193,7 @@ pub unsafe extern "C" fn nulang_arr_len(regs: *mut u64, arr_reg: u32, dst_reg: u
     let arr_ptr_val = *regs.add(arr_reg as usize);
     let arr_ptr = val_ptr(arr_ptr_val);
     let len = if !arr_ptr.is_null() {
-        let header = &*ActorHeap::header_of(arr_ptr);
-        if header.type_tag == HeapTypeTag::Array {
-            header.size.saturating_sub(ActorHeap::HEADER_SIZE) / std::mem::size_of::<Value>()
-        } else {
-            0
-        }
+        crate::vm::heap_array_len(arr_ptr).unwrap_or(0)
     } else {
         0
     };
