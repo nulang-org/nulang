@@ -712,6 +712,11 @@ pub struct CodeModule {
     pub spawn_capability_grants: Vec<(usize, Vec<String>)>,
     #[serde(default)]
     pub remote_spawn_init_fields: Vec<(usize, Vec<String>)>,
+    /// Send-site structural actor protocol identity. Maps bytecode instruction
+    /// PC to the canonical ProtocolId required by a statically typed
+    /// ActorRef<P>. Dynamic/legacy sends have no entry.
+    #[serde(default)]
+    pub actor_send_protocols: Vec<(usize, [u8; 32])>,
     /// Sorted (bytecode pc -> 1-indexed source line) for the DAP server's
     /// breakpoint resolution and stepping. One entry per source statement
     /// (the pc of its first instruction).
@@ -739,6 +744,7 @@ impl CodeModule {
             spawn_init_overrides: Vec::new(),
             spawn_capability_grants: Vec::new(),
             remote_spawn_init_fields: Vec::new(),
+            actor_send_protocols: Vec::new(),
             handler_tables: Vec::new(),
             actor_metadata: Vec::new(),
             foreign_functions: Vec::new(),
