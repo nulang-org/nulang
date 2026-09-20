@@ -321,6 +321,9 @@ pub enum RValue {
         behavior_idx: usize,
         args: Vec<LocalId>,
         remote: bool,
+        /// Required structural actor protocol for this send site, when the
+        /// source receiver was statically typed as ActorRef<P>.
+        required_protocol: Option<[u8; 32]>,
     },
     /// `resume(value)` — resume an effect continuation with a value.
     Resume(LocalId),
@@ -682,6 +685,7 @@ mod tests {
             behavior_idx: 0,
             args: vec![LocalId(0)],
             remote: false,
+            required_protocol: None,
         };
         let _ = RValue::Ask {
             actor: LocalId(0),
