@@ -498,7 +498,8 @@ pub fn compile_bytecode_region(
                 instr.op2 as usize,
                 instr.op3 as usize,
                 RuntimeHelper::FDiv,
-            ),            // Interpreter reads src from op1 and writes dst to op3 for FNeg.
+            ),
+            // Interpreter reads src from op1 and writes dst to op3 for FNeg.
             OpCode::FNeg => emit_unary(
                 &mut builder,
                 &helpers,
@@ -1004,7 +1005,8 @@ fn emit_self_unary(
     regs_ptr: Value,
     reg: usize,
     helper: RuntimeHelper,
-) {    emit_unary(builder, helpers, regs_ptr, reg, reg, helper);
+) {
+    emit_unary(builder, helpers, regs_ptr, reg, reg, helper);
 }
 
 fn emit_reg_call3(
