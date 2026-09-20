@@ -828,7 +828,11 @@ fn main() {
         // compiler. This is the durable-distribution path — a `.nbc` minted
         // in 2026 runs on any conforming runtime in 2126.
         if path.ends_with(".nbc") {
-            if let Err(e) = run_nbc_file(path, opts.verify_source.as_deref()) {
+            if let Err(e) = run_nbc_file(
+                path,
+                opts.verify_source.as_deref(),
+                opts.store_path.as_deref(),
+            ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
@@ -2430,8 +2434,10 @@ fn compile_source_to_nbc(
 
 /// Load and run a `.nbc` artifact directly, optionally verifying its recorded
 /// source hash against a source file. This is the durable-distribution path:
-/// no compiler invocation, no source parse — just `from_nbc` + `VM::run`.
-fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
+/// no compiler invocation or source parse. Pure modules run directly in the VM;
+/// actor/workflow modules use `run_with_runtime` so spawn/send/state semantics
+/// match source execution.
+fn run_nbc_file(path: &str, verify_source: Option<&str>, store_path: Option<&str>) -> NuResult<()> {
     let bytes = std::fs::read(path).map_err(|e| nulang::types::NuError::VMError {
         msg: format!("cannot read .nbc file '{path}': {e}"),
         span: Span::default(),
@@ -2471,14 +2477,78 @@ fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
         }
     }
 
-    let mut vm = VM::new();
-    vm.load_module(artifact.module);
-    let value = vm.run()?;
-    let result_str = value.to_string_repr();
+    let constants = artifact.module.constants.clone();
+    let (value, _runtime) = run_nbc_module(artifact.module, store_path)?;
+
+    let result_str = if value.is_string() || value.is_ptr() {
+        nulang::vm::resolve_value_string(&constants, value)
+    } else {
+        value.to_string_repr()
+    };
     if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
         println!("{}", result_str);
     }
     Ok(())
+}
+
+/// Execute a deserialized `.nbc` module with the same actor semantics as
+/// source execution.
+///
+/// A bare `VM` installs `StandaloneVmCallbacks`, whose actor operations are
+/// deliberately inert (`spawn` returns actor-ref 0 and `send` is a no-op).
+/// Serialized actor/workflow modules therefore must use the real Runtime bridge
+/// and scheduler, exactly like the bytecode source path in `run_source`.
+fn run_nbc_module(
+    module: nulang::bytecode::CodeModule,
+    store_path: Option<&str>,
+) -> NuResult<(
+    nulang::vm::Value,
+    Option<std::rc::Rc<std::cell::RefCell<nulang::runtime::Runtime>>>,
+)> {
+    let has_actors = !module.actor_metadata.is_empty() || !module.behaviors.is_empty();
+    let has_durable = module.actor_metadata.iter().any(|meta| {
+        meta.persistent
+            || meta.is_workflow
+            || meta.state_models.iter().any(|(_, model)| {
+                matches!(
+                    model,
+                    nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
+                )
+            })
+    });
+    let store_dir = if has_actors && has_durable {
+        Some(
+            store_path
+                .map(str::to_owned)
+                .or_else(|| std::env::var("NULANG_STORE_PATH").ok())
+                .unwrap_or_else(|| ".nulang/store".to_string()),
+        )
+    } else {
+        None
+    };
+
+    if has_actors {
+        let (value, runtime) = run_with_runtime(module, None, store_dir.as_deref())?;
+
+        let failures = runtime.borrow().workflow_failures();
+        if !failures.is_empty() {
+            let summary = failures
+                .iter()
+                .map(|(step, error)| format!("{step}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(NuError::RuntimeError {
+                msg: format!("workflow execution failed: {summary}"),
+                span: Span::default(),
+            });
+        }
+
+        Ok((value, Some(runtime)))
+    } else {
+        let mut vm = VM::new();
+        vm.load_module(module);
+        Ok((vm.run()?, None))
+    }
 }
 
 fn type_to_string(ty: &Type) -> String {
@@ -2621,6 +2691,100 @@ mod tests {
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub
     /// spawn/send callbacks would leave the counter at 0.
+    /// Actor semantics must survive serialization. Running the deserialized
+    /// module through a standalone VM would make spawn/send no-ops, so this
+    /// pins the durable artifact path to the production Runtime bridge.
+    #[test]
+    fn test_nbc_actor_program_schedules_and_delivers() {
+        let source = r#"
+            actor Counter {
+                state count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+            let c = spawn Counter {} in {
+                send c inc()
+                send c inc()
+                c
+            }
+        "#;
+
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+            .expect("frontend should accept the actor program");
+        let module = compile_with_new_pipeline(&ast, "test", &type_checker)
+            .expect("actor program should compile");
+        let source_hash = blake3::hash(source.as_bytes());
+        let bytes = module
+            .to_nbc(Some(*source_hash.as_bytes()))
+            .expect("actor module should serialize to nbc");
+        let artifact = nulang::bytecode::CodeModule::from_nbc(&bytes)
+            .expect("serialized actor module should deserialize");
+
+        let (_value, runtime) =
+            run_nbc_module(artifact.module, None).expect("nbc actor program should run");
+        let runtime = runtime.expect("actor nbc must execute with a real Runtime");
+        let rt = runtime.borrow();
+        let actor = rt.actors.values().next().expect("one actor should exist");
+        assert_eq!(
+            actor.get_state_field("count").and_then(|v| v.as_int()),
+            Some(2),
+            "both inc messages must be delivered after nbc round-trip"
+        );
+    }
+
+    #[test]
+    fn test_nbc_persistent_actor_uses_requested_store() {
+        let source = r#"
+            persistent actor BankAccount {
+                state durable balance: Int = 0
+                behavior deposit(amount: Int) { self.balance = self.balance + amount }
+            }
+            let acc = spawn BankAccount {} in {
+                send acc deposit(50)
+                acc
+            }
+        "#;
+
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+            .expect("frontend should accept persistent actor program");
+        let module = compile_with_new_pipeline(&ast, "test", &type_checker)
+            .expect("persistent actor program should compile");
+        let source_hash = blake3::hash(source.as_bytes());
+        let bytes = module
+            .to_nbc(Some(*source_hash.as_bytes()))
+            .expect("persistent actor module should serialize");
+        let artifact = nulang::bytecode::CodeModule::from_nbc(&bytes)
+            .expect("persistent actor artifact should deserialize");
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let store_dir = std::env::temp_dir().join(format!(
+            "nulang-nbc-persist-{}-{unique}",
+            std::process::id()
+        ));
+        let store_str = store_dir.to_string_lossy().into_owned();
+
+        let (_value, runtime) = run_nbc_module(artifact.module, Some(&store_str))
+            .expect("persistent nbc actor program should run");
+        let runtime = runtime.expect("persistent actor nbc must use Runtime");
+        let rt = runtime.borrow();
+        let (actor_id, actor) = rt.actors.iter().next().expect("one actor should exist");
+        assert_eq!(
+            actor.get_state_field("balance").and_then(|v| v.as_int()),
+            Some(50)
+        );
+        let snapshot = store_dir
+            .join(format!("actor_{actor_id}"))
+            .join("snapshot.json");
+        assert!(
+            snapshot.exists(),
+            "durable nbc actor must checkpoint to the requested store"
+        );
+        drop(rt);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
     #[test]
     fn test_run_source_actor_program_schedules_and_delivers() {
         let source = r#"

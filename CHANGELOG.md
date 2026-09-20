@@ -45,6 +45,14 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Actor-capable `.nbc` execution — 2026-09-20
+- **Precompiled actor/workflow artifacts now execute through the real Runtime**
+  instead of the standalone VM callbacks. `.nbc` modules carrying actor
+  metadata use the same spawn/send/state/scheduler path as source execution;
+  pure modules keep the lower-overhead standalone VM path. A round-trip
+  regression test serializes an actor program, reloads it, and verifies queued
+  messages mutate actor state after scheduling.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor

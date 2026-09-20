@@ -1,0 +1,43 @@
+actor Collector {
+    state total: Int = 0
+    state remaining: Int = 64
+
+    behavior done(value: Int) {
+        self.total = self.total + value
+        self.remaining = self.remaining - 1
+        if self.remaining == 0 then {
+            perform IO.print(self.total)
+        }
+    }
+}
+
+actor Worker {
+    state count: Int = 0
+
+    behavior work() {
+        self.count = self.count + 1
+    }
+
+    behavior finish(tag reply: Address) {
+        send reply done(self.count)
+    }
+}
+
+fn main() {
+    let collector_iso = spawn Collector {}
+    let collector = collector_iso :cap tag
+
+    var worker_index = 0
+    while worker_index < 64 {
+        let worker = spawn Worker {}
+        var i = 0
+        while i < 2000 {
+            send worker work()
+            i = i + 1
+        }
+        send worker finish(collector)
+        worker_index = worker_index + 1
+    }
+
+    unit
+}

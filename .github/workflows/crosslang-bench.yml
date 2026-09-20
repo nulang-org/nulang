@@ -1,0 +1,78 @@
+name: Cross-language benchmarks
+
+on:
+  pull_request:
+    paths:
+      - "benchmarks/crosslang/**"
+      - ".github/workflows/crosslang-bench.yml"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Timed samples per implementation
+        required: false
+        default: "7"
+  schedule:
+    - cron: "17 5 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crosslang-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Informational cross-language comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+
+      - name: Build optimized Nulang CLI
+        id: nulang
+        run: |
+          cargo build --release --bin nulang
+          TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+          NULANG_BIN="$TARGET_DIR/release/nulang"
+          test -x "$NULANG_BIN"
+          "$NULANG_BIN" --version
+          echo "bin=$NULANG_BIN" >> "$GITHUB_OUTPUT"
+
+      - name: Run suite
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_RUNS: ${{ inputs.runs || '7' }}
+        run: |
+          mkdir -p benchmark-artifacts
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            WARMUPS=0
+            RUNS=1
+          else
+            WARMUPS=2
+            RUNS="$REQUESTED_RUNS"
+          fi
+          python3 benchmarks/crosslang/run.py \
+            --nulang-bin "${{ steps.nulang.outputs.bin }}" \
+            --warmups "$WARMUPS" \
+            --runs "$RUNS" \
+            --json-out benchmark-artifacts/results.json \
+            --markdown-out benchmark-artifacts/summary.md
+          cat benchmark-artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosslang-bench-${{ github.sha }}
+          path: benchmark-artifacts/
+          if-no-files-found: error
+          retention-days: 90
