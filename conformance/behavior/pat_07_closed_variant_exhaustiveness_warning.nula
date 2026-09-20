@@ -1,0 +1,13 @@
+// Closed variant totality is diagnosed non-fatally in v1.x.
+type Color = Red | Green | Blue
+
+fn name(c: Color) -> String {
+    match c {
+        | Red => "red"
+        | Green => "green"
+    }
+}
+
+fn main() {
+    perform IO.print("ok")
+}
