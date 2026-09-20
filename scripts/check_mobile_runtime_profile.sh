@@ -31,10 +31,11 @@ required = {
     "dep:cranelift-native", "dep:cranelift-frontend", "dep:cranelift-codegen",
     "dep:target-lexicon",
 }
-for feature in ("jit-codegen", "native-aot"):
-    missing = sorted(required - set(features.get(feature, [])))
-    if missing:
-        raise SystemExit(f"{feature} missing dependency ownership: " + ", ".join(missing))
+missing = sorted(required - set(features.get("jit-codegen", [])))
+if missing:
+    raise SystemExit("jit-codegen missing dependency ownership: " + ", ".join(missing))
+if set(features.get("native-aot", [])) != {"jit-codegen"}:
+    raise SystemExit("native-aot must depend on jit-codegen without owning a second Cranelift stack")
 if set(features.get("native-codegen", [])) != {"jit-codegen", "native-aot"}:
     raise SystemExit("native-codegen must remain the compatibility umbrella for jit-codegen + native-aot")
 mobile = set(features.get("mobile-runtime", []))
