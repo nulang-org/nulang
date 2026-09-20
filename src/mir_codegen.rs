@@ -1166,17 +1166,24 @@ impl MirCodegen {
                 behavior_idx,
                 args,
                 remote,
+                required_protocol,
             } => {
                 let _ractor = self.local_reg(*actor);
                 self.emit(Instruction::new2(OpCode::Move, _ractor, FUNC_VALUE_REG));
                 self.stage_args(args)?;
                 let opcode = if *remote { OpCode::RSend } else { OpCode::Send };
+                let send_pc = self.current_offset();
                 self.emit(Instruction::new3(
                     opcode,
                     FUNC_VALUE_REG,
                     ((*behavior_idx >> 8) & 0xFF) as u8,
                     (*behavior_idx & 0xFF) as u8,
                 ));
+                if let Some(protocol_id) = required_protocol {
+                    self.module
+                        .actor_send_protocols
+                        .push((send_pc, *protocol_id));
+                }
                 // Send is fire-and-forget with no VM-level result register;
                 // the stable compiler yields 0 for send-as-expression.
             }
