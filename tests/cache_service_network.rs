@@ -2139,3 +2139,84 @@ fn automatic_remote_transfer_retry_recovers_without_early_source_finalize() {
     service_a.shutdown().unwrap();
     service_b.shutdown().unwrap();
 }
+
+
+#[test]
+fn shard_checkpoint_restores_resp_values_and_reduces_ttl() {
+    let snapshot_path = temp_journal_path("shard-checkpoint").with_extension("snapshot");
+    let node_id = 4242u64;
+    let placement = CacheSlotMap::new_local(node_id, 1).unwrap();
+
+    let service = CacheServiceBuilder::new(node_id, placement.clone())
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut client = StdTcpStream::connect(service.local_addrs()[0]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    client
+        .write_all(&frame(&[b"SET", b"persist", b"value"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+    client
+        .write_all(&frame(&[b"SET", b"ttl", b"live", b"PX", b"10000"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+
+    let checkpoint = service.checkpoint_shard(0, &snapshot_path).unwrap();
+    assert_eq!(checkpoint.entries, 2);
+    assert!(checkpoint.bytes > 0);
+    service.shutdown().unwrap();
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let restored = CacheServiceBuilder::new(node_id, placement)
+        .with_shard(
+            CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            )
+            .restore_from_snapshot(&snapshot_path),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut client = StdTcpStream::connect(restored.local_addrs()[0]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    client
+        .write_all(&frame(&[b"GET", b"persist"]))
+        .unwrap();
+    let mut persistent = [0u8; 11];
+    client.read_exact(&mut persistent).unwrap();
+    assert_eq!(&persistent, b"$5\r\nvalue\r\n");
+
+    client.write_all(&frame(&[b"GET", b"ttl"])).unwrap();
+    let mut ttl_value = [0u8; 10];
+    client.read_exact(&mut ttl_value).unwrap();
+    assert_eq!(&ttl_value, b"$4\r\nlive\r\n");
+
+    client.write_all(&frame(&[b"TTL", b"ttl"])).unwrap();
+    let ttl_reply = read_resp_line(&mut client);
+    let ttl_secs: i64 = std::str::from_utf8(&ttl_reply[1..ttl_reply.len() - 2])
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (8..=9).contains(&ttl_secs),
+        "restored TTL should reflect downtime instead of resetting: {ttl_secs}"
+    );
+
+    restored.shutdown().unwrap();
+    std::fs::remove_file(snapshot_path).unwrap();
+}
