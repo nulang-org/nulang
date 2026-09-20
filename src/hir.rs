@@ -631,6 +631,7 @@ mod tests {
             body: Body::default(),
             public: true,
             placement: None,
+            performance_contracts: vec![],
             span: Span::default(),
         };
         assert_eq!(def.name, "f");
