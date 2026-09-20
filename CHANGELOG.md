@@ -53,6 +53,13 @@ two major versions.*
   changing an existing signature is incompatible. V1 intentionally avoids
   implicit field/default/variance rules.
 
+- **Pre-mailbox actor protocol admission** (Experimental, `src/protocol.rs`).
+  `ProtocolAdmissionPolicy` defaults to strict compatible admission: exact
+  protocol identity is accepted directly, additive receiver upgrades require
+  registry proof, incompatible or unknown schemas are rejected, and messages
+  without a required protocol identity are rejected unless operators
+  explicitly select legacy migration mode.
+
 - **Protocol schema registry** (Experimental, `src/protocol.rs`). A canonical
   `ProtocolRegistry` maps structural `ProtocolId` values to trusted schemas so
   different digests can be compared safely. Exact digest equality requires no
