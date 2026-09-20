@@ -1,0 +1,4 @@
+module CNulangMobile {
+    umbrella header "CNulangMobile.h"
+    export *
+}
