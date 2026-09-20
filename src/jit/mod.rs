@@ -105,6 +105,12 @@ pub struct JitSession {
     /// Regions compiled through the type-directed (guard-stripped) path in
     /// `typed_compiler`, i.e. where inferred register types were available.
     typed_regions: FxHashSet<(usize, usize)>,
+    /// Regions whose active cached function is a tier-2 SIMD replacement.
+    simd_regions: FxHashSet<(usize, usize)>,
+    /// Regions that were analyzed for tier-2 SIMD and rejected. Bytecode is
+    /// immutable after loading, so retrying the same failed analysis every
+    /// TIER2_THRESHOLD executions would only add overhead.
+    tier2_exhausted: FxHashSet<(usize, usize)>,
     /// Per-module "may suspend" vectors (indexed by function-table index),
     /// computed lazily from each module's bytecode: true if the function
     /// transitively performs an effect that can suspend (or calls one).
@@ -164,6 +170,8 @@ impl JitSession {
             hot_counts: Vec::new(),
             last_compiled_probe: None,
             typed_regions: FxHashSet::default(),
+            simd_regions: FxHashSet::default(),
+            tier2_exhausted: FxHashSet::default(),
             may_suspend: FxHashMap::default(),
             recursive: FxHashMap::default(),
             builder_context: FunctionBuilderContext::new(),
@@ -232,47 +240,90 @@ impl JitSession {
     }
 
     /// Record one execution of an already-compiled region and attempt
-    /// tier-2 promotion when the threshold is crossed.
+    /// tier-2 SIMD promotion when the threshold is crossed.
     ///
-    /// Tier-2 attempts more aggressive compilation: typed path for regions
-    /// that were compiled untyped, or SIMD for typed regions.  Promotion is
-    /// best-effort — a failed attempt just resets the counter so we retry
-    /// later.
+    /// Promotion replaces the cached tier-1 function pointer in place. Regions
+    /// that cannot be vectorized are marked exhausted so hot scalar code does
+    /// not pay repeated analysis/compilation attempts.
     pub fn record_tier2_and_maybe_promote(
         &mut self,
         module_idx: usize,
         pc: usize,
         instructions: &[crate::bytecode::Instruction],
     ) {
-        let count = self.tier2_counters.entry((module_idx, pc)).or_insert(0);
-        *count += 1;
-        if *count < TIER2_THRESHOLD {
+        let key = (module_idx, pc);
+        if self.simd_regions.contains(&key) || self.tier2_exhausted.contains(&key) {
             return;
         }
 
-        let region_len = match self.compiled.get(&(module_idx, pc)) {
+        let region_len = match self.compiled.get(&key) {
             Some(&(_, len)) if len >= 3 => len,
             _ => return,
         };
 
-        let was_typed = self.typed_regions.contains(&(module_idx, pc));
-
-        if !was_typed {
-            // Try typed compilation with the benefit of profile data.
-            // We don't have a CodeModule here, so infer_reg_types needs
-            // one — skip for now, promotion will retry later.
-            // Reset counter to allow future retries.
-            self.tier2_counters.insert((module_idx, pc), 0);
-        } else {
-            // Try SIMD compilation for hot typed regions.
-            if let Some(_func) =
-                unsafe { self.compile_region_simd(module_idx, pc, region_len, instructions, None) }
-            {
-                // SIMD compilation succeeded; the compiled cache was
-                // updated inside compile_region_simd.
-            }
-            self.tier2_counters.insert((module_idx, pc), 0);
+        let count = self.tier2_counters.entry(key).or_insert(0);
+        *count += 1;
+        if *count < TIER2_THRESHOLD {
+            return;
         }
+        *count = 0;
+
+        // SAFETY: the bytecode and JIT module remain owned by this JitSession
+        // for the lifetime of every generated function pointer.
+        if unsafe {
+            self.promote_region_simd(module_idx, pc, region_len, instructions)
+        }
+        .is_none()
+        {
+            self.tier2_exhausted.insert(key);
+        }
+    }
+
+    /// Compile a fresh SIMD implementation for an already-compiled region and
+    /// replace the active cache entry. Unlike `compile_region_simd`, this path
+    /// intentionally does not return the existing tier-1 pointer.
+    unsafe fn promote_region_simd(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+    ) -> Option<JitFunctionPtr> {
+        use crate::jit::simd_analyzer::analyze_region;
+        use crate::jit::simd_compiler::{
+            compile_simd_region, is_simd_supported, native_simd_codegen_supported,
+        };
+
+        if !is_simd_supported() {
+            return None;
+        }
+
+        let simd_region = analyze_region(instructions, start_offset, num_instrs, None)?;
+        if !native_simd_codegen_supported(&simd_region) {
+            return None;
+        }
+        if simd_region.trip_count_hint.is_none()
+            || (simd_region.trip_count_hint == Some(0)
+                && simd_region.trip_count_array_reg.is_none())
+        {
+            return None;
+        }
+
+        let func_name = format!("nulang_t2_simd_{}_{}", module_idx, start_offset);
+        let ptr = compile_simd_region(
+            &mut self.module,
+            &mut self.builder_context,
+            &mut self.ctx,
+            &func_name,
+            instructions,
+            &simd_region,
+        )
+        .ok()?;
+
+        self.compiled
+            .insert((module_idx, start_offset), (ptr, num_instrs));
+        self.simd_regions.insert((module_idx, start_offset));
+        Some(std::mem::transmute(ptr))
     }
 
     /// Reset tier-2 counters (used by tests).
