@@ -50,7 +50,9 @@ run cargo test --no-default-features
 run cargo check --tests --no-default-features
 run cargo clippy --all-targets --no-default-features -- -D clippy::correctness
 
-# Standard standalone runtime profile: JIT + networking without optional\n# language-service, AI, foreign-runtime, or database SDK dependency families.\nrun bash scripts/check_standard_runtime_profile.sh
+# Standard standalone runtime profile: JIT + networking without optional
+# language-service, AI, foreign-runtime, or database SDK dependency families.
+run bash scripts/check_standard_runtime_profile.sh
 
 # WASM/all-features paths catch backend-specific semantic drift.
 run cargo build --all-targets --features wasm-backend
