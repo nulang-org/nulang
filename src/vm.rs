@@ -3,7 +3,7 @@
 //! ## Architecture
 //!
 //! - **256 general-purpose registers** per activation frame
-//! - **NaN-boxing** for efficient tagged values (int/float/bool/nil/actor_ref)
+//! - **64-bit tagged values** with a stable 16-bit tag / 48-bit payload ABI
 //! - **Bytecode modules** with constant pools and function tables
 //! - **Algebraic effects** via handler stack (Perform/Resume/Unwind/Handle)
 //!
@@ -20,9 +20,10 @@
 //!
 //! ## Value Representation
 //!
-//! Uses NaN boxing: all non-float values are encoded in the quiet-NaN
-//! payload of an f64. This gives us 51 bits of payload space for
-//! pointers, integers, and type tags.
+//! Values are carried as raw `u64` words. Tagged values reserve the upper
+//! 16 bits for the type tag and the lower 48 bits for payload. Finite floats
+//! and infinities retain their IEEE-754 bits; NaNs are canonicalized to a
+//! reserved non-tag pattern so they cannot alias runtime tags.
 
 use std::ffi::{c_char, CStr, CString};
 
@@ -1914,21 +1915,22 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
 }
 
 // ---------------------------------------------------------------------------
-// Value: NaN-boxed tagged value
+// Value: canonical 64-bit tagged value
 // ---------------------------------------------------------------------------
 
-/// Tagged value using NaN boxing.
+/// Canonical Nulang 64-bit value.
 ///
-/// All non-float values are encoded in the quiet-NaN payload of an f64.
-/// The high 16 bits hold the type tag; the low 48 bits hold the payload.
+/// Tagged values use the high 16 bits for the type tag and the low 48 bits
+/// for payload. Float values retain IEEE-754 bits, with NaNs canonicalized to
+/// a reserved pattern that cannot alias a runtime tag.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Value {
     raw: u64,
 }
 
 use crate::value_layout::{
-    is_float_raw, sext48, tag_object, PAYLOAD_MASK, TAG_ACTOR, TAG_BOOL, TAG_CLOSURE, TAG_INT,
-    TAG_MASK, TAG_NIL, TAG_OBJECT, TAG_PTR, TAG_STRING, TAG_UNIT,
+    float_bits, is_float_raw, sext48, tag_object, PAYLOAD_MASK, TAG_ACTOR, TAG_BOOL, TAG_CLOSURE,
+    TAG_INT, TAG_MASK, TAG_NIL, TAG_OBJECT, TAG_PTR, TAG_STRING, TAG_UNIT,
 };
 
 impl Value {
@@ -1948,7 +1950,7 @@ impl Value {
 
     /// Create a float value.
     pub fn float(f: f64) -> Self {
-        Value { raw: f.to_bits() }
+        Value { raw: float_bits(f) }
     }
 
     /// Create a boolean value.
@@ -2111,12 +2113,12 @@ impl Value {
         }
     }
 
-    /// Return the raw NaN-boxed bits.
+    /// Return the raw canonical value bits.
     pub fn as_raw(&self) -> u64 {
         self.raw
     }
 
-    /// Construct a `Value` from trusted raw NaN-boxed bits.
+    /// Construct a `Value` from trusted raw canonical value bits.
     ///
     /// # Safety
     /// Every tag payload must satisfy its runtime invariant. If `raw` has
@@ -2127,12 +2129,12 @@ impl Value {
         Value { raw }
     }
 
-    /// Return the raw NaN-boxed bits (opaque bit pattern).
+    /// Return the raw canonical value bits (opaque bit pattern).
     pub fn to_bits(self) -> u64 {
         self.raw
     }
 
-    /// Construct a `Value` from trusted raw NaN-boxed bits.
+    /// Construct a `Value` from trusted raw canonical value bits.
     ///
     /// # Safety
     /// Same contract as [`Value::from_raw`]. Pointer-tagged bits must retain
@@ -2190,7 +2192,7 @@ pub(crate) fn constant_to_value(c: &Constant) -> Value {
     }
 }
 
-/// Convert a bytecode constant pool to raw NaN-boxed bits for the JIT.
+/// Convert a bytecode constant pool to raw canonical value bits for the JIT.
 ///
 /// String constants must encode their constant-pool index exactly like the
 /// interpreter's `ConstU` (`Value::string(idx)`); encoding them as nil makes
@@ -2435,7 +2437,7 @@ pub struct SuspendedVmState {
 ///
 /// Executes Nulang bytecode modules with:
 /// - 256 registers per frame
-/// - NaN-boxed tagged values
+/// - canonical tagged values
 /// - Algebraic effects via handler stack
 /// - Capability tracking
 pub struct VM {
@@ -2950,7 +2952,7 @@ impl VM {
     }
 
     /// Number of hot regions compiled through the type-directed JIT path
-    /// (NaN-tag guard stripping) since this VM was created. Exposed for
+    /// (tag-guard stripping) since this VM was created. Exposed for
     /// testing the tiering pipeline.
     pub fn jit_typed_compiled_count(&self) -> usize {
         self.jit_session
@@ -3176,7 +3178,7 @@ impl VM {
 
     /// Add a runtime string to a module's constant pool and return its string-id value.
     ///
-    /// Also appends the matching NaN-boxed bits to the module's JIT constant
+    /// Also appends the matching canonical value bits to the module's JIT constant
     /// table so JIT-compiled regions resolve the new constant correctly. This
     /// is `&mut self` and must run on the single scheduler thread (the only
     /// thread that touches the VM); the cross-node string interning in
@@ -6255,7 +6257,16 @@ mod vm_tests {
         assert_eq!(result.unwrap().as_int(), Some(-1));
     }
 
-    /// Test 2: NaN-boxed value representation.
+    /// Test 2: canonical tagged-value representation.
+    #[test]
+    fn test_value_nan_is_canonical_and_never_nil() {
+        let nan = Value::float(f64::NAN);
+        assert!(nan.is_float());
+        assert!(nan.as_float().unwrap().is_nan());
+        assert!(!nan.is_nil());
+        assert_eq!(nan.as_raw(), crate::value_layout::CANONICAL_NAN_BITS);
+    }
+
     #[test]
     fn test_value_nan_tagging() {
         let v_int = Value::int(42);
