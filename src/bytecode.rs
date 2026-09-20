@@ -715,6 +715,12 @@ pub struct CodeModule {
     /// server. Includes actor behaviors (compiled as functions).
     #[serde(default)]
     pub debug_functions: Vec<DebugFunctionInfo>,
+    /// Bytecode ranges for functions explicitly annotated `@hot()`.
+    ///
+    /// Additive optional metadata: old .nbc artifacts deserialize with an
+    /// empty vector, while runtimes that understand it can bias JIT tiering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hot_function_ranges: Vec<(usize, usize)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub export_table: Vec<ExportTableEntry>,
 }
@@ -739,6 +745,7 @@ impl CodeModule {
             tools: Vec::new(),
             line_table: Vec::new(),
             debug_functions: Vec::new(),
+            hot_function_ranges: Vec::new(),
             export_table: Vec::new(),
         }
     }
@@ -772,6 +779,16 @@ impl CodeModule {
             Err(0) => None,
             Err(i) => Some(self.line_table[i - 1].1),
         }
+    }
+
+    /// Whether `pc` lies inside a source function annotated `@hot()`.
+    pub fn is_hot_pc(&self, pc: usize) -> bool {
+        if self.hot_function_ranges.is_empty() {
+            return false;
+        }
+        self.hot_function_ranges
+            .iter()
+            .any(|&(start, len)| pc >= start && pc < start.saturating_add(len))
     }
 
     /// Resolve a requested source `line` to a bytecode pc for breakpoint
