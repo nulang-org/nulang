@@ -61,9 +61,10 @@ pub use crate::type_metadata::{KnownType, TypeMetadata};
 /// as the scalar compiler.
 ///
 /// Rules:
-/// - Anchors (function entries, behavior offsets, effect-handler bodies, the
-///   module entry point) start with all registers `Unknown`: function
-///   arguments arrive in r0..r15 with statically unknowable types.
+/// - Function/behavior entries may start with compiler-owned parameter facts
+///   for r0..rN. Those seeds live only on the in-memory `CodeModule` and are
+///   never serialized into .nbc, so loaded artifacts cannot forge facts used
+///   for guard stripping. Other anchors start with all registers `Unknown`.
 /// - Modeled opcodes propagate the result type their interpreter semantics
 ///   guarantee unconditionally (e.g. `IAdd` always writes a tagged int,
 ///   comparisons always write a tagged bool; `IDiv`/`IMod`/`FDiv` can yield
@@ -139,7 +140,18 @@ pub fn infer_reg_types(module: &CodeModule, pc: usize) -> TypeMetadata {
     let mut states: Vec<Option<[KnownType; 256]>> = vec![None; n];
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let mut in_queue: Vec<bool> = vec![false; n];
-    states[0] = Some([KnownType::Unknown; 256]);
+
+    // Source compilation can provide trusted representation facts for typed
+    // function arguments. The metadata is intentionally serde-skipped on
+    // CodeModule; artifacts loaded from .nbc therefore retain the historical
+    // all-Unknown entry state and must prove types from bytecode alone.
+    let entry_state = module
+        .jit_type_seeds
+        .iter()
+        .find(|(offset, _)| *offset == start)
+        .map(|(_, meta)| meta.regs)
+        .unwrap_or([KnownType::Unknown; 256]);
+    states[0] = Some(entry_state);
     queue.push_back(start);
     in_queue[0] = true;
 
