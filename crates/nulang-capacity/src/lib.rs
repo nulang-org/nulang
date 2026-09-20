@@ -9,6 +9,7 @@ pub mod lease;
 pub mod provider;
 pub mod providers;
 pub mod telemetry;
+pub mod topology;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
