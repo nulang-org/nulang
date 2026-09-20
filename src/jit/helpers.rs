@@ -167,6 +167,7 @@ define_helpers! {
     // Heap operations
     ArrStore => nulang_arr_store, Reg4,
     ArrLen   => nulang_arr_len,   Reg3,
+    SimdArrayLen => nulang_simd_array_len, Unary,
     FieldL   => nulang_field_load, Reg4,
     // AOT value-based helpers (new)
     Pow      => nulang_pow,         Bin,
