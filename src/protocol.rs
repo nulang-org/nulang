@@ -344,6 +344,49 @@ pub enum ProtocolCompatibilityIssue {
     ResponseContractChanged(String),
 }
 
+/// Convert a compile-time structural `ActorRef<P>` type into the canonical
+/// protocol schema used for distributed identity.
+///
+/// This deliberately returns `None` for dynamic/non-ActorRef values and for
+/// malformed protocol shapes. The typechecker is the authority that validates
+/// source-level ActorRef syntax; lowering must fail closed rather than invent a
+/// runtime protocol identity when that proof is unavailable.
+pub fn actor_ref_schema(name: impl Into<String>, actor_ref: &Type) -> Option<ProtocolSchema> {
+    let protocol = actor_ref.actor_ref_protocol()?;
+    let Type::Record(fields) = protocol else {
+        return None;
+    };
+
+    let mut members = Vec::with_capacity(fields.len());
+    for (behavior, signature) in fields {
+        if behavior == crate::types::RECORD_ROW_TAIL_FIELD {
+            // Open actor protocols do not have a closed wire identity yet.
+            return None;
+        }
+        let Type::Function { param, ret, .. } = signature else {
+            return None;
+        };
+
+        // ActorRef protocol syntax uses the function parameter position as an
+        // argument pack: () => zero args, (A, B) => two args, scalar T => one.
+        let params = match param.as_ref() {
+            Type::Tuple(items) => items
+                .iter()
+                .map(ProtocolTypeId::from_type)
+                .collect::<Vec<_>>(),
+            other => vec![ProtocolTypeId::from_type(other)],
+        };
+
+        members.push(ProtocolMember::request_reply(
+            behavior.clone(),
+            params,
+            ProtocolTypeId::from_type(ret),
+        ));
+    }
+
+    ProtocolSchema::new(name, members).ok()
+}
+
 impl ProtocolSchema {
     pub fn new(
         name: impl Into<String>,
