@@ -9,7 +9,7 @@
 
 mod actor_protocol;
 pub mod agent;
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 pub mod aot;
 pub mod artifact_identity;
 pub mod ast;
@@ -29,11 +29,11 @@ pub mod cir_analysis;
 pub mod cir_lower;
 pub mod content_identity;
 pub mod core_vm;
-#[cfg(feature = "native-codegen")]
+#[cfg(any(feature = "jit-codegen", feature = "native-aot"))]
 pub mod cranelift_utils;
 pub mod dap;
 pub mod diagnostic;
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "difffuzz")]
 pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
@@ -43,13 +43,13 @@ pub mod effect_checker;
 pub mod ffi;
 pub mod fmt;
 pub mod format;
-#[cfg(feature = "native-codegen")]
+#[cfg(all(feature = "jit-codegen", feature = "native-aot"))]
 pub mod fuzz;
 pub mod hir;
 pub mod hir_lower;
 pub mod integration_tests;
 pub mod iso_arena;
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "jit-codegen")]
 pub mod jit;
 pub mod json_diagnostics;
 pub mod lexer;
