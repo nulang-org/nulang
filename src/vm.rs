@@ -222,6 +222,20 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Send a message to an actor by behavior table index.
     fn send_message(&mut self, target: Value, behavior_id: u16, args: &[Value]);
 
+    /// Send with an optional compile-time structural actor protocol
+    /// requirement. Standalone/custom callbacks remain source-compatible by
+    /// defaulting to the legacy send behavior.
+    fn send_message_with_protocol(
+        &mut self,
+        target: Value,
+        behavior_id: u16,
+        args: &[Value],
+        required_protocol: Option<[u8; 32]>,
+    ) {
+        let _ = required_protocol;
+        self.send_message(target, behavior_id, args);
+    }
+
     /// Synchronously ask an actor and return its response.
     /// Default implementation sends the message and returns nil.
     fn ask_actor(&mut self, target: Value, behavior_id: u16, args: &[Value]) -> Value {
@@ -5002,8 +5016,22 @@ impl VM {
                     .map(|b| (b.param_count, behavior_idx as u16))
                     .unwrap_or((0, 0));
                 let args: Vec<Value> = (0..param_count).map(|i| frame.regs[i]).collect();
-                self.actor_callbacks
-                    .send_message(actor_val, behavior_id, &args);
+                let send_pc = frame.pc.saturating_sub(1);
+                let required_protocol = self
+                    .modules
+                    .get(module_idx)
+                    .and_then(|m| {
+                        m.actor_send_protocols
+                            .iter()
+                            .find(|(pc, _)| *pc == send_pc)
+                            .map(|(_, id)| *id)
+                    });
+                self.actor_callbacks.send_message_with_protocol(
+                    actor_val,
+                    behavior_id,
+                    &args,
+                    required_protocol,
+                );
                 return Ok(());
             }
             OpCode::Ask => {
