@@ -48,11 +48,7 @@ impl Bridge {
                             Some(actor.name.as_str()),
                         );
                         if let Some(compensate) = &mut behavior.compensate {
-                            self.transform_body(
-                                compensate,
-                                env.clone(),
-                                Some(actor.name.as_str()),
-                            );
+                            self.transform_body(compensate, env.clone(), Some(actor.name.as_str()));
                         }
                     }
                 }
@@ -74,10 +70,7 @@ impl Bridge {
         for stmt in &mut body.stmts {
             match stmt {
                 Stmt::Let {
-                    name,
-                    value,
-                    span,
-                    ..
+                    name, value, span, ..
                 } => {
                     let invalidated = invalidated_actor_bindings(value, &env);
                     self.transform_rvalue(value, &env, current_actor, *span);
@@ -272,10 +265,7 @@ impl Bridge {
     }
 }
 
-fn actor_identity_of_operand(
-    operand: &Operand,
-    env: &FxHashMap<String, String>,
-) -> Option<String> {
+fn actor_identity_of_operand(operand: &Operand, env: &FxHashMap<String, String>) -> Option<String> {
     match operand {
         Operand::Var(name, _) => env.get(name).cloned(),
         Operand::Literal(..) | Operand::Unit => None,
@@ -361,10 +351,7 @@ fn actor_identity_of_body(
     }
 }
 
-fn invalidated_actor_bindings(
-    value: &RValue,
-    env: &FxHashMap<String, String>,
-) -> HashSet<String> {
+fn invalidated_actor_bindings(value: &RValue, env: &FxHashMap<String, String>) -> HashSet<String> {
     let mut out = HashSet::new();
     collect_rvalue_assignments(value, env, &HashSet::new(), &mut out);
     out
