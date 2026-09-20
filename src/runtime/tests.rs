@@ -7,7 +7,9 @@ use super::*;
 use crate::bytecode::{ActorMeta, CodeModule, Constant};
 use crate::runtime::gc::OrcaGc;
 use crate::runtime::heap::{ActorHeap, TypeTag};
-use crate::vm::{Frame, Value};
+use crate::vm::{ActorVmCallbacks, Frame, Value};
+use std::cell::RefCell;
+use std::rc::Rc;
 #[cfg(feature = "tcp")]
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -6744,6 +6746,31 @@ fn test_object_store_put_get() {
     let id = rt.object_store.put(bytes);
     let entry = rt.object_store.get(id).unwrap();
     assert_eq!(entry.as_bytes(), &[1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn test_runtime_vm_object_callbacks_share_zero_copy_store() {
+    let rt = Rc::new(RefCell::new(Runtime::new()));
+    let mut callbacks = RuntimeVmCallbacks::new(rt.clone());
+
+    let object = callbacks.object_put(vec![5, 10, 15, 20].into_boxed_slice());
+    assert!(object.is_object());
+    assert_eq!(callbacks.object_len(object), Some(4));
+    assert_eq!(callbacks.object_get_byte(object, 2), Some(15));
+
+    let view = callbacks.object_slice(object, 1, 3);
+    assert!(view.is_object());
+    assert_eq!(callbacks.object_len(view), Some(2));
+    assert_eq!(callbacks.object_get_byte(view, 0), Some(10));
+    assert_eq!(callbacks.object_get_byte(view, 1), Some(15));
+
+    let source_id = object.as_object_id().unwrap();
+    let view_id = view.as_object_id().unwrap();
+    let rt = rt.borrow();
+    let source = rt.object_store.get(source_id).unwrap();
+    let view_entry = rt.object_store.get(view_id).unwrap();
+    assert_eq!(source.as_bytes(), &[5, 10, 15, 20]);
+    assert_eq!(view_entry.as_bytes(), &[10, 15]);
 }
 
 #[test]
