@@ -39,8 +39,8 @@ pub mod typed_compiler;
 #[cfg(test)]
 mod tests;
 
-pub use compiler::*;
 pub(crate) use call_liveness::NativeCallSite;
+pub use compiler::*;
 
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
