@@ -289,6 +289,131 @@ fn actor_ref_and_concrete_protocols_are_erased_before_hir() {
 }
 
 #[test]
+fn actor_ref_can_be_attenuated_to_a_narrower_abstract_protocol() {
+    let result = check(
+        r#"
+        fn narrow(
+            target: ActorRef[{ get: () -> Int, add: Int -> Unit }]
+        ) -> ActorRef[{ get: () -> Int }] {
+            target
+        }
+
+        fn read(target: ActorRef[{ get: () -> Int }]) -> Int {
+            ask target get()
+        }
+
+        fn run(target: ActorRef[{ get: () -> Int, add: Int -> Unit }]) -> Int {
+            read(narrow(target))
+        }
+        "#,
+    );
+
+    assert!(
+        result.is_ok(),
+        "an ActorRef exposing a protocol superset should flow to a narrower requirement: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn actor_ref_cannot_be_widened_to_require_missing_behaviors() {
+    let result = check(
+        r#"
+        fn widen(
+            target: ActorRef[{ get: () -> Int }]
+        ) -> ActorRef[{ get: () -> Int, add: Int -> Unit }] {
+            target
+        }
+        "#,
+    );
+
+    assert!(
+        result.is_err(),
+        "ActorRef attenuation must be directional; a narrower reference cannot be widened"
+    );
+}
+
+#[test]
+fn actor_ref_function_arguments_support_safe_attenuation() {
+    let ok = check(
+        r#"
+        fn read(target: ActorRef[{ get: () -> Int }]) -> Int {
+            ask target get()
+        }
+
+        fn run(target: ActorRef[{ get: () -> Int, add: Int -> Unit }]) -> Int {
+            read(target)
+        }
+        "#,
+    );
+    assert!(
+        ok.is_ok(),
+        "function arguments should accept ActorRef protocol supersets: {:?}",
+        ok.err()
+    );
+
+    let bad = check(
+        r#"
+        fn mutate(target: ActorRef[{ get: () -> Int, add: Int -> Unit }]) -> Unit {
+            send target add(1)
+        }
+
+        fn run(target: ActorRef[{ get: () -> Int }]) -> Unit {
+            mutate(target)
+        }
+        "#,
+    );
+    assert!(
+        bad.is_err(),
+        "function arguments must reject ActorRef values missing required behaviors"
+    );
+}
+
+#[test]
+fn actor_ref_annotation_supports_attenuation_but_not_widening() {
+    let narrow = check(
+        r#"
+        fn narrow(target: ActorRef[{ get: () -> Int, add: Int -> Unit }]) -> ActorRef[{ get: () -> Int }] {
+            target : ActorRef[{ get: () -> Int }]
+        }
+        "#,
+    );
+    assert!(
+        narrow.is_ok(),
+        "explicit annotation should permit attenuation"
+    );
+
+    let widen = check(
+        r#"
+        fn widen(target: ActorRef[{ get: () -> Int }]) -> ActorRef[{ get: () -> Int, add: Int -> Unit }] {
+            target : ActorRef[{ get: () -> Int, add: Int -> Unit }]
+        }
+        "#,
+    );
+    assert!(widen.is_err(), "explicit annotation must reject widening");
+}
+
+#[test]
+fn actor_ref_attenuation_still_checks_behavior_signatures() {
+    let result = check(
+        r#"
+        fn use_int(target: ActorRef[{ add: Int -> Unit }]) -> Unit {
+            send target add(1)
+        }
+
+        fn run(target: ActorRef[{ add: String -> Unit, get: () -> Int }]) -> Unit {
+            use_int(target)
+        }
+        "#,
+    );
+
+    assert!(
+        result.is_err(),
+        "matching behavior names are insufficient when their signatures differ"
+    );
+}
+
+#[test]
 fn actor_ref_requires_a_record_protocol() {
     let tokens = Lexer::new("fn bad(target: ActorRef[Int]) { nil }")
         .lex()
