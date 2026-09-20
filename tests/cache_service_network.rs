@@ -2147,7 +2147,7 @@ fn configured_missing_snapshot_fails_closed() {
     let node_id = 4241u64;
     let placement = CacheSlotMap::new_local(node_id, 1).unwrap();
 
-    let error = CacheServiceBuilder::new(node_id, placement)
+    match CacheServiceBuilder::new(node_id, placement)
         .with_shard(
             CacheServiceShardConfig::new(
                 "127.0.0.1:0".parse().unwrap(),
@@ -2156,14 +2156,13 @@ fn configured_missing_snapshot_fails_closed() {
             .restore_from_snapshot(&missing),
         )
         .build()
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        nulang::runtime::CacheServiceError::Snapshot(
-            nulang::runtime::CacheSnapshotError::Io(ref io_error)
-        ) if io_error.kind() == std::io::ErrorKind::NotFound
-    ));
+    {
+        Err(nulang::runtime::CacheServiceError::Snapshot(
+            nulang::runtime::CacheSnapshotError::Io(io_error),
+        )) => assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound),
+        Err(other) => panic!("unexpected cache service error: {other:?}"),
+        Ok(_) => panic!("configured missing snapshot should fail closed"),
+    }
 }
 
 #[test]
