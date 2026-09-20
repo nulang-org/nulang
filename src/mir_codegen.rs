@@ -50,8 +50,8 @@ const SPILL_TEMP3: u8 = 14;
 /// Only incoming argument staging registers are seeded. The tiered JIT guards
 /// these facts against live value tags before entering guard-stripped native
 /// code because public VM/FFI call boundaries can provide dynamic values.
-/// Local static types are
-/// not globally trusted as runtime representations because operations such as
+/// Local static types are not globally trusted as runtime representations
+/// because operations such as
 /// checked division can produce `nil` despite an `Int`/`Float` source type.
 /// MIR codegen immediately moves r0..rN into the function's fixed local
 /// registers, so the normal bytecode must-analysis propagates these facts from
