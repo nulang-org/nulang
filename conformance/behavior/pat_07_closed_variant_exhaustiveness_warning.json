@@ -1,0 +1,1 @@
+{"exit_code": 0, "stdout": "ok", "stderr": "non-exhaustive match: missing variant Blue", "proves": "A statically-known closed variant match that omits a constructor emits W0201 while compilation and execution still succeed by default."}
