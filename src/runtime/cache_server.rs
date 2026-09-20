@@ -23,8 +23,8 @@ use parking_lot::Mutex;
 use rand_core::{OsRng, RngCore};
 
 use super::cache::{
-    CacheStore, CacheTransferBatch, CacheTransferCursor, CacheTransferEntry, CacheTransferFinalize,
-    CacheTransferImport, CacheTransferImportTracker,
+    CacheDurableEntry, CacheStore, CacheTransferBatch, CacheTransferCursor, CacheTransferEntry,
+    CacheTransferFinalize, CacheTransferImport, CacheTransferImportTracker,
 };
 use super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap, CacheRoutingMode};
 use super::cache_dispatch::{
@@ -32,7 +32,8 @@ use super::cache_dispatch::{
     CacheShardInbox,
 };
 use super::cache_durable_store::{
-    restore_cache_snapshot, write_cache_snapshot, CacheSnapshotError, CacheSnapshotReport,
+    restore_cache_snapshot_with_lsn, write_cache_snapshot_at_lsn, CacheSnapshotError,
+    CacheSnapshotReport,
 };
 use super::cache_migration_journal::{
     CacheMigrationConvergenceEvidence, CacheMigrationJournal, CacheMigrationKey,
@@ -40,13 +41,19 @@ use super::cache_migration_journal::{
 };
 use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
 use super::cache_routing::{CachePlacementError, CacheShardOwner, CacheSlotMap};
+use super::cache_wal::{
+    current_unix_ms as wal_current_unix_ms, CacheWal, CacheWalError, CacheWalMutation,
+    CacheWalSync,
+};
 use super::cache_transport::{
     CacheServiceTransportEndpoint, CacheServiceTransportSender, CacheTransportBridgeError,
     CacheTransportInbound, CacheTransportMessage, CacheTransportOutbound,
 };
 use super::cluster::NodeId;
 use super::resp::{parse_command, RespParseError};
-use super::resp_cache::{command_slot, execute_command, RespCommandSlot};
+use super::resp_cache::{
+    command_mutation_keys, command_slot, execute_command, RespCommandSlot,
+};
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
@@ -474,6 +481,20 @@ impl CacheDispatchWake for Waker {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheShardDurability {
+    Memory,
+    /// Fsync exact post-mutation WAL state before acknowledging a mutating
+    /// command.
+    Journal { wal_path: PathBuf },
+}
+
+impl Default for CacheShardDurability {
+    fn default() -> Self {
+        Self::Memory
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheServiceShardConfig {
     pub bind_addr: SocketAddr,
@@ -484,6 +505,7 @@ pub struct CacheServiceShardConfig {
     /// configured existing file is integrity-checked and restored before the
     /// shard reactor starts.
     pub restore_snapshot_path: Option<PathBuf>,
+    pub durability: CacheShardDurability,
 }
 
 impl CacheServiceShardConfig {
@@ -494,6 +516,7 @@ impl CacheServiceShardConfig {
             advertised_port: None,
             cpu: None,
             restore_snapshot_path: None,
+            durability: CacheShardDurability::Memory,
         }
     }
 
@@ -514,6 +537,13 @@ impl CacheServiceShardConfig {
 
     pub fn restore_from_snapshot(mut self, path: impl Into<PathBuf>) -> Self {
         self.restore_snapshot_path = Some(path.into());
+        self
+    }
+
+    pub fn journaled(mut self, wal_path: impl Into<PathBuf>) -> Self {
+        self.durability = CacheShardDurability::Journal {
+            wal_path: wal_path.into(),
+        };
         self
     }
 }
@@ -554,6 +584,7 @@ pub enum CacheServiceError {
     MigrationRecoveryTransferNotFound(u64),
     MigrationRestartReplayUnsafe,
     Snapshot(CacheSnapshotError),
+    Wal(CacheWalError),
     ShardServer {
         shard: u16,
         source: CacheServerError,
@@ -588,6 +619,12 @@ impl From<CacheTransportBridgeError> for CacheServiceError {
 impl From<CacheSnapshotError> for CacheServiceError {
     fn from(value: CacheSnapshotError) -> Self {
         Self::Snapshot(value)
+    }
+}
+
+impl From<CacheWalError> for CacheServiceError {
+    fn from(value: CacheWalError) -> Self {
+        Self::Wal(value)
     }
 }
 
@@ -697,6 +734,7 @@ impl CacheServiceBuilder {
                 local_addr,
                 shard.cpu,
                 shard.restore_snapshot_path.clone(),
+                shard.durability.clone(),
             ));
         }
 
@@ -711,7 +749,10 @@ impl CacheServiceBuilder {
         let mut local_addrs = Vec::with_capacity(self.shards.len());
         let mut cpus = Vec::with_capacity(self.shards.len());
 
-        for (index, ((listener, local_addr, cpu, restore_snapshot_path), inbox)) in
+        for (
+            index,
+            ((listener, local_addr, cpu, restore_snapshot_path, durability), inbox),
+        ) in
             reserved.into_iter().zip(inboxes.into_iter()).enumerate()
         {
             let shard = index as u16;
@@ -723,9 +764,26 @@ impl CacheServiceBuilder {
             )?
             .with_cluster_redirects(endpoints.clone());
 
-            let store = match restore_snapshot_path {
-                Some(path) => restore_cache_snapshot(&path, clock.now_ms())?,
-                None => CacheStore::new(),
+            let (mut store, checkpoint_lsn) = match restore_snapshot_path {
+                Some(path) => {
+                    let restored = restore_cache_snapshot_with_lsn(&path, clock.now_ms())?;
+                    (restored.store, restored.checkpoint_lsn)
+                }
+                None => (CacheStore::new(), 0),
+            };
+
+            let wal = match durability {
+                CacheShardDurability::Memory => None,
+                CacheShardDurability::Journal { wal_path } => {
+                    let mut wal = CacheWal::open(wal_path)?;
+                    wal.replay_into(
+                        &mut store,
+                        checkpoint_lsn,
+                        clock.now_ms(),
+                        wal_current_unix_ms()?,
+                    )?;
+                    Some(wal)
+                }
             };
 
             let server = CacheShardServer::from_listener(
@@ -736,6 +794,7 @@ impl CacheServiceBuilder {
                 self.server_config.clone(),
                 clock.clone(),
                 Some(placement_publisher.clone()),
+                wal,
             )
             .map_err(|source| CacheServiceError::ShardServer { shard, source })?;
 
