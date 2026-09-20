@@ -398,16 +398,18 @@ calls `jit::tiered_execute_step_typed`:
    `find_compilable_region` collects up to 500 instructions (stopping at the
    first non-compilable opcode, and *before* `Ret` so the VM still pops the
    frame); regions of 3 or more instructions (`region_len >= 3`) are compiled.
-3. SIMD first: `simd_analyzer` recognizes element-wise binop/unary/compare
-   loops and `simd_compiler` emits vectorized Cranelift IR
-   (`I64x2`/`F64x2`/`I32x4`/`F32x4`); otherwise the scalar
-   `compiler::compile_region` path is used.
-4. The **typed path is live**: at tier-up, `typed_compiler::infer_reg_types`
+3. Tier 1 uses the **typed path** when possible: `typed_compiler::infer_reg_types`
    recovers register types from the enclosing function's bytecode (a
    conservative forward must-analysis), and hot regions compile through
    `compile_region_typed` with NaN-tag guards stripped when types are
    provable — falling back to the scalar path on absent/empty metadata or
    compile error.
+4. Tier 2 counts compiled-region entries. At `TIER2_THRESHOLD = 10_000`, a
+   region gets one conservative SIMD promotion attempt. Production SIMD is
+   currently Int64-only and requires a canonical zero-based array loop with
+   unobservable scalar scratch state. Generated SIMD validates all participating
+   Array lengths before direct memory access; a failed guard deopts to the
+   original bytecode and bypasses JIT once at the region start.
 5. Helpers callable from JIT code are `extern "C"` functions in
    `src/jit/runtime.rs`, NaN-tag-aware (e.g. division by zero yields `nil`).
 
