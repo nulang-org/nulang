@@ -2187,6 +2187,7 @@ pub fn process_network_packets(
                             msg.sender,
                             "string intern failed on receiver",
                         );
+                        ack_packet(transport, cluster, incoming.from_node, incoming.seq);
                         continue;
                     }
                     if !intern_wire_objects(runtime, &mut payload_vec, &object_table) {
@@ -2199,6 +2200,7 @@ pub fn process_network_packets(
                             msg.sender,
                             "object intern failed on receiver",
                         );
+                        ack_packet(transport, cluster, incoming.from_node, incoming.seq);
                         continue;
                     }
                     msg.payload = Arc::new(payload_vec);
@@ -2578,6 +2580,76 @@ mod tests {
         let peer_id = NodeId::new(&peer_addr);
         cluster.handle_heartbeat(peer_id, peer_addr);
         peer_id
+    }
+
+    #[test]
+    fn rejected_wire_string_payload_is_still_acknowledged() {
+        fn noop(_actor: &mut crate::runtime::Actor, _args: &[Value]) {}
+
+        let bus = std::sync::Arc::new(parking_lot::Mutex::new(
+            std::collections::HashMap::new(),
+        ));
+        let sender_addr = addr(8998);
+        let receiver_addr = addr(8999);
+        let mut sender =
+            crate::runtime::network::DeterministicNetworkTransport::bind_with_bus(
+                sender_addr,
+                bus.clone(),
+            )
+            .unwrap();
+        let mut receiver =
+            crate::runtime::network::DeterministicNetworkTransport::bind_with_bus(
+                receiver_addr,
+                bus,
+            )
+            .unwrap();
+        sender.register_on_bus();
+        receiver.register_on_bus();
+
+        let sender_id = sender.node_id();
+        let receiver_id = receiver.node_id();
+        let mut cluster = make_cluster(receiver_addr.port());
+        add_peer(&mut cluster, sender_addr.port());
+        let mut resolver = AddressResolver::new(receiver_id);
+
+        let mut runtime = Runtime::new();
+        let target_actor = runtime.spawn_actor(Box::new(Vec::new));
+        runtime
+            .actors
+            .get_mut(&target_actor)
+            .unwrap()
+            .register_behavior("noop", noop);
+
+        sender.send(
+            receiver_id,
+            receiver_addr,
+            Packet::ActorMessage {
+                target_actor,
+                behavior_name: "noop".to_string(),
+                content_hash: None,
+                payload: vec![Value::string(0)],
+                string_table: vec!["wire-text".to_string()],
+                object_table: vec![],
+                sender_actor: 0,
+                sender_node: sender_id,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            },
+        );
+
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+
+        assert!(runtime.actors[&target_actor].mailbox.is_empty());
+        let replies = sender.receive();
+        assert!(
+            replies.iter().any(|incoming| {
+                matches!(
+                    incoming.packet,
+                    Packet::Ack { packet_seq: 0 }
+                )
+            }),
+            "receiver must acknowledge a definitively rejected wire payload"
+        );
     }
 
     // -- 1. Local ActorAddress ----------------------------------------------
