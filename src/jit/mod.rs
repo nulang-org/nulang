@@ -270,11 +270,7 @@ impl JitSession {
 
         // SAFETY: the bytecode and JIT module remain owned by this JitSession
         // for the lifetime of every generated function pointer.
-        if unsafe {
-            self.promote_region_simd(module_idx, pc, region_len, instructions)
-        }
-        .is_none()
-        {
+        if unsafe { self.promote_region_simd(module_idx, pc, region_len, instructions) }.is_none() {
             self.tier2_exhausted.insert(key);
         }
     }
@@ -397,12 +393,11 @@ impl JitSession {
         };
         let preheader = &body[..first_array];
         if !preheader.iter().any(|instr| {
-            instr.opcode == OpCode::ArrLen
-                && instr.op1 == trip_array
-                && instr.op2 == bound_reg
-        }) || !preheader.iter().any(|instr| {
-            instr.opcode == OpCode::Const0 && instr.op1 == region.induction_var_reg
-        }) {
+            instr.opcode == OpCode::ArrLen && instr.op1 == trip_array && instr.op2 == bound_reg
+        }) || !preheader
+            .iter()
+            .any(|instr| instr.opcode == OpCode::Const0 && instr.op1 == region.induction_var_reg)
+        {
             return false;
         }
 
@@ -430,13 +425,16 @@ impl JitSession {
         }
 
         // The loop bound must remain stable between ArrLen and the exit test.
-        if body[first_array..body.len() - 2].iter().any(|instr| match instr.opcode {
-            OpCode::ArrLoad => instr.op3 == bound_reg,
-            OpCode::IAdd | OpCode::ISub | OpCode::IMul => instr.op3 == bound_reg,
-            OpCode::INeg => instr.op2 == bound_reg,
-            OpCode::IInc => instr.op1 == bound_reg,
-            _ => false,
-        }) {
+        if body[first_array..body.len() - 2]
+            .iter()
+            .any(|instr| match instr.opcode {
+                OpCode::ArrLoad => instr.op3 == bound_reg,
+                OpCode::IAdd | OpCode::ISub | OpCode::IMul => instr.op3 == bound_reg,
+                OpCode::INeg => instr.op2 == bound_reg,
+                OpCode::IInc => instr.op1 == bound_reg,
+                _ => false,
+            })
+        {
             return false;
         }
 
@@ -469,10 +467,15 @@ impl JitSession {
         }
 
         match instructions.get(end) {
-            None | Some(crate::bytecode::Instruction { opcode: OpCode::Halt, .. }) => {
-                !clobbered.contains(&0)
-            }
-            Some(crate::bytecode::Instruction { opcode: OpCode::Ret, .. }) => true,
+            None
+            | Some(crate::bytecode::Instruction {
+                opcode: OpCode::Halt,
+                ..
+            }) => !clobbered.contains(&0),
+            Some(crate::bytecode::Instruction {
+                opcode: OpCode::Ret,
+                ..
+            }) => true,
             Some(crate::bytecode::Instruction {
                 opcode: OpCode::RetVal,
                 op1,
