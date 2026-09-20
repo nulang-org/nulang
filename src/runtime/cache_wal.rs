@@ -21,6 +21,7 @@ const RECORD_PREFIX_LEN: usize = 13; // kind + len + lsn
 const CHECKSUM_LEN: usize = 32;
 const KIND_UPSERT: u8 = 1;
 const KIND_DELETE: u8 = 2;
+const KIND_BATCH: u8 = 3;
 const MAX_RECORD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_KEY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_VALUE_BYTES: usize = 384 * 1024 * 1024;
@@ -66,6 +67,7 @@ pub enum CacheWalMutation {
         key: Vec<u8>,
         token: CacheTransferToken,
     },
+    Batch(Vec<CacheWalMutation>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +203,14 @@ impl CacheWal {
         )
     }
 
+    pub fn append_batch(
+        &mut self,
+        mutations: Vec<CacheWalMutation>,
+        sync: CacheWalSync,
+    ) -> Result<u64, CacheWalError> {
+        self.append(CacheWalMutation::Batch(mutations), sync)
+    }
+
     pub fn append(
         &mut self,
         mutation: CacheWalMutation,
@@ -257,14 +267,12 @@ impl CacheWal {
         let records = self.read_records_after(checkpoint_lsn)?;
         let mut applied = checkpoint_lsn;
         for record in records {
-            match record.mutation {
-                CacheWalMutation::Upsert(entry) => {
-                    store.apply_durable_entry(&entry, now_ms, wall_now_unix_ms)?;
-                }
-                CacheWalMutation::Delete { key, token } => {
-                    let _ = store.delete_durable_token(&key, token);
-                }
-            }
+            apply_mutation(
+                store,
+                record.mutation,
+                now_ms,
+                wall_now_unix_ms,
+            )?;
             applied = record.lsn;
         }
         Ok(applied)
@@ -365,6 +373,26 @@ fn encode_mutation(mutation: &CacheWalMutation) -> Result<(u8, Vec<u8>), CacheWa
             out.extend_from_slice(&token.source_generation.to_be_bytes());
             Ok((KIND_DELETE, out))
         }
+        CacheWalMutation::Batch(mutations) => {
+            let count = u32::try_from(mutations.len())
+                .map_err(|_| CacheWalError::LengthOverflow)?;
+            out.extend_from_slice(&count.to_be_bytes());
+            for mutation in mutations {
+                let (subkind, payload) = encode_mutation(mutation)?;
+                if subkind == KIND_BATCH {
+                    return Err(CacheWalError::TooLarge);
+                }
+                out.push(subkind);
+                let len = u32::try_from(payload.len())
+                    .map_err(|_| CacheWalError::LengthOverflow)?;
+                out.extend_from_slice(&len.to_be_bytes());
+                out.extend_from_slice(&payload);
+                if out.len() > MAX_RECORD_BYTES {
+                    return Err(CacheWalError::TooLarge);
+                }
+            }
+            Ok((KIND_BATCH, out))
+        }
     }
 }
 
@@ -400,10 +428,49 @@ fn decode_mutation(kind: u8, payload: &[u8]) -> Result<CacheWalMutation, CacheWa
                 source_generation: reader.u32()?,
             },
         },
+        KIND_BATCH => {
+            let count = reader.u32()? as usize;
+            let mut mutations = Vec::with_capacity(count);
+            for _ in 0..count {
+                let subkind = reader.u8()?;
+                if subkind == KIND_BATCH {
+                    return Err(CacheWalError::UnknownKind(subkind));
+                }
+                let len = reader.u32()? as usize;
+                if len > MAX_RECORD_BYTES {
+                    return Err(CacheWalError::TooLarge);
+                }
+                let payload = reader.take(len)?;
+                mutations.push(decode_mutation(subkind, payload)?);
+            }
+            CacheWalMutation::Batch(mutations)
+        }
         other => return Err(CacheWalError::UnknownKind(other)),
     };
     reader.finish()?;
     Ok(mutation)
+}
+
+fn apply_mutation(
+    store: &mut CacheStore,
+    mutation: CacheWalMutation,
+    now_ms: u64,
+    wall_now_unix_ms: u64,
+) -> Result<(), CacheWalError> {
+    match mutation {
+        CacheWalMutation::Upsert(entry) => {
+            store.apply_durable_entry(&entry, now_ms, wall_now_unix_ms)?;
+        }
+        CacheWalMutation::Delete { key, token } => {
+            let _ = store.delete_durable_token(&key, token);
+        }
+        CacheWalMutation::Batch(mutations) => {
+            for mutation in mutations {
+                apply_mutation(store, mutation, now_ms, wall_now_unix_ms)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn record_checksum(kind: u8, len: u32, lsn: u64, payload: &[u8]) -> [u8; 32] {
@@ -628,6 +695,28 @@ mod tests {
 
         fs::remove_file(snapshot_path).unwrap();
         fs::remove_file(wal_path).unwrap();
+    }
+
+    #[test]
+    fn batch_record_replays_multi_key_mutation_under_one_lsn() {
+        let path = temp_path("batch");
+        let mut wal = CacheWal::open(&path).unwrap();
+        let lsn = wal
+            .append_batch(
+                vec![
+                    CacheWalMutation::Upsert(upsert(b"a", b"1", 0, 1)),
+                    CacheWalMutation::Upsert(upsert(b"b", b"2", 1, 1)),
+                ],
+                CacheWalSync::Fsync,
+            )
+            .unwrap();
+        assert_eq!(lsn, 1);
+
+        let mut store = CacheStore::new();
+        assert_eq!(wal.replay_into(&mut store, 0, 0, 10_000).unwrap(), 1);
+        assert_eq!(store.get(b"a", 0), Some(CacheValueView::Bytes(b"1")));
+        assert_eq!(store.get(b"b", 0), Some(CacheValueView::Bytes(b"2")));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
