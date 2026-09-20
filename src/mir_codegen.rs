@@ -3009,6 +3009,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            no_alloc: false,
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
@@ -3040,6 +3041,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            no_alloc: false,
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
