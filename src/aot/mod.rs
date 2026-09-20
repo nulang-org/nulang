@@ -63,6 +63,7 @@ impl AotModule {
 
     /// Compile a MIR module to native code for a specific target ISA.
     pub fn compile_for_target(mir_module: &mir::Module, target: &str) -> NuResult<Self> {
+        crate::cost_model::prove_noalloc_contracts(mir_module)?;
         // Set up Cranelift with the target ISA.
         let mut flag_builder = settings::builder();
         let _ = flag_builder.set("enable_simd", "true");
