@@ -540,6 +540,12 @@ impl JitSession {
             Ok(ptr) => {
                 self.compiled
                     .insert((module_idx, start_offset), (ptr, num_instrs));
+                if let Some(meta) = type_metadata {
+                    let guard = type_guard_from_metadata(meta);
+                    if !guard.is_empty() {
+                        self.typed_guards.insert((module_idx, start_offset), guard);
+                    }
+                }
                 Some(std::mem::transmute(ptr))
             }
             Err(_) => self.compile_region_typed(
