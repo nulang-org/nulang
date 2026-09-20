@@ -180,6 +180,7 @@ define_helpers! {
     SafePoint => nulang_jit_safepoint_check, Unary,
     SetYield => nulang_jit_set_yield_pc, Unary,
     SetBranchExit => nulang_jit_set_branch_exit_pc, Unary,
+    SetDeopt => nulang_jit_set_deopt_pc, Unary,
     // Re-entrant direct call of a provably non-suspending callee from a
     // compiled region (see `nulang_jit_direct_call`).
     DirectCall => nulang_jit_direct_call, DirectCall,
