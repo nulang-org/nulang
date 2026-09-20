@@ -14,6 +14,8 @@ pub enum TokenKind {
     IntLit(i64),
     FloatLit(f64),
     StringLit(String),
+    /// Immutable byte-string literal, e.g. `b"abc\x00"`.
+    BytesLit(Vec<u8>),
     FStringLit(String),
     BoolLit(bool),
     NilLit,
@@ -179,6 +181,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::IntLit(n) => write!(f, "integer {}", n),
             TokenKind::FloatLit(n) => write!(f, "float {}", n),
             TokenKind::StringLit(s) => write!(f, "\"{}\"", s),
+            TokenKind::BytesLit(bytes) => write!(f, "bytes[{}]", bytes.len()),
             TokenKind::FStringLit(s) => write!(f, "f\"{}\"", s),
             TokenKind::BoolLit(b) => write!(f, "{}", b),
             TokenKind::NilLit => write!(f, "nil"),
@@ -431,7 +434,14 @@ impl<'a> Lexer<'a> {
                     self.read_operator()?
                 }
             }
-            b'a'..=b'e' | b'g'..=b'z' | b'_' => self.read_identifier(),
+            b'b' => {
+                if self.bytes.get(self.pos + 1) == Some(&b'"') {
+                    self.read_bytes_string()?
+                } else {
+                    self.read_identifier()
+                }
+            }
+            b'a' | b'c'..=b'e' | b'g'..=b'z' | b'_' => self.read_identifier(),
             b'f' => {
                 if self.bytes.get(self.pos + 1) == Some(&b'"') {
                     let f_start = self.pos;
@@ -697,6 +707,112 @@ impl<'a> Lexer<'a> {
                 span: Span::new(start as u32, self.pos as u32),
             })
         }
+    }
+
+    fn read_bytes_string(&mut self) -> NuResult<Token> {
+        let start = self.pos;
+        self.advance(); // b
+        self.advance(); // opening quote
+
+        let mut result = Vec::new();
+        loop {
+            match self.peek() {
+                Some(b'"') => {
+                    self.advance();
+                    break;
+                }
+                Some(b'\\') => {
+                    self.advance();
+                    match self.advance() {
+                        Some(b'n') => result.push(b'\n'),
+                        Some(b't') => result.push(b'\t'),
+                        Some(b'r') => result.push(b'\r'),
+                        Some(b'0') => result.push(0),
+                        Some(b'\\') => result.push(b'\\'),
+                        Some(b'"') => result.push(b'"'),
+                        Some(b'x') => {
+                            let hi = self.advance().ok_or_else(|| NuError::LexError {
+                                msg: "Incomplete \\x escape in bytes literal".to_string(),
+                                span: Span::new(start as u32, self.pos as u32),
+                            })?;
+                            let lo = self.advance().ok_or_else(|| NuError::LexError {
+                                msg: "Incomplete \\x escape in bytes literal".to_string(),
+                                span: Span::new(start as u32, self.pos as u32),
+                            })?;
+                            let hex = |ch: u8| -> Option<u8> {
+                                match ch {
+                                    b'0'..=b'9' => Some(ch - b'0'),
+                                    b'a'..=b'f' => Some(ch - b'a' + 10),
+                                    b'A'..=b'F' => Some(ch - b'A' + 10),
+                                    _ => None,
+                                }
+                            };
+                            let Some(hi) = hex(hi) else {
+                                return Err(NuError::LexError {
+                                    msg: "Invalid hexadecimal digit in bytes literal".to_string(),
+                                    span: Span::new((self.pos - 2) as u32, self.pos as u32),
+                                });
+                            };
+                            let Some(lo) = hex(lo) else {
+                                return Err(NuError::LexError {
+                                    msg: "Invalid hexadecimal digit in bytes literal".to_string(),
+                                    span: Span::new((self.pos - 1) as u32, self.pos as u32),
+                                });
+                            };
+                            result.push((hi << 4) | lo);
+                        }
+                        Some(b'u') => {
+                            let ch = self.read_unicode_escape(start)?;
+                            let mut buf = [0u8; 4];
+                            result.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                        }
+                        Some(other) => {
+                            return Err(NuError::LexError {
+                                msg: format!(
+                                    "Unknown bytes escape sequence: \\{}",
+                                    other as char
+                                ),
+                                span: Span::new((self.pos - 1) as u32, self.pos as u32),
+                            });
+                        }
+                        None => {
+                            return Err(NuError::LexError {
+                                msg: "Unterminated bytes literal escape".to_string(),
+                                span: Span::new(start as u32, self.pos as u32),
+                            });
+                        }
+                    }
+                }
+                Some(ch) if ch < 0x80 => {
+                    result.push(ch);
+                    self.advance();
+                }
+                Some(_) => {
+                    let Some(ch) = self.source[self.pos..].chars().next() else {
+                        return Err(NuError::LexError {
+                            msg: "Unterminated bytes literal".to_string(),
+                            span: Span::new(start as u32, self.pos as u32),
+                        });
+                    };
+                    let mut buf = [0u8; 4];
+                    result.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    for _ in 0..ch.len_utf8() {
+                        self.advance();
+                    }
+                }
+                None => {
+                    return Err(NuError::LexError {
+                        msg: "Unterminated bytes literal".to_string(),
+                        span: Span::new(start as u32, self.pos as u32),
+                    });
+                }
+            }
+        }
+
+        Ok(Token {
+            kind: TokenKind::BytesLit(result),
+            span: Span::new(start as u32, self.pos as u32),
+        })
     }
 
     fn read_string(&mut self) -> NuResult<Token> {
