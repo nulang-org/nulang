@@ -270,6 +270,24 @@ two major versions.*
   tombstones from removing newer generations. This slice provides the durable
   format/replay substrate only; command acknowledgement modes are stacked
   separately so fsync-failure outcome semantics remain explicit.
+- **Synchronous journal durability for normal cache commands** (Experimental,
+  `src/runtime/cache_server.rs`, `src/runtime/cache_wal.rs`,
+  `src/runtime/resp_cache.rs`). Shards can opt into
+  `CacheShardDurability::Journal` with a dedicated WAL path. Startup restores
+  an optional checkpoint, reads its checkpoint LSN, then replays newer WAL
+  records before the reactor starts. For mutating RESP commands
+  (SET/DEL/INCR/EXPIRE/MSET), journal mode captures only the potentially mutated
+  keys, executes through the existing command pipeline, derives exact post-state
+  deltas, appends one atomic WAL batch/LSN, and fsyncs before the response is
+  eligible for socket flush. Authenticated remote commands use the same
+  reactor-owned ordering before returning their application response.
+  Non-idempotent remote INCR recovery is covered across target cache-service
+  restart. Multi-key changes share one WAL record/fsync. A WAL failure after
+  in-memory mutation is treated as an unknown execution outcome and fail-stops
+  the shard rather than continuing with an untrustworthy durability stream.
+  Memory mode does not open or replay a WAL. Migration import/finalize control
+  mutations are intentionally not claimed by this slice and remain a separate
+  durability boundary.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
