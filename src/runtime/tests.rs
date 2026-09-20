@@ -38,6 +38,27 @@ fn test_authority_snapshot_round_trip_recovery() {
 }
 
 #[test]
+fn test_checkpoint_preserves_declared_schema_version() {
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(MemoryStore::new());
+    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    rt.actors.get_mut(&actor_id).unwrap().schema_version = 7;
+
+    rt.checkpoint_actor(actor_id);
+
+    let (schema_version, snapshot) = rt
+        .persistence
+        .load_snapshot_versioned(actor_id)
+        .expect("versioned snapshot");
+    assert_eq!(schema_version, 7);
+    assert_eq!(snapshot.actor_id, actor_id);
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(rt.actors.get(&actor_id).unwrap().schema_version, 7);
+}
+
+#[test]
 fn test_malformed_authority_snapshot_fails_recovery_closed() {
     let mut rt = Runtime::new();
     let actor_id = 91_001;
