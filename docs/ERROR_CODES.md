@@ -102,11 +102,18 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 | Range   | Category                                  |
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
+| `W02xx` | Static correctness / totality diagnostics |
 
 | Code    | Meaning                                   | Replacement (RFC)        |
 |---------|-------------------------------------------|--------------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
 | `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+| `W0201` | Closed variant `match` omits constructor(s) | Add missing arm(s) or an unguarded `_`; strict projects may use `--deny-warnings` |
+
+`W0201` is intentionally non-fatal in language version 1.x: changing an
+already-valid Frozen-Core `match` into a hard compile error would violate the
+current compatibility contract. It supplies migration evidence and an opt-in
+strict mode while an RFC defines any future versioned enforcement policy.
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
