@@ -389,6 +389,14 @@ pub fn lookup_host_operation_by_identity(
     })
 }
 
+pub fn lookup_host_operation_by_canonical_id(
+    canonical_id: &str,
+) -> Option<&'static HostOperationDescriptor> {
+    HOST_OPERATIONS
+        .iter()
+        .find(|operation| operation.canonical_id() == canonical_id)
+}
+
 /// Build the compiler-owned external ABI descriptor consumed by conformance
 /// tooling and, eventually, Cloud admission/runtime adapters.
 ///
