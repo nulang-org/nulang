@@ -68,6 +68,14 @@ two major versions.*
   behaviors is rejected. The check is applied at value-to-expected-type
   boundaries without making general HM unification asymmetric.
 
+### Actor dispatch soundness — 2026-09-20
+- **Fail-closed behavior-name resolution** (Stable runtime correction). Local,
+  cross-shard, and remote actor sends no longer map an unknown behavior name to
+  behavior id 0. Name resolution remains on the owning runtime/shard, fetched
+  or hot-reloaded code must still declare the requested behavior, invalid
+  synchronous numeric asks fail explicitly, and a genuinely declared behavior
+  id 0 remains valid.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
