@@ -905,6 +905,11 @@ pub struct TypeChecker {
     pub collect_errors: bool,
     /// Errors collected when `collect_errors` is set (empty otherwise).
     pub collected_errors: Vec<crate::types::NuError>,
+    /// Non-fatal semantic diagnostics produced during type checking.
+    ///
+    /// These preserve v1.x source compatibility while allowing stricter
+    /// projects to escalate them with the CLI's `--deny-warnings` policy.
+    pub warnings: Vec<NuWarning>,
 }
 
 /// Pre-computed class and instance tables extracted from an AST module.
@@ -986,7 +991,13 @@ impl TypeChecker {
             rigid_vars: FxHashSet::default(),
             collect_errors: false,
             collected_errors: Vec::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Consume and return semantic warnings accumulated by the type checker.
+    pub fn take_warnings(&mut self) -> Vec<NuWarning> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Type-check an entire module, returning the type of the last declaration.
@@ -3174,7 +3185,7 @@ impl TypeChecker {
         }
 
         let resolved_scrutinee = apply_subst(&scrut_ty, &final_subst);
-        Self::check_match_exhaustiveness(&resolved_scrutinee, arms, span)?;
+        self.warn_non_exhaustive_match(&resolved_scrutinee, arms, span);
 
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
     }
@@ -3184,13 +3195,14 @@ impl TypeChecker {
     /// at runtime. Primitive/literal, tuple, record, and open/unknown matches
     /// retain their existing runtime non-exhaustive behavior until the full
     /// pattern-matrix checker lands.
-    fn check_match_exhaustiveness(
+    fn warn_non_exhaustive_match(
+        &mut self,
         scrut_ty: &Type,
         arms: &[(Pattern, Option<Expr>, Expr)],
         span: Span,
-    ) -> NuResult<()> {
+    ) {
         let Type::Variant(variants) = scrut_ty else {
-            return Ok(());
+            return;
         };
 
         let mut covered: FxHashSet<String> = FxHashSet::default();
@@ -3201,7 +3213,7 @@ impl TypeChecker {
             }
 
             if Self::pattern_is_catch_all(pattern) {
-                return Ok(());
+                return;
             }
 
             if let Some(name) = Self::covered_variant_constructor(pattern, variants) {
@@ -3215,21 +3227,11 @@ impl TypeChecker {
             .collect();
 
         if missing.is_empty() {
-            return Ok(());
+            return;
         }
 
-        let plural = if missing.len() == 1 { "variant" } else { "variants" };
-        Err(NuError::TypeError {
-            msg: format!(
-                "non-exhaustive match: missing {} {}",
-                plural,
-                missing.join(", ")
-            ),
-            span,
-            expected_type: Some("all variants or an unguarded catch-all pattern".to_string()),
-            found_type: Some(format!("missing {}", missing.join(", "))),
-            similar_names: None,
-        })
+        self.warnings
+            .push(NuWarning::non_exhaustive_variant_match(span, &missing));
     }
 
     /// Whether a top-level pattern is a true catch-all for an arbitrary
@@ -4563,9 +4565,11 @@ mod tests {
             span: sp(),
         };
 
-        let err = tc.infer_expr(&ctx, &expr).unwrap_err();
-        assert!(err.to_string().contains("non-exhaustive match"));
-        assert!(err.to_string().contains("Blue"));
+        let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &s), Type::int());
+        assert_eq!(tc.warnings.len(), 1);
+        assert_eq!(tc.warnings[0].code, "W0201");
+        assert!(tc.warnings[0].msg.contains("Blue"));
     }
 
     #[test]
@@ -4603,6 +4607,7 @@ mod tests {
 
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
         assert_eq!(apply_subst(&ty, &s), Type::int());
+        assert!(tc.warnings.is_empty());
     }
 
     #[test]
@@ -4635,8 +4640,10 @@ mod tests {
             span: sp(),
         };
 
-        let err = tc.infer_expr(&ctx, &expr).unwrap_err();
-        assert!(err.to_string().contains("Some"));
+        let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &s), Type::int());
+        assert_eq!(tc.warnings.len(), 1);
+        assert!(tc.warnings[0].msg.contains("Some"));
     }
 
     #[test]
@@ -4667,6 +4674,7 @@ mod tests {
 
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
         assert_eq!(apply_subst(&ty, &s), Type::int());
+        assert!(tc.warnings.is_empty());
     }
 
     #[test]
@@ -4689,9 +4697,11 @@ mod tests {
             span: sp(),
         };
 
-        let err = tc.infer_expr(&ctx, &expr).unwrap_err();
-        assert!(err.to_string().contains("Left"));
-        assert!(err.to_string().contains("Right"));
+        let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &s), Type::int());
+        assert_eq!(tc.warnings.len(), 1);
+        assert!(tc.warnings[0].msg.contains("Left"));
+        assert!(tc.warnings[0].msg.contains("Right"));
     }
 
     // -----------------------------------------------------------------------
