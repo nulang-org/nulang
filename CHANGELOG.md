@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Compiler-owned JIT type seeds — 2026-09-20
+- **Typed function arguments now seed tiered-JIT must-analysis without changing the bytecode format** (`src/bytecode.rs`, `src/mir_codegen.rs`, `src/jit/typed_compiler.rs`). MIR codegen records primitive parameter facts for the incoming ABI registers (`r0..rN`) on the in-memory `CodeModule`; the existing conservative bytecode analysis then propagates those facts through the function prologue and invalidates them at nil-producing or otherwise unprovable operations exactly as before. The seed table is crate-private and `#[serde(skip)]`, so frozen `.nbc` artifacts neither encode nor restore trusted guard-stripping facts.
+
 ### MIR scalar replacement — 2026-09-20
 - **Same-block mutable-record SROA with field versioning** (`src/mir_mutable_sroa.rs`, `src/mir_codegen.rs`). Non-escaping compiler-generated records can now stay entirely scalar even when fields are mutated: each `StoreFieldNamed` advances a per-field scalar version, later field loads read the current version, and the record allocation plus field stores are removed. The first mutable pass deliberately rejects cross-block record uses, aliases, escaping records, unknown fields, unstable captured values, and debugger-visible ordinary named locals; branch-sensitive field phi construction remains a follow-up.
 - **Dominance-aware cross-block scalar replacement** (`src/mir_cfg.rs`, `src/mir_scalar_replace.rs`). The optimizer now computes explicit MIR dominators and can eliminate immutable tuple/record allocations when projections occur in dominated successor blocks. Cross-block substitution requires stable captured constituents and fails closed for non-dominating joins, later source reassignments, unreachable blocks, and functions with effect-handler tables whose implicit edges are not represented by the normal CFG.
