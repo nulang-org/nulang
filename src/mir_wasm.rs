@@ -2249,12 +2249,15 @@ impl WasmBackend {
                 // canonical ABI id. Custom/unknown effects retain their legacy
                 // dotted source tag during the migration. Runtime arguments stay
                 // positional; Cloud instantiates the compiler-authored request
-                // schema for canonical ids and writes the projected JSON result
-                // to the ring buffer. Args are marshalled into the module-wide argv
+                // schema for canonical ids and returns the projected result as
+                // a tagged Nulang Value. Legacy/custom calls still use the
+                // ring-buffer JSON result contract. Args are marshalled into the module-wide argv
                 // scratch (they are already-computed locals, so no dispatch's
                 // argument evaluation can run between our stores and the call).
                 // The tag is interned in the pre-scan.
-                let tag = crate::host_effect_abi::lookup_host_operation(effect, op)
+                let canonical_operation =
+                    crate::host_effect_abi::lookup_host_operation(effect, op);
+                let tag = canonical_operation
                     .map(|operation| operation.canonical_id())
                     .unwrap_or_else(|| format!("{effect}.{op}"));
                 let (tag_off, tag_len) = self.interned.get(&tag).copied().unwrap_or((0, 0));
@@ -2273,7 +2276,17 @@ impl WasmBackend {
                 body.instruction(&Instruction::I32Const(scratch as i32));
                 body.instruction(&Instruction::I32Const(args.len() as i32));
                 body.instruction(&Instruction::Call(IMPORT_NULANG_DISPATCH_ARGS));
-                self.compile_dispatch_readback(body);
+                if canonical_operation.is_none() {
+                    // Legacy/custom dotted calls keep the historical contract:
+                    // the host returns a ring-buffer byte length and the guest
+                    // parses that JSON scalar locally.
+                    self.compile_dispatch_readback(body);
+                }
+                // Compiler-canonical calls return the tagged Nulang Value
+                // directly in the existing i64 result slot. This avoids a
+                // second JSON parse inside generated WASM and preserves exact
+                // string escaping/Unicode at the host boundary.
+
             }
         }
     }
