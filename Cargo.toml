@@ -37,8 +37,23 @@ language-version = "1.0.0-frozen"
 
 [features]
 default = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
-# Cranelift-backed tiered JIT plus the current native/AOT backend.
-native-codegen = [
+# Backward-compatible umbrella for native execution. New code should depend on
+# the narrower `jit-codegen` or `native-aot` feature so JIT progress does not
+# implicitly expand the experimental AOT surface.
+native-codegen = ["jit-codegen", "native-aot"]
+# Cranelift-backed tiered JIT for the register VM.
+jit-codegen = [
+    "dep:cranelift",
+    "dep:cranelift-jit",
+    "dep:cranelift-module",
+    "dep:cranelift-native",
+    "dep:cranelift-frontend",
+    "dep:cranelift-codegen",
+    "dep:target-lexicon",
+]
+# Experimental MIR -> native backend. Kept independently selectable while its
+# semantic surface is frozen during backend consolidation.
+native-aot = [
     "dep:cranelift",
     "dep:cranelift-jit",
     "dep:cranelift-module",
@@ -54,7 +69,7 @@ python = ["dep:pyo3"]
 sqlite = ["dep:libsql"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
 ai-runtime = ["dep:nulang-ai", "dep:nulang-ai-local", "dep:uuid", "dep:reqwest", "dep:tokio"]
-wasm-backend = ["native-codegen", "dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
+wasm-backend = ["dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
 # WasmFX stack-switching backend: depends on wasm-backend, and additionally
 # enables wasmtime's GC support (required for exception tags, which carry
 # `suspend` payloads).
@@ -85,7 +100,7 @@ rocksdb = ["dep:rocksdb"]
 # PostgreSQL persistence backend (production-grade relational storage).
 postgres = ["dep:postgres"]
 # Differential fuzzing driver binary (src/bin/nula_difffuzz.rs).
-difffuzz = ["native-codegen"]
+difffuzz = ["jit-codegen", "native-aot"]
 
 [dependencies]
 # Memory & concurrency
