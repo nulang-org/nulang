@@ -68,51 +68,73 @@ pub fn builtin_effect_wit_interfaces() -> Vec<WitInterface> {
                     result: None,
                 },
                 WitOp {
+                    name: "println".into(),
+                    params: vec![("msg".into(), "string".into())],
+                    result: None,
+                },
+                WitOp {
                     name: "read".into(),
                     params: vec![],
                     result: Some("string".into()),
                 },
+                WitOp {
+                    name: "log".into(),
+                    params: vec![
+                        ("level".into(), "string".into()),
+                        ("message".into(), "string".into()),
+                    ],
+                    result: None,
+                },
+                WitOp {
+                    name: "log-error".into(),
+                    params: vec![("message".into(), "string".into())],
+                    result: None,
+                },
             ],
+        },
+        WitInterface {
+            name: "time".into(),
+            ops: vec![WitOp {
+                name: "now".into(),
+                params: vec![],
+                result: Some("s64".into()),
+            }],
         },
         WitInterface {
             name: "timer".into(),
             ops: vec![WitOp {
                 name: "sleep".into(),
-                params: vec![("ms".into(), "u64".into())],
+                params: vec![
+                    ("name".into(), "string".into()),
+                    ("duration-ms".into(), "s64".into()),
+                ],
                 result: None,
             }],
         },
         WitInterface {
             name: "random".into(),
             ops: vec![WitOp {
-                name: "u64".into(),
-                params: vec![],
-                result: Some("u64".into()),
+                name: "int".into(),
+                params: vec![
+                    ("lo".into(), "s64".into()),
+                    ("hi".into(), "s64".into()),
+                ],
+                result: Some("s64".into()),
             }],
         },
         WitInterface {
             name: "signal".into(),
-            ops: vec![
-                WitOp {
-                    name: "wait".into(),
-                    params: vec![("name".into(), "string".into())],
-                    result: None,
-                },
-                WitOp {
-                    name: "notify".into(),
-                    params: vec![("name".into(), "string".into())],
-                    result: None,
-                },
-            ],
+            ops: vec![WitOp {
+                name: "wait".into(),
+                params: vec![("name".into(), "string".into())],
+                result: None,
+            }],
         },
         WitInterface {
             name: "provider".into(),
             ops: vec![WitOp {
                 name: "ask".into(),
-                params: vec![
-                    ("provider".into(), "string".into()),
-                    ("prompt".into(), "string".into()),
-                ],
+                params: vec![("prompt".into(), "string".into())],
                 result: Some("string".into()),
             }],
         },
@@ -392,11 +414,15 @@ impl std::error::Error for WitGenError {}
 pub fn effect_to_wit_interface_name(effect: &Effect) -> Option<&'static str> {
     match effect {
         Effect::IO => Some("io"),
-        Effect::Net => Some("http"),
+        // Http currently canonicalizes to Effect::Net, which is too coarse to
+        // distinguish Http.get/post from Http.serve. Keep it unsupported until
+        // operation-sensitive WIT lowering lands rather than emit an incomplete
+        // http interface.
+        Effect::Net => None,
         Effect::String => Some("string"),
         Effect::FS => Some("fs"),
         Effect::Rand => Some("random"),
-        Effect::Time => Some("timer"),
+        Effect::Time => Some("time"),
         Effect::Inference => Some("provider"),
         Effect::Array => Some("array"),
         Effect::UserDefined(name) => match name.as_str() {
@@ -404,8 +430,6 @@ pub fn effect_to_wit_interface_name(effect: &Effect) -> Option<&'static str> {
             "Int" => Some("int"),
             "Float" => Some("float"),
             "Signal" => Some("signal"),
-            "Provider" => Some("provider"),
-            "Random" => Some("random"),
             "Timer" => Some("timer"),
             _ => None,
         },
@@ -620,11 +644,16 @@ mod tests {
             Effect::IO,
             Effect::FS,
             Effect::Inference,
+            Effect::Time,
+            Effect::Rand,
             Effect::UserDefined("Int".into()),
         ]);
         let imports = effect_row_to_wit_imports(&row).unwrap();
         let expected: BTreeSet<String> =
-            ["fs", "int", "io", "provider"].into_iter().map(str::to_string).collect();
+            ["fs", "int", "io", "provider", "random", "time"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
         assert_eq!(imports, expected);
     }
 
