@@ -1827,10 +1827,14 @@ fn log(msg: String) -> Unit ! {IO} {
 }
 ```
 
-Named functions may recurse by referring to their own name. Functions may be preceded by annotations; the only supported annotation is `@tool(description: "...")`, which exposes the function as an agent tool (§11.4):
+Named functions may recurse by referring to their own name. Functions may be preceded by annotations. `@tool(description: "...")` exposes a function as an agent tool (§11.4); the Experimental `@noalloc` marker requires the compiler to prove that the optimized function and its statically resolved call graph contain no allocation-capable runtime operations:
 
 ```nulang
-// fragment
+// allocation-free mechanical contract
+@noalloc
+fn hash_slot(key: Int) -> Int { key & 16383 }
+
+// agent-tool annotation
 @tool(description: "Search the knowledge base")
 fn search(query: String) -> String {
   ...
