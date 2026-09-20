@@ -54,6 +54,14 @@ two major versions.*
   references retain the previous compatibility behavior. The implementation is
   a compiler pre-pass integrated directly into `TypeChecker::check_module`; it
   does not alter runtime dispatch, persistence, or wire formats.
+- **Structural `ActorRef[P]` protocols** (Experimental). Public/generic actor
+  APIs can require a behavior record such as
+  `ActorRef[{ get: () -> Int, add: Int -> Unit }]`. Concrete actors advertise
+  declared behavior signatures through the existing `Type::Actor.behavior`
+  slot; concrete-to-`ActorRef` unification permits extra concrete behaviors
+  while requiring every requested behavior/signature. Calls through
+  `ActorRef[P]` are checked directly from `P`. The type is compile-time-only
+  and does not change runtime actor representation or stable formats.
 
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,

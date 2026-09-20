@@ -69,9 +69,51 @@ Dynamic actor references remain permissive in Phase 1. For example, a function p
 
 This gives Nulang an incremental migration path: known actors become safer immediately without requiring every existing generic actor API to adopt protocol parameters in one release.
 
+## Phase 2: structural actor references
+
+Phase 2 adds an explicit compile-time-only structural reference type:
+
+```nulang
+ActorRef[{ get: () -> Int, add: Int -> Unit }]
+```
+
+A concrete actor advertises a closed record of its declared behavior signatures in
+`Type::Actor.behavior`. Passing that actor where an `ActorRef[P]` is required
+checks that every behavior in `P` exists with a compatible parameter, return,
+effect, and capability signature. Extra concrete behaviors are permitted, so a
+concrete actor can be attenuated to a smaller required interface.
+
+Calls through `ActorRef[P]` are checked directly from `P`, which makes actor
+parameters and public APIs statically safe even when the concrete actor identity
+is intentionally hidden. Behavior signatures with omitted parameter or return
+annotations are not allowed to satisfy a typed structural requirement; Phase 1
+direct-call compatibility remains unchanged.
+
+ActorRef behavior signatures use an explicit **message argument-pack**
+interpretation for the function parameter position: `() -> R` means zero
+message arguments, `T -> R` means one argument, and `(A, B) -> R` means two
+arguments. Concrete actor protocols preserve the declared parameter vector as a
+pack, so a behavior declared as `behavior f(pair: (A, B))` is not confused
+with `behavior f(a: A, b: B)`. The current surface therefore fails closed for
+the uncommon case where a public structural protocol must name one tuple-valued
+message argument; a future dedicated behavior-signature syntax can make that
+case explicit without reintroducing arity ambiguity.
+
+`ActorRef[P]` and concrete actor protocol metadata are erased at the AST→HIR
+boundary to the deterministic runtime actor shape `Actor[Unit, Unit]`. Erasure
+is recursive across function signatures, containers, aliases, event schemas,
+FFI signatures, and database schemas; inferred function return types are erased
+before becoming HIR temporaries as well. This keeps protocol metadata available
+for type checking and semantic analysis while preventing it from entering MIR,
+bytecode, persistence, or NUL0 wire-facing artifacts.
+
+This phase does not change runtime actor values or any stable format. Structural
+subtyping between two already-abstract `ActorRef` values and distributed
+protocol fingerprints remain follow-up work.
+
 ## Future phases
 
-1. Encode behavior signatures directly in `Type::Actor.behavior` instead of relying on the annotation pre-pass.
+1. Generalize structural compatibility between `ActorRef` values (protocol attenuation/intersection).
 2. Introduce a user-facing structural protocol type (`ActorRef[P]` or equivalent) for parameters, fields, collections, and public APIs.
 3. Support protocol intersection and capability attenuation, e.g. `ActorRef[Readable & Observable]`.
 4. Include protocol/version metadata in distributed actor references and wire negotiation.

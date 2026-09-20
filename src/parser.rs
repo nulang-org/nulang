@@ -8,7 +8,7 @@ use crate::authority::AuthorityGrant;
 use crate::lexer::{Token, TokenKind};
 use crate::types::{
     Capability, Effect, EffectRow, NuError, NuResult, NuWarning, PrimitiveType, Region, Span, Type,
-    TypeVar,
+    TypeVar, ACTOR_REF_TYPE_NAME,
 };
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
@@ -5453,6 +5453,26 @@ impl Parser {
                 } else {
                     Vec::new()
                 };
+
+                if name == ACTOR_REF_TYPE_NAME {
+                    if args.len() != 1 {
+                        return Err(NuError::parse_error(
+                            format!(
+                                "ActorRef expects exactly one protocol argument, got {}",
+                                args.len()
+                            ),
+                            name_span,
+                        ));
+                    }
+                    let protocol = args.into_iter().next().expect("length checked above");
+                    if !matches!(protocol, Type::Record(_)) {
+                        return Err(NuError::parse_error(
+                            "ActorRef protocol must be a structural record, e.g. ActorRef[{ get: () -> Int }]".to_string(),
+                            name_span,
+                        ));
+                    }
+                    return Ok(Type::actor_ref(protocol));
+                }
 
                 let ty = match name.as_str() {
                     "Int" => Type::Primitive(PrimitiveType::Int),
