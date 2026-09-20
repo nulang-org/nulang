@@ -2669,6 +2669,25 @@ mod tests {
     #[cfg(feature = "tcp")]
     use std::thread::sleep;
 
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn golden_nul0_v1_handshake_bytes_are_frozen() {
+        let node = NodeId(0x0102_0304_0506_0708);
+        let mut bytes = Vec::new();
+        write_handshake(&mut bytes, node).expect("write v1 handshake");
+
+        let expected: [u8; crate::format::constants::WIRE_HANDSHAKE_LEN] = [
+            b'N', b'U', b'L', b'0',
+            0x00, 0x00, 0x00, 0x01,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        ];
+        assert_eq!(bytes.as_slice(), expected.as_slice());
+
+        let decoded = read_handshake(&mut std::io::Cursor::new(expected))
+            .expect("read frozen v1 handshake");
+        assert_eq!(decoded, node);
+    }
+
     // ------------------------------------------------------------------
     // 1. NodeId hashing
     // ------------------------------------------------------------------
