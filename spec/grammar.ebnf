@@ -12,8 +12,9 @@
 > against this grammar; see `conformance/README.md` for the check harness.
 >
 > Experimental surface (actors' `@backend`, `workflow`, `agent`, FFI `extern`,
-> Python interop, WIT) is **out of scope** for this grammar and is not part of
-> the frozen or stable language.
+> Python interop, WIT, and function performance contracts `@hot()`,
+> `@no_block()`, `@no_suspend()`) is **out of scope** for this grammar and
+> is not part of the frozen or stable language.
 >
 > EBNF conventions: `{ X }` = zero or more; `[ X ]` = optional; `X | Y` =
 > alternation; `"tok"` = literal terminal; `(* comment *)`. Newlines and
