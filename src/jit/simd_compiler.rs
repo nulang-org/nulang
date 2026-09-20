@@ -75,6 +75,7 @@ use crate::jit::simd_analyzer::{
     BinopKind, CmpKind, SimdElemType, SimdRegion, UnaryKind, VectorizablePattern,
 };
 use crate::jit::typed_compiler::load_reg;
+use crate::runtime::heap::{ActorHeap, OrcaHeader};
 use crate::value_layout::{PAYLOAD_MASK, TAG_INT};
 
 // ---------------------------------------------------------------------------
@@ -98,6 +99,26 @@ impl SimdBinOp {
             BinopKind::IMul | BinopKind::FMul => Some(SimdBinOp::Mul),
             _ => None,
         }
+    }
+}
+
+pub(crate) fn native_simd_codegen_supported(region: &SimdRegion) -> bool {
+    // Generic Nulang arrays store one 8-byte Value per slot. 32-bit SIMD
+    // lanes would use the wrong stride until an explicitly unboxed array
+    // representation exists.
+    if !matches!(region.elem_type, SimdElemType::Int64 | SimdElemType::Float64) {
+        return false;
+    }
+
+    match &region.pattern {
+        VectorizablePattern::ElementWiseBinop { op, .. } => {
+            SimdBinOp::from_binop_kind(*op).is_some()
+        }
+        VectorizablePattern::ElementWiseUnary { .. } => true,
+        // Comparison results are Nulang Bool values, not numeric array
+        // elements. The current vector store path does not yet synthesize
+        // per-lane TAG_BOOL values, so keep these scalar.
+        VectorizablePattern::ElementWiseCmp { .. } => false,
     }
 }
 
@@ -181,8 +202,9 @@ pub fn compile_simd_region(
     instructions: &[Instruction],
     simd_region: &SimdRegion,
 ) -> Result<*const u8, CompileError> {
-    // If SIMD is not supported on this host, fall back to scalar compilation
-    if !is_simd_supported() {
+    // Fall back unless this host and this concrete Value representation can
+    // execute the pattern without changing Nulang semantics.
+    if !is_simd_supported() || !native_simd_codegen_supported(simd_region) {
         return fallback_to_scalar(
             module,
             builder_context,
@@ -194,9 +216,12 @@ pub fn compile_simd_region(
         );
     }
 
-    // If no trip count hint and no ArrLen register, fall back to scalar.
-    let trip_count_is_runtime =
-        simd_region.trip_count_hint == Some(0) && simd_region.arr_len_reg.is_some();
+    // Some(0) means the analyzer observed ArrLen inside the candidate region.
+    // trip_count_array_reg is the source array register; the SIMD replacement
+    // derives its length directly from the heap header because it does not
+    // execute the original ArrLen bytecode.
+    let trip_count_is_runtime = simd_region.trip_count_hint == Some(0)
+        && simd_region.trip_count_array_reg.is_some();
     if simd_region.trip_count_hint.is_none() && !trip_count_is_runtime {
         return fallback_to_scalar(
             module,
@@ -293,13 +318,35 @@ pub fn compile_simd_region(
     let rhs_base = emit_extract_payload(&mut builder, rhs_base_tagged);
     let dst_base = emit_extract_payload(&mut builder, dst_base_tagged);
 
-    // Trip count: either compile-time constant or loaded from ArrLen register
+    // Trip count: either a compile-time constant or the payload length of
+    // the participating array whose ArrLen established the loop bound.
     let trip_count = if trip_count_is_runtime {
-        let arr_len_reg = simd_region.arr_len_reg.unwrap();
-        let offset = i32::from(arr_len_reg) * 8;
-        let addr = builder.ins().iadd_imm(regs_ptr, offset as i64);
-        let mem_flags = MemFlags::trusted();
-        builder.ins().load(types::I64, mem_flags, addr, 0)
+        let trip_reg = simd_region.trip_count_array_reg.unwrap();
+        let array_payload = if usize::from(trip_reg) == lhs_arr_reg {
+            lhs_base
+        } else if usize::from(trip_reg) == rhs_arr_reg {
+            rhs_base
+        } else if usize::from(trip_reg) == dst_arr_reg {
+            dst_base
+        } else {
+            return Err(CompileError::Internal(
+                "SIMD trip-count array is not part of the vectorized pattern".into(),
+            ));
+        };
+
+        let header = builder
+            .ins()
+            .iadd_imm(array_payload, -(ActorHeap::HEADER_SIZE as i64));
+        let payload_size_addr = builder.ins().iadd_imm(
+            header,
+            std::mem::offset_of!(OrcaHeader, payload_size) as i64,
+        );
+        let payload_bytes =
+            builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), payload_size_addr, 0);
+        // Generic arrays contain 8-byte Value slots.
+        builder.ins().ushr_imm(payload_bytes, 3)
     } else {
         let n = simd_region.trip_count_hint.unwrap_or(0) as i64;
         builder.ins().iconst(types::I64, n)
@@ -687,7 +734,21 @@ pub fn emit_simd_load(
     let addr = builder.ins().iadd(base_ptr, offset);
     let vtype = vector_clif_type(simd_region.elem_type);
     let flags = MemFlags::trusted();
-    builder.ins().load(vtype, flags, addr, 0)
+    let raw = builder.ins().load(vtype, flags, addr, 0);
+
+    match simd_region.elem_type {
+        SimdElemType::Int64 => {
+            // Each lane is a full tagged Value. Sign-extend the low 48-bit
+            // integer payload independently: (raw << 16) >>s 16.
+            let shift = builder.ins().iconst(types::I64, 16);
+            let shifted = builder.ins().ishl(raw, shift);
+            builder.ins().sshr(shifted, shift)
+        }
+        SimdElemType::Float64 => raw,
+        SimdElemType::Int32 | SimdElemType::Float32 => {
+            unreachable!("32-bit SIMD is not valid for generic Value arrays")
+        }
+    }
 }
 
 /// Store a SIMD vector to an array at the given index.
@@ -704,7 +765,7 @@ pub fn emit_simd_load(
 /// - `value`: The SIMD vector value to store
 pub fn emit_simd_store(
     builder: &mut FunctionBuilder,
-    _simd_region: &SimdRegion,
+    simd_region: &SimdRegion,
     base_ptr: Value,
     index: Value,
     elem_size_val: Value,
@@ -713,7 +774,26 @@ pub fn emit_simd_store(
     let offset = builder.ins().imul(index, elem_size_val);
     let addr = builder.ins().iadd(base_ptr, offset);
     let flags = MemFlags::trusted();
-    builder.ins().store(flags, value, addr, 0);
+
+    let stored = match simd_region.elem_type {
+        SimdElemType::Int64 => {
+            // Restore each lane to the canonical tagged-int representation.
+            // Arithmetic may overflow the 48-bit payload; masking preserves
+            // the VM/JIT scalar wrapping semantics.
+            let mask = builder.ins().iconst(types::I64, PAYLOAD_MASK as i64);
+            let tag = builder.ins().iconst(types::I64, TAG_INT as i64);
+            let mask_vec = builder.ins().splat(types::I64X2, mask);
+            let tag_vec = builder.ins().splat(types::I64X2, tag);
+            let payload = builder.ins().band(value, mask_vec);
+            builder.ins().bor(payload, tag_vec)
+        }
+        SimdElemType::Float64 => value,
+        SimdElemType::Int32 | SimdElemType::Float32 => {
+            unreachable!("32-bit SIMD is not valid for generic Value arrays")
+        }
+    };
+
+    builder.ins().store(flags, stored, addr, 0);
 }
 
 // ---------------------------------------------------------------------------
