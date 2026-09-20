@@ -69,10 +69,7 @@ pub(crate) fn module_behavior_index_for_actor(
     module_behavior_index_for_meta(meta, runtime_behavior_idx)
 }
 
-fn module_behavior_index_for_meta(
-    meta: &ActorMeta,
-    runtime_behavior_idx: usize,
-) -> Option<usize> {
+fn module_behavior_index_for_meta(meta: &ActorMeta, runtime_behavior_idx: usize) -> Option<usize> {
     match meta.role().ok()? {
         ActorRole::Workflow => meta.behavior_indices.get(runtime_behavior_idx).copied(),
         _ => meta
@@ -155,8 +152,7 @@ mod tests {
         typechecker.check_module(&ast).expect("typecheck");
         let hir = crate::hir_lower::lower_module(&ast, &typechecker.inferred_decl_types);
         let mut mir = crate::mir_lower::lower_module(&hir).expect("MIR lowering");
-        crate::mir_codegen::compile_mir(&mut mir, "behavior_ownership")
-            .expect("bytecode codegen")
+        crate::mir_codegen::compile_mir(&mut mir, "behavior_ownership").expect("bytecode codegen")
     }
 
     #[test]
@@ -226,8 +222,14 @@ mod tests {
             module_behavior_index_for_runtime_id(&module, "Flow", 1),
             Some(flow.behavior_indices[1])
         );
-        assert_eq!(runtime_behavior_id_for_name(&module, "Flow", "first"), Some(0));
-        assert_eq!(runtime_behavior_id_for_name(&module, "Flow", "second"), Some(1));
+        assert_eq!(
+            runtime_behavior_id_for_name(&module, "Flow", "first"),
+            Some(0)
+        );
+        assert_eq!(
+            runtime_behavior_id_for_name(&module, "Flow", "second"),
+            Some(1)
+        );
         assert_eq!(
             behavior_name_for_runtime_id(&module, "Flow", 0),
             Some("Flow.first")
