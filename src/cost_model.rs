@@ -448,6 +448,29 @@ fn direct_noalloc_reason(
 /// semantic heap allocation; this contract is about program-visible/runtime
 /// data allocation, not whether an internal Vec ever grows its reserved
 /// capacity.
+/// Run the canonical bytecode mechanical proof for any backend that consumes
+/// MIR directly. Backends call this only when a source-level `@noalloc`
+/// contract is present, so ordinary compilation pays no duplicate-codegen
+/// cost.
+///
+/// The bytecode proof is intentionally the single source of truth for the
+/// language-level contract. Backend-specific code generators may lower the
+/// accepted operations differently, but they must not silently weaken what
+/// `@noalloc` means.
+pub fn prove_noalloc_contracts(mir: &crate::mir::Module) -> crate::types::NuResult<()> {
+    if !mir
+        .functions
+        .iter()
+        .chain(mir.behaviors.iter())
+        .any(|function| function.no_alloc)
+    {
+        return Ok(());
+    }
+
+    let mut proof_mir = mir.clone();
+    crate::mir_codegen::compile_mir(&mut proof_mir, "<noalloc-proof>").map(|_| ())
+}
+
 pub fn validate_noalloc_contracts(
     mir: &crate::mir::Module,
     module: &CodeModule,
