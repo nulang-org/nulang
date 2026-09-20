@@ -38,7 +38,6 @@ pub enum MessagePriority {
     Bulk = 2,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MailboxPressureSnapshot {
     pub depth: usize,
@@ -116,7 +115,6 @@ impl Mailbox {
             active_match: None,
         }
     }
-
 
     fn record_high_watermark(&self, depth: usize) {
         let mut observed = self.high_watermark.load(Ordering::Relaxed);
@@ -289,7 +287,6 @@ impl Mailbox {
         self.len() == 0
     }
 
-
     /// Highest logical queue depth observed since mailbox creation.
     pub fn high_watermark(&self) -> usize {
         self.high_watermark.load(Ordering::Relaxed)
@@ -315,7 +312,6 @@ impl Mailbox {
             },
         }
     }
-
 
     /// Snapshot the mailbox without changing logical ownership/counting.
     pub fn drain(&mut self) -> Vec<Message> {
