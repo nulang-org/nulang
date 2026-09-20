@@ -113,6 +113,34 @@ impl ForeignCallRequest {
 /// into a VM Value on the scheduler thread.
 pub type ForeignCallResult = Result<OwnedForeignValue, String>;
 
+/// Materialize an owned worker result back into a VM value on the runtime
+/// thread.
+///
+/// Primitive values have canonical VM encodings and are reconstructed
+/// directly. Strings and opaque backend handles deliberately require caller
+/// callbacks because their concrete representation belongs to runtime/module
+/// state that worker threads are forbidden to access.
+pub fn materialize_foreign_value<FS, FO>(
+    value: OwnedForeignValue,
+    mut intern_string: FS,
+    mut materialize_opaque: FO,
+) -> Result<Value, String>
+where
+    FS: FnMut(String) -> Result<Value, String>,
+    FO: FnMut(&'static str, u64) -> Result<Value, String>,
+{
+    match value {
+        OwnedForeignValue::Int(value) => Ok(Value::int(value)),
+        OwnedForeignValue::Float(value) => Ok(Value::float(value)),
+        OwnedForeignValue::Bool(value) => Ok(Value::bool(value)),
+        OwnedForeignValue::Unit => Ok(Value::unit()),
+        OwnedForeignValue::Nil => Ok(Value::nil()),
+        OwnedForeignValue::String(value) => intern_string(value),
+        OwnedForeignValue::OpaqueHandle { backend, id } => materialize_opaque(backend, id),
+    }
+}
+
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForeignMarshalError {
     UnknownString(u32),
@@ -140,6 +168,80 @@ mod tests {
     use super::*;
 
     fn assert_send_static<T: Send + 'static>() {}
+
+    #[test]
+    fn materialization_reconstructs_primitives_without_runtime_state() {
+        let never_string = |_value: String| -> Result<Value, String> {
+            panic!("primitive materialization must not intern strings")
+        };
+        let never_opaque = |_backend: &'static str, _id: u64| -> Result<Value, String> {
+            panic!("primitive materialization must not touch opaque handles")
+        };
+
+        assert_eq!(
+            materialize_foreign_value(
+                OwnedForeignValue::Int(42),
+                never_string,
+                never_opaque
+            )
+            .unwrap()
+            .as_int(),
+            Some(42)
+        );
+        assert_eq!(
+            materialize_foreign_value(
+                OwnedForeignValue::Bool(true),
+                never_string,
+                never_opaque
+            )
+            .unwrap()
+            .as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn materialization_delegates_string_to_scheduler_owned_interner() {
+        let value = materialize_foreign_value(
+            OwnedForeignValue::String("hello".to_string()),
+            |content| {
+                assert_eq!(content, "hello");
+                Ok(Value::string(17))
+            },
+            |_backend, _id| Err("unexpected opaque handle".to_string()),
+        )
+        .unwrap();
+        assert_eq!(value.as_string_id(), Some(17));
+    }
+
+    #[test]
+    fn materialization_delegates_opaque_handle_to_backend_boundary() {
+        let value = materialize_foreign_value(
+            OwnedForeignValue::OpaqueHandle {
+                backend: "python",
+                id: 91,
+            },
+            |_content| Err("unexpected string".to_string()),
+            |backend, id| {
+                assert_eq!(backend, "python");
+                assert_eq!(id, 91);
+                Ok(Value::int(id as i64))
+            },
+        )
+        .unwrap();
+        assert_eq!(value.as_int(), Some(91));
+    }
+
+    #[test]
+    fn materialization_propagates_runtime_owned_failures() {
+        let err = materialize_foreign_value(
+            OwnedForeignValue::String("cannot-intern".to_string()),
+            |_content| Err("string interner unavailable".to_string()),
+            |_backend, _id| Err("opaque backend unavailable".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(err, "string interner unavailable");
+    }
 
     #[test]
     fn request_and_result_types_are_worker_thread_safe() {
