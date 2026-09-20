@@ -24,6 +24,12 @@ const codeHtml = [
 <div class="hero hero-cloud">
 	<div class="hero-copy">
 		<div class="hero-copy-inner">
+			<div class="hero-status" aria-label="Project status">
+				<span class="hero-status-dot" aria-hidden="true"></span>
+				Alpha software
+				<span class="hero-status-separator" aria-hidden="true">·</span>
+				Open source
+			</div>
 			<h1 id={PAGE_TITLE_ID} data-page-title set:html={title} />
 			{tagline && <div class="tagline" set:html={tagline} />}
 			{actions.length > 0 && (
@@ -67,6 +73,34 @@ const codeHtml = [
 		.hero-copy-inner {
 			display: flex;
 			flex-direction: column;
+		}
+
+		.hero-status {
+			display: inline-flex;
+			align-items: center;
+			align-self: flex-start;
+			gap: 0.5rem;
+			margin-bottom: 1.25rem;
+			padding: 0.4rem 0.7rem;
+			border: 1px solid var(--nu-border);
+			border-radius: 999px;
+			background: color-mix(in srgb, var(--nu-surface) 88%, transparent);
+			color: var(--nu-text-secondary);
+			font-size: 0.75rem;
+			font-weight: 600;
+			letter-spacing: 0.02em;
+		}
+
+		.hero-status-dot {
+			width: 0.5rem;
+			height: 0.5rem;
+			border-radius: 999px;
+			background: var(--nu-accent-high);
+			box-shadow: 0 0 0 3px color-mix(in srgb, var(--nu-accent-high) 14%, transparent);
+		}
+
+		.hero-status-separator {
+			color: var(--nu-text-tertiary);
 		}
 
 		h1 {
