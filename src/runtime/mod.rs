@@ -2039,21 +2039,9 @@ impl Runtime {
                 self.current_actor = prev;
             }
             // A behavior_idx with neither a bytecode nor native handler
-            // falls through here silently. In practice this branch is
-            // unreachable for messages sent via `send_message`/
-            // `send_message_by_id` today: `send_message` resolves an
-            // unknown behavior NAME to id 0 via
-            // `behavior_id_for(..).unwrap_or(0)` (see its doc comment) --
-            // NOT a genuinely unknown numeric id -- so a typo'd or
-            // undeclared behavior name silently runs behavior 0 well
-            // before reaching this point, rather than being skipped as
-            // this comment used to claim. Tracked as a known surprising
-            // behavior in SPEC2.md (Chapter 8, message passing), not
-            // fixed here -- `send_message` is called pervasively and
-            // AGENTS.md documents the remote-message path as
-            // deliberately mirroring this same fallback, so correcting
-            // it needs a wider, carefully-audited change, not a
-            // single-site patch.
+            // falls through without executing user code. Public name-based
+            // sends resolve fail-closed before enqueueing; this defensive path
+            // remains for trusted/internal numeric delivery.
 
             depth += 1;
             if depth >= MAX_FLUSH_DEPTH {
