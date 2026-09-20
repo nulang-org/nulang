@@ -1,6 +1,8 @@
 use crate::types::{NuError, NuResult, Span};
 
 #[cfg(feature = "wasm-backend")]
+use crate::authority::{AuthorityGrant, AuthorityManifest};
+#[cfg(feature = "wasm-backend")]
 use wasmtime::component::*;
 #[cfg(feature = "wasm-backend")]
 use wasmtime::*;
@@ -29,58 +31,60 @@ pub fn component_config() -> Config {
     config
 }
 
-/// Capability controls for the WASM component host.
+/// Exact authority grant required for one low-level WASM host import.
 ///
-/// Each flag determines whether a given host function is made available to
-/// the guest component. If a flag is `false` and the component imports the
-/// corresponding function, instantiation will fail at the linker level.
+/// These use the existing typed authority extension point rather than a
+/// backend-specific boolean policy. The WIT host functions are intentionally
+/// narrow: source-level effects may lower to these operations, but granting one
+/// operation never grants a sibling operation.
 #[cfg(feature = "wasm-backend")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Capabilities {
-    pub allow_log: bool,
-    pub allow_clock: bool,
-    pub allow_random: bool,
-}
-
-#[cfg(feature = "wasm-backend")]
-impl Default for Capabilities {
-    fn default() -> Self {
-        Capabilities {
-            allow_log: false,
-            allow_clock: false,
-            allow_random: false,
-        }
+fn component_host_grant(namespace: &str, operation: &str) -> AuthorityGrant {
+    AuthorityGrant::Other {
+        namespace: namespace.to_string(),
+        operation: operation.to_string(),
+        argument: None,
     }
 }
 
 #[cfg(feature = "wasm-backend")]
+fn allows_component_host(
+    authority: &AuthorityManifest,
+    namespace: &str,
+    operation: &str,
+) -> bool {
+    authority.allows(&component_host_grant(namespace, operation))
+}
+
+#[cfg(feature = "wasm-backend")]
 pub struct HostState {
-    caps: Capabilities,
+    authority: AuthorityManifest,
     log_messages: Vec<String>,
 }
 
 #[cfg(feature = "wasm-backend")]
 impl HostTrait for HostState {
     fn log(&mut self, msg: String) {
-        if self.caps.allow_log {
-            self.log_messages.push(msg);
-        }
+        assert!(
+            allows_component_host(&self.authority, "IO", "Log"),
+            "WASM host authority denied: IO::Log"
+        );
+        self.log_messages.push(msg);
     }
 
     fn clock_now(&mut self) -> u64 {
-        if self.caps.allow_clock {
-            0
-        } else {
-            panic!("clock capability denied")
-        }
+        assert!(
+            allows_component_host(&self.authority, "Time", "Now"),
+            "WASM host authority denied: Time::Now"
+        );
+        0
     }
 
     fn random_u64(&mut self) -> u64 {
-        if self.caps.allow_random {
-            0
-        } else {
-            panic!("random capability denied")
-        }
+        assert!(
+            allows_component_host(&self.authority, "Random", "U64"),
+            "WASM host authority denied: Random::U64"
+        );
+        0
     }
 }
 
@@ -95,17 +99,25 @@ pub struct ComponentRuntime {
     engine: Engine,
     component: Component,
     linker: wasmtime::component::Linker<HostState>,
-    caps: Capabilities,
+    authority: AuthorityManifest,
     pool: std::sync::Mutex<Vec<PooledInstance>>,
 }
 
 #[cfg(feature = "wasm-backend")]
 impl ComponentRuntime {
+    /// Construct a deny-by-default component runtime.
     pub fn new(wasm_bytes: &[u8]) -> NuResult<Self> {
-        Self::new_with_caps(wasm_bytes, Capabilities::default())
+        Self::new_with_authority(wasm_bytes, AuthorityManifest::new())
     }
 
-    pub fn new_with_caps(wasm_bytes: &[u8], caps: Capabilities) -> NuResult<Self> {
+    /// Construct a component runtime with an exact typed authority manifest.
+    ///
+    /// Only WIT host functions whose exact grant is present are linked. A
+    /// component importing any other host function fails instantiation.
+    pub fn new_with_authority(
+        wasm_bytes: &[u8],
+        authority: AuthorityManifest,
+    ) -> NuResult<Self> {
         let config = component_config();
         let engine = Engine::new(&config).map_err(|e| NuError::VMError {
             msg: format!("wasmtime engine: {}", e),
@@ -115,24 +127,27 @@ impl ComponentRuntime {
             msg: format!("wasmtime component: {}", e),
             span: Span::default(),
         })?;
-        let linker = Self::build_linker(&engine, caps)?;
+        let linker = Self::build_linker(&engine, &authority)?;
         Ok(ComponentRuntime {
             engine,
             component,
             linker,
-            caps,
+            authority,
             pool: std::sync::Mutex::new(Vec::new()),
         })
     }
 
     fn build_linker(
         engine: &Engine,
-        caps: Capabilities,
+        authority: &AuthorityManifest,
     ) -> NuResult<wasmtime::component::Linker<HostState>> {
         let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
+        let allow_log = allows_component_host(authority, "IO", "Log");
+        let allow_clock = allows_component_host(authority, "Time", "Now");
+        let allow_random = allows_component_host(authority, "Random", "U64");
 
-        // Add the host instance manually with the correct name
-        if caps.allow_log || caps.allow_clock || caps.allow_random {
+        // Add only the exact host operations authorized by the manifest.
+        if allow_log || allow_clock || allow_random {
             let mut inst =
                 linker
                     .instance("nulang:runtime/host")
@@ -140,7 +155,7 @@ impl ComponentRuntime {
                         msg: format!("wasmtime linker: {}", e),
                         span: Span::default(),
                     })?;
-            if caps.allow_log {
+            if allow_log {
                 inst.func_wrap(
                     "log",
                     move |mut caller: wasmtime::StoreContextMut<'_, HostState>,
@@ -154,7 +169,7 @@ impl ComponentRuntime {
                     span: Span::default(),
                 })?;
             }
-            if caps.allow_clock {
+            if allow_clock {
                 inst.func_wrap(
                     "clock-now",
                     move |mut caller: wasmtime::StoreContextMut<'_, HostState>, _: ()| {
@@ -167,7 +182,7 @@ impl ComponentRuntime {
                     span: Span::default(),
                 })?;
             }
-            if caps.allow_random {
+            if allow_random {
                 inst.func_wrap(
                     "random-u64",
                     move |mut caller: wasmtime::StoreContextMut<'_, HostState>, _: ()| {
@@ -193,7 +208,7 @@ impl ComponentRuntime {
         let mut store = Store::new(
             &self.engine,
             HostState {
-                caps: self.caps,
+                authority: self.authority.clone(),
                 log_messages: Vec::new(),
             },
         );
@@ -262,7 +277,7 @@ impl ComponentRuntime {
 mod tests {
     use super::*;
 
-    /// Minimal WAT component that imports `log` and exports `init`.
+    /// Minimal WAT component that imports `log`.
     const LOG_IMPORT_WAT: &str = r#"
         (component
             (import "nulang:runtime/host" (instance $host
@@ -271,34 +286,30 @@ mod tests {
         )
     "#;
 
-    #[test]
-    fn test_component_capability_gate_denies_log() {
-        let wasm = wat::parse_str(LOG_IMPORT_WAT).expect("parse WAT");
-        let rt = ComponentRuntime::new_with_caps(
-            &wasm,
-            Capabilities {
-                allow_log: false,
-                allow_clock: false,
-                allow_random: false,
-            },
-        )
-        .expect("new_with_caps");
+    fn manifest(grants: &[(&str, &str)]) -> AuthorityManifest {
+        AuthorityManifest::from_grants(grants.iter().map(|(namespace, operation)| {
+            component_host_grant(namespace, operation)
+        }))
+    }
 
-        // Direct instantiation with the linker should fail because the host
-        // interface is not added when allow_log is false.
+    #[test]
+    fn component_authority_is_deny_by_default() {
+        let wasm = wat::parse_str(LOG_IMPORT_WAT).expect("parse WAT");
+        let rt = ComponentRuntime::new(&wasm).expect("new runtime");
         let engine = wasmtime::Engine::new(&component_config()).expect("engine");
         let mut store = wasmtime::Store::new(
             &engine,
             HostState {
-                caps: rt.caps,
+                authority: AuthorityManifest::new(),
                 log_messages: Vec::new(),
             },
         );
-        let linker = ComponentRuntime::build_linker(&engine, rt.caps).expect("linker");
+        let linker =
+            ComponentRuntime::build_linker(&engine, &rt.authority).expect("linker");
         let component = wasmtime::component::Component::new(&engine, &wasm).expect("component");
         let err = linker
             .instantiate(&mut store, &component)
-            .expect_err("should fail to instantiate without log capability");
+            .expect_err("missing IO::Log authority must deny the import");
         assert!(
             err.to_string().contains("host"),
             "error should mention missing host import: {}",
@@ -307,32 +318,55 @@ mod tests {
     }
 
     #[test]
-    fn test_component_capability_gate_allows_log() {
+    fn exact_component_authority_allows_log() {
         let wasm = wat::parse_str(LOG_IMPORT_WAT).expect("parse WAT");
-        let rt = ComponentRuntime::new_with_caps(
-            &wasm,
-            Capabilities {
-                allow_log: true,
-                allow_clock: false,
-                allow_random: false,
-            },
-        )
-        .expect("new_with_caps");
-
-        // Direct instantiation with the linker should succeed because the host
-        // interface is added when allow_log is true.
+        let authority = manifest(&[("IO", "Log")]);
+        let rt = ComponentRuntime::new_with_authority(&wasm, authority.clone())
+            .expect("new_with_authority");
         let engine = wasmtime::Engine::new(&component_config()).expect("engine");
         let mut store = wasmtime::Store::new(
             &engine,
             HostState {
-                caps: rt.caps,
+                authority,
                 log_messages: Vec::new(),
             },
         );
-        let linker = ComponentRuntime::build_linker(&engine, rt.caps).expect("linker");
+        let linker =
+            ComponentRuntime::build_linker(&engine, &rt.authority).expect("linker");
         let component = wasmtime::component::Component::new(&engine, &wasm).expect("component");
         let _instance = linker
             .instantiate(&mut store, &component)
-            .expect("should succeed with log capability");
+            .expect("exact IO::Log authority should link log");
+    }
+
+    #[test]
+    fn sibling_authority_does_not_authorize_log() {
+        let wasm = wat::parse_str(LOG_IMPORT_WAT).expect("parse WAT");
+        let authority = manifest(&[("Time", "Now")]);
+        let rt = ComponentRuntime::new_with_authority(&wasm, authority.clone())
+            .expect("new_with_authority");
+        let engine = wasmtime::Engine::new(&component_config()).expect("engine");
+        let mut store = wasmtime::Store::new(
+            &engine,
+            HostState {
+                authority,
+                log_messages: Vec::new(),
+            },
+        );
+        let linker =
+            ComponentRuntime::build_linker(&engine, &rt.authority).expect("linker");
+        let component = wasmtime::component::Component::new(&engine, &wasm).expect("component");
+        linker
+            .instantiate(&mut store, &component)
+            .expect_err("Time::Now must not authorize IO::Log");
+    }
+
+    #[test]
+    fn component_host_grants_are_exact_typed_authority() {
+        let authority = manifest(&[("IO", "Log"), ("Random", "U64")]);
+        assert!(authority.allows(&component_host_grant("IO", "Log")));
+        assert!(authority.allows(&component_host_grant("Random", "U64")));
+        assert!(!authority.allows(&component_host_grant("Time", "Now")));
+        assert!(!authority.allows(&component_host_grant("IO", "Print")));
     }
 }
