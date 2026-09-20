@@ -7,9 +7,9 @@ interface Metric {
 }
 
 const metrics: Metric[] = [
-  { value: '1,500+', label: 'Tests passing', detail: 'Core language suite' },
-  { value: '3', label: 'Backends', detail: 'Bytecode · Native · WASM' },
-  { value: 'Per-actor', label: 'Garbage collection', detail: 'No stop-the-world pauses' },
+  { value: 'Alpha', label: 'Implementation status', detail: 'Frozen core · evolving runtime', href: 'https://github.com/nulang-org/nulang#project-status--stability' },
+  { value: '4', label: 'Execution modes', detail: 'Bytecode · JIT · Native AOT · WASM' },
+  { value: 'Per-actor', label: 'Garbage collection', detail: 'No global stop-the-world collector' },
   { value: 'Apache 2.0', label: 'Open source', detail: 'Contribute on GitHub', href: 'https://github.com/nulang-org/nulang' },
 ];
 ---
