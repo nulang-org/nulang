@@ -1197,6 +1197,44 @@ mod tests {
     }
 
     #[test]
+    fn exact_wasm_ffi_authority_reaches_resolution_boundary() {
+        let lib_offset = 16u64;
+        let sym_offset = 64u64;
+        let lib_value = value_layout::TAG_STRING | lib_offset;
+        let sym_value = value_layout::TAG_STRING | sym_offset;
+        let wat = format!(
+            r#"(module
+                (import "env" "memory" (memory 1))
+                (import "env" "ffi_call_0"
+                    (func $ffi (param i64 i64 i64) (result i64)))
+                (data (i32.const {lib_offset}) "libdefinitely-missing.so\00")
+                (data (i32.const {sym_offset}) "missing_symbol\00")
+                (func (export "nulang_init") (result i64)
+                    i64.const {lib_value}
+                    i64.const {sym_value}
+                    i64.const 0
+                    call $ffi)
+            )"#
+        );
+        let manifest = crate::authority::AuthorityManifest::from_tokens([
+            "FFI::Call(libdefinitely-missing.so::missing_symbol)",
+        ])
+        .unwrap();
+
+        let mut runtime =
+            WasmRuntime::new_with_authority(wat.as_bytes(), None, manifest).unwrap();
+        let error = runtime.run().unwrap_err().to_string();
+        assert!(
+            !error.contains("WASM FFI denied"),
+            "exact authority must cross the authority gate: {error}"
+        );
+        assert!(
+            error.contains("ffi resolve"),
+            "the deliberately missing library should fail only after authorization: {error}"
+        );
+    }
+
+    #[test]
     fn test_default_config_creates() {
         let config = default_wasm_config();
         let engine = Engine::new(&config);
