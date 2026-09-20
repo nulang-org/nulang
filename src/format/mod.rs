@@ -10,9 +10,11 @@
 //! for the concrete codecs:
 //!
 //! - [`constants`] — magic bytes, version numbers, [`constants::FormatError`].
-//! - [`nbc`] — `CodeModule::to_nbc` / `from_nbc` and [`nbc::NbcArtifact`].
+//! - [`nbc`] — stable public `CodeModule::to_nbc` / `from_nbc` API.
+//! - `nbc_v1` — private byte-level implementation of the frozen v1 codec.
 //! - [`migrate`] — the only legal place format-version upgrades live.
 
 pub mod constants;
 pub mod migrate;
 pub mod nbc;
+pub(crate) mod nbc_v1;
