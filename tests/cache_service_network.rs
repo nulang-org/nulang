@@ -2235,3 +2235,160 @@ fn shard_checkpoint_restores_resp_values_and_reduces_ttl() {
     restored.shutdown().unwrap();
     std::fs::remove_file(snapshot_path).unwrap();
 }
+
+
+#[test]
+fn journaled_shard_recovers_mutations_without_checkpoint() {
+    let wal_path = temp_journal_path("journal-only").with_extension("wal");
+    let node_id = 5251u64;
+    let placement = CacheSlotMap::new_local(node_id, 1).unwrap();
+
+    let service = CacheServiceBuilder::new(node_id, placement.clone())
+        .with_shard(
+            CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            )
+            .journaled(&wal_path),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut client = StdTcpStream::connect(service.local_addrs()[0]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+
+    client.write_all(&frame(&[b"SET", b"n", b"1"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+    client.write_all(&frame(&[b"INCR", b"n"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b":2\r\n");
+
+    client
+        .write_all(&frame(&[b"MSET", b"a{j}", b"A", b"b{j}", b"B"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+
+    client
+        .write_all(&frame(&[b"SET", b"gone", b"x"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+    client.write_all(&frame(&[b"DEL", b"gone"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b":1\r\n");
+
+    client
+        .write_all(&frame(&[b"SET", b"ttl", b"live"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+    client
+        .write_all(&frame(&[b"EXPIRE", b"ttl", b"10"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut client), b":1\r\n");
+
+    service.shutdown().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+
+    let restored = CacheServiceBuilder::new(node_id, placement)
+        .with_shard(
+            CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            )
+            .journaled(&wal_path),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut client = StdTcpStream::connect(restored.local_addrs()[0]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+
+    client.write_all(&frame(&[b"GET", b"n"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b"$1\r\n2\r\n");
+
+    client.write_all(&frame(&[b"MGET", b"a{j}", b"b{j}"])).unwrap();
+    let mut values = [0u8; 18];
+    client.read_exact(&mut values).unwrap();
+    assert_eq!(&values, b"*2\r\n$1\r\nA\r\n$1\r\nB\r\n");
+
+    client.write_all(&frame(&[b"GET", b"gone"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b"$-1\r\n");
+
+    client.write_all(&frame(&[b"GET", b"ttl"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b"$4\r\nlive\r\n");
+    client.write_all(&frame(&[b"TTL", b"ttl"])).unwrap();
+    let ttl_reply = read_resp_line(&mut client);
+    let ttl_secs: i64 = std::str::from_utf8(&ttl_reply[1..ttl_reply.len() - 2])
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((8..=9).contains(&ttl_secs));
+
+    restored.shutdown().unwrap();
+    std::fs::remove_file(wal_path).unwrap();
+}
+
+#[test]
+fn journaled_checkpoint_replays_only_mutations_after_snapshot_lsn() {
+    let wal_path = temp_journal_path("journal-checkpoint").with_extension("wal");
+    let snapshot_path = temp_journal_path("journal-checkpoint").with_extension("snapshot");
+    let node_id = 5252u64;
+    let placement = CacheSlotMap::new_local(node_id, 1).unwrap();
+
+    let service = CacheServiceBuilder::new(node_id, placement.clone())
+        .with_shard(
+            CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            )
+            .journaled(&wal_path),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut client = StdTcpStream::connect(service.local_addrs()[0]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+
+    client.write_all(&frame(&[b"SET", b"k", b"1"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
+    let checkpoint = service.checkpoint_shard(0, &snapshot_path).unwrap();
+    assert_eq!(checkpoint.checkpoint_lsn, 1);
+
+    client.write_all(&frame(&[b"INCR", b"k"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b":2\r\n");
+    service.shutdown().unwrap();
+
+    let restored = CacheServiceBuilder::new(node_id, placement)
+        .with_shard(
+            CacheServiceShardConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1",
+            )
+            .restore_from_snapshot(&snapshot_path)
+            .journaled(&wal_path),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut client = StdTcpStream::connect(restored.local_addrs()[0]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    client.write_all(&frame(&[b"GET", b"k"])).unwrap();
+    assert_eq!(read_resp_line(&mut client), b"$1\r\n2\r\n");
+
+    restored.shutdown().unwrap();
+    std::fs::remove_file(wal_path).unwrap();
+    std::fs::remove_file(snapshot_path).unwrap();
+}
