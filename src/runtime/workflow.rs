@@ -100,9 +100,18 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
     // deterministic shadow node before the local save, so the replica is a
     // byte-identical copy of exactly what the local store will hold.
     rt.maybe_shadow_replicate(actor_id, &snapshot, schema_version);
-    let _ = rt
+    if let Err(error) = rt
         .persistence
-        .save_snapshot_versioned(snapshot, schema_version);
+        .save_snapshot_versioned(snapshot, schema_version)
+    {
+        tracing::warn!(
+            actor_id,
+            schema_version,
+            %error,
+            "nulang-persist: durable checkpoint failed; retaining dirty state"
+        );
+        return;
+    }
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = seq;
         actor.dirty_fields.clear();
