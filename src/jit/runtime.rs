@@ -1673,6 +1673,7 @@ define_aot_call_closure!(nulang_aot_call_closure_8, a0, a1, a2, a3, a4, a5, a6, 
 // effect name from the module pool, routes through the current callbacks'
 // `perform_async` (the same path the bytecode PerformAsync opcode takes), and
 // materializes the result: Ready(Some(content)) becomes a heap string,
+// ReadyValue(value) forwards the already-materialized raw Value, while
 // Ready(None) and unarmed callbacks become nil. Effects that return Pending
 // (LLM.ask, Timer.sleep with a positive delay) degrade to nil — the native
 // backend has no VM suspension, so the actor cannot be parked mid-behavior.
@@ -1697,6 +1698,7 @@ macro_rules! define_aot_perform_async {
                         Value::nil().as_raw()
                     }
                 }
+                Some(crate::vm::PerformAsyncResult::ReadyValue(value)) => value.as_raw(),
                 // Ready(None), unarmed callbacks, or Pending (no native
                 // suspension) all degrade to nil.
                 _ => Value::nil().as_raw(),
