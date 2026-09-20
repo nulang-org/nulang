@@ -2322,7 +2322,9 @@ fn journaled_shard_recovers_mutations_without_checkpoint() {
     assert_eq!(read_resp_line(&mut client), b"$-1\r\n");
 
     client.write_all(&frame(&[b"GET", b"ttl"])).unwrap();
-    assert_eq!(read_resp_line(&mut client), b"$4\r\nlive\r\n");
+    let mut ttl_value = [0u8; 10];
+    client.read_exact(&mut ttl_value).unwrap();
+    assert_eq!(&ttl_value, b"$4\r\nlive\r\n");
     client.write_all(&frame(&[b"TTL", b"ttl"])).unwrap();
     let ttl_reply = read_resp_line(&mut client);
     let ttl_secs: i64 = std::str::from_utf8(&ttl_reply[1..ttl_reply.len() - 2])
