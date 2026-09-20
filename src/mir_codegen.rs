@@ -2948,6 +2948,7 @@ mod tests {
                 effect: crate::types::EffectRow::empty(),
                 cap: crate::types::Capability::Ref,
                 placement: None,
+                performance_contracts: vec![],
                 body: {
                     let mut b = crate::hir::Body::new();
                     b.push(crate::hir::Stmt::Let {
@@ -2992,6 +2993,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            performance_contracts: vec![],
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
@@ -3023,6 +3025,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            performance_contracts: vec![],
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
