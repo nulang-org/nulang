@@ -1183,10 +1183,13 @@ impl EffectChecker {
                     body,
                     ..
                 } => {
-                    let row = effect
-                        .clone()
-                        .or_else(|| self.fn_rows.get(name).cloned())
-                        .unwrap_or(self.infer_effects(&ctx, body)?);
+                    let row = if let Some(row) = effect {
+                        row.clone()
+                    } else if let Some(row) = self.fn_rows.get(name) {
+                        row.clone()
+                    } else {
+                        self.infer_effects(&ctx, body)?
+                    };
                     rows.push(row);
                 }
                 Decl::Actor {
