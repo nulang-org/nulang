@@ -291,6 +291,7 @@ pub(crate) enum MessageAdmission {
 pub enum ForeignDispatchError {
     NotConfigured,
     AlreadyConfigured,
+    Config(BlockingExecutorConfigError),
     Submit(BlockingSubmitError),
 }
 
@@ -299,6 +300,7 @@ impl std::fmt::Display for ForeignDispatchError {
         match self {
             Self::NotConfigured => f.write_str("foreign executor is not configured"),
             Self::AlreadyConfigured => f.write_str("foreign executor is already configured"),
+            Self::Config(error) => write!(f, "foreign executor configuration failed: {error}"),
             Self::Submit(error) => write!(f, "foreign executor submission failed: {error}"),
         }
     }
@@ -692,7 +694,7 @@ impl Runtime {
             return Err(ForeignDispatchError::AlreadyConfigured);
         }
         let executor = BlockingForeignExecutor::new(backend, queue_capacity)
-            .map_err(|_| ForeignDispatchError::Submit(BlockingSubmitError::Closed))?;
+            .map_err(ForeignDispatchError::Config)?;
         self.foreign_executor = Some(executor);
         Ok(())
     }
@@ -716,12 +718,12 @@ impl Runtime {
 
     /// Drain currently-ready foreign completions without blocking.
     pub fn poll_foreign_completions(&mut self) -> Vec<ForeignActorCompletion> {
-        let Some(executor) = self.foreign_executor.as_ref() else {
-            return Vec::new();
+        let completions = match self.foreign_executor.as_ref() {
+            Some(executor) => executor.drain_ready(),
+            None => return Vec::new(),
         };
 
-        executor
-            .drain_ready()
+        completions
             .into_iter()
             .map(|completion| {
                 let job_id = completion.id();
