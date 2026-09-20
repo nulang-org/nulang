@@ -283,6 +283,14 @@ impl MirCodegen {
             let offset = self.compile_function(func)?;
             self.module.function_table[idx] = offset;
             self.module.function_local_counts[idx] = LOCAL_BASE as usize + func.locals.len();
+            if func
+                .performance_contracts
+                .contains(&crate::ast::PerformanceContract::Hot)
+            {
+                self.module
+                    .hot_function_ranges
+                    .push((offset, self.module.instructions.len().saturating_sub(offset)));
+            }
             if func.name == "__main" {
                 main_idx = Some(idx);
             }
