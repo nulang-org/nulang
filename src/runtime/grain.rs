@@ -109,9 +109,41 @@ impl ActivationHandle {
     }
 }
 
+/// Monotonic generation for successive live activations of one logical actor.
+///
+/// Epoch zero is intentionally invalid so an absent/default value cannot be
+/// mistaken for an authoritative activation. The directory retains the last
+/// epoch after deactivation so a later activation is always strictly newer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ActivationEpoch(u64);
+
+impl ActivationEpoch {
+    pub const INITIAL: Self = Self(1);
+
+    pub fn new(raw: u64) -> Option<Self> {
+        (raw >= Self::INITIAL.0).then_some(Self(raw))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    fn next(self) -> Option<Self> {
+        self.0.checked_add(1).and_then(Self::new)
+    }
+}
+
+/// Runtime-local identity of one specific activation incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActivationStamp {
+    pub handle: ActivationHandle,
+    pub epoch: ActivationEpoch,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationDirectoryError {
     Exhausted,
+    EpochExhausted,
 }
 
 impl fmt::Display for ActivationDirectoryError {
@@ -119,6 +151,9 @@ impl fmt::Display for ActivationDirectoryError {
         match self {
             ActivationDirectoryError::Exhausted => {
                 write!(f, "virtual actor activation-handle space exhausted")
+            }
+            ActivationDirectoryError::EpochExhausted => {
+                write!(f, "virtual actor activation epoch space exhausted")
             }
         }
     }
@@ -130,8 +165,9 @@ impl std::error::Error for ActivationDirectoryError {}
 #[derive(Debug)]
 pub struct ActivationDirectory {
     next_handle: u64,
-    by_grain: HashMap<GrainId, ActivationHandle>,
+    by_grain: HashMap<GrainId, ActivationStamp>,
     by_handle: HashMap<ActivationHandle, GrainId>,
+    last_epoch: HashMap<GrainId, ActivationEpoch>,
 }
 
 impl Default for ActivationDirectory {
@@ -146,6 +182,7 @@ impl ActivationDirectory {
             next_handle: ActivationHandle::MIN,
             by_grain: HashMap::new(),
             by_handle: HashMap::new(),
+            last_epoch: HashMap::new(),
         }
     }
 
@@ -153,8 +190,16 @@ impl ActivationDirectory {
         &mut self,
         grain_id: GrainId,
     ) -> Result<ActivationHandle, ActivationDirectoryError> {
-        if let Some(handle) = self.by_grain.get(&grain_id).copied() {
-            return Ok(handle);
+        self.resolve_or_activate(grain_id).map(|stamp| stamp.handle)
+    }
+
+    /// Resolve the current activation or allocate a strictly newer incarnation.
+    pub fn resolve_or_activate(
+        &mut self,
+        grain_id: GrainId,
+    ) -> Result<ActivationStamp, ActivationDirectoryError> {
+        if let Some(stamp) = self.by_grain.get(&grain_id).copied() {
+            return Ok(stamp);
         }
 
         let raw = self.next_handle;
@@ -162,13 +207,36 @@ impl ActivationDirectory {
         self.next_handle = raw
             .checked_add(1)
             .ok_or(ActivationDirectoryError::Exhausted)?;
-        self.by_grain.insert(grain_id.clone(), handle);
+
+        let epoch = match self.last_epoch.get(&grain_id).copied() {
+            Some(previous) => previous
+                .next()
+                .ok_or(ActivationDirectoryError::EpochExhausted)?,
+            None => ActivationEpoch::INITIAL,
+        };
+        let stamp = ActivationStamp { handle, epoch };
+
+        self.last_epoch.insert(grain_id.clone(), epoch);
+        self.by_grain.insert(grain_id.clone(), stamp);
         self.by_handle.insert(handle, grain_id);
-        Ok(handle)
+        Ok(stamp)
     }
 
     pub fn handle_for(&self, grain_id: &GrainId) -> Option<ActivationHandle> {
+        self.by_grain.get(grain_id).map(|stamp| stamp.handle)
+    }
+
+    pub fn stamp_for(&self, grain_id: &GrainId) -> Option<ActivationStamp> {
         self.by_grain.get(grain_id).copied()
+    }
+
+    pub fn epoch_for(&self, grain_id: &GrainId) -> Option<ActivationEpoch> {
+        self.stamp_for(grain_id).map(|stamp| stamp.epoch)
+    }
+
+    /// True only for the currently authoritative local incarnation.
+    pub fn is_current(&self, grain_id: &GrainId, stamp: ActivationStamp) -> bool {
+        self.stamp_for(grain_id) == Some(stamp)
     }
 
     pub fn grain_for(&self, handle: ActivationHandle) -> Option<&GrainId> {
@@ -180,9 +248,9 @@ impl ActivationDirectory {
     }
 
     pub fn remove(&mut self, grain_id: &GrainId) -> Option<ActivationHandle> {
-        let handle = self.by_grain.remove(grain_id)?;
-        self.by_handle.remove(&handle);
-        Some(handle)
+        let stamp = self.by_grain.remove(grain_id)?;
+        self.by_handle.remove(&stamp.handle);
+        Some(stamp.handle)
     }
 
     pub fn len(&self) -> usize {
@@ -327,6 +395,43 @@ mod tests {
         assert_eq!(directory.grain_for(ah), Some(&a));
         assert_eq!(directory.logical_id_for(ah), Some(a.logical_id()));
         assert_eq!(directory.len(), 2);
+    }
+
+    #[test]
+    fn activation_epoch_is_stable_while_live_and_advances_after_reactivation() {
+        let mut directory = ActivationDirectory::new();
+        let grain = GrainId::new("User", "epoch-test");
+
+        let first = directory.resolve_or_activate(grain.clone()).unwrap();
+        assert_eq!(first.epoch, ActivationEpoch::INITIAL);
+        assert_eq!(directory.resolve_or_activate(grain.clone()).unwrap(), first);
+        assert!(directory.is_current(&grain, first));
+
+        assert_eq!(directory.remove(&grain), Some(first.handle));
+        assert!(!directory.is_current(&grain, first));
+
+        let second = directory.resolve_or_activate(grain.clone()).unwrap();
+        assert_ne!(second.handle, first.handle);
+        assert_eq!(second.epoch.get(), first.epoch.get() + 1);
+        assert!(!directory.is_current(&grain, first));
+        assert!(directory.is_current(&grain, second));
+        assert_eq!(directory.epoch_for(&grain), Some(second.epoch));
+    }
+
+    #[test]
+    fn activation_epochs_are_independent_per_full_logical_identity() {
+        let mut directory = ActivationDirectory::new();
+        let a = GrainId::new("User", "a");
+        let b = GrainId::new("User", "b");
+
+        let a1 = directory.resolve_or_activate(a.clone()).unwrap();
+        let b1 = directory.resolve_or_activate(b.clone()).unwrap();
+        directory.remove(&a);
+        let a2 = directory.resolve_or_activate(a.clone()).unwrap();
+
+        assert_eq!(b1.epoch, ActivationEpoch::INITIAL);
+        assert_eq!(a2.epoch.get(), a1.epoch.get() + 1);
+        assert_eq!(directory.epoch_for(&b), Some(ActivationEpoch::INITIAL));
     }
 
     #[test]
