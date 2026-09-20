@@ -32,6 +32,24 @@ fn test_hot_counter() {
 /// another session (the old global counter map made parallel tests that
 /// share module_idx 0 flaky).
 #[test]
+fn test_annotated_hot_threshold_is_lower_and_enforced() {
+    assert!(ANNOTATED_HOT_THRESHOLD < HOT_THRESHOLD);
+    let mut jit = make_jit();
+    for _ in 1..ANNOTATED_HOT_THRESHOLD {
+        assert!(!jit.record_and_check_hot_with_threshold(
+            0,
+            7,
+            ANNOTATED_HOT_THRESHOLD
+        ));
+    }
+    assert!(jit.record_and_check_hot_with_threshold(
+        0,
+        7,
+        ANNOTATED_HOT_THRESHOLD
+    ));
+}
+
+#[test]
 fn test_hot_counters_are_per_session() {
     let mut jit_a = make_jit();
     let mut jit_b = make_jit();
