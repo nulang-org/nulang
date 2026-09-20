@@ -317,11 +317,37 @@ not request-id sorting.
 
 This is still **not general CacheStore restart recovery**. A non-drained source
 may contain versions that were never exported, and an unacked durable send has
-an unknown target outcome, so both remain fail-closed. Relative TTLs are also
-excluded from this restart-replay path: replaying an old `ttl_ms` after an
-arbitrary outage would extend expiry and could resurrect data. Full restart
-support for those cases needs a process-independent expiry durability contract
-and, for non-drained migrations, a durable CacheStore/WAL or snapshot.
+an unknown target outcome, so both remain fail-closed. Fully drained
+TTL-bearing migrations are now covered by a process-independent expiry
+contract: the source captures a Unix-millisecond wall anchor **before** export,
+then fsyncs that anchor with the durable transfer proof before network send.
+Because the exported `ttl_ms` is observed after the anchor, restart subtraction
+is conservative—any local delay between anchor and export can only make the
+recovered value expire slightly earlier, never later.
+
+At restart, recovery computes `elapsed = now_wall - anchor_wall` with checked
+subtraction and replaces each relative TTL with
+`ttl_ms.saturating_sub(elapsed)`. A zero value is intentionally retained in the
+reconstructed TransferBatch so the target imports an expiry tombstone/fence via
+`ExpiredInTransit`; the key is not resurrected. If the wall clock moved
+backward, recovery refuses to replay that migration rather than infer negative
+elapsed time. A large forward clock adjustment can expire data early, but this
+bias preserves the stronger invariant that restart cannot extend expiry.
+
+The journal treats the original application TransferAck as immutable historical
+evidence because that ACK justified source deletion. A restarted target may
+produce a different reconstruction outcome—for example, an originally
+`Imported` entry can become `ExpiredInTransit` after downtime—so restart
+rebuild ACKs are correlation-validated separately and never overwrite the
+historical ACK. A crash after the TransferSent record is durable but before its
+wall-anchor record is durable is also explicit: the transfer reopens without an
+anchor and remains restart-replay unsafe; a later wall time cannot be inserted
+because doing so could extend expiry.
+
+General restart recovery is therefore now blocked primarily by **non-drained
+source state and unacked/ambiguous operations**, not by TTL semantics. Supporting
+those cases requires a durable CacheStore WAL/snapshot (or equivalent replicated
+state) so versions that were never durably exported can be reconstructed.
 
 The same cluster layer serves topology discovery without touching CacheStore:
 `CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
@@ -388,17 +414,15 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Define a process-independent expiry durability contract so fully drained
-   TTL-bearing migrations can restart-replay without extending or resurrecting
-   expired data.
-2. Add general durable CacheStore WAL/snapshot recovery for non-drained
+1. Add general durable CacheStore WAL/snapshot recovery for non-drained
    migrations and ordinary cache durability modes.
-3. Reconcile journaled pending commit intents against durable placement/control
+2. Reconcile journaled pending commit intents against durable placement/control
    state after process restart; never infer the outcome from an empty source.
-4. Add a separate transparent proxy endpoint only for non-cluster clients;
+3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
-5. Allow topology publication to add/remove advertised remote endpoints without
+4. Allow topology publication to add/remove advertised remote endpoints without
    restarting local reactors.
-6. Promote expiration to a hierarchical timing wheel, then expand packed
-   aggregates, RESP compatibility, leases, locks, semaphores, queues, and
-   stored functions where they fit the product boundary.
+5. Promote expiration to a hierarchical timing wheel and benchmark TTL churn
+   against the current single-level wheel.
+6. Expand packed aggregates, RESP compatibility, leases, locks, semaphores,
+   queues, stored functions, and explicit durability acknowledgement classes.
