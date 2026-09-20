@@ -15,7 +15,7 @@ export default defineConfig({
         { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
         { tag: 'meta', attrs: { name: 'twitter:image', content: 'https://nulang.org/og-image.png' } },
       ],
-      description: 'A distributed, actor-based programming language',
+      description: 'An actor-based programming language with static types, algebraic effects, supervision, and durable state',
       defaultLocale: 'en',
       logo: {
         src: './src/assets/logo.svg',
