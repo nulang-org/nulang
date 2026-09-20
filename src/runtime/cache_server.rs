@@ -2881,6 +2881,9 @@ fn execute_remote_command_on_reactor(
         Ok(Err(CacheRemoteControlError::Parse(_) | CacheRemoteControlError::InvalidFrame)) => {
             b"-ERR invalid cache transport command\r\n".to_vec()
         }
+        Ok(Err(CacheRemoteControlError::Durability)) => {
+            b"-ERR cache durability failure; execution outcome unknown\r\n".to_vec()
+        }
         Ok(Err(
             CacheRemoteControlError::TopologyChanged { .. }
             | CacheRemoteControlError::OwnerMismatch,
