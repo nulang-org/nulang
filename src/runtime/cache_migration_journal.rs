@@ -1386,6 +1386,46 @@ mod tests {
     }
 
     #[test]
+    fn durable_ttl_send_without_anchor_remains_replay_unsafe() {
+        let path = temp_path("migration-ttl-missing-anchor");
+        let migration = key();
+        let mut ttl_request = request(migration, 91);
+        let CacheTransportMessage::TransferBatch { batch, .. } = &mut ttl_request else {
+            unreachable!()
+        };
+        batch.entries[0].ttl_ms = Some(5_000);
+
+        {
+            let mut journal = CacheMigrationJournal::open(&path).unwrap();
+            journal.record_intent(migration, incarnation()).unwrap();
+
+            // Simulate a crash after the TransferSent fsync but before the
+            // separate wall-anchor fsync.
+            let wire = ttl_request.to_wire_bytes().unwrap();
+            let mut payload = Vec::new();
+            write_key(&mut payload, migration);
+            write_u64(&mut payload, 91);
+            write_blob(&mut payload, &wire).unwrap();
+            journal.append_record(KIND_TRANSFER_SENT, &payload).unwrap();
+        }
+
+        let mut journal = CacheMigrationJournal::open(&path).unwrap();
+        let transfer = journal
+            .recovery_state(migration)
+            .unwrap()
+            .transfers
+            .get(&91)
+            .unwrap();
+        assert!(transfer.wall_anchor_unix_ms.is_none());
+
+        // Supplying a new, later anchor would extend expiry and is forbidden.
+        assert!(journal
+            .record_transfer_sent_at(migration, &ttl_request, Some(current_unix_ms().unwrap()))
+            .is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn unacked_transfer_blocks_restart_reprobe() {
         let path = temp_path("migration-unacked");
         let migration = key();
