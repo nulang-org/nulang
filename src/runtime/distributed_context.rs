@@ -891,6 +891,7 @@ impl Runtime {
                     behavior_id,
                 } => match self.fabric_admit_local(actor_id, behavior_id, args) {
                     MessageAdmission::Accepted => report.admitted += 1,
+                    MessageAdmission::Forwarded => report.forwarded_remote += 1,
                     MessageAdmission::Backpressured => report.backpressured += 1,
                     MessageAdmission::Rejected => report.rejected += 1,
                 },
