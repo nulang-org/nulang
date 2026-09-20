@@ -3994,6 +3994,26 @@ mod lsp_tests {
         );
     }
 
+    /// Closed-variant totality is a warning in v1.x, not a hard error.
+    #[test]
+    fn test_diagnostics_non_exhaustive_closed_variant_is_w0201_warning() {
+        let source = "type Color = Red | Green | Blue\n\
+                      fn name(c: Color) -> String { match c { | Red => \"red\" | Green => \"green\" } }";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.severity == Some(DiagnosticSeverity::WARNING)
+                    && d.code == Some(NumberOrString::String("W0201".to_string()))
+                    && d.message.contains("Blue")
+            }),
+            "expected W0201 warning mentioning Blue, got: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (&d.code, &d.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Positive control: functions staying within their declared effect rows
     /// must produce no diagnostics at all.
     #[test]
