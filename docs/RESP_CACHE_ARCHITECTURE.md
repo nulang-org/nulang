@@ -404,10 +404,27 @@ checksum corruption fail closed. A shard can opt into restore-on-start with
 `CacheServiceHandle::checkpoint_shard` executes the snapshot on the owning
 reactor thread.
 
-This checkpoint does **not** make normal writes crash durable. Any mutation after
-the last completed checkpoint is still volatile. The next durability layer must
-therefore log mutations after the checkpoint boundary. Keep acknowledgement
-classes explicit:
+The checkpoint now has an explicit mutation-log boundary. Snapshot v2 embeds a
+monotonic `checkpoint_lsn`; v1 snapshots remain readable and are interpreted as
+LSN 0. `cache_wal.rs` appends strictly increasing exact-state records after that
+boundary. An upsert record stores the complete post-mutation value, absolute
+expiry, and physical slot/generation token. A delete record stores the removed
+key plus exact token, so replay of an older tombstone cannot delete a newer
+generation. Recovery restores the checkpoint, then applies only records with
+`lsn > checkpoint_lsn`.
+
+The WAL is append-only, length bounded, BLAKE3 checksummed, and supports both
+buffered append and explicit fsync. Opening a WAL validates every complete
+record and monotonic LSN; an incomplete crash tail is truncated to the last
+complete record, while checksum corruption in a complete record fails closed.
+The replay format deliberately logs physical post-state rather than RESP command
+text so allocator/free-slot behavior does not have to be reproduced by inference
+and migration transfer tokens remain stable.
+
+This still does **not** make normal writes crash durable by itself. The format
+and replay substrate exists, but command execution has not yet selected when a
+WAL append/fsync must happen relative to client acknowledgement. Keep
+acknowledgement classes explicit:
 
 - memory: acknowledge after local mutation;
 - async journal: enqueue WAL append before acknowledgement;
@@ -437,9 +454,9 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Add a bounded mutation WAL above the token-preserving checkpoint boundary,
-   with explicit memory/async-journal/journal acknowledgement modes and
-   checksum/truncated-tail recovery.
+1. Wire the exact-state WAL into reactor mutation execution with explicit
+   memory and synchronous-journal acknowledgement modes; add async-journal only
+   with a bounded writer queue and well-defined failure semantics.
 2. Use snapshot + WAL replay to recover non-drained migrations, preserving
    source generations and reconciling in-flight migration journal state.
 3. Reconcile journaled pending commit intents against durable placement/control
