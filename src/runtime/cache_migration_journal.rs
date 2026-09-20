@@ -61,8 +61,10 @@ pub struct CacheMigrationRecoveredTransfer {
     pub transfer_id: u64,
     pub request: CacheTransportMessage,
     pub ack: Option<CacheTransportMessage>,
-    /// Source wall-clock anchor captured after export and fsynced before send.
-    /// Required only for restart replay of relative-TTL entries.
+    /// Source wall-clock anchor captured before export and fsynced before send.
+    /// Required only for restart replay of relative-TTL entries. Using an
+    /// earlier-than-export anchor is conservative: restart replay may expire a
+    /// value slightly early, but can never extend its exported remaining TTL.
     pub wall_anchor_unix_ms: Option<u64>,
 }
 
@@ -370,13 +372,13 @@ impl CacheMigrationJournal {
         Ok(())
     }
 
-    /// Rebind a fully drained persistent-value migration to a new source
-    /// CacheStore incarnation after process restart.
+    /// Rebind a fully drained migration to a new source CacheStore incarnation
+    /// after process restart.
     ///
     /// This is deliberately narrower than general CacheStore recovery. It is
     /// legal only when the journal proves the old source was drained, every
     /// sent transfer has an application ACK, no commit is pending/completed,
-    /// and no durable batch carries a relative TTL.
+    /// and every relative-TTL batch has its durable pre-export wall anchor.
     pub fn rebind_drained_source_incarnation(
         &mut self,
         key: CacheMigrationKey,
@@ -1344,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn drained_restart_replay_rejects_relative_ttl_batches() {
+    fn drained_restart_replay_reduces_relative_ttl_and_rejects_backward_clock() {
         let path = temp_path("migration-drained-ttl");
         let migration = key();
         let mut ttl_request = request(migration, 81);
