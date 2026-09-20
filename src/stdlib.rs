@@ -62,6 +62,16 @@ pub struct BuiltinOp {
     pub description: &'static str,
 }
 
+impl BuiltinOp {
+    /// Scheduling/isolation contract for this built-in operation.
+    ///
+    /// The inventory does not choose an executor. It exposes semantic metadata
+    /// shared by the compiler, runtime, diagnostics, and Nulang Cloud.
+    pub fn execution_class(&self) -> crate::primitives::EffectExecutionClass {
+        crate::primitives::classify_named_effect_execution(self.effect, self.op)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // StdLib: registry of built-in operations
 // ---------------------------------------------------------------------------
@@ -1001,6 +1011,48 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn every_builtin_has_an_explicit_execution_class() {
+        use crate::primitives::EffectExecutionClass;
+
+        let lib = StdLib::new();
+        for op in lib.ops() {
+            assert_ne!(
+                op.execution_class(),
+                EffectExecutionClass::HandlerDefined,
+                "built-in '{}' must declare an execution class",
+                op.name
+            );
+        }
+    }
+
+    #[test]
+    fn execution_classes_capture_scheduler_risk() {
+        use crate::primitives::EffectExecutionClass;
+
+        let lib = StdLib::new();
+        assert_eq!(
+            lib.lookup("Timer.sleep").unwrap().execution_class(),
+            EffectExecutionClass::CooperativeSuspend
+        );
+        assert_eq!(
+            lib.lookup("Inference.ask").unwrap().execution_class(),
+            EffectExecutionClass::AsyncExternal
+        );
+        assert_eq!(
+            lib.lookup("Python.call").unwrap().execution_class(),
+            EffectExecutionClass::BlockingHost
+        );
+        assert_eq!(
+            lib.lookup("FS.read").unwrap().execution_class(),
+            EffectExecutionClass::BlockingHost
+        );
+        assert_eq!(
+            lib.lookup("Actor.link").unwrap().execution_class(),
+            EffectExecutionClass::Inline
+        );
     }
 
     #[test]
