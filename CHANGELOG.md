@@ -53,6 +53,14 @@ two major versions.*
   `--json` form is machine-readable, and `--deny-allocations` provides a CI
   gate for explicit heap/string allocation sites without claiming to model
   dynamic execution frequency or hidden host allocations.
+- **Transitive `@noalloc` function contract** (Experimental). `@noalloc`
+  is preserved through AST → HIR → MIR and checked against optimized emitted
+  bytecode. Direct calls are proven transitively; indirect calls fail closed.
+  Heap/string materialization, capturing closure environments, deep-copy
+  operations, spills, effect/suspension boundaries, FFI/Python, actor and
+  distributed operations, I/O, and missing proof metadata reject the contract.
+  Native, WASM, and WasmFX reuse the same bytecode proof before backend-specific
+  code generation so changing backends cannot silently weaken the guarantee.
 
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
