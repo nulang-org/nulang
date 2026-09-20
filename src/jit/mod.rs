@@ -290,7 +290,7 @@ impl JitSession {
     /// The returned function pointer is valid for the lifetime of this
     /// `JitSession`. The bytecode must not be modified while JIT code is
     /// executing.
-    pub unsafe fn compile_region(
+    pub(crate) unsafe fn compile_region(
         &mut self,
         module_idx: usize,
         start_offset: usize,
@@ -337,7 +337,7 @@ impl JitSession {
     ///
     /// # Safety
     /// Same safety requirements as `compile_region`.
-    pub unsafe fn compile_region_typed(
+    pub(crate) unsafe fn compile_region_typed(
         &mut self,
         module_idx: usize,
         start_offset: usize,
