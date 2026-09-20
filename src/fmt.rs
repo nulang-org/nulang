@@ -1239,6 +1239,17 @@ mod tests {
     }
 
     #[test]
+    fn test_fmt_noalloc_annotation_is_preserved() {
+        let src = "@noalloc\nfn add(a: Int, b: Int) -> Int { a + b }\n";
+        let out = format_source(src).expect("noalloc function formats");
+        assert!(
+            out.contains("@noalloc\nfn add"),
+            "formatter must not erase the checked @noalloc contract: {out}"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
     fn test_fmt_effect_decl() {
         let src = r#"effect MyEffect {
     op: Int -> Bool
