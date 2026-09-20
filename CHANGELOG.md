@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Direct JIT register-file execution — 2026-09-20
+- **Cranelift now executes directly against the VM frame's 256 tagged-word registers** (`src/vm.rs`, `src/jit/mod.rs`, `src/backends/mod.rs`). `Value` has an explicit transparent one-`u64` representation, and the built-in JIT uses a raw register pointer instead of copying 256 values into a temporary array before every native-region entry and copying them back afterward. The public `JitBackend` contract remains source-compatible: alternative backends inherit a default copy-based adapter unless they opt into the direct register hook.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
