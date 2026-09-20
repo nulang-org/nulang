@@ -795,7 +795,113 @@ fn write_canonical_effect_row(row: &EffectRow, out: &mut Vec<u8>) {
 /// check, and generalization all handle it with no special casing.
 pub const RECORD_ROW_TAIL_FIELD: &str = "..";
 
+/// Reserved nominal constructor used by the source-level `ActorRef[P]` type.
+///
+/// This is a compile-time-only type constructor. Runtime actor values remain
+/// `Type::Actor`; unification checks a concrete actor's advertised behavior
+/// protocol against the required `ActorRef` protocol.
+pub const ACTOR_REF_TYPE_NAME: &str = "ActorRef";
+
 impl Type {
+    /// Construct the compile-time-only structural actor-reference type
+    /// `ActorRef[P]`. `P` is expected to be a record whose fields map
+    /// behavior names to function signatures.
+    pub fn actor_ref(protocol: Type) -> Type {
+        Type::App {
+            constructor: Box::new(Type::Nominal {
+                name: ACTOR_REF_TYPE_NAME.to_string(),
+                underlying: Box::new(Type::unit()),
+            }),
+            args: vec![protocol],
+        }
+    }
+
+    /// Return the required structural behavior protocol for `ActorRef[P]`.
+    pub fn actor_ref_protocol(&self) -> Option<&Type> {
+        match self {
+            Type::App { constructor, args } if args.len() == 1 => match constructor.as_ref() {
+                Type::Nominal { name, .. } if name == ACTOR_REF_TYPE_NAME => args.first(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Erase compile-time actor protocol information before HIR/runtime
+    /// lowering. Both explicit `ActorRef[P]` and concrete `Type::Actor`
+    /// protocol/state metadata collapse to the stable runtime actor shape.
+    ///
+    /// This is recursive so nested occurrences such as
+    /// `Option[ActorRef[P]]`, tuples, records, and function signatures cannot
+    /// leak protocol metadata into MIR, bytecode, persistence, or wire-facing
+    /// artifacts.
+    pub fn erase_actor_protocols(&self) -> Type {
+        if self.actor_ref_protocol().is_some() {
+            return Type::Actor {
+                state: Box::new(Type::unit()),
+                behavior: Box::new(Type::unit()),
+            };
+        }
+
+        match self {
+            Type::Var(v) => Type::Var(*v),
+            Type::Primitive(p) => Type::Primitive(p.clone()),
+            Type::Tuple(items) => {
+                Type::Tuple(items.iter().map(Type::erase_actor_protocols).collect())
+            }
+            Type::Record(fields) => Type::Record(
+                fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), ty.erase_actor_protocols()))
+                    .collect(),
+            ),
+            Type::Variant(variants) => Type::Variant(
+                variants
+                    .iter()
+                    .map(|(name, payload)| {
+                        (
+                            name.clone(),
+                            payload.as_ref().map(Type::erase_actor_protocols),
+                        )
+                    })
+                    .collect(),
+            ),
+            Type::Array(inner) => Type::Array(Box::new(inner.erase_actor_protocols())),
+            Type::Function {
+                param,
+                ret,
+                effect,
+                cap,
+            } => Type::Function {
+                param: Box::new(param.erase_actor_protocols()),
+                ret: Box::new(ret.erase_actor_protocols()),
+                effect: effect.clone(),
+                cap: *cap,
+            },
+            Type::Actor { .. } => Type::Actor {
+                state: Box::new(Type::unit()),
+                behavior: Box::new(Type::unit()),
+            },
+            Type::App { constructor, args } => Type::App {
+                constructor: Box::new(constructor.erase_actor_protocols()),
+                args: args.iter().map(Type::erase_actor_protocols).collect(),
+            },
+            Type::Reference { cap, inner } => Type::Reference {
+                cap: *cap,
+                inner: Box::new(inner.erase_actor_protocols()),
+            },
+            Type::Scheme { vars, body } => Type::Scheme {
+                vars: vars.clone(),
+                body: Box::new(body.erase_actor_protocols()),
+            },
+            Type::Nominal { name, underlying } => Type::Nominal {
+                name: name.clone(),
+                underlying: Box::new(underlying.erase_actor_protocols()),
+            },
+            Type::Skolem(id) => Type::Skolem(*id),
+        }
+    }
+
     /// Convert to an NTIR structural representation for content-addressed hashing.
     pub fn to_ntir(&self) -> NtirNode {
         self.to_ntir_with_stack(&mut Vec::new())

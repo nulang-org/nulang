@@ -266,6 +266,117 @@ fn effect_row_compatible(e1: &EffectRow, e2: &EffectRow) -> bool {
     }
 }
 
+fn unify_actor_protocol(advertised: &Type, required: &Type, span: Span) -> NuResult<Substitution> {
+    let Type::Record(advertised_fields) = advertised else {
+        return Err(NuError::TypeError {
+            msg: "actor does not expose a statically checkable behavior protocol".to_string(),
+            span,
+            expected_type: Some(format!("{}", required)),
+            found_type: Some(format!("{}", advertised)),
+            similar_names: None,
+        });
+    };
+    let Type::Record(required_fields) = required else {
+        return Err(NuError::TypeError {
+            msg: "ActorRef protocol must be a record of behavior signatures".to_string(),
+            span,
+            expected_type: Some("record protocol".to_string()),
+            found_type: Some(format!("{}", required)),
+            similar_names: None,
+        });
+    };
+
+    let mut subst = Vec::new();
+    for (name, required_sig) in required_fields {
+        let Some((_, advertised_sig)) = advertised_fields.iter().find(|(n, _)| n == name) else {
+            let available = advertised_fields.iter().map(|(n, _)| n.clone()).collect();
+            return Err(NuError::field_not_found(
+                name.clone(),
+                span,
+                Some(available),
+            ));
+        };
+        // Actor protocols use an argument-pack convention: the function
+        // parameter slot represents the behavior's full message argument
+        // list, not a single tuple-valued parameter. Normalize the required
+        // source signature so zero/many arguments stay tuple-packed and a
+        // single scalar argument becomes a one-element pack.
+        let required_sig = normalize_required_actor_behavior_sig(required_sig);
+        let s = mgu(
+            &apply_subst(advertised_sig, &subst),
+            &apply_subst(&required_sig, &subst),
+            span,
+        )?;
+        subst = compose_subst(&s, &subst);
+    }
+    Ok(subst)
+}
+
+fn protocol_call_signature<'a>(
+    protocol: &'a Type,
+    behavior: &str,
+    span: Span,
+) -> NuResult<(&'a Type, &'a Type)> {
+    let Type::Record(fields) = protocol else {
+        return Err(NuError::type_error(
+            "ActorRef protocol must be a record of behavior signatures".to_string(),
+            span,
+        ));
+    };
+    let Some((_, sig)) = fields.iter().find(|(name, _)| name == behavior) else {
+        let available = fields.iter().map(|(name, _)| name.clone()).collect();
+        return Err(NuError::field_not_found(
+            behavior.to_string(),
+            span,
+            Some(available),
+        ));
+    };
+    let Type::Function { param, ret, .. } = sig else {
+        return Err(NuError::type_error(
+            format!(
+                "ActorRef behavior '{}' must have a function signature",
+                behavior
+            ),
+            span,
+        ));
+    };
+    Ok((param.as_ref(), ret.as_ref()))
+}
+
+fn protocol_param_types(param: &Type) -> Vec<Type> {
+    match param {
+        // In ActorRef protocol syntax a tuple in the function-parameter
+        // position denotes the message argument pack: () is zero args and
+        // (A, B) is two args. A scalar denotes one argument.
+        Type::Tuple(items) => items.clone(),
+        other => vec![other.clone()],
+    }
+}
+
+fn normalize_required_actor_behavior_sig(sig: &Type) -> Type {
+    let Type::Function {
+        param,
+        ret,
+        effect,
+        cap,
+    } = sig
+    else {
+        return sig.clone();
+    };
+
+    let packed_param = match param.as_ref() {
+        Type::Tuple(items) => Type::Tuple(items.clone()),
+        other => Type::Tuple(vec![other.clone()]),
+    };
+
+    Type::Function {
+        param: Box::new(packed_param),
+        ret: ret.clone(),
+        effect: effect.clone(),
+        cap: *cap,
+    }
+}
+
 /// Compute the most general unifier of two types.
 /// Returns a substitution `s` such that `apply_subst(t1, s) == apply_subst(t2, s)`.
 fn mgu(t1: &Type, t2: &Type, span: Span) -> NuResult<Substitution> {
@@ -275,6 +386,16 @@ fn mgu(t1: &Type, t2: &Type, span: Span) -> NuResult<Substitution> {
     {
         return Ok(vec![]);
     }
+
+    // A concrete actor may be attenuated to an explicit structural ActorRef
+    // when it advertises every required behavior with a compatible signature.
+    if let (Type::Actor { behavior, .. }, Some(required)) = (t1, t2.actor_ref_protocol()) {
+        return unify_actor_protocol(behavior, required, span);
+    }
+    if let (Some(required), Type::Actor { behavior, .. }) = (t1.actor_ref_protocol(), t2) {
+        return unify_actor_protocol(behavior, required, span);
+    }
+
     if t1 == t2 {
         return Ok(vec![]);
     }
@@ -999,6 +1120,20 @@ impl TypeChecker {
 
     /// Type-check an entire module, returning the type of the last declaration.
     pub fn check_module(&mut self, module: &AstModule) -> NuResult<Type> {
+        // Enrich statically known actor sends/asks with protocol constraints
+        // before ordinary Algorithm-W inference. Dynamic actor references
+        // remain permissive for compatibility; explicit ActorRef<P> values
+        // are checked structurally below.
+        let annotated = match crate::actor_protocol::annotate_module(module) {
+            Ok(module) => module,
+            Err(err) if self.collect_errors => {
+                self.collected_errors.push(err);
+                module.clone()
+            }
+            Err(err) => return Err(err),
+        };
+        let module = &annotated;
+
         self.register_class_decls(module);
         let mut ctx = TypeContext::new();
         let mut last_type = Type::unit();
@@ -1756,11 +1891,11 @@ impl TypeChecker {
             // Ask request
             Expr::Ask {
                 actor,
-                behavior: _,
-                args: _,
+                behavior,
+                args,
                 span,
                 ..
-            } => self.infer_ask(ctx, actor, *span),
+            } => self.infer_ask(ctx, actor, behavior, args, *span),
 
             // Receive
             Expr::Receive { after, span, .. } => {
@@ -3293,6 +3428,84 @@ impl TypeChecker {
         Ok((subst.clone(), apply_subst(&last_ty, &subst)))
     }
 
+    fn declared_actor_protocol(behaviors: &[Behavior]) -> Type {
+        let fields = behaviors
+            .iter()
+            .map(|behavior| {
+                // Structural ActorRef compatibility is intentionally
+                // fail-closed for omitted signature annotations. Direct
+                // statically-known actor calls keep the Phase-1 compatibility
+                // behavior from actor_protocol.rs.
+                let unspecified = || Type::Nominal {
+                    name: "__UnspecifiedActorProtocolType".to_string(),
+                    underlying: Box::new(Type::unit()),
+                };
+                let params: Vec<Type> = behavior
+                    .params
+                    .iter()
+                    .map(|param| param.ty.clone().unwrap_or_else(|| unspecified()))
+                    .collect();
+                // Always encode concrete behavior parameters as an explicit
+                // argument pack. This preserves arity and, crucially,
+                // distinguishes one tuple-valued parameter from two scalar
+                // parameters:
+                //   behavior f(pair: (Int, String)) => ((Int, String),)
+                //   behavior f(x: Int, y: String)   => (Int, String)
+                let param = Type::Tuple(params);
+                let ret = behavior.ret_type.clone().unwrap_or_else(|| unspecified());
+                let signature = Type::Function {
+                    param: Box::new(param),
+                    ret: Box::new(ret),
+                    effect: behavior.effect.clone().unwrap_or_else(EffectRow::empty),
+                    cap: behavior.cap,
+                };
+                (behavior.name.clone(), signature)
+            })
+            .collect();
+        Type::Record(fields)
+    }
+
+    fn infer_actor_ref_call(
+        &mut self,
+        ctx: &TypeContext,
+        mut subst: Substitution,
+        protocol: &Type,
+        behavior: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> NuResult<(Substitution, Type)> {
+        let (param, ret) = protocol_call_signature(protocol, behavior, span)?;
+        let expected_args = protocol_param_types(param);
+        if args.len() != expected_args.len() {
+            return Err(NuError::TypeError {
+                msg: format!(
+                    "behavior '{}' expects {} argument(s), got {}",
+                    behavior,
+                    expected_args.len(),
+                    args.len()
+                ),
+                span,
+                expected_type: Some(format!("{} argument(s)", expected_args.len())),
+                found_type: Some(format!("{} argument(s)", args.len())),
+                similar_names: None,
+            });
+        }
+
+        for (arg, expected) in args.iter().zip(expected_args.iter()) {
+            let ctx_sub = apply_subst_to_ctx(ctx, &subst);
+            let (s_arg, arg_ty) = self.infer_expr(&ctx_sub, arg)?;
+            subst = compose_subst(&s_arg, &subst);
+            let s_match = mgu(
+                &apply_subst(&arg_ty, &subst),
+                &apply_subst(expected, &subst),
+                span,
+            )?;
+            subst = compose_subst(&s_match, &subst);
+        }
+
+        Ok((subst.clone(), apply_subst(ret, &subst)))
+    }
+
     fn infer_actor_decl(
         &mut self,
         ctx: &TypeContext,
@@ -3307,9 +3520,10 @@ impl TypeChecker {
         // actor can `spawn`/`send`/`ask` its own type (recursive actor graphs,
         // e.g. skynet). A placeholder `Type::Actor` suffices: spawn/send/ask
         // only require "is an actor", not the concrete state/behavior types.
+        let behavior_protocol = Self::declared_actor_protocol(behaviors);
         let self_ty = Type::Actor {
             state: Box::new(Type::Var(TypeVar::fresh())),
-            behavior: Box::new(Type::Var(TypeVar::fresh())),
+            behavior: Box::new(behavior_protocol.clone()),
         };
 
         // Type-check state field defaults and CRDT type compatibility.
@@ -3384,7 +3598,7 @@ impl TypeChecker {
 
         let actor_ty = Type::Actor {
             state: Box::new(Type::Var(TypeVar::fresh())),
-            behavior: Box::new(Type::Var(TypeVar::fresh())),
+            behavior: Box::new(behavior_protocol),
         };
         Ok((vec![], actor_ty))
     }
@@ -3424,30 +3638,32 @@ impl TypeChecker {
         &mut self,
         ctx: &TypeContext,
         actor: &Expr,
-        _behavior: &str,
+        behavior: &str,
         args: &[Expr],
         span: Span,
     ) -> NuResult<(Substitution, Type)> {
         let (s1, actor_ty) = self.infer_expr(ctx, actor)?;
+        let resolved_actor = apply_subst(&actor_ty, &s1);
 
-        // Actor must be an actor type
-        let actor_var = TypeVar::fresh();
+        if let Some(protocol) = resolved_actor.actor_ref_protocol() {
+            let (subst, _) = self.infer_actor_ref_call(ctx, s1, protocol, behavior, args, span)?;
+            return Ok((subst, Type::unit()));
+        }
+
+        // Ordinary concrete/dynamic actor behavior remains Phase-1 compatible:
+        // the actor_protocol pre-pass validates statically known actors while
+        // opaque dynamic actors are accepted as actor-typed values.
         let fresh_actor = Type::Actor {
-            state: Box::new(Type::Var(actor_var)),
+            state: Box::new(Type::Var(TypeVar::fresh())),
             behavior: Box::new(Type::Var(TypeVar::fresh())),
         };
-        let s2 = mgu(&apply_subst(&actor_ty, &s1), &fresh_actor, span)?;
-        let s_combined = compose_subst(&s2, &s1);
-
-        // Infer argument types
-        let mut subst = s_combined;
+        let s2 = mgu(&resolved_actor, &fresh_actor, span)?;
+        let mut subst = compose_subst(&s2, &s1);
         for arg in args {
             let ctx_sub = apply_subst_to_ctx(ctx, &subst);
             let (s_arg, _arg_ty) = self.infer_expr(&ctx_sub, arg)?;
             subst = compose_subst(&s_arg, &subst);
         }
-
-        // Send returns Unit
         Ok((subst, Type::unit()))
     }
 
@@ -3456,20 +3672,31 @@ impl TypeChecker {
         &mut self,
         ctx: &TypeContext,
         actor: &Expr,
+        behavior: &str,
+        args: &[Expr],
         span: Span,
     ) -> NuResult<(Substitution, Type)> {
         let (s1, actor_ty) = self.infer_expr(ctx, actor)?;
+        let resolved_actor = apply_subst(&actor_ty, &s1);
+
+        if let Some(protocol) = resolved_actor.actor_ref_protocol() {
+            return self.infer_actor_ref_call(ctx, s1, protocol, behavior, args, span);
+        }
 
         let fresh_actor = Type::Actor {
             state: Box::new(Type::Var(TypeVar::fresh())),
             behavior: Box::new(Type::Var(TypeVar::fresh())),
         };
-        let s2 = mgu(&actor_ty, &fresh_actor, span)?;
-        let subst = compose_subst(&s2, &s1);
+        let s2 = mgu(&resolved_actor, &fresh_actor, span)?;
+        let mut subst = compose_subst(&s2, &s1);
+        for arg in args {
+            let ctx_sub = apply_subst_to_ctx(ctx, &subst);
+            let (s_arg, _arg_ty) = self.infer_expr(&ctx_sub, arg)?;
+            subst = compose_subst(&s_arg, &subst);
+        }
 
-        // Ask returns a fresh type (the behavior's return type)
-        let ret_var = Type::Var(TypeVar::fresh());
-        Ok((subst, ret_var))
+        // Opaque/dynamic asks retain the existing unconstrained result.
+        Ok((subst, Type::Var(TypeVar::fresh())))
     }
 
     /// Infer perform expression.

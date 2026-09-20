@@ -45,6 +45,24 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Typed actor protocol checking — 2026-09-20
+- **Static protocol validation for known actor references** (Experimental,
+  `src/actor_protocol.rs`, RFC 0023). Actor `send`/`ask` calls whose receiver
+  resolves statically to an actor declaration now reject unknown behaviors and
+  wrong arity, constrain behavior arguments through the existing HM checker,
+  and propagate conservatively known `ask` return types. Dynamic/opaque actor
+  references retain the previous compatibility behavior. The implementation is
+  a compiler pre-pass integrated directly into `TypeChecker::check_module`; it
+  does not alter runtime dispatch, persistence, or wire formats.
+- **Structural `ActorRef[P]` protocols** (Experimental). Public/generic actor
+  APIs can require a behavior record such as
+  `ActorRef[{ get: () -> Int, add: Int -> Unit }]`. Concrete actors advertise
+  declared behavior signatures through the existing `Type::Actor.behavior`
+  slot; concrete-to-`ActorRef` unification permits extra concrete behaviors
+  while requiring every requested behavior/signature. Calls through
+  `ActorRef[P]` are checked directly from `P`. The type is compile-time-only
+  and does not change runtime actor representation or stable formats.
+
 ### Zero-copy array slices — 2026-09-20
 - **Constant-size `ArrayView` slices** (Experimental, `src/vm.rs`,
   `src/runtime/heap.rs`). `Array.slice` now returns a three-slot runtime view
