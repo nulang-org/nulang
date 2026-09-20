@@ -32,7 +32,7 @@ use super::cache_dispatch::{
     CacheShardInbox,
 };
 use super::cache_durable_store::{
-    restore_cache_snapshot, write_cache_snapshot, CacheSnapshotError, CacheSnapshotReport,
+    restore_cache_snapshot, write_cache_snapshot_at, CacheSnapshotError, CacheSnapshotReport,
 };
 use super::cache_migration_journal::{
     CacheMigrationConvergenceEvidence, CacheMigrationJournal, CacheMigrationKey,
@@ -3255,7 +3255,21 @@ impl CacheShardServer {
                 let _ = reply.send(());
             }
             CacheShardControlRequest::WriteSnapshot { path, reply } => {
-                let _ = reply.send(write_cache_snapshot(path, &self.store, now_ms));
+                // Capture wall time before a fresh monotonic observation. This
+                // conservative ordering guarantees restore cannot extend TTL by
+                // the checkpoint capture gap.
+                let result = cache_wall_unix_ms()
+                    .map_err(CacheSnapshotError::Io)
+                    .and_then(|wall_anchor| {
+                        let snapshot_now_ms = self.clock.now_ms();
+                        write_cache_snapshot_at(
+                            path,
+                            &self.store,
+                            snapshot_now_ms,
+                            wall_anchor,
+                        )
+                    });
+                let _ = reply.send(result);
             }
         }
     }
