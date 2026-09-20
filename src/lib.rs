@@ -8,6 +8,7 @@
 #![cfg_attr(test, allow(clippy::approx_constant))]
 
 mod actor_protocol;
+pub mod actor_inspection;
 pub mod agent;
 #[cfg(feature = "native-codegen")]
 pub mod aot;
