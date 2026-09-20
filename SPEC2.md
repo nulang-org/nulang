@@ -2059,9 +2059,7 @@ counter ! increment()
 
 Message sending is asynchronous and non-blocking: the message is enqueued in the target's mailbox and the sender continues immediately. Send arguments must be sendable (§5.7).
 
-**Implementation status (verified 2026-08-02).** Behavior name resolution has two surprising edge cases, neither caught at compile time:
-1. A `send`/`ask` naming a behavior the target actor doesn't declare does not drop the message or error -- it silently runs the actor's first declared behavior instead (`Runtime::send_message` resolves an unknown name to behavior id 0; see the doc comment on `send_message` in `src/runtime/mod.rs`).
-2. Two different actor types that happen to declare a same-named behavior can collide: dispatch resolves by suffix-matching the *variable's* name hint, not the target's concrete actor type, so addressing one type's variable can run the *other* type's same-named behavior against the first type's state. See `conformance/behavior/lifecycle_03/04/05_*.nula` for the evidence trail. Both are tracked as known gaps, not fixed -- `send_message` is called pervasively enough that correcting the fallback needs a wider, carefully-audited change (the remote-message delivery path in §12.4 deliberately mirrors the same behavior-id-0 fallback today).
+**Implementation status (updated 2026-09-20).** Unknown behavior names now fail closed at local, cross-shard, and remote runtime ingress and never alias behavior id 0. Explicit synchronous numeric asks also reject undeclared behavior ids. A separate nominal-ownership gap remains for modules containing multiple actor types with same-named behaviors: module-global behavior identity still needs to be proven against the concrete target schema on every bytecode dispatch path.
 
 ## 8.6 Request-Response
 
