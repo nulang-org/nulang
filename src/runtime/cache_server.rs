@@ -1103,18 +1103,19 @@ impl CacheServiceHandle {
             .ok_or(CacheServiceError::MigrationJournalUnavailable)?;
 
         let replay = {
-            let mut journal = journal.lock();
+            let journal = journal.lock();
             let state = journal
                 .recovery_state(key)
                 .cloned()
                 .ok_or(CacheServiceError::MigrationRecoveryNotFound)?;
-            let plan = state
+            state
                 .drained_restart_replay_plan()
-                .ok_or(CacheServiceError::MigrationRestartReplayUnsafe)?;
-            journal.rebind_drained_source_incarnation(key, self.migration_incarnation)?;
-            plan
+                .ok_or(CacheServiceError::MigrationRestartReplayUnsafe)?
         };
 
+        // Validate the currently installed migration before mutating durable
+        // recovery state. A stale/wrong topology cannot rebind an old journal
+        // to this source incarnation.
         let placement = self.placement_publisher.snapshot();
         let Some(migration) = placement.migration_for_slot(key.slot) else {
             return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
@@ -1127,6 +1128,10 @@ impl CacheServiceHandle {
         {
             return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
         }
+
+        journal
+            .lock()
+            .rebind_drained_source_incarnation(key, self.migration_incarnation)?;
 
         let mut pending = Vec::with_capacity(replay.len());
         for message in replay {
