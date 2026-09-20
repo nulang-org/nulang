@@ -880,13 +880,84 @@ fn guest_value_to_json(raw: u64, data: &[u8]) -> serde_json::Value {
 
 /// `env.nulang_dispatch_args(tag_ptr: i32, tag_len: i32, argv_ptr: i32, argc: i32) -> i64`
 ///
-/// Runtime-argument effect dispatch stub: decodes the guest's positional argv
-/// (tagged Nulang values in linear memory) into a positional JSON array,
-/// records it alongside the dotted effect tag for test verification, and
-/// writes the injectable [`HostState::dispatch_result`] (if any) to the ring
-/// buffer at [`crate::mir_wasm::RING_BUFFER_BASE`], returning its length —
-/// matching the length-return contract nulang-cloud's `host_dispatch_args`
-/// implements. Returns 0 when no result is injected.
+/// Runtime-argument effect dispatch stub.
+///
+/// Compiler-canonical tags return one tagged Nulang `Value` directly in the
+/// existing i64 result slot. Scalar results map to native tagged values and
+/// structured `json-text` results become a NUL-terminated Nulang string.
+///
+/// Legacy/custom dotted tags preserve the historical contract: injected bytes
+/// are copied to the ring buffer and the function returns their byte length.
+fn write_guest_string(caller: &mut Caller<'_, HostState>, text: &str) -> Result<i64, Error> {
+    let total = text
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| Error::msg("string allocation overflow"))?;
+    let size = ((total as u32) + 7) & !7u32;
+    let offset = caller.data().alloc_offset;
+    let required = offset
+        .checked_add(size)
+        .ok_or_else(|| Error::msg("string allocation overflow"))?;
+
+    let mem = get_memory(caller)?;
+    let current_size = mem.data_size(&*caller) as u32;
+    if required > current_size {
+        let pages_needed = (required - current_size).div_ceil(65536);
+        mem.grow(&mut *caller, pages_needed as u64)
+            .map_err(|e| Error::msg(format!("memory grow: {e}")))?;
+    }
+    caller.data_mut().alloc_offset = required;
+
+    let mem = get_memory(caller)?;
+    let data = mem.data_mut(&mut *caller);
+    let dst = offset as usize;
+    data[dst..dst + text.len()].copy_from_slice(text.as_bytes());
+    data[dst + text.len()] = 0;
+    Ok((value_layout::TAG_STRING | offset as u64) as i64)
+}
+
+fn canonical_result_to_guest_value(
+    caller: &mut Caller<'_, HostState>,
+    result: &[u8],
+    operation: &crate::host_effect_abi::HostOperationDescriptor,
+) -> i64 {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(result) else {
+        return value_layout::TAG_NIL as i64;
+    };
+
+    match operation.result_encoding {
+        crate::host_effect_abi::HostResultEncoding::JsonText => {
+            let Ok(text) = serde_json::to_string(&value) else {
+                return value_layout::TAG_NIL as i64;
+            };
+            write_guest_string(caller, &text).unwrap_or(value_layout::TAG_NIL as i64)
+        }
+        crate::host_effect_abi::HostResultEncoding::Scalar => match value {
+            serde_json::Value::Null => value_layout::TAG_NIL as i64,
+            serde_json::Value::Bool(value) => value_layout::tag_bool(value) as i64,
+            serde_json::Value::Number(number) => {
+                if let Some(integer) = number.as_i64() {
+                    if value_layout::int48_in_range(integer) {
+                        value_layout::tag_int(integer) as i64
+                    } else {
+                        value_layout::TAG_NIL as i64
+                    }
+                } else if let Some(float) = number.as_f64() {
+                    value_layout::float_bits(float) as i64
+                } else {
+                    value_layout::TAG_NIL as i64
+                }
+            }
+            serde_json::Value::String(text) => {
+                write_guest_string(caller, &text).unwrap_or(value_layout::TAG_NIL as i64)
+            }
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                value_layout::TAG_NIL as i64
+            }
+        },
+    }
+}
+
 fn host_dispatch_args(
     mut caller: Caller<'_, HostState>,
     tag_ptr: i32,
@@ -898,10 +969,11 @@ fn host_dispatch_args(
     if argc < 0 || argc > MAX_DISPATCH_ARGS {
         return 0;
     }
+
     // Read the tag + argv words, decode into a positional JSON array, and
-    // record for tests. Scoped to release the memory borrow before the result
-    // write-back below takes `&mut caller`.
-    {
+    // record for tests. Keep the tag bytes so canonical calls can select their
+    // compiler-owned result encoding after the handler result is injected.
+    let tag = {
         let mem = match get_memory(&mut caller) {
             Ok(m) => m,
             Err(_) => return 0,
@@ -926,12 +998,30 @@ fn host_dispatch_args(
             })
             .collect();
         let payload = serde_json::to_vec(&serde_json::Value::Array(args)).unwrap_or_default();
-        *caller.data().last_dispatch.lock() = Some((tag, payload));
-    }
+        *caller.data().last_dispatch.lock() = Some((tag.clone(), payload));
+        tag
+    };
+
+    let canonical_operation = std::str::from_utf8(&tag)
+        .ok()
+        .and_then(crate::host_effect_abi::lookup_host_operation_by_canonical_id);
+
     let result = {
         let guard = caller.data().dispatch_result.lock();
         guard.clone()
     };
+
+    if let Some(operation) = canonical_operation {
+        let Some(result) = result else {
+            return value_layout::TAG_NIL as i64;
+        };
+        if result.is_empty() {
+            return value_layout::TAG_NIL as i64;
+        }
+        return canonical_result_to_guest_value(&mut caller, &result, operation);
+    }
+
+    // Legacy/custom source tags retain the old ring-buffer-length result ABI.
     let Some(result) = result else {
         return 0;
     };
@@ -939,7 +1029,7 @@ fn host_dispatch_args(
         return 0;
     }
     let base = crate::mir_wasm::RING_BUFFER_BASE as usize;
-    let write_len = result.len().min(0x1000); // ring buffer is 4 KiB
+    let write_len = result.len().min(0x1000);
     let mem = match get_memory(&mut caller) {
         Ok(m) => m,
         Err(_) => return 0,
