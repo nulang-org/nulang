@@ -82,6 +82,8 @@ pub struct Function {
     pub line_table: Vec<((BlockId, usize), u32)>,
     /// Web framework compile-time placement hint (None = infer from effect row).
     pub placement: Option<crate::types::Placement>,
+    /// Source-level performance contracts retained through MIR optimization.
+    pub performance_contracts: Vec<crate::ast::PerformanceContract>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -378,6 +380,7 @@ pub struct FunctionBuilder {
     current_line: Option<u32>,
     line_table: Vec<((BlockId, usize), u32)>,
     placement: Option<crate::types::Placement>,
+    performance_contracts: Vec<crate::ast::PerformanceContract>,
 }
 
 impl FunctionBuilder {
@@ -396,6 +399,7 @@ impl FunctionBuilder {
             current_line: None,
             line_table: Vec::new(),
             placement: None,
+            performance_contracts: Vec::new(),
         };
         builder.create_block(); // entry block
         builder
@@ -403,6 +407,13 @@ impl FunctionBuilder {
 
     pub fn set_placement(&mut self, placement: Option<crate::types::Placement>) {
         self.placement = placement;
+    }
+
+    pub fn set_performance_contracts(
+        &mut self,
+        contracts: Vec<crate::ast::PerformanceContract>,
+    ) {
+        self.performance_contracts = contracts;
     }
 
     pub fn add_param(&mut self, name: impl Into<String>, ty: Type) -> LocalId {
@@ -549,6 +560,7 @@ impl FunctionBuilder {
             type_metadata,
             line_table: self.line_table,
             placement: self.placement,
+            performance_contracts: self.performance_contracts,
         }
     }
 }
