@@ -2781,14 +2781,10 @@ mod tests {
         let _guard = ChangeDir::new(&dir);
         assert_eq!(
             package_compiler_args(&["--check", "src/main.nula"]),
-            vec![
-                "--check",
-                "src/main.nula",
-                "--with",
-                "fs",
-                "--with",
-                "net",
-            ]
+            ["--check", "src/main.nula", "--with", "fs", "--with", "net"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
         );
 
         let _ = std::fs::remove_dir_all(&dir);
