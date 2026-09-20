@@ -7,9 +7,11 @@ use super::*;
 use crate::bytecode::{ActorMeta, CodeModule, Constant};
 use crate::runtime::gc::OrcaGc;
 use crate::runtime::heap::{ActorHeap, TypeTag};
-use crate::vm::{Frame, Value};
+use crate::vm::{ActorVmCallbacks, Frame, Value};
+use std::cell::RefCell;
 #[cfg(feature = "tcp")]
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -6747,6 +6749,47 @@ fn test_object_store_put_get() {
 }
 
 #[test]
+fn test_standalone_vm_object_callbacks_support_zero_copy_views() {
+    let mut callbacks = crate::vm::StandaloneVmCallbacks::new();
+
+    let object = callbacks.object_put(vec![1, 2, 3, 4].into_boxed_slice());
+    let view = callbacks.object_slice(object, 1, 4);
+
+    assert!(object.is_object());
+    assert!(view.is_object());
+    assert_eq!(callbacks.object_len(object), Some(4));
+    assert_eq!(callbacks.object_len(view), Some(3));
+    assert_eq!(callbacks.object_get_byte(view, 0), Some(2));
+    assert_eq!(callbacks.object_get_byte(view, 2), Some(4));
+    assert_eq!(callbacks.object_get_byte(view, 3), None);
+}
+
+#[test]
+fn test_runtime_vm_object_callbacks_share_zero_copy_store() {
+    let rt = Rc::new(RefCell::new(Runtime::new()));
+    let mut callbacks = RuntimeVmCallbacks::new(rt.clone());
+
+    let object = callbacks.object_put(vec![5, 10, 15, 20].into_boxed_slice());
+    assert!(object.is_object());
+    assert_eq!(callbacks.object_len(object), Some(4));
+    assert_eq!(callbacks.object_get_byte(object, 2), Some(15));
+
+    let view = callbacks.object_slice(object, 1, 3);
+    assert!(view.is_object());
+    assert_eq!(callbacks.object_len(view), Some(2));
+    assert_eq!(callbacks.object_get_byte(view, 0), Some(10));
+    assert_eq!(callbacks.object_get_byte(view, 1), Some(15));
+
+    let source_id = object.as_object_id().unwrap();
+    let view_id = view.as_object_id().unwrap();
+    let rt = rt.borrow();
+    let source = rt.object_store.get(source_id).unwrap();
+    let view_entry = rt.object_store.get(view_id).unwrap();
+    assert_eq!(source.as_bytes(), &[5, 10, 15, 20]);
+    assert_eq!(view_entry.as_bytes(), &[10, 15]);
+}
+
+#[test]
 fn test_object_ref_send_same_shard_records_hold() {
     let mut rt = Runtime::new();
     let receiver = rt.spawn_actor(Box::new(|| vec![]));
@@ -6839,6 +6882,52 @@ fn test_object_ref_cross_shard_copies_bytes() {
             .unwrap()
             .as_bytes(),
         &[11, 22, 33]
+    );
+}
+
+#[test]
+fn test_object_view_cross_shard_copies_only_view_bytes() {
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut a = shards[0].spawn_actor(Box::new(|| vec![]));
+    while a % 2 != 0 {
+        a = shards[0].spawn_actor(Box::new(|| vec![]));
+    }
+    let mut b = shards[1].spawn_actor(Box::new(|| vec![]));
+    while b % 2 != 1 {
+        b = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let source_shard = (a % 2) as usize;
+    let target_shard = (b % 2) as usize;
+    let source_id = shards[source_shard]
+        .object_store
+        .put(vec![10, 20, 30, 40, 50].into_boxed_slice());
+    let view_id = shards[source_shard]
+        .object_store
+        .slice(source_id, 1, 4)
+        .expect("valid zero-copy view");
+
+    shards[source_shard].current_actor = Some(a);
+    shards[source_shard].send_message_by_id(b, 0, &[Value::object(view_id)]);
+    shards[target_shard].drain_cross_shard_messages();
+
+    let received_msg = shards[target_shard]
+        .actors
+        .get_mut(&b)
+        .unwrap()
+        .mailbox
+        .pop()
+        .unwrap();
+    let local_id = received_msg.payload[0].as_object_id().unwrap();
+    assert_eq!(
+        shards[target_shard]
+            .object_store
+            .get(local_id)
+            .unwrap()
+            .as_bytes(),
+        &[20, 30, 40],
+        "cross-shard serialization must copy only the logical view range"
     );
 }
 
