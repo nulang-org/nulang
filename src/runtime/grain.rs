@@ -58,7 +58,7 @@ impl GrainId {
 pub struct LogicalActorId([u8; 16]);
 
 impl LogicalActorId {
-    const DOMAIN: &'static [u8] = b"nulang.logical-actor.v1\\0";
+    const DOMAIN: &'static [u8] = b"nulang.logical-actor.v1\0";
 
     pub fn from_grain(grain: &GrainId) -> Self {
         let mut hasher = blake3::Hasher::new();
