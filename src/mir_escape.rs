@@ -235,10 +235,7 @@ fn classify_stmt_use(stmt: &Stmt, aliases: &BTreeSet<LocalId>) -> UseClass {
     }
 }
 
-fn classify_terminator_use(
-    terminator: &Terminator,
-    aliases: &BTreeSet<LocalId>,
-) -> UseClass {
+fn classify_terminator_use(terminator: &Terminator, aliases: &BTreeSet<LocalId>) -> UseClass {
     match terminator {
         Terminator::Return(Some(value)) if aliases.contains(value) => {
             UseClass::Escape(EscapeReason::Return)
@@ -315,10 +312,7 @@ fn classify_rvalue_use(op: &RValue, aliases: &BTreeSet<LocalId>) -> UseClass {
             }
         }
         RValue::RecordUpdate { base, overrides } => {
-            if overrides
-                .iter()
-                .any(|(_, value)| aliases.contains(value))
-            {
+            if overrides.iter().any(|(_, value)| aliases.contains(value)) {
                 UseClass::Escape(EscapeReason::AggregateStorage)
             } else if aliases.contains(base) {
                 UseClass::Materialized
@@ -348,9 +342,7 @@ fn classify_rvalue_use(op: &RValue, aliases: &BTreeSet<LocalId>) -> UseClass {
             }
         }
         RValue::Spawn {
-            init,
-            target_node,
-            ..
+            init, target_node, ..
         } => {
             let init_alias = init
                 .iter()
@@ -440,10 +432,7 @@ fn rvalue_mentions_alias(op: &RValue, aliases: &BTreeSet<LocalId>) -> bool {
         RValue::Closure { captures, .. } => any_alias(captures, aliases),
         RValue::Record(fields) => fields.iter().any(|(_, value)| aliases.contains(value)),
         RValue::RecordUpdate { base, overrides } => {
-            aliases.contains(base)
-                || overrides
-                    .iter()
-                    .any(|(_, value)| aliases.contains(value))
+            aliases.contains(base) || overrides.iter().any(|(_, value)| aliases.contains(value))
         }
         RValue::Perform { args, .. } | RValue::PerformAsync { args, .. } => {
             any_alias(args, aliases)
@@ -453,9 +442,7 @@ fn rvalue_mentions_alias(op: &RValue, aliases: &BTreeSet<LocalId>) -> bool {
         RValue::Migrate { actor, node } => aliases.contains(actor) || aliases.contains(node),
         RValue::CapabilityCheck { val } => aliases.contains(val),
         RValue::Spawn {
-            init,
-            target_node,
-            ..
+            init, target_node, ..
         } => {
             target_node
                 .as_ref()
@@ -508,7 +495,10 @@ mod tests {
 
         let function = finish(builder, Some(projected));
         let summaries = analyze_function(&function);
-        let summary = summaries.iter().find(|summary| summary.site.dst == tuple).unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.site.dst == tuple)
+            .unwrap();
 
         assert!(!summary.escapes);
         assert!(summary.scalar_replaceable);
@@ -527,7 +517,10 @@ mod tests {
 
         let function = finish(builder, Some(alias));
         let summaries = analyze_function(&function);
-        let summary = summaries.iter().find(|summary| summary.site.dst == tuple).unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.site.dst == tuple)
+            .unwrap();
 
         assert!(summary.escapes);
         assert!(!summary.scalar_replaceable);
@@ -542,23 +535,20 @@ mod tests {
         builder.assign(one, RValue::Const(Constant::Int(1)));
 
         let record = builder.add_temp(Type::unit());
-        builder.assign(
-            record,
-            RValue::Record(vec![("x".to_string(), one)]),
-        );
+        builder.assign(record, RValue::Record(vec![("x".to_string(), one)]));
 
         let outer = builder.add_temp(Type::unit());
         builder.assign(outer, RValue::Tuple(vec![record]));
 
         let function = finish(builder, Some(outer));
         let summaries = analyze_function(&function);
-        let summary = summaries.iter().find(|summary| summary.site.dst == record).unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.site.dst == record)
+            .unwrap();
 
         assert!(summary.escapes);
-        assert_eq!(
-            summary.escape_reason,
-            Some(EscapeReason::AggregateStorage)
-        );
+        assert_eq!(summary.escape_reason, Some(EscapeReason::AggregateStorage));
     }
 
     #[test]
@@ -567,10 +557,7 @@ mod tests {
         let one = builder.add_temp(Type::int());
         builder.assign(one, RValue::Const(Constant::Int(1)));
         let record = builder.add_temp(Type::unit());
-        builder.assign(
-            record,
-            RValue::Record(vec![("x".to_string(), one)]),
-        );
+        builder.assign(record, RValue::Record(vec![("x".to_string(), one)]));
         let projected = builder.add_temp(Type::int());
         builder.assign(
             projected,
@@ -595,10 +582,7 @@ mod tests {
         builder.assign(two, RValue::Const(Constant::Int(2)));
 
         let record = builder.add_temp(Type::unit());
-        builder.assign(
-            record,
-            RValue::Record(vec![("x".to_string(), one)]),
-        );
+        builder.assign(record, RValue::Record(vec![("x".to_string(), one)]));
         builder.emit(Stmt::StoreFieldNamed {
             obj: record,
             field: "x".to_string(),
@@ -615,7 +599,10 @@ mod tests {
 
         let function = finish(builder, Some(projected));
         let summaries = analyze_function(&function);
-        let summary = summaries.iter().find(|summary| summary.site.dst == record).unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.site.dst == record)
+            .unwrap();
 
         assert!(!summary.escapes);
         assert!(!summary.scalar_replaceable);
