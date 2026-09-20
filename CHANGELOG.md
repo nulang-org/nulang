@@ -81,6 +81,11 @@ two major versions.*
   `Actor.behavior` identity. Opaque local actor references may use a short
   behavior name only when it is globally unique; ambiguous dispatch fails
   closed instead of selecting the first suffix match.
+- **Runtime actor schema identity** (Stable runtime correction). Actors spawned
+  from compiler-produced module metadata retain the canonical `ActorMeta.name`
+  that owns their behavior table. Manual/native actors keep their synthetic
+  instance names. This gives runtime dispatch a concrete schema identity for
+  subsequent ownership enforcement.
 
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
