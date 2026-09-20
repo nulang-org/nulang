@@ -37,3 +37,16 @@ This intentionally does not need a dedicated non-shared runner: the
 noise-adaptive threshold is the fix, not the infrastructure change.
 
 `docs/PERFORMANCE_ANALYSIS.md` should cite numbers from here, not estimates.
+
+## Cross-language comparisons
+
+`benchmarks/crosslang/` contains a separate informational suite that compares
+identical source-level workloads across Nulang, Rust, C++, Go, Java, Node.js and
+Python. It builds compiled implementations once, validates identical checksums,
+then records run-many wall-clock samples plus host/toolchain metadata.
+
+This suite is intentionally **not** part of the regression gate above. Shared
+runner and cross-toolchain variance make it useful for directional comparison,
+not as a merge-blocking threshold. See `benchmarks/crosslang/README.md` for the
+methodology and interpretation rules.
+

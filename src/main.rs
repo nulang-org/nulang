@@ -2430,7 +2430,9 @@ fn compile_source_to_nbc(
 
 /// Load and run a `.nbc` artifact directly, optionally verifying its recorded
 /// source hash against a source file. This is the durable-distribution path:
-/// no compiler invocation, no source parse — just `from_nbc` + `VM::run`.
+/// no compiler invocation or source parse. Pure modules run directly in the VM;
+/// actor/workflow modules use `run_with_runtime` so spawn/send/state semantics
+/// match source execution.
 fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
     let bytes = std::fs::read(path).map_err(|e| nulang::types::NuError::VMError {
         msg: format!("cannot read .nbc file '{path}': {e}"),
@@ -2471,14 +2473,57 @@ fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
         }
     }
 
-    let mut vm = VM::new();
-    vm.load_module(artifact.module);
-    let value = vm.run()?;
-    let result_str = value.to_string_repr();
+    let constants = artifact.module.constants.clone();
+    let (value, _runtime) = run_nbc_module(artifact.module)?;
+
+    let result_str = if value.is_string() || value.is_ptr() {
+        nulang::vm::resolve_value_string(&constants, value)
+    } else {
+        value.to_string_repr()
+    };
     if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
         println!("{}", result_str);
     }
     Ok(())
+}
+
+/// Execute a deserialized `.nbc` module with the same actor semantics as
+/// source execution.
+///
+/// A bare `VM` installs `StandaloneVmCallbacks`, whose actor operations are
+/// deliberately inert (`spawn` returns actor-ref 0 and `send` is a no-op).
+/// Serialized actor/workflow modules therefore must use the real Runtime bridge
+/// and scheduler, exactly like the bytecode source path in `run_source`.
+fn run_nbc_module(
+    module: nulang::bytecode::CodeModule,
+) -> NuResult<(
+    nulang::vm::Value,
+    Option<std::rc::Rc<std::cell::RefCell<nulang::runtime::Runtime>>>,
+)> {
+    let has_actors = !module.actor_metadata.is_empty() || !module.behaviors.is_empty();
+
+    if has_actors {
+        let (value, runtime) = run_with_runtime(module, None, None)?;
+
+        let failures = runtime.borrow().workflow_failures();
+        if !failures.is_empty() {
+            let summary = failures
+                .iter()
+                .map(|(step, error)| format!("{step}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(NuError::RuntimeError {
+                msg: format!("workflow execution failed: {summary}"),
+                span: Span::default(),
+            });
+        }
+
+        Ok((value, Some(runtime)))
+    } else {
+        let mut vm = VM::new();
+        vm.load_module(module);
+        Ok((vm.run()?, None))
+    }
 }
 
 fn type_to_string(ty: &Type) -> String {
@@ -2621,6 +2666,46 @@ mod tests {
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub
     /// spawn/send callbacks would leave the counter at 0.
+    /// Actor semantics must survive serialization. Running the deserialized
+    /// module through a standalone VM would make spawn/send no-ops, so this
+    /// pins the durable artifact path to the production Runtime bridge.
+    #[test]
+    fn test_nbc_actor_program_schedules_and_delivers() {
+        let source = r#"
+            actor Counter {
+                state count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+            let c = spawn Counter {} in {
+                send c inc()
+                send c inc()
+                c
+            }
+        "#;
+
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+            .expect("frontend should accept the actor program");
+        let module = compile_with_new_pipeline(&ast, "test", &type_checker)
+            .expect("actor program should compile");
+        let source_hash = blake3::hash(source.as_bytes());
+        let bytes = module
+            .to_nbc(Some(*source_hash.as_bytes()))
+            .expect("actor module should serialize to nbc");
+        let artifact = nulang::bytecode::CodeModule::from_nbc(&bytes)
+            .expect("serialized actor module should deserialize");
+
+        let (_value, runtime) =
+            run_nbc_module(artifact.module).expect("nbc actor program should run");
+        let runtime = runtime.expect("actor nbc must execute with a real Runtime");
+        let rt = runtime.borrow();
+        let actor = rt.actors.values().next().expect("one actor should exist");
+        assert_eq!(
+            actor.get_state_field("count").and_then(|v| v.as_int()),
+            Some(2),
+            "both inc messages must be delivered after nbc round-trip"
+        );
+    }
+
     #[test]
     fn test_run_source_actor_program_schedules_and_delivers() {
         let source = r#"
