@@ -305,6 +305,12 @@ pub(crate) fn spawn_from_module(
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
         if let Some(meta) = meta {
+            // Preserve canonical compiler actor identity for runtime behavior
+            // ownership and protocol admission. Virtual actors use their
+            // instance name (Type@key) when hydrated through the grain path.
+            if !meta.is_virtual {
+                actor.name = meta.name.clone();
+            }
             if matches!(role, ActorRole::Agent) {
                 // Legacy storage flag retained until the serialized role enum
                 // replaces the compatibility booleans.
