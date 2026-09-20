@@ -1008,12 +1008,7 @@ impl crate::backends::JitBackend for JitSession {
         JitSession::record_and_check_hot(self, module_idx, pc)
     }
 
-    fn probe_and_maybe_hot(
-        &mut self,
-        module_idx: usize,
-        pc: usize,
-        annotated_hot: bool,
-    ) -> bool {
+    fn probe_and_maybe_hot(&mut self, module_idx: usize, pc: usize, annotated_hot: bool) -> bool {
         // Fast path: check if this is the last compiled PC we saw
         // This avoids HashMap lookups for sequential execution in hot loops
         if self.last_compiled_probe == Some((module_idx, pc)) {
