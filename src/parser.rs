@@ -922,6 +922,10 @@ impl Parser {
                     ));
                 }
             }
+            // Allow the normal declaration style of one annotation per line.
+            // Without this, only the first annotation is consumed and the next
+            // leading '@' is misparsed as a new declaration.
+            self.skip_newlines();
         }
         Ok(annotations)
     }
