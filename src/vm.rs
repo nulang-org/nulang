@@ -428,7 +428,7 @@ pub(crate) struct StandaloneVmCallbacks {
     gc: crate::runtime::OrcaGc,
     /// Immutable object values use the same handle representation as the actor
     /// runtime even when executing without a Runtime.
-    object_store: crate::runtime::object_store::ObjectStore,
+    object_store: crate::runtime::ObjectStore,
     /// Test hook: when set, `IO.print` output is recorded here instead of
     /// written to stdout.
     io_output: Option<std::rc::Rc<std::cell::RefCell<Vec<String>>>>,
@@ -1026,11 +1026,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
 
     fn object_get_byte(&self, object: Value, index: usize) -> Option<u8> {
         let id = object.as_object_id()?;
-        self.object_store
-            .get(id)?
-            .as_bytes()
-            .get(index)
-            .copied()
+        self.object_store.get(id)?.as_bytes().get(index).copied()
     }
 
     fn spawn_actor(
