@@ -225,15 +225,9 @@ mod tests {
 
         assert_eq!(artifact.format_version, 1);
         assert_eq!(artifact.language_version, 1);
-        assert_eq!(
-            artifact.source_hash,
-            Some([
-                0x84, 0xf3, 0xad, 0x3e, 0xdb, 0x76, 0xc0, 0x68,
-                0xbe, 0x59, 0x8d, 0x22, 0xa1, 0x69, 0x78, 0x46,
-                0x8a, 0x0c, 0xab, 0xe8, 0xd8, 0x42, 0x96, 0x8a,
-                0x93, 0xd1, 0xac, 0x49, 0x5e, 0xcc, 0x1e, 0xa9,
-            ])
-        );
+        // This particular historical bootstrap artifact was emitted without
+        // source provenance, so the frozen all-zero hash decodes to None.
+        assert_eq!(artifact.source_hash, None);
 
         assert_eq!(artifact.module.name, "main");
         assert_eq!(artifact.module.instructions.len(), 3493);
