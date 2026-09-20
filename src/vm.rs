@@ -444,7 +444,7 @@ impl StandaloneVmCallbacks {
         Self {
             heap,
             gc: crate::runtime::OrcaGc::new(0),
-            object_store: crate::runtime::object_store::ObjectStore::new(),
+            object_store: crate::runtime::ObjectStore::new(),
             io_output: None,
             routes: Vec::new(),
         }
