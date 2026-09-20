@@ -1455,8 +1455,21 @@ impl RocksDbStore {
 #[cfg(feature = "rocksdb")]
 impl PersistenceStore for RocksDbStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        self.save_snapshot_versioned(snapshot, LEGACY_SCHEMA_VERSION)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.load_snapshot_versioned(actor_id)
+            .map(|(_, snapshot)| snapshot)
+    }
+
+    fn save_snapshot_versioned(
+        &mut self,
+        snapshot: ActorSnapshot,
+        schema_version: u32,
+    ) -> io::Result<()> {
         let cf = self.cf(Self::CF_SNAPSHOTS)?;
-        let json = serde_json::to_string(&snapshot)
+        let json = encode_record(&snapshot, schema_version)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         self.db
             .put_cf(cf, Self::actor_key(snapshot.actor_id), json.as_bytes())
@@ -1468,10 +1481,12 @@ impl PersistenceStore for RocksDbStore {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 
-    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+    fn load_snapshot_versioned(&self, actor_id: u64) -> Option<(u32, ActorSnapshot)> {
         let cf = self.cf(Self::CF_SNAPSHOTS).ok()?;
         let bytes = self.db.get_cf(cf, Self::actor_key(actor_id)).ok()??;
-        serde_json::from_slice(&bytes).ok()
+        let json = std::str::from_utf8(&bytes).ok()?;
+        let decoded = decode_record::<ActorSnapshot>(json).ok()?;
+        Some((decoded.schema_version, decoded.record))
     }
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
