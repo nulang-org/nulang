@@ -2765,6 +2765,105 @@ mod tests {
     }
 
     #[test]
+    fn test_package_compiler_args_append_manifest_capabilities() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_package_caps_args_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "caps-args", "default").expect("scaffold should succeed");
+
+        let mut manifest = Manifest::load(&dir).expect("manifest should load");
+        manifest.package.capabilities = vec!["fs".into(), "net".into()];
+        manifest.save(&dir).expect("manifest should save");
+
+        let _guard = ChangeDir::new(&dir);
+        assert_eq!(
+            package_compiler_args(&["--check", "src/main.nula"]),
+            vec![
+                "--check",
+                "src/main.nula",
+                "--with",
+                "fs",
+                "--with",
+                "net",
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_build_json_forwards_manifest_capabilities() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_json_caps_build_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "json-caps", "default").expect("scaffold should succeed");
+
+        let mut manifest = Manifest::load(&dir).expect("manifest should load");
+        manifest.package.capabilities = vec!["fs".into()];
+        manifest.save(&dir).expect("manifest should save");
+        std::fs::write(
+            dir.join("src/main.nula"),
+            r#"fn main() -> Bool ! {FS} {
+    perform FS.exists("/tmp")
+}
+"#,
+        )
+        .expect("write main");
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build(true).expect("JSON build must forward the fs capability");
+        assert!(
+            dir.join(".nula/dist/json-caps.nbc").is_file(),
+            "JSON build should emit the bytecode artifact"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "wasm-backend")]
+    #[test]
+    fn test_cmd_build_wasm_forwards_manifest_capabilities() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_wasm_caps_build_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "wasm-caps", "default").expect("scaffold should succeed");
+
+        let mut manifest = Manifest::load(&dir).expect("manifest should load");
+        manifest.package.capabilities = vec!["fs".into()];
+        manifest.save(&dir).expect("manifest should save");
+        std::fs::write(
+            dir.join("src/main.nula"),
+            r#"fn main() -> Bool ! {FS} {
+    perform FS.exists("/tmp")
+}
+"#,
+        )
+        .expect("write main");
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_wasm().expect("WASM build must forward the fs capability");
+        assert!(
+            dir.join(".nula/dist/wasm-caps.wasm").is_file(),
+            "WASM build should emit .wasm"
+        );
+        assert!(
+            dir.join(".nula/dist/wasm-caps.cwasm").is_file(),
+            "WASM build should emit precompiled .cwasm"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_cmd_add_and_remove_dependency() {
         let dir =
             std::env::temp_dir().join(format!("nulang_add_remove_test_{}", std::process::id()));
