@@ -287,6 +287,34 @@ pub(crate) enum MessageAdmission {
     Rejected,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForeignDispatchError {
+    NotConfigured,
+    AlreadyConfigured,
+    Submit(BlockingSubmitError),
+}
+
+impl std::fmt::Display for ForeignDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConfigured => f.write_str("foreign executor is not configured"),
+            Self::AlreadyConfigured => f.write_str("foreign executor is already configured"),
+            Self::Submit(error) => write!(f, "foreign executor submission failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ForeignDispatchError {}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignActorCompletion {
+    pub job_id: BlockingJobId,
+    /// None indicates an invariant violation: a completion arrived after its
+    /// ownership entry was lost. The result is still surfaced for diagnostics.
+    pub actor_id: Option<u64>,
+    pub result: ForeignCallResult,
+}
+
 pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
@@ -362,6 +390,11 @@ pub struct Runtime {
     /// on first `Python.*` builtin effect invocation.
     #[cfg(feature = "python")]
     pub foreign_interop: Option<Box<dyn crate::backends::ForeignInterop>>,
+    /// Optional isolated executor for blocking/foreign host calls.
+    foreign_executor: Option<BlockingForeignExecutor>,
+    /// Job ownership used to route worker completions back to the actor that
+    /// initiated the call without giving workers access to actor state.
+    foreign_job_owners: HashMap<BlockingJobId, u64>,
     // LLM subsystem (v0.9 AI Runtime): client, worker thread, token budget,
     // completion channel, and non-blocking suspension state.
     #[cfg(feature = "ai-runtime")]
@@ -596,6 +629,8 @@ impl Runtime {
             metrics: None,
             #[cfg(feature = "python")]
             foreign_interop: None,
+            foreign_executor: None,
+            foreign_job_owners: HashMap::new(),
             crdt_sync_rounds: 0,
             timer_wheel: TimerWheel::new(),
             registry: ActorRegistry::new(),
@@ -642,6 +677,68 @@ impl Runtime {
             cross_shard_tx: None,
             cross_shard_rx: None,
         }
+    }
+
+    /// Install one isolated foreign backend for non-blocking owned calls.
+    ///
+    /// Installation is one-shot because replacing an executor would synchronously
+    /// join its worker while jobs may still be running.
+    pub fn install_foreign_executor(
+        &mut self,
+        backend: Box<dyn crate::backends::ForeignInterop>,
+        queue_capacity: usize,
+    ) -> Result<(), ForeignDispatchError> {
+        if self.foreign_executor.is_some() {
+            return Err(ForeignDispatchError::AlreadyConfigured);
+        }
+        let executor = BlockingForeignExecutor::new(backend, queue_capacity)
+            .map_err(|_| ForeignDispatchError::Submit(BlockingSubmitError::Closed))?;
+        self.foreign_executor = Some(executor);
+        Ok(())
+    }
+
+    /// Submit one owned foreign call without blocking the actor scheduler.
+    pub fn try_submit_foreign_call(
+        &mut self,
+        actor_id: u64,
+        request: ForeignCallRequest,
+    ) -> Result<BlockingJobId, ForeignDispatchError> {
+        let executor = self
+            .foreign_executor
+            .as_mut()
+            .ok_or(ForeignDispatchError::NotConfigured)?;
+        let job_id = executor
+            .try_submit(request)
+            .map_err(ForeignDispatchError::Submit)?;
+        self.foreign_job_owners.insert(job_id, actor_id);
+        Ok(job_id)
+    }
+
+    /// Drain currently-ready foreign completions without blocking.
+    pub fn poll_foreign_completions(&mut self) -> Vec<ForeignActorCompletion> {
+        let Some(executor) = self.foreign_executor.as_ref() else {
+            return Vec::new();
+        };
+
+        executor
+            .drain_ready()
+            .into_iter()
+            .map(|completion| {
+                let job_id = completion.id();
+                let actor_id = self.foreign_job_owners.remove(&job_id);
+                let result = match completion {
+                    BlockingCompletion::Finished { value, .. } => value,
+                    BlockingCompletion::Panicked { .. } => {
+                        Err("foreign worker panicked while executing call".to_string())
+                    }
+                };
+                ForeignActorCompletion {
+                    job_id,
+                    actor_id,
+                    result,
+                }
+            })
+            .collect()
     }
 
     /// Compute the BLAKE3 hash of `data` using the configured [`CryptoProvider`].
