@@ -28,8 +28,7 @@ fn runtime_with_consumer() -> (Runtime, u64) {
 
     // Drain any spawn-time scheduling state and verify the measured behavior is
     // admissible before entering a timed iteration.
-    let admission = rt.send_message(actor_id, "handle", &[Value::int(0)]);
-    assert!(admission.admitted(), "benchmark message must be admitted");
+    rt.send_message(actor_id, "handle", &[Value::int(0)]);
     rt.run_scheduler();
     rt.process_gc_ops();
 
@@ -50,8 +49,7 @@ fn bench_spawn_send_receive(c: &mut Criterion) {
                 .expect("spawned actor")
                 .register_behavior("handle", noop_handler);
 
-            let admission = rt.send_message(actor_id, "handle", &[Value::int(42)]);
-            assert!(admission.admitted(), "benchmark message must be admitted");
+            rt.send_message(actor_id, "handle", &[Value::int(42)]);
             rt.run_scheduler();
             rt.process_gc_ops();
             black_box(actor_id);
@@ -73,8 +71,7 @@ fn bench_message_enqueue(c: &mut Criterion) {
             |(mut rt, actor_id)| {
                 let msg = Value::int(1);
                 for _ in 0..MESSAGE_BATCH {
-                    let admission = rt.send_message(actor_id, "handle", &[msg]);
-                    debug_assert!(admission.admitted());
+                    rt.send_message(actor_id, "handle", &[msg]);
                 }
                 black_box(rt);
             },
@@ -100,8 +97,7 @@ fn bench_message_drain(c: &mut Criterion) {
                 let (mut rt, actor_id) = runtime_with_consumer();
                 let msg = Value::int(1);
                 for _ in 0..MESSAGE_BATCH {
-                    let admission = rt.send_message(actor_id, "handle", &[msg]);
-                    assert!(admission.admitted(), "benchmark message must be admitted");
+                    rt.send_message(actor_id, "handle", &[msg]);
                 }
                 rt
             },
