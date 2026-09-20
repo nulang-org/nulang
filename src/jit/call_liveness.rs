@@ -259,7 +259,10 @@ mod tests {
         let save = caller_save_set(&code, &live, 0);
 
         assert_eq!(save.members(), vec![10]);
-        assert!(!save.contains(5), "return destination must not be preserved");
+        assert!(
+            !save.contains(5),
+            "return destination must not be preserved"
+        );
     }
 
     #[test]
@@ -279,7 +282,10 @@ mod tests {
         assert!(save.contains(1), "loop induction value is live across call");
         assert!(save.contains(2), "loop limit is live across call");
         assert!(save.contains(10), "loop accumulator is live across call");
-        assert!(!save.contains(5), "call destination is overwritten by result");
+        assert!(
+            !save.contains(5),
+            "call destination is overwritten by result"
+        );
     }
 
     #[test]
@@ -295,6 +301,9 @@ mod tests {
 
         assert!(save.contains(0));
         assert!(save.contains(254));
-        assert!(!save.contains(7), "call destination still must not be restored");
+        assert!(
+            !save.contains(7),
+            "call destination still must not be restored"
+        );
     }
 }
