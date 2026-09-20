@@ -9,6 +9,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::persistence_schema::{
+    decode_record, encode_record, LEGACY_SCHEMA_VERSION,
+};
 use crate::vm::Value;
 
 use tracing::warn;
@@ -259,6 +262,33 @@ pub trait PersistenceStore: Send + Sync {
     /// Load the latest snapshot for an actor, if any.
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot>;
 
+    /// Persist a snapshot together with the durable entity schema version that
+    /// produced it. Legacy/custom backends inherit a fail-closed default: they
+    /// may persist v1 snapshots through the historical API, but must explicitly
+    /// implement this method before accepting newer schemas.
+    fn save_snapshot_versioned(
+        &mut self,
+        snapshot: ActorSnapshot,
+        schema_version: u32,
+    ) -> io::Result<()> {
+        if schema_version != LEGACY_SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "persistence backend cannot preserve schema version {schema_version}; version-aware snapshot support is required"
+                ),
+            ));
+        }
+        self.save_snapshot(snapshot)
+    }
+
+    /// Load a snapshot together with its producing schema version. Historical
+    /// backends that do not store provenance explicitly are interpreted as v1.
+    fn load_snapshot_versioned(&self, actor_id: u64) -> Option<(u32, ActorSnapshot)> {
+        self.load_snapshot(actor_id)
+            .map(|snapshot| (LEGACY_SCHEMA_VERSION, snapshot))
+    }
+
     /// Append a message to the actor's journal.
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()>;
 
@@ -409,6 +439,7 @@ pub trait PersistenceStore: Send + Sync {
 #[derive(Debug, Default, Clone)]
 pub struct MemoryStore {
     snapshots: HashMap<u64, ActorSnapshot>,
+    snapshot_versions: HashMap<u64, u32>,
     journals: HashMap<u64, Vec<JournalEntry>>,
     workflow_events: HashMap<u64, Vec<WorkflowEvent>>,
     events: HashMap<u64, Vec<EventEntry>>,
@@ -422,12 +453,39 @@ impl MemoryStore {
 
 impl PersistenceStore for MemoryStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
-        self.snapshots.insert(snapshot.actor_id, snapshot);
-        Ok(())
+        self.save_snapshot_versioned(snapshot, LEGACY_SCHEMA_VERSION)
     }
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
-        self.snapshots.get(&actor_id).cloned()
+        self.load_snapshot_versioned(actor_id)
+            .map(|(_, snapshot)| snapshot)
+    }
+
+    fn save_snapshot_versioned(
+        &mut self,
+        snapshot: ActorSnapshot,
+        schema_version: u32,
+    ) -> io::Result<()> {
+        if schema_version == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "schema version must be >= 1",
+            ));
+        }
+        let actor_id = snapshot.actor_id;
+        self.snapshots.insert(actor_id, snapshot);
+        self.snapshot_versions.insert(actor_id, schema_version);
+        Ok(())
+    }
+
+    fn load_snapshot_versioned(&self, actor_id: u64) -> Option<(u32, ActorSnapshot)> {
+        let snapshot = self.snapshots.get(&actor_id).cloned()?;
+        let version = self
+            .snapshot_versions
+            .get(&actor_id)
+            .copied()
+            .unwrap_or(LEGACY_SCHEMA_VERSION);
+        Some((version, snapshot))
     }
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
@@ -492,6 +550,7 @@ impl PersistenceStore for MemoryStore {
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         self.snapshots.remove(&actor_id);
+        self.snapshot_versions.remove(&actor_id);
         self.journals.remove(&actor_id);
         self.workflow_events.remove(&actor_id);
         self.events.remove(&actor_id);
@@ -537,10 +596,23 @@ impl JsonFileStore {
 
 impl PersistenceStore for JsonFileStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        self.save_snapshot_versioned(snapshot, LEGACY_SCHEMA_VERSION)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.load_snapshot_versioned(actor_id)
+            .map(|(_, snapshot)| snapshot)
+    }
+
+    fn save_snapshot_versioned(
+        &mut self,
+        snapshot: ActorSnapshot,
+        schema_version: u32,
+    ) -> io::Result<()> {
         let dir = self.actor_dir(snapshot.actor_id);
         fs::create_dir_all(&dir)?;
         let path = self.snapshot_path(snapshot.actor_id);
-        let json = serde_json::to_string_pretty(&snapshot)
+        let json = encode_record(&snapshot, schema_version)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // Write to a temp file in the same directory, then atomically rename
         // it into place: a crash mid-write can no longer leave a truncated
@@ -555,12 +627,12 @@ impl PersistenceStore for JsonFileStore {
         Ok(())
     }
 
-    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+    fn load_snapshot_versioned(&self, actor_id: u64) -> Option<(u32, ActorSnapshot)> {
         let path = self.snapshot_path(actor_id);
         // A missing file is the normal "no snapshot yet" case — stay silent.
         let data = fs::read_to_string(&path).ok()?;
-        match serde_json::from_str(&data) {
-            Ok(snapshot) => Some(snapshot),
+        match decode_record::<ActorSnapshot>(&data) {
+            Ok(decoded) => Some((decoded.schema_version, decoded.record)),
             Err(e) => {
                 // A present-but-unparseable snapshot means corruption (e.g. an
                 // older non-atomic write); log it instead of silently resetting
