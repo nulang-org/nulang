@@ -69,6 +69,46 @@ pub const TIER2_THRESHOLD: u64 = 10_000;
 /// threshold are rejected.
 pub const STRAIGHT_LINE_MIN: usize = 8;
 
+/// Compact runtime precondition for a guard-stripped region. Static analysis
+/// can prove a register type from source/bytecode, but public VM/FFI entry
+/// points may still supply dynamically typed values. Every known entry fact
+/// used by native code is therefore checked against the live register file
+/// before the cached region executes.
+type TypeGuard = Vec<(u8, typed_compiler::KnownType)>;
+
+fn type_guard_from_metadata(meta: &typed_compiler::TypeMetadata) -> TypeGuard {
+    meta.regs
+        .iter()
+        .enumerate()
+        .filter_map(|(reg, &ty)| {
+            (ty != typed_compiler::KnownType::Unknown).then_some((reg as u8, ty))
+        })
+        .collect()
+}
+
+fn type_guard_matches(guard: &TypeGuard, regs: &[u64; 256]) -> bool {
+    use crate::value_layout::{is_float_raw, TAG_BOOL, TAG_INT, TAG_MASK};
+    use typed_compiler::KnownType;
+
+    guard.iter().all(|&(reg, ty)| {
+        let bits = regs[reg as usize];
+        match ty {
+            KnownType::Unknown => true,
+            KnownType::Int => (bits & TAG_MASK) == TAG_INT,
+            KnownType::Float => is_float_raw(bits),
+            KnownType::Bool => (bits & TAG_MASK) == TAG_BOOL,
+        }
+    })
+}
+
+struct CompiledRegion {
+    ptr: *const u8,
+    len: usize,
+    /// Runtime representation precondition for guard-stripped code. Scalar
+    /// regions keep this as None.
+    guard: Option<TypeGuard>,
+}
+
 // ---------------------------------------------------------------------------
 // JIT Session
 // ---------------------------------------------------------------------------
@@ -81,11 +121,10 @@ pub const STRAIGHT_LINE_MIN: usize = 8;
 pub struct JitSession {
     /// The Cranelift JIT module that owns compiled code memory.
     module: JITModule,
-    /// Map from `(module_idx, bytecode offset)` → (compiled function
-    /// pointer, region length in instructions). The length is recorded at
-    /// compile time so the VM can advance pc after a JIT run without
-    /// re-scanning the instruction stream.
-    compiled: FxHashMap<(usize, usize), (*const u8, usize)>,
+    /// Map from `(module_idx, bytecode offset)` to the compiled function,
+    /// region length, and optional live-type guard. Keeping all three in one
+    /// cache entry avoids a second hash lookup on every typed JIT execution.
+    compiled: FxHashMap<(usize, usize), CompiledRegion>,
     /// Per-region execution counters for already-compiled code. When a
     /// region crosses TIER2_THRESHOLD, a more aggressive compilation is
     /// attempted. Reset after each promotion attempt.
@@ -251,7 +290,7 @@ impl JitSession {
         }
 
         let region_len = match self.compiled.get(&(module_idx, pc)) {
-            Some(&(_, len)) if len >= 3 => len,
+            Some(region) if region.len >= 3 => region.len,
             _ => return,
         };
 
@@ -297,8 +336,8 @@ impl JitSession {
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
-        if let Some(&(ptr, _)) = self.compiled.get(&(module_idx, start_offset)) {
-            return Some(std::mem::transmute(ptr));
+        if let Some(region) = self.compiled.get(&(module_idx, start_offset)) {
+            return Some(std::mem::transmute(region.ptr));
         }
 
         // Build the function
@@ -315,8 +354,14 @@ impl JitSession {
             native_calls,
         ) {
             Ok(ptr) => {
-                self.compiled
-                    .insert((module_idx, start_offset), (ptr, num_instrs));
+                self.compiled.insert(
+                    (module_idx, start_offset),
+                    CompiledRegion {
+                        ptr,
+                        len: num_instrs,
+                        guard: None,
+                    },
+                );
                 Some(std::mem::transmute(ptr))
             }
             Err(_) => None,
@@ -345,8 +390,8 @@ impl JitSession {
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
-        if let Some(&(ptr, _)) = self.compiled.get(&(module_idx, start_offset)) {
-            return Some(std::mem::transmute(ptr));
+        if let Some(region) = self.compiled.get(&(module_idx, start_offset)) {
+            return Some(std::mem::transmute(region.ptr));
         }
 
         let has_known_types = type_metadata
@@ -372,8 +417,17 @@ impl JitSession {
                 instructions,
                 type_metadata,
             ) {
-                self.compiled
-                    .insert((module_idx, start_offset), (ptr, num_instrs));
+                let guard = type_metadata
+                    .map(type_guard_from_metadata)
+                    .filter(|guard| !guard.is_empty());
+                self.compiled.insert(
+                    (module_idx, start_offset),
+                    CompiledRegion {
+                        ptr,
+                        len: num_instrs,
+                        guard,
+                    },
+                );
                 self.typed_regions.insert((module_idx, start_offset));
                 return Some(std::mem::transmute(ptr));
             }
@@ -419,7 +473,7 @@ impl JitSession {
     pub unsafe fn get_compiled(&self, module_idx: usize, offset: usize) -> Option<JitFunctionPtr> {
         self.compiled
             .get(&(module_idx, offset))
-            .map(|&(ptr, _)| std::mem::transmute(ptr))
+            .map(|region| std::mem::transmute(region.ptr))
     }
 
     /// Number of bytecode instructions covered by the compiled region at
@@ -429,7 +483,7 @@ impl JitSession {
     pub fn compiled_region_len(&self, module_idx: usize, offset: usize) -> Option<usize> {
         self.compiled
             .get(&(module_idx, offset))
-            .map(|&(_, len)| len)
+            .map(|region| region.len)
     }
 
     /// Return the number of compiled regions.
@@ -464,8 +518,8 @@ impl JitSession {
         use crate::jit::simd_compiler::{compile_simd_region, is_simd_supported};
 
         // Check if already compiled
-        if let Some(&(ptr, _)) = self.compiled.get(&(module_idx, start_offset)) {
-            return Some(std::mem::transmute(ptr));
+        if let Some(region) = self.compiled.get(&(module_idx, start_offset)) {
+            return Some(std::mem::transmute(region.ptr));
         }
 
         // Only attempt SIMD if host CPU supports it
@@ -494,8 +548,17 @@ impl JitSession {
             &simd_region,
         ) {
             Ok(ptr) => {
-                self.compiled
-                    .insert((module_idx, start_offset), (ptr, num_instrs));
+                let guard = type_metadata
+                    .map(type_guard_from_metadata)
+                    .filter(|guard| !guard.is_empty());
+                self.compiled.insert(
+                    (module_idx, start_offset),
+                    CompiledRegion {
+                        ptr,
+                        len: num_instrs,
+                        guard,
+                    },
+                );
                 Some(std::mem::transmute(ptr))
             }
             Err(_) => self.compile_region_typed(
@@ -1035,7 +1098,7 @@ impl crate::backends::JitBackend for JitSession {
     }
 
     fn compiled_region_len(&self, module_idx: usize, pc: usize) -> Option<usize> {
-        self.compiled.get(&(module_idx, pc)).map(|&(_, len)| len)
+        self.compiled.get(&(module_idx, pc)).map(|region| region.len)
     }
 
     fn compiled_count(&self) -> usize {
@@ -1060,8 +1123,19 @@ impl crate::backends::JitBackend for JitSession {
     ) -> crate::backends::TieredAction {
         let instructions = &module.instructions;
 
-        // Check if already compiled
-        if let Some(func) = unsafe { self.get_compiled(module_idx, pc) } {
+        // Check if already compiled. Guard-stripped regions carry an entry
+        // guard because public VM/FFI call boundaries can supply values that
+        // do not match the source-level parameter signature. A mismatch is a
+        // normal deopt: execute this bytecode step in the interpreter.
+        if let Some(region) = self.compiled.get(&(module_idx, pc)) {
+            if region
+                .guard
+                .as_ref()
+                .is_some_and(|guard| !type_guard_matches(guard, regs))
+            {
+                return crate::backends::TieredAction::Interpret;
+            }
+            let func: JitFunctionPtr = unsafe { std::mem::transmute(region.ptr) };
             func(regs.as_mut_ptr(), constants.as_ptr());
             // Track post-compilation hotness for tier-2 promotion.
             self.record_tier2_and_maybe_promote(module_idx, pc, instructions);
@@ -1087,6 +1161,14 @@ impl crate::backends::JitBackend for JitSession {
                         &native_calls,
                     )
                 } {
+                    if self
+                        .compiled
+                        .get(&(module_idx, pc))
+                        .and_then(|region| region.guard.as_ref())
+                        .is_some_and(|guard| !type_guard_matches(guard, regs))
+                    {
+                        return crate::backends::TieredAction::Interpret;
+                    }
                     func(regs.as_mut_ptr(), constants.as_ptr());
                     return crate::backends::TieredAction::RanJit;
                 }
