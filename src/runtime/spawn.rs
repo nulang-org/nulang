@@ -21,6 +21,7 @@ pub(crate) fn spawn_actor_with_models(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+    schema_version: u32,
 ) -> u64 {
     spawn_actor_with_id(
         rt,
@@ -29,6 +30,7 @@ pub(crate) fn spawn_actor_with_models(
         state_models,
         persistent,
         workflow,
+        schema_version,
     )
 }
 
@@ -60,6 +62,7 @@ pub(crate) fn spawn_actor_with_id(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+    schema_version: u32,
 ) -> u64 {
     let restart_snapshot = if persistent && workflow.is_none() {
         match preflight_persistent_snapshot(rt, id) {
@@ -84,6 +87,7 @@ pub(crate) fn spawn_actor_with_id(
     }
     actor.state_models = state_models;
     actor.persistent = persistent;
+    actor.schema_version = schema_version;
     let workflow_name = workflow.map(|n| n.to_string());
     if let Some(name) = workflow {
         // Legacy storage field retained until the versioned ActorRole format
@@ -282,9 +286,17 @@ pub(crate) fn spawn_from_module(
             } else {
                 None
             },
+            meta.version,
         )
     } else {
-        spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
+        spawn_actor_with_models(
+            rt,
+            Box::new(move || init),
+            HashMap::new(),
+            false,
+            None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
+        )
     };
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
@@ -572,6 +584,7 @@ mod authority_tests {
             std::collections::HashMap::new(),
             true,
             None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
         );
 
         assert_eq!(returned, actor_id);
