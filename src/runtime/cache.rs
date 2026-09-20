@@ -28,6 +28,7 @@ const FREE_LIST_COUNT: usize = MAX_ARENA_EXP - MIN_ARENA_EXP + 1;
 const DEFAULT_INDEX_CAPACITY: usize = 64;
 const DEFAULT_WHEEL_BUCKETS: usize = 4_096;
 const DEFAULT_WHEEL_TICK_MS: u64 = 10;
+const MAX_DURABLE_RESTORE_SLOTS: usize = 16_777_216;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArenaSlice {
@@ -316,6 +317,8 @@ pub enum CacheDurableRestoreError {
     DuplicateSlot(u32),
     DuplicateKey,
     SlotOverflow,
+    TooManySlots(usize),
+    InvalidGeneration(u32),
 }
 
 impl CacheTransferEntry {
@@ -974,6 +977,9 @@ impl CacheStore {
             {
                 continue;
             }
+            if entry.token.source_generation == 0 {
+                return Err(CacheDurableRestoreError::InvalidGeneration(0));
+            }
             if !seen_slots.insert(entry.token.source_slot) {
                 return Err(CacheDurableRestoreError::DuplicateSlot(
                     entry.token.source_slot,
@@ -996,6 +1002,9 @@ impl CacheStore {
             .ok()
             .and_then(|slot| slot.checked_add(1))
             .ok_or(CacheDurableRestoreError::SlotOverflow)?;
+        if slot_len > MAX_DURABLE_RESTORE_SLOTS {
+            return Err(CacheDurableRestoreError::TooManySlots(slot_len));
+        }
         store.slots = (0..slot_len).map(|_| EntrySlot::default()).collect();
         store.free_slots.clear();
         store.index = vec![
@@ -1682,6 +1691,38 @@ mod tests {
         assert_eq!(
             restored.get(b"k{durable}", 1),
             Some(CacheValueView::Bytes(b"new"))
+        );
+    }
+
+    #[test]
+    fn durable_restore_rejects_sparse_allocation_bomb_and_zero_generation() {
+        let huge = CacheDurableEntry {
+            key: b"huge".to_vec(),
+            value: CacheTransferValue::Integer(1),
+            expires_unix_ms: None,
+            token: CacheTransferToken {
+                source_slot: u32::MAX,
+                source_generation: 1,
+            },
+        };
+        assert!(matches!(
+            CacheStore::restore_durable_entries(&[huge], 0, 0),
+            Err(CacheDurableRestoreError::TooManySlots(_))
+                | Err(CacheDurableRestoreError::SlotOverflow)
+        ));
+
+        let zero_generation = CacheDurableEntry {
+            key: b"zero".to_vec(),
+            value: CacheTransferValue::Integer(1),
+            expires_unix_ms: None,
+            token: CacheTransferToken {
+                source_slot: 0,
+                source_generation: 0,
+            },
+        };
+        assert_eq!(
+            CacheStore::restore_durable_entries(&[zero_generation], 0, 0),
+            Err(CacheDurableRestoreError::InvalidGeneration(0))
         );
     }
 
