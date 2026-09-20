@@ -681,9 +681,10 @@ pub struct CodeModule {
     #[serde(default)]
     pub function_local_counts: Vec<usize>,
     /// Compiler-owned entry type facts for the tiered JIT, keyed by function
-    /// or behavior code offset. These seeds are deliberately in-memory only:
-    /// serialized .nbc artifacts must not be able to forge facts used by the
-    /// guard-stripped JIT path.
+    /// or behavior code offset. These seeds are deliberately in-memory only.
+    /// They refine static analysis, but native execution still validates the
+    /// corresponding live register tags because VM/FFI callers are dynamic.
+    /// Serialized .nbc artifacts never carry these optimization hints.
     #[serde(skip)]
     pub(crate) jit_type_seeds: Vec<(usize, crate::type_metadata::TypeMetadata)>,
     pub exports: Vec<(String, usize)>, // name -> constant/function index
