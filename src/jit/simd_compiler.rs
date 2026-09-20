@@ -224,8 +224,8 @@ pub fn compile_simd_region(
     // trip_count_array_reg is the source array register; the SIMD replacement
     // derives its length directly from the heap header because it does not
     // execute the original ArrLen bytecode.
-    let trip_count_is_runtime = simd_region.trip_count_hint == Some(0)
-        && simd_region.trip_count_array_reg.is_some();
+    let trip_count_is_runtime =
+        simd_region.trip_count_hint == Some(0) && simd_region.trip_count_array_reg.is_some();
     if simd_region.trip_count_hint.is_none() && !trip_count_is_runtime {
         return fallback_to_scalar(
             module,
