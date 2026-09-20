@@ -1526,6 +1526,7 @@ pub fn compile_bytecode_region_typed(
             OpCode::ArrLoad => {
                 emit_arr_load(
                     &mut builder,
+                    helpers["nulang_obj_get"],
                     regs_ptr,
                     instr.op1 as usize,
                     instr.op2 as usize,

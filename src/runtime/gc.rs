@@ -613,7 +613,11 @@ impl OrcaGc {
         if owner == self.actor_id
             && matches!(
                 type_tag,
-                TypeTag::Array | TypeTag::Record | TypeTag::Tuple | TypeTag::Map
+                TypeTag::Array
+                    | TypeTag::ArrayView
+                    | TypeTag::Record
+                    | TypeTag::Tuple
+                    | TypeTag::Map
             )
         {
             let slot_count = size / std::mem::size_of::<crate::vm::Value>();
@@ -623,10 +627,16 @@ impl OrcaGc {
                 std::slice::from_raw_parts(payload_ptr as *const crate::vm::Value, slot_count);
             for slot in slots {
                 if let Some(child) = slot.as_ptr() {
-                    // SAFETY: the slot held a counted local reference to an
-                    // object on this heap; releasing it balances the barrier
-                    // retain exactly once.
-                    self.drop_local_ref(heap, child);
+                    // A local container may legally carry a foreign pointer
+                    // received through the runtime's actor-scoped hold
+                    // protocol. Such a child must never be decremented through
+                    // this actor's local heap.
+                    let child_owner = (*crate::runtime::heap::ActorHeap::header_of(child)).actor_id;
+                    if child_owner == self.actor_id {
+                        // SAFETY: same-owner child was retained by the local
+                        // container write barrier.
+                        self.drop_local_ref(heap, child);
+                    }
                 }
             }
         }

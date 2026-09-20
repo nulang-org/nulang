@@ -110,6 +110,9 @@ struct ObjectInfo {
     type_tag: TypeTag,
     payload_size: u32,
     payload_ptr: *const u8,
+    /// Runtime-only ArrayView materialized as an ordinary Array on the wire.
+    /// (backing array, absolute start, logical length)
+    array_view: Option<(*mut u8, usize, usize)>,
 }
 
 struct ClosureInfo {
@@ -324,27 +327,60 @@ fn walk_value(
         // SAFETY: ptr is a valid heap payload pointer from the actor's heap.
         let header = unsafe { &*ActorHeap::header_of(ptr) };
         let payload_ptr = ptr;
-        let payload_size = header.payload_size as u32;
+        let view_region = if header.type_tag == TypeTag::ArrayView {
+            // Runtime-only representation: serialize the logical contents as
+            // an ordinary Array so NLCS v1 never exposes the new internal tag.
+            unsafe { crate::vm::heap_array_region(ptr) }
+        } else {
+            None
+        };
+        let wire_type_tag = if view_region.is_some() {
+            TypeTag::Array
+        } else {
+            header.type_tag
+        };
+        let payload_size = if let Some((_, _, len)) = view_region {
+            len.checked_mul(std::mem::size_of::<Value>())
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| "ArrayView too large to serialize".to_string())?
+        } else {
+            u32::try_from(header.payload_size)
+                .map_err(|_| "heap object too large to serialize".to_string())?
+        };
 
         let obj_id = ctx.objects.len() as u32;
         ctx.obj_ids.insert(payload_ptr as *const u8, obj_id);
         ctx.objects.push(ObjectInfo {
-            type_tag: header.type_tag,
+            type_tag: wire_type_tag,
             payload_size,
             payload_ptr: payload_ptr as *const u8,
+            array_view: view_region,
         });
 
-        // Recursively walk container slots.
-        match header.type_tag {
-            TypeTag::Array | TypeTag::Record | TypeTag::Tuple | TypeTag::Closure | TypeTag::Map => {
-                let slot_count = payload_size as usize / std::mem::size_of::<Value>();
-                let slots =
-                    unsafe { std::slice::from_raw_parts(payload_ptr as *const Value, slot_count) };
-                for slot in slots {
-                    walk_value(ctx, *slot, vm, module_idx)?;
-                }
+        if let Some((base, start, len)) = view_region {
+            for i in 0..len {
+                let slot = unsafe { *((base as *const Value).add(start + i)) };
+                walk_value(ctx, slot, vm, module_idx)?;
             }
-            TypeTag::String | TypeTag::ActorRef | TypeTag::RemoteActor | TypeTag::Raw => {}
+        } else {
+            // Recursively walk container slots.
+            match header.type_tag {
+                TypeTag::Array
+                | TypeTag::Record
+                | TypeTag::Tuple
+                | TypeTag::Closure
+                | TypeTag::Map => {
+                    let slot_count = payload_size as usize / std::mem::size_of::<Value>();
+                    let slots = unsafe {
+                        std::slice::from_raw_parts(payload_ptr as *const Value, slot_count)
+                    };
+                    for slot in slots {
+                        walk_value(ctx, *slot, vm, module_idx)?;
+                    }
+                }
+                TypeTag::ArrayView => unreachable!("ArrayView handled above"),
+                TypeTag::String | TypeTag::ActorRef | TypeTag::RemoteActor | TypeTag::Raw => {}
+            }
         }
     }
 
@@ -427,15 +463,24 @@ fn write_objects(buf: &mut Vec<u8>, ctx: &SerializeCtx) {
             | TypeTag::Map
             | TypeTag::RemoteActor => {
                 // Container: rewrite TAG_PTR and TAG_STRING in Value slots.
-                let slot_count = obj.payload_size as usize / std::mem::size_of::<Value>();
-                let slots = unsafe {
-                    std::slice::from_raw_parts(obj.payload_ptr as *const Value, slot_count)
-                };
-                for slot in slots {
-                    let sv = serialize_one_value(*slot, ctx);
-                    buf.extend_from_slice(&sv.to_le_bytes());
+                if let Some((base, start, len)) = obj.array_view {
+                    for i in 0..len {
+                        let slot = unsafe { *((base as *const Value).add(start + i)) };
+                        let sv = serialize_one_value(slot, ctx);
+                        buf.extend_from_slice(&sv.to_le_bytes());
+                    }
+                } else {
+                    let slot_count = obj.payload_size as usize / std::mem::size_of::<Value>();
+                    let slots = unsafe {
+                        std::slice::from_raw_parts(obj.payload_ptr as *const Value, slot_count)
+                    };
+                    for slot in slots {
+                        let sv = serialize_one_value(*slot, ctx);
+                        buf.extend_from_slice(&sv.to_le_bytes());
+                    }
                 }
             }
+            TypeTag::ArrayView => unreachable!("ArrayView is materialized as Array on the wire"),
             _ => {
                 // Non-container: copy payload verbatim.
                 let payload_slice = unsafe {
@@ -957,6 +1002,67 @@ mod tests {
         assert_eq!(MAGIC, *b"NLCS");
         assert_eq!(VERSION, 1);
         assert_eq!(CALLER_NONE, -1);
+    }
+
+    #[test]
+    fn test_array_view_serializes_as_plain_array_v1() {
+        let mut heap = ActorHeap::new(4096);
+        let elem_bytes = 4 * std::mem::size_of::<Value>();
+        let backing = heap
+            .alloc(elem_bytes, TypeTag::Array)
+            .expect("backing array allocation");
+        unsafe {
+            let slots = std::slice::from_raw_parts_mut(backing as *mut Value, 4);
+            slots.copy_from_slice(&[
+                Value::int(10),
+                Value::int(20),
+                Value::int(30),
+                Value::int(40),
+            ]);
+        }
+
+        let view = heap
+            .alloc(3 * std::mem::size_of::<Value>(), TypeTag::ArrayView)
+            .expect("view allocation");
+        unsafe {
+            let slots = std::slice::from_raw_parts_mut(view as *mut Value, 3);
+            slots[0] = Value::ptr(backing);
+            slots[1] = Value::int(1);
+            slots[2] = Value::int(2);
+        }
+
+        let mut frame = Frame::new(None, 0);
+        frame.regs[0] = unsafe { Value::ptr(view) };
+        let cont = Continuation {
+            frames: vec![frame],
+            current_frame_idx: 0,
+            resume_pc: 0,
+            resume_dst: 0,
+            step_count: 0,
+            handler_stack_snapshot: Vec::new(),
+        };
+        let vm = VM::new();
+        let bytes = serialize_continuation(&cont, &[], &vm, &[0; 32])
+            .expect("ArrayView continuation should serialize");
+
+        // A v1 reader must be able to consume the bytes without knowing the
+        // runtime-only ArrayView tag.
+        let mut restored_vm = VM::new();
+        let (restored, handlers) =
+            deserialize_continuation(&bytes, &mut restored_vm).expect("v1 roundtrip");
+        assert!(handlers.is_empty());
+
+        let restored_ptr = restored.frames[0].regs[0]
+            .as_ptr()
+            .expect("restored array pointer");
+        unsafe {
+            let header = &*ActorHeap::header_of(restored_ptr);
+            assert_eq!(header.type_tag, TypeTag::Array);
+            assert_eq!(header.payload_size, 2 * std::mem::size_of::<Value>());
+            let slots = std::slice::from_raw_parts(restored_ptr as *const Value, 2);
+            assert_eq!(slots[0].as_int(), Some(20));
+            assert_eq!(slots[1].as_int(), Some(30));
+        }
     }
 
     #[test]
