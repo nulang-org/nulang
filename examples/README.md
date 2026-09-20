@@ -1,10 +1,8 @@
 # Nulang Example Programs
 
 A curated suite of self-contained Nulang programs demonstrating the language
-from basic to advanced. Each example is runnable and verified against the
-current compiler.
-
-**Verified against commit:** `fd516ef`
+from basic to advanced. Each example is intended to remain runnable against the
+current compiler; executable-example checks in CI are the source of truth.
 
 ## Running an example
 
@@ -44,5 +42,6 @@ nulang examples/NN_name.nula
 - Actors must appear before `let` bindings at the top level.
 - `spawn Actor { ... }` field initializers use `=` (e.g. `count = 42`) and
   correctly override the actor's declared defaults.
-- Top-level `fn` declarations with `match` on variant types may fail
-  exhaustiveness checking when an `actor` block is present in the same file.
+- Pattern matching is type-checked, but general compile-time exhaustiveness
+  checking is not implemented yet. Non-exhaustive matches can therefore fail
+  at runtime; use an unguarded wildcard/catch-all arm when totality is required.

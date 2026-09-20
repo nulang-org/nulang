@@ -80,11 +80,14 @@ A native/AOT backend (`--backend native`) compiles via Cranelift ahead-of-time.
 Other verified divergences from the target design of Layers 2–4, to keep in
 mind while reading §3–§5:
 
-- **Mailboxes are unbounded**, backed by `crossbeam::queue::SegQueue`
-  (`src/runtime/mailbox.rs`); push always succeeds — there is no 10,000-slot
-  ring buffer, no overflow policy, and no transport-level backpressure.
-  Messages carry a `MessagePriority` (`System`/`Normal`/`Bulk`) field, but the
-  queue itself is a single FIFO.
+- **Mailboxes use priority lanes with optional application backpressure**
+  (`src/runtime/mailbox.rs`). Concurrent producers feed separate lock-free
+  system and normal `SegQueue` lanes; scheduler-local traffic has its own
+  `VecDeque`. A non-zero configured capacity is enforced atomically for
+  normal/bulk traffic and rejected pushes surface explicit backpressure.
+  System-priority supervision/monitor messages bypass that capacity, so the
+  configured capacity is deliberately not a hard bound on total mailbox
+  memory.
 - **Actor identity is a bare `u64`** from a global atomic counter
   (`fresh_actor_id`, `src/runtime/mod.rs`); `spawn` is explicit — there is no
   Orleans-style string identity, no activation-on-first-message, and no
@@ -205,10 +208,13 @@ runtime; the two halves meet in the `Perform` opcode.
   inferred one via `effect_row_subset`. Rows are `Closed` or `Open` with a
   `Region` variable; an open row on the *allowed* side may cover extra
   effects.
-- Bodies with a declared row are enforced; un-annotated bodies are
-  inference-only so existing programs keep compiling until interprocedural
-  effect propagation lands. The checker accumulates `diagnostics` rather
-  than aborting the compile.
+- `EffectChecker::check_module` first registers module-function rows and
+  iterates unannotated functions to a fixpoint. Direct named call sites union
+  the callee row, so effects propagate through ordinary transitive,
+  recursive, and mutually-recursive call chains. A second pass enforces
+  explicitly declared rows; unannotated bodies remain inference-only.
+  Dynamic or otherwise statically-unresolved call targets can only use the
+  effect information available at that call site.
 
 **Runtime side** (opcode-level detail in §2.6):
 
