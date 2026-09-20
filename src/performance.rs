@@ -153,10 +153,7 @@ pub fn analyze_function_allocations(module: &mir::Module) -> Vec<AllocationSumma
                             }
                         }
                         FuncRef::Index(_) | FuncRef::Local(_) => {
-                            push_unique(
-                                &mut summaries[index].direct,
-                                AllocationRisk::UnknownCall,
-                            );
+                            push_unique(&mut summaries[index].direct, AllocationRisk::UnknownCall);
                         }
                     }
                     continue;
@@ -194,7 +191,6 @@ pub fn analyze_function_allocations(module: &mir::Module) -> Vec<AllocationSumma
 
     summaries
 }
-
 
 fn allocation_risk_label(risk: AllocationRisk) -> &'static str {
     match risk {
