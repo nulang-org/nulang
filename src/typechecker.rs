@@ -1010,6 +1010,10 @@ impl TypeChecker {
 
     /// Type-check an entire module, returning the type of the last declaration.
     pub fn check_module(&mut self, module: &AstModule) -> NuResult<Type> {
+        // Diagnostics describe this check pass, not the lifetime of a reused
+        // TypeChecker (notably the REPL). Prevent stale warnings from
+        // accumulating across repeated module checks.
+        self.warnings.clear();
         self.register_class_decls(module);
         let mut ctx = TypeContext::new();
         let mut last_type = Type::unit();
