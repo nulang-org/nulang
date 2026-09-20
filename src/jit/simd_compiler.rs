@@ -69,13 +69,13 @@ use std::collections::HashMap;
 use crate::bytecode::Instruction;
 use crate::cranelift_utils::{emit_extract_payload, emit_sext48};
 use crate::jit::compiler::CompileError;
+use crate::jit::helpers::RuntimeHelper;
 #[cfg(test)]
 use crate::jit::simd_analyzer::SimdWidth;
 use crate::jit::simd_analyzer::{
     BinopKind, CmpKind, SimdElemType, SimdRegion, UnaryKind, VectorizablePattern,
 };
 use crate::jit::typed_compiler::load_reg;
-use crate::runtime::heap::{ActorHeap, OrcaHeader};
 use crate::value_layout::{PAYLOAD_MASK, TAG_INT};
 
 // ---------------------------------------------------------------------------
@@ -246,6 +246,7 @@ pub fn compile_simd_region(
     ctx.func.signature.params.push(AbiParam::new(pointer_type));
 
     let mut builder = FunctionBuilder::new(&mut ctx.func, builder_context);
+    let helpers = crate::jit::helpers::register_with_module(module, &mut builder)?;
 
     // -----------------------------------------------------------------------
     // Create blocks
@@ -269,6 +270,8 @@ pub fn compile_simd_region(
     builder.append_block_param(epilogue_header, types::I64);
     let epilogue_body = builder.create_block();
     let _epilogue_post = builder.create_block();
+    let validated_entry = builder.create_block();
+    let deopt_block = builder.create_block();
     let return_block = builder.create_block();
 
     // -----------------------------------------------------------------------
@@ -322,39 +325,91 @@ pub fn compile_simd_region(
     let rhs_base = emit_extract_payload(&mut builder, rhs_base_tagged);
     let dst_base = emit_extract_payload(&mut builder, dst_base_tagged);
 
-    // Trip count: either a compile-time constant or the payload length of
-    // the participating array whose ArrLen established the loop bound.
+    // Validate all array operands through the runtime before touching heap
+    // memory directly. u64::MAX is the helper's invalid/non-array sentinel.
+    let lhs_len_call = builder.ins().call(
+        helpers[&RuntimeHelper::SimdArrayLen],
+        &[lhs_base_tagged],
+    );
+    let rhs_len_call = builder.ins().call(
+        helpers[&RuntimeHelper::SimdArrayLen],
+        &[rhs_base_tagged],
+    );
+    let dst_len_call = builder.ins().call(
+        helpers[&RuntimeHelper::SimdArrayLen],
+        &[dst_base_tagged],
+    );
+    let lhs_len = builder.inst_results(lhs_len_call)[0];
+    let rhs_len = builder.inst_results(rhs_len_call)[0];
+    let dst_len = builder.inst_results(dst_len_call)[0];
+
+    // Trip count is exactly the scalar loop bound: either a compile-time hint
+    // or the validated length of the array whose ArrLen feeds ICmpLt.
     let trip_count = if trip_count_is_runtime {
-        let trip_reg = simd_region.trip_count_array_reg.unwrap();
-        let array_payload = if usize::from(trip_reg) == lhs_arr_reg {
-            lhs_base
-        } else if usize::from(trip_reg) == rhs_arr_reg {
-            rhs_base
-        } else if usize::from(trip_reg) == dst_arr_reg {
-            dst_base
+        let trip_reg = usize::from(simd_region.trip_count_array_reg.unwrap());
+        if trip_reg == lhs_arr_reg {
+            lhs_len
+        } else if trip_reg == rhs_arr_reg {
+            rhs_len
+        } else if trip_reg == dst_arr_reg {
+            dst_len
         } else {
             return Err(CompileError::Internal(
                 "SIMD trip-count array is not part of the vectorized pattern".into(),
             ));
-        };
-
-        let header = builder
-            .ins()
-            .iadd_imm(array_payload, -(ActorHeap::HEADER_SIZE as i64));
-        let payload_size_addr = builder.ins().iadd_imm(
-            header,
-            std::mem::offset_of!(OrcaHeader, payload_size) as i64,
-        );
-        let payload_bytes =
-            builder
-                .ins()
-                .load(types::I64, MemFlags::trusted(), payload_size_addr, 0);
-        // Generic arrays contain 8-byte Value slots.
-        builder.ins().ushr_imm(payload_bytes, 3)
+        }
     } else {
         let n = simd_region.trip_count_hint.unwrap_or(0) as i64;
         builder.ins().iconst(types::I64, n)
     };
+
+    // Direct SIMD/scalarized memory accesses are safe only while every
+    // participating Array covers the entire scalar loop bound. Otherwise
+    // deopt before side effects and let the original bounds-checked bytecode
+    // execute once in the interpreter.
+    let invalid_len = builder.ins().iconst(types::I64, -1);
+    let lhs_valid = builder
+        .ins()
+        .icmp(IntCC::NotEqual, lhs_len, invalid_len);
+    let rhs_valid = builder
+        .ins()
+        .icmp(IntCC::NotEqual, rhs_len, invalid_len);
+    let dst_valid = builder
+        .ins()
+        .icmp(IntCC::NotEqual, dst_len, invalid_len);
+    let lhs_cover = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, lhs_len, trip_count);
+    let rhs_cover = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, rhs_len, trip_count);
+    let dst_cover = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, dst_len, trip_count);
+    let valid_inputs = builder.ins().band(lhs_valid, rhs_valid);
+    let valid_inputs = builder.ins().band(valid_inputs, dst_valid);
+    let full_coverage = builder.ins().band(lhs_cover, rhs_cover);
+    let full_coverage = builder.ins().band(full_coverage, dst_cover);
+    let safe_to_vectorize = builder.ins().band(valid_inputs, full_coverage);
+    builder.ins().brif(
+        safe_to_vectorize,
+        validated_entry,
+        &[],
+        deopt_block,
+        &[],
+    );
+
+    builder.switch_to_block(deopt_block);
+    let restart = builder.ins().iconst(types::I64, 0);
+    builder
+        .ins()
+        .call(helpers[&RuntimeHelper::SetDeopt], &[restart]);
+    builder.ins().jump(return_block, &[]);
+    builder.seal_block(deopt_block);
+
+    builder.switch_to_block(validated_entry);
+    builder.seal_block(validated_entry);
+
     let vwidth = vector_width(simd_region.elem_type) as i64;
     let vwidth_val = builder.ins().iconst(types::I64, vwidth);
 
