@@ -1085,14 +1085,15 @@ impl CacheServiceHandle {
         Ok(())
     }
 
-    /// Rebind and replay a fully source-drained persistent migration after a
-    /// cache-service process restart.
+    /// Rebind and replay a fully source-drained migration after a cache-service
+    /// process restart.
     ///
     /// This is intentionally not general CacheStore recovery. The journal must
     /// prove that the old source was fully drained, every sent batch had a
-    /// durable application ACK, no ownership commit is pending/completed, and
-    /// every transferred entry was persistent (no relative TTL). The exact
-    /// durable TransferBatch envelopes are then resent in original append order.
+    /// durable application ACK, and no ownership commit is pending/completed.
+    /// Relative-TTL entries additionally require a durable pre-export wall-clock
+    /// anchor so replay can only reduce their remaining lifetime. Reconstructed
+    /// TransferBatch envelopes are resent in original append order.
     pub fn replay_drained_remote_migration_after_restart(
         &self,
         key: CacheMigrationKey,
