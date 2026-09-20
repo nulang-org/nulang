@@ -26,6 +26,7 @@
 //! }
 //! ```
 
+use crate::types::{Effect, EffectRow};
 use std::collections::BTreeSet;
 
 /// A single operation in a WIT interface.
@@ -353,6 +354,104 @@ pub fn builtin_effect_wit_interfaces() -> Vec<WitInterface> {
     ]
 }
 
+/// Error returned when a typed effect row cannot be represented as a closed WIT capability set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WitGenError {
+    /// Open rows may acquire additional effects through their row variable, so
+    /// emitting a closed capability manifest would be unsound.
+    OpenEffectRow,
+    /// Effects with no canonical WIT host interface must be mapped explicitly
+    /// before they can cross a component boundary.
+    UnsupportedEffects(Vec<String>),
+}
+
+impl std::fmt::Display for WitGenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WitGenError::OpenEffectRow => write!(
+                f,
+                "cannot emit a closed WIT capability manifest from an open effect row"
+            ),
+            WitGenError::UnsupportedEffects(effects) => write!(
+                f,
+                "no WIT interface mapping for effect(s): {}",
+                effects.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WitGenError {}
+
+/// Map a compiler-level effect to the canonical WIT host interface.
+///
+/// This is intentionally fail-closed: effects not listed here are not silently
+/// erased from the component's authority contract. A few legacy stdlib modules
+/// are represented as user-defined effects until they receive dedicated
+/// `Effect` variants, so those names are mapped explicitly as well.
+pub fn effect_to_wit_interface_name(effect: &Effect) -> Option<&'static str> {
+    match effect {
+        Effect::IO => Some("io"),
+        Effect::Net => Some("http"),
+        Effect::String => Some("string"),
+        Effect::FS => Some("fs"),
+        Effect::Rand => Some("random"),
+        Effect::Time => Some("timer"),
+        Effect::Inference => Some("provider"),
+        Effect::Array => Some("array"),
+        Effect::UserDefined(name) => match name.as_str() {
+            "Debug" => Some("debug"),
+            "Int" => Some("int"),
+            "Float" => Some("float"),
+            "Signal" => Some("signal"),
+            "Provider" => Some("provider"),
+            "Random" => Some("random"),
+            "Timer" => Some("timer"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Convert a closed compiler effect row into the exact WIT interfaces it
+/// requires. Open rows are rejected because their authority is not statically
+/// closed; unmapped effects are rejected rather than silently under-granting.
+pub fn effect_row_to_wit_imports(row: &EffectRow) -> Result<BTreeSet<String>, WitGenError> {
+    if matches!(row, EffectRow::Open(_, _)) {
+        return Err(WitGenError::OpenEffectRow);
+    }
+
+    let mut imports = BTreeSet::new();
+    let mut unsupported = BTreeSet::new();
+    for effect in row.effects() {
+        if let Some(name) = effect_to_wit_interface_name(effect) {
+            imports.insert(name.to_string());
+        } else {
+            unsupported.insert(effect.to_string());
+        }
+    }
+
+    if unsupported.is_empty() {
+        Ok(imports)
+    } else {
+        Err(WitGenError::UnsupportedEffects(
+            unsupported.into_iter().collect(),
+        ))
+    }
+}
+
+/// Generate a WIT world from one or more compiler-checked function effect
+/// rows. Imports are deduplicated across functions.
+pub fn generate_wit_world_from_effect_rows<'a>(
+    rows: impl IntoIterator<Item = &'a EffectRow>,
+) -> Result<WitWorld, WitGenError> {
+    let mut effects = BTreeSet::new();
+    for row in rows {
+        effects.extend(effect_row_to_wit_imports(row)?);
+    }
+    Ok(generate_wit_world(&effects))
+}
+
 /// Generate a WIT world for the given set of Nulang effect names.
 ///
 /// `effects` is a set of effect module names (e.g., `{"io", "timer"}`).
@@ -439,10 +538,12 @@ pub fn render_wit(world: &WitWorld) -> String {
     out
 }
 
-/// Extract effect names from a Nulang source program's effect row.
+/// Legacy textual effect extraction helper.
 ///
-/// This is a simplified parser that scans the source for `perform Effect.op`
-/// patterns and returns the set of effect module names used.
+/// New compiler paths should use [`effect_row_to_wit_imports`] or
+/// [`generate_wit_world_from_effect_rows`], which consume checked `EffectRow`
+/// values and therefore include transitive callee effects and reject open rows.
+#[deprecated(note = "use compiler-checked EffectRow-based WIT generation")]
 pub fn extract_effects_from_source(source: &str) -> BTreeSet<String> {
     let mut effects = BTreeSet::new();
 
@@ -512,6 +613,47 @@ mod tests {
         assert!(wit.contains("import io: interface {"));
         assert!(wit.contains("print: func(msg: string);"));
         assert!(wit.contains("export init: func() -> s64;"));
+    }
+
+    #[test]
+    fn typed_effect_row_maps_to_wit_imports() {
+        let row = EffectRow::Closed(vec![
+            Effect::IO,
+            Effect::FS,
+            Effect::Inference,
+            Effect::UserDefined("Int".into()),
+        ]);
+        let imports = effect_row_to_wit_imports(&row).unwrap();
+        let expected: BTreeSet<String> =
+            ["fs", "int", "io", "provider"].into_iter().map(str::to_string).collect();
+        assert_eq!(imports, expected);
+    }
+
+    #[test]
+    fn typed_effect_rows_deduplicate_imports() {
+        let a = EffectRow::Closed(vec![Effect::IO, Effect::FS]);
+        let b = EffectRow::Closed(vec![Effect::IO, Effect::Rand]);
+        let world = generate_wit_world_from_effect_rows([&a, &b]).unwrap();
+        let names: Vec<_> = world.imports.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["io", "random", "fs"]);
+    }
+
+    #[test]
+    fn open_effect_row_fails_closed() {
+        let row = EffectRow::Open(vec![Effect::IO], crate::types::Region(1));
+        assert_eq!(
+            effect_row_to_wit_imports(&row),
+            Err(WitGenError::OpenEffectRow)
+        );
+    }
+
+    #[test]
+    fn unmapped_effect_fails_closed() {
+        let row = EffectRow::Closed(vec![Effect::DB, Effect::IO]);
+        assert_eq!(
+            effect_row_to_wit_imports(&row),
+            Err(WitGenError::UnsupportedEffects(vec!["DB".into()]))
+        );
     }
 
     #[test]
