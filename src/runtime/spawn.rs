@@ -630,6 +630,7 @@ mod authority_tests {
             std::collections::HashMap::new(),
             true,
             None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
         );
 
         assert_eq!(returned, actor_id);
