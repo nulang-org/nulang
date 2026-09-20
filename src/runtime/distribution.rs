@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 
+use crate::protocol::ProtocolId;
 use crate::runtime::distributed;
 use crate::runtime::Runtime;
 use crate::runtime::GOSSIP_PAYLOAD_MAX_ENTRIES;
@@ -29,6 +30,7 @@ pub(crate) struct PendingSpawnMessage {
     pub object_table: Vec<(u64, Vec<u8>)>,
     pub sender: u64,
     pub trace_id: Option<String>,
+    pub protocol_id: Option<[u8; 32]>,
 }
 
 /// Queue a message for a spawn@node placeholder whose SpawnResponse has
@@ -41,6 +43,7 @@ pub(crate) fn queue_spawn_message(
     _node: NodeId,
     behavior: &str,
     args: &[Value],
+    protocol_id: Option<[u8; 32]>,
 ) {
     let (payload, string_table) = match distributed::resolve_wire_strings(rt, args) {
         Some(resolved) => resolved,
@@ -86,6 +89,7 @@ pub(crate) fn queue_spawn_message(
             object_table,
             sender,
             trace_id,
+            protocol_id,
         });
 }
 
@@ -210,6 +214,16 @@ pub(crate) fn send_distributed(
     behavior: &str,
     args: &[Value],
 ) {
+    send_distributed_with_protocol(rt, target, behavior, args, None)
+}
+
+pub(crate) fn send_distributed_with_protocol(
+    rt: &mut Runtime,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+    protocol_id: Option<ProtocolId>,
+) {
     if !rt.distributed.enabled {
         let actor_id = match target {
             ActorAddress::Local { actor_id } => actor_id,
@@ -241,15 +255,27 @@ pub(crate) fn send_distributed(
             return;
         }
     };
-    distributed::send_distributed(
-        rt,
-        &mut transport,
-        &cluster,
-        &mut resolver,
-        target,
-        behavior,
-        args,
-    );
+    if let Some(protocol_id) = protocol_id {
+        distributed::send_distributed_typed(
+            rt,
+            &mut transport,
+            &cluster,
+            &mut resolver,
+            distributed::ProtocolActorAddress::new(target, protocol_id),
+            behavior,
+            args,
+        );
+    } else {
+        distributed::send_distributed(
+            rt,
+            &mut transport,
+            &cluster,
+            &mut resolver,
+            target,
+            behavior,
+            args,
+        );
+    }
     rt.distributed.transport = Some(transport);
     rt.distributed.cluster = Some(cluster);
     rt.distributed.resolver = Some(resolver);
