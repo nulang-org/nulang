@@ -105,6 +105,13 @@ The JIT backend lives in `src/jit/` (~7,900 lines across 7 files, cranelift 0.13
 
 ### Tiering mechanics (`src/jit/mod.rs`)
 
+- Tier 1 promotes bytecode regions after `HOT_THRESHOLD = 1000` interpreted hits. Tier 2 counts **compiled-region entries** (not loop iterations) and attempts one SIMD replacement after `TIER2_THRESHOLD = 10_000` entries.
+- A successful tier-2 promotion compiles a fresh SIMD function and replaces the cached tier-1 pointer. A rejected region is recorded in a per-session exhausted set so static bytecode is not re-analyzed on every subsequent threshold crossing.
+- Production tier-2 SIMD is intentionally conservative: generic arrays use 8-byte tagged `Value` slots, so only Int64 element-wise add/sub/mul and integer negation are currently eligible. Vector loads sign-extend the 48-bit integer payload per lane and vector stores restore `TAG_INT`.
+- Float SIMD remains disabled until per-lane NaN canonicalization is proven equivalent to Nulang's scalar value contract. 32-bit lanes, comparisons, division, non-zero-based loops, mismatched `ArrLen` bounds, and kernels with observable scalar scratch state remain on the scalar JIT path.
+
+
+
 - `VM` holds `jit_session: Option<JitSession>` (`src/vm.rs:695`). A session builds the Cranelift `JITModule` for the host ISA with the `enable_simd` flag set, and registers 31 `nulang_*` runtime helpers as importable symbols.
 - Before each interpreted instruction, the VM snapshots the current frame's 256 registers into a `[u64; 256]` array and calls `jit::tiered_execute_step_typed`. If the result is not `TieredAction::Interpret`, the array is copied back into the frame and `pc` is advanced by the compiled region's length.
 - Hotness is tracked in a global `Mutex<HashMap<(usize, usize), u64>>` keyed by `(module_idx, offset)` so identical offsets in different modules do not share counts. `HOT_THRESHOLD = 1000` (`src/jit/mod.rs:55`): a region compiles on its 1000th interpreted hit.
