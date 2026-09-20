@@ -176,14 +176,8 @@ mod tests {
     #[test]
     fn nominal_lookup_selects_only_the_receiver_schema() {
         let names = names();
-        assert_eq!(
-            resolve_behavior_index(Some("First"), "hit", &names),
-            Ok(0)
-        );
-        assert_eq!(
-            resolve_behavior_index(Some("Second"), "hit", &names),
-            Ok(2)
-        );
+        assert_eq!(resolve_behavior_index(Some("First"), "hit", &names), Ok(0));
+        assert_eq!(resolve_behavior_index(Some("Second"), "hit", &names), Ok(2));
     }
 
     #[test]
