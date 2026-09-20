@@ -110,6 +110,7 @@ fn bench_record_access(c: &mut Criterion) {
         )
     });
 }
+
 fn bench_scalar_replaced_record_hot_loop(c: &mut Criterion) {
     // Compiler-generated aggregate local: scalar replacement should eliminate
     // the per-iteration RecMk/field-load traffic while preserving the same
