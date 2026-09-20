@@ -71,7 +71,7 @@ mod registry;
 pub mod resp;
 pub mod resp_cache;
 mod spawn;
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
 mod trace;
@@ -472,11 +472,11 @@ pub struct Runtime {
     /// AOT-compiled modules registered for native behavior dispatch, keyed by
     /// actor type name → module pointer. Ownership lives in
     /// `aot_module_storage`; the pointers are stable (each module is Boxed).
-    #[cfg(feature = "native-codegen")]
+    #[cfg(feature = "native-aot")]
     pub aot_modules: std::collections::HashMap<String, *const crate::aot::AotModule>,
     /// Owns the registered AOT modules so the raw pointers in `aot_modules`
     /// (and on actors) stay valid for the Runtime's lifetime.
-    #[cfg(feature = "native-codegen")]
+    #[cfg(feature = "native-aot")]
     pub aot_module_storage: Vec<Box<crate::aot::AotModule>>,
     /// Actor ID of the dead-letter queue (created lazily).
     /// Undeliverable messages are routed here.
@@ -615,9 +615,9 @@ impl Runtime {
             supervisor_teams: SupervisorTeamRegistry::new(),
             crypto: Box::new(crate::backends::DefaultCryptoProvider::new()),
             spawnable_behaviors: HashMap::new(),
-            #[cfg(feature = "native-codegen")]
+            #[cfg(feature = "native-aot")]
             aot_modules: std::collections::HashMap::new(),
-            #[cfg(feature = "native-codegen")]
+            #[cfg(feature = "native-aot")]
             aot_module_storage: Vec::new(),
             #[cfg(any(feature = "ai-runtime", feature = "http-client"))]
             http: Box::new(crate::backends::ReqwestHttpProvider::new()),
@@ -1172,7 +1172,7 @@ impl Runtime {
     /// Mirrors the structure of `resume_suspended_llm_step` but without
     /// LLM-specific logic: re-installs callbacks, restores VM state,
     /// resets the safepoint counter, and resumes execution.
-    #[cfg(feature = "native-codegen")]
+    #[cfg(feature = "native-aot")]
     fn resume_suspended_jit_yield(&mut self, actor_id: u64) {
         let suspended = match self.actors.get_mut(&actor_id) {
             Some(actor) => actor.suspended_execution.take(),
@@ -3312,7 +3312,7 @@ impl Runtime {
         // behavior (clearing suspended_execution) or re-suspend (setting it
         // again), after which the normal suspended_execution guard below
         // prevents processing new messages while the behavior is live.
-        #[cfg(feature = "native-codegen")]
+        #[cfg(feature = "native-aot")]
         {
             let jit_yield = self
                 .actors
@@ -3577,7 +3577,7 @@ impl Runtime {
             };
             // AOT target to arm around the handler (None for bytecode/native
             // handlers or behaviors without an AOT-compiled version).
-            #[cfg(feature = "native-codegen")]
+            #[cfg(feature = "native-aot")]
             let aot_target = self
                 .actors
                 .get(&actor_id)
@@ -3614,12 +3614,12 @@ impl Runtime {
                     };
                     // Arm the AOT native target so `aot_behavior_adapter` (the
                     // behavior's handler) dispatches through AOT code.
-                    #[cfg(feature = "native-codegen")]
+                    #[cfg(feature = "native-aot")]
                     if let Some(target) = aot_target {
                         crate::aot::set_aot_dispatch(Some(target));
                     }
                     handler(actor, &msg.payload);
-                    #[cfg(feature = "native-codegen")]
+                    #[cfg(feature = "native-aot")]
                     if aot_target.is_some() {
                         crate::aot::clear_aot_dispatch();
                     }
@@ -4577,7 +4577,7 @@ impl Runtime {
 
             (*self_ptr).vm_exec_begin();
 
-            #[cfg(feature = "native-codegen")]
+            #[cfg(feature = "native-aot")]
             {
                 // Reset native-codegen safepoint counter for this behavior.
                 if let Some(actor) = self.actors.get_mut(&actor_id) {
@@ -4588,7 +4588,7 @@ impl Runtime {
 
             let result = vm.run_from(module_idx, code_offset);
 
-            #[cfg(feature = "native-codegen")]
+            #[cfg(feature = "native-aot")]
             {
                 // JIT safepoint yield: capture state for inline resume.
                 if vm.yield_pending {
@@ -4635,7 +4635,7 @@ impl Runtime {
             // suspend still needs. Runs on every path, so wakes of other
             // actors are not lost when THIS actor suspends.
             (*self_ptr).vm_exec_end();
-            #[cfg(feature = "native-codegen")]
+            #[cfg(feature = "native-aot")]
             crate::jit::runtime::clear_jit_safepoint_ptr();
             // String-id values index into this runtime VM's constant pool. When
             // the result is returned to a different VM (e.g. the top-level VM
@@ -6283,7 +6283,7 @@ impl Runtime {
     /// their behaviors through AOT native code (bypassing the bytecode VM)
     /// when the behavior is compiled in the module; behaviors absent from the
     /// module keep their bytecode handlers.
-    #[cfg(feature = "native-codegen")]
+    #[cfg(feature = "native-aot")]
     pub fn register_aot_module(
         &mut self,
         module: crate::aot::AotModule,
