@@ -27,6 +27,7 @@
 //! mutability is required.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 pub type ObjectId = u64;
 
@@ -34,23 +35,27 @@ pub type ObjectId = u64;
 #[derive(Debug)]
 pub struct ObjectEntry {
     pub id: ObjectId,
-    bytes: Box<[u8]>,
+    /// Shared immutable backing allocation. Multiple entries may reference
+    /// disjoint or overlapping ranges without copying bytes.
+    bytes: Arc<[u8]>,
+    offset: usize,
+    len: usize,
     ref_count: usize,
 }
 
 impl ObjectEntry {
     /// Return a slice to the immutable bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[self.offset..self.offset + self.len]
     }
 
-    /// Return the byte length.
+    /// Return the byte length of this logical view.
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.len == 0
     }
 
     /// Return the current reference count.
@@ -77,6 +82,12 @@ impl ObjectStore {
 
     /// Store an immutable buffer and return its object id.  Refcount starts at 1.
     pub fn put(&mut self, bytes: Box<[u8]>) -> ObjectId {
+        self.put_shared(Arc::from(bytes), 0, None)
+    }
+
+    fn put_shared(&mut self, bytes: Arc<[u8]>, offset: usize, len: Option<usize>) -> ObjectId {
+        let available = bytes.len().saturating_sub(offset);
+        let len = len.unwrap_or(available).min(available);
         let id = self.next_id;
         self.next_id += 1;
         self.entries.insert(
@@ -84,10 +95,29 @@ impl ObjectStore {
             ObjectEntry {
                 id,
                 bytes,
+                offset,
+                len,
                 ref_count: 1,
             },
         );
         id
+    }
+
+    /// Create a zero-copy immutable view over start..end of an existing
+    /// object. The returned object id owns an independent store refcount while
+    /// sharing the same immutable backing allocation.
+    ///
+    /// Returns None when id does not exist or the requested range is invalid.
+    /// Empty ranges are valid.
+    pub fn slice(&mut self, id: ObjectId, start: usize, end: usize) -> Option<ObjectId> {
+        let entry = self.entries.get(&id)?;
+        if start > end || end > entry.len {
+            return None;
+        }
+        let bytes = Arc::clone(&entry.bytes);
+        let offset = entry.offset + start;
+        let len = end - start;
+        Some(self.put_shared(bytes, offset, Some(len)))
     }
 
     /// Borrow an entry by id.
@@ -148,6 +178,45 @@ mod tests {
         let entry = store.get(id).unwrap();
         assert_eq!(entry.as_bytes(), &[1, 2, 3, 4]);
         assert_eq!(entry.len(), 4);
+    }
+
+    #[test]
+    fn test_slice_is_zero_copy_view() {
+        let mut store = ObjectStore::new();
+        let id = store.put(vec![10, 20, 30, 40, 50].into_boxed_slice());
+        let view_id = store.slice(id, 1, 4).expect("valid slice");
+
+        let source = store.get(id).unwrap();
+        let view = store.get(view_id).unwrap();
+        assert_eq!(view.as_bytes(), &[20, 30, 40]);
+        assert_eq!(view.len(), 3);
+        assert!(Arc::ptr_eq(&source.bytes, &view.bytes));
+        assert_eq!(view.as_bytes().as_ptr(), unsafe {
+            source.as_bytes().as_ptr().add(1)
+        });
+    }
+
+    #[test]
+    fn test_slice_outlives_source_entry() {
+        let mut store = ObjectStore::new();
+        let id = store.put(vec![1, 2, 3, 4].into_boxed_slice());
+        let view_id = store.slice(id, 1, 3).unwrap();
+
+        assert!(store.drop_ref(id));
+        assert!(store.get(id).is_none());
+        assert_eq!(store.get(view_id).unwrap().as_bytes(), &[2, 3]);
+    }
+
+    #[test]
+    fn test_slice_rejects_invalid_ranges() {
+        let mut store = ObjectStore::new();
+        let id = store.put(vec![1, 2, 3].into_boxed_slice());
+        assert!(store.slice(id, 2, 1).is_none());
+        assert!(store.slice(id, 0, 4).is_none());
+        assert!(store.slice(999, 0, 0).is_none());
+
+        let empty = store.slice(id, 1, 1).unwrap();
+        assert!(store.get(empty).unwrap().is_empty());
     }
 
     #[test]
