@@ -45,6 +45,16 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Closed-variant totality diagnostic — 2026-09-19
+- **`W0201` warns on conservatively provable non-exhaustive closed-variant
+  matches** (`src/typechecker.rs`, `src/types.rs`). Unguarded constructor
+  arms with total payload bindings contribute coverage; guarded arms do not;
+  an unguarded wildcard/variable catch-all is total. The diagnostic is a
+  warning rather than a hard type error in language version 1.x so programs
+  accepted by Frozen Core remain valid. `--deny-warnings` provides opt-in
+  strict enforcement, and the LSP publishes the warning with its stable code.
+  General primitive/literal and structural exhaustiveness remains unchanged.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
