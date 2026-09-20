@@ -409,10 +409,7 @@ impl FunctionBuilder {
         self.placement = placement;
     }
 
-    pub fn set_performance_contracts(
-        &mut self,
-        contracts: Vec<crate::ast::PerformanceContract>,
-    ) {
+    pub fn set_performance_contracts(&mut self, contracts: Vec<crate::ast::PerformanceContract>) {
         self.performance_contracts = contracts;
     }
 
