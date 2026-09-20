@@ -748,7 +748,14 @@ impl Runtime {
 
     #[tracing::instrument(level = "trace", skip(self, init))]
     pub fn spawn_actor(&mut self, init: Box<dyn FnOnce() -> Vec<(String, Value)>>) -> u64 {
-        spawn::spawn_actor_with_models(self, init, HashMap::new(), false, None, crate::persistence_schema::LEGACY_SCHEMA_VERSION)
+        spawn::spawn_actor_with_models(
+            self,
+            init,
+            HashMap::new(),
+            false,
+            None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
+        )
     }
 
     /// Spawn an actor co-located on the same shard as `near_actor_id`.
@@ -779,7 +786,15 @@ impl Runtime {
         } else {
             fresh_actor_id()
         };
-        spawn::spawn_actor_with_id(self, id, init, HashMap::new(), false, None, crate::persistence_schema::LEGACY_SCHEMA_VERSION)
+        spawn::spawn_actor_with_id(
+            self,
+            id,
+            init,
+            HashMap::new(),
+            false,
+            None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
+        )
     }
 
     pub fn spawn_persistent_actor(
@@ -787,7 +802,14 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, None, crate::persistence_schema::LEGACY_SCHEMA_VERSION)
+        spawn::spawn_actor_with_models(
+            self,
+            init,
+            state_models,
+            true,
+            None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
+        )
     }
 
     /// Spawn a durable workflow actor.  Workflows are always persistent and
@@ -798,7 +820,14 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, Some(name), crate::persistence_schema::LEGACY_SCHEMA_VERSION)
+        spawn::spawn_actor_with_models(
+            self,
+            init,
+            state_models,
+            true,
+            Some(name),
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
+        )
     }
 
     /// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with
@@ -5318,8 +5347,8 @@ impl Runtime {
                 return false;
             }
         };
-        let decoded = match crate::persistence_schema::decode_record::<ActorSnapshot>(snapshot_text)
-        {
+        let decoded =
+            match crate::persistence_schema::decode_record::<ActorSnapshot>(snapshot_text) {
             Ok(decoded) => decoded,
             Err(e) => {
                 tracing::warn!(
