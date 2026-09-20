@@ -1720,10 +1720,10 @@ mod tests {
                 source_generation: 0,
             },
         };
-        assert_eq!(
+        assert!(matches!(
             CacheStore::restore_durable_entries(&[zero_generation], 0, 0),
             Err(CacheDurableRestoreError::InvalidGeneration(0))
-        );
+        ));
     }
 
     #[test]
