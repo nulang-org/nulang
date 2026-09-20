@@ -3098,6 +3098,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn typed_distributed_send_carries_required_protocol_identity() {
+        let local_addr = addr(9500);
+        let local_node = NodeId::new(&local_addr);
+        let peer_addr = addr(9501);
+        let peer_node = NodeId::new(&peer_addr);
+
+        let mut runtime = Runtime::new();
+        let mut cluster = ClusterState::new(local_node, local_addr);
+        cluster.handle_heartbeat(peer_node, peer_addr);
+        let mut resolver = AddressResolver::new(local_node);
+        let mut transport = QueueTransport {
+            node_id: local_node,
+            listen_addr: local_addr,
+            incoming: Mutex::new(Vec::new()),
+            sent: Mutex::new(Vec::new()),
+        };
+
+        let schema = crate::protocol::ProtocolSchema::new(
+            "RemoteAccount",
+            [crate::protocol::ProtocolMember::request_reply(
+                "balance",
+                vec![],
+                crate::protocol::ProtocolTypeId::from_type(
+                    &crate::types::Type::Primitive(crate::types::PrimitiveType::Int),
+                ),
+            )],
+        )
+        .unwrap();
+        let required = schema.id();
+        let target = ProtocolActorAddress::remote(peer_node, 77, required);
+
+        send_distributed_typed(
+            &mut runtime,
+            &mut transport,
+            &cluster,
+            &mut resolver,
+            target,
+            "balance",
+            &[],
+        );
+
+        let sent = transport.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        match &sent[0] {
+            Packet::ActorMessage {
+                target_actor,
+                protocol_id,
+                behavior_name,
+                ..
+            } => {
+                assert_eq!(*target_actor, 77);
+                assert_eq!(behavior_name, "balance");
+                assert_eq!(*protocol_id, Some(*required.as_bytes()));
+            }
+            packet => panic!("expected typed actor message, got {packet:?}"),
+        }
+    }
+
     // -- 11. Parse packet ----------------------------------------------------
 
     #[test]
