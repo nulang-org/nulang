@@ -538,9 +538,9 @@ impl WasmBackend {
     }
 
     /// Pre-scan interning for a dispatchable effect (`Perform` or the async
-    /// variant): interns the dotted effect path (`"Storage.write"`). The host
-    /// owns the EffectId + request envelope mapping; the compiler emits only
-    /// what it knows (the tag + runtime-marshalled positional args).
+    /// variant). Compiler-owned host operations intern their versioned
+    /// canonical ABI id; custom/unknown effects retain the legacy dotted source
+    /// tag until they have an explicit host ABI declaration.
     fn intern_effect_dispatch(&mut self, effect: &str, op: &str, args: &[LocalId]) -> NuResult<()> {
         let dispatchable = !matches!(
             (effect, op),
@@ -559,7 +559,22 @@ impl WasmBackend {
                 crate::types::Span::default(),
             ));
         }
-        let tag = format!("{effect}.{op}");
+        let tag = match crate::host_effect_abi::lookup_host_operation(effect, op) {
+            Some(operation) => {
+                if args.len() != operation.request.arity as usize {
+                    return Err(crate::types::NuError::type_error(
+                        format!(
+                            "WASM backend: host effect {effect}.{op} expects {} args, got {}",
+                            operation.request.arity,
+                            args.len()
+                        ),
+                        crate::types::Span::default(),
+                    ));
+                }
+                operation.canonical_id()
+            }
+            None => format!("{effect}.{op}"),
+        };
         self.intern_string(&tag);
         Ok(())
     }
@@ -2230,14 +2245,21 @@ impl WasmBackend {
             _ => {
                 // Runtime-argument effect dispatch: `perform Effect.op(args)`
                 // → `nulang_dispatch_args(tag_ptr, tag_len, argv_ptr, argc)`.
-                // The guest emits only the dotted effect path plus a positional
-                // array of tagged Nulang values; the host resolves the EffectId
-                // + request envelope and writes the single JSON result to the
-                // ring buffer. Args are marshalled into the module-wide argv
+                // For compiler-owned host operations, `tag` is the versioned
+                // canonical ABI id. Custom/unknown effects retain their legacy
+                // dotted source tag during the migration. Runtime arguments stay
+                // positional; Cloud instantiates the compiler-authored request
+                // schema for canonical ids and returns the projected result as
+                // a tagged Nulang Value. Legacy/custom calls still use the
+                // ring-buffer JSON result contract. Args are marshalled into the module-wide argv
                 // scratch (they are already-computed locals, so no dispatch's
                 // argument evaluation can run between our stores and the call).
                 // The tag is interned in the pre-scan.
-                let tag = format!("{effect}.{op}");
+                let canonical_operation =
+                    crate::host_effect_abi::lookup_host_operation(effect, op);
+                let tag = canonical_operation
+                    .map(|operation| operation.canonical_id())
+                    .unwrap_or_else(|| format!("{effect}.{op}"));
                 let (tag_off, tag_len) = self.interned.get(&tag).copied().unwrap_or((0, 0));
                 let scratch = self.argv_scratch_off;
                 for (i, arg) in args.iter().enumerate() {
@@ -2254,7 +2276,17 @@ impl WasmBackend {
                 body.instruction(&Instruction::I32Const(scratch as i32));
                 body.instruction(&Instruction::I32Const(args.len() as i32));
                 body.instruction(&Instruction::Call(IMPORT_NULANG_DISPATCH_ARGS));
-                self.compile_dispatch_readback(body);
+                if canonical_operation.is_none() {
+                    // Legacy/custom dotted calls keep the historical contract:
+                    // the host returns a ring-buffer byte length and the guest
+                    // parses that JSON scalar locally.
+                    self.compile_dispatch_readback(body);
+                }
+                // Compiler-canonical calls return the tagged Nulang Value
+                // directly in the existing i64 result slot. This avoids a
+                // second JSON parse inside generated WASM and preserves exact
+                // string escaping/Unicode at the host boundary.
+
             }
         }
     }
@@ -3324,8 +3356,8 @@ mod tests {
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_inference_ask_maps_to_pool_builtin() {
-        // `perform Inference.ask("hi there")` emits the dotted effect path
-        // plus a positional argv array; the host resolves the EffectId +
+        // `perform Inference.ask("hi there")` emits the compiler-owned
+        // canonical host id plus a positional argv array; the host resolves +
         // chat envelope and unwraps the handler's `{"content": ...}`
         // response, so the guest read-back sees the plain reply string.
         let wasm = compile_source(r#"perform Inference.ask("hi there")"#).expect("compile");
@@ -3335,7 +3367,10 @@ mod tests {
         let (tag, payload) = rt
             .take_last_dispatch()
             .expect("dispatch must have been called");
-        assert_eq!(tag, b"Inference.ask", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:inference/inference#chat",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"["hi there"]"#, "positional argv array");
         assert_eq!(
             rt.string_value(&value).as_deref(),
@@ -3346,9 +3381,26 @@ mod tests {
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_canonical_string_result_preserves_json_escapes_and_utf8() {
+        let wasm = compile_source(r#"perform Storage.read("greeting")"#).expect("compile");
+        let mut rt = crate::wasm_runtime::WasmRuntime::new(&wasm, None).unwrap();
+        rt.set_dispatch_result(Some(
+            br#""quote: \" slash: \\ newline:\n snowman: ☃""#.to_vec(),
+        ));
+
+        let value = rt.run().expect("run");
+        assert_eq!(
+            rt.string_value(&value).as_deref(),
+            Some("quote: \" slash: \\ newline:\n snowman: ☃"),
+            "canonical host results must be decoded by the host before becoming a tagged string"
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_storage_read_maps_to_pool_builtin() {
-        // `perform Storage.read(key)` emits the dotted path + argv; the host
-        // resolves the string-contract storage EffectId and unwraps the
+        // `perform Storage.read(key)` emits the canonical host id + argv;
+        // the host resolves the string-contract storage EffectId and unwraps the
         // handler's `{"found":..., "value": "..."}` response to the plain
         // stored string.
         let (value, last) = run_source_with_dispatch(
@@ -3357,7 +3409,10 @@ mod tests {
         )
         .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Storage.read", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:storage/string#Read",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"["greeting"]"#, "positional argv array");
         assert!(
             value.is_string(),
@@ -3374,7 +3429,10 @@ mod tests {
             run_source_with_dispatch(r#"perform Storage.write("greeting", "hello")"#, None)
                 .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Storage.write", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:storage/string#Write",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"["greeting","hello"]"#, "positional argv array");
         assert!(value.is_nil(), "discarded write result must be nil");
     }
@@ -3386,7 +3444,10 @@ mod tests {
             run_source_with_dispatch(r#"perform Queue.pop("orders")"#, Some(br#""m1""#.to_vec()))
                 .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Queue.pop", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:queue/string#Receive",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"["orders"]"#, "positional argv array");
         assert!(
             value.is_string(),
@@ -3401,7 +3462,10 @@ mod tests {
             run_source_with_dispatch(r#"perform Queue.push("orders", "hello")"#, None)
                 .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Queue.push", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:queue/string#Send",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"["orders","hello"]"#, "positional argv array");
         assert!(value.is_nil(), "discarded send result must be nil");
     }
@@ -3415,7 +3479,10 @@ mod tests {
         )
         .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Http.get", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:http/string#GET",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(
             payload, br#"["https://example.com/"]"#,
             "positional argv array"
@@ -3434,7 +3501,10 @@ mod tests {
         let (value, last) =
             run_source_with_dispatch(r#"perform Timer.sleep(1000)"#, None).expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Timer.sleep", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:timer/timer#sleep",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"[1000]"#, "positional argv array");
         assert!(value.is_nil(), "discarded sleep result must be nil");
     }

@@ -26,6 +26,18 @@ pub enum HostResponseProjection {
     Discard,
 }
 
+/// Canonical result encoding returned by `nulang_dispatch_args`.
+///
+/// Compiler-canonical calls return a tagged Nulang `Value` directly. Scalar
+/// JSON values become their native tagged representation; structured host
+/// responses that have no portable Nulang aggregate representation yet are
+/// returned as canonical compact JSON text in a Nulang string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostResultEncoding {
+    Scalar,
+    JsonText,
+}
+
 /**
  * Deterministic compiler-owned request schema.
  *
@@ -90,6 +102,7 @@ pub struct HostOperationDescriptor {
     pub operation_id: &'static str,
     pub request: HostRequestSchema,
     pub response: HostResponseProjection,
+    pub result_encoding: HostResultEncoding,
     pub authority: HostAuthorityRequirement,
     pub replay: HostReplayClass,
 }
@@ -123,6 +136,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"chat","messages":[{"role":"user","content":{"$arg":0}}]}"#,
         },
         response: HostResponseProjection::Field("content"),
+        result_encoding: HostResultEncoding::Scalar,
         authority: HostAuthorityRequirement::CheckedEffectRow("Inference"),
         replay: HostReplayClass::JournalResult,
     },
@@ -136,6 +150,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"Write","key":{"$arg":0},"value":{"$arg":1}}"#,
         },
         response: HostResponseProjection::Discard,
+        result_encoding: HostResultEncoding::Scalar,
         authority: HostAuthorityRequirement::CheckedEffectRow("Storage"),
         replay: HostReplayClass::JournalResult,
     },
@@ -149,6 +164,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"Read","key":{"$arg":0}}"#,
         },
         response: HostResponseProjection::Field("value"),
+        result_encoding: HostResultEncoding::Scalar,
         authority: HostAuthorityRequirement::CheckedEffectRow("Storage"),
         replay: HostReplayClass::JournalResult,
     },
@@ -162,6 +178,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"Delete","key":{"$arg":0}}"#,
         },
         response: HostResponseProjection::Discard,
+        result_encoding: HostResultEncoding::Scalar,
         authority: HostAuthorityRequirement::CheckedEffectRow("Storage"),
         replay: HostReplayClass::JournalResult,
     },
@@ -175,6 +192,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"Send","queue_name":{"$arg":0},"message":{"$arg":1}}"#,
         },
         response: HostResponseProjection::Discard,
+        result_encoding: HostResultEncoding::Scalar,
         authority: HostAuthorityRequirement::CheckedEffectRow("Queue"),
         replay: HostReplayClass::JournalResult,
     },
@@ -188,6 +206,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"Receive","queue_name":{"$arg":0}}"#,
         },
         response: HostResponseProjection::Field("message"),
+        result_encoding: HostResultEncoding::Scalar,
         authority: HostAuthorityRequirement::CheckedEffectRow("Queue"),
         replay: HostReplayClass::JournalResult,
     },
@@ -201,6 +220,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"url":{"$arg":0},"method":"GET","headers":{},"body":""}"#,
         },
         response: HostResponseProjection::Field("body"),
+        result_encoding: HostResultEncoding::Scalar,
         authority: HostAuthorityRequirement::CheckedEffectRow("Http"),
         replay: HostReplayClass::JournalResult,
     },
@@ -214,6 +234,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"ms":{"$arg":0}}"#,
         },
         response: HostResponseProjection::Discard,
+        result_encoding: HostResultEncoding::Scalar,
         authority: HostAuthorityRequirement::CheckedEffectRow("Timer"),
         replay: HostReplayClass::JournalResult,
     },
@@ -227,6 +248,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"send","provider":{"$arg":0},"channel":{"$arg":1},"from":{"$arg":2},"to":{"$arg":3},"body":{"$arg":4},"media_urls":{"$arg":5},"idempotency_key":{"$arg":6},"metadata":{"$arg":7}}"#,
         },
         response: HostResponseProjection::Passthrough,
+        result_encoding: HostResultEncoding::JsonText,
         authority: HostAuthorityRequirement::CheckedEffectRow("Comms"),
         replay: HostReplayClass::ExternalRequiresIdempotencyKey,
     },
@@ -240,6 +262,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"call","provider":{"$arg":0},"from":{"$arg":1},"to":{"$arg":2},"metadata":{"$arg":3}}"#,
         },
         response: HostResponseProjection::Passthrough,
+        result_encoding: HostResultEncoding::JsonText,
         authority: HostAuthorityRequirement::CheckedEffectRow("Comms"),
         replay: HostReplayClass::ExternalNonreplayable,
     },
@@ -253,6 +276,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"create","name":{"$arg":0},"system_prompt":{"$arg":1},"max_turns":{"$arg":2}}"#,
         },
         response: HostResponseProjection::Passthrough,
+        result_encoding: HostResultEncoding::JsonText,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
         replay: HostReplayClass::JournalResult,
     },
@@ -266,6 +290,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"send","session_id":{"$arg":0},"text":{"$arg":1}}"#,
         },
         response: HostResponseProjection::Passthrough,
+        result_encoding: HostResultEncoding::JsonText,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
         replay: HostReplayClass::JournalResult,
     },
@@ -279,6 +304,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"state","session_id":{"$arg":0}}"#,
         },
         response: HostResponseProjection::Passthrough,
+        result_encoding: HostResultEncoding::JsonText,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
         replay: HostReplayClass::JournalResult,
     },
@@ -292,6 +318,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"list"}"#,
         },
         response: HostResponseProjection::Passthrough,
+        result_encoding: HostResultEncoding::JsonText,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
         replay: HostReplayClass::JournalResult,
     },
@@ -305,6 +332,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"delete","session_id":{"$arg":0}}"#,
         },
         response: HostResponseProjection::Passthrough,
+        result_encoding: HostResultEncoding::JsonText,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
         replay: HostReplayClass::JournalResult,
     },
@@ -318,6 +346,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"remember","session_id":{"$arg":0},"text":{"$arg":1},"metadata":{"$arg":2}}"#,
         },
         response: HostResponseProjection::Passthrough,
+        result_encoding: HostResultEncoding::JsonText,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
         replay: HostReplayClass::JournalResult,
     },
@@ -331,6 +360,7 @@ pub const HOST_OPERATIONS: &[HostOperationDescriptor] = &[
             template_json: r#"{"operation":"recall","session_id":{"$arg":0},"query":{"$arg":1},"top_k":{"$arg":2}}"#,
         },
         response: HostResponseProjection::Passthrough,
+        result_encoding: HostResultEncoding::JsonText,
         authority: HostAuthorityRequirement::CheckedEffectRow("Agent"),
         replay: HostReplayClass::JournalResult,
     },
@@ -357,6 +387,14 @@ pub fn lookup_host_operation_by_identity(
     HOST_OPERATIONS.iter().find(|operation| {
         operation.effect_id == effect_id && operation.operation_id == operation_id
     })
+}
+
+pub fn lookup_host_operation_by_canonical_id(
+    canonical_id: &str,
+) -> Option<&'static HostOperationDescriptor> {
+    HOST_OPERATIONS
+        .iter()
+        .find(|operation| operation.canonical_id() == canonical_id)
 }
 
 /// Build the compiler-owned external ABI descriptor consumed by conformance
@@ -398,6 +436,10 @@ pub fn host_effect_abi_descriptor() -> Result<serde_json::Value, serde_json::Err
                 "template": template
             },
             "response": response,
+            "result_encoding": match operation.result_encoding {
+                HostResultEncoding::Scalar => "scalar",
+                HostResultEncoding::JsonText => "json-text",
+            },
             "authority": authority,
             "replay_class": operation.replay.manifest_class()
         }));
@@ -500,12 +542,32 @@ mod tests {
             r#"{"operation":"Write","key":{"$arg":0},"value":{"$arg":1}}"#
         );
         assert_eq!(operation.response, HostResponseProjection::Discard);
+        assert_eq!(operation.result_encoding, HostResultEncoding::Scalar);
         assert_eq!(operation.replay, HostReplayClass::JournalResult);
         assert_eq!(operation.replay.manifest_class(), "journal-result");
         assert_eq!(
             operation.canonical_id(),
             "nulang.host-effects/v0alpha1:nulang:storage/string#Write"
         );
+    }
+
+    #[test]
+    fn structured_passthrough_operations_use_explicit_json_text_encoding() {
+        for (effect, operation) in [
+            ("Comms", "send"),
+            ("Comms", "call"),
+            ("Agent", "create"),
+            ("Agent", "send"),
+            ("Agent", "state"),
+            ("Agent", "list"),
+            ("Agent", "delete"),
+            ("Agent", "remember"),
+            ("Agent", "recall"),
+        ] {
+            let descriptor = lookup_host_operation(effect, operation).unwrap();
+            assert_eq!(descriptor.response, HostResponseProjection::Passthrough);
+            assert_eq!(descriptor.result_encoding, HostResultEncoding::JsonText);
+        }
     }
 
     #[test]
