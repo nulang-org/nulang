@@ -14,6 +14,37 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[test]
+fn typed_send_admission_reports_local_acceptance_backpressure_and_rejection() {
+    let mut rt = Runtime::new();
+    let actor_id = fresh_actor_id();
+    let mut actor = Actor::new(actor_id, "bounded-target", 1);
+    actor.state = ActorState::Running;
+    rt.actors.insert(actor_id, actor);
+
+    assert_eq!(
+        rt.send_message_by_id(actor_id, 0, &[Value::int(1)]),
+        MessageAdmission::Accepted
+    );
+    assert_eq!(
+        rt.send_message_by_id(actor_id, 0, &[Value::int(2)]),
+        MessageAdmission::Backpressured
+    );
+    assert_eq!(
+        rt.send_message_by_id(actor_id + 10_000, 0, &[]),
+        MessageAdmission::Rejected
+    );
+}
+
+#[test]
+fn send_admission_helpers_distinguish_retryable_overload() {
+    assert!(MessageAdmission::Accepted.admitted());
+    assert!(MessageAdmission::Forwarded.admitted());
+    assert!(!MessageAdmission::Backpressured.admitted());
+    assert!(MessageAdmission::Backpressured.retryable());
+    assert!(!MessageAdmission::Rejected.retryable());
+}
+
+#[test]
 fn test_authority_snapshot_round_trip_recovery() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
