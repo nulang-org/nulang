@@ -1528,7 +1528,7 @@ fn test_compute_recursive_classifies_cycles() {
 fn test_tier2_counter_increments() {
     let mut jit = make_jit();
     let dummy_ptr: *const u8 = std::ptr::null();
-    jit.compiled.insert((0, 100), (dummy_ptr, 5));
+    jit.store_compiled(0, 100, dummy_ptr, 5);
 
     // Counter starts at 0 (not yet in map), increments each call.
     for i in 0..TIER2_THRESHOLD - 1 {
@@ -1555,8 +1555,8 @@ fn test_tier2_counters_are_per_session() {
     let mut jit_a = make_jit();
     let mut jit_b = make_jit();
     let dummy_ptr: *const u8 = std::ptr::null();
-    jit_a.compiled.insert((0, 200), (dummy_ptr, 3));
-    jit_b.compiled.insert((0, 200), (dummy_ptr, 3));
+    jit_a.store_compiled(0, 200, dummy_ptr, 3);
+    jit_b.store_compiled(0, 200, dummy_ptr, 3);
 
     // Heat session A to threshold.
     for _ in 0..TIER2_THRESHOLD {
