@@ -1063,6 +1063,185 @@ fn drained_ttl_migration_restart_replay_never_extends_expiry() {
 }
 
 #[test]
+fn drained_ttl_restart_replay_preserves_only_remaining_lifetime() {
+    let journal_path = temp_journal_path("drained-live-ttl-restart");
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:33511".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:33512".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut runtime_a = distributed_runtime(addr_a, bus.clone());
+    let mut runtime_b = distributed_runtime(addr_b, bus);
+    runtime_a
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    runtime_b
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let key = b"restart-live-ttl-key";
+    let slot = redis_slot(key);
+    let source = CacheShardOwner {
+        node_id: node_a.0,
+        shard: 0,
+    };
+    let target = CacheShardOwner {
+        node_id: node_b.0,
+        shard: 0,
+    };
+    let base = CacheSlotMap::new_local(node_a.0, 1).unwrap();
+
+    let (runtime_bridge_a, service_bridge_a) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b, service_bridge_b) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b).unwrap();
+
+    let service_a = CacheServiceBuilder::new(node_a.0, base.clone())
+        .with_migration_journal_path(&journal_path)
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 53512))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    let service_b = CacheServiceBuilder::new(node_b.0, base.clone())
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 53511))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut source_client = StdTcpStream::connect(service_a.local_addrs()[0]).unwrap();
+    source_client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    source_client
+        .write_all(&frame(&[b"SET", key, b"value", b"PX", b"10000"]))
+        .unwrap();
+    assert_eq!(read_resp_line(&mut source_client), b"+OK\r\n");
+
+    let mut migrating = base;
+    migrating.begin_migration(1, slot, source, target).unwrap();
+    service_a.install_placement(migrating.clone()).unwrap();
+    service_b.install_placement(migrating.clone()).unwrap();
+    wait_epoch(&service_a, 1);
+    wait_epoch(&service_b, 1);
+
+    let pending = service_a
+        .send_remote_slot_batch(0, target, slot, None, 8, 9711)
+        .unwrap();
+    let exported_ttl = pending.batch.entries[0].ttl_ms.unwrap();
+    let ack = wait_event(&mut runtime_a, &mut runtime_b, &service_a);
+    assert!(service_a
+        .complete_remote_slot_batch(&pending, &ack)
+        .unwrap()
+        .source_drained());
+
+    let journal_key = CacheMigrationKey {
+        started_epoch: 1,
+        slot,
+        source,
+        target,
+    };
+
+    service_a.shutdown().unwrap();
+    service_b.shutdown().unwrap();
+    runtime_a.detach_cache_transport();
+    runtime_b.detach_cache_transport();
+    std::thread::sleep(Duration::from_millis(120));
+
+    let (runtime_bridge_a2, service_bridge_a2) = cache_transport_bridge(64).unwrap();
+    let (runtime_bridge_b2, service_bridge_b2) = cache_transport_bridge(64).unwrap();
+    runtime_a.attach_cache_transport(runtime_bridge_a2).unwrap();
+    runtime_b.attach_cache_transport(runtime_bridge_b2).unwrap();
+
+    let service_a2 = CacheServiceBuilder::new(node_a.0, migrating.clone())
+        .with_migration_journal_path(&journal_path)
+        .with_endpoint(target, CacheAdvertisedEndpoint::new("127.0.0.1", 54512))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_a2)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    let service_b2 = CacheServiceBuilder::new(node_b.0, migrating.clone())
+        .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 54511))
+        .with_shard(CacheServiceShardConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+        ))
+        .with_transport_endpoint(service_bridge_b2)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let replayed = service_a2
+        .replay_drained_remote_migration_after_restart(journal_key)
+        .unwrap();
+    let replay_ttl = replayed[0].batch.entries[0].ttl_ms.unwrap();
+    assert!(replay_ttl > 0);
+    assert!(
+        replay_ttl < exported_ttl,
+        "restart replay must decrease TTL: exported={exported_ttl}, replay={replay_ttl}"
+    );
+
+    let replay_ack = wait_event(&mut runtime_a, &mut runtime_b, &service_a2);
+    assert_eq!(
+        service_a2
+            .complete_restart_replay_batch(&replayed[0], &replay_ack)
+            .unwrap(),
+        vec![nulang::runtime::CacheTransferImport::Imported]
+    );
+
+    service_a2
+        .reprobe_recovered_remote_migration(journal_key, 9712)
+        .unwrap();
+    let probe = wait_event(&mut runtime_a, &mut runtime_b, &service_a2);
+    assert!(service_a2
+        .complete_remote_migration_probe(&probe)
+        .unwrap()
+        .ready_for_live_commit());
+
+    let mut committed = migrating.clone();
+    committed.commit_migration(2, slot, source, target).unwrap();
+    service_a2.install_placement(committed.clone()).unwrap();
+    service_b2.install_placement(committed).unwrap();
+
+    let mut target_client = StdTcpStream::connect(service_b2.local_addrs()[0]).unwrap();
+    target_client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    target_client.write_all(&frame(&[b"GET", key])).unwrap();
+    let mut value = [0u8; 11];
+    target_client.read_exact(&mut value).unwrap();
+    assert_eq!(&value, b"$5\r\nvalue\r\n");
+
+    service_a2.shutdown().unwrap();
+    service_b2.shutdown().unwrap();
+    std::fs::remove_file(journal_path).unwrap();
+}
+
+#[test]
 fn stale_remote_transfer_epoch_never_finalizes_source_key() {
     let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let addr_a: SocketAddr = "127.0.0.1:33501".parse().unwrap();
