@@ -560,6 +560,114 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_is_exact_for_identical_protocols() {
+        let required = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Balance", vec![], money())],
+        )
+        .unwrap();
+        let renamed = ProtocolSchema::new(
+            "RenamedAccount",
+            [ProtocolMember::request_reply("Balance", vec![], money())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            renamed.compatibility_for_required(&required),
+            ProtocolCompatibility::Exact
+        );
+        assert!(renamed.can_serve(&required));
+    }
+
+    #[test]
+    fn additive_receiver_upgrade_is_directionally_compatible() {
+        let old = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Balance", vec![], money())],
+        )
+        .unwrap();
+        let new = ProtocolSchema::new(
+            "Account",
+            [
+                ProtocolMember::request_reply("Balance", vec![], money()),
+                ProtocolMember::message("Deposit", vec![money()]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            new.compatibility_for_required(&old),
+            ProtocolCompatibility::ReceiverSuperset
+        );
+        assert!(new.can_serve(&old));
+        assert_eq!(
+            old.compatibility_for_required(&new),
+            ProtocolCompatibility::Incompatible
+        );
+        assert_eq!(
+            old.compatibility_issues_for_required(&new),
+            vec![ProtocolCompatibilityIssue::MissingBehavior("Deposit".into())]
+        );
+    }
+
+    #[test]
+    fn changing_existing_parameter_contract_is_incompatible() {
+        let required = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::message("Deposit", vec![money()])],
+        )
+        .unwrap();
+        let changed = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::message("Deposit", vec![int()])],
+        )
+        .unwrap();
+
+        assert_eq!(
+            changed.compatibility_for_required(&required),
+            ProtocolCompatibility::Incompatible
+        );
+        assert_eq!(
+            changed.compatibility_issues_for_required(&required),
+            vec![ProtocolCompatibilityIssue::ParameterContractChanged(
+                "Deposit".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn changing_response_or_message_mode_is_incompatible() {
+        let required = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Withdraw", vec![money()], receipt())],
+        )
+        .unwrap();
+        let changed_response = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::request_reply("Withdraw", vec![money()], money())],
+        )
+        .unwrap();
+        let fire_and_forget = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::message("Withdraw", vec![money()])],
+        )
+        .unwrap();
+
+        for schema in [&changed_response, &fire_and_forget] {
+            assert_eq!(
+                schema.compatibility_for_required(&required),
+                ProtocolCompatibility::Incompatible
+            );
+            assert_eq!(
+                schema.compatibility_issues_for_required(&required),
+                vec![ProtocolCompatibilityIssue::ResponseContractChanged(
+                    "Withdraw".into()
+                )]
+            );
+        }
+    }
+
+    #[test]
     fn protocol_id_hex_round_trips() {
         let schema = ProtocolSchema::new(
             "Account",
