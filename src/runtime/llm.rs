@@ -406,20 +406,58 @@ pub(crate) fn prune_episodic_memory(rt: &mut Runtime, actor_id: u64, max_tokens:
         serde_json::from_str(&memory_json).unwrap_or_else(|_| nulang_ai::EpisodicMemory::new(50));
 
     let max_chars = max_tokens.saturating_mul(4);
-    let total_chars: usize = memory.turns.iter().map(|t| t.content.len()).sum();
-    while total_chars > max_chars && !memory.turns.is_empty() {
-        // Remove oldest non-system turn.
-        if memory.turns.len() > 1 {
-            memory.turns.remove(0);
-        } else {
-            break;
-        }
-    }
+    prune_memory_to_char_budget(&mut memory, max_chars);
 
     let updated_json = serde_json::to_string(&memory).unwrap_or_default();
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         let ptr = actor.allocate_string(&updated_json);
         actor.set_state_field("episodic_memory", ptr);
+    }
+}
+
+/// Trim oldest turns until the retained conversational content fits the
+/// character budget. The system prompt is stored separately, so retaining at
+/// least one turn prevents an over-small budget from erasing the active turn.
+fn prune_memory_to_char_budget(memory: &mut nulang_ai::EpisodicMemory, max_chars: usize) {
+    let mut total_chars: usize = memory.turns.iter().map(|t| t.content.len()).sum();
+    while total_chars > max_chars && memory.turns.len() > 1 {
+        if let Some(removed) = memory.turns.pop_front() {
+            total_chars = total_chars.saturating_sub(removed.content.len());
+        }
+    }
+}
+
+#[cfg(test)]
+mod context_pruning_tests {
+    use super::prune_memory_to_char_budget;
+
+    #[test]
+    fn pruning_stops_once_budget_is_met() {
+        let mut memory = nulang_ai::EpisodicMemory::new(10);
+        memory.add_turn("user", "aaaaaaaa");
+        memory.add_turn("assistant", "bbbbbbbb");
+        memory.add_turn("user", "cccccccc");
+
+        prune_memory_to_char_budget(&mut memory, 16);
+
+        assert_eq!(memory.turns.len(), 2);
+        assert_eq!(memory.turns.front().unwrap().content, "bbbbbbbb");
+        assert_eq!(
+            memory.turns.iter().map(|turn| turn.content.len()).sum::<usize>(),
+            16
+        );
+    }
+
+    #[test]
+    fn pruning_retains_latest_turn_when_budget_is_smaller_than_one_turn() {
+        let mut memory = nulang_ai::EpisodicMemory::new(10);
+        memory.add_turn("user", "old");
+        memory.add_turn("assistant", "latest response");
+
+        prune_memory_to_char_budget(&mut memory, 1);
+
+        assert_eq!(memory.turns.len(), 1);
+        assert_eq!(memory.turns.front().unwrap().content, "latest response");
     }
 }
 
