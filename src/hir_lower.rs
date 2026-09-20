@@ -182,6 +182,13 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             span,
             ..
         } => {
+            let mut source_param_map: FxHashMap<String, Type> = FxHashMap::default();
+            for p in params.iter().chain(using_params.iter()) {
+                if let Some(ty) = &p.ty {
+                    source_param_map.insert(p.name.clone(), ty.clone());
+                }
+            }
+
             let mut all_params: Vec<(String, Type)> = params
                 .iter()
                 .map(|p| (p.name.clone(), resolve_type(&p.ty)))
@@ -243,9 +250,11 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                     CURRENT_TYPE_PARAM_CONSTRAINTS
                         .with(|c| *c.borrow_mut() = type_param_constraints.clone());
                     CURRENT_FN_PARAMS.with(|c| *c.borrow_mut() = param_map);
+                    CURRENT_SOURCE_FN_PARAMS.with(|c| *c.borrow_mut() = source_param_map);
                     let b = with_fresh_defer_stack(|| lower_body(body));
                     CURRENT_TYPE_PARAM_CONSTRAINTS.with(|c| *c.borrow_mut() = Vec::new());
                     CURRENT_FN_PARAMS.with(|c| *c.borrow_mut() = FxHashMap::default());
+                    CURRENT_SOURCE_FN_PARAMS.with(|c| *c.borrow_mut() = FxHashMap::default());
                     b
                 },
                 public: *public,
@@ -1882,6 +1891,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             span,
             ..
         } => {
+            let required_protocol = required_actor_protocol_id(actor);
             let aop = lower_expr(actor, body);
             let aops: Vec<_> = args.iter().map(|a| lower_expr(a, body)).collect();
             let ty = Type::unit();
@@ -1894,6 +1904,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                     behavior: behavior.clone(),
                     args: aops,
                     remote: *remote,
+                    required_protocol,
                     ty: ty.clone(),
                 },
                 span: *span,
@@ -2472,6 +2483,24 @@ fn try_lower_run_call(
     }
 }
 
+fn required_actor_protocol_id(expr: &Expr) -> Option<[u8; 32]> {
+    fn id_from_type(ty: &Type) -> Option<[u8; 32]> {
+        crate::protocol::actor_ref_schema("ActorRef", ty)
+            .map(|schema| *schema.id().as_bytes())
+    }
+
+    match expr {
+        Expr::TypeAnnotate { ty, .. } => id_from_type(ty),
+        Expr::CapAnnotate { expr, .. } => required_actor_protocol_id(expr),
+        Expr::Var(name, _) => CURRENT_SOURCE_FN_PARAMS.with(|cell| {
+            cell.borrow()
+                .get(name)
+                .and_then(id_from_type)
+        }),
+        _ => None,
+    }
+}
+
 fn actor_name_from_expr(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Var(name, _) => Some(name.clone()),
@@ -2605,6 +2634,10 @@ thread_local! {
     static CURRENT_TYPE_PARAM_CONSTRAINTS: RefCell<Vec<(String, TypeVar, Vec<String>)>> = RefCell::new(Vec::new());
     #[allow(clippy::missing_const_for_thread_local)]
     static CURRENT_FN_PARAMS: RefCell<FxHashMap<String, Type>> = RefCell::new(FxHashMap::default());
+    /// Source-level parameter types before ActorRef protocol erasure. Used
+    /// only to derive compact protocol identity at actor send sites.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static CURRENT_SOURCE_FN_PARAMS: RefCell<FxHashMap<String, Type>> = RefCell::new(FxHashMap::default());
 }
 
 // Thread-local: inferred function return types from type checker.
