@@ -632,6 +632,22 @@ mod tests {
     }
 
     #[test]
+    fn reports_iso_arena_eligible_allocations_separately() {
+        let mut module = CodeModule::new("arena-cost");
+        module.emit(Instruction::new1(OpCode::Const0, 0));
+        module.emit(Instruction::new2(OpCode::ArrAlloc, 0, 1));
+        module.emit(Instruction::new2(OpCode::ArrLen, 1, 2));
+        module.emit(Instruction::new1(OpCode::Drop, 1));
+        module.emit(Instruction::new0(OpCode::Halt));
+
+        let report = analyze_module(&module);
+        assert_eq!(report.total.allocation_sites, 1);
+        assert_eq!(report.total.arena_eligible_allocation_sites, 1);
+        assert_eq!(report.allocation_sites.len(), 1);
+        assert!(report.allocation_sites[0].arena_eligible);
+    }
+
+    #[test]
     fn immediate_closure_is_not_reported_as_an_allocation() {
         let mut module = CodeModule::new("closure");
         module.emit(Instruction::new3(OpCode::Closure, 0, 0, 1));
