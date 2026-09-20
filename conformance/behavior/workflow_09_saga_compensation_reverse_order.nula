@@ -1,7 +1,8 @@
 // SPEC2 10.8: saga pattern. reserve and charge complete (each advancing
 // the durable step_index, which the runtime consults for compensation),
-// then ship fails at runtime (non-exhaustive match). The compensations
-// run in reverse order of step completion: refunded, then released.
+// then ship fails at runtime through a non-exhaustive primitive match.
+// Closed variants are now checked earlier by the typechecker, so this keeps
+// the workflow test focused on runtime step failure + compensation ordering.
 workflow SagaTransaction {
   step reserve_inventory {
     {
@@ -22,14 +23,11 @@ workflow SagaTransaction {
   }
 
   step ship_goods {
-    let m: Maybe[Int] = None in
-    match m {
-      | Some(x) => perform IO.print("unreachable")
+    match 1 {
+      | 0 => perform IO.print("unreachable")
     }
   }
 }
-
-type Maybe[V] = Some(V) | None
 
 actor Dummy {
   behavior noop() { 0 }
