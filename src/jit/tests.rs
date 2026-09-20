@@ -1749,3 +1749,65 @@ fn test_mir_codegen_publishes_typed_parameter_jit_seed() {
         "JIT must retain the compiler-proven argument type after the prologue move"
     );
 }
+
+
+#[test]
+fn test_typed_region_guard_deopts_dynamic_type_mismatch() {
+    use crate::backends::JitBackend;
+    use crate::jit::typed_compiler::{KnownType, TypeMetadata};
+    use crate::vm::Value;
+
+    let mut jit = make_jit();
+    let mut module = CodeModule::new("typed_guard");
+    module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 2));
+
+    let mut meta = TypeMetadata::new();
+    meta.set_type(0, KnownType::Int);
+    meta.set_type(1, KnownType::Int);
+
+    let compiled = unsafe {
+        jit.compile_region_typed(
+            0,
+            0,
+            1,
+            &module.instructions,
+            Some(&meta),
+            &std::collections::HashMap::new(),
+        )
+    };
+    assert!(compiled.is_some(), "typed region should compile");
+    assert!(jit.is_typed_compiled(0, 0));
+
+    // Public VM/FFI entry points may supply values that do not match the
+    // source signature. The cached guard-stripped region must deopt instead
+    // of interpreting a Float payload as an Int.
+    let mut regs = [0u64; 256];
+    regs[0] = Value::float(1.5).to_bits();
+    regs[1] = Value::int(2).to_bits();
+    let action = JitBackend::tiered_execute_step_typed(
+        &mut jit,
+        0,
+        0,
+        &module,
+        &mut regs,
+        &[],
+    );
+    assert_eq!(action, TieredAction::Interpret);
+    assert_eq!(regs[2], 0, "deopt must not execute the typed region");
+
+    // The same cached region should execute when its live representation
+    // assumptions are satisfied.
+    regs[0] = Value::int(20).to_bits();
+    regs[1] = Value::int(22).to_bits();
+    let action = JitBackend::tiered_execute_step_typed(
+        &mut jit,
+        0,
+        0,
+        &module,
+        &mut regs,
+        &[],
+    );
+    assert_eq!(action, TieredAction::RanJit);
+    let result = unsafe { Value::from_bits(regs[2]) };
+    assert_eq!(result.as_int(), Some(42));
+}
