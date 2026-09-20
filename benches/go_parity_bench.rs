@@ -36,7 +36,7 @@ const FIB25: &str = r#"
     fn main() -> Int { fib(25) }
 "#;
 
-fn frontend(source: &str) -> (nulang::ast::Module, TypeChecker) {
+fn frontend(source: &str) -> (nulang::ast::AstModule, TypeChecker) {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.lex().expect("lex failed");
     let mut parser = Parser::new(tokens);
