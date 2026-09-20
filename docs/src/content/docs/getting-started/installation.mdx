@@ -41,7 +41,9 @@ cargo build --release --all-features
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `native-codegen` | On | Cranelift-backed tiered JIT and the native/AOT backend |
+| `native-codegen` | On | Compatibility umbrella enabling both `jit-codegen` and `native-aot` |
+| `jit-codegen` | Via umbrella | Cranelift-backed tiered JIT for the register VM |
+| `native-aot` | Via umbrella | Experimental MIR-to-native backend; independently selectable |
 | `python` | On | PyO3 Python interop |
 | `sqlite` | On | libsql/Turso persistence |
 | `lsp` | On | tower-lsp language server |
