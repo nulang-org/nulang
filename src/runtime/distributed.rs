@@ -504,10 +504,42 @@ impl AddressResolver {
         content_hash: Option<[u8; 32]>,
         trace_id: Option<String>,
     ) -> Packet {
+        self.build_packet_with_required_protocol(
+            target_actor,
+            behavior_name,
+            payload,
+            sender_actor,
+            priority,
+            string_table,
+            object_table,
+            content_hash,
+            trace_id,
+            None,
+        )
+    }
+
+    /// Build a remote actor message carrying the protocol contract required by
+    /// the sender/client. Existing callers keep using `build_packet`, which
+    /// emits the historical NUL0-v1 payload with no protocol tail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_packet_with_required_protocol(
+        &self,
+        target_actor: u64,
+        behavior_name: &str,
+        payload: Vec<Value>,
+        sender_actor: u64,
+        priority: MessagePriority,
+        string_table: Vec<String>,
+        object_table: Vec<(u64, Vec<u8>)>,
+        content_hash: Option<[u8; 32]>,
+        trace_id: Option<String>,
+        required_protocol_id: Option<crate::protocol::ProtocolId>,
+    ) -> Packet {
         Packet::ActorMessage {
             target_actor,
             behavior_name: behavior_name.to_string(),
             content_hash,
+            required_protocol_id,
             payload,
             string_table,
             object_table,
@@ -517,9 +549,11 @@ impl AddressResolver {
             trace_id,
         }
     }
+
     /// Parse a received network packet into a message for local delivery.
     ///
-    /// Returns `Some((target_actor_id, behavior_name, message, string_table, content_hash))`
+    /// Returns the local target, behavior/message payload tables, optional
+    /// behavior content hash, and optional sender-required protocol identity.
     /// if the packet is an actor message that should be delivered locally.
     /// The message's `behavior_id` is left as `0` — the caller must resolve
     /// `behavior_name` against the target actor's behavior table before
@@ -542,12 +576,14 @@ impl AddressResolver {
         Vec<String>,
         Vec<(u64, Vec<u8>)>,
         Option<[u8; 32]>,
+        Option<crate::protocol::ProtocolId>,
     )> {
         match packet {
             Packet::ActorMessage {
                 target_actor,
                 behavior_name,
                 content_hash,
+                required_protocol_id,
                 payload,
                 string_table,
                 object_table,
@@ -574,6 +610,7 @@ impl AddressResolver {
                     string_table,
                     object_table,
                     content_hash,
+                    required_protocol_id,
                 ))
             }
             // Non-actor-message packets are not parsed here.
@@ -1539,6 +1576,7 @@ pub fn process_network_packets(
                                 target_actor: 0,
                                 behavior_name: FABRIC_STREAM_REPLICA_ACK_BEHAVIOR.to_string(),
                                 content_hash: None,
+                                required_protocol_id: None,
                                 payload: Vec::new(),
                                 string_table: Vec::new(),
                                 object_table: vec![(0, bytes)],
@@ -1631,6 +1669,7 @@ pub fn process_network_packets(
                                                 behavior_name:
                                                     FABRIC_STREAM_COMMIT_BEHAVIOR.to_string(),
                                                 content_hash: None,
+                                                required_protocol_id: None,
                                                 payload: Vec::new(),
                                                 string_table: Vec::new(),
                                                 object_table: vec![(0, update_bytes)],
@@ -1751,6 +1790,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
                                         content_hash: None,
+                                        required_protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -1824,6 +1864,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR.to_string(),
                                         content_hash: None,
+                                        required_protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -1938,6 +1979,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
                                         content_hash: None,
+                                        required_protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -2018,6 +2060,7 @@ pub fn process_network_packets(
                                                     FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR
                                                         .to_string(),
                                                 content_hash: None,
+                                                required_protocol_id: None,
                                                 payload: Vec::new(),
                                                 string_table: Vec::new(),
                                                 object_table: vec![(
@@ -2092,6 +2135,7 @@ pub fn process_network_packets(
                     string_table,
                     object_table,
                     content_hash,
+                    _required_protocol_id,
                 )) = resolver.parse_packet(incoming.packet)
                 {
                     // Record the wire sender (bare id → node) so the
@@ -2841,6 +2885,7 @@ mod tests {
                 target_actor,
                 behavior_name,
                 content_hash,
+                required_protocol_id,
                 payload,
                 string_table,
                 sender_actor,
@@ -2852,6 +2897,7 @@ mod tests {
                 assert_eq!(target_actor, 42);
                 assert_eq!(behavior_name, "handle_msg");
                 assert_eq!(content_hash, None);
+                assert_eq!(required_protocol_id, None);
                 assert_eq!(sender_actor, 100);
                 assert_eq!(sender_node.0, local_node.0); // Same underlying u64
                 assert_eq!(priority, MessagePriority::Normal);
@@ -2859,6 +2905,35 @@ mod tests {
                 assert_eq!(string_table, vec!["hello".to_string()]);
                 assert_eq!(trace_id.as_deref(), Some(trace));
             }
+            other => panic!("expected ActorMessage packet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_packet_with_required_protocol_preserves_typed_contract() {
+        let local_addr = addr(9000);
+        let local_node = NodeId::new(&local_addr);
+        let resolver = AddressResolver::new(local_node);
+        let required = crate::protocol::ProtocolId::from_bytes([0x5A; 32]);
+
+        let packet = resolver.build_packet_with_required_protocol(
+            42,
+            "handle_msg",
+            vec![Value::int(1)],
+            100,
+            MessagePriority::Normal,
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(required),
+        );
+
+        match packet {
+            Packet::ActorMessage {
+                required_protocol_id,
+                ..
+            } => assert_eq!(required_protocol_id, Some(required)),
             other => panic!("expected ActorMessage packet, got {:?}", other),
         }
     }
@@ -2875,6 +2950,7 @@ mod tests {
             target_actor: 77,
             behavior_name: "inc".to_string(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::int(123)],
             string_table: vec![],
             object_table: vec![],
@@ -2886,11 +2962,19 @@ mod tests {
         let result = resolver.parse_packet(packet);
         assert!(result.is_some());
 
-        let (target, behavior_name, msg, string_table, _object_table, content_hash) =
-            result.unwrap();
+        let (
+            target,
+            behavior_name,
+            msg,
+            string_table,
+            _object_table,
+            content_hash,
+            required_protocol_id,
+        ) = result.unwrap();
         assert_eq!(target, 77);
         assert_eq!(behavior_name, "inc");
         assert_eq!(content_hash, None);
+        assert_eq!(required_protocol_id, None);
         // behavior_id is resolved at delivery, not parse time.
         assert_eq!(msg.behavior_id, 0);
         assert_eq!(msg.sender, 88);

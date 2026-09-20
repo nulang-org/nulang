@@ -1796,6 +1796,7 @@ fn system_packet(behavior: &str, sender_node: NodeId, bytes: Vec<u8>) -> Packet 
         target_actor: 0,
         behavior_name: behavior.to_string(),
         content_hash: None,
+        required_protocol_id: None,
         payload: Vec::new(),
         string_table: Vec::new(),
         object_table: vec![(0, bytes)],
