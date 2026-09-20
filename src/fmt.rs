@@ -108,8 +108,19 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             ret_type,
             body,
             effect,
+            annotations,
             ..
         } => {
+            // @noalloc is a checked semantic contract. Dropping it while
+            // formatting would silently weaken the program, so preserve the
+            // marker even though the formatter does not yet round-trip every
+            // historical annotation form.
+            if annotations
+                .iter()
+                .any(|a| matches!(a, crate::ast::FunctionAnnotation::NoAlloc))
+            {
+                out.push_str(&format!("{}@noalloc\n", sp));
+            }
             out.push_str(&format!("{}fn {}(", sp, name));
             for (i, p) in params.iter().enumerate() {
                 let pn = &p.name;
