@@ -1669,3 +1669,83 @@ fn test_may_suspend_analysis() {
         "peephole must recover the direct callee fib"
     );
 }
+
+
+#[test]
+fn test_infer_reg_types_uses_compiler_owned_entry_seed() {
+    use crate::jit::typed_compiler::{infer_reg_types, KnownType, TypeMetadata};
+
+    let mut module = CodeModule::new("compiler_type_seed");
+    module.function_table = vec![0];
+    module.emit(Instruction::new2(OpCode::Move, 0, 15));
+    module.emit(Instruction::new3(OpCode::IAdd, 15, 15, 16));
+    module.emit(Instruction::new1(OpCode::RetVal, 16));
+
+    let without_seed = infer_reg_types(&module, 1);
+    assert_eq!(
+        without_seed.get_type(15),
+        KnownType::Unknown,
+        "the historical bytecode-only path cannot prove an incoming argument type"
+    );
+
+    let mut seed = TypeMetadata::new();
+    seed.set_type(0, KnownType::Int);
+    module.jit_type_seeds.push((0, seed));
+
+    let with_seed = infer_reg_types(&module, 1);
+    assert_eq!(
+        with_seed.get_type(15),
+        KnownType::Int,
+        "the function prologue must propagate the trusted r0 Int fact into its fixed local register"
+    );
+}
+
+#[test]
+fn test_mir_codegen_publishes_typed_parameter_jit_seed() {
+    use crate::hir_lower::lower_module;
+    use crate::jit::typed_compiler::{infer_reg_types, KnownType};
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+
+    let source = r#"
+        fn bump(x: Int) -> Int { x + 1 }
+        fn main() -> Int { bump(41) }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_param_seed").expect("codegen");
+
+    let bump_offset = module
+        .function_offset_by_name("bump")
+        .expect("bump function offset");
+    let seed = module
+        .jit_type_seeds
+        .iter()
+        .find(|(offset, _)| *offset == bump_offset)
+        .map(|(_, seed)| seed)
+        .expect("compiler must publish a type seed for typed parameters");
+
+    assert_eq!(seed.get_type(0), KnownType::Int);
+
+    let prologue = module.instructions[bump_offset];
+    assert_eq!(
+        prologue.opcode,
+        OpCode::Move,
+        "typed parameter should enter through the normal ABI prologue"
+    );
+    assert_eq!(prologue.op1, 0, "first argument must arrive in r0");
+
+    let after_prologue = infer_reg_types(&module, bump_offset + 1);
+    assert_eq!(
+        after_prologue.get_type(prologue.op2 as usize),
+        KnownType::Int,
+        "JIT must retain the compiler-proven argument type after the prologue move"
+    );
+}
