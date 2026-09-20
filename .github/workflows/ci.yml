@@ -157,6 +157,24 @@ jobs:
         run: cargo check --tests --no-default-features
 
   # -----------------------------------------------------------------------
+  # Standard standalone runtime profile — JIT + network, no optional SDKs
+  # -----------------------------------------------------------------------
+  standard-runtime:
+    name: Standard runtime dependency boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify profile
+        run: bash scripts/check_standard_runtime_profile.sh
+
+  # -----------------------------------------------------------------------
   # WASM backend
   # -----------------------------------------------------------------------
   wasm-backend:
