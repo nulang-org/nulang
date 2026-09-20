@@ -69,6 +69,38 @@ pub const TIER2_THRESHOLD: u64 = 10_000;
 /// threshold are rejected.
 pub const STRAIGHT_LINE_MIN: usize = 8;
 
+/// Compact runtime precondition for a guard-stripped region. Static analysis
+/// can prove a register type from source/bytecode, but public VM/FFI entry
+/// points may still supply dynamically typed values. Every known entry fact
+/// used by native code is therefore checked against the live register file
+/// before the cached region executes.
+type TypeGuard = Vec<(u8, typed_compiler::KnownType)>;
+
+fn type_guard_from_metadata(meta: &typed_compiler::TypeMetadata) -> TypeGuard {
+    meta.regs
+        .iter()
+        .enumerate()
+        .filter_map(|(reg, &ty)| {
+            (ty != typed_compiler::KnownType::Unknown).then_some((reg as u8, ty))
+        })
+        .collect()
+}
+
+fn type_guard_matches(guard: &TypeGuard, regs: &[u64; 256]) -> bool {
+    use crate::value_layout::{is_float_raw, TAG_BOOL, TAG_INT, TAG_MASK};
+    use typed_compiler::KnownType;
+
+    guard.iter().all(|&(reg, ty)| {
+        let bits = regs[reg as usize];
+        match ty {
+            KnownType::Unknown => true,
+            KnownType::Int => (bits & TAG_MASK) == TAG_INT,
+            KnownType::Float => is_float_raw(bits),
+            KnownType::Bool => (bits & TAG_MASK) == TAG_BOOL,
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // JIT Session
 // ---------------------------------------------------------------------------
@@ -105,6 +137,11 @@ pub struct JitSession {
     /// Regions compiled through the type-directed (guard-stripped) path in
     /// `typed_compiler`, i.e. where inferred register types were available.
     typed_regions: FxHashSet<(usize, usize)>,
+    /// Runtime entry guards for type-directed regions. The compiler may use
+    /// facts seeded from source types, but public VM/FFI entry points are
+    /// dynamic; a mismatch deopts to the interpreter instead of executing
+    /// native code under an invalid representation assumption.
+    typed_guards: FxHashMap<(usize, usize), TypeGuard>,
     /// Per-module "may suspend" vectors (indexed by function-table index),
     /// computed lazily from each module's bytecode: true if the function
     /// transitively performs an effect that can suspend (or calls one).
@@ -164,6 +201,7 @@ impl JitSession {
             hot_counts: Vec::new(),
             last_compiled_probe: None,
             typed_regions: FxHashSet::default(),
+            typed_guards: FxHashMap::default(),
             may_suspend: FxHashMap::default(),
             recursive: FxHashMap::default(),
             builder_context: FunctionBuilderContext::new(),
@@ -375,6 +413,12 @@ impl JitSession {
                 self.compiled
                     .insert((module_idx, start_offset), (ptr, num_instrs));
                 self.typed_regions.insert((module_idx, start_offset));
+                if let Some(meta) = type_metadata {
+                    self.typed_guards.insert(
+                        (module_idx, start_offset),
+                        type_guard_from_metadata(meta),
+                    );
+                }
                 return Some(std::mem::transmute(ptr));
             }
             // Typed compilation failed: fall through to the scalar compiler.
@@ -1060,8 +1104,18 @@ impl crate::backends::JitBackend for JitSession {
     ) -> crate::backends::TieredAction {
         let instructions = &module.instructions;
 
-        // Check if already compiled
+        // Check if already compiled. Guard-stripped regions carry an entry
+        // guard because public VM/FFI call boundaries can supply values that
+        // do not match the source-level parameter signature. A mismatch is a
+        // normal deopt: execute this bytecode step in the interpreter.
         if let Some(func) = unsafe { self.get_compiled(module_idx, pc) } {
+            if self
+                .typed_guards
+                .get(&(module_idx, pc))
+                .is_some_and(|guard| !type_guard_matches(guard, regs))
+            {
+                return crate::backends::TieredAction::Interpret;
+            }
             func(regs.as_mut_ptr(), constants.as_ptr());
             // Track post-compilation hotness for tier-2 promotion.
             self.record_tier2_and_maybe_promote(module_idx, pc, instructions);
@@ -1087,6 +1141,13 @@ impl crate::backends::JitBackend for JitSession {
                         &native_calls,
                     )
                 } {
+                    if self
+                        .typed_guards
+                        .get(&(module_idx, pc))
+                        .is_some_and(|guard| !type_guard_matches(guard, regs))
+                    {
+                        return crate::backends::TieredAction::Interpret;
+                    }
                     func(regs.as_mut_ptr(), constants.as_ptr());
                     return crate::backends::TieredAction::RanJit;
                 }
