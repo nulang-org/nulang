@@ -1407,6 +1407,98 @@ mod simd_compiler_tests {
     }
 
     #[test]
+    fn test_simd_short_operand_deopts_before_side_effects() {
+        use crate::runtime::heap::{ActorHeap, TypeTag};
+        use crate::vm::Value as NuValue;
+
+        let _ = crate::jit::runtime::take_jit_deopt_pc();
+        let mut heap = ActorHeap::new(4096);
+        heap.set_actor_id(0);
+
+        let lhs = heap
+            .alloc(4 * std::mem::size_of::<NuValue>(), TypeTag::Array)
+            .expect("lhs array");
+        let rhs = heap
+            .alloc(std::mem::size_of::<NuValue>(), TypeTag::Array)
+            .expect("short rhs array");
+        let dst = heap
+            .alloc(4 * std::mem::size_of::<NuValue>(), TypeTag::Array)
+            .expect("dst array");
+
+        unsafe {
+            let lhs_slots = std::slice::from_raw_parts_mut(lhs as *mut NuValue, 4);
+            let rhs_slots = std::slice::from_raw_parts_mut(rhs as *mut NuValue, 1);
+            let dst_slots = std::slice::from_raw_parts_mut(dst as *mut NuValue, 4);
+            for (idx, slot) in lhs_slots.iter_mut().enumerate() {
+                *slot = NuValue::int(idx as i64 + 1);
+            }
+            rhs_slots[0] = NuValue::int(10);
+            for slot in dst_slots.iter_mut() {
+                *slot = NuValue::int(-1);
+            }
+        }
+
+        let region = SimdRegion {
+            start_offset: 0,
+            num_instrs: 7,
+            pattern: VectorizablePattern::ElementWiseBinop {
+                op: BinopKind::IAdd,
+                lhs_arr_reg: 10,
+                rhs_arr_reg: 11,
+                dst_arr_reg: 12,
+                lhs_elem_reg: 4,
+                rhs_elem_reg: 5,
+                result_reg: 6,
+            },
+            width: SimdWidth::Width2,
+            elem_type: SimdElemType::Int64,
+            induction_var_reg: 3,
+            array_regs: vec![10, 11, 12],
+            trip_count_hint: Some(0),
+            trip_count_array_reg: Some(10),
+        };
+        let instructions = vec![
+            Instruction::new2(OpCode::ArrLen, 10, 13),
+            Instruction::new3(OpCode::ArrLoad, 10, 3, 4),
+            Instruction::new3(OpCode::ArrLoad, 11, 3, 5),
+            Instruction::new3(OpCode::IAdd, 4, 5, 6),
+            Instruction::new3(OpCode::ArrStore, 12, 3, 6),
+            Instruction::new1(OpCode::IInc, 3),
+            Instruction::new3(OpCode::ICmpLt, 3, 13, 7),
+        ];
+
+        let mut jit = make_jit();
+        let ptr = compile_simd_region(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_simd_short_operand_deopt",
+            &instructions,
+            &region,
+        )
+        .expect("SIMD compile");
+
+        let mut regs = [NuValue::nil().to_bits(); 256];
+        regs[10] = unsafe { NuValue::ptr(lhs) }.to_bits();
+        regs[11] = unsafe { NuValue::ptr(rhs) }.to_bits();
+        regs[12] = unsafe { NuValue::ptr(dst) }.to_bits();
+
+        let func: crate::jit::JitFunctionPtr = unsafe { std::mem::transmute(ptr) };
+        func(regs.as_mut_ptr(), std::ptr::null());
+
+        assert_eq!(
+            crate::jit::runtime::take_jit_deopt_pc(),
+            Some(0),
+            "coverage mismatch must request interpreter restart at region start"
+        );
+        let values = unsafe { std::slice::from_raw_parts(dst as *const NuValue, 4) };
+        assert!(
+            values.iter().all(|v| v.as_int() == Some(-1)),
+            "SIMD guard must deopt before mutating the destination"
+        );
+    }
+
+    #[test]
     fn test_native_simd_support_matches_value_array_representation() {
         let i64 = make_i64_binop_region(BinopKind::IAdd);
         assert!(native_simd_codegen_supported(&i64));
