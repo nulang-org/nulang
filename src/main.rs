@@ -828,7 +828,11 @@ fn main() {
         // compiler. This is the durable-distribution path — a `.nbc` minted
         // in 2026 runs on any conforming runtime in 2126.
         if path.ends_with(".nbc") {
-            if let Err(e) = run_nbc_file(path, opts.verify_source.as_deref(), opts.store_path.as_deref()) {
+            if let Err(e) = run_nbc_file(
+                path,
+                opts.verify_source.as_deref(),
+                opts.store_path.as_deref(),
+            ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
