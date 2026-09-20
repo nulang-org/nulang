@@ -63,10 +63,10 @@ pub struct PackageSection {
     #[serde(default)]
     pub language: Option<String>,
     /// Resource capabilities the package needs (e.g. `["net"]` for the
-    /// `Http` effect). Forwarded to the compiler as `--with <cap>` by
-    /// `nula build`, `nula test`, and `nula run`, so packages performing
-    /// gated effects (Net, ...) can declare their requirements instead of
-    /// failing the default-deny capability check.
+    /// `Http` effect). Every package-owned compiler invocation forwards
+    /// these as `--with <cap>` (build, JSON build, WASM, web/dev, test,
+    /// run/watch, and deployment artifact compilation) so command variants
+    /// cannot diverge from the package's declared requirements.
     #[serde(default)]
     pub capabilities: Vec<String>,
 }
