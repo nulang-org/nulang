@@ -3200,7 +3200,7 @@ impl TypeChecker {
                 continue;
             }
 
-            if Self::pattern_is_irrefutable(pattern) {
+            if Self::pattern_is_catch_all(pattern) {
                 return Ok(());
             }
 
@@ -3232,18 +3232,32 @@ impl TypeChecker {
         })
     }
 
-    /// Whether a pattern is guaranteed to accept every value of its expected
-    /// type. This intentionally recognizes only structurally irrefutable
-    /// forms; variant and literal patterns are refutable by definition.
-    fn pattern_is_irrefutable(pattern: &Pattern) -> bool {
+    /// Whether a top-level pattern is a true catch-all for an arbitrary
+    /// closed-variant value. Structured tuple/record patterns are deliberately
+    /// not considered catch-alls here: even if all of their children bind
+    /// variables, their outer shape can still reject a variant value.
+    fn pattern_is_catch_all(pattern: &Pattern) -> bool {
         match pattern {
             Pattern::Wild | Pattern::Var(_) => true,
-            Pattern::Alias(_, inner) => Self::pattern_is_irrefutable(inner),
-            Pattern::Tuple(items) => items.iter().all(Self::pattern_is_irrefutable),
-            Pattern::Record(fields) => fields
-                .iter()
-                .all(|(_, pattern)| Self::pattern_is_irrefutable(pattern)),
-            Pattern::Lit(_) | Pattern::Variant(_, _) => false,
+            Pattern::Alias(_, inner) => Self::pattern_is_catch_all(inner),
+            Pattern::Lit(_)
+            | Pattern::Tuple(_)
+            | Pattern::Record(_)
+            | Pattern::Variant(_, _) => false,
+        }
+    }
+
+    /// Whether a constructor payload pattern is conservatively known to cover
+    /// every payload value. Keep this intentionally narrow until the full
+    /// pattern-matrix checker can reason from the payload's exact type.
+    fn payload_pattern_is_total(pattern: &Pattern) -> bool {
+        match pattern {
+            Pattern::Wild | Pattern::Var(_) => true,
+            Pattern::Alias(_, inner) => Self::payload_pattern_is_total(inner),
+            Pattern::Lit(_)
+            | Pattern::Tuple(_)
+            | Pattern::Record(_)
+            | Pattern::Variant(_, _) => false,
         }
     }
 
@@ -3259,7 +3273,7 @@ impl TypeChecker {
                 let (_, declared_payload) = variants.iter().find(|(n, _)| n == name)?;
                 let covers_constructor = match (declared_payload, payload_pattern.as_deref()) {
                     (None, None) => true,
-                    (Some(_), Some(inner)) => Self::pattern_is_irrefutable(inner),
+                    (Some(_), Some(inner)) => Self::payload_pattern_is_total(inner),
                     // A nullary pattern for a payload-carrying constructor is
                     // not total: the current MIR representation stores those
                     // values as { ctor, payload } records, while a nullary
@@ -4653,6 +4667,31 @@ mod tests {
 
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
         assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+
+    #[test]
+    fn test_closed_variant_structured_pattern_is_not_a_catch_all() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with(
+            "value",
+            Type::Variant(vec![
+                ("Left".to_string(), None),
+                ("Right".to_string(), None),
+            ]),
+        );
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("value")),
+            arms: vec![(
+                Pattern::Tuple(vec![Pattern::Var("x".to_string())]),
+                None,
+                int_lit(1),
+            )],
+            span: sp(),
+        };
+
+        let err = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(err.to_string().contains("Left"));
+        assert!(err.to_string().contains("Right"));
     }
 
     // -----------------------------------------------------------------------
