@@ -999,6 +999,19 @@ impl TypeChecker {
 
     /// Type-check an entire module, returning the type of the last declaration.
     pub fn check_module(&mut self, module: &AstModule) -> NuResult<Type> {
+        // Enrich statically known actor sends/asks with protocol constraints
+        // before ordinary Algorithm-W inference. Dynamic actor references
+        // remain permissive until structural ActorRef<P> types land.
+        let annotated = match crate::actor_protocol::annotate_module(module) {
+            Ok(module) => module,
+            Err(err) if self.collect_errors => {
+                self.collected_errors.push(err);
+                module.clone()
+            }
+            Err(err) => return Err(err),
+        };
+        let module = &annotated;
+
         self.register_class_decls(module);
         let mut ctx = TypeContext::new();
         let mut last_type = Type::unit();
