@@ -45,6 +45,17 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Zero-copy object-store views — 2026-09-20
+- **Shared immutable backing for object-store slices** (Experimental,
+  `src/runtime/object_store.rs`). Object entries now retain an immutable
+  shared byte allocation plus a logical range, allowing `ObjectStore::slice`
+  to create O(1) subviews without copying payload bytes. Views own independent
+  store refcounts and keep their backing allocation alive after the source
+  entry is released. Same-shard actor delivery remains handle-only; cross-shard
+  delivery serializes only the logical view range rather than the full backing
+  object. The `Value::object(id)` representation and wire format remain
+  unchanged.
+
 ### Mechanical cost inspection — 2026-09-20
 - **Static bytecode mechanical-cost reports** (Experimental, `src/cost_model.rs`,
   `nulang costs`). Compiled modules can now report explicit VM heap-allocation
