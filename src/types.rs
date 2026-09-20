@@ -48,6 +48,7 @@ pub enum PrimitiveType {
     Float,
     Bool,
     String,
+    Bytes,
     Nil,
     Unit,
     Never,
@@ -478,6 +479,7 @@ impl std::fmt::Display for Type {
                 PrimitiveType::Float => write!(f, "Float"),
                 PrimitiveType::Bool => write!(f, "Bool"),
                 PrimitiveType::String => write!(f, "String"),
+                PrimitiveType::Bytes => write!(f, "Bytes"),
                 PrimitiveType::Unit => write!(f, "Unit"),
                 PrimitiveType::Nil => write!(f, "Nil"),
                 PrimitiveType::Never => write!(f, "Never"),
@@ -911,6 +913,9 @@ impl Type {
     }
     pub fn string() -> Type {
         Type::Primitive(PrimitiveType::String)
+    }
+    pub fn bytes() -> Type {
+        Type::Primitive(PrimitiveType::Bytes)
     }
     pub fn nil() -> Type {
         Type::Primitive(PrimitiveType::Nil)
