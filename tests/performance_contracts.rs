@@ -29,9 +29,7 @@ fn quote_midpoint() -> Int {
         other => panic!("expected function, got {other:?}"),
     };
 
-    assert!(annotations.contains(&FunctionAnnotation::Performance(
-        PerformanceContract::Hot
-    )));
+    assert!(annotations.contains(&FunctionAnnotation::Performance(PerformanceContract::Hot)));
     assert!(annotations.contains(&FunctionAnnotation::Performance(
         PerformanceContract::NoBlock
     )));
@@ -103,7 +101,6 @@ fn add_one(x: Int) -> Int {
         .expect("pure function should satisfy performance contracts");
 }
 
-
 fn lower_to_mir(source: &str) -> Result<nulang::mir::Module, nulang::types::NuError> {
     let ast = parse(source);
     let mut type_checker = nulang::typechecker::TypeChecker::new();
@@ -170,7 +167,6 @@ fn hot_path() -> String {
     assert!(msg.contains("hot_path"), "{msg}");
     assert!(msg.contains("@no_alloc()"), "{msg}");
 }
-
 
 fn compile_to_bytecode(source: &str) -> nulang::bytecode::CodeModule {
     let mut mir = lower_to_mir(source).expect("source should lower to MIR");
