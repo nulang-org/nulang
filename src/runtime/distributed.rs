@@ -58,6 +58,7 @@ use super::fabric_stream_epoch::{
 use super::mailbox::{Message, MessagePriority};
 use super::network::{NetworkTransport, Packet};
 use super::{ClusterState, NodeId, NodeStatus};
+use crate::protocol::{admit_protocol, ProtocolAdmission, ProtocolAdmissionError, ProtocolId};
 use crate::runtime::Runtime;
 use crate::types::ExitReason;
 use crate::vm::Value;
@@ -504,10 +505,42 @@ impl AddressResolver {
         content_hash: Option<[u8; 32]>,
         trace_id: Option<String>,
     ) -> Packet {
+        self.build_packet_with_protocol(
+            target_actor,
+            behavior_name,
+            payload,
+            sender_actor,
+            priority,
+            string_table,
+            object_table,
+            content_hash,
+            trace_id,
+            None,
+        )
+    }
+
+    /// Build a remote actor packet with an explicit required structural
+    /// protocol identity. Existing callers remain untyped and use
+    /// `build_packet`; typed distributed references can opt in without a
+    /// NUL0 version bump.
+    pub fn build_packet_with_protocol(
+        &self,
+        target_actor: u64,
+        behavior_name: &str,
+        payload: Vec<Value>,
+        sender_actor: u64,
+        priority: MessagePriority,
+        string_table: Vec<String>,
+        object_table: Vec<(u64, Vec<u8>)>,
+        content_hash: Option<[u8; 32]>,
+        trace_id: Option<String>,
+        protocol_id: Option<[u8; 32]>,
+    ) -> Packet {
         Packet::ActorMessage {
             target_actor,
             behavior_name: behavior_name.to_string(),
             content_hash,
+            protocol_id,
             payload,
             string_table,
             object_table,
@@ -542,12 +575,14 @@ impl AddressResolver {
         Vec<String>,
         Vec<(u64, Vec<u8>)>,
         Option<[u8; 32]>,
+        Option<[u8; 32]>,
     )> {
         match packet {
             Packet::ActorMessage {
                 target_actor,
                 behavior_name,
                 content_hash,
+                protocol_id,
                 payload,
                 string_table,
                 object_table,
@@ -574,6 +609,7 @@ impl AddressResolver {
                     string_table,
                     object_table,
                     content_hash,
+                    protocol_id,
                 ))
             }
             // Non-actor-message packets are not parsed here.
@@ -914,6 +950,24 @@ fn exit_reason_from_tag(tag: &str) -> ExitReason {
     }
 }
 
+/// Evaluate the incoming actor protocol before any mailbox publication or
+/// payload interning. Exact identity needs no registry lookup. Different
+/// identities require registry proof under compatible mode.
+fn admit_remote_actor_protocol(
+    runtime: &Runtime,
+    target_actor: u64,
+    required_protocol: Option<[u8; 32]>,
+) -> Result<ProtocolAdmission, ProtocolAdmissionError> {
+    let receiver = runtime.actor_protocol_id(target_actor);
+    let required = required_protocol.map(ProtocolId::from_bytes);
+    admit_protocol(
+        &runtime.protocol_registry,
+        runtime.protocol_admission_policy,
+        receiver,
+        required,
+    )
+}
+
 /// Verify that the target actor's behavior at the given index has a matching
 /// content hash. Returns `true` if verification passes (or if the local
 /// behavior entry has no hash — backward compatibility preserves nodes whose
@@ -1252,6 +1306,7 @@ pub fn process_network_packets(
                                     mut msg,
                                     string_table,
                                     object_table,
+                                    required_protocol,
                                 ) in messages
                                 {
                                     // Hot-reload the newly cached module into the target actor
@@ -1272,6 +1327,20 @@ pub fn process_network_packets(
                                         &cached,
                                         &behavior_name,
                                     );
+                                    // The hot reload may have changed the actor's
+                                    // structural protocol. Re-check admission before
+                                    // resolving or publishing the pending message.
+                                    if let Err(error) = admit_remote_actor_protocol(
+                                        runtime,
+                                        target_actor,
+                                        required_protocol,
+                                    ) {
+                                        warn!(
+                                            "nulang-net: rejecting pending message to actor {} after hot reload: {}",
+                                            target_actor, error
+                                        );
+                                        continue;
+                                    }
                                     // Resolve behavior_id against the updated module
                                     msg.behavior_id = runtime
                                         .behavior_id_for(target_actor, &behavior_name)
@@ -1339,7 +1408,7 @@ pub fn process_network_packets(
                             // Drop pending messages for this hash on deserialize failure
                             let pending = runtime.pending_fetched_messages.remove(&content_hash);
                             if let Some(messages) = pending {
-                                for (_, _, msg, _, _) in messages {
+                                for (_, _, msg, _, _, _) in messages {
                                     notify_delivery_failed(
                                         runtime,
                                         msg.sender,
@@ -1353,7 +1422,7 @@ pub fn process_network_packets(
                     // Sender didn't have the requested bytecode; drain and notify
                     let pending = runtime.pending_fetched_messages.remove(&content_hash);
                     if let Some(messages) = pending {
-                        for (_, _, msg, _, _) in messages {
+                        for (_, _, msg, _, _, _) in messages {
                             notify_delivery_failed(runtime, msg.sender, "bytecode fetch failed: sender does not have the requested behavior");
                         }
                     }
@@ -1539,6 +1608,7 @@ pub fn process_network_packets(
                                 target_actor: 0,
                                 behavior_name: FABRIC_STREAM_REPLICA_ACK_BEHAVIOR.to_string(),
                                 content_hash: None,
+                                protocol_id: None,
                                 payload: Vec::new(),
                                 string_table: Vec::new(),
                                 object_table: vec![(0, bytes)],
@@ -1631,6 +1701,7 @@ pub fn process_network_packets(
                                                 behavior_name:
                                                     FABRIC_STREAM_COMMIT_BEHAVIOR.to_string(),
                                                 content_hash: None,
+                                                protocol_id: None,
                                                 payload: Vec::new(),
                                                 string_table: Vec::new(),
                                                 object_table: vec![(0, update_bytes)],
@@ -1751,6 +1822,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
                                         content_hash: None,
+                                        protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -1824,6 +1896,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR.to_string(),
                                         content_hash: None,
+                                        protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -1938,6 +2011,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
                                         content_hash: None,
+                                        protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -2018,6 +2092,7 @@ pub fn process_network_packets(
                                                     FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR
                                                         .to_string(),
                                                 content_hash: None,
+                                                protocol_id: None,
                                                 payload: Vec::new(),
                                                 string_table: Vec::new(),
                                                 object_table: vec![(
@@ -2092,8 +2167,22 @@ pub fn process_network_packets(
                     string_table,
                     object_table,
                     content_hash,
+                    required_protocol,
                 )) = resolver.parse_packet(incoming.packet)
                 {
+                    // Protocol admission is deliberately first: reject before
+                    // behavior resolution, payload interning, or mailbox mutation.
+                    if let Err(error) =
+                        admit_remote_actor_protocol(runtime, target_actor, required_protocol)
+                    {
+                        warn!(
+                            "nulang-net: rejecting actor message '{}' to {} before mailbox admission: {}",
+                            behavior_name, target_actor, error
+                        );
+                        ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+                        continue;
+                    }
+
                     // Record the wire sender (bare id → node) so the
                     // recipient can reply BY VALUE (RFC-0007): a later
                     // `send <sender_ref>` on this node routes over the
@@ -2161,6 +2250,7 @@ pub fn process_network_packets(
                                         msg.clone(),
                                         string_table.clone(),
                                         object_table.clone(),
+                                        required_protocol,
                                     ));
                                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
                                 continue;
@@ -2875,6 +2965,7 @@ mod tests {
             target_actor: 77,
             behavior_name: "inc".to_string(),
             content_hash: None,
+            protocol_id: None,
             payload: vec![Value::int(123)],
             string_table: vec![],
             object_table: vec![],
