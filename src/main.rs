@@ -1623,6 +1623,30 @@ fn run_frontend(
     let mut type_checker = TypeChecker::new();
     let module_type = type_checker.check_module(&ast)?;
 
+    // Surface non-fatal semantic warnings produced by the type checker.
+    // These preserve the v1.x/Frozen-Core validity contract by default while
+    // allowing strict projects to opt into hard enforcement.
+    let type_warnings = type_checker.take_warnings();
+    if !type_warnings.is_empty() {
+        let use_color = std::io::stderr().is_terminal();
+        for w in &type_warnings {
+            eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
+        }
+        if deny_warnings {
+            return Err(NuError::TypeError {
+                msg: format!(
+                    "aborting due to {} type warning{} (--deny-warnings)",
+                    type_warnings.len(),
+                    if type_warnings.len() == 1 { "" } else { "s" }
+                ),
+                span: type_warnings[0].span,
+                expected_type: None,
+                found_type: None,
+                similar_names: None,
+            });
+        }
+    }
+
     if verbose {
         println!("=== Inferred Type ===");
         println!("{}\n", type_to_string(&module_type));
