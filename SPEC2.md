@@ -94,7 +94,7 @@ This document is the design target for Nulang 2.0. The implementation in this re
 - 15 verified example programs under `examples/` with `examples/README.md` — from basic IO to JSON, HTTP, Option/Result, and ranges. (Experimental)
 - `consume` / `recover` expressions: `consume x` marks a linear (`lineariso`) variable as consumed (reusing the existing at-most-once tracker); `recover { body }` is an isolated scope whose result must be sendable (checked in `src/effect_checker.rs`; the typechecker infers the body's type unchanged and lowering is transparent — it does **not** wrap the result in `Ok`/`Error`). See §3.9.2. Commit `e0cf432`. (Experimental)
 
-- Function performance contracts (Experimental): `@hot()` marks a function for future tiering/PGO preference; `@no_block()` and `@no_suspend()` are compile-time contracts checked against the function's transitive effect row. User-defined effects are conservatively treated as potentially blocking and suspending. These annotations erase after compile-time checking; they do not change runtime semantics. `@no_alloc()` is intentionally not specified yet because allocation freedom requires MIR-level proof rather than effect-row inference. — `src/ast.rs`, `src/parser.rs`, `src/effect_checker.rs`.
+- Function performance contracts (Experimental): `@no_block()` and `@no_suspend()` are compile-time contracts checked against the function's transitive effect row; user-defined effects are conservatively treated as potentially blocking and suspending. `@no_alloc()` is validated after MIR lowering and closure inlining against a conservative transitive allocation summary: managed-heap construction, allocation-prone runtime operations, and unresolved indirect calls all violate the contract. `@hot()` preserves metadata through AST → HIR → MIR → bytecode and lowers the Cranelift tier-up threshold from 1000 interpreted executions to 100 only inside the annotated function's bytecode range. The bytecode metadata field is optional/default-empty so older artifacts remain readable. None of these annotations changes language semantics. — `src/ast.rs`, `src/parser.rs`, `src/effect_checker.rs`, `src/performance.rs`, `src/mir_lower.rs`, `src/mir_codegen.rs`, `src/jit/mod.rs`.
 
 **Planned (described in this specification, not implemented):**
 
@@ -3553,6 +3553,7 @@ tool_annotation ::= "@tool" "(" "description" ":" string ")"
 performance_annotation ::= "@hot" "(" ")"
                          | "@no_block" "(" ")"
                          | "@no_suspend" "(" ")"
+                         | "@no_alloc" "(" ")"
 
 decl_head     ::= function_definition
                 | agent_definition
