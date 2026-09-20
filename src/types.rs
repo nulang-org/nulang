@@ -802,6 +802,11 @@ pub const RECORD_ROW_TAIL_FIELD: &str = "..";
 /// protocol against the required `ActorRef` protocol.
 pub const ACTOR_REF_TYPE_NAME: &str = "ActorRef";
 
+/// Reserved nominal marker used when a behavior parameter/return type was not
+/// explicitly declared. Protocol identity generation must reject this marker:
+/// it is a compatibility fallback for local typechecking, not a stable schema.
+pub const UNSPECIFIED_ACTOR_PROTOCOL_TYPE_NAME: &str = "__UnspecifiedActorProtocolType";
+
 impl Type {
     /// Construct the compile-time-only structural actor-reference type
     /// `ActorRef[P]`. `P` is expected to be a record whose fields map
