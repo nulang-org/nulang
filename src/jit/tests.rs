@@ -1564,23 +1564,32 @@ fn test_arrlen_scalar_register_destination() {
     // bug: ArrLen wrote the length to the wrong register → the loop body
     // saw a stale 0 → sum stayed 0 instead of 10.
     let source = "var acc = 0\nvar arr = [1, 2, 3, 4]\nfor x in arr { acc = acc + x }\nacc";
-    let mutant = crate::fuzz::compile_for_diff(source).expect("compile");
+    let tokens = crate::lexer::Lexer::new(source).lex().expect("lex");
+    let ast = crate::parser::Parser::new(tokens)
+        .parse_module()
+        .expect("parse");
+    let mut type_checker = crate::typechecker::TypeChecker::new();
+    type_checker.check_module(&ast).expect("typecheck");
+    let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+    let mut mir = crate::mir_lower::lower_module(&hir).expect("lower MIR");
+    let module = crate::mir_codegen::compile_mir(&mut mir, "jit-arrlen-regression")
+        .expect("compile bytecode");
 
     // Interpreter (cold) — authoritative result.
     let mut cold = VM::new_without_jit();
-    cold.load_module(mutant.code_module.clone());
-    let (cold_val, _) = crate::fuzz::run_once(&mut cold).expect("cold run");
+    cold.load_module(module.clone());
+    let cold_val = cold.run().expect("cold run");
     let expected = cold_val.as_int().unwrap();
     assert_eq!(expected, 10, "interpreter sum of [1,2,3,4] must be 10");
 
     // JIT (warm) — repeated runs force tier-up of the array-setup region
     // (pc ≈ 7), which includes the ArrLen opcode.
     let mut warm = VM::new();
-    warm.load_module(mutant.code_module.clone());
+    warm.load_module(module);
     for _ in 0..1500 {
-        let _ = crate::fuzz::run_once(&mut warm);
+        let _ = warm.run();
     }
-    let (warm_val, _) = crate::fuzz::run_once(&mut warm).expect("warm run");
+    let warm_val = warm.run().expect("warm run");
 
     assert_eq!(
         warm_val.as_int(),
