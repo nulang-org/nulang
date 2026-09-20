@@ -53,6 +53,13 @@ two major versions.*
   changing an existing signature is incompatible. V1 intentionally avoids
   implicit field/default/variance rules.
 
+- **Runtime actor protocol identity lookup** (Experimental,
+  `src/runtime/protocol_identity.rs`). Live actors resolve their canonical
+  compiler-emitted `ActorMeta.protocol_id` through their own module metadata;
+  virtual `Type@key` instances resolve through the virtual type schema, while
+  synthetic/manual actor names fail closed instead of borrowing unrelated
+  module metadata.
+
 - **Pre-mailbox actor protocol admission** (Experimental, `src/protocol.rs`).
   `ProtocolAdmissionPolicy` defaults to strict compatible admission: exact
   protocol identity is accepted directly, additive receiver upgrades require

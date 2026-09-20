@@ -67,6 +67,7 @@ mod llm;
 mod metrics;
 mod persistence;
 mod process_groups;
+mod protocol_identity;
 mod registry;
 pub mod resp;
 pub mod resp_cache;
@@ -554,6 +555,14 @@ impl crate::backends::ForeignInterop for NoOpForeignInterop {
 }
 
 impl Runtime {
+    /// Canonical structural protocol identity installed for a live actor.
+    ///
+    /// Returns None for native/manual actors without compiler metadata and
+    /// for any runtime name that cannot be tied to its own ActorMeta.
+    pub fn actor_protocol_id(&self, actor_id: u64) -> Option<crate::protocol::ProtocolId> {
+        protocol_identity::protocol_id_for_actor(self, actor_id)
+    }
+
     pub fn new() -> Self {
         Runtime {
             actors: HashMap::new(),
