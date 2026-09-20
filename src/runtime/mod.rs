@@ -270,15 +270,34 @@ enum CrossShardMsg {
     },
 }
 
-/// Admission result for a local-process actor delivery.
+/// Admission result for a non-blocking actor send.
 ///
-/// Fabric uses this to distinguish successful mailbox/channel admission from
-/// bounded-capacity backpressure without changing the public actor-send API.
+/// Existing fire-and-forget callers may ignore this value. Callers that need
+/// overload control can distinguish successful local admission, cross-node
+/// forwarding (where destination admission is not yet known), bounded-capacity
+/// backpressure, and permanent/local rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MessageAdmission {
+pub enum MessageAdmission {
+    /// The message was admitted to the destination mailbox or a local
+    /// cross-shard delivery queue.
     Accepted,
+    /// The message was handed to cross-node routing. This confirms local
+    /// handoff only; final destination-mailbox admission is not yet known.
+    Forwarded,
+    /// A bounded mailbox/channel was full. The caller may retry/back off.
     Backpressured,
+    /// The target/payload/routing context was invalid or unavailable.
     Rejected,
+}
+
+impl MessageAdmission {
+    pub const fn admitted(self) -> bool {
+        matches!(self, Self::Accepted | Self::Forwarded)
+    }
+
+    pub const fn retryable(self) -> bool {
+        matches!(self, Self::Backpressured)
+    }
 }
 
 pub struct Runtime {
@@ -1616,18 +1635,23 @@ impl Runtime {
     /// name silently runs the actor's FIRST declared behavior instead
     /// of erroring or being ignored. See SPEC2.md Chapter 8 (message
     /// passing) and `conformance/behavior/lifecycle_03/04_*.nula`.
-    pub fn send_message(&mut self, target_id: u64, behavior: &str, args: &[Value]) {
+    pub fn send_message(
+        &mut self,
+        target_id: u64,
+        behavior: &str,
+        args: &[Value],
+    ) -> MessageAdmission {
         // Name-based sends already carry the wire behavior name, so route
         // remote refs directly (same local-existence guard as
         // `send_message_by_id`; see RFC-0007 note there).
         if !self.actors.contains_key(&target_id) {
             if let Some(node) = self.remote_refs.get(&target_id).copied() {
                 self.route_ref_send(target_id, node, behavior, args);
-                return;
+                return MessageAdmission::Forwarded;
             }
         }
         let behavior_id = self.behavior_id_for(target_id, behavior).unwrap_or(0);
-        self.send_message_by_id(target_id, behavior_id, args);
+        self.send_message_by_id(target_id, behavior_id, args)
     }
 
     /// Route a message to a KNOWN remote ref (hosting node already
@@ -2218,7 +2242,12 @@ impl Runtime {
     }
 
     #[tracing::instrument(level = "trace", skip(self, args))]
-    pub fn send_message_by_id(&mut self, target_id: u64, behavior_id: u16, args: &[Value]) {
+    pub fn send_message_by_id(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+    ) -> MessageAdmission {
         // Stamp the outgoing message with the current handler's trace span (if
         // any), so the receiver's child span links directly to it and causal
         // chains continue across actor, shard, and node boundaries. The W3C
@@ -2249,10 +2278,10 @@ impl Runtime {
                         "nulang-net: dropping message to remote actor {} on node {:?}: cannot resolve behavior name (no sender module context)",
                         target_id, node
                     );
-                    return;
+                    return MessageAdmission::Rejected;
                 };
                 self.route_ref_send(target_id, node, &behavior_name, args);
-                return;
+                return MessageAdmission::Forwarded;
             }
         }
         // Forwarding for migrated actors: if this actor has been relocated
@@ -2271,7 +2300,7 @@ impl Runtime {
                 .unwrap_or_else(|| format!("behavior_{}", behavior_id));
             let target = ActorAddress::remote(target_node, target_id);
             self.send_distributed(target, &behavior_name, args);
-            return;
+            return MessageAdmission::Forwarded;
         }
         // Cross-shard routing: if the target actor lives on another shard,
         // forward via the cross-shard channel. The receiving shard delivers it
@@ -2279,14 +2308,13 @@ impl Runtime {
         if self.shard_count > 1 {
             let target_shard = (target_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
-                self.send_cross_shard_message(
+                return self.send_cross_shard_message(
                     target_id,
                     behavior_id,
                     args.to_vec(),
                     out_trace.clone(),
                     None,
                 );
-                return;
             }
         }
         // Grain hydration: a resident grain actor that is hibernated should be
@@ -2330,10 +2358,10 @@ impl Runtime {
                         },
                         "grain hydration failed",
                     );
-                    return;
+                    return MessageAdmission::Rejected;
                 }
                 if self.actors.contains_key(&target_id) {
-                    self.deliver_local_message(target_id, behavior_id, args, out_trace);
+                    return self.deliver_local_message(target_id, behavior_id, args, out_trace);
                 } else {
                     self.route_to_dlq(
                         &Message {
@@ -2346,11 +2374,11 @@ impl Runtime {
                         "grain hydration failed",
                     );
                 }
-                return;
+                return MessageAdmission::Rejected;
             }
         }
 
-        self.deliver_local_message(target_id, behavior_id, args, out_trace);
+        self.deliver_local_message(target_id, behavior_id, args, out_trace)
     }
 
     /// Deliver a message to a local actor's mailbox, track cross-actor
