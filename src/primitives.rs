@@ -186,6 +186,156 @@ impl crate::runtime::TimerMessage {
     }
 }
 
+
+/// Execution class for a performed effect operation.
+///
+/// This is runtime scheduling metadata, not source-language syntax. It lets the
+/// runtime and Nulang Cloud decide whether an operation is safe on the actor
+/// scheduler or must suspend/offload without baking transient executor choices
+/// into the language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EffectExecutionClass {
+    /// Cheap, non-blocking work safe to execute on the actor scheduler.
+    Inline,
+    /// The actor should suspend while runtime-owned state/time/message progress
+    /// determines when it can resume.
+    CooperativeSuspend,
+    /// External asynchronous work. The actor should suspend and the scheduler
+    /// thread must remain free while the operation is in flight.
+    AsyncExternal,
+    /// Host work that may block an OS thread (filesystem, process, Python/FFI,
+    /// terminal I/O). It must not run on the actor scheduler once isolation is
+    /// wired.
+    BlockingHost,
+    /// Long-running CPU work that should execute on a compute pool rather than
+    /// monopolizing a cooperative actor scheduler thread.
+    CpuBound,
+    /// Accelerator-backed work whose execution belongs on a GPU/TPU/etc.
+    /// resource executor and normally suspends the actor.
+    Accelerator,
+    /// User-defined/unknown effect. Its handler owns the execution contract;
+    /// callers must not assume scheduler safety.
+    HandlerDefined,
+}
+
+impl EffectExecutionClass {
+    /// Whether running the operation directly on an actor scheduler may stall
+    /// unrelated actors.
+    pub const fn requires_isolation(self) -> bool {
+        matches!(
+            self,
+            Self::BlockingHost | Self::CpuBound | Self::Accelerator
+        )
+    }
+
+    /// Whether normal actor execution should resume only after an asynchronous
+    /// completion/wakeup.
+    pub const fn suspends_actor(self) -> bool {
+        matches!(
+            self,
+            Self::CooperativeSuspend | Self::AsyncExternal | Self::Accelerator
+        )
+    }
+}
+
+/// Classify a semantic effect plus operation name.
+///
+/// Operation-level overrides matter for effects such as Time: reading the
+/// clock is inline, while sleeping is a cooperative suspension.
+pub fn classify_effect_execution(
+    effect: &crate::types::Effect,
+    op: &str,
+) -> EffectExecutionClass {
+    use crate::types::Effect;
+    use EffectExecutionClass::*;
+
+    match (effect, op) {
+        (Effect::Time, "sleep") | (Effect::Receive, _) => CooperativeSuspend,
+
+        (Effect::Net, _)
+        | (Effect::Migrate, _)
+        | (Effect::Async, _)
+        | (Effect::Inference, _)
+        | (Effect::DB, _)
+        | (Effect::Realtime, _) => AsyncExternal,
+
+        (Effect::IO, _)
+        | (Effect::FS, _)
+        | (Effect::FFI, _)
+        | (Effect::Python, _)
+        | (Effect::Process, _)
+        | (Effect::System, _) => BlockingHost,
+
+        (Effect::UserDefined(_), _) => HandlerDefined,
+
+        (Effect::String, _)
+        | (Effect::Rand, _)
+        | (Effect::Time, _)
+        | (Effect::Spawn, _)
+        | (Effect::Send, _)
+        | (Effect::STM, _)
+        | (Effect::Cost, _)
+        | (Effect::Event, _)
+        | (Effect::Array, _)
+        | (Effect::Test, _)
+        | (Effect::Env, _)
+        | (Effect::Render, _)
+        | (Effect::Request, _)
+        | (Effect::Respond, _)
+        | (Effect::Client, _)
+        | (Effect::Web, _) => Inline,
+    }
+}
+
+/// Classify the concrete named effects used by VM/runtime built-ins.
+///
+/// This covers aliases/runtime surfaces that are intentionally not distinct
+/// variants in the stable Effect enum (Http→Net, Inference/LLM, Timer, Signal,
+/// Actor/Otp/Crdt, and pure helper namespaces). Unknown names fail closed as
+/// HandlerDefined so adding a built-in requires an explicit scheduling choice.
+pub fn classify_named_effect_execution(effect: &str, op: &str) -> EffectExecutionClass {
+    use EffectExecutionClass::*;
+
+    match (effect, op) {
+        ("Timer", "sleep") | ("Time", "sleep") | ("Signal", "wait") => CooperativeSuspend,
+
+        ("Http", _)
+        | ("Net", _)
+        | ("Inference", _)
+        | ("LLM", _)
+        | ("Realtime", _)
+        | ("Database", _)
+        | ("DB", _) => AsyncExternal,
+
+        ("IO", _)
+        | ("Debug", _)
+        | ("FS", _)
+        | ("Python", _)
+        | ("FFI", _)
+        | ("Process", _)
+        | ("System", _) => BlockingHost,
+
+        ("Actor", _)
+        | ("Array", _)
+        | ("Crdt", _)
+        | ("Env", _)
+        | ("Float", _)
+        | ("Int", _)
+        | ("Map", _)
+        | ("Otp", _)
+        | ("Random", _)
+        | ("Signal", _)
+        | ("StrBuilder", _)
+        | ("String", _)
+        | ("Test", _)
+        | ("Time", _)
+        | ("Timer", _)
+        | ("Web", _) => Inline,
+
+        _ => HandlerDefined,
+    }
+}
+
 /// Durability boundary for a side effect.
 ///
 /// This is deliberately narrower than an "exactly once" claim. Nulang can
@@ -265,6 +415,45 @@ mod tests {
 
         actor.is_agent = true;
         assert!(actor.role().is_err());
+    }
+
+    #[test]
+    fn effect_execution_class_distinguishes_waits_external_and_blocking_work() {
+        use crate::types::Effect;
+
+        assert_eq!(
+            classify_effect_execution(&Effect::Time, "now"),
+            EffectExecutionClass::Inline
+        );
+        assert_eq!(
+            classify_effect_execution(&Effect::Time, "sleep"),
+            EffectExecutionClass::CooperativeSuspend
+        );
+        assert_eq!(
+            classify_effect_execution(&Effect::Inference, "ask"),
+            EffectExecutionClass::AsyncExternal
+        );
+        assert_eq!(
+            classify_effect_execution(&Effect::Python, "call"),
+            EffectExecutionClass::BlockingHost
+        );
+        assert_eq!(
+            classify_effect_execution(&Effect::UserDefined("Custom".into()), "run"),
+            EffectExecutionClass::HandlerDefined
+        );
+    }
+
+    #[test]
+    fn execution_class_helpers_expose_scheduler_contract() {
+        assert!(EffectExecutionClass::BlockingHost.requires_isolation());
+        assert!(EffectExecutionClass::CpuBound.requires_isolation());
+        assert!(EffectExecutionClass::Accelerator.requires_isolation());
+        assert!(!EffectExecutionClass::Inline.requires_isolation());
+
+        assert!(EffectExecutionClass::CooperativeSuspend.suspends_actor());
+        assert!(EffectExecutionClass::AsyncExternal.suspends_actor());
+        assert!(EffectExecutionClass::Accelerator.suspends_actor());
+        assert!(!EffectExecutionClass::BlockingHost.suspends_actor());
     }
 
     #[test]
