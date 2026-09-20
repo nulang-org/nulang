@@ -34,6 +34,26 @@
 //! (the current tag set occupies the quiet-NaN range 0x7FF6–0x7FFE, so no
 //! valid non-NaN float will collide).
 // ---------------------------------------------------------------------------
+// Stable ABI contract
+// ---------------------------------------------------------------------------
+
+/// Version of the public tagged-value ABI shared by Nulang runtimes and hosts.
+///
+/// Increment this only for an intentionally incompatible change to the semantic
+/// value contract. Physical transports may add their own envelope versions,
+/// but a host claiming this ABI must preserve these tags and payload rules.
+pub const VALUE_ABI_VERSION: u32 = 1;
+
+/// Stable identifier for the public tagged-value ABI.
+pub const VALUE_ABI_ID: &str = "nulang.value/i64-tagged-v1";
+
+/// Number of high bits reserved for the type tag.
+pub const VALUE_ABI_TAG_BITS: u32 = 16;
+
+/// Number of low bits available to tagged payloads.
+pub const VALUE_ABI_PAYLOAD_BITS: u32 = 48;
+
+// ---------------------------------------------------------------------------
 // Masks
 // ---------------------------------------------------------------------------
 
@@ -248,6 +268,14 @@ pub fn is_float_raw(raw: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_value_abi_contract_descriptor() {
+        assert_eq!(VALUE_ABI_VERSION, 1);
+        assert_eq!(VALUE_ABI_ID, "nulang.value/i64-tagged-v1");
+        assert_eq!(VALUE_ABI_TAG_BITS + VALUE_ABI_PAYLOAD_BITS, 64);
+        assert_eq!(TAG_SHIFT, VALUE_ABI_PAYLOAD_BITS);
+    }
 
     #[test]
     fn test_tags_are_unique() {
