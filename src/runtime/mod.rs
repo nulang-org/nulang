@@ -18,6 +18,8 @@ pub mod cache_dispatch;
 pub mod cache_durable_store;
 #[cfg(feature = "cache-server")]
 pub mod cache_migration_journal;
+#[cfg(feature = "cache-server")]
+pub mod cache_wal;
 pub mod cache_pipeline;
 pub mod cache_routing;
 #[cfg(feature = "cache-server")]
@@ -100,6 +102,8 @@ pub use cache_dispatch::*;
 pub use cache_durable_store::*;
 #[cfg(feature = "cache-server")]
 pub use cache_migration_journal::*;
+#[cfg(feature = "cache-server")]
+pub use cache_wal::*;
 pub use cache_pipeline::*;
 pub use cache_routing::*;
 #[cfg(feature = "cache-server")]
