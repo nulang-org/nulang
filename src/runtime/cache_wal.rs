@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::cache::{
-    CacheDurableEntry, CacheDurableRestoreError, CacheStore, CacheTransferToken,
-    CacheTransferValue,
+    CacheDurableEntry, CacheDurableRestoreError, CacheStore, CacheTransferToken, CacheTransferValue,
 };
 
 const MAGIC: &[u8; 4] = b"NCWL";
@@ -146,7 +145,8 @@ impl CacheWal {
                 break;
             }
 
-            let expected = record_checksum(kind, len as u32, lsn, &bytes[payload_start..payload_end]);
+            let expected =
+                record_checksum(kind, len as u32, lsn, &bytes[payload_start..payload_end]);
             if bytes[payload_end..record_end] != expected {
                 return Err(CacheWalError::ChecksumMismatch);
             }
@@ -267,12 +267,7 @@ impl CacheWal {
         let records = self.read_records_after(checkpoint_lsn)?;
         let mut applied = checkpoint_lsn;
         for record in records {
-            apply_mutation(
-                store,
-                record.mutation,
-                now_ms,
-                wall_now_unix_ms,
-            )?;
+            apply_mutation(store, record.mutation, now_ms, wall_now_unix_ms)?;
             applied = record.lsn;
         }
         Ok(applied)
@@ -374,8 +369,8 @@ fn encode_mutation(mutation: &CacheWalMutation) -> Result<(u8, Vec<u8>), CacheWa
             Ok((KIND_DELETE, out))
         }
         CacheWalMutation::Batch(mutations) => {
-            let count = u32::try_from(mutations.len())
-                .map_err(|_| CacheWalError::LengthOverflow)?;
+            let count =
+                u32::try_from(mutations.len()).map_err(|_| CacheWalError::LengthOverflow)?;
             out.extend_from_slice(&count.to_be_bytes());
             for mutation in mutations {
                 let (subkind, payload) = encode_mutation(mutation)?;
@@ -383,8 +378,8 @@ fn encode_mutation(mutation: &CacheWalMutation) -> Result<(u8, Vec<u8>), CacheWa
                     return Err(CacheWalError::TooLarge);
                 }
                 out.push(subkind);
-                let len = u32::try_from(payload.len())
-                    .map_err(|_| CacheWalError::LengthOverflow)?;
+                let len =
+                    u32::try_from(payload.len()).map_err(|_| CacheWalError::LengthOverflow)?;
                 out.extend_from_slice(&len.to_be_bytes());
                 out.extend_from_slice(&payload);
                 if out.len() > MAX_RECORD_BYTES {
@@ -556,8 +551,8 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::cache::{CacheTtl, CacheValueView};
     use super::*;
-    use super::super::cache::{CacheValueView, CacheTtl};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -652,10 +647,7 @@ mod tests {
 
         store.set_bytes(b"k", b"one", None, 0);
         let first = store.durable_entry_for_key(b"k", 0, wall).unwrap();
-        assert_eq!(
-            wal.append_upsert(&first, CacheWalSync::Fsync).unwrap(),
-            1
-        );
+        assert_eq!(wal.append_upsert(&first, CacheWalSync::Fsync).unwrap(), 1);
 
         super::super::cache_durable_store::write_cache_snapshot_at_lsn(
             &snapshot_path,
@@ -667,10 +659,7 @@ mod tests {
 
         store.set_bytes(b"k", b"two", None, 1);
         let second = store.durable_entry_for_key(b"k", 1, wall + 1).unwrap();
-        assert_eq!(
-            wal.append_upsert(&second, CacheWalSync::Fsync).unwrap(),
-            2
-        );
+        assert_eq!(wal.append_upsert(&second, CacheWalSync::Fsync).unwrap(), 2);
 
         let restored =
             super::super::cache_durable_store::restore_cache_snapshot_with_lsn(&snapshot_path, 0)
@@ -681,10 +670,7 @@ mod tests {
             .replay_into(&mut recovered, restored.checkpoint_lsn, 0, wall + 2)
             .unwrap();
         assert_eq!(applied, 2);
-        assert_eq!(
-            recovered.get(b"k", 0),
-            Some(CacheValueView::Bytes(b"two"))
-        );
+        assert_eq!(recovered.get(b"k", 0), Some(CacheValueView::Bytes(b"two")));
         assert_eq!(
             recovered
                 .durable_entry_for_key(b"k", 0, wall + 2)
