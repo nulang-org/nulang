@@ -98,6 +98,17 @@ two major versions.*
   or open contracts fail closed. Protocol type hashes now use the canonical
   content encoding rather than information-erasing NTIR.
 
+### Compiler-owned host effect ABI — 2026-09-20
+- **Built-in host effects now lower through a versioned compiler-owned contract**
+  (Experimental, `src/host_effect_abi.rs`, `spec/host-effects/v0alpha1.json`,
+  `src/mir_wasm.rs`). The compiler defines canonical operation identity,
+  deterministic request shape, response projection, minimum checked authority,
+  and replay classification for platform-provided effects. WASM lowering emits
+  canonical versioned host-operation identifiers for known operations instead
+  of requiring the host to reconstruct Nulang semantics from dotted source
+  spellings such as `Storage.write`. Unknown/custom effects retain the legacy
+  compatibility path while the experimental ABI rolls out.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
