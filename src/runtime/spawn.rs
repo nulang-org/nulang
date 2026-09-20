@@ -452,6 +452,14 @@ pub(crate) fn register_recovery_module(
     offsets: Vec<usize>,
     compensation_offsets: Vec<Option<usize>>,
 ) {
+    if let Some(actor) = rt.actors.get(&actor_id) {
+        if let Some(schema_name) =
+            super::schema_identity::canonical_schema_name_for_runtime_actor(&module, &actor.name)
+        {
+            rt.recovery_schema_names
+                .insert(actor_id, schema_name.to_string());
+        }
+    }
     rt.recovery_modules
         .insert(actor_id, (module, offsets, compensation_offsets));
 }
