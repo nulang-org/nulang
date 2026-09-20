@@ -118,6 +118,23 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                     ctx.parallel_branches_of.push((abs_idx, branches.clone()));
                 }
             }
+            let protocol_id = crate::protocol::ProtocolSchema::new(
+                a.name.clone(),
+                a.behaviors.iter().map(|behavior| {
+                    crate::protocol::ProtocolMember::request_reply(
+                        behavior.name.clone(),
+                        behavior
+                            .params
+                            .iter()
+                            .map(|(_, ty)| crate::protocol::ProtocolTypeId::from_type(ty))
+                            .collect(),
+                        crate::protocol::ProtocolTypeId::from_type(&behavior.ret),
+                    )
+                }),
+            )
+            .ok()
+            .map(|schema| *schema.id().as_bytes());
+
             let state_models = a
                 .state_fields
                 .iter()
@@ -147,6 +164,7 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 backend: crate::ast::ActorBackendKind::Native,
                 fallback_config: a.fallback_config.clone(),
                 retry_config: a.retry_config.clone(),
+                protocol_id,
                 type_hash: None,
                 version: a.version,
                 migrations: String::new(),
