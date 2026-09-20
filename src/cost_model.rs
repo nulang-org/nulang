@@ -17,6 +17,9 @@ pub struct MechanicalCostSummary {
     pub instructions: usize,
     pub allocation_sites: usize,
     pub heap_allocation_sites: usize,
+    /// Heap allocation sites proven eligible for the activation-local iso arena.
+    /// This is a strategy opportunity, not an allocation-free guarantee.
+    pub arena_eligible_allocation_sites: usize,
     pub string_materialization_sites: usize,
     pub copy_sites: usize,
     pub call_sites: usize,
@@ -140,6 +143,10 @@ pub struct AllocationSite {
     pub function: Option<String>,
     pub source_line: Option<u32>,
     pub class: AllocationClass,
+    /// True when the existing iso-arena escape analysis proves this allocation
+    /// can be reclaimed with its activation instead of entering the general
+    /// actor heap/ORCA lifecycle.
+    pub arena_eligible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -214,11 +221,12 @@ impl MechanicalCostReport {
 
 fn format_summary(name: &str, summary: &MechanicalCostSummary) -> String {
     format!(
-        "  {:<24} instr={:<5} alloc={:<4} heap={:<4} strings={:<4} copies={:<4} calls={:<4} branches={:<4} effects={:<4} suspend={:<4} ffi={:<4} actor={:<4} dist={:<4} io={}\n",
+        "  {:<24} instr={:<5} alloc={:<4} heap={:<4} arena={:<4} strings={:<4} copies={:<4} calls={:<4} branches={:<4} effects={:<4} suspend={:<4} ffi={:<4} actor={:<4} dist={:<4} io={}\n",
         name,
         summary.instructions,
         summary.allocation_sites,
         summary.heap_allocation_sites,
+        summary.arena_eligible_allocation_sites,
         summary.string_materialization_sites,
         summary.copy_sites,
         summary.call_sites,
@@ -232,11 +240,20 @@ fn format_summary(name: &str, summary: &MechanicalCostSummary) -> String {
     )
 }
 
-fn summary_for_range(module: &CodeModule, start: usize, len: usize) -> MechanicalCostSummary {
+fn summary_for_range(
+    module: &CodeModule,
+    arena_sites: &std::collections::HashSet<usize>,
+    start: usize,
+    len: usize,
+) -> MechanicalCostSummary {
     let mut summary = MechanicalCostSummary::default();
     let end = start.saturating_add(len).min(module.instructions.len());
-    for instruction in &module.instructions[start.min(end)..end] {
+    for (pc, instruction) in module.instructions[start.min(end)..end].iter().enumerate() {
+        let absolute_pc = start + pc;
         summary.observe(instruction.opcode);
+        if arena_sites.contains(&absolute_pc) {
+            summary.arena_eligible_allocation_sites += 1;
+        }
     }
     summary
 }
@@ -269,7 +286,8 @@ fn allocation_class(opcode: OpCode) -> Option<AllocationClass> {
 /// debug ranges remain visible under `unattributed`; this commonly includes
 /// module-level `__main` scaffolding in older artifacts.
 pub fn analyze_module(module: &CodeModule) -> MechanicalCostReport {
-    let total = summary_for_range(module, 0, module.instructions.len());
+    let arena_sites = crate::iso_arena::qualifying_alloc_sites(module);
+    let total = summary_for_range(module, &arena_sites, 0, module.instructions.len());
 
     let functions = module
         .debug_functions
@@ -278,7 +296,12 @@ pub fn analyze_module(module: &CodeModule) -> MechanicalCostReport {
             name: function.name.clone(),
             code_offset: function.code_offset,
             code_len: function.code_len,
-            summary: summary_for_range(module, function.code_offset, function.code_len),
+            summary: summary_for_range(
+                module,
+                &arena_sites,
+                function.code_offset,
+                function.code_len,
+            ),
         })
         .collect::<Vec<_>>();
 
@@ -301,6 +324,9 @@ pub fn analyze_module(module: &CodeModule) -> MechanicalCostReport {
     for (pc, instruction) in module.instructions.iter().enumerate() {
         if !covered[pc] {
             unattributed.observe(instruction.opcode);
+            if arena_sites.contains(&pc) {
+                unattributed.arena_eligible_allocation_sites += 1;
+            }
         }
     }
 
@@ -315,6 +341,7 @@ pub fn analyze_module(module: &CodeModule) -> MechanicalCostReport {
                 function: function_name_at(module, pc),
                 source_line: module.line_at(pc),
                 class,
+                arena_eligible: arena_sites.contains(&pc),
             })
         })
         .collect();
