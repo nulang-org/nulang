@@ -287,9 +287,10 @@ impl MirCodegen {
                 .performance_contracts
                 .contains(&crate::ast::PerformanceContract::Hot)
             {
-                self.module
-                    .hot_function_ranges
-                    .push((offset, self.module.instructions.len().saturating_sub(offset)));
+                self.module.hot_function_ranges.push((
+                    offset,
+                    self.module.instructions.len().saturating_sub(offset),
+                ));
             }
             if func.name == "__main" {
                 main_idx = Some(idx);
