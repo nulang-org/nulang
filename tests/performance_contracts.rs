@@ -170,3 +170,36 @@ fn hot_path() -> String {
     assert!(msg.contains("hot_path"), "{msg}");
     assert!(msg.contains("@no_alloc()"), "{msg}");
 }
+
+
+fn compile_to_bytecode(source: &str) -> nulang::bytecode::CodeModule {
+    let mut mir = lower_to_mir(source).expect("source should lower to MIR");
+    nulang::mir_codegen::compile_mir(&mut mir, "performance-contract-test")
+        .expect("MIR should compile to bytecode")
+}
+
+#[test]
+fn test_hot_annotation_reaches_bytecode_ranges() {
+    let module = compile_to_bytecode(
+        r#"
+@hot()
+fn hot_add(x: Int) -> Int {
+    x + 1
+}
+
+fn cold_add(x: Int) -> Int {
+    x + 1
+}
+"#,
+    );
+
+    let hot_offset = module
+        .function_offset_by_name("hot_add")
+        .expect("hot_add bytecode offset");
+    let cold_offset = module
+        .function_offset_by_name("cold_add")
+        .expect("cold_add bytecode offset");
+
+    assert!(module.is_hot_pc(hot_offset));
+    assert!(!module.is_hot_pc(cold_offset));
+}
