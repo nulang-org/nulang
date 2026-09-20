@@ -1439,6 +1439,7 @@ impl<'c> FnLowerer<'c> {
                 behavior,
                 args,
                 remote,
+                required_protocol,
                 ..
             } => {
                 let actor_hint = operand_name_hint(actor);
@@ -1455,6 +1456,7 @@ impl<'c> FnLowerer<'c> {
                         behavior_idx: idx,
                         args: arg_ids,
                         remote: *remote,
+                        required_protocol: *required_protocol,
                     },
                 );
                 Ok(())
