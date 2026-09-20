@@ -53,6 +53,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// before it becomes eligible for JIT compilation.
 pub const HOT_THRESHOLD: u64 = 1000;
 
+/// Source-declared `@hot()` functions tier up sooner, but still require
+/// repeated execution so one-shot initialization code is not compiled eagerly.
+pub const ANNOTATED_HOT_THRESHOLD: u64 = 100;
+
 /// Threshold for tier-2 recompilation: after an already-compiled region
 /// has been executed this many additional times, a more aggressive
 /// compilation strategy is attempted (typed path if not already typed,
@@ -177,6 +181,15 @@ impl JitSession {
     /// interpreted at least `HOT_THRESHOLD` times, making it eligible for
     /// JIT compilation.
     pub fn record_and_check_hot(&mut self, module_idx: usize, offset: usize) -> bool {
+        self.record_and_check_hot_with_threshold(module_idx, offset, HOT_THRESHOLD)
+    }
+
+    fn record_and_check_hot_with_threshold(
+        &mut self,
+        module_idx: usize,
+        offset: usize,
+        threshold: u64,
+    ) -> bool {
         if module_idx >= self.hot_counts.len() {
             self.hot_counts.resize(module_idx + 1, Vec::new());
         }
@@ -189,7 +202,7 @@ impl JitSession {
         }
         let count = &mut row[offset];
         *count += 1;
-        u64::from(*count) >= HOT_THRESHOLD
+        u64::from(*count) >= threshold
     }
 
     /// Reset all hot counters (used by tests that re-heat a region on an
@@ -992,17 +1005,7 @@ impl crate::backends::JitBackend for JitSession {
     }
 
     fn record_and_check_hot(&mut self, module_idx: usize, pc: usize) -> bool {
-        if module_idx >= self.hot_counts.len() {
-            self.hot_counts.resize(module_idx + 1, Vec::new());
-        }
-        let row = &mut self.hot_counts[module_idx];
-        if pc >= row.len() {
-            let new_len = (pc + 1).max(row.len().max(1) * 2);
-            row.resize(new_len, 0);
-        }
-        let count = &mut row[pc];
-        *count += 1;
-        u64::from(*count) >= HOT_THRESHOLD
+        JitSession::record_and_check_hot(self, module_idx, pc)
     }
 
     fn probe_and_maybe_hot(&mut self, module_idx: usize, pc: usize) -> bool {
@@ -1068,8 +1071,14 @@ impl crate::backends::JitBackend for JitSession {
             return crate::backends::TieredAction::RanJit;
         }
 
-        // Record execution for hotness
-        if self.record_and_check_hot(module_idx, pc) {
+        // Record execution for hotness. A source-level @hot() annotation
+        // lowers the tier-up threshold without changing execution semantics.
+        let hot_threshold = if module.is_hot_pc(pc) {
+            ANNOTATED_HOT_THRESHOLD
+        } else {
+            HOT_THRESHOLD
+        };
+        if self.record_and_check_hot_with_threshold(module_idx, pc, hot_threshold) {
             let ms = self.may_suspend_for(module_idx, module).to_vec();
             let rc = self.recursive_for(module_idx, module).to_vec();
             let (region_len, native_calls) =
