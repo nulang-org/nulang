@@ -6842,6 +6842,52 @@ fn test_object_ref_cross_shard_copies_bytes() {
     );
 }
 
+#[test]
+fn test_object_view_cross_shard_copies_only_view_bytes() {
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut a = shards[0].spawn_actor(Box::new(|| vec![]));
+    while a % 2 != 0 {
+        a = shards[0].spawn_actor(Box::new(|| vec![]));
+    }
+    let mut b = shards[1].spawn_actor(Box::new(|| vec![]));
+    while b % 2 != 1 {
+        b = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let source_shard = (a % 2) as usize;
+    let target_shard = (b % 2) as usize;
+    let source_id = shards[source_shard]
+        .object_store
+        .put(vec![10, 20, 30, 40, 50].into_boxed_slice());
+    let view_id = shards[source_shard]
+        .object_store
+        .slice(source_id, 1, 4)
+        .expect("valid zero-copy view");
+
+    shards[source_shard].current_actor = Some(a);
+    shards[source_shard].send_message_by_id(b, 0, &[Value::object(view_id)]);
+    shards[target_shard].drain_cross_shard_messages();
+
+    let received_msg = shards[target_shard]
+        .actors
+        .get_mut(&b)
+        .unwrap()
+        .mailbox
+        .pop()
+        .unwrap();
+    let local_id = received_msg.payload[0].as_object_id().unwrap();
+    assert_eq!(
+        shards[target_shard]
+            .object_store
+            .get(local_id)
+            .unwrap()
+            .as_bytes(),
+        &[20, 30, 40],
+        "cross-shard serialization must copy only the logical view range"
+    );
+}
+
 // ========================================================================
 // Built-in Grain effects
 // ========================================================================
