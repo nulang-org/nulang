@@ -1,6 +1,6 @@
 # RFC 0022: Logical Actor Identity and Activation Handles
 
-- **Status:** Draft — Phase 1 implemented
+- **Status:** Draft — Phase 1 + local activation fencing substrate implemented
 - **Tier:** Experimental
 - **Created:** 2026-09-20
 - **Depends on:** RFC 0016 (virtual actors), RFC 0017 (unified runtime primitives)
@@ -12,7 +12,8 @@ Nulang virtual actors need separate logical and physical identities.
 - `GrainId` is the lossless logical identity: `(actor type, key)`.
 - `LogicalActorId` is a stable 128-bit BLAKE3-derived digest for compact directory, persistence, tracing, and wire metadata.
 - `ActivationHandle` is an ephemeral 48-bit runtime-local handle compatible with the current NaN-boxed `ActorRef` representation.
-- `ActivationDirectory` maintains a bijection between full `GrainId` values and live activation handles.
+- `ActivationEpoch` is a monotonic incarnation number for successive activations of the same full logical identity.
+- `ActivationDirectory` maintains a bijection between full `GrainId` values and live activation handles and locally fences stale activation stamps.
 
 The existing `grain_actor_id` 48-bit FNV mapping remains unchanged for compatibility, but is explicitly legacy-only and must not become the durable identity boundary.
 
@@ -58,12 +59,28 @@ The 128-bit digest is an index/protocol representation, not a license to discard
 
 Activation handles are runtime-local, may change after reactivation/migration, and must not be used as the sole durable persistence key.
 
+### Activation epoch
+
+Every live activation also carries an `ActivationEpoch`, starting at 1. Repeated
+resolution of the same live activation preserves its epoch. Removing and later
+reactivating the same full `GrainId` advances the epoch monotonically.
+
+The local authority token is therefore the full logical identity plus
+`(ActivationHandle, ActivationEpoch)`. A delayed operation carrying an older
+stamp is stale even when the logical actor identity is unchanged.
+
+`ActivationDirectory::is_current` enforces this inside one runtime process.
+Cross-process or cross-node enforcement is deliberately not claimed until the
+epoch is stored in the durable/distributed directory. Epoch history is keyed by
+the full `GrainId`, not solely by the compact 128-bit digest.
+
 ## Phase 1 implemented
 
 - Add canonical `GrainId` encoding.
 - Add 128-bit `LogicalActorId`.
 - Add `ActivationHandle` with the current VM payload bound.
 - Add collision-free `ActivationDirectory` keyed by full `GrainId`.
+- Add local monotonic `ActivationEpoch` / `ActivationStamp` fencing across deactivation and reactivation.
 - Preserve the historical `grain_actor_id` encoding exactly.
 - Add regression tests for canonical identity, stable logical IDs, handle bounds, directory bijection, and legacy-ID stability.
 
@@ -84,8 +101,8 @@ Activation handles are runtime-local, may change after reactivation/migration, a
 
 ### Phase 4 — distributed entity directory
 
-- Map logical identity to node, activation generation, and local activation handle.
-- Fence stale routes using activation generations/epochs.
+- Persist and replicate the last authoritative activation epoch with logical identity, node, and local activation handle.
+- Fence stale routes and stale commits using the replicated activation epoch.
 - Re-resolve after node failure or migration rather than assuming actor-number permanence.
 
 ### Phase 5 — wire addressing
@@ -103,7 +120,9 @@ This RFC's first phase is additive. It does not change the NaN-boxed value ABI, 
 3. Dehydration or migration may change an activation handle without changing logical identity.
 4. Persistence correctness must not depend on reproducing a prior activation handle.
 5. The legacy 48-bit FNV mapping remains byte-for-byte stable during the compatibility window.
-6. Distributed routing must eventually fence stale activations with generations/epochs.
+6. A reactivated full logical identity receives an epoch strictly greater than its prior local incarnation.
+7. A stale local activation stamp is rejected once a replacement activation becomes authoritative.
+8. Distributed routing must eventually persist and fence stale activations with generations/epochs.
 
 ## Why not widen ActorRef immediately?
 
