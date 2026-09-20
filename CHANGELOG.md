@@ -67,6 +67,12 @@ two major versions.*
   every required behavior/signature is present. Widening to claim missing
   behaviors is rejected. The check is applied at value-to-expected-type
   boundaries without making general HM unification asymmetric.
+- **Compiler-owned protocol fingerprints** (Experimental, `src/protocol.rs`).
+  `ProtocolSchema::from_actor_type` derives structural protocol identity from
+  the typechecker's canonical actor behavior record. Full behavior signatures
+  include parameter packs, return types, effects, and capabilities; unresolved
+  or open contracts fail closed. Protocol type hashes now use the canonical
+  content encoding rather than information-erasing NTIR.
 
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
