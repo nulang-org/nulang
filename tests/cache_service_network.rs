@@ -2140,7 +2140,6 @@ fn automatic_remote_transfer_retry_recovers_without_early_source_finalize() {
     service_b.shutdown().unwrap();
 }
 
-
 #[test]
 fn configured_missing_snapshot_fails_closed() {
     let missing = temp_journal_path("missing-shard-checkpoint").with_extension("snapshot");
@@ -2149,11 +2148,8 @@ fn configured_missing_snapshot_fails_closed() {
 
     match CacheServiceBuilder::new(node_id, placement)
         .with_shard(
-            CacheServiceShardConfig::new(
-                "127.0.0.1:0".parse().unwrap(),
-                "127.0.0.1",
-            )
-            .restore_from_snapshot(&missing),
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .restore_from_snapshot(&missing),
         )
         .build()
     {
@@ -2203,11 +2199,8 @@ fn shard_checkpoint_restores_resp_values_and_reduces_ttl() {
 
     let restored = CacheServiceBuilder::new(node_id, placement)
         .with_shard(
-            CacheServiceShardConfig::new(
-                "127.0.0.1:0".parse().unwrap(),
-                "127.0.0.1",
-            )
-            .restore_from_snapshot(&snapshot_path),
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .restore_from_snapshot(&snapshot_path),
         )
         .build()
         .unwrap()
@@ -2218,9 +2211,7 @@ fn shard_checkpoint_restores_resp_values_and_reduces_ttl() {
     client
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    client
-        .write_all(&frame(&[b"GET", b"persist"]))
-        .unwrap();
+    client.write_all(&frame(&[b"GET", b"persist"])).unwrap();
     let mut persistent = [0u8; 11];
     client.read_exact(&mut persistent).unwrap();
     assert_eq!(&persistent, b"$5\r\nvalue\r\n");
