@@ -543,7 +543,6 @@ pub fn render_wit(world: &WitWorld) -> String {
 /// New compiler paths should use [`effect_row_to_wit_imports`] or
 /// [`generate_wit_world_from_effect_rows`], which consume checked `EffectRow`
 /// values and therefore include transitive callee effects and reject open rows.
-#[deprecated(note = "use compiler-checked EffectRow-based WIT generation")]
 pub fn extract_effects_from_source(source: &str) -> BTreeSet<String> {
     let mut effects = BTreeSet::new();
 
