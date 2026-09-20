@@ -9,9 +9,9 @@ use crate::runtime::gc::OrcaGc;
 use crate::runtime::heap::{ActorHeap, TypeTag};
 use crate::vm::{ActorVmCallbacks, Frame, Value};
 use std::cell::RefCell;
-use std::rc::Rc;
 #[cfg(feature = "tcp")]
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -6746,6 +6746,22 @@ fn test_object_store_put_get() {
     let id = rt.object_store.put(bytes);
     let entry = rt.object_store.get(id).unwrap();
     assert_eq!(entry.as_bytes(), &[1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn test_standalone_vm_object_callbacks_support_zero_copy_views() {
+    let mut callbacks = crate::vm::StandaloneVmCallbacks::new();
+
+    let object = callbacks.object_put(vec![1, 2, 3, 4].into_boxed_slice());
+    let view = callbacks.object_slice(object, 1, 4);
+
+    assert!(object.is_object());
+    assert!(view.is_object());
+    assert_eq!(callbacks.object_len(object), Some(4));
+    assert_eq!(callbacks.object_len(view), Some(3));
+    assert_eq!(callbacks.object_get_byte(view, 0), Some(2));
+    assert_eq!(callbacks.object_get_byte(view, 2), Some(4));
+    assert_eq!(callbacks.object_get_byte(view, 3), None);
 }
 
 #[test]
