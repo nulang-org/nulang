@@ -10,9 +10,9 @@ Every change must preserve all of the following:
 3. The normal/build dependency tree contains no Cranelift crates, Wasmtime, or
    `libloading`.
 4. Cranelift and `target-lexicon` root dependencies remain owned by the
-   `native-codegen` feature.
-5. `mobile-runtime` does not enable `native-codegen` or dynamic FFI loading.
-6. Default builds retain `native-codegen` until that public default changes
+   `jit-codegen` / `native-aot` features.
+5. `mobile-runtime` does not enable `native-codegen`, `jit-codegen`, `native-aot`, or dynamic FFI loading.
+6. Default builds retain the backward-compatible `native-codegen` umbrella until that public default changes
    intentionally.
 
 The canonical local/CI command is:
