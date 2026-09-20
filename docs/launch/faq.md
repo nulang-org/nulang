@@ -31,9 +31,10 @@ package manager, LSP server, REPL, test runner. ~1,680 tests plus a `.nula`
 conformance suite under `conformance/`.
 
 Experimental (feature-gated or marked): multi-node distribution over TCP,
-WASM backend, AOT native backend (pure-functional programs only), AI-agent
-runtime, CRDT state fields (implemented and tested at the Rust level; the
-`.nula` surface parses but behaves as `durable` — SPEC2 §9.10).
+WASM/WasmFX backends, the secondary native AOT backend (restricted semantics),
+AI-agent runtime, Fabric, RESP cache serving, typed actor-protocol hardening,
+and CRDT state fields (implemented and tested at the Rust level; the `.nula`
+surface parses but behaves as `durable` — SPEC2 §9.10).
 
 Documented known gaps: `send` to an undeclared behavior currently runs the
 actor's first behavior instead of erroring, and cross-type behavior-name
