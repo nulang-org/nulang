@@ -55,6 +55,7 @@ pub mod lexer;
 #[cfg(feature = "lsp")]
 pub mod lsp;
 pub mod mir;
+pub mod mir_cfg;
 pub mod mir_codegen;
 pub mod mir_escape;
 pub mod mir_inline;
