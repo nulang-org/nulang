@@ -421,10 +421,36 @@ The replay format deliberately logs physical post-state rather than RESP command
 text so allocator/free-slot behavior does not have to be reproduced by inference
 and migration transfer tokens remain stable.
 
-This still does **not** make normal writes crash durable by itself. The format
-and replay substrate exists, but command execution has not yet selected when a
-WAL append/fsync must happen relative to client acknowledgement. Keep
-acknowledgement classes explicit:
+Normal cache command execution can now opt into synchronous local journal
+durability. `CacheServiceShardConfig::journaled(wal_path)` opens/replays the
+shard WAL before the reactor starts. Memory-mode shards do not open a WAL.
+Journal-mode reactors classify only mutating commands, capture exact pre-state
+for their keys, execute the existing RESP path, compare exact post-state, then
+append one atomic WAL batch under one LSN and fsync it before the response can
+reach the socket flush path. SET, DEL, INCR, EXPIRE and MSET are covered;
+read-only commands generate no WAL work. Duplicate keys within one command are
+coalesced before delta generation.
+
+Authenticated remote commands use the same owning-reactor durability gate. The
+application CommandResponse is created only after WAL fsync. A deterministic
+test executes a remote non-idempotent INCR, receives `:1`, restarts the target
+cache service with the same WAL, and reads back `1`. Local tests recover
+SET/INCR/MSET/DEL/EXPIRE from WAL alone and recover post-checkpoint mutations by
+replaying only records newer than the snapshot LSN.
+
+A journal failure after the in-memory mutation is fundamentally an **unknown
+execution outcome**: pretending the mutation did not happen would make automatic
+retry unsafe for non-idempotent commands. The reactor therefore does not flush
+the local RESP response, reports an explicit unknown-outcome durability error
+for remote commands, and fail-stops that shard instead of accepting more work
+against a compromised WAL stream.
+
+Migration import/finalize control operations are still governed by their
+migration proof journal and are not yet claimed as CacheStore-WAL durable in
+this slice. That boundary must be closed before snapshot+WAL can recover an
+arbitrary non-drained migration solely from CacheStore durability.
+
+Keep acknowledgement classes explicit:
 
 - memory: acknowledge after local mutation;
 - async journal: enqueue WAL append before acknowledgement;
@@ -454,9 +480,9 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Wire the exact-state WAL into reactor mutation execution with explicit
-   memory and synchronous-journal acknowledgement modes; add async-journal only
-   with a bounded writer queue and well-defined failure semantics.
+1. Journal migration import/finalize CacheStore mutations under the same exact
+   post-state WAL so non-drained migration recovery has complete source/target
+   state.
 2. Use snapshot + WAL replay to recover non-drained migrations, preserving
    source generations and reconciling in-flight migration journal state.
 3. Reconcile journaled pending commit intents against durable placement/control
