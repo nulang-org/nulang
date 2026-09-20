@@ -79,8 +79,15 @@ impl MechanicalCostSummary {
 
         if matches!(
             opcode,
-            FFICall | PyImport | PyGetAttr | PyCall | PyCallKw | PySetAttr | PyToNu
-                | PyFromNu | PyRelease
+            FFICall
+                | PyImport
+                | PyGetAttr
+                | PyCall
+                | PyCallKw
+                | PySetAttr
+                | PyToNu
+                | PyFromNu
+                | PyRelease
         ) {
             self.ffi_boundaries += 1;
         }
@@ -113,7 +120,10 @@ impl MechanicalCostSummary {
             self.distributed_operations += 1;
         }
 
-        if matches!(opcode, SPrint | SRead | FOpen | FRead | FWrite | FClose | Print) {
+        if matches!(
+            opcode,
+            SPrint | SRead | FOpen | FRead | FWrite | FClose | Print
+        ) {
             self.io_operations += 1;
         }
     }
@@ -318,7 +328,6 @@ pub fn analyze_module(module: &CodeModule) -> MechanicalCostReport {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NoAllocViolation {
     pub function: String,
@@ -340,31 +349,11 @@ fn noalloc_forbidden_opcode(opcode: OpCode) -> Option<&'static str> {
         Perform | PerformDirect | PerformAsync | Handle | Resume | Unwind => {
             Some("effect/continuation boundary may allocate")
         }
-        Receive
-        | ReceiveWait
-        | SignalWait
-        | Ask
-        | Spawn
-        | Send
-        | Monitor
-        | Demon
-        | Link
-        | Unlink
-        | Exit
-        | Yield
-        | StateGet
-        | StateSet
-        | Emit
-        | ReceiveMatch
-        | ReceiveCommit => Some("actor/suspension boundary may allocate"),
-        FFICall
-        | PyImport
-        | PyGetAttr
-        | PyCall
-        | PyCallKw
-        | PySetAttr
-        | PyToNu
-        | PyFromNu
+        Receive | ReceiveWait | SignalWait | Ask | Spawn | Send | Monitor | Demon | Link
+        | Unlink | Exit | Yield | StateGet | StateSet | Emit | ReceiveMatch | ReceiveCommit => {
+            Some("actor/suspension boundary may allocate")
+        }
+        FFICall | PyImport | PyGetAttr | PyCall | PyCallKw | PySetAttr | PyToNu | PyFromNu
         | PyRelease => Some("foreign-runtime boundary is not allocation-provable"),
         Migrate | RSend | RAsk | RSpawn | Gossip => {
             Some("distributed-runtime boundary may allocate")
@@ -403,10 +392,7 @@ fn direct_calls(func: &crate::mir::Function) -> (Vec<usize>, bool) {
     (calls, has_indirect)
 }
 
-fn function_bytecode_range(
-    module: &CodeModule,
-    function_index: usize,
-) -> Option<(usize, usize)> {
+fn function_bytecode_range(module: &CodeModule, function_index: usize) -> Option<(usize, usize)> {
     let start = *module.function_table.get(function_index)?;
     let info = module
         .debug_functions
@@ -415,10 +401,7 @@ fn function_bytecode_range(
     Some((start, info.code_len))
 }
 
-fn direct_noalloc_reason(
-    module: &CodeModule,
-    function_index: usize,
-) -> Option<String> {
+fn direct_noalloc_reason(module: &CodeModule, function_index: usize) -> Option<String> {
     let Some((start, len)) = function_bytecode_range(module, function_index) else {
         return Some(format!(
             "missing bytecode range metadata for function-table index {}",
@@ -489,9 +472,8 @@ pub fn validate_noalloc_contracts(
         let (targets, has_indirect) = direct_calls(func);
         calls[idx] = targets;
         if has_indirect && direct_reason[idx].is_none() {
-            direct_reason[idx] = Some(
-                "indirect/closure call target cannot be proven allocation-free".to_string(),
-            );
+            direct_reason[idx] =
+                Some("indirect/closure call target cannot be proven allocation-free".to_string());
         }
     }
 
@@ -556,7 +538,6 @@ pub fn validate_noalloc_contracts(
         Err(violations)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
