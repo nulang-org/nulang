@@ -53,7 +53,7 @@
 | ID | Threat | Mitigation | Status |
 |---|---|---|---|
 | W1 | **Sandbox escape via host imports** | Wasmtime `Linker` limits imports to explicitly-wrapped functions. Guard pages (4GiB reserved, 128MiB guard) contain linear memory. | Implemented. |
-| W2 | **Capability escalation in component model** | WASM component capability gate (TBD in P5b) will restrict which host capabilities a component may import. | Not yet implemented. |
+| W2 | **Capability escalation in component model** | Core Wasmtime native FFI is exact-grant gated and deny-by-default; full WIT/WASI/component import derivation from the authority manifest remains required. | Partial — FFI boundary enforced; general component/WASI mapping pending. |
 | W3 | **Infinite loop in guest** | Wasmtime fuel metering (not yet wired) or execution timeout. | Not yet implemented. |
 | W4 | **AOT compilation of untrusted wasm** | `wasmtime compile` produces `.cwasm` files that are only loaded by the trusted runtime. Do not run `wasmtime compile` on untrusted input. | Documented. |
 
