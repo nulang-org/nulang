@@ -305,7 +305,9 @@ impl JitSession {
         }
 
         let simd_region = analyze_region(instructions, start_offset, num_instrs, None)?;
-        if !native_simd_codegen_supported(&simd_region) {
+        if !native_simd_codegen_supported(&simd_region)
+            || !Self::simd_promotion_state_safe(&simd_region, instructions)
+        {
             return None;
         }
         if simd_region.trip_count_hint.is_none()
@@ -330,6 +332,154 @@ impl JitSession {
             .insert((module_idx, start_offset), (ptr, num_instrs));
         self.simd_regions.insert((module_idx, start_offset));
         Some(std::mem::transmute(ptr))
+    }
+
+    /// Conservative semantic gate for the first production SIMD tier.
+    ///
+    /// The current SIMD emitter accelerates array memory effects but does not
+    /// reproduce every scalar scratch-register write. Only promote canonical
+    /// zero-based counted loops whose scratch state is unobservable after the
+    /// region. Broader loop shapes can be admitted once bytecode liveness is
+    /// threaded into the JIT.
+    fn simd_promotion_state_safe(
+        region: &crate::jit::simd_analyzer::SimdRegion,
+        instructions: &[crate::bytecode::Instruction],
+    ) -> bool {
+        use crate::bytecode::OpCode;
+        use crate::jit::simd_analyzer::VectorizablePattern;
+
+        let start = region.start_offset;
+        let Some(end) = start.checked_add(region.num_instrs) else {
+            return false;
+        };
+        if start >= instructions.len() || end > instructions.len() || end <= start + 2 {
+            return false;
+        }
+        let body = &instructions[start..end];
+
+        // Native SIMD currently models a canonical counted loop only:
+        //   [ArrLen/Const0 preheader] ...
+        //   array loads/op/store; IInc
+        //   ICmpLt induction,bound -> cond
+        //   JmpT cond -> loop body
+        let branch = body[body.len() - 1];
+        if branch.opcode != OpCode::JmpT {
+            return false;
+        }
+        let cmp = body[body.len() - 2];
+        if cmp.opcode != OpCode::ICmpLt
+            || cmp.op1 != region.induction_var_reg
+            || cmp.op3 != branch.op1
+        {
+            return false;
+        }
+        let bound_reg = cmp.op2;
+
+        let branch_pc = end - 1;
+        let target = branch_pc as i64 + i64::from(branch.offset16());
+        if target < start as i64 || target >= branch_pc as i64 {
+            return false;
+        }
+        let target = target as usize;
+
+        let first_array = body
+            .iter()
+            .position(|instr| matches!(instr.opcode, OpCode::ArrLoad | OpCode::ArrStore));
+        let Some(first_array) = first_array else {
+            return false;
+        };
+        if target != start + first_array {
+            return false;
+        }
+
+        let Some(trip_array) = region.trip_count_array_reg else {
+            return false;
+        };
+        let preheader = &body[..first_array];
+        if !preheader.iter().any(|instr| {
+            instr.opcode == OpCode::ArrLen
+                && instr.op1 == trip_array
+                && instr.op2 == bound_reg
+        }) || !preheader.iter().any(|instr| {
+            instr.opcode == OpCode::Const0 && instr.op1 == region.induction_var_reg
+        }) {
+            return false;
+        }
+
+        // Reject instructions whose semantics the SIMD replacement does not
+        // reproduce in this conservative tier.
+        if body.iter().enumerate().any(|(idx, instr)| {
+            if idx + 2 >= body.len() {
+                return false;
+            }
+            !matches!(
+                instr.opcode,
+                OpCode::Nop
+                    | OpCode::ArrLen
+                    | OpCode::Const0
+                    | OpCode::ArrLoad
+                    | OpCode::ArrStore
+                    | OpCode::IAdd
+                    | OpCode::ISub
+                    | OpCode::IMul
+                    | OpCode::INeg
+                    | OpCode::IInc
+            )
+        }) {
+            return false;
+        }
+
+        // The loop bound must remain stable between ArrLen and the exit test.
+        if body[first_array..body.len() - 2].iter().any(|instr| match instr.opcode {
+            OpCode::ArrLoad => instr.op3 == bound_reg,
+            OpCode::IAdd | OpCode::ISub | OpCode::IMul => instr.op3 == bound_reg,
+            OpCode::INeg => instr.op2 == bound_reg,
+            OpCode::IInc => instr.op1 == bound_reg,
+            _ => false,
+        }) {
+            return false;
+        }
+
+        // Scratch-register writes are intentionally not reconstructed by the
+        // SIMD function. They must therefore be dead at region exit.
+        let mut clobbered = FxHashSet::default();
+        clobbered.insert(region.induction_var_reg);
+        clobbered.insert(bound_reg);
+        clobbered.insert(cmp.op3);
+        match &region.pattern {
+            VectorizablePattern::ElementWiseBinop {
+                lhs_elem_reg,
+                rhs_elem_reg,
+                result_reg,
+                ..
+            } => {
+                clobbered.insert(*lhs_elem_reg);
+                clobbered.insert(*rhs_elem_reg);
+                clobbered.insert(*result_reg);
+            }
+            VectorizablePattern::ElementWiseUnary {
+                src_elem_reg,
+                result_reg,
+                ..
+            } => {
+                clobbered.insert(*src_elem_reg);
+                clobbered.insert(*result_reg);
+            }
+            VectorizablePattern::ElementWiseCmp { .. } => return false,
+        }
+
+        match instructions.get(end) {
+            None | Some(crate::bytecode::Instruction { opcode: OpCode::Halt, .. }) => {
+                !clobbered.contains(&0)
+            }
+            Some(crate::bytecode::Instruction { opcode: OpCode::Ret, .. }) => true,
+            Some(crate::bytecode::Instruction {
+                opcode: OpCode::RetVal,
+                op1,
+                ..
+            }) => !clobbered.contains(op1),
+            _ => false,
+        }
     }
 
     /// Reset tier-2 counters (used by tests).
