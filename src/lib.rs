@@ -27,6 +27,7 @@ pub mod cir_analysis;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir_lower;
 pub mod content_identity;
+pub mod cost_model;
 pub mod core_vm;
 #[cfg(feature = "native-codegen")]
 pub mod cranelift_utils;
