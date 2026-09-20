@@ -1272,10 +1272,19 @@ pub fn process_network_packets(
                                         &cached,
                                         &behavior_name,
                                     );
-                                    // Resolve behavior_id against the updated module
-                                    msg.behavior_id = runtime
-                                        .behavior_id_for(target_actor, &behavior_name)
-                                        .unwrap_or(0);
+                                    // A fetched module must still declare the requested
+                                    // behavior name. Fetch success never authorizes behavior 0.
+                                    let Some(behavior_id) =
+                                        runtime.behavior_id_for(target_actor, &behavior_name)
+                                    else {
+                                        notify_delivery_failed(
+                                            runtime,
+                                            msg.sender,
+                                            "unknown behavior after fetch",
+                                        );
+                                        continue;
+                                    };
+                                    msg.behavior_id = behavior_id;
                                     // Verify the hash now matches
                                     if !verify_behavior_hash(
                                         runtime,
@@ -2107,14 +2116,23 @@ pub fn process_network_packets(
                             msg.sender,
                         );
                     }
-                    // Resolve the behavior name against the target actor's
-                    // behavior table — the same rule local sends use
-                    // (`Runtime::send_message`). An unknown name falls back
-                    // to behavior 0, mirroring `send_message`'s
-                    // `unwrap_or(0)`.
-                    msg.behavior_id = runtime
-                        .behavior_id_for(target_actor, &behavior_name)
-                        .unwrap_or(0);
+                    // Resolve against the target actor's behavior table. Unknown
+                    // names never alias behavior 0. A message carrying a content
+                    // hash may still fetch/hot-reload the requested behavior; the
+                    // sentinel is never delivered.
+                    match runtime.behavior_id_for(target_actor, &behavior_name) {
+                        Some(behavior_id) => msg.behavior_id = behavior_id,
+                        None if content_hash.is_some() => msg.behavior_id = u16::MAX,
+                        None => {
+                            warn!(
+                                "nulang-net: rejecting message to actor {}: unknown behavior '{}'",
+                                target_actor, behavior_name
+                            );
+                            notify_delivery_failed(runtime, msg.sender, "unknown behavior");
+                            ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+                            continue;
+                        }
+                    }
                     // If the sender attached a content hash, verify it
                     // against the local behavior table.
                     if let Some(sender_hash) = content_hash {
@@ -2129,10 +2147,25 @@ pub fn process_network_packets(
                             if let Some(cached) = cached_module {
                                 // Hot-reload: install the cached module
                                 hot_reload_behavior(runtime, target_actor, &cached, &behavior_name);
-                                // Retry resolution after hot-reload
-                                msg.behavior_id = runtime
-                                    .behavior_id_for(target_actor, &behavior_name)
-                                    .unwrap_or(0);
+                                // Retry resolution after hot-reload. A cached module
+                                // that lacks the requested name is a failed delivery.
+                                let Some(behavior_id) =
+                                    runtime.behavior_id_for(target_actor, &behavior_name)
+                                else {
+                                    notify_delivery_failed(
+                                        runtime,
+                                        msg.sender,
+                                        "unknown behavior after hot reload",
+                                    );
+                                    ack_packet(
+                                        transport,
+                                        cluster,
+                                        incoming.from_node,
+                                        incoming.seq,
+                                    );
+                                    continue;
+                                };
+                                msg.behavior_id = behavior_id;
                             } else {
                                 // Request the bytecode from the sender
                                 warn!(
