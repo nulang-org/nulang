@@ -310,6 +310,86 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
         unsafe { heap_array_get(ptr, idx) }
     }
 
+    /// Detach an ArrayView from an oversized backing array while preserving
+    /// its logical contents. Ordinary arrays and already-compact views are
+    /// no-ops. Returns false only when the view cannot be safely compacted in
+    /// the current allocation domain.
+    fn array_compact(&mut self, ptr: *mut u8) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+
+        // SAFETY: callers only pass live VM heap pointers.
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag == HeapTypeTag::Array {
+                return true;
+            }
+            if header.type_tag != HeapTypeTag::ArrayView {
+                return false;
+            }
+
+            let current_owner = self.current_actor_id().unwrap_or(0);
+            if header.actor_id != current_owner || self.is_arena_ptr(ptr) {
+                return false;
+            }
+
+            let (base, start, len) = match heap_array_region(ptr) {
+                Some(region) => region,
+                None => return false,
+            };
+            let base_header = &*ActorHeap::header_of(base);
+            if base_header.type_tag != HeapTypeTag::Array
+                || base_header.actor_id != current_owner
+                || self.is_arena_ptr(base)
+            {
+                return false;
+            }
+
+            let base_len = base_header.payload_size / std::mem::size_of::<Value>();
+            if start == 0 && len == base_len {
+                return true;
+            }
+
+            let len_i64 = match i64::try_from(len) {
+                Ok(len) => len,
+                Err(_) => return false,
+            };
+            let bytes = match len.checked_mul(std::mem::size_of::<Value>()) {
+                Some(bytes) => bytes,
+                None => return false,
+            };
+            let new_ptr = match self.alloc(bytes, HeapTypeTag::Array) {
+                Some(ptr) => ptr,
+                None => return false,
+            };
+            let dst = std::slice::from_raw_parts_mut(new_ptr as *mut Value, len);
+            dst.fill(Value::nil());
+            for i in 0..len {
+                let item = *((base as *const Value).add(start + i));
+                if let Some(child) = item.as_ptr() {
+                    if !self.retain_container_child(child) {
+                        self.drop_ref(new_ptr);
+                        return false;
+                    }
+                }
+                dst[i] = item;
+            }
+
+            let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, ARRAY_VIEW_SLOTS);
+            let old_backing = slots[0].as_ptr();
+            // The fresh allocation's initial local reference becomes the
+            // view's single ownership reference; do not retain it again.
+            slots[0] = Value::ptr(new_ptr);
+            slots[1] = Value::int(0);
+            slots[2] = Value::int(len_i64);
+            if let Some(old_backing) = old_backing {
+                self.release_container_child(old_backing);
+            }
+            true
+        }
+    }
+
     /// Mutate an array element. ArrayView uses copy-on-write so mutating a
     /// slice never changes the source array that was sliced.
     fn array_store(&mut self, ptr: *mut u8, idx: usize, val: Value) -> bool {
@@ -339,47 +419,48 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
                     true
                 }
                 HeapTypeTag::ArrayView => {
-                    let (base, start, len) = match heap_array_region(ptr) {
-                        Some(region) => region,
+                    let len = match heap_array_len(ptr) {
+                        Some(len) => len,
                         None => return false,
                     };
                     if idx >= len {
                         return false;
                     }
-                    let bytes = match len.checked_mul(std::mem::size_of::<Value>()) {
-                        Some(bytes) => bytes,
-                        None => return false,
-                    };
-                    let new_ptr = match self.alloc(bytes, HeapTypeTag::Array) {
-                        Some(ptr) => ptr,
-                        None => return false,
-                    };
-                    let dst = std::slice::from_raw_parts_mut(new_ptr as *mut Value, len);
-                    dst.fill(Value::nil());
-                    for i in 0..len {
-                        let item = if i == idx {
-                            val
-                        } else {
-                            *((base as *const Value).add(start + i))
-                        };
-                        if let Some(child) = item.as_ptr() {
-                            if !self.retain_container_child(child) {
-                                self.drop_ref(new_ptr);
-                                return false;
-                            }
+
+                    // Retain the replacement before compaction can release the
+                    // old backing. The replacement may itself be reachable
+                    // only through that backing (for example, a pointer-valued
+                    // element outside the logical view).
+                    let retained_child = val.as_ptr();
+                    if let Some(child) = retained_child {
+                        if !self.retain_container_child(child) {
+                            return false;
                         }
-                        dst[i] = item;
+                    }
+                    if !self.array_compact(ptr) {
+                        if let Some(child) = retained_child {
+                            self.release_container_child(child);
+                        }
+                        return false;
                     }
 
-                    let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, ARRAY_VIEW_SLOTS);
-                    let old_backing = slots[0].as_ptr();
-                    // The allocation's initial local ref becomes the view's
-                    // single ownership reference; do not retain it again.
-                    slots[0] = Value::ptr(new_ptr);
-                    slots[1] = Value::int(0);
-                    slots[2] = Value::int(len as i64);
-                    if let Some(old_backing) = old_backing {
-                        self.release_container_child(old_backing);
+                    let (base, start, compact_len) = match heap_array_region(ptr) {
+                        Some(region) => region,
+                        None => {
+                            if let Some(child) = retained_child {
+                                self.release_container_child(child);
+                            }
+                            return false;
+                        }
+                    };
+                    debug_assert_eq!(start, 0);
+                    debug_assert_eq!(compact_len, len);
+
+                    let slot = (base as *mut Value).add(idx);
+                    let old = *slot;
+                    *slot = val;
+                    if let Some(old_ptr) = old.as_ptr() {
+                        self.release_container_child(old_ptr);
                     }
                     true
                 }
@@ -1364,6 +1445,10 @@ pub(crate) fn perform_array_builtin<C: ActorVmCallbacks + ?Sized>(
                 return Some(Value::nil());
             }
             Some(callbacks.array_slice(ptr, start, end))
+        }
+        Some("compact") => {
+            let ptr = regs.first()?.as_ptr()?;
+            Some(Value::bool(callbacks.array_compact(ptr)))
         }
         Some("range") => {
             let start = regs.first().and_then(|v| v.as_int()).unwrap_or(0);
@@ -6568,6 +6653,136 @@ mod vm_tests {
                 .and_then(|value| value.as_int()),
             Some(4)
         );
+    }
+
+    #[test]
+    fn test_array_compact_releases_oversized_backing() {
+        const LARGE_LEN: usize = 131_072; // 1 MiB of Value payload.
+
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let payload_bytes = LARGE_LEN * std::mem::size_of::<Value>();
+        let source_ptr = callbacks
+            .alloc(payload_bytes, HeapTypeTag::Array)
+            .expect("large backing allocation");
+        unsafe {
+            let slots = std::slice::from_raw_parts_mut(source_ptr as *mut Value, LARGE_LEN);
+            slots.fill(Value::int(7));
+        }
+
+        let view = callbacks.array_slice(source_ptr, LARGE_LEN / 2, LARGE_LEN / 2 + 2);
+        let view_ptr = view.as_ptr().expect("small slice view");
+        assert_eq!(
+            unsafe { (*ActorHeap::header_of(view_ptr)).type_tag },
+            HeapTypeTag::ArrayView
+        );
+
+        // Simulate the original array binding going out of scope. The view's
+        // counted backing reference keeps the 1 MiB source alive.
+        callbacks.drop_ref(source_ptr);
+
+        let mut retained_before = 0usize;
+        let mut backing_live_before = false;
+        callbacks.heap.iter_live_objects(|_, payload, size| {
+            retained_before += size;
+            backing_live_before |= payload == source_ptr;
+        });
+        assert!(backing_live_before, "view must retain its backing array");
+        assert!(
+            retained_before >= payload_bytes,
+            "small view should demonstrate full backing retention: retained={retained_before}, backing={payload_bytes}"
+        );
+
+        let compacted = perform_array_builtin(&mut callbacks, Some("compact"), &[view])
+            .expect("Array.compact result");
+        assert_eq!(compacted.as_bool(), Some(true));
+
+        let mut retained_after = 0usize;
+        let mut backing_live_after = false;
+        callbacks.heap.iter_live_objects(|_, payload, size| {
+            retained_after += size;
+            backing_live_after |= payload == source_ptr;
+        });
+        assert!(
+            !backing_live_after,
+            "compaction must release the oversized original backing"
+        );
+        assert_eq!(
+            callbacks
+                .array_get(view_ptr, 0)
+                .and_then(|value| value.as_int()),
+            Some(7)
+        );
+        assert_eq!(
+            callbacks
+                .array_get(view_ptr, 1)
+                .and_then(|value| value.as_int()),
+            Some(7)
+        );
+        assert!(
+            retained_after <= 64,
+            "2-element compact view should retain only tiny payloads, got {retained_after} bytes"
+        );
+        assert!(
+            retained_before > retained_after * 10_000,
+            "expected a material retained-memory reduction: before={retained_before}, after={retained_after}"
+        );
+
+        callbacks.drop_ref(view_ptr);
+        assert_eq!(callbacks.heap.live_count(), 0);
+    }
+
+    #[test]
+    fn test_array_view_store_retains_pointer_before_releasing_old_backing() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+
+        let kept_child = callbacks
+            .alloc(std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("kept child");
+        let replacement_child = callbacks
+            .alloc(std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("replacement child");
+        unsafe {
+            *(kept_child as *mut Value) = Value::int(11);
+            *(replacement_child as *mut Value) = Value::int(22);
+        }
+
+        let source_ptr = callbacks
+            .alloc(3 * std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("source array");
+        callbacks.retain_container_child(kept_child);
+        callbacks.retain_container_child(replacement_child);
+        unsafe {
+            let source = std::slice::from_raw_parts_mut(source_ptr as *mut Value, 3);
+            source[0] = Value::ptr(kept_child);
+            source[1] = Value::int(0);
+            source[2] = Value::ptr(replacement_child);
+        }
+
+        // Drop the allocation references so source is the sole owner of each
+        // pointer child. The replacement value is then read from outside the
+        // logical view and used as the first COW store value.
+        callbacks.drop_ref(kept_child);
+        callbacks.drop_ref(replacement_child);
+
+        let view = callbacks.array_slice(source_ptr, 0, 2);
+        let view_ptr = view.as_ptr().unwrap();
+        let replacement = callbacks.array_get(source_ptr, 2).unwrap();
+        callbacks.drop_ref(source_ptr);
+
+        assert!(callbacks.array_store(view_ptr, 1, replacement));
+        let stored = callbacks
+            .array_get(view_ptr, 1)
+            .and_then(|value| value.as_ptr());
+        assert_eq!(stored, Some(replacement_child));
+        assert_eq!(
+            callbacks
+                .array_get(replacement_child, 0)
+                .and_then(|value| value.as_int()),
+            Some(22)
+        );
+
+        callbacks.drop_ref(view_ptr);
+        assert_eq!(callbacks.heap.live_count(), 0);
     }
 
     #[test]

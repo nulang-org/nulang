@@ -137,6 +137,131 @@ pub struct ProtocolSchema {
     members: BTreeMap<String, ProtocolMember>,
 }
 
+/// Directional compatibility of a receiver/implementation protocol against a
+/// protocol required by an existing client/reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolCompatibility {
+    Exact,
+    ReceiverSuperset,
+    Incompatible,
+}
+
+impl ProtocolCompatibility {
+    pub fn is_compatible(self) -> bool {
+        !matches!(self, ProtocolCompatibility::Incompatible)
+    }
+}
+
+/// One stable behavior-level reason a receiver cannot satisfy a required
+/// protocol. Parameters and return types are surfaced separately for useful
+/// diagnostics; if those match but the authoritative signature hash differs,
+/// the remaining drift is effect/capability contract drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolCompatibilityIssue {
+    MissingBehavior(String),
+    ParameterContractChanged(String),
+    ResponseContractChanged(String),
+    EffectOrCapabilityContractChanged(String),
+}
+
+/// Trusted in-process catalog of canonical actor protocol schemas.
+///
+/// Exact protocol-id equality is self-authenticating for compatibility checks.
+/// Different ids require both canonical schemas so the runtime can prove a
+/// directional additive upgrade rather than guessing from names or versions.
+#[derive(Debug, Clone, Default)]
+pub struct ProtocolRegistry {
+    schemas: BTreeMap<ProtocolId, ProtocolSchema>,
+}
+
+impl ProtocolRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one canonical schema.
+    ///
+    /// Human-readable schema names are intentionally ignored for collision
+    /// detection because they are not part of ProtocolId. A pure rename of an
+    /// otherwise identical protocol therefore registers idempotently.
+    pub fn register(
+        &mut self,
+        schema: ProtocolSchema,
+    ) -> Result<ProtocolId, ProtocolRegistryError> {
+        let id = schema.id();
+        if let Some(existing) = self.schemas.get(&id) {
+            if existing.members != schema.members {
+                return Err(ProtocolRegistryError::HashCollision(id));
+            }
+            return Ok(id);
+        }
+        self.schemas.insert(id, schema);
+        Ok(id)
+    }
+
+    pub fn get(&self, id: ProtocolId) -> Option<&ProtocolSchema> {
+        self.schemas.get(&id)
+    }
+
+    pub fn contains(&self, id: ProtocolId) -> bool {
+        self.schemas.contains_key(&id)
+    }
+
+    /// Prove whether receiver can serve required.
+    ///
+    /// Exact ids need no registry lookup. Different ids require both schemas;
+    /// an unknown digest fails closed.
+    pub fn compatibility(
+        &self,
+        receiver: ProtocolId,
+        required: ProtocolId,
+    ) -> Result<ProtocolCompatibility, ProtocolRegistryError> {
+        if receiver == required {
+            return Ok(ProtocolCompatibility::Exact);
+        }
+
+        let receiver_schema = self
+            .schemas
+            .get(&receiver)
+            .ok_or(ProtocolRegistryError::UnknownProtocol(receiver))?;
+        let required_schema = self
+            .schemas
+            .get(&required)
+            .ok_or(ProtocolRegistryError::UnknownProtocol(required))?;
+
+        Ok(receiver_schema.compatibility_for_required(required_schema))
+    }
+
+    pub fn can_serve(
+        &self,
+        receiver: ProtocolId,
+        required: ProtocolId,
+    ) -> Result<bool, ProtocolRegistryError> {
+        Ok(self.compatibility(receiver, required)?.is_compatible())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolRegistryError {
+    UnknownProtocol(ProtocolId),
+    HashCollision(ProtocolId),
+}
+
+impl fmt::Display for ProtocolRegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtocolRegistryError::UnknownProtocol(id) => {
+                write!(f, "unknown actor protocol schema {id}")
+            }
+            ProtocolRegistryError::HashCollision(id) => {
+                write!(f, "actor protocol hash collision for {id}")
+            }
+        }
+    }
+}
+
+impl Error for ProtocolRegistryError {}
+
 impl ProtocolSchema {
     pub fn new(
         name: impl Into<String>,
@@ -198,6 +323,65 @@ impl ProtocolSchema {
 
     pub fn id(&self) -> ProtocolId {
         ProtocolId::from_schema(self)
+    }
+
+    /// Classify whether this receiver/implementation can serve a client that
+    /// was compiled against `required`.
+    ///
+    /// Compatibility is directional: additive receiver behaviors are safe for
+    /// an older client, but removing or changing any required behavior is not.
+    pub fn compatibility_for_required(&self, required: &ProtocolSchema) -> ProtocolCompatibility {
+        if self.id() == required.id() {
+            return ProtocolCompatibility::Exact;
+        }
+        if self.compatibility_issues_for_required(required).is_empty() {
+            ProtocolCompatibility::ReceiverSuperset
+        } else {
+            ProtocolCompatibility::Incompatible
+        }
+    }
+
+    /// Explain incompatibilities using the compiler-owned behavior contract.
+    ///
+    /// V1 is intentionally invariant: no field defaults, record widening,
+    /// parameter variance, or implicit coercions are inferred here.
+    pub fn compatibility_issues_for_required(
+        &self,
+        required: &ProtocolSchema,
+    ) -> Vec<ProtocolCompatibilityIssue> {
+        let mut issues = Vec::new();
+
+        for (name, expected) in &required.members {
+            let Some(actual) = self.members.get(name) else {
+                issues.push(ProtocolCompatibilityIssue::MissingBehavior(name.clone()));
+                continue;
+            };
+
+            if actual.params != expected.params {
+                issues.push(ProtocolCompatibilityIssue::ParameterContractChanged(
+                    name.clone(),
+                ));
+            }
+            if actual.response != expected.response {
+                issues.push(ProtocolCompatibilityIssue::ResponseContractChanged(
+                    name.clone(),
+                ));
+            }
+            if actual.params == expected.params
+                && actual.response == expected.response
+                && actual.signature != expected.signature
+            {
+                issues.push(
+                    ProtocolCompatibilityIssue::EffectOrCapabilityContractChanged(name.clone()),
+                );
+            }
+        }
+
+        issues
+    }
+
+    pub fn can_serve(&self, required: &ProtocolSchema) -> bool {
+        self.compatibility_for_required(required).is_compatible()
     }
 }
 
@@ -281,9 +465,10 @@ impl ProtocolActorRef {
         self.protocol_id == expected
     }
 
-    /// Exact compatibility is the initial distributed protocol rule.
-    /// Subtyping/schema-evolution compatibility must be explicit later rather
-    /// than silently weakening this check.
+    /// Exact protocol-id validation. Rolling-upgrade compatibility is defined
+    /// structurally by `ProtocolSchema::compatibility_for_required`, because a
+    /// different digest alone cannot prove that the receiver is an additive
+    /// compatible superset.
     pub fn require_protocol(&self, expected: ProtocolId) -> Result<(), ProtocolMismatch> {
         if self.matches_protocol(expected) {
             Ok(())
@@ -760,6 +945,243 @@ mod tests {
                 actual: account,
             })
         );
+    }
+
+    #[test]
+    fn compatibility_is_exact_for_identical_compiler_protocols() {
+        let required =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let renamed =
+            ProtocolSchema::new("RenamedAccount", [member("Balance", vec![], money_ty())]).unwrap();
+
+        assert_eq!(
+            renamed.compatibility_for_required(&required),
+            ProtocolCompatibility::Exact
+        );
+        assert!(renamed.can_serve(&required));
+    }
+
+    #[test]
+    fn additive_receiver_upgrade_is_directionally_compatible() {
+        let old = ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let new = ProtocolSchema::new(
+            "Account",
+            [
+                member("Balance", vec![], money_ty()),
+                member("Deposit", vec![money_ty()], Type::unit()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            new.compatibility_for_required(&old),
+            ProtocolCompatibility::ReceiverSuperset
+        );
+        assert!(new.can_serve(&old));
+        assert_eq!(
+            old.compatibility_for_required(&new),
+            ProtocolCompatibility::Incompatible
+        );
+        assert_eq!(
+            old.compatibility_issues_for_required(&new),
+            vec![ProtocolCompatibilityIssue::MissingBehavior(
+                "Deposit".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn parameter_and_response_contract_changes_are_incompatible() {
+        let required = ProtocolSchema::new(
+            "Account",
+            [member("Withdraw", vec![money_ty()], receipt_ty())],
+        )
+        .unwrap();
+        let changed_param = ProtocolSchema::new(
+            "Account",
+            [member("Withdraw", vec![int_ty()], receipt_ty())],
+        )
+        .unwrap();
+        let changed_response = ProtocolSchema::new(
+            "Account",
+            [member("Withdraw", vec![money_ty()], money_ty())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            changed_param.compatibility_issues_for_required(&required),
+            vec![ProtocolCompatibilityIssue::ParameterContractChanged(
+                "Withdraw".into()
+            )]
+        );
+        assert_eq!(
+            changed_response.compatibility_issues_for_required(&required),
+            vec![ProtocolCompatibilityIssue::ResponseContractChanged(
+                "Withdraw".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn effect_or_capability_drift_is_incompatible() {
+        let required = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::behavior(
+                "Withdraw",
+                vec![money_ty()],
+                receipt_ty(),
+                EffectRow::empty(),
+                Capability::Ref,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let changed_effect = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::behavior(
+                "Withdraw",
+                vec![money_ty()],
+                receipt_ty(),
+                EffectRow::Closed(vec![Effect::IO]),
+                Capability::Ref,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let changed_cap = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::behavior(
+                "Withdraw",
+                vec![money_ty()],
+                receipt_ty(),
+                EffectRow::empty(),
+                Capability::Box,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+
+        for changed in [&changed_effect, &changed_cap] {
+            assert_eq!(
+                changed.compatibility_for_required(&required),
+                ProtocolCompatibility::Incompatible
+            );
+            assert_eq!(
+                changed.compatibility_issues_for_required(&required),
+                vec![
+                    ProtocolCompatibilityIssue::EffectOrCapabilityContractChanged(
+                        "Withdraw".into()
+                    )
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn compiler_generated_schemas_use_same_rolling_compatibility_rule() {
+        let get = behavior_sig(vec![], Type::int(), EffectRow::empty(), Capability::Ref);
+        let add = behavior_sig(
+            vec![Type::int()],
+            Type::unit(),
+            EffectRow::Closed(vec![Effect::Send]),
+            Capability::Ref,
+        );
+        let old =
+            ProtocolSchema::from_actor_type("Counter", &actor_type(vec![("get", get.clone())]))
+                .unwrap();
+        let new = ProtocolSchema::from_actor_type(
+            "Counter",
+            &actor_type(vec![("add", add), ("get", get)]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            new.compatibility_for_required(&old),
+            ProtocolCompatibility::ReceiverSuperset
+        );
+        assert!(new.can_serve(&old));
+        assert!(!old.can_serve(&new));
+    }
+
+    #[test]
+    fn registry_exact_match_needs_no_schema_lookup() {
+        let schema =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let id = schema.id();
+        let registry = ProtocolRegistry::new();
+
+        assert_eq!(
+            registry.compatibility(id, id).unwrap(),
+            ProtocolCompatibility::Exact
+        );
+    }
+
+    #[test]
+    fn registry_proves_additive_receiver_compatibility() {
+        let old = ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let new = ProtocolSchema::new(
+            "Account",
+            [
+                member("Balance", vec![], money_ty()),
+                member("Deposit", vec![money_ty()], Type::unit()),
+            ],
+        )
+        .unwrap();
+
+        let old_id = old.id();
+        let new_id = new.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(old).unwrap();
+        registry.register(new).unwrap();
+
+        assert_eq!(
+            registry.compatibility(new_id, old_id).unwrap(),
+            ProtocolCompatibility::ReceiverSuperset
+        );
+        assert!(registry.can_serve(new_id, old_id).unwrap());
+        assert_eq!(
+            registry.compatibility(old_id, new_id).unwrap(),
+            ProtocolCompatibility::Incompatible
+        );
+    }
+
+    #[test]
+    fn registry_fails_closed_for_unknown_different_digest() {
+        let known =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let unknown = ProtocolSchema::new(
+            "Account",
+            [
+                member("Balance", vec![], money_ty()),
+                member("Deposit", vec![money_ty()], Type::unit()),
+            ],
+        )
+        .unwrap();
+
+        let known_id = known.id();
+        let unknown_id = unknown.id();
+        let mut registry = ProtocolRegistry::new();
+        registry.register(known).unwrap();
+
+        assert_eq!(
+            registry.compatibility(known_id, unknown_id),
+            Err(ProtocolRegistryError::UnknownProtocol(unknown_id))
+        );
+    }
+
+    #[test]
+    fn registry_accepts_structurally_identical_schema_rename() {
+        let original =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
+        let renamed =
+            ProtocolSchema::new("CustomerAccount", [member("Balance", vec![], money_ty())])
+                .unwrap();
+        assert_eq!(original.id(), renamed.id());
+
+        let mut registry = ProtocolRegistry::new();
+        let id = registry.register(original).unwrap();
+        assert_eq!(registry.register(renamed).unwrap(), id);
+        assert_eq!(registry.get(id).unwrap().name, "Account");
     }
 
     #[test]

@@ -45,6 +45,21 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Actor protocol rolling-upgrade compatibility — 2026-09-20
+- **Directional structural compatibility** (Experimental, `src/protocol.rs`).
+  A receiver may serve an older required protocol when it preserves every
+  required compiler-owned behavior contract exactly; additive receiver
+  behaviors are allowed. Parameter, return, effect, or capability changes are
+  incompatible. V1 deliberately avoids implicit variance/default-field rules.
+
+### Actor protocol schema registry — 2026-09-20
+- **Trusted canonical schema registry** (Experimental, `src/protocol.rs`).
+  `ProtocolRegistry` maps `ProtocolId` values to compiler-derived schemas so
+  different digests can be compared using directional rolling-upgrade rules.
+  Exact digest equality needs no lookup; different/unknown digests fail closed.
+  Structurally identical source renames register idempotently because display
+  names are intentionally excluded from protocol identity.
+
 ### Typed actor protocol checking — 2026-09-20
 - **Static protocol validation for known actor references** (Experimental,
   `src/actor_protocol.rs`, RFC 0023). Actor `send`/`ask` calls whose receiver
@@ -98,6 +113,11 @@ two major versions.*
   internal `ArrayView` heap tag: views are materialized as ordinary logical
   Arrays during continuation serialization, preserving the existing durable
   wire format.
+- **Explicit `Array.compact` lifetime escape hatch** (Experimental,
+  `src/vm.rs`, `src/stdlib.rs`). A small long-lived view can otherwise retain
+  its entire backing array after the original binding dies. `Array.compact`
+  detaches the view in place without changing logical contents, allowing the
+  oversized backing allocation to be reclaimed; ordinary arrays are a no-op.
 
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,

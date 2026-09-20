@@ -15,14 +15,14 @@ const HOT_SLICE_READ: &str = r#"
 fn main() -> Int {
     let source = [10, 20, 30, 40]
     let slice = perform Array.slice(source, 1, 3)
-    let state = [0, 0]
+    let loop_state = [0, 0]
 
-    while state[0] < 1200 {
-        state[1] = state[1] + slice[0] + slice[1]
-        state[0] = state[0] + 1
+    while loop_state[0] < 1200 {
+        loop_state[1] = loop_state[1] + slice[0] + slice[1]
+        loop_state[0] = loop_state[0] + 1
     }
 
-    state[1]
+    loop_state[1]
 }
 "#;
 
@@ -32,6 +32,18 @@ fn main() -> Int {
     let slice = perform Array.slice(source, 1, 3)
     slice[0] = 99
     slice[0] * 100 + slice[1] + source[1]
+}
+"#;
+
+const SLICE_COMPACT: &str = r#"
+fn main() -> Int {
+    let source = [10, 20, 30, 40]
+    let slice = perform Array.slice(source, 1, 3)
+    if perform Array.compact(slice) then {
+        slice[0] * 100 + slice[1] + source[1]
+    } else {
+        -1
+    }
 }
 "#;
 
@@ -96,4 +108,11 @@ fn hot_array_view_loads_match_interpreter_jit_and_aot() {
 fn array_view_cow_store_matches_interpreter_jit_and_aot() {
     // slice becomes [99, 30] while source must remain [10, 20, 30, 40].
     assert_all_backends_int(SLICE_COW_STORE, 9_950);
+}
+
+#[test]
+fn array_view_compact_matches_interpreter_jit_and_aot() {
+    // Compaction changes only representation: slice remains [20, 30] and
+    // source remains unchanged.
+    assert_all_backends_int(SLICE_COMPACT, 2_050);
 }

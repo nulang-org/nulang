@@ -268,6 +268,14 @@ impl StdLib {
                     description: "Return a new array containing elements from start (inclusive) to end (exclusive).",
                 },
                 BuiltinOp {
+                    name: "Array.compact",
+                    effect: "Array",
+                    op: "compact",
+                    signature: "compact(arr: [T]) -> Bool",
+                    implemented_in: ImplSite::StandaloneVm,
+                    description: "Detach a zero-copy slice from an oversized backing array without changing its logical contents; ordinary arrays are unchanged.",
+                },
+                BuiltinOp {
                     name: "Test.assert",
                     effect: "Test",
                     op: "assert",
