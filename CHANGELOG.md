@@ -45,6 +45,20 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### WASM component authority unification — 2026-09-20
+- **Wasmtime component host imports now use the typed runtime authority model**
+  (Experimental, `src/wasm_component_runtime.rs`). The backend-specific
+  `Capabilities { allow_log, allow_clock, allow_random }` policy has been
+  removed. `ComponentRuntime::new` is deny-by-default and
+  `ComponentRuntime::new_with_authority` accepts the same
+  `AuthorityManifest` used by the actor/runtime authority stack.
+- **WIT host operations require exact grants at both link and dispatch time.**
+  `IO::Log`, `Time::Now`, and `Random::U64` are represented through the
+  existing typed `AuthorityGrant::Other` extension point. A sibling grant does
+  not authorize another operation, and unauthorized imports are omitted from
+  the linker so component instantiation fails closed. This advances #334
+  without introducing a second WASM-specific sandbox policy.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
