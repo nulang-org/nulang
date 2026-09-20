@@ -2703,11 +2703,7 @@ mod tests {
         // records are allowed to disappear completely and therefore should
         // not consume a bytecode field id.
         let fns: Vec<String> = (0..257)
-            .map(|i| {
-                format!(
-                    "fn g{i}() -> Int {{ let record = {{ f{i}: {i} }} in record.f{i} }}"
-                )
-            })
+            .map(|i| format!("fn g{i}() -> Int {{ let record = {{ f{i}: {i} }} in record.f{i} }}"))
             .collect();
         let source = format!("{}\ng0()", fns.join("\n"));
         let result = compile_mir_source(&source);
