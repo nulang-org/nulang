@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::cache::CacheTransferImport;
 use super::cache_routing::CacheShardOwner;
@@ -34,6 +35,7 @@ const KIND_COMPLETED: u8 = 6;
 const KIND_COMMIT_INTENT: u8 = 7;
 const KIND_COMMIT_ABORTED: u8 = 8;
 const KIND_SOURCE_REBOUND: u8 = 9;
+const KIND_TRANSFER_WALL_ANCHOR: u8 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheMigrationKey {
@@ -59,6 +61,9 @@ pub struct CacheMigrationRecoveredTransfer {
     pub transfer_id: u64,
     pub request: CacheTransportMessage,
     pub ack: Option<CacheTransportMessage>,
+    /// Source wall-clock anchor captured after export and fsynced before send.
+    /// Required only for restart replay of relative-TTL entries.
+    pub wall_anchor_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,11 +121,9 @@ impl CacheMigrationRecoveryState {
             .collect()
     }
 
-    /// Whether a fully source-drained migration can be reconstructed after a
-    /// cache-process restart using only durable transfer envelopes.
-    ///
-    /// Relative TTLs are intentionally excluded: replaying an old ttl_ms after
-    /// an arbitrary outage would extend expiry and could resurrect data.
+    /// Whether durable history is structurally complete enough for a drained
+    /// process-restart reconstruction. TTL-bearing batches additionally require
+    /// a pre-send wall-clock anchor.
     pub fn drained_restart_replay_safe(&self) -> bool {
         self.completed_commit_epoch.is_none()
             && self.pending_commit_epoch.is_none()
@@ -130,17 +133,52 @@ impl CacheMigrationRecoveryState {
                 let CacheTransportMessage::TransferBatch { batch, .. } = &transfer.request else {
                     return false;
                 };
-                batch.entries.iter().all(|entry| entry.ttl_ms.is_none())
+                let has_ttl = batch.entries.iter().any(|entry| entry.ttl_ms.is_some());
+                !has_ttl || transfer.wall_anchor_unix_ms.is_some()
             })
     }
 
-    pub fn drained_restart_replay_plan(&self) -> Option<Vec<CacheTransportMessage>> {
-        self.drained_restart_replay_safe().then(|| {
-            self.ordered_transfers()
-                .into_iter()
-                .map(|transfer| transfer.request.clone())
-                .collect()
-        })
+    /// Build exact restart-replay envelopes at a supplied process-independent
+    /// wall-clock observation.
+    ///
+    /// Remaining TTL can only decrease. If the wall clock moved backwards
+    /// relative to a durable anchor, recovery fails closed rather than extending
+    /// expiry. A zero result is retained as ttl_ms=0 so the target records an
+    /// ExpiredInTransit fence instead of resurrecting the value.
+    pub fn drained_restart_replay_plan_at(
+        &self,
+        now_unix_ms: u64,
+    ) -> io::Result<Vec<CacheTransportMessage>> {
+        if !self.drained_restart_replay_safe() {
+            return Err(invalid_data("drained restart replay proof is incomplete"));
+        }
+
+        let mut out = Vec::with_capacity(self.transfer_order.len());
+        for transfer in self.ordered_transfers() {
+            let mut message = transfer.request.clone();
+            let CacheTransportMessage::TransferBatch { batch, .. } = &mut message else {
+                return Err(invalid_data("durable restart replay record is not TransferBatch"));
+            };
+            if batch.entries.iter().any(|entry| entry.ttl_ms.is_some()) {
+                let anchor = transfer
+                    .wall_anchor_unix_ms
+                    .ok_or_else(|| invalid_data("TTL transfer is missing durable wall anchor"))?;
+                let elapsed = now_unix_ms.checked_sub(anchor).ok_or_else(|| {
+                    invalid_data("wall clock moved backwards since durable TTL transfer anchor")
+                })?;
+                for entry in &mut batch.entries {
+                    if let Some(ttl) = entry.ttl_ms {
+                        entry.ttl_ms = Some(ttl.saturating_sub(elapsed));
+                    }
+                }
+            }
+            out.push(message);
+        }
+        Ok(out)
+    }
+
+    pub fn drained_restart_replay_plan(&self) -> io::Result<Vec<CacheTransportMessage>> {
+        self.drained_restart_replay_plan_at(current_unix_ms()?)
     }
 
     /// Number of unique migration keys for which the target must still retain
@@ -397,6 +435,7 @@ impl CacheMigrationJournal {
                     transfer_id,
                     request: message.clone(),
                     ack: None,
+                    wall_anchor_unix_ms: None,
                 },
             );
         self.states
@@ -404,6 +443,28 @@ impl CacheMigrationJournal {
             .expect("migration state disappeared")
             .transfer_order
             .push(transfer_id);
+
+        let has_ttl = match message {
+            CacheTransportMessage::TransferBatch { batch, .. } => {
+                batch.entries.iter().any(|entry| entry.ttl_ms.is_some())
+            }
+            _ => false,
+        };
+        if has_ttl {
+            let anchor = current_unix_ms()?;
+            let mut anchor_payload = Vec::with_capacity(46);
+            write_key(&mut anchor_payload, key);
+            write_u64(&mut anchor_payload, transfer_id);
+            write_u64(&mut anchor_payload, anchor);
+            self.append_record(KIND_TRANSFER_WALL_ANCHOR, &anchor_payload)?;
+            self.states
+                .get_mut(&key)
+                .expect("migration state disappeared")
+                .transfers
+                .get_mut(&transfer_id)
+                .expect("transfer disappeared")
+                .wall_anchor_unix_ms = Some(anchor);
+        }
         Ok(())
     }
 
@@ -661,10 +722,28 @@ fn apply_record(
                             transfer_id,
                             request: message,
                             ack: None,
+                            wall_anchor_unix_ms: None,
                         },
                     );
                     state.transfer_order.push(transfer_id);
                 }
+            }
+        }
+        KIND_TRANSFER_WALL_ANCHOR => {
+            let transfer_id = reader.u64()?;
+            let anchor = reader.u64()?;
+            reader.finish()?;
+            let state = states
+                .get_mut(&key)
+                .ok_or_else(|| invalid_data("TTL wall anchor precedes migration intent"))?;
+            let transfer = state
+                .transfers
+                .get_mut(&transfer_id)
+                .ok_or_else(|| invalid_data("TTL wall anchor precedes transfer send"))?;
+            match transfer.wall_anchor_unix_ms {
+                Some(existing) if existing == anchor => {}
+                Some(_) => return Err(invalid_data("conflicting TTL wall anchors in journal")),
+                None => transfer.wall_anchor_unix_ms = Some(anchor),
             }
         }
         KIND_TRANSFER_ACK => {
@@ -889,6 +968,14 @@ fn write_blob(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
     Ok(())
+}
+
+fn current_unix_ms() -> io::Result<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| invalid_data("system wall clock is before Unix epoch"))?;
+    u64::try_from(duration.as_millis())
+        .map_err(|_| invalid_data("system wall clock milliseconds overflow"))
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -1247,13 +1334,27 @@ mod tests {
             .unwrap();
         journal.record_source_remaining(migration, 0).unwrap();
 
-        assert!(!journal
-            .recovery_state(migration)
+        let state = journal.recovery_state(migration).unwrap();
+        assert!(state.drained_restart_replay_safe());
+        let anchor = state
+            .transfers
+            .get(&81)
             .unwrap()
-            .drained_restart_replay_safe());
-        assert!(journal
-            .rebind_drained_source_incarnation(migration, [0xa5; 16])
+            .wall_anchor_unix_ms
+            .unwrap();
+        let plan = state
+            .drained_restart_replay_plan_at(anchor + 2_000)
+            .unwrap();
+        let CacheTransportMessage::TransferBatch { batch, .. } = &plan[0] else {
+            unreachable!()
+        };
+        assert_eq!(batch.entries[0].ttl_ms, Some(3_000));
+        assert!(state
+            .drained_restart_replay_plan_at(anchor.saturating_sub(1))
             .is_err());
+        journal
+            .rebind_drained_source_incarnation(migration, [0xa5; 16])
+            .unwrap();
         fs::remove_file(path).unwrap();
     }
 
