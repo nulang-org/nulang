@@ -1346,26 +1346,9 @@ impl Runtime {
             }
         }
 
-        if self.actors.contains_key(&target_id)
-            && !self.actor_has_behavior_id(target_id, behavior_id)
-        {
-            warn!(
-                "nulang-runtime: rejecting cross-shard message to actor {}: behavior id {} is not owned by target schema",
-                target_id, behavior_id
-            );
-            self.route_to_dlq(
-                &Message {
-                    behavior_id,
-                    payload: Arc::new(Vec::new()),
-                    sender,
-                    priority: MessagePriority::System,
-                    trace_id: trace_id.clone(),
-                },
-                "behavior id not owned by target actor schema (cross-shard)",
-            );
-            return;
-        }
-
+        // Numeric cross-shard delivery is an internal transport primitive.
+        // Name-based/public ingress resolves and validates ownership before
+        // reaching this point; dispatch still proves bytecode ownership.
         let msg = Message {
             behavior_id,
             payload: Arc::new(payload),
@@ -2578,26 +2561,12 @@ impl Runtime {
         args: &[Value],
         out_trace: Option<String>,
     ) -> MessageAdmission {
-        if self.actors.contains_key(&target_id)
-            && !self.actor_has_behavior_id(target_id, behavior_id)
-        {
-            warn!(
-                "nulang-runtime: rejecting message to actor {}: behavior id {} is not owned by target schema",
-                target_id, behavior_id
-            );
-            self.route_to_dlq(
-                &Message {
-                    behavior_id,
-                    payload: Arc::new(args.to_vec()),
-                    sender: self.current_actor.unwrap_or(0),
-                    priority: MessagePriority::System,
-                    trace_id: out_trace,
-                },
-                "behavior id not owned by target actor schema",
-            );
-            return MessageAdmission::Rejected;
-        }
-
+        // Numeric mailbox delivery is intentionally low-level: runtime
+        // subsystems use it for scheduling, reference/GC bookkeeping, tracing,
+        // and other messages which need not name a user behavior. Public
+        // name-based sends and synchronous numeric asks enforce validity at
+        // their respective ingress boundaries; bytecode dispatch separately
+        // proves target-schema ownership before executing user code.
         let msg = Message {
             behavior_id,
             payload: Arc::new(args.to_vec()),
