@@ -45,6 +45,18 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Package capability forwarding consistency — 2026-09-20
+- **All package-owned compiler invocations now forward `[package].capabilities`**
+  (Stable tooling fix, `src/package/commands.rs`). A single
+  `package_compiler_args` path now appends the manifest's `--with <cap>`
+  grants for normal builds, JSON builds, WASM AOT builds, web/dev builds,
+  signal analysis, run/watch, and deployment artifact compilation. This fixes
+  #148 and also closes equivalent drift in `build --json`, `run --watch`,
+  web/dev, and deploy paths.
+- **Regression coverage verifies gated package builds across bytecode and WASM.**
+  Tests assert canonical argument forwarding, a JSON bytecode build using the
+  `fs` capability, and (under `wasm-backend`) `.wasm`/`.cwasm`
+  emission for the same gated effect.
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
