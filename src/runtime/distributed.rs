@@ -1252,7 +1252,7 @@ pub fn process_network_packets(
                     if success {
                         for m in msgs {
                             let content_hash = try_lookup_content_hash(runtime, &m.behavior_name);
-                            let packet = resolver.build_packet(
+                            let packet = resolver.build_packet_with_protocol(
                                 actor_id,
                                 &m.behavior_name,
                                 m.payload,
@@ -1262,6 +1262,7 @@ pub fn process_network_packets(
                                 m.object_table,
                                 content_hash,
                                 m.trace_id,
+                                m.protocol_id,
                             );
                             let reply_addr = cluster
                                 .get_node(from)
