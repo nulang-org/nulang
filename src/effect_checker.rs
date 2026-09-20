@@ -1160,6 +1160,116 @@ impl EffectChecker {
         Ok(())
     }
 
+    /// Return conservative effect rows for every executable module surface.
+    ///
+    /// This is intended for authority manifests such as generated WIT worlds.
+    /// Declared function/behavior rows are preserved as upper bounds (so the
+    /// manifest may over-grant but never under-grants because of an annotation);
+    /// unannotated behavior bodies, actor initializers/defaults, and workflow
+    /// bodies are inferred using the already-registered function rows.
+    ///
+    /// Call `EffectChecker::check_module` first so transitive module-function
+    /// rows have reached their fixpoint.
+    pub fn module_effect_rows(&mut self, decls: &[Decl]) -> NuResult<Vec<EffectRow>> {
+        let flat = flatten_decls(decls);
+        let ctx = EffectContext::empty();
+        let mut rows = Vec::new();
+
+        for decl in flat {
+            match decl {
+                Decl::Function {
+                    name,
+                    effect,
+                    body,
+                    ..
+                } => {
+                    let row = effect
+                        .clone()
+                        .or_else(|| self.fn_rows.get(name).cloned())
+                        .unwrap_or(self.infer_effects(&ctx, body)?);
+                    rows.push(row);
+                }
+                Decl::Actor {
+                    behaviors,
+                    state_fields,
+                    init,
+                    ..
+                } => {
+                    for behavior in behaviors {
+                        rows.push(match &behavior.effect {
+                            Some(row) => row.clone(),
+                            None => self.infer_effects(&ctx, &behavior.body)?,
+                        });
+                    }
+                    for (_, _, _, default) in state_fields {
+                        rows.push(self.infer_effects(&ctx, default)?);
+                    }
+                    for (_, expr) in init {
+                        rows.push(self.infer_effects(&ctx, expr)?);
+                    }
+                }
+                Decl::StateMachine {
+                    name,
+                    states,
+                    events,
+                    entry_hooks,
+                    exit_hooks,
+                    span,
+                } => {
+                    let actor = crate::ast::desugar_state_machine(
+                        name,
+                        states,
+                        events,
+                        entry_hooks,
+                        exit_hooks,
+                        *span,
+                    );
+                    if let Decl::Actor {
+                        behaviors,
+                        state_fields,
+                        init,
+                        ..
+                    } = actor
+                    {
+                        for behavior in behaviors {
+                            rows.push(match behavior.effect {
+                                Some(row) => row,
+                                None => self.infer_effects(&ctx, &behavior.body)?,
+                            });
+                        }
+                        for (_, _, _, default) in state_fields {
+                            rows.push(self.infer_effects(&ctx, &default)?);
+                        }
+                        for (_, expr) in init {
+                            rows.push(self.infer_effects(&ctx, &expr)?);
+                        }
+                    }
+                }
+                Decl::Workflow {
+                    items, compensate, ..
+                } => {
+                    for item in items {
+                        let steps: &[WorkflowStep] = match item {
+                            WorkflowItem::Step(step) => std::slice::from_ref(step),
+                            WorkflowItem::Parallel(steps) => steps,
+                        };
+                        for step in steps {
+                            rows.push(self.infer_effects(&ctx, &step.body)?);
+                            if let Some(comp) = &step.compensate {
+                                rows.push(self.infer_effects(&ctx, comp)?);
+                            }
+                        }
+                    }
+                    if let Some(comp) = compensate {
+                        rows.push(self.infer_effects(&ctx, comp)?);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(rows)
+    }
     /// Enforce the resource-capability gate (active only when
     /// `set_resource_grants` was called): every resource effect performed by a
     /// module function must belong to a granted category. Core language
