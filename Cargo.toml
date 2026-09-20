@@ -51,17 +51,10 @@ jit-codegen = [
     "dep:cranelift-codegen",
     "dep:target-lexicon",
 ]
-# Experimental MIR -> native backend. Kept independently selectable while its
-# semantic surface is frozen during backend consolidation.
-native-aot = [
-    "dep:cranelift",
-    "dep:cranelift-jit",
-    "dep:cranelift-module",
-    "dep:cranelift-native",
-    "dep:cranelift-frontend",
-    "dep:cranelift-codegen",
-    "dep:target-lexicon",
-]
+# Experimental MIR -> native backend. The current implementation reuses JIT
+# runtime helpers, so AOT depends one-way on `jit-codegen`; the JIT remains
+# independently selectable and does not enable AOT.
+native-aot = ["jit-codegen"]
 # Marker profile for embedded mobile runtimes. Intentionally empty: the
 # bytecode interpreter and pre-registered host callbacks need no JIT.
 mobile-runtime = []
