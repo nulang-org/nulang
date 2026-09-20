@@ -317,11 +317,8 @@ fn journaled_remote_increment_recovers_after_target_cache_restart() {
     let service_b = CacheServiceBuilder::new(node_b.0, placement.clone())
         .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 7210))
         .with_shard(
-            CacheServiceShardConfig::new(
-                "127.0.0.1:0".parse().unwrap(),
-                "127.0.0.1",
-            )
-            .journaled(&wal_path),
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .journaled(&wal_path),
         )
         .with_transport_endpoint(service_bridge_b)
         .build()
@@ -357,11 +354,8 @@ fn journaled_remote_increment_recovers_after_target_cache_restart() {
     let service_b2 = CacheServiceBuilder::new(node_b.0, placement)
         .with_endpoint(source, CacheAdvertisedEndpoint::new("127.0.0.1", 7211))
         .with_shard(
-            CacheServiceShardConfig::new(
-                "127.0.0.1:0".parse().unwrap(),
-                "127.0.0.1",
-            )
-            .journaled(&wal_path),
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .journaled(&wal_path),
         )
         .with_transport_endpoint(service_bridge_b2)
         .build()
@@ -2379,7 +2373,6 @@ fn shard_checkpoint_restores_resp_values_and_reduces_ttl() {
     std::fs::remove_file(snapshot_path).unwrap();
 }
 
-
 #[test]
 fn journaled_shard_recovers_mutations_without_checkpoint() {
     let wal_path = temp_journal_path("journal-only").with_extension("wal");
@@ -2388,11 +2381,8 @@ fn journaled_shard_recovers_mutations_without_checkpoint() {
 
     let service = CacheServiceBuilder::new(node_id, placement.clone())
         .with_shard(
-            CacheServiceShardConfig::new(
-                "127.0.0.1:0".parse().unwrap(),
-                "127.0.0.1",
-            )
-            .journaled(&wal_path),
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .journaled(&wal_path),
         )
         .build()
         .unwrap()
@@ -2414,9 +2404,7 @@ fn journaled_shard_recovers_mutations_without_checkpoint() {
         .unwrap();
     assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
 
-    client
-        .write_all(&frame(&[b"SET", b"gone", b"x"]))
-        .unwrap();
+    client.write_all(&frame(&[b"SET", b"gone", b"x"])).unwrap();
     assert_eq!(read_resp_line(&mut client), b"+OK\r\n");
     client.write_all(&frame(&[b"DEL", b"gone"])).unwrap();
     assert_eq!(read_resp_line(&mut client), b":1\r\n");
@@ -2435,11 +2423,8 @@ fn journaled_shard_recovers_mutations_without_checkpoint() {
 
     let restored = CacheServiceBuilder::new(node_id, placement)
         .with_shard(
-            CacheServiceShardConfig::new(
-                "127.0.0.1:0".parse().unwrap(),
-                "127.0.0.1",
-            )
-            .journaled(&wal_path),
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .journaled(&wal_path),
         )
         .build()
         .unwrap()
@@ -2456,7 +2441,9 @@ fn journaled_shard_recovers_mutations_without_checkpoint() {
     client.read_exact(&mut n_value).unwrap();
     assert_eq!(&n_value, b"$1\r\n2\r\n");
 
-    client.write_all(&frame(&[b"MGET", b"a{j}", b"b{j}"])).unwrap();
+    client
+        .write_all(&frame(&[b"MGET", b"a{j}", b"b{j}"]))
+        .unwrap();
     let mut values = [0u8; 18];
     client.read_exact(&mut values).unwrap();
     assert_eq!(&values, b"*2\r\n$1\r\nA\r\n$1\r\nB\r\n");
@@ -2489,11 +2476,8 @@ fn journaled_checkpoint_replays_only_mutations_after_snapshot_lsn() {
 
     let service = CacheServiceBuilder::new(node_id, placement.clone())
         .with_shard(
-            CacheServiceShardConfig::new(
-                "127.0.0.1:0".parse().unwrap(),
-                "127.0.0.1",
-            )
-            .journaled(&wal_path),
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .journaled(&wal_path),
         )
         .build()
         .unwrap()
@@ -2516,12 +2500,9 @@ fn journaled_checkpoint_replays_only_mutations_after_snapshot_lsn() {
 
     let restored = CacheServiceBuilder::new(node_id, placement)
         .with_shard(
-            CacheServiceShardConfig::new(
-                "127.0.0.1:0".parse().unwrap(),
-                "127.0.0.1",
-            )
-            .restore_from_snapshot(&snapshot_path)
-            .journaled(&wal_path),
+            CacheServiceShardConfig::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+                .restore_from_snapshot(&snapshot_path)
+                .journaled(&wal_path),
         )
         .build()
         .unwrap()
