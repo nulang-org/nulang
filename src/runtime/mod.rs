@@ -11,6 +11,13 @@ use std::time::Instant;
 use tracing::warn;
 
 mod actor;
+pub mod cache;
+pub mod cache_cluster;
+pub mod cache_dispatch;
+pub mod cache_pipeline;
+pub mod cache_routing;
+#[cfg(feature = "cache-server")]
+pub mod cache_server;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
@@ -61,6 +68,8 @@ mod metrics;
 mod persistence;
 mod process_groups;
 mod registry;
+pub mod resp;
+pub mod resp_cache;
 mod spawn;
 #[cfg(feature = "native-codegen")]
 pub(crate) use spawn::spawn_from_module_with_authority;
@@ -79,6 +88,13 @@ mod cluster_sim;
 mod tests;
 
 pub use actor::*;
+pub use cache::*;
+pub use cache_cluster::*;
+pub use cache_dispatch::*;
+pub use cache_pipeline::*;
+pub use cache_routing::*;
+#[cfg(feature = "cache-server")]
+pub use cache_server::*;
 pub use callbacks::RuntimeVmCallbacks;
 pub(crate) use callbacks::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks};
 pub use cluster::*;
@@ -98,6 +114,7 @@ pub use orca_cycle::*;
 pub use persistence::*;
 pub use process_groups::*;
 pub use registry::*;
+pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
