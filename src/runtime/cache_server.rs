@@ -27,13 +27,13 @@ use super::cache::{
     CacheTransferImport, CacheTransferImportTracker,
 };
 use super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap, CacheRoutingMode};
-use super::cache_migration_journal::{
-    CacheMigrationConvergenceEvidence, CacheMigrationJournal, CacheMigrationKey,
-    CacheMigrationRecoveryState,
-};
 use super::cache_dispatch::{
     CacheDispatchChannels, CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher,
     CacheShardInbox,
+};
+use super::cache_migration_journal::{
+    CacheMigrationConvergenceEvidence, CacheMigrationJournal, CacheMigrationKey,
+    CacheMigrationRecoveryState,
 };
 use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
 use super::cache_routing::{CachePlacementError, CacheShardOwner, CacheSlotMap};
@@ -256,9 +256,7 @@ impl CacheTransferImportState {
             .entries
             .iter()
             .map(|entry| {
-                let result = self
-                    .tracker
-                    .import_entry(store, entry, elapsed_ms, now_ms);
+                let result = self.tracker.import_entry(store, entry, elapsed_ms, now_ms);
                 match result {
                     CacheTransferImport::Conflict => {
                         self.conflicts = self.conflicts.saturating_add(1);
@@ -273,12 +271,7 @@ impl CacheTransferImportState {
             .collect()
     }
 
-    fn snapshot(
-        &self,
-        store: &CacheStore,
-        slot: u16,
-        now_ms: u64,
-    ) -> CacheMigrationProbeSnapshot {
+    fn snapshot(&self, store: &CacheStore, slot: u16, now_ms: u64) -> CacheMigrationProbeSnapshot {
         CacheMigrationProbeSnapshot {
             live_entries: store.live_entries_in_slot(slot, now_ms),
             import_fences: self.tracker.len(),
@@ -1109,12 +1102,9 @@ impl CacheServiceHandle {
             .recovery_state(key)
             .cloned()
             .ok_or(CacheServiceError::MigrationRecoveryNotFound)?;
-        let transfer = state
-            .transfers
-            .get(&transfer_id)
-            .ok_or(CacheServiceError::MigrationRecoveryTransferNotFound(
-                transfer_id,
-            ))?;
+        let transfer = state.transfers.get(&transfer_id).ok_or(
+            CacheServiceError::MigrationRecoveryTransferNotFound(transfer_id),
+        )?;
         let CacheTransportMessage::TransferBatch {
             transfer_id,
             placement_epoch,
@@ -1501,9 +1491,7 @@ impl CacheServiceHandle {
             };
             // Durable-before-delete: source generations cannot be finalized
             // unless the matching application ACK is already fsynced.
-            journal
-                .lock()
-                .record_transfer_ack(key, &event.message)?;
+            journal.lock().record_transfer_ack(key, &event.message)?;
         }
 
         let mut imported = 0;
@@ -2289,24 +2277,18 @@ fn handle_cache_network_inbound(
             target,
             slot,
         } => {
-            let snapshot = probe_remote_migration_on_reactor(
-                controls,
-                target,
-                placement_epoch,
-                slot,
-                source,
-            );
-            let (accepted, live_entries, import_fences, conflicts, wrong_slot) =
-                match snapshot {
-                    Some(snapshot) => (
-                        true,
-                        snapshot.live_entries.min(u64::MAX as usize) as u64,
-                        snapshot.import_fences.min(u64::MAX as usize) as u64,
-                        snapshot.conflicts,
-                        snapshot.wrong_slot,
-                    ),
-                    None => (false, 0, 0, 0, 0),
-                };
+            let snapshot =
+                probe_remote_migration_on_reactor(controls, target, placement_epoch, slot, source);
+            let (accepted, live_entries, import_fences, conflicts, wrong_slot) = match snapshot {
+                Some(snapshot) => (
+                    true,
+                    snapshot.live_entries.min(u64::MAX as usize) as u64,
+                    snapshot.import_fences.min(u64::MAX as usize) as u64,
+                    snapshot.conflicts,
+                    snapshot.wrong_slot,
+                ),
+                None => (false, 0, 0, 0, 0),
+            };
             let reply = CacheTransportMessage::MigrationProbeResponse {
                 probe_id,
                 placement_epoch,
@@ -2466,7 +2448,8 @@ fn reject_cache_network_id_reuse(
                         placement_epoch,
                         slot,
                         responder: target,
-                        response: b"-ERR cache request id reused with different payload\r\n".to_vec(),
+                        response: b"-ERR cache request id reused with different payload\r\n"
+                            .to_vec(),
                     },
                 },
             );
@@ -3046,8 +3029,7 @@ impl CacheShardServer {
                     .transfer_imports
                     .entry(batch.slot)
                     .or_insert_with(|| CacheTransferImportState::new(batch.slot));
-                let results =
-                    state.import_batch(&mut self.store, &batch, elapsed_ms, now_ms);
+                let results = state.import_batch(&mut self.store, &batch, elapsed_ms, now_ms);
                 let _ = reply.send(results);
             }
             CacheShardControlRequest::Finalize { entries, reply } => {
