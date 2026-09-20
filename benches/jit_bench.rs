@@ -85,6 +85,39 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
 /// quantifies the real-world JIT gap for call-heavy loops — the largest
 /// remaining coverage hole — against the pure-interpreter `interp/function_call`
 /// baseline and the no-call `jit/hot_loop_warm` ceiling.
+/// Parameter-driven numeric loop. Before compiler-owned entry seeds, the
+/// callee's incoming `seed`/`limit` registers start as Unknown in JIT type
+/// inference, forcing helper-backed arithmetic/comparisons when those values
+/// remain live in the hot loop. This benchmark tracks the steady-state benefit
+/// of preserving those types through the function prologue.
+fn bench_jit_typed_parameter_loop(c: &mut Criterion) {
+    let source = r#"
+        fn accumulate(seed: Int, limit: Int) -> Int {
+            var sum = seed;
+            var i = 0;
+            while i < limit {
+                sum = sum + i;
+                i = i + 1
+            };
+            sum
+        }
+        fn main() -> Int { accumulate(1, 100000) }
+    "#;
+    let module = compile(source);
+
+    c.bench_function("jit/typed_parameter_loop_warm", |b| {
+        b.iter_batched(
+            || {
+                let mut vm = fresh_vm(&module);
+                let _ = vm.run();
+                vm
+            },
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 fn bench_jit_function_call_loop(c: &mut Criterion) {
     let source = "fn add(x: Int, y: Int) -> Int { x + y }; var sum = 0; var i = 0; while i < 100000 { sum = add(sum, i); i = i + 1; }; sum";
     let module = compile(source);
@@ -116,4 +149,9 @@ fn bench_jit_function_call_loop(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_jit_hot_loop, bench_jit_function_call_loop);
+criterion_group!(
+    benches,
+    bench_jit_hot_loop,
+    bench_jit_typed_parameter_loop,
+    bench_jit_function_call_loop
+);
