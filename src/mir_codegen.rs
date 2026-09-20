@@ -294,6 +294,23 @@ impl MirCodegen {
         // treat main as the entry point (matching the legacy compiler).
         let effective_main = main_idx.or(user_main_idx);
 
+        // Enforce source-level @noalloc only after optimization and bytecode
+        // emission, so the contract is checked against the code that will
+        // actually execute. Direct calls are validated transitively by the
+        // cost model; unresolved indirect calls and allocation-capable runtime
+        // boundaries fail closed.
+        if let Err(violations) = crate::cost_model::validate_noalloc_contracts(mir, &self.module) {
+            let details = violations
+                .iter()
+                .map(|v| format!("@noalloc fn '{}': {}", v.function, v.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(compile_err(
+                format!("noalloc contract violation: {}", details),
+                Span::default(),
+            ));
+        }
+
         // Actor behaviors compile through the exact same machinery as
         // ordinary functions, but land in CodeModule.behaviors instead of
         // function_table — Spawn/Send/Ask reference them by index there,
