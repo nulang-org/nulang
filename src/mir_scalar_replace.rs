@@ -204,17 +204,17 @@ trait ProjectionFields {
 impl ProjectionFields for FieldsAdapter<'_> {
     fn source_for_projection(&self, op: &RValue, root: LocalId) -> Option<LocalId> {
         match (self, op) {
-            (
-                FieldsAdapter::Tuple(values),
-                RValue::LoadFieldPos { obj, index },
-            ) if *obj == root => values.get(*index as usize).copied(),
-            (
-                FieldsAdapter::Record(values),
-                RValue::LoadFieldNamed { obj, field },
-            ) if *obj == root => values
-                .iter()
-                .find(|(name, _)| name == field)
-                .map(|(_, source)| *source),
+            (FieldsAdapter::Tuple(values), RValue::LoadFieldPos { obj, index }) if *obj == root => {
+                values.get(*index as usize).copied()
+            }
+            (FieldsAdapter::Record(values), RValue::LoadFieldNamed { obj, field })
+                if *obj == root =>
+            {
+                values
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, source)| *source)
+            }
             _ => None,
         }
     }
@@ -229,9 +229,7 @@ fn stmt_mentions_local(stmt: &Stmt, local: LocalId) -> bool {
     match stmt {
         Stmt::Assign { dst, op } => *dst == local || rvalue_mentions_local(op, local),
         Stmt::StoreFieldNamed { obj, src, .. } => *obj == local || *src == local,
-        Stmt::ArrayStore { arr, idx, src } => {
-            *arr == local || *idx == local || *src == local
-        }
+        Stmt::ArrayStore { arr, idx, src } => *arr == local || *idx == local || *src == local,
         Stmt::Emit { args, .. } => args.contains(&local),
         Stmt::StateSet { src, .. } => *src == local,
         Stmt::EnterHandle { .. } | Stmt::PopHandler => false,
@@ -284,9 +282,7 @@ fn rvalue_mentions_local(op: &RValue, local: LocalId) -> bool {
         | RValue::FFICall { args, .. } => args.contains(&local),
         RValue::ReceiveWait { timeout, .. } => *timeout == local,
         RValue::Spawn {
-            init,
-            target_node,
-            ..
+            init, target_node, ..
         } => {
             target_node.is_some_and(|value| value == local)
                 || init
@@ -348,10 +344,13 @@ mod tests {
     fn replaces_anonymous_tuple_projection() {
         let (mut function, tuple) = tuple_function(None);
         assert_eq!(scalar_replace_function(&mut function), 1);
-        assert!(!function.blocks[0]
-            .stmts
-            .iter()
-            .any(|stmt| matches!(stmt, Stmt::Assign { op: RValue::Tuple(_), .. })));
+        assert!(!function.blocks[0].stmts.iter().any(|stmt| matches!(
+            stmt,
+            Stmt::Assign {
+                op: RValue::Tuple(_),
+                ..
+            }
+        )));
         assert!(!function.blocks[0].stmts.iter().any(|stmt| {
             matches!(
                 stmt,
@@ -367,10 +366,13 @@ mod tests {
     fn preserves_ordinary_named_local_for_debugger() {
         let (mut function, _) = tuple_function(Some("point"));
         assert_eq!(scalar_replace_function(&mut function), 0);
-        assert!(function.blocks[0]
-            .stmts
-            .iter()
-            .any(|stmt| matches!(stmt, Stmt::Assign { op: RValue::Tuple(_), .. })));
+        assert!(function.blocks[0].stmts.iter().any(|stmt| matches!(
+            stmt,
+            Stmt::Assign {
+                op: RValue::Tuple(_),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -379,10 +381,7 @@ mod tests {
         let one = builder.add_temp(Type::int());
         builder.assign(one, RValue::Const(Constant::Int(1)));
         let record = builder.add_local("__point", Type::unit());
-        builder.assign(
-            record,
-            RValue::Record(vec![("x".to_string(), one)]),
-        );
+        builder.assign(record, RValue::Record(vec![("x".to_string(), one)]));
         let projected = builder.add_temp(Type::int());
         builder.assign(
             projected,
@@ -395,10 +394,13 @@ mod tests {
         let mut function = builder.build();
 
         assert_eq!(scalar_replace_function(&mut function), 1);
-        assert!(!function.blocks[0]
-            .stmts
-            .iter()
-            .any(|stmt| matches!(stmt, Stmt::Assign { op: RValue::Record(_), .. })));
+        assert!(!function.blocks[0].stmts.iter().any(|stmt| matches!(
+            stmt,
+            Stmt::Assign {
+                op: RValue::Record(_),
+                ..
+            }
+        )));
     }
 
     #[test]
