@@ -535,6 +535,7 @@ pub enum CacheServiceError {
     MigrationJournalUnavailable,
     MigrationRecoveryNotFound,
     MigrationRecoveryTransferNotFound(u64),
+    MigrationRestartReplayUnsafe,
     ShardServer {
         shard: u16,
         source: CacheServerError,
@@ -1082,6 +1083,77 @@ impl CacheServiceHandle {
             control.wake();
         }
         Ok(())
+    }
+
+    /// Rebind and replay a fully source-drained persistent migration after a
+    /// cache-service process restart.
+    ///
+    /// This is intentionally not general CacheStore recovery. The journal must
+    /// prove that the old source was fully drained, every sent batch had a
+    /// durable application ACK, no ownership commit is pending/completed, and
+    /// every transferred entry was persistent (no relative TTL). The exact
+    /// durable TransferBatch envelopes are then resent in original append order.
+    pub fn replay_drained_remote_migration_after_restart(
+        &self,
+        key: CacheMigrationKey,
+    ) -> Result<Vec<CacheRemoteTransferPending>, CacheServiceError> {
+        let journal = self
+            .migration_journal
+            .as_ref()
+            .ok_or(CacheServiceError::MigrationJournalUnavailable)?;
+
+        let replay = {
+            let mut journal = journal.lock();
+            let state = journal
+                .recovery_state(key)
+                .cloned()
+                .ok_or(CacheServiceError::MigrationRecoveryNotFound)?;
+            let plan = state
+                .drained_restart_replay_plan()
+                .ok_or(CacheServiceError::MigrationRestartReplayUnsafe)?;
+            journal
+                .rebind_drained_source_incarnation(key, self.migration_incarnation)?;
+            plan
+        };
+
+        let placement = self.placement_publisher.snapshot();
+        let Some(migration) = placement.migration_for_slot(key.slot) else {
+            return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
+        };
+        if migration.started_epoch != key.started_epoch
+            || migration.source != key.source
+            || migration.target != key.target
+            || key.source.node_id != self.local_node_id
+            || key.target.node_id == self.local_node_id
+        {
+            return Err(CacheServiceError::RemoteTransferNotActive(key.slot));
+        }
+
+        let mut pending = Vec::with_capacity(replay.len());
+        for message in replay {
+            let CacheTransportMessage::TransferBatch {
+                transfer_id,
+                placement_epoch,
+                source,
+                target,
+                batch,
+            } = message
+            else {
+                return Err(CacheServiceError::MigrationRestartReplayUnsafe);
+            };
+            let recovered = CacheRemoteTransferPending {
+                transfer_id,
+                placement_epoch,
+                source,
+                target,
+                batch,
+            };
+            // The journal was rebound above, so this remains idempotent and
+            // uses the ordinary retry/correlation path.
+            self.retry_remote_slot_batch(&recovered)?;
+            pending.push(recovered);
+        }
+        Ok(pending)
     }
 
     /// Re-send an exact durable transfer envelope after controller recovery.
