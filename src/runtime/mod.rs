@@ -3051,11 +3051,19 @@ impl Runtime {
             }
 
             // Persist a snapshot of durable state before hibernating.
+            let schema_version = self
+                .actors
+                .get(&actor_id)
+                .map(|actor| actor.schema_version)
+                .unwrap_or(crate::persistence_schema::LEGACY_SCHEMA_VERSION);
             let Some(snapshot) = self.build_actor_snapshot(actor_id) else {
                 continue;
             };
             let sequence = snapshot.sequence;
-            if let Err(e) = self.persistence.save_snapshot(snapshot) {
+            if let Err(e) = self
+                .persistence
+                .save_snapshot_versioned(snapshot, schema_version)
+            {
                 warn!(
                     "nulang-grain: failed to save snapshot before dehydrating actor {}: {}",
                     actor_id, e
@@ -4450,12 +4458,16 @@ impl Runtime {
             Some(actor) if actor.persistent => actor.waiting_signal.clone(),
             _ => return,
         };
-        if let Some(mut snapshot) = self.persistence.load_snapshot(actor_id) {
+        if let Some((schema_version, mut snapshot)) =
+            self.persistence.load_snapshot_versioned(actor_id)
+        {
             if snapshot.waiting_signal == waiting_signal {
                 return;
             }
             snapshot.waiting_signal = waiting_signal;
-            let _ = self.persistence.save_snapshot(snapshot);
+            let _ = self
+                .persistence
+                .save_snapshot_versioned(snapshot, schema_version);
         }
     }
 
