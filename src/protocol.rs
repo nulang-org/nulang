@@ -212,6 +212,125 @@ impl fmt::Display for ProtocolRegistryError {
 }
 
 impl Error for ProtocolRegistryError {}
+/// Runtime admission policy for incoming actor messages carrying protocol identity.
+///
+/// Strict policies reject untyped/legacy messages before mailbox publication.
+/// LegacyCompatible exists only as an explicit migration mode for mixed
+/// deployments; it must never be the implicit default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolAdmissionPolicy {
+    StrictExact,
+    StrictCompatible,
+    LegacyCompatible,
+}
+
+impl Default for ProtocolAdmissionPolicy {
+    fn default() -> Self {
+        ProtocolAdmissionPolicy::StrictCompatible
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolAdmission {
+    Exact,
+    CompatibleUpgrade,
+    LegacyUntyped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolAdmissionError {
+    MissingRequiredProtocol,
+    MissingReceiverProtocol,
+    ExactMismatch {
+        receiver: ProtocolId,
+        required: ProtocolId,
+    },
+    Incompatible {
+        receiver: ProtocolId,
+        required: ProtocolId,
+    },
+    UnknownProtocol(ProtocolId),
+}
+
+impl fmt::Display for ProtocolAdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtocolAdmissionError::MissingRequiredProtocol => {
+                f.write_str("incoming actor message has no required protocol identity")
+            }
+            ProtocolAdmissionError::MissingReceiverProtocol => {
+                f.write_str("target actor has no protocol identity")
+            }
+            ProtocolAdmissionError::ExactMismatch { receiver, required } => write!(
+                f,
+                "actor protocol mismatch: receiver {receiver}, required {required}"
+            ),
+            ProtocolAdmissionError::Incompatible { receiver, required } => write!(
+                f,
+                "actor protocol is incompatible: receiver {receiver}, required {required}"
+            ),
+            ProtocolAdmissionError::UnknownProtocol(id) => {
+                write!(f, "unknown actor protocol schema {id}")
+            }
+        }
+    }
+}
+
+impl Error for ProtocolAdmissionError {}
+
+/// Decide whether a message may be published to a target actor mailbox.
+///
+/// `receiver` is the target actor's currently installed protocol identity.
+/// `required` is the protocol identity carried by the incoming client/message.
+/// The function is deliberately side-effect free so runtimes can call it
+/// before mutating mailbox state.
+pub fn admit_protocol(
+    registry: &ProtocolRegistry,
+    policy: ProtocolAdmissionPolicy,
+    receiver: Option<ProtocolId>,
+    required: Option<ProtocolId>,
+) -> Result<ProtocolAdmission, ProtocolAdmissionError> {
+    match (receiver, required) {
+        (Some(receiver), Some(required)) if receiver == required => {
+            Ok(ProtocolAdmission::Exact)
+        }
+        (Some(receiver), Some(required)) => match policy {
+            ProtocolAdmissionPolicy::StrictExact => Err(
+                ProtocolAdmissionError::ExactMismatch { receiver, required },
+            ),
+            ProtocolAdmissionPolicy::StrictCompatible
+            | ProtocolAdmissionPolicy::LegacyCompatible => {
+                let compatibility = registry.compatibility(receiver, required).map_err(
+                    |error| match error {
+                        ProtocolRegistryError::UnknownProtocol(id) => {
+                            ProtocolAdmissionError::UnknownProtocol(id)
+                        }
+                        ProtocolRegistryError::HashCollision(id) => {
+                            ProtocolAdmissionError::UnknownProtocol(id)
+                        }
+                    },
+                )?;
+                match compatibility {
+                    ProtocolCompatibility::Exact => Ok(ProtocolAdmission::Exact),
+                    ProtocolCompatibility::ReceiverSuperset => {
+                        Ok(ProtocolAdmission::CompatibleUpgrade)
+                    }
+                    ProtocolCompatibility::Incompatible => Err(
+                        ProtocolAdmissionError::Incompatible { receiver, required },
+                    ),
+                }
+            }
+        },
+        (None, Some(_)) => Err(ProtocolAdmissionError::MissingReceiverProtocol),
+        (_, None) => match policy {
+            ProtocolAdmissionPolicy::LegacyCompatible => Ok(ProtocolAdmission::LegacyUntyped),
+            ProtocolAdmissionPolicy::StrictExact
+            | ProtocolAdmissionPolicy::StrictCompatible => {
+                Err(ProtocolAdmissionError::MissingRequiredProtocol)
+            }
+        },
+    }
+}
 
 /// One concrete reason a receiver cannot satisfy a required actor protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
