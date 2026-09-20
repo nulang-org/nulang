@@ -1684,19 +1684,43 @@ impl Runtime {
     /// still pending, otherwise translate the placeholder to the real
     /// actor id (if applicable) and send over the wire.
     fn route_ref_send(&mut self, target_id: u64, node: NodeId, behavior: &str, args: &[Value]) {
+        self.route_ref_send_with_protocol(target_id, node, behavior, args, None);
+    }
+
+    fn route_ref_send_with_protocol(
+        &mut self,
+        target_id: u64,
+        node: NodeId,
+        behavior: &str,
+        args: &[Value],
+        protocol_id: Option<[u8; 32]>,
+    ) {
         if self.spawn_placeholders.contains(&target_id)
             && !self.pending_spawn_responses.contains_key(&target_id)
         {
             // SpawnResponse still in flight: queue the pre-resolved wire
             // form; it flushes when the real actor id arrives.
-            distribution::queue_spawn_message(self, target_id, node, behavior, args);
+            distribution::queue_spawn_message(
+                self,
+                target_id,
+                node,
+                behavior,
+                args,
+                protocol_id,
+            );
         } else {
             let real_id = self
                 .spawn_translations
                 .get(&target_id)
                 .copied()
                 .unwrap_or(target_id);
-            self.send_distributed(ActorAddress::remote(node, real_id), behavior, args);
+            distribution::send_distributed_with_protocol(
+                self,
+                ActorAddress::remote(node, real_id),
+                behavior,
+                args,
+                protocol_id.map(crate::protocol::ProtocolId::from_bytes),
+            );
         }
     }
 
@@ -2268,6 +2292,17 @@ impl Runtime {
 
     #[tracing::instrument(level = "trace", skip(self, args))]
     pub fn send_message_by_id(&mut self, target_id: u64, behavior_id: u16, args: &[Value]) {
+        self.send_message_by_id_with_protocol(target_id, behavior_id, args, None);
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, args))]
+    pub(crate) fn send_message_by_id_with_protocol(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+        protocol_id: Option<[u8; 32]>,
+    ) {
         // Stamp the outgoing message with the current handler's trace span (if
         // any), so the receiver's child span links directly to it and causal
         // chains continue across actor, shard, and node boundaries. The W3C
@@ -2300,7 +2335,13 @@ impl Runtime {
                     );
                     return;
                 };
-                self.route_ref_send(target_id, node, &behavior_name, args);
+                self.route_ref_send_with_protocol(
+                    target_id,
+                    node,
+                    &behavior_name,
+                    args,
+                    protocol_id,
+                );
                 return;
             }
         }
@@ -2319,7 +2360,13 @@ impl Runtime {
                 })
                 .unwrap_or_else(|| format!("behavior_{}", behavior_id));
             let target = ActorAddress::remote(target_node, target_id);
-            self.send_distributed(target, &behavior_name, args);
+            distribution::send_distributed_with_protocol(
+                self,
+                target,
+                &behavior_name,
+                args,
+                protocol_id.map(crate::protocol::ProtocolId::from_bytes),
+            );
             return;
         }
         // Cross-shard routing: if the target actor lives on another shard,
