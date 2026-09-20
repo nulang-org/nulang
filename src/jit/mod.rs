@@ -294,7 +294,13 @@ impl JitSession {
             compile_simd_region, is_simd_supported, native_simd_codegen_supported,
         };
 
-        if !is_simd_supported() {
+        if !is_simd_supported()
+            || start_offset >= instructions.len()
+            || num_instrs < 3
+            || start_offset
+                .checked_add(num_instrs)
+                .is_none_or(|end| end > instructions.len())
+        {
             return None;
         }
 
