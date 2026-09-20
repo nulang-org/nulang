@@ -62,6 +62,11 @@ two major versions.*
   while requiring every requested behavior/signature. Calls through
   `ActorRef[P]` are checked directly from `P`. The type is compile-time-only
   and does not change runtime actor representation or stable formats.
+- **Directional ActorRef attenuation** (Experimental). Already-abstract
+  `ActorRef<P>` values may flow to narrower `ActorRef<Q>` requirements when
+  every required behavior/signature is present. Widening to claim missing
+  behaviors is rejected. The check is applied at value-to-expected-type
+  boundaries without making general HM unification asymmetric.
 
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
