@@ -3292,6 +3292,20 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_scalar_replace_record_across_dominated_branch_removes_recmk() {
+        let source =
+            "fn main() { let __r = { x: 20, y: 22 }; if true then __r.x + __r.y else 0 }";
+        let value = run_source(source).unwrap();
+        assert_eq!(value.as_int(), Some(42));
+
+        let module = compile_source(source).unwrap();
+        assert!(
+            !has_opcode(&module, OpCode::RecMk),
+            "record constructed before a dominated branch should be scalar-replaced"
+        );
+    }
+
+    #[test]
     fn test_scalar_replace_preserves_named_record_for_debugger() {
         let source = "fn main() { let point = { x: 20, y: 22 }; point.x + point.y }";
         let value = run_source(source).unwrap();
