@@ -864,8 +864,8 @@ fn main() {
                 &opts.with_capabilities,
                 opts.deny_warnings,
             ) {
-                Ok((_ast, _type_checker, effect_checker)) => {
-                    if let Err(e) = emit_wit_contract(&effect_checker, out) {
+                Ok((ast, _type_checker, mut effect_checker)) => {
+                    if let Err(e) = emit_wit_contract(&ast, &mut effect_checker, out) {
                         print_error(&e, use_color);
                         std::process::exit(exit_code(&e));
                     }
@@ -1773,9 +1773,13 @@ fn run_frontend(
 
 /// Render the module's compiler-checked effect rows as a closed WIT capability
 /// world. The WIT generator fails closed on open or unmapped rows.
-fn emit_wit_contract(effect_checker: &EffectChecker, out_path: &str) -> NuResult<()> {
-    let function_rows = effect_checker.function_rows();
-    let world = nulang::witgen::generate_wit_world_from_effect_rows(function_rows.values())
+fn emit_wit_contract(
+    ast: &nulang::ast::AstModule,
+    effect_checker: &mut EffectChecker,
+    out_path: &str,
+) -> NuResult<()> {
+    let effect_rows = effect_checker.module_effect_rows(&ast.decls)?;
+    let world = nulang::witgen::generate_wit_world_from_effect_rows(effect_rows.iter())
         .map_err(|e| NuError::EffectError {
             msg: format!("cannot emit WIT capability world: {e}"),
             span: Span::default(),
