@@ -35,7 +35,7 @@ A logical actor must retain the same identity through dehydration, rehydration, 
 `GrainId` remains authoritative. Its canonical encoding is length-prefixed so no separator ambiguity is possible.
 
 ```text
-u32(type_len) || type_utf8 || u32(key_len) || key_utf8
+u64(type_len) || type_utf8 || u64(key_len) || key_utf8
 ```
 
 ### Compact logical identity
