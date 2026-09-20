@@ -36,53 +36,7 @@
 
 use crate::bytecode::{Instruction, OpCode};
 use crate::jit::typed_compiler::{KnownType, TypeMetadata};
-
-// ---------------------------------------------------------------------------
-// SimdElemType
-// ---------------------------------------------------------------------------
-
-/// The scalar element type that will be packed into SIMD vectors.
-///
-/// This determines both the lane width and the Cranelift SIMD type to use:
-/// - `Int64` → `I64x2` (2-wide on 128-bit vectors)
-/// - `Float64` → `F64x2` (2-wide on 128-bit vectors)
-/// - `Int32` → `I32x4` (4-wide on 128-bit vectors)
-/// - `Float32` → `F32x4` (4-wide on 128-bit vectors)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SimdElemType {
-    Int64,
-    Float64,
-    Int32,
-    Float32,
-}
-
-impl SimdElemType {
-    /// Return true if this is a floating-point type.
-    pub fn is_float(&self) -> bool {
-        matches!(self, SimdElemType::Float64 | SimdElemType::Float32)
-    }
-
-    /// Return true if this is an integer type.
-    pub fn is_int(&self) -> bool {
-        !self.is_float()
-    }
-
-    /// Return the SIMD lane width for this element type on a 128-bit vector.
-    pub fn lane_count(&self) -> usize {
-        match self {
-            SimdElemType::Int64 | SimdElemType::Float64 => 2,
-            SimdElemType::Int32 | SimdElemType::Float32 => 4,
-        }
-    }
-
-    /// Return the element size in bytes.
-    pub fn elem_size(&self) -> usize {
-        match self {
-            SimdElemType::Int64 | SimdElemType::Float64 => 8,
-            SimdElemType::Int32 | SimdElemType::Float32 => 4,
-        }
-    }
-}
+pub use crate::simd::SimdElemType;
 
 // ---------------------------------------------------------------------------
 // SimdWidth
