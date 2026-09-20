@@ -6,10 +6,10 @@
 //! while ensuring statically known actor sends/asks reach MIR with an exact
 //! actor-schema receiver hint.
 
-#[path = "hir_lower.rs"]
-mod legacy;
 #[path = "actor_identity_bridge.rs"]
 mod actor_identity_bridge;
+#[path = "hir_lower.rs"]
+mod legacy;
 
 pub use legacy::{lower_body, lower_expr};
 
