@@ -3,6 +3,10 @@
 // contract: the failure is not fatal to the workflow actor — steps still
 // queued in the mailbox (step_d) execute afterwards, and compensations
 // are marked so they run only once.
+//
+// Use a primitive non-exhaustive match here intentionally. Closed variants are
+// rejected by the typechecker now; this test needs a runtime failure so it can
+// exercise the workflow compensation machinery.
 workflow HaltWf {
   step step_a {
     {
@@ -23,9 +27,8 @@ workflow HaltWf {
   }
 
   step step_c {
-    let m: Maybe[Int] = None in
-    match m {
-      | Some(x) => perform IO.print("unreachable")
+    match 1 {
+      | 0 => perform IO.print("unreachable")
     }
   }
 
@@ -33,8 +36,6 @@ workflow HaltWf {
     perform IO.print("step-d")
   }
 }
-
-type Maybe[V] = Some(V) | None
 
 actor Dummy {
   behavior noop() { 0 }
