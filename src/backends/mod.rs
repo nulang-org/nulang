@@ -590,14 +590,14 @@ impl CryptoProvider for DefaultCryptoProvider {
 pub const JIT_SAFEPOINT_BUDGET: u64 = 1000;
 
 /// Create the default JIT backend when native code generation is compiled in.
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "jit-codegen")]
 pub fn create_default_jit() -> Option<Box<dyn JitBackend>> {
     crate::jit::JitSession::new().map(|j| Box::new(j) as Box<dyn JitBackend>)
 }
 
 /// Interpreter-only builds preserve the same VM trait boundary but have no
 /// native tier to instantiate.
-#[cfg(not(feature = "native-codegen"))]
+#[cfg(not(feature = "jit-codegen"))]
 pub fn create_default_jit() -> Option<Box<dyn JitBackend>> {
     None
 }
