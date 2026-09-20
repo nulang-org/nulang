@@ -27,7 +27,8 @@
         "kind": "checked-effect-row",
         "effect": "Inference"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "scalar"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:storage/string#Write",
@@ -52,7 +53,8 @@
         "kind": "checked-effect-row",
         "effect": "Storage"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "scalar"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:storage/string#Read",
@@ -75,7 +77,8 @@
         "kind": "checked-effect-row",
         "effect": "Storage"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "scalar"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:storage/string#Delete",
@@ -97,7 +100,8 @@
         "kind": "checked-effect-row",
         "effect": "Storage"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "scalar"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:queue/string#Send",
@@ -122,7 +126,8 @@
         "kind": "checked-effect-row",
         "effect": "Queue"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "scalar"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:queue/string#Receive",
@@ -145,7 +150,8 @@
         "kind": "checked-effect-row",
         "effect": "Queue"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "scalar"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:http/string#GET",
@@ -170,7 +176,8 @@
         "kind": "checked-effect-row",
         "effect": "Http"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "scalar"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:timer/timer#sleep",
@@ -191,7 +198,8 @@
         "kind": "checked-effect-row",
         "effect": "Timer"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "scalar"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:comms/comms#send",
@@ -234,7 +242,8 @@
         "kind": "checked-effect-row",
         "effect": "Comms"
       },
-      "replay_class": "external-requires-idempotency-key"
+      "replay_class": "external-requires-idempotency-key",
+      "result_encoding": "json-text"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:comms/comms#call",
@@ -265,7 +274,8 @@
         "kind": "checked-effect-row",
         "effect": "Comms"
       },
-      "replay_class": "external-nonreplayable"
+      "replay_class": "external-nonreplayable",
+      "result_encoding": "json-text"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#create",
@@ -293,7 +303,8 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "json-text"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#send",
@@ -318,7 +329,8 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "json-text"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#state",
@@ -340,7 +352,8 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "json-text"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#list",
@@ -359,7 +372,8 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "json-text"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#delete",
@@ -381,7 +395,8 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "json-text"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#remember",
@@ -409,7 +424,8 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "json-text"
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#recall",
@@ -437,7 +453,8 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "result_encoding": "json-text"
     }
   ]
 }
