@@ -160,7 +160,7 @@ impl ComponentRuntime {
                     "log",
                     move |mut caller: wasmtime::StoreContextMut<'_, HostState>,
                           (msg,): (String,)| {
-                        caller.data_mut().log_messages.push(msg);
+                        caller.data_mut().log(msg);
                         Ok(())
                     },
                 )
