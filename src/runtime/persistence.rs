@@ -932,6 +932,7 @@ impl LibsqlStore {
                 "CREATE TABLE IF NOT EXISTS snapshots (
                     actor_id INTEGER PRIMARY KEY,
                     sequence INTEGER NOT NULL,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
                     state TEXT NOT NULL,
                     waiting_signal TEXT,
                     crdt_snapshot TEXT,
@@ -942,6 +943,13 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // RFC 0008 schema provenance. Historical rows default to v1.
+            let _ = conn
+                .execute(
+                    "ALTER TABLE snapshots ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+                    (),
+                )
+                .await;
             // Migrate databases created before the waiting_signal column existed.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN waiting_signal TEXT", ())
@@ -1063,6 +1071,25 @@ impl LibsqlStore {
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        self.save_snapshot_versioned(snapshot, LEGACY_SCHEMA_VERSION)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.load_snapshot_versioned(actor_id)
+            .map(|(_, snapshot)| snapshot)
+    }
+
+    fn save_snapshot_versioned(
+        &mut self,
+        snapshot: ActorSnapshot,
+        schema_version: u32,
+    ) -> io::Result<()> {
+        if schema_version == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "schema version must be >= 1",
+            ));
+        }
         let state_json = serde_json::to_string(&snapshot.state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
@@ -1074,30 +1101,38 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
+                "INSERT INTO snapshots (actor_id, sequence, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, schema_version=excluded.schema_version, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
+                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, schema_version as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
 
-    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+    fn load_snapshot_versioned(&self, actor_id: u64) -> Option<(u32, ActorSnapshot)> {
         let conn = self.conn();
         self.rt.block_on(async {
             let mut rows = conn
                 .query(
-                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
+                    "SELECT sequence, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
                     libsql::params![actor_id as i64],
                 )
                 .await
                 .ok()?;
             let row = rows.next().await.ok()??;
             let sequence: i64 = row.get(0).ok()?;
-            let state_json: String = row.get(1).ok()?;
-            let waiting_signal: Option<String> = row.get(2).ok()?;
-            let crdt_json: Option<String> = row.get(3).ok()?;
-            let crdt_field_map_json: Option<String> = row.get(4).ok()?;
-            let authority_json: Option<String> = row.get(5).ok()?;
+            let schema_version: i64 = row.get(1).ok()?;
+            if schema_version <= 0 || schema_version > u32::MAX as i64 {
+                warn!(
+                    "nulang-persist: invalid schema version {} for actor {}",
+                    schema_version, actor_id
+                );
+                return None;
+            }
+            let state_json: String = row.get(2).ok()?;
+            let waiting_signal: Option<String> = row.get(3).ok()?;
+            let crdt_json: Option<String> = row.get(4).ok()?;
+            let crdt_field_map_json: Option<String> = row.get(5).ok()?;
+            let authority_json: Option<String> = row.get(6).ok()?;
             let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
@@ -1120,15 +1155,18 @@ impl PersistenceStore for LibsqlStore {
                 None => BTreeSet::new(),
             };
             let state: HashMap<String, PersistedValue> = serde_json::from_str(&state_json).ok()?;
-            Some(ActorSnapshot {
-                actor_id,
-                sequence: sequence as u64,
-                state,
-                waiting_signal,
-                crdt_snapshot,
-                crdt_field_map,
-                authority_tokens,
-            })
+            Some((
+                schema_version as u32,
+                ActorSnapshot {
+                    actor_id,
+                    sequence: sequence as u64,
+                    state,
+                    waiting_signal,
+                    crdt_snapshot,
+                    crdt_field_map,
+                    authority_tokens,
+                },
+            ))
         })
     }
 
