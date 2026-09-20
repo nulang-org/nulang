@@ -3246,10 +3246,9 @@ impl TypeChecker {
         match pattern {
             Pattern::Wild | Pattern::Var(_) => true,
             Pattern::Alias(_, inner) => Self::pattern_is_catch_all(inner),
-            Pattern::Lit(_)
-            | Pattern::Tuple(_)
-            | Pattern::Record(_)
-            | Pattern::Variant(_, _) => false,
+            Pattern::Lit(_) | Pattern::Tuple(_) | Pattern::Record(_) | Pattern::Variant(_, _) => {
+                false
+            }
         }
     }
 
@@ -3260,10 +3259,9 @@ impl TypeChecker {
         match pattern {
             Pattern::Wild | Pattern::Var(_) => true,
             Pattern::Alias(_, inner) => Self::payload_pattern_is_total(inner),
-            Pattern::Lit(_)
-            | Pattern::Tuple(_)
-            | Pattern::Record(_)
-            | Pattern::Variant(_, _) => false,
+            Pattern::Lit(_) | Pattern::Tuple(_) | Pattern::Record(_) | Pattern::Variant(_, _) => {
+                false
+            }
         }
     }
 
@@ -4555,11 +4553,7 @@ mod tests {
         let expr = Expr::Match {
             scrutinee: Box::new(var("color")),
             arms: vec![
-                (
-                    Pattern::Variant("Red".to_string(), None),
-                    None,
-                    int_lit(1),
-                ),
+                (Pattern::Variant("Red".to_string(), None), None, int_lit(1)),
                 (
                     Pattern::Variant("Green".to_string(), None),
                     None,
@@ -4590,21 +4584,13 @@ mod tests {
         let expr = Expr::Match {
             scrutinee: Box::new(var("color")),
             arms: vec![
-                (
-                    Pattern::Variant("Red".to_string(), None),
-                    None,
-                    int_lit(1),
-                ),
+                (Pattern::Variant("Red".to_string(), None), None, int_lit(1)),
                 (
                     Pattern::Variant("Green".to_string(), None),
                     None,
                     int_lit(2),
                 ),
-                (
-                    Pattern::Variant("Blue".to_string(), None),
-                    None,
-                    int_lit(3),
-                ),
+                (Pattern::Variant("Blue".to_string(), None), None, int_lit(3)),
             ],
             span: sp(),
         };
@@ -4635,11 +4621,7 @@ mod tests {
                     Some(bool_lit(true)),
                     int_lit(1),
                 ),
-                (
-                    Pattern::Variant("None".to_string(), None),
-                    None,
-                    int_lit(0),
-                ),
+                (Pattern::Variant("None".to_string(), None), None, int_lit(0)),
             ],
             span: sp(),
         };
