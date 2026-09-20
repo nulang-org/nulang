@@ -11,8 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::cache::{
-    CacheDurableEntry, CacheDurableRestoreError, CacheStore, CacheTransferToken,
-    CacheTransferValue,
+    CacheDurableEntry, CacheDurableRestoreError, CacheStore, CacheTransferToken, CacheTransferValue,
 };
 
 const MAGIC: &[u8; 4] = b"NCDS";
@@ -309,8 +308,8 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::cache::{CacheTransferFinalize, CacheTtl, CacheValueView};
     use super::*;
-    use super::super::cache::{CacheTtl, CacheValueView, CacheTransferFinalize};
     use std::time::{Duration, SystemTime};
 
     fn temp_path(name: &str) -> PathBuf {
