@@ -108,6 +108,8 @@ pub struct FunctionDef {
     pub public: bool,
     /// Web framework compile-time placement hint (None = infer from effect row).
     pub placement: Option<crate::types::Placement>,
+    /// Strong mechanical-cost contract inherited from source `@noalloc`.
+    pub no_alloc: bool,
     pub span: Span,
 }
 
