@@ -11,6 +11,7 @@ use std::time::Instant;
 use tracing::warn;
 
 mod actor;
+mod behavior_ownership;
 pub mod cache;
 pub mod cache_cluster;
 pub mod cache_dispatch;
@@ -1345,6 +1346,9 @@ impl Runtime {
             }
         }
 
+        // Numeric cross-shard delivery is an internal transport primitive.
+        // Name-based/public ingress resolves and validates ownership before
+        // reaching this point; dispatch still proves bytecode ownership.
         let msg = Message {
             behavior_id,
             payload: Arc::new(payload),
@@ -1765,10 +1769,15 @@ impl Runtime {
             }
         }
         let module = actor.bytecode_module.as_ref()?;
+        let module_idx = behavior_ownership::module_behavior_index_for_actor(
+            module,
+            &actor.name,
+            behavior_id as usize,
+        )?;
         module
             .behaviors
-            .get(behavior_id as usize)
-            .map(|b| b.name.clone())
+            .get(module_idx)
+            .map(|behavior| behavior.name.clone())
     }
 
     /// Synchronously run a single behavior on an actor and return its result.
@@ -2062,41 +2071,42 @@ impl Runtime {
     /// declares handler 0; invalid ids are never aliases for it.
     fn actor_has_behavior_id(&self, target_id: u64, behavior_id: u16) -> bool {
         let behavior_idx = behavior_id as usize;
-        let has_native = self
-            .actors
-            .get(&target_id)
-            .and_then(|actor| actor.behavior_table.get(behavior_idx))
+        let Some(actor) = self.actors.get(&target_id) else {
+            return false;
+        };
+        let has_native = actor
+            .behavior_table
+            .get(behavior_idx)
             .is_some_and(|entry| !entry.name.is_empty());
-        has_native || self.has_bytecode_handler(target_id, behavior_idx)
+        if has_native {
+            return true;
+        }
+        let Some(module) = actor.bytecode_module.as_ref() else {
+            return false;
+        };
+        behavior_ownership::module_behavior_index_for_actor(module, &actor.name, behavior_idx)
+            .is_some()
+            && self.has_bytecode_handler(target_id, behavior_idx)
     }
 
     pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {
         let actor = self.actors.get(&target_id)?;
-        // Allocation-free match: `entry.name == behavior`, or
-        // `entry.name` ends with `.<behavior>` (qualified name).
         let matches = |name: &str| {
             name == behavior
                 || name
                     .strip_suffix(behavior)
                     .is_some_and(|prefix| prefix.ends_with('.'))
         };
-        // Search the per-actor behavior table first (native handlers).
         if let Some(idx) = actor
             .behavior_table
             .iter()
             .position(|entry| matches(&entry.name))
         {
-            return Some(idx as u16);
+            return u16::try_from(idx).ok();
         }
-        // Fall back to the module-level behavior table (bytecode handlers).
-        // Returns the GLOBAL index into module.behaviors, which matches
-        // what bytecode_offsets expects.
         let module = actor.bytecode_module.as_ref()?;
-        module
-            .behaviors
-            .iter()
-            .position(|b| matches(&b.name))
-            .map(|idx| idx as u16)
+        behavior_ownership::runtime_behavior_id_for_actor_name(module, &actor.name, behavior)
+            .and_then(|idx| u16::try_from(idx).ok())
     }
 
     /// Resolve a behavior name to a numeric id using the registered grain
@@ -2104,13 +2114,12 @@ impl Runtime {
     /// target actor has been hydrated on the local shard.
     fn resolve_grain_behavior_id(&self, grain_id: &GrainId, behavior_name: &str) -> Option<u16> {
         let grain_type = self.grain_registry.get(&grain_id.grain_type)?;
-        let suffix = format!(".{}", behavior_name);
-        grain_type
-            .module
-            .behaviors
-            .iter()
-            .position(|b| b.name == behavior_name || b.name.ends_with(&suffix))
-            .map(|idx| idx as u16)
+        behavior_ownership::runtime_behavior_id_for_name(
+            &grain_type.module,
+            &grain_id.grain_type,
+            behavior_name,
+        )
+        .and_then(|idx| u16::try_from(idx).ok())
     }
 
     /// Send a message to an actor owned by another shard. Validates that the
@@ -2544,6 +2553,12 @@ impl Runtime {
         args: &[Value],
         out_trace: Option<String>,
     ) -> MessageAdmission {
+        // Numeric mailbox delivery is intentionally low-level: runtime
+        // subsystems use it for scheduling, reference/GC bookkeeping, tracing,
+        // and other messages which need not name a user behavior. Public
+        // name-based sends and synchronous numeric asks enforce validity at
+        // their respective ingress boundaries; bytecode dispatch separately
+        // proves target-schema ownership before executing user code.
         let msg = Message {
             behavior_id,
             payload: Arc::new(args.to_vec()),

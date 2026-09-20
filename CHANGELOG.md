@@ -86,6 +86,12 @@ two major versions.*
   that owns their behavior table. Manual/native actors keep their synthetic
   instance names. This gives runtime dispatch a concrete schema identity for
   subsequent ownership enforcement.
+- **Runtime behavior ownership enforcement** (Stable runtime correction).
+  Name and numeric behavior resolution for bytecode actors is scoped to the
+  target actor schema. Foreign-schema numeric IDs are rejected before local or
+  cross-shard mailbox publication, workflow-local IDs are translated through
+  their own metadata, and virtual actor instances resolve only their declared
+  grain schema.
 
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
