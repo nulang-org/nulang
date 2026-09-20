@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn open_effect_row_fails_closed() {
-        let row = EffectRow::Open(vec![Effect::IO], crate::types::Region(1));
+        let row = EffectRow::Open(vec![Effect::IO], crate::types::Region::fresh());
         assert_eq!(
             effect_row_to_wit_imports(&row),
             Err(WitGenError::OpenEffectRow)
