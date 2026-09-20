@@ -397,6 +397,9 @@ pub struct Runtime {
     /// Job ownership used to route worker completions back to the actor that
     /// initiated the call without giving workers access to actor state.
     foreign_job_owners: HashMap<BlockingJobId, u64>,
+    /// Completed foreign jobs buffered by the scheduler until a consumer
+    /// explicitly drains them. Scheduler polling must never discard results.
+    foreign_ready_completions: Vec<ForeignActorCompletion>,
     // LLM subsystem (v0.9 AI Runtime): client, worker thread, token budget,
     // completion channel, and non-blocking suspension state.
     #[cfg(feature = "ai-runtime")]
@@ -633,6 +636,7 @@ impl Runtime {
             foreign_interop: None,
             foreign_executor: None,
             foreign_job_owners: HashMap::new(),
+            foreign_ready_completions: Vec::new(),
             crdt_sync_rounds: 0,
             timer_wheel: TimerWheel::new(),
             registry: ActorRegistry::new(),
@@ -716,31 +720,46 @@ impl Runtime {
         Ok(job_id)
     }
 
-    /// Drain currently-ready foreign completions without blocking.
-    pub fn poll_foreign_completions(&mut self) -> Vec<ForeignActorCompletion> {
+    /// Number of admitted foreign jobs that have not completed yet.
+    fn foreign_inflight_count(&self) -> usize {
+        self.foreign_job_owners.len()
+    }
+
+    /// Move worker completions into the runtime-owned ready buffer.
+    ///
+    /// This is safe to call from scheduler hot paths: it never blocks and it
+    /// preserves every completion until an explicit consumer drains it.
+    fn pump_foreign_completions(&mut self) {
         let completions = match self.foreign_executor.as_ref() {
             Some(executor) => executor.drain_ready(),
-            None => return Vec::new(),
+            None => return,
         };
 
-        completions
-            .into_iter()
-            .map(|completion| {
-                let job_id = completion.id();
-                let actor_id = self.foreign_job_owners.remove(&job_id);
-                let result = match completion {
-                    BlockingCompletion::Finished { value, .. } => value,
-                    BlockingCompletion::Panicked { .. } => {
-                        Err("foreign worker panicked while executing call".to_string())
-                    }
-                };
-                ForeignActorCompletion {
-                    job_id,
-                    actor_id,
-                    result,
+        for completion in completions {
+            let job_id = completion.id();
+            let actor_id = self.foreign_job_owners.remove(&job_id);
+            let result = match completion {
+                BlockingCompletion::Finished { value, .. } => value,
+                BlockingCompletion::Panicked { .. } => {
+                    Err("foreign worker panicked while executing call".to_string())
                 }
-            })
-            .collect()
+            };
+            self.foreign_ready_completions.push(ForeignActorCompletion {
+                job_id,
+                actor_id,
+                result,
+            });
+        }
+    }
+
+    /// Drain currently-ready foreign completions without blocking.
+    ///
+    /// Any completions already collected by the scheduler are returned first;
+    /// newly-ready worker completions are pumped into the same buffer before
+    /// the drain.
+    pub fn poll_foreign_completions(&mut self) -> Vec<ForeignActorCompletion> {
+        self.pump_foreign_completions();
+        std::mem::take(&mut self.foreign_ready_completions)
     }
 
     /// Compute the BLAKE3 hash of `data` using the configured [`CryptoProvider`].
@@ -2766,6 +2785,9 @@ impl Runtime {
     pub fn run_scheduler(&mut self) {
         let mut ticks: u64 = 0;
         loop {
+            // Foreign workers never touch Runtime state. Pull completed owned
+            // results back onto the scheduler thread before choosing work.
+            self.pump_foreign_completions();
             // Drain any cross-shard messages before checking the local
             // scheduler queue. In-flight messages from other shards inject
             // actors into the local scheduler.
@@ -2773,14 +2795,17 @@ impl Runtime {
             let actor_id = match self.scheduler.dequeue() {
                 Some(actor_id) => actor_id,
                 None => {
-                    if self.llm_inflight_count() == 0 && self.timer_wheel.is_empty() {
+                    if self.llm_inflight_count() == 0
+                        && self.foreign_inflight_count() == 0
+                        && self.timer_wheel.is_empty()
+                    {
                         if let Some(ref mut cb) = self.idle_callback {
                             cb();
                         }
                         break;
                     }
-                    // The run queue is drained but background LLM calls are
-                    // still in flight or timers are pending: block briefly
+                    // The run queue is drained but background LLM/foreign
+                    // calls are still in flight or timers are pending: wait briefly
                     // for the next completion or timer deadline so
                     // run_scheduler keeps its "run until quiescent"
                     // semantics - an actor whose last turn armed a timer
@@ -2801,6 +2826,9 @@ impl Runtime {
                     }
                     #[cfg(not(feature = "ai-runtime"))]
                     std::thread::sleep(wait);
+                    // Pull any foreign result that completed during the wait
+                    // into the ready buffer, then deliver matured timers.
+                    self.pump_foreign_completions();
                     // Deliver any timers that matured while waiting; fired
                     // messages re-enqueue their target actors, so the next
                     // dequeue resumes work.
