@@ -222,6 +222,37 @@ fn presence_from_flags(saw_present: bool, saw_missing: bool) -> RespCommandKeyPr
     }
 }
 
+/// Return the keys a command may mutate.
+    ///
+    /// The default memory path does not call this helper. WAL-enabled reactors
+    /// use it to capture exact before/after physical state around execution.
+    pub fn command_mutation_keys(command: RespCommand<'_>) -> Vec<&[u8]> {
+        let name = command.name();
+
+        if name.eq_ignore_ascii_case(b"SET")
+            || name.eq_ignore_ascii_case(b"INCR")
+            || name.eq_ignore_ascii_case(b"EXPIRE")
+        {
+            return command.args().next().into_iter().collect();
+        }
+
+        if name.eq_ignore_ascii_case(b"DEL") {
+            return command.args().collect();
+        }
+
+        if name.eq_ignore_ascii_case(b"MSET") {
+            let mut args = command.args();
+            let mut keys = Vec::with_capacity(command.argc() / 2);
+            while let Some(key) = args.next() {
+                let _ = args.next();
+                keys.push(key);
+            }
+            return keys;
+        }
+
+        Vec::new()
+    }
+
 /// Execute a validated RESP command against one shard-local cache store.
 ///
 /// Multi-key commands fail with Redis-compatible `CROSSSLOT` before any
