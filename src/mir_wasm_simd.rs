@@ -1,5 +1,5 @@
 use crate::ast::BinOp;
-use crate::jit::simd_analyzer::SimdElemType;
+use crate::simd::SimdElemType;
 use crate::mir::{self, BlockId, LocalId, RValue, Stmt, Terminator};
 use crate::type_metadata::KnownType;
 
