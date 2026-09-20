@@ -27,6 +27,9 @@ use super::cache::{
     CacheTransferImport, CacheTransferImportTracker,
 };
 use super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap, CacheRoutingMode};
+use super::cache_durable_store::{
+    restore_cache_snapshot, write_cache_snapshot, CacheSnapshotError, CacheSnapshotReport,
+};
 use super::cache_dispatch::{
     CacheDispatchChannels, CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher,
     CacheShardInbox,
@@ -322,6 +325,10 @@ enum CacheShardControlRequest {
         slot: u16,
         reply: SyncSender<()>,
     },
+    WriteSnapshot {
+        path: PathBuf,
+        reply: SyncSender<Result<CacheSnapshotReport, CacheSnapshotError>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +480,10 @@ pub struct CacheServiceShardConfig {
     pub advertised_host: String,
     pub advertised_port: Option<u16>,
     pub cpu: Option<usize>,
+    /// Optional cold-start checkpoint. Missing path means start empty; a
+    /// configured existing file is integrity-checked and restored before the
+    /// shard reactor starts.
+    pub restore_snapshot_path: Option<PathBuf>,
 }
 
 impl CacheServiceShardConfig {
@@ -482,6 +493,7 @@ impl CacheServiceShardConfig {
             advertised_host: advertised_host.into(),
             advertised_port: None,
             cpu: None,
+            restore_snapshot_path: None,
         }
     }
 
@@ -497,6 +509,11 @@ impl CacheServiceShardConfig {
     /// Best-effort pin of this shard reactor to a logical CPU.
     pub fn pin_to_cpu(mut self, cpu: usize) -> Self {
         self.cpu = Some(cpu);
+        self
+    }
+
+    pub fn restore_from_snapshot(mut self, path: impl Into<PathBuf>) -> Self {
+        self.restore_snapshot_path = Some(path.into());
         self
     }
 }
@@ -536,6 +553,7 @@ pub enum CacheServiceError {
     MigrationRecoveryNotFound,
     MigrationRecoveryTransferNotFound(u64),
     MigrationRestartReplayUnsafe,
+    Snapshot(CacheSnapshotError),
     ShardServer {
         shard: u16,
         source: CacheServerError,
@@ -564,6 +582,12 @@ impl From<CacheDispatchConfigError> for CacheServiceError {
 impl From<CacheTransportBridgeError> for CacheServiceError {
     fn from(value: CacheTransportBridgeError) -> Self {
         Self::TransportBridge(value)
+    }
+}
+
+impl From<CacheSnapshotError> for CacheServiceError {
+    fn from(value: CacheSnapshotError) -> Self {
+        Self::Snapshot(value)
     }
 }
 
@@ -668,7 +692,12 @@ impl CacheServiceBuilder {
                 owner,
                 CacheAdvertisedEndpoint::new(&shard.advertised_host, advertised_port),
             );
-            reserved.push((listener, local_addr, shard.cpu));
+            reserved.push((
+                listener,
+                local_addr,
+                shard.cpu,
+                shard.restore_snapshot_path.clone(),
+            ));
         }
 
         validate_placement_endpoints(&self.placement, &endpoints)?;
@@ -682,7 +711,7 @@ impl CacheServiceBuilder {
         let mut local_addrs = Vec::with_capacity(self.shards.len());
         let mut cpus = Vec::with_capacity(self.shards.len());
 
-        for (index, ((listener, local_addr, cpu), inbox)) in
+        for (index, ((listener, local_addr, cpu, restore_snapshot_path), inbox)) in
             reserved.into_iter().zip(inboxes.into_iter()).enumerate()
         {
             let shard = index as u16;
@@ -694,11 +723,16 @@ impl CacheServiceBuilder {
             )?
             .with_cluster_redirects(endpoints.clone());
 
+            let store = match restore_snapshot_path {
+                Some(path) if path.exists() => restore_cache_snapshot(&path, clock.now_ms())?,
+                Some(_) | None => CacheStore::new(),
+            };
+
             let server = CacheShardServer::from_listener(
                 listener,
                 dispatcher,
                 inbox,
-                CacheStore::new(),
+                store,
                 self.server_config.clone(),
                 clock.clone(),
                 Some(placement_publisher.clone()),
@@ -918,6 +952,27 @@ impl CacheServiceHandle {
             .iter()
             .map(CacheShardServerControl::placement_epoch)
             .collect()
+    }
+
+    /// Write a point-in-time shard checkpoint on the owning reactor thread.
+    ///
+    /// The checkpoint is integrity-checked and preserves migration generation
+    /// tokens, but mutations after this call are not durable until a WAL exists.
+    pub fn checkpoint_shard(
+        &self,
+        shard: u16,
+        path: impl Into<PathBuf>,
+    ) -> Result<CacheSnapshotReport, CacheServiceError> {
+        let control = self.transfer_control(shard)?;
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        control.request_control(CacheShardControlRequest::WriteSnapshot {
+            path: path.into(),
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .recv()
+            .map_err(|_| CacheServiceError::ControlDisconnected(shard))?
+            .map_err(CacheServiceError::from)
     }
 
     pub fn send_network_message(
@@ -3198,6 +3253,9 @@ impl CacheShardServer {
             CacheShardControlRequest::ClearImportTracker { slot, reply } => {
                 self.transfer_imports.remove(&slot);
                 let _ = reply.send(());
+            }
+            CacheShardControlRequest::WriteSnapshot { path, reply } => {
+                let _ = reply.send(write_cache_snapshot(path, &self.store, now_ms));
             }
         }
     }
