@@ -129,8 +129,20 @@ pub fn analyze_function_allocations(module: &mir::Module) -> Vec<AllocationSumma
     for (index, function) in module.functions.iter().enumerate() {
         for block in &function.blocks {
             for stmt in &block.stmts {
-                let Stmt::Assign { op, .. } = stmt else {
-                    continue;
+                let op = match stmt {
+                    Stmt::Assign { op, .. } => op,
+                    // Handler installation pushes runtime handler metadata;
+                    // Emit crosses into the event/runtime subsystem. Both are
+                    // conservatively allocation-prone for a strict no-alloc
+                    // guarantee.
+                    Stmt::EnterHandle { .. } | Stmt::Emit { .. } => {
+                        push_unique(&mut summaries[index].direct, AllocationRisk::Runtime);
+                        continue;
+                    }
+                    Stmt::StoreFieldNamed { .. }
+                    | Stmt::ArrayStore { .. }
+                    | Stmt::PopHandler
+                    | Stmt::StateSet { .. } => continue,
                 };
 
                 if let RValue::Call { func, .. } = op {
@@ -321,6 +333,20 @@ mod tests {
         assert!(summaries[0]
             .transitive
             .contains(&AllocationRisk::UnknownCall));
+    }
+
+    #[test]
+    fn test_allocation_summary_runtime_statement() {
+        let mut module = Module::new("test");
+        let mut builder = FunctionBuilder::new("emit_event", None);
+        builder.emit(Stmt::Emit {
+            event: "Tick".to_string(),
+            args: vec![],
+        });
+        module.functions.push(finish(builder));
+
+        let summaries = analyze_function_allocations(&module);
+        assert!(summaries[0].may_allocate_runtime());
     }
 
     #[test]
