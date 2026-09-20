@@ -2965,6 +2965,7 @@ mod tests {
                 effect: crate::types::EffectRow::empty(),
                 cap: crate::types::Capability::Ref,
                 placement: None,
+                no_alloc: false,
                 body: {
                     let mut b = crate::hir::Body::new();
                     b.push(crate::hir::Stmt::Let {
