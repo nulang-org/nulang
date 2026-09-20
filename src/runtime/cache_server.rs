@@ -41,19 +41,16 @@ use super::cache_migration_journal::{
 };
 use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
 use super::cache_routing::{CachePlacementError, CacheShardOwner, CacheSlotMap};
-use super::cache_wal::{
-    current_unix_ms as wal_current_unix_ms, CacheWal, CacheWalError, CacheWalMutation,
-    CacheWalSync,
-};
 use super::cache_transport::{
     CacheServiceTransportEndpoint, CacheServiceTransportSender, CacheTransportBridgeError,
     CacheTransportInbound, CacheTransportMessage, CacheTransportOutbound,
 };
+use super::cache_wal::{
+    current_unix_ms as wal_current_unix_ms, CacheWal, CacheWalError, CacheWalMutation, CacheWalSync,
+};
 use super::cluster::NodeId;
 use super::resp::{parse_command, RespParseError};
-use super::resp_cache::{
-    command_mutation_keys, command_slot, execute_command, RespCommandSlot,
-};
+use super::resp_cache::{command_mutation_keys, command_slot, execute_command, RespCommandSlot};
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
@@ -487,7 +484,9 @@ pub enum CacheShardDurability {
     Memory,
     /// Fsync exact post-mutation WAL state before acknowledging a mutating
     /// command.
-    Journal { wal_path: PathBuf },
+    Journal {
+        wal_path: PathBuf,
+    },
 }
 
 impl Default for CacheShardDurability {
@@ -750,10 +749,7 @@ impl CacheServiceBuilder {
         let mut local_addrs = Vec::with_capacity(self.shards.len());
         let mut cpus = Vec::with_capacity(self.shards.len());
 
-        for (
-            index,
-            ((listener, local_addr, cpu, restore_snapshot_path, durability), inbox),
-        ) in
+        for (index, ((listener, local_addr, cpu, restore_snapshot_path, durability), inbox)) in
             reserved.into_iter().zip(inboxes.into_iter()).enumerate()
         {
             let shard = index as u16;
@@ -3059,14 +3055,7 @@ impl CacheShardServer {
     ) -> Result<Self, CacheServerError> {
         let listener = TcpListener::bind(bind_addr)?;
         Self::from_listener(
-            listener,
-            dispatcher,
-            inbox,
-            store,
-            config,
-            clock,
-            None,
-            None,
+            listener, dispatcher, inbox, store, config, clock, None, None,
         )
     }
 
@@ -3373,8 +3362,7 @@ impl CacheShardServer {
             }
             before.push((
                 key.to_vec(),
-                self.store
-                    .durable_entry_for_key(key, now_ms, wall_unix_ms),
+                self.store.durable_entry_for_key(key, now_ms, wall_unix_ms),
             ));
         }
         Ok(Some(CacheWalCapture {
@@ -3459,12 +3447,10 @@ impl CacheShardServer {
             return Err(CacheRemoteControlError::InvalidFrame);
         }
 
-        let capture = self
-            .capture_wal_state(command, now_ms)
-            .map_err(|error| {
-                self.fail_durability(&error);
-                CacheRemoteControlError::Durability
-            })?;
+        let capture = self.capture_wal_state(command, now_ms).map_err(|error| {
+            self.fail_durability(&error);
+            CacheRemoteControlError::Durability
+        })?;
         let mut out = Vec::with_capacity(128);
         execute_command(&mut self.store, command, now_ms, &mut out);
         self.persist_wal_state(capture, now_ms).map_err(|error| {
@@ -3678,15 +3664,13 @@ impl CacheShardServer {
             let capture = if self.wal.is_some() {
                 let input = &connection.input[connection.input_start..];
                 match parse_command(input) {
-                    Ok(Some((command, _))) => {
-                        match self.capture_wal_state(command, now_ms) {
-                            Ok(capture) => capture,
-                            Err(error) => {
-                                self.fail_durability(&error);
-                                return Err(CachePipelineError::Durability);
-                            }
+                    Ok(Some((command, _))) => match self.capture_wal_state(command, now_ms) {
+                        Ok(capture) => capture,
+                        Err(error) => {
+                            self.fail_durability(&error);
+                            return Err(CachePipelineError::Durability);
                         }
-                    }
+                    },
                     Ok(None) | Err(_) => None,
                 }
             } else {
