@@ -3674,18 +3674,42 @@ impl CacheShardServer {
                 return Ok(());
             }
 
+            let now_ms = self.clock.now_ms();
+            let capture = if self.wal.is_some() {
+                let input = &connection.input[connection.input_start..];
+                match parse_command(input) {
+                    Ok(Some((command, _))) => {
+                        match self.capture_wal_state(command, now_ms) {
+                            Ok(capture) => capture,
+                            Err(error) => {
+                                self.fail_durability(&error);
+                                return Err(CachePipelineError::Durability);
+                            }
+                        }
+                    }
+                    Ok(None) | Err(_) => None,
+                }
+            } else {
+                None
+            };
+
             let input = &connection.input[connection.input_start..];
             let Some(submit) = connection.pipeline.submit_frame(
                 &self.dispatcher,
                 &mut self.store,
                 input,
-                self.clock.now_ms(),
+                now_ms,
                 &mut connection.output,
             )?
             else {
                 connection.compact_input();
                 return Ok(());
             };
+
+            if let Err(error) = self.persist_wal_state(capture, now_ms) {
+                self.fail_durability(&error);
+                return Err(CachePipelineError::Durability);
+            }
 
             if submit.remote.is_some() {
                 return Err(CachePipelineError::Dispatch(
