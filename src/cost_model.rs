@@ -419,7 +419,12 @@ fn direct_noalloc_reason(
     module: &CodeModule,
     function_index: usize,
 ) -> Option<String> {
-    let (start, len) = function_bytecode_range(module, function_index)?;
+    let Some((start, len)) = function_bytecode_range(module, function_index) else {
+        return Some(format!(
+            "missing bytecode range metadata for function-table index {}",
+            function_index
+        ));
+    };
     let end = start.saturating_add(len).min(module.instructions.len());
     for (pc, instruction) in module.instructions[start..end].iter().enumerate() {
         if let Some(reason) = noalloc_forbidden_opcode(instruction.opcode) {
