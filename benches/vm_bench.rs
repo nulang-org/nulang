@@ -111,6 +111,22 @@ fn bench_record_access(c: &mut Criterion) {
     });
 }
 
+
+fn bench_scalar_replaced_record_hot_loop(c: &mut Criterion) {
+    // Compiler-generated aggregate local: scalar replacement should eliminate
+    // the per-iteration RecMk/field-load traffic while preserving the same
+    // source-level result.
+    let source = "var sum = 0; var i = 0; while i < 1000 { let __point = { x: i, y: i + 1 }; sum = sum + __point.x + __point.y; i = i + 1; }; sum";
+    let module = compile(source);
+    c.bench_function("vm/scalar_replacement/record_hot_loop", |b| {
+        b.iter_batched(
+            || fresh_vm(&module),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 fn bench_array_indexing(c: &mut Criterion) {
     let source = "let arr = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]; var sum = 0; var i = 0; while i < 1000 { sum = sum + arr[i % 10]; i = i + 1; }; sum";
     let module = compile(source);
@@ -196,6 +212,7 @@ criterion_group!(
     bench_function_call,
     bench_closure_capture,
     bench_record_access,
+    bench_scalar_replaced_record_hot_loop,
     bench_array_indexing,
     bench_perform_float_sqrt,
     bench_perform_int_to_float,
