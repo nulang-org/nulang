@@ -70,13 +70,17 @@ fn greet() -> Unit ! {IO} {
 ```
 
 The current implementation provides static effect-row inference and validates
-an explicitly declared row against effects inferred from that body.
+an explicitly declared row against effects inferred from that body. For direct
+calls to module functions by name, unannotated function rows are iterated to a
+fixpoint, so transitive callee effects propagate through ordinary call chains,
+including recursive and mutually-recursive groups.
 
 Important limits:
 
-- **Interprocedural propagation is incomplete**: the compiler does not yet
-  provide a complete whole-call-graph proof that every unannotated caller
-  exposes every transitive effect.
+- **Static propagation follows resolvable call edges**: direct named calls use
+  the fixpoint function-row table. Calls whose target is not statically known
+  as a module function cannot gain precision from that table and remain
+  subject to the effect information available at the call site.
 - **Handler resolution is dynamic**: a performed effect is matched against the
   runtime handler stack. If no handler or runtime-backed operation handles it,
   execution raises an unhandled-effect error.
