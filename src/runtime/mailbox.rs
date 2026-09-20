@@ -15,7 +15,7 @@
 use crate::vm::Value;
 use crossbeam::queue::SegQueue;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Message sent between actors.
@@ -36,6 +36,18 @@ pub enum MessagePriority {
     System = 0,
     Normal = 1,
     Bulk = 2,
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MailboxPressureSnapshot {
+    pub depth: usize,
+    pub capacity: usize,
+    pub high_watermark: usize,
+    pub backpressured_total: u64,
+    /// Current depth / configured application capacity. May exceed 1.0 when
+    /// system messages bypass a bounded mailbox; None for unbounded mailboxes.
+    pub utilization: Option<f64>,
 }
 
 /// MPSC mailbox with priority bands and optional capacity.
@@ -66,6 +78,10 @@ pub struct Mailbox {
     local_queue: VecDeque<Message>,
     capacity: usize,
     queued_count: AtomicUsize,
+    /// Highest logical depth observed since mailbox creation.
+    high_watermark: AtomicUsize,
+    /// Lifetime normal/bulk admissions rejected because capacity was full.
+    backpressured_count: AtomicU64,
     /// System messages already observed by a selective receive. They remain
     /// logically queued until a successful pattern+guard commits exactly one.
     system_skip_buffer: VecDeque<(Message, bool)>,
@@ -92,10 +108,28 @@ impl Mailbox {
             local_queue: VecDeque::new(),
             capacity,
             queued_count: AtomicUsize::new(0),
+            high_watermark: AtomicUsize::new(0),
+            backpressured_count: AtomicU64::new(0),
             system_skip_buffer: VecDeque::new(),
             local_skip_buffer: VecDeque::new(),
             skip_buffer: VecDeque::new(),
             active_match: None,
+        }
+    }
+
+
+    fn record_high_watermark(&self, depth: usize) {
+        let mut observed = self.high_watermark.load(Ordering::Relaxed);
+        while depth > observed {
+            match self.high_watermark.compare_exchange_weak(
+                observed,
+                depth,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => observed = actual,
+            }
         }
     }
 
@@ -106,13 +140,15 @@ impl Mailbox {
     /// observe the same free slot and overfill the mailbox.
     fn reserve_slot(&self, system: bool) -> bool {
         if system || self.capacity == 0 {
-            self.queued_count.fetch_add(1, Ordering::AcqRel);
+            let depth = self.queued_count.fetch_add(1, Ordering::AcqRel) + 1;
+            self.record_high_watermark(depth);
             return true;
         }
 
         let mut current = self.queued_count.load(Ordering::Acquire);
         loop {
             if current >= self.capacity {
+                self.backpressured_count.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             match self.queued_count.compare_exchange_weak(
@@ -121,7 +157,10 @@ impl Mailbox {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    self.record_high_watermark(current + 1);
+                    return true;
+                }
                 Err(observed) => current = observed,
             }
         }
@@ -250,6 +289,34 @@ impl Mailbox {
         self.len() == 0
     }
 
+
+    /// Highest logical queue depth observed since mailbox creation.
+    pub fn high_watermark(&self) -> usize {
+        self.high_watermark.load(Ordering::Relaxed)
+    }
+
+    /// Lifetime application-message admissions rejected due to mailbox capacity.
+    pub fn backpressured_count(&self) -> u64 {
+        self.backpressured_count.load(Ordering::Relaxed)
+    }
+
+    /// Point-in-time overload/pressure snapshot.
+    pub fn pressure_snapshot(&self) -> MailboxPressureSnapshot {
+        let depth = self.len();
+        MailboxPressureSnapshot {
+            depth,
+            capacity: self.capacity,
+            high_watermark: self.high_watermark(),
+            backpressured_total: self.backpressured_count(),
+            utilization: if self.capacity == 0 {
+                None
+            } else {
+                Some(depth as f64 / self.capacity as f64)
+            },
+        }
+    }
+
+
     /// Snapshot the mailbox without changing logical ownership/counting.
     pub fn drain(&mut self) -> Vec<Message> {
         let mut snapshot = Vec::with_capacity(self.len());
@@ -340,6 +407,57 @@ mod tests {
             priority: MessagePriority::Normal,
             trace_id: None,
         }
+    }
+
+    #[test]
+    fn pressure_snapshot_tracks_peak_depth_and_backpressure() {
+        let mut mb = Mailbox::new(2);
+        mb.push(make_msg(1, 1)).unwrap();
+        mb.push(make_msg(1, 2)).unwrap();
+
+        let rejected = mb.push(make_msg(1, 3));
+        assert!(rejected.is_err());
+
+        let full = mb.pressure_snapshot();
+        assert_eq!(full.depth, 2);
+        assert_eq!(full.capacity, 2);
+        assert_eq!(full.high_watermark, 2);
+        assert_eq!(full.backpressured_total, 1);
+        assert_eq!(full.utilization, Some(1.0));
+
+        mb.pop();
+        let drained = mb.pressure_snapshot();
+        assert_eq!(drained.depth, 1);
+        assert_eq!(drained.high_watermark, 2);
+        assert_eq!(drained.backpressured_total, 1);
+        assert_eq!(drained.utilization, Some(0.5));
+    }
+
+    #[test]
+    fn unbounded_mailbox_reports_no_utilization_but_tracks_peak() {
+        let mb = Mailbox::new(0);
+        mb.push(make_msg(1, 1)).unwrap();
+        mb.push(make_msg(1, 2)).unwrap();
+
+        let pressure = mb.pressure_snapshot();
+        assert_eq!(pressure.capacity, 0);
+        assert_eq!(pressure.high_watermark, 2);
+        assert_eq!(pressure.backpressured_total, 0);
+        assert_eq!(pressure.utilization, None);
+    }
+
+    #[test]
+    fn system_messages_bypass_capacity_without_counting_backpressure() {
+        let mb = Mailbox::new(1);
+        mb.push(make_msg(1, 1)).unwrap();
+        let mut system = make_msg(1, 0);
+        system.priority = MessagePriority::System;
+        mb.push(system).unwrap();
+
+        let pressure = mb.pressure_snapshot();
+        assert_eq!(pressure.depth, 2);
+        assert_eq!(pressure.high_watermark, 2);
+        assert_eq!(pressure.backpressured_total, 0);
     }
 
     #[test]
