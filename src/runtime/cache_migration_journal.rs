@@ -33,6 +33,7 @@ const KIND_CONVERGENCE: u8 = 5;
 const KIND_COMPLETED: u8 = 6;
 const KIND_COMMIT_INTENT: u8 = 7;
 const KIND_COMMIT_ABORTED: u8 = 8;
+const KIND_SOURCE_REBOUND: u8 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheMigrationKey {
@@ -65,6 +66,7 @@ pub struct CacheMigrationRecoveryState {
     pub key: CacheMigrationKey,
     pub source_incarnation: [u8; 16],
     pub transfers: HashMap<u64, CacheMigrationRecoveredTransfer>,
+    pub transfer_order: Vec<u64>,
     pub source_remaining: Option<usize>,
     pub convergence: Option<CacheMigrationConvergenceEvidence>,
     pub pending_commit_epoch: Option<u64>,
@@ -77,6 +79,7 @@ impl CacheMigrationRecoveryState {
             key,
             source_incarnation,
             transfers: HashMap::new(),
+            transfer_order: Vec::new(),
             source_remaining: None,
             convergence: None,
             pending_commit_epoch: None,
@@ -99,6 +102,46 @@ impl CacheMigrationRecoveryState {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+
+    /// Exact transfer envelopes in durable append order.
+    ///
+    /// Order matters when multiple source generations of the same key were
+    /// migrated. Replaying HashMap iteration order could resurrect an older
+    /// version after a newer one.
+    pub fn ordered_transfers(&self) -> Vec<&CacheMigrationRecoveredTransfer> {
+        self.transfer_order
+            .iter()
+            .filter_map(|id| self.transfers.get(id))
+            .collect()
+    }
+
+    /// Whether a fully source-drained migration can be reconstructed after a
+    /// cache-process restart using only durable transfer envelopes.
+    ///
+    /// Relative TTLs are intentionally excluded: replaying an old ttl_ms after
+    /// an arbitrary outage would extend expiry and could resurrect data.
+    pub fn drained_restart_replay_safe(&self) -> bool {
+        self.completed_commit_epoch.is_none()
+            && self.pending_commit_epoch.is_none()
+            && self.source_remaining == Some(0)
+            && self.all_sent_transfers_acked()
+            && self.ordered_transfers().iter().all(|transfer| {
+                let CacheTransportMessage::TransferBatch { batch, .. } = &transfer.request else {
+                    return false;
+                };
+                batch.entries.iter().all(|entry| entry.ttl_ms.is_none())
+            })
+    }
+
+    pub fn drained_restart_replay_plan(&self) -> Option<Vec<CacheTransportMessage>> {
+        self.drained_restart_replay_safe().then(|| {
+            self.ordered_transfers()
+                .into_iter()
+                .map(|transfer| transfer.request.clone())
+                .collect()
+        })
     }
 
     /// Number of unique migration keys for which the target must still retain
@@ -288,6 +331,39 @@ impl CacheMigrationJournal {
         Ok(())
     }
 
+    /// Rebind a fully drained persistent-value migration to a new source
+    /// CacheStore incarnation after process restart.
+    ///
+    /// This is deliberately narrower than general CacheStore recovery. It is
+    /// legal only when the journal proves the old source was drained, every
+    /// sent transfer has an application ACK, no commit is pending/completed,
+    /// and no durable batch carries a relative TTL.
+    pub fn rebind_drained_source_incarnation(
+        &mut self,
+        key: CacheMigrationKey,
+        new_incarnation: [u8; 16],
+    ) -> io::Result<()> {
+        let state = self.require_state(key)?;
+        if state.source_incarnation == new_incarnation {
+            return Ok(());
+        }
+        if !state.drained_restart_replay_safe() {
+            return Err(invalid_data(
+                "cache migration cannot rebind source incarnation: durable drained replay proof is incomplete or contains relative TTLs",
+            ));
+        }
+
+        let mut payload = Vec::with_capacity(46);
+        write_key(&mut payload, key);
+        payload.extend_from_slice(&new_incarnation);
+        self.append_record(KIND_SOURCE_REBOUND, &payload)?;
+        self.states
+            .get_mut(&key)
+            .expect("migration state disappeared")
+            .source_incarnation = new_incarnation;
+        Ok(())
+    }
+
     pub fn record_transfer_sent(
         &mut self,
         key: CacheMigrationKey,
@@ -324,6 +400,11 @@ impl CacheMigrationJournal {
                     ack: None,
                 },
             );
+        self.states
+            .get_mut(&key)
+            .expect("migration state disappeared")
+            .transfer_order
+            .push(transfer_id);
         Ok(())
     }
 
@@ -540,6 +621,22 @@ fn apply_record(
                 }
             }
         }
+        KIND_SOURCE_REBOUND => {
+            let new_incarnation: [u8; 16] = reader
+                .take(16)?
+                .try_into()
+                .expect("source incarnation slice");
+            reader.finish()?;
+            let state = states
+                .get_mut(&key)
+                .ok_or_else(|| invalid_data("source rebound precedes migration intent"))?;
+            if !state.drained_restart_replay_safe() {
+                return Err(invalid_data(
+                    "source rebound is not justified by durable drained replay proof",
+                ));
+            }
+            state.source_incarnation = new_incarnation;
+        }
         KIND_TRANSFER_SENT => {
             let transfer_id = reader.u64()?;
             let wire = reader.blob()?;
@@ -567,6 +664,7 @@ fn apply_record(
                             ack: None,
                         },
                     );
+                    state.transfer_order.push(transfer_id);
                 }
             }
         }
@@ -1088,6 +1186,71 @@ mod tests {
             .unwrap()
             .pending_commit_epoch
             .is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn drained_persistent_migration_can_rebind_and_preserves_transfer_order() {
+        let path = temp_path("migration-drained-rebind");
+        let migration = key();
+        let first = request(migration, 20);
+        let second = request(migration, 10);
+        {
+            let mut journal = CacheMigrationJournal::open(&path).unwrap();
+            journal.record_intent(migration, incarnation()).unwrap();
+            journal.record_transfer_sent(migration, &first).unwrap();
+            journal.record_transfer_ack(migration, &ack(migration, 20)).unwrap();
+            journal.record_transfer_sent(migration, &second).unwrap();
+            journal.record_transfer_ack(migration, &ack(migration, 10)).unwrap();
+            journal.record_source_remaining(migration, 0).unwrap();
+
+            let state = journal.recovery_state(migration).unwrap();
+            assert!(state.drained_restart_replay_safe());
+            let plan = state.drained_restart_replay_plan().unwrap();
+            assert_eq!(plan, vec![first.clone(), second.clone()]);
+
+            journal
+                .rebind_drained_source_incarnation(migration, [0xa5; 16])
+                .unwrap();
+        }
+
+        let journal = CacheMigrationJournal::open(&path).unwrap();
+        let state = journal.recovery_state(migration).unwrap();
+        assert_eq!(state.source_incarnation, [0xa5; 16]);
+        assert_eq!(
+            state.drained_restart_replay_plan().unwrap(),
+            vec![first, second]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn drained_restart_replay_rejects_relative_ttl_batches() {
+        let path = temp_path("migration-drained-ttl");
+        let migration = key();
+        let mut ttl_request = request(migration, 81);
+        let CacheTransportMessage::TransferBatch { batch, .. } = &mut ttl_request else {
+            unreachable!()
+        };
+        batch.entries[0].ttl_ms = Some(5_000);
+
+        let mut journal = CacheMigrationJournal::open(&path).unwrap();
+        journal.record_intent(migration, incarnation()).unwrap();
+        journal
+            .record_transfer_sent(migration, &ttl_request)
+            .unwrap();
+        journal
+            .record_transfer_ack(migration, &ack(migration, 81))
+            .unwrap();
+        journal.record_source_remaining(migration, 0).unwrap();
+
+        assert!(!journal
+            .recovery_state(migration)
+            .unwrap()
+            .drained_restart_replay_safe());
+        assert!(journal
+            .rebind_drained_source_incarnation(migration, [0xa5; 16])
+            .is_err());
         fs::remove_file(path).unwrap();
     }
 
