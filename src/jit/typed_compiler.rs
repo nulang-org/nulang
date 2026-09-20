@@ -55,16 +55,20 @@ pub use crate::type_metadata::{KnownType, TypeMetadata};
 /// the type of a register at a given pc can be recovered statically from the
 /// instruction stream itself (constants, arithmetic results, moves). The
 /// analysis is a *must* analysis — a register is only marked `Int`/`Float`/
-/// `Bool` when every static path to `pc` proves it — so wrong metadata is
-/// impossible by construction; missing precision simply yields `Unknown`,
-/// which makes the typed compiler fall back to the same runtime helper calls
-/// as the scalar compiler.
+/// `Bool` when every static path to `pc` proves it. Bytecode-derived facts
+/// are unconditional; compiler-owned parameter seeds are static signature
+/// facts and are therefore paired with live tag guards in `JitSession` before
+/// guard-stripped native code executes. Missing precision simply yields
+/// `Unknown`, which makes the typed compiler fall back to the same runtime
+/// helper calls as the scalar compiler.
 ///
 /// Rules:
 /// - Function/behavior entries may start with compiler-owned parameter facts
 ///   for r0..rN. Those seeds live only on the in-memory `CodeModule` and are
-///   never serialized into .nbc, so loaded artifacts cannot forge facts used
-///   for guard stripping. Other anchors start with all registers `Unknown`.
+///   never serialized into .nbc. `JitSession` validates the corresponding
+///   live tags before executing a typed region, so dynamic host/message entry
+///   cannot violate the representation assumption. Other anchors start with
+///   all registers `Unknown`.
 /// - Modeled opcodes propagate the result type their interpreter semantics
 ///   guarantee unconditionally (e.g. `IAdd` always writes a tagged int,
 ///   comparisons always write a tagged bool; `IDiv`/`IMod`/`FDiv` can yield
@@ -141,10 +145,11 @@ pub fn infer_reg_types(module: &CodeModule, pc: usize) -> TypeMetadata {
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let mut in_queue: Vec<bool> = vec![false; n];
 
-    // Source compilation can provide trusted representation facts for typed
+    // Source compilation can provide static representation facts for typed
     // function arguments. The metadata is intentionally serde-skipped on
     // CodeModule; artifacts loaded from .nbc therefore retain the historical
-    // all-Unknown entry state and must prove types from bytecode alone.
+    // all-Unknown entry state. JitSession runtime-guards seeded facts before
+    // guard-stripped native execution because host call boundaries are dynamic.
     let entry_state = module
         .jit_type_seeds
         .iter()
