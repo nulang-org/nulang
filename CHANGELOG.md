@@ -190,6 +190,24 @@ two major versions.*
   wrong-slot history before ownership publication. The gate is deliberately
   scoped to a live controller: reconstructing proof after controller/process
   restart still requires persisted migration intent and ACK history.
+- **Durable migration proof journal and commit enforcement** (Experimental,
+  `src/runtime/cache_migration_journal.rs`, `src/runtime/cache_server.rs`).
+  Optional source-controller journaling records migration intent, the exact
+  TransferBatch envelope before send, the exact application TransferAck before
+  any source deletion, source-drain observations, fresh convergence evidence,
+  and ownership commit intent/completion. Records are length bounded, BLAKE3
+  checksummed, append-only, and fsynced before returning; crash-truncated tails
+  are discarded while complete checksum corruption fails closed. Recovery can
+  resend the exact durable transfer without re-exporting, and a remote ownership
+  commit is now rejected unless the source holds a current exact-epoch
+  convergence proof. Commit intent is fsynced before placement publication so a
+  crash between publication and completion remains explicitly ambiguous in the
+  journal rather than silently appearing complete. Durable histories are bound
+  to a random source CacheStore incarnation; a newly started ephemeral cache
+  process cannot continue an old migration proof until CacheStore itself gains
+  durable restoration. The transfer replay fence also now removes an older
+  imported target value when a newer source version expires in transit, avoiding
+  stale-value resurrection after source finalization.
 
 ### Progressive capability diagnostics — 2026-09-19
 - **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
