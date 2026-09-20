@@ -573,6 +573,11 @@ pub struct ActorMeta {
     /// Serialized retry config (JSON `Option<AgentRetryConfig>`).
     #[serde(default)]
     pub retry_config: String,
+    /// Canonical structural actor protocol identity. This hashes behavior
+    /// names plus parameter/return type identities and deliberately excludes
+    /// implementation bytecode, so body-only changes preserve compatibility.
+    #[serde(default)]
+    pub protocol_id: Option<[u8; 32]>,
     /// NTIR structural type hash.
     #[serde(default)]
     pub type_hash: Option<[u8; 32]>,
@@ -605,6 +610,7 @@ impl ActorMeta {
             backend: crate::ast::ActorBackendKind::default(),
             fallback_config: String::new(),
             retry_config: String::new(),
+            protocol_id: None,
             type_hash: None,
             version: 1,
             migrations: String::new(),
