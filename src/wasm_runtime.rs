@@ -19,6 +19,8 @@
 //! - `env.log(i32,i32) -> i64` — log to stderr
 //! - `env.io_print(i32,i32) -> i64` — print to stdout
 //! - `env.io_read() -> i64` — read stdin (stub: returns nil)
+//! - `env.ffi_call_0..4(...)` — native FFI bridge, denied by default and
+//!   enabled only by an exact `FFI::Call(library::symbol)` authority grant
 
 use crate::types::Span;
 use crate::types::{NuError, NuResult};
@@ -65,6 +67,12 @@ struct HostState {
     /// tests to verify the compiler's marshaling. Cleared by
     /// [`WasmRuntime::take_last_dispatch`].
     last_dispatch: std::sync::Arc<parking_lot::Mutex<Option<(Vec<u8>, Vec<u8>)>>>,
+    /// Maximum external authority available to this WASM activation.
+    ///
+    /// Empty by default. Host imports must check this manifest before crossing
+    /// a privileged boundary so Wasmtime isolation cannot be bypassed by an
+    /// ambient linker capability.
+    authority: crate::authority::AuthorityManifest,
 }
 
 impl Default for HostState {
@@ -75,6 +83,7 @@ impl Default for HostState {
             input: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             dispatch_result: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             last_dispatch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            authority: crate::authority::AuthorityManifest::new(),
         }
     }
 }
@@ -100,7 +109,24 @@ pub struct WasmRuntime {
 
 impl WasmRuntime {
     /// Compile WASM bytecode and instantiate with host imports.
+    ///
+    /// This constructor is deny-by-default for privileged host imports. Use
+    /// [`WasmRuntime::new_with_authority`] only when an embedding boundary has
+    /// already validated the exact authority manifest for this activation.
     pub fn new(wasm_bytes: &[u8], config: Option<Config>) -> NuResult<Self> {
+        Self::new_with_authority(
+            wasm_bytes,
+            config,
+            crate::authority::AuthorityManifest::new(),
+        )
+    }
+
+    /// Compile WASM bytecode with an explicitly validated maximum authority.
+    pub fn new_with_authority(
+        wasm_bytes: &[u8],
+        config: Option<Config>,
+        authority: crate::authority::AuthorityManifest,
+    ) -> NuResult<Self> {
         let config = config.unwrap_or_else(default_wasm_config);
         let engine = Engine::new(&config).map_err(map_wasmtime_err)?;
 
@@ -110,7 +136,9 @@ impl WasmRuntime {
         }
         let module = res.map_err(map_wasmtime_err)?;
 
-        let mut store = Store::new(&engine, HostState::default());
+        let mut host_state = HostState::default();
+        host_state.authority = authority;
+        let mut store = Store::new(&engine, host_state);
 
         // Build a Linker and define all host imports.
         let mut linker: Linker<HostState> = Linker::new(&engine);
@@ -628,6 +656,28 @@ fn read_wasm_string(mut caller: &mut Caller<'_, HostState>, v: i64) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+fn require_wasm_ffi_authority(
+    manifest: &crate::authority::AuthorityManifest,
+    library: &str,
+    symbol: &str,
+) -> Result<(), String> {
+    if library.is_empty() || symbol.is_empty() {
+        return Err("WASM FFI library and symbol must be non-empty".to_string());
+    }
+    let grant = crate::authority::AuthorityGrant::Other {
+        namespace: "FFI".to_string(),
+        operation: "Call".to_string(),
+        argument: Some(format!("{library}::{symbol}")),
+    };
+    if manifest.allows(&grant) {
+        Ok(())
+    } else {
+        Err(format!(
+            "WASM FFI denied: missing exact authority FFI::Call({library}::{symbol})"
+        ))
+    }
+}
+
 /// `env.ffi_call_N(lib, sym, sig, arg0..argN-1) -> i64`
 ///
 /// Invoke a foreign C function from WASM. `lib`/`sym` are TAG_STRING constants
@@ -643,6 +693,8 @@ fn host_ffi_call_impl(
 ) -> Result<i64, Error> {
     let lib_s = read_wasm_string(&mut caller, lib);
     let sym_s = read_wasm_string(&mut caller, sym);
+    require_wasm_ffi_authority(&caller.data().authority, &lib_s, &sym_s)
+        .map_err(Error::msg)?;
     let sig = sig as u64;
     let ret_tag = sig & 0b111;
     let mut params: Vec<crate::ffi::marshal::CType> = Vec::with_capacity(args.len());
@@ -1085,6 +1137,30 @@ mod tests {
     fn guest_non_pointer_value_accepts_scalar() {
         let value = guest_non_pointer_value(value_layout::tag_int(42)).unwrap();
         assert_eq!(value.as_int(), Some(42));
+    }
+
+    #[test]
+    fn wasm_ffi_authority_is_deny_by_default_and_exact_match_only() {
+        let empty = crate::authority::AuthorityManifest::new();
+        assert!(require_wasm_ffi_authority(&empty, "libpayments.so", "charge").is_err());
+
+        let manifest = crate::authority::AuthorityManifest::from_tokens([
+            "FFI::Call(libpayments.so::charge)",
+        ])
+        .unwrap();
+        assert!(require_wasm_ffi_authority(&manifest, "libpayments.so", "charge").is_ok());
+        assert!(require_wasm_ffi_authority(&manifest, "libpayments.so", "refund").is_err());
+        assert!(require_wasm_ffi_authority(&manifest, "libother.so", "charge").is_err());
+    }
+
+    #[test]
+    fn wasm_ffi_authority_rejects_empty_library_or_symbol() {
+        let manifest = crate::authority::AuthorityManifest::from_tokens([
+            "FFI::Call(libpayments.so::charge)",
+        ])
+        .unwrap();
+        assert!(require_wasm_ffi_authority(&manifest, "", "charge").is_err());
+        assert!(require_wasm_ffi_authority(&manifest, "libpayments.so", "").is_err());
     }
 
     #[test]
