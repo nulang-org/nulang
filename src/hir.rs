@@ -338,6 +338,9 @@ pub enum RValue {
         behavior: String,
         args: Vec<Operand>,
         remote: bool,
+        /// Canonical required ActorRef protocol identity captured before
+        /// compile-time protocol types are erased from runtime-facing HIR.
+        required_protocol: Option<[u8; 32]>,
         ty: Type,
     },
     Ask {
