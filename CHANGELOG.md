@@ -60,6 +60,15 @@ two major versions.*
   Structurally identical source renames register idempotently because display
   names are intentionally excluded from protocol identity.
 
+### Actor protocol pre-mailbox admission — 2026-09-20
+- **Fail-closed protocol admission policy** (Experimental, `src/protocol.rs`).
+  `admit_protocol` is a side-effect-free decision point intended to run before
+  mailbox publication. `StrictCompatible` is the default: exact ids pass
+  directly, proven additive receiver upgrades pass through the trusted schema
+  registry, and incompatible/unknown/missing typed identities are rejected.
+  `LegacyCompatible` is explicit migration mode and relaxes only a missing
+  incoming required protocol identity; typed mismatches remain fail-closed.
+
 ### Typed actor protocol checking — 2026-09-20
 - **Static protocol validation for known actor references** (Experimental,
   `src/actor_protocol.rs`, RFC 0023). Actor `send`/`ask` calls whose receiver
