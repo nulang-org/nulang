@@ -1,44 +1,44 @@
 //! Stable identities for typed actor protocols.
 //!
-//! Distributed actor references need a schema identity that is independent of
-//! source declaration order, formatting, and compiler-internal `Debug` output.
-//! This module provides that boundary without changing the existing actor-ref
-//! representation yet.
+//! Protocol identity is derived from the compiler-owned actor behavior type,
+//! not from formatting, source declaration order, runtime behavior ids, or
+//! delivery mode. Each behavior hashes its full canonical function contract:
+//! argument pack, return type, effect row, and capability.
 //!
-//! `ProtocolTypeId` reuses Nulang's canonical NTIR type hash. `ProtocolId` is
-//! then derived from the set of behavior signatures. Human-readable protocol
-//! names are deliberately not hashed, so a source-level rename does not break
-//! wire compatibility when the protocol shape is unchanged.
+//! Human-readable actor/protocol names remain outside the structural hash, so
+//! a pure source-level rename does not break compatibility when the behavior
+//! contract is unchanged.
 
-use crate::type_ir::NtirNode;
-use crate::types::Type;
+use crate::types::{
+    canonical_type_bytes, Capability, EffectRow, Type, RECORD_ROW_TAIL_FIELD,
+    UNSPECIFIED_ACTOR_PROTOCOL_TYPE_NAME,
+};
 use blake3::Hasher;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
 
-const PROTOCOL_DOMAIN: &[u8] = b"nulang.protocol.v1\0";
+const PROTOCOL_DOMAIN: &[u8] = b"nulang.protocol.v2\0";
+const PROTOCOL_TYPE_DOMAIN: &[u8] = b"nulang.protocol.type.v1\0";
 
-/// Stable identity of one canonical parameter/response type.
+/// Stable identity of one canonical protocol type/signature.
 ///
-/// This is exactly the existing NTIR structural hash wrapped in a protocol
-/// vocabulary type. Reusing NTIR prevents actor protocols from inventing a
-/// second, subtly different notion of semantic type identity.
+/// This deliberately uses `canonical_type_bytes`, not NTIR. NTIR is allowed
+/// to erase distinctions for compiler equality fast paths; protocol identity
+/// has no such backstop and must preserve nominal wrappers, primitive
+/// distinctions, effect rows, capabilities, and the rest of the canonical
+/// type contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolTypeId([u8; 32]);
 
 impl ProtocolTypeId {
     pub fn from_type(ty: &Type) -> Self {
-        Self::from_ntir(&ty.to_ntir())
-    }
-
-    pub fn from_ntir(ntir: &NtirNode) -> Self {
-        Self(ntir.hash())
-    }
-
-    pub fn from_ntir_hash(hash: [u8; 32]) -> Self {
-        Self(hash)
+        let bytes = canonical_type_bytes(ty);
+        let mut hasher = Hasher::new();
+        hasher.update(PROTOCOL_TYPE_DOMAIN);
+        put_bytes(&mut hasher, &bytes);
+        Self(*hasher.finalize().as_bytes())
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -46,35 +46,85 @@ impl ProtocolTypeId {
     }
 }
 
-/// One behavior in an actor protocol.
+/// One compiler-level behavior contract in an actor protocol.
+///
+/// `signature` is authoritative for structural identity and includes the full
+/// normalized function type. `params` and `response` are retained as
+/// behavior-level metadata for compatibility diagnostics and future protocol
+/// diff tooling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolMember {
     pub behavior: String,
     pub params: Vec<ProtocolTypeId>,
-    /// `None` means fire-and-forget. `Some` means request/reply and hashes the
-    /// response type into the protocol identity.
-    pub response: Option<ProtocolTypeId>,
+    pub response: ProtocolTypeId,
+    pub signature: ProtocolTypeId,
 }
 
 impl ProtocolMember {
-    pub fn message(behavior: impl Into<String>, params: Vec<ProtocolTypeId>) -> Self {
-        Self {
-            behavior: behavior.into(),
-            params,
-            response: None,
-        }
+    /// Build a member from the compiler's behavior function type.
+    ///
+    /// Actor behavior parameters use an explicit argument-pack convention:
+    /// `()` is zero arguments, `(A, B)` is two, and a scalar source
+    /// parameter is normalized to a one-element pack. Delivery mode
+    /// (`send` vs `ask`) is intentionally not part of the behavior schema.
+    pub fn from_signature(
+        behavior: impl Into<String>,
+        signature: &Type,
+    ) -> Result<Self, ProtocolSchemaError> {
+        let behavior = behavior.into();
+        let Type::Function {
+            param,
+            ret,
+            effect,
+            cap,
+        } = signature
+        else {
+            return Err(ProtocolSchemaError::InvalidBehaviorSignature(behavior));
+        };
+
+        let packed_param = match param.as_ref() {
+            Type::Tuple(items) => Type::Tuple(items.clone()),
+            other => Type::Tuple(vec![other.clone()]),
+        };
+        let normalized = Type::Function {
+            param: Box::new(packed_param.clone()),
+            ret: ret.clone(),
+            effect: effect.clone(),
+            cap: *cap,
+        };
+
+        validate_stable_protocol_type(&normalized, &behavior)?;
+
+        let Type::Tuple(params) = packed_param else {
+            unreachable!("actor protocol parameter normalization always yields a tuple");
+        };
+
+        Ok(Self {
+            behavior,
+            params: params.iter().map(ProtocolTypeId::from_type).collect(),
+            response: ProtocolTypeId::from_type(ret),
+            signature: ProtocolTypeId::from_type(&normalized),
+        })
     }
 
-    pub fn request_reply(
+    /// Convenience constructor for tests/tooling that already has concrete
+    /// compiler types. This produces the same identity as `from_signature`.
+    pub fn behavior(
         behavior: impl Into<String>,
-        params: Vec<ProtocolTypeId>,
-        response: ProtocolTypeId,
-    ) -> Self {
-        Self {
-            behavior: behavior.into(),
-            params,
-            response: Some(response),
-        }
+        params: Vec<Type>,
+        response: Type,
+        effect: EffectRow,
+        cap: Capability,
+    ) -> Result<Self, ProtocolSchemaError> {
+        Self::from_signature(
+            behavior,
+            &Type::Function {
+                param: Box::new(Type::Tuple(params)),
+                ret: Box::new(response),
+                effect,
+                cap,
+            },
+        )
     }
 }
 
@@ -109,6 +159,39 @@ impl ProtocolSchema {
         })
     }
 
+    /// Construct a canonical schema directly from a typechecker's actor type.
+    pub fn from_actor_type(
+        name: impl Into<String>,
+        actor_type: &Type,
+    ) -> Result<Self, ProtocolSchemaError> {
+        let Type::Actor { behavior, .. } = actor_type else {
+            return Err(ProtocolSchemaError::ExpectedActorType);
+        };
+        Self::from_behavior_type(name, behavior)
+    }
+
+    /// Construct a canonical schema from the compiler-owned behavior record in
+    /// `Type::Actor.behavior`.
+    pub fn from_behavior_type(
+        name: impl Into<String>,
+        behavior_type: &Type,
+    ) -> Result<Self, ProtocolSchemaError> {
+        let Type::Record(fields) = behavior_type else {
+            return Err(ProtocolSchemaError::ExpectedBehaviorRecord);
+        };
+
+        let mut members = Vec::with_capacity(fields.len());
+        for (behavior, signature) in fields {
+            if behavior == RECORD_ROW_TAIL_FIELD {
+                return Err(ProtocolSchemaError::UnresolvedBehaviorType(
+                    behavior.clone(),
+                ));
+            }
+            members.push(ProtocolMember::from_signature(behavior.clone(), signature)?);
+        }
+        Self::new(name, members)
+    }
+
     pub fn members(&self) -> impl Iterator<Item = &ProtocolMember> {
         self.members.values()
     }
@@ -128,23 +211,12 @@ impl ProtocolId {
         hasher.update(PROTOCOL_DOMAIN);
         put_u32(&mut hasher, schema.members.len() as u32);
 
-        // BTreeMap iteration gives order-independent canonicalization of source
-        // declaration order. Behavior names remain semantic and are hashed.
+        // BTreeMap iteration canonicalizes declaration order. Behavior names
+        // remain semantic; the authoritative member signature hash includes
+        // params, return, effects, and capability.
         for member in schema.members.values() {
             put_bytes(&mut hasher, member.behavior.as_bytes());
-            put_u32(&mut hasher, member.params.len() as u32);
-            for param in &member.params {
-                hasher.update(param.as_bytes());
-            }
-            match member.response {
-                Some(response) => {
-                    hasher.update(&[1]);
-                    hasher.update(response.as_bytes());
-                }
-                None => {
-                    hasher.update(&[0]);
-                }
-            }
+            hasher.update(member.signature.as_bytes());
         }
 
         Self(*hasher.finalize().as_bytes())
@@ -246,6 +318,11 @@ impl Error for ProtocolMismatch {}
 pub enum ProtocolSchemaError {
     EmptyBehaviorName,
     DuplicateBehavior(String),
+    ExpectedActorType,
+    ExpectedBehaviorRecord,
+    InvalidBehaviorSignature(String),
+    UnresolvedBehaviorType(String),
+    OpenBehaviorEffect(String),
 }
 
 impl fmt::Display for ProtocolSchemaError {
@@ -257,11 +334,102 @@ impl fmt::Display for ProtocolSchemaError {
             ProtocolSchemaError::DuplicateBehavior(name) => {
                 write!(f, "duplicate protocol behavior '{name}'")
             }
+            ProtocolSchemaError::ExpectedActorType => {
+                f.write_str("protocol schema source must be an actor type")
+            }
+            ProtocolSchemaError::ExpectedBehaviorRecord => {
+                f.write_str("actor protocol behavior metadata must be a record")
+            }
+            ProtocolSchemaError::InvalidBehaviorSignature(name) => {
+                write!(
+                    f,
+                    "actor protocol behavior '{name}' is not a function signature"
+                )
+            }
+            ProtocolSchemaError::UnresolvedBehaviorType(name) => {
+                write!(
+                    f,
+                    "actor protocol behavior '{name}' contains an unresolved type"
+                )
+            }
+            ProtocolSchemaError::OpenBehaviorEffect(name) => {
+                write!(f, "actor protocol behavior '{name}' has an open effect row")
+            }
         }
     }
 }
 
 impl Error for ProtocolSchemaError {}
+
+fn validate_stable_protocol_type(ty: &Type, behavior: &str) -> Result<(), ProtocolSchemaError> {
+    match ty {
+        Type::Var(_) | Type::Skolem(_) | Type::Scheme { .. } => Err(
+            ProtocolSchemaError::UnresolvedBehaviorType(behavior.to_string()),
+        ),
+        Type::Primitive(_) => Ok(()),
+        Type::Tuple(items) => {
+            for item in items {
+                validate_stable_protocol_type(item, behavior)?;
+            }
+            Ok(())
+        }
+        Type::Record(fields) => {
+            for (name, field) in fields {
+                if name == RECORD_ROW_TAIL_FIELD {
+                    return Err(ProtocolSchemaError::UnresolvedBehaviorType(
+                        behavior.to_string(),
+                    ));
+                }
+                validate_stable_protocol_type(field, behavior)?;
+            }
+            Ok(())
+        }
+        Type::Variant(variants) => {
+            for (_, payload) in variants {
+                if let Some(payload) = payload {
+                    validate_stable_protocol_type(payload, behavior)?;
+                }
+            }
+            Ok(())
+        }
+        Type::Array(inner) | Type::Reference { inner, .. } => {
+            validate_stable_protocol_type(inner, behavior)
+        }
+        Type::Function {
+            param, ret, effect, ..
+        } => {
+            if matches!(effect, EffectRow::Open(..)) {
+                return Err(ProtocolSchemaError::OpenBehaviorEffect(
+                    behavior.to_string(),
+                ));
+            }
+            validate_stable_protocol_type(param, behavior)?;
+            validate_stable_protocol_type(ret, behavior)
+        }
+        Type::Actor {
+            state,
+            behavior: actor_behavior,
+        } => {
+            validate_stable_protocol_type(state, behavior)?;
+            validate_stable_protocol_type(actor_behavior, behavior)
+        }
+        Type::App { constructor, args } => {
+            validate_stable_protocol_type(constructor, behavior)?;
+            for arg in args {
+                validate_stable_protocol_type(arg, behavior)?;
+            }
+            Ok(())
+        }
+        Type::Nominal { name, underlying } => {
+            if name == UNSPECIFIED_ACTOR_PROTOCOL_TYPE_NAME {
+                return Err(ProtocolSchemaError::UnresolvedBehaviorType(
+                    behavior.to_string(),
+                ));
+            }
+            validate_stable_protocol_type(underlying, behavior)
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolIdParseError {
@@ -318,30 +486,74 @@ fn decode_hex_nibble(byte: u8) -> Result<u8, ProtocolIdParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PrimitiveType;
+    use crate::types::{Effect, PrimitiveType, Region, TypeVar};
 
-    fn int() -> ProtocolTypeId {
-        ProtocolTypeId::from_type(&Type::Primitive(PrimitiveType::Int))
+    fn int_ty() -> Type {
+        Type::Primitive(PrimitiveType::Int)
     }
 
-    fn money() -> ProtocolTypeId {
-        ProtocolTypeId::from_type(&Type::Record(vec![(
-            "cents".to_string(),
-            Type::Primitive(PrimitiveType::Int),
-        )]))
+    fn money_ty() -> Type {
+        Type::Record(vec![("cents".to_string(), int_ty())])
     }
 
-    fn receipt() -> ProtocolTypeId {
-        ProtocolTypeId::from_type(&Type::Record(vec![(
+    fn receipt_ty() -> Type {
+        Type::Record(vec![(
             "id".to_string(),
             Type::Primitive(PrimitiveType::String),
-        )]))
+        )])
+    }
+
+    fn member(behavior: &str, params: Vec<Type>, response: Type) -> ProtocolMember {
+        ProtocolMember::behavior(
+            behavior,
+            params,
+            response,
+            EffectRow::empty(),
+            Capability::Ref,
+        )
+        .unwrap()
+    }
+
+    fn actor_type(members: Vec<(&str, Type)>) -> Type {
+        Type::Actor {
+            state: Box::new(Type::unit()),
+            behavior: Box::new(Type::Record(
+                members
+                    .into_iter()
+                    .map(|(name, signature)| (name.to_string(), signature))
+                    .collect(),
+            )),
+        }
+    }
+
+    fn behavior_sig(params: Vec<Type>, ret: Type, effect: EffectRow, cap: Capability) -> Type {
+        Type::Function {
+            param: Box::new(Type::Tuple(params)),
+            ret: Box::new(ret),
+            effect,
+            cap,
+        }
     }
 
     #[test]
-    fn protocol_type_id_reuses_ntir_hash() {
-        let ty = Type::Primitive(PrimitiveType::Int);
-        assert_eq!(ProtocolTypeId::from_type(&ty).0, ty.to_ntir().hash());
+    fn protocol_type_id_uses_canonical_type_identity_not_ntir() {
+        let never = Type::Primitive(PrimitiveType::Never);
+        let unit = Type::unit();
+        assert_eq!(never.to_ntir().hash(), unit.to_ntir().hash());
+        assert_ne!(
+            ProtocolTypeId::from_type(&never),
+            ProtocolTypeId::from_type(&unit)
+        );
+
+        let a = Type::Nominal {
+            name: "CustomerId".into(),
+            underlying: Box::new(Type::int()),
+        };
+        let b = Type::Nominal {
+            name: "OrderId".into(),
+            underlying: Box::new(Type::int()),
+        };
+        assert_ne!(ProtocolTypeId::from_type(&a), ProtocolTypeId::from_type(&b));
     }
 
     #[test]
@@ -349,16 +561,16 @@ mod tests {
         let first = ProtocolSchema::new(
             "Account",
             [
-                ProtocolMember::message("Deposit", vec![money()]),
-                ProtocolMember::request_reply("Balance", vec![], money()),
+                member("Deposit", vec![money_ty()], Type::unit()),
+                member("Balance", vec![], money_ty()),
             ],
         )
         .unwrap();
         let second = ProtocolSchema::new(
             "Account",
             [
-                ProtocolMember::request_reply("Balance", vec![], money()),
-                ProtocolMember::message("Deposit", vec![money()]),
+                member("Balance", vec![], money_ty()),
+                member("Deposit", vec![money_ty()], Type::unit()),
             ],
         )
         .unwrap();
@@ -367,98 +579,175 @@ mod tests {
 
     #[test]
     fn display_name_rename_does_not_break_structural_identity() {
-        let old = ProtocolSchema::new(
-            "Account",
-            [ProtocolMember::request_reply("Balance", vec![], money())],
-        )
-        .unwrap();
-        let renamed = ProtocolSchema::new(
-            "CustomerAccount",
-            [ProtocolMember::request_reply("Balance", vec![], money())],
-        )
-        .unwrap();
+        let member = member("Balance", vec![], money_ty());
+        let old = ProtocolSchema::new("Account", [member.clone()]).unwrap();
+        let renamed = ProtocolSchema::new("CustomerAccount", [member]).unwrap();
         assert_eq!(old.id(), renamed.id());
     }
 
     #[test]
-    fn signature_changes_change_protocol_id() {
-        let one = ProtocolSchema::new(
+    fn full_behavior_contract_changes_protocol_id() {
+        let base = ProtocolSchema::new(
             "Account",
-            [ProtocolMember::request_reply(
+            [ProtocolMember::behavior(
                 "Withdraw",
-                vec![money()],
-                receipt(),
-            )],
+                vec![money_ty()],
+                receipt_ty(),
+                EffectRow::empty(),
+                Capability::Ref,
+            )
+            .unwrap()],
         )
         .unwrap();
+
         let changed_param = ProtocolSchema::new(
             "Account",
-            [ProtocolMember::request_reply(
-                "Withdraw",
-                vec![int()],
-                receipt(),
-            )],
+            [member("Withdraw", vec![int_ty()], receipt_ty())],
         )
         .unwrap();
         let changed_response = ProtocolSchema::new(
             "Account",
-            [ProtocolMember::request_reply(
-                "Withdraw",
-                vec![money()],
-                money(),
-            )],
+            [member("Withdraw", vec![money_ty()], money_ty())],
         )
         .unwrap();
-        assert_ne!(one.id(), changed_param.id());
-        assert_ne!(one.id(), changed_response.id());
+        let changed_effect = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::behavior(
+                "Withdraw",
+                vec![money_ty()],
+                receipt_ty(),
+                EffectRow::Closed(vec![Effect::IO]),
+                Capability::Ref,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let changed_capability = ProtocolSchema::new(
+            "Account",
+            [ProtocolMember::behavior(
+                "Withdraw",
+                vec![money_ty()],
+                receipt_ty(),
+                EffectRow::empty(),
+                Capability::Box,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+
+        assert_ne!(base.id(), changed_param.id());
+        assert_ne!(base.id(), changed_response.id());
+        assert_ne!(base.id(), changed_effect.id());
+        assert_ne!(base.id(), changed_capability.id());
     }
 
     #[test]
-    fn fire_and_forget_differs_from_request_reply() {
-        let message = ProtocolSchema::new(
-            "Account",
-            [ProtocolMember::message("Deposit", vec![money()])],
+    fn compiler_actor_type_generates_canonical_protocol_schema() {
+        let get = behavior_sig(vec![], Type::int(), EffectRow::empty(), Capability::Ref);
+        let add = behavior_sig(
+            vec![Type::int()],
+            Type::unit(),
+            EffectRow::Closed(vec![Effect::Send]),
+            Capability::Ref,
+        );
+
+        let first = ProtocolSchema::from_actor_type(
+            "Counter",
+            &actor_type(vec![("get", get.clone()), ("add", add.clone())]),
         )
         .unwrap();
-        let request = ProtocolSchema::new(
-            "Account",
-            [ProtocolMember::request_reply(
-                "Deposit",
-                vec![money()],
-                receipt(),
+        let reordered = ProtocolSchema::from_actor_type(
+            "RenamedCounter",
+            &actor_type(vec![("add", add), ("get", get)]),
+        )
+        .unwrap();
+
+        assert_eq!(first.id(), reordered.id());
+        assert_eq!(first.members().count(), 2);
+    }
+
+    #[test]
+    fn tuple_payload_and_two_argument_pack_have_distinct_protocol_ids() {
+        let pair = Type::Tuple(vec![Type::int(), Type::string()]);
+        let one_tuple_arg =
+            ProtocolSchema::new("Sink", [member("push", vec![pair], Type::unit())]).unwrap();
+        let two_args = ProtocolSchema::new(
+            "Sink",
+            [member(
+                "push",
+                vec![Type::int(), Type::string()],
+                Type::unit(),
             )],
         )
         .unwrap();
-        assert_ne!(message.id(), request.id());
+
+        assert_ne!(one_tuple_arg.id(), two_args.id());
+    }
+
+    #[test]
+    fn schema_generation_fails_closed_for_unresolved_contracts() {
+        let unspecified = Type::Nominal {
+            name: UNSPECIFIED_ACTOR_PROTOCOL_TYPE_NAME.to_string(),
+            underlying: Box::new(Type::unit()),
+        };
+        let unresolved = actor_type(vec![(
+            "add",
+            behavior_sig(
+                vec![unspecified],
+                Type::unit(),
+                EffectRow::empty(),
+                Capability::Ref,
+            ),
+        )]);
+        assert!(matches!(
+            ProtocolSchema::from_actor_type("Counter", &unresolved),
+            Err(ProtocolSchemaError::UnresolvedBehaviorType(name)) if name == "add"
+        ));
+
+        let open_effect = actor_type(vec![(
+            "get",
+            behavior_sig(
+                vec![],
+                Type::int(),
+                EffectRow::Open(vec![Effect::IO], Region::fresh()),
+                Capability::Ref,
+            ),
+        )]);
+        assert!(matches!(
+            ProtocolSchema::from_actor_type("Counter", &open_effect),
+            Err(ProtocolSchemaError::OpenBehaviorEffect(name)) if name == "get"
+        ));
+
+        let unresolved_var = actor_type(vec![(
+            "get",
+            behavior_sig(
+                vec![],
+                Type::Var(TypeVar::fresh()),
+                EffectRow::empty(),
+                Capability::Ref,
+            ),
+        )]);
+        assert!(matches!(
+            ProtocolSchema::from_actor_type("Counter", &unresolved_var),
+            Err(ProtocolSchemaError::UnresolvedBehaviorType(name)) if name == "get"
+        ));
     }
 
     #[test]
     fn duplicate_behaviors_are_rejected() {
-        let err = ProtocolSchema::new(
-            "Broken",
-            [
-                ProtocolMember::message("Ping", vec![]),
-                ProtocolMember::message("Ping", vec![int()]),
-            ],
-        )
-        .unwrap_err();
+        let ping = member("Ping", vec![], Type::unit());
+        let err = ProtocolSchema::new("Broken", [ping.clone(), ping]).unwrap_err();
         assert_eq!(err, ProtocolSchemaError::DuplicateBehavior("Ping".into()));
     }
 
     #[test]
     fn protocol_actor_ref_requires_exact_protocol() {
-        let account = ProtocolSchema::new(
-            "Account",
-            [ProtocolMember::request_reply("Balance", vec![], money())],
-        )
-        .unwrap()
-        .id();
-        let inventory = ProtocolSchema::new(
-            "Inventory",
-            [ProtocolMember::request_reply("Count", vec![], int())],
-        )
-        .unwrap()
-        .id();
+        let account = ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())])
+            .unwrap()
+            .id();
+        let inventory = ProtocolSchema::new("Inventory", [member("Count", vec![], int_ty())])
+            .unwrap()
+            .id();
 
         let actor = ProtocolActorRef::new(7, 42, account);
         assert_eq!(actor.node_id, 7);
@@ -475,11 +764,8 @@ mod tests {
 
     #[test]
     fn protocol_id_hex_round_trips() {
-        let schema = ProtocolSchema::new(
-            "Account",
-            [ProtocolMember::request_reply("Balance", vec![], money())],
-        )
-        .unwrap();
+        let schema =
+            ProtocolSchema::new("Account", [member("Balance", vec![], money_ty())]).unwrap();
         let id = schema.id();
         let encoded = id.to_string();
         assert_eq!(encoded.len(), 64);
