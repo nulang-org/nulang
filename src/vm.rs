@@ -127,6 +127,71 @@ pub enum PerformAsyncResult {
     Pending,
 }
 
+/// Internal payload width of a zero-copy ArrayView.
+const ARRAY_VIEW_SLOTS: usize = 3;
+
+/// Resolve an Array or ArrayView to its ultimate backing Array plus logical
+/// start/length. Views created by the runtime are flattened, but recursive
+/// resolution keeps continuation deserialization and defensive callers sound.
+///
+/// # Safety
+/// `ptr` must be a live ORCA-managed heap payload pointer.
+pub(crate) unsafe fn heap_array_region(ptr: *mut u8) -> Option<(*mut u8, usize, usize)> {
+    unsafe fn resolve(ptr: *mut u8, depth: usize) -> Option<(*mut u8, usize, usize)> {
+        if ptr.is_null() || depth > 16 {
+            return None;
+        }
+        let header = &*ActorHeap::header_of(ptr);
+        match header.type_tag {
+            HeapTypeTag::Array => {
+                Some((ptr, 0, header.payload_size / std::mem::size_of::<Value>()))
+            }
+            HeapTypeTag::ArrayView => {
+                if header.payload_size < ARRAY_VIEW_SLOTS * std::mem::size_of::<Value>() {
+                    return None;
+                }
+                let slots = std::slice::from_raw_parts(ptr as *const Value, ARRAY_VIEW_SLOTS);
+                let backing = slots[0].as_ptr()?;
+                let start = slots[1].as_int()?;
+                let len = slots[2].as_int()?;
+                if start < 0 || len < 0 {
+                    return None;
+                }
+                let (base, backing_start, backing_len) = resolve(backing, depth + 1)?;
+                let start = start as usize;
+                if start > backing_len {
+                    return None;
+                }
+                let len = (len as usize).min(backing_len - start);
+                Some((base, backing_start.checked_add(start)?, len))
+            }
+            _ => None,
+        }
+    }
+
+    resolve(ptr, 0)
+}
+
+/// Logical element count for an Array or ArrayView.
+///
+/// # Safety
+/// `ptr` must be a live ORCA-managed heap payload pointer.
+pub(crate) unsafe fn heap_array_len(ptr: *mut u8) -> Option<usize> {
+    heap_array_region(ptr).map(|(_, _, len)| len)
+}
+
+/// Read one logical element from an Array or ArrayView.
+///
+/// # Safety
+/// `ptr` must be a live ORCA-managed heap payload pointer.
+pub(crate) unsafe fn heap_array_get(ptr: *mut u8, idx: usize) -> Option<Value> {
+    let (base, start, len) = heap_array_region(ptr)?;
+    if idx >= len {
+        return None;
+    }
+    Some(*(base as *const Value).add(start.checked_add(idx)?))
+}
+
 /// Callback interface that supplies real actor-runtime behavior for the VM's
 /// `Spawn`, `ArrAlloc`, `SConcat`, `SRead`, and `Drop` opcodes.
 pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
@@ -186,8 +251,326 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// (increment vs. decrement of the same reference count).
     fn retain_ref(&mut self, ptr: *mut u8);
 
-    /// Return the number of elements in an array allocated on the actor heap.
-    fn array_len(&self, ptr: *mut u8) -> Option<usize>;
+    /// Retain a pointer stored inside a container owned by this callback's
+    /// allocation domain.
+    ///
+    /// Same-owner children participate in local ORCA reference counting.
+    /// Foreign children are rejected: actor-scoped receiver holds are not an
+    /// object-lifetime edge for a newly-created local container, which may
+    /// itself be forwarded or outlive the current actor. Arena pointers are
+    /// likewise forbidden from escaping into heap containers.
+    fn retain_container_child(&mut self, ptr: *mut u8) -> bool {
+        if ptr.is_null() {
+            return true;
+        }
+        if self.is_arena_ptr(ptr) {
+            return false;
+        }
+        // SAFETY: pointer-tagged VM values carry a live OrcaHeader immediately
+        // before the payload.
+        let owner = unsafe { (*ActorHeap::header_of(ptr)).actor_id };
+        let current_owner = self.current_actor_id().unwrap_or(0);
+        if owner != current_owner {
+            // Actor-scoped receiver holds do not give a newly-created local
+            // container an independent lifetime edge to a foreign object.
+            // Refuse the store rather than manufacture a dangling nested
+            // cross-heap reference that could outlive this actor.
+            return false;
+        }
+        self.retain_ref(ptr);
+        true
+    }
+
+    /// Release a pointer previously stored in a local container.
+    ///
+    /// Foreign children are receiver-held at actor scope, so a local container
+    /// must not decrement them through the wrong heap.
+    fn release_container_child(&mut self, ptr: *mut u8) {
+        if ptr.is_null() || self.is_arena_ptr(ptr) {
+            return;
+        }
+        // SAFETY: pointer-tagged VM values carry a live OrcaHeader immediately
+        // before the payload.
+        let owner = unsafe { (*ActorHeap::header_of(ptr)).actor_id };
+        let current_owner = self.current_actor_id().unwrap_or(0);
+        if owner == current_owner {
+            self.drop_ref(ptr);
+        }
+    }
+
+    /// Return the logical number of elements in an Array or ArrayView.
+    fn array_len(&self, ptr: *mut u8) -> Option<usize> {
+        // SAFETY: callers only pass live VM heap pointers.
+        unsafe { heap_array_len(ptr) }
+    }
+
+    /// Read one logical array element.
+    fn array_get(&self, ptr: *mut u8, idx: usize) -> Option<Value> {
+        // SAFETY: callers only pass live VM heap pointers.
+        unsafe { heap_array_get(ptr, idx) }
+    }
+
+    /// Detach an ArrayView from an oversized backing array while preserving
+    /// its logical contents. Ordinary arrays and already-compact views are
+    /// no-ops. Returns false only when the view cannot be safely compacted in
+    /// the current allocation domain.
+    fn array_compact(&mut self, ptr: *mut u8) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+
+        // SAFETY: callers only pass live VM heap pointers.
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag == HeapTypeTag::Array {
+                return true;
+            }
+            if header.type_tag != HeapTypeTag::ArrayView {
+                return false;
+            }
+
+            let current_owner = self.current_actor_id().unwrap_or(0);
+            if header.actor_id != current_owner || self.is_arena_ptr(ptr) {
+                return false;
+            }
+
+            let (base, start, len) = match heap_array_region(ptr) {
+                Some(region) => region,
+                None => return false,
+            };
+            let base_header = &*ActorHeap::header_of(base);
+            if base_header.type_tag != HeapTypeTag::Array
+                || base_header.actor_id != current_owner
+                || self.is_arena_ptr(base)
+            {
+                return false;
+            }
+
+            let base_len = base_header.payload_size / std::mem::size_of::<Value>();
+            if start == 0 && len == base_len {
+                return true;
+            }
+
+            let len_i64 = match i64::try_from(len) {
+                Ok(len) => len,
+                Err(_) => return false,
+            };
+            let bytes = match len.checked_mul(std::mem::size_of::<Value>()) {
+                Some(bytes) => bytes,
+                None => return false,
+            };
+            let new_ptr = match self.alloc(bytes, HeapTypeTag::Array) {
+                Some(ptr) => ptr,
+                None => return false,
+            };
+            let dst = std::slice::from_raw_parts_mut(new_ptr as *mut Value, len);
+            dst.fill(Value::nil());
+            for i in 0..len {
+                let item = *((base as *const Value).add(start + i));
+                if let Some(child) = item.as_ptr() {
+                    if !self.retain_container_child(child) {
+                        self.drop_ref(new_ptr);
+                        return false;
+                    }
+                }
+                dst[i] = item;
+            }
+
+            let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, ARRAY_VIEW_SLOTS);
+            let old_backing = slots[0].as_ptr();
+            // The fresh allocation's initial local reference becomes the
+            // view's single ownership reference; do not retain it again.
+            slots[0] = Value::ptr(new_ptr);
+            slots[1] = Value::int(0);
+            slots[2] = Value::int(len_i64);
+            if let Some(old_backing) = old_backing {
+                self.release_container_child(old_backing);
+            }
+            true
+        }
+    }
+
+    /// Mutate an array element. ArrayView uses copy-on-write so mutating a
+    /// slice never changes the source array that was sliced.
+    fn array_store(&mut self, ptr: *mut u8, idx: usize, val: Value) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        // SAFETY: ptr is a live VM heap payload.
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            match header.type_tag {
+                HeapTypeTag::Array => {
+                    let len = header.payload_size / std::mem::size_of::<Value>();
+                    if idx >= len {
+                        return false;
+                    }
+                    if let Some(child) = val.as_ptr() {
+                        if !self.retain_container_child(child) {
+                            return false;
+                        }
+                    }
+                    let slot = (ptr as *mut Value).add(idx);
+                    let old = *slot;
+                    *slot = val;
+                    if let Some(old_ptr) = old.as_ptr() {
+                        self.release_container_child(old_ptr);
+                    }
+                    true
+                }
+                HeapTypeTag::ArrayView => {
+                    let len = match heap_array_len(ptr) {
+                        Some(len) => len,
+                        None => return false,
+                    };
+                    if idx >= len {
+                        return false;
+                    }
+
+                    // Retain the replacement before compaction can release the
+                    // old backing. The replacement may itself be reachable
+                    // only through that backing (for example, a pointer-valued
+                    // element outside the logical view).
+                    let retained_child = val.as_ptr();
+                    if let Some(child) = retained_child {
+                        if !self.retain_container_child(child) {
+                            return false;
+                        }
+                    }
+                    if !self.array_compact(ptr) {
+                        if let Some(child) = retained_child {
+                            self.release_container_child(child);
+                        }
+                        return false;
+                    }
+
+                    let (base, start, compact_len) = match heap_array_region(ptr) {
+                        Some(region) => region,
+                        None => {
+                            if let Some(child) = retained_child {
+                                self.release_container_child(child);
+                            }
+                            return false;
+                        }
+                    };
+                    debug_assert_eq!(start, 0);
+                    debug_assert_eq!(compact_len, len);
+
+                    let slot = (base as *mut Value).add(idx);
+                    let old = *slot;
+                    *slot = val;
+                    if let Some(old_ptr) = old.as_ptr() {
+                        self.release_container_child(old_ptr);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
+    /// Materialize one logical array region into a fresh local Array.
+    ///
+    /// This is the ownership-safe fallback for foreign or arena-backed
+    /// sources. Scalar values materialize normally. Pointer-valued elements
+    /// must belong to the current allocation domain; otherwise materialization
+    /// fails closed rather than creating a nested cross-heap lifetime edge.
+    fn materialize_array_region(&mut self, ptr: *mut u8, start: usize, end: usize) -> Value {
+        let len = match end.checked_sub(start) {
+            Some(len) => len,
+            None => return Value::nil(),
+        };
+        let bytes = match len.checked_mul(std::mem::size_of::<Value>()) {
+            Some(bytes) => bytes,
+            None => return Value::nil(),
+        };
+        let new_ptr = match self.alloc(bytes, HeapTypeTag::Array) {
+            Some(ptr) => ptr,
+            None => return Value::nil(),
+        };
+
+        // Initialise every slot before any fallible retain so rollback through
+        // ORCA can never scan uninitialised Value bits.
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(new_ptr as *mut Value, len);
+            dst.fill(Value::nil());
+            for i in 0..len {
+                let item = match self.array_get(ptr, start + i) {
+                    Some(item) => item,
+                    None => {
+                        self.drop_ref(new_ptr);
+                        return Value::nil();
+                    }
+                };
+                if let Some(child) = item.as_ptr() {
+                    if !self.retain_container_child(child) {
+                        self.drop_ref(new_ptr);
+                        return Value::nil();
+                    }
+                }
+                dst[i] = item;
+            }
+        }
+        unsafe {
+            // SAFETY: new_ptr was allocated immediately above by this callback
+            // and remains live in the current allocation domain.
+            Value::ptr(new_ptr)
+        }
+    }
+
+    /// Create a constant-size zero-copy slice view when the ultimate backing
+    /// Array belongs to this callback's allocation domain. Nested views are
+    /// flattened. Foreign and arena-backed sources are materialized locally so
+    /// ArrayView never creates a cross-heap ownership edge.
+    fn array_slice(&mut self, ptr: *mut u8, start: usize, end: usize) -> Value {
+        // SAFETY: callers only pass live VM heap pointers.
+        unsafe {
+            let (base, base_start, len) = match heap_array_region(ptr) {
+                Some(region) => region,
+                None => return Value::nil(),
+            };
+            if start > end || end > len {
+                return Value::nil();
+            }
+
+            let view_len = end - start;
+            // Empty slices should not pin an arbitrarily large backing array.
+            if view_len == 0 {
+                return self.materialize_array_region(ptr, start, end);
+            }
+
+            let current_owner = self.current_actor_id().unwrap_or(0);
+            let backing_owner = (*ActorHeap::header_of(base)).actor_id;
+            if backing_owner != current_owner || self.is_arena_ptr(base) {
+                return self.materialize_array_region(ptr, start, end);
+            }
+
+            let abs_start = match base_start.checked_add(start) {
+                Some(v) => v,
+                None => return Value::nil(),
+            };
+            let abs_start_i64 = match i64::try_from(abs_start) {
+                Ok(v) => v,
+                Err(_) => return Value::nil(),
+            };
+            let view_len_i64 = match i64::try_from(view_len) {
+                Ok(v) => v,
+                Err(_) => return Value::nil(),
+            };
+            let bytes = ARRAY_VIEW_SLOTS * std::mem::size_of::<Value>();
+            let view_ptr = match self.alloc(bytes, HeapTypeTag::ArrayView) {
+                Some(ptr) => ptr,
+                None => return Value::nil(),
+            };
+            // Same-domain view: one counted local reference to the backing.
+            self.retain_ref(base);
+            let slots = std::slice::from_raw_parts_mut(view_ptr as *mut Value, ARRAY_VIEW_SLOTS);
+            slots[0] = Value::ptr(base);
+            slots[1] = Value::int(abs_start_i64);
+            slots[2] = Value::int(view_len_i64);
+            Value::ptr(view_ptr)
+        }
+    }
 
     /// Allocate a fresh heap string via `self.alloc`, copy `s` into it,
     /// and null-terminate. Default implementation works for any callback
@@ -944,6 +1327,151 @@ pub(crate) fn hashmap_op(
     }
 }
 
+/// Shared implementation of the built-in Array effect.
+///
+/// `slice` is zero-copy: it creates a constant-size ArrayView retaining only
+/// the ultimate backing array. Operations that produce a fresh array preserve
+/// value semantics when their input is a view.
+pub(crate) fn perform_array_builtin<C: ActorVmCallbacks + ?Sized>(
+    callbacks: &mut C,
+    op_name: Option<&str>,
+    regs: &[Value],
+) -> Option<Value> {
+    match op_name {
+        Some("length") => {
+            let ptr = regs.first()?.as_ptr()?;
+            Some(Value::int(callbacks.array_len(ptr).unwrap_or(0) as i64))
+        }
+        Some("push") => {
+            let ptr = regs.first()?.as_ptr()?;
+            let elem = regs.get(1).copied().unwrap_or(Value::nil());
+            let len = callbacks.array_len(ptr).unwrap_or(0);
+            let new_len = len.checked_add(1)?;
+            let bytes = new_len.checked_mul(std::mem::size_of::<Value>())?;
+            let new_ptr = callbacks.alloc(bytes, HeapTypeTag::Array)?;
+            unsafe {
+                let dst = std::slice::from_raw_parts_mut(new_ptr as *mut Value, new_len);
+                dst.fill(Value::nil());
+                for i in 0..len {
+                    let item = callbacks.array_get(ptr, i).unwrap_or_else(Value::nil);
+                    if let Some(child) = item.as_ptr() {
+                        if !callbacks.retain_container_child(child) {
+                            callbacks.drop_ref(new_ptr);
+                            return Some(Value::nil());
+                        }
+                    }
+                    dst[i] = item;
+                }
+                if let Some(child) = elem.as_ptr() {
+                    if !callbacks.retain_container_child(child) {
+                        callbacks.drop_ref(new_ptr);
+                        return Some(Value::nil());
+                    }
+                }
+                dst[len] = elem;
+                Some(Value::ptr(new_ptr))
+            }
+        }
+        Some("new") => {
+            let n = regs.first().and_then(|v| v.as_int()).unwrap_or(0);
+            if n < 0 {
+                return Some(Value::nil());
+            }
+            let n = n as usize;
+            let init = regs.get(1).copied().unwrap_or(Value::nil());
+            let bytes = n.checked_mul(std::mem::size_of::<Value>())?;
+            let ptr = callbacks.alloc(bytes, HeapTypeTag::Array)?;
+            unsafe {
+                let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, n);
+                slots.fill(Value::nil());
+                for slot in slots {
+                    if let Some(child) = init.as_ptr() {
+                        if !callbacks.retain_container_child(child) {
+                            callbacks.drop_ref(ptr);
+                            return Some(Value::nil());
+                        }
+                    }
+                    *slot = init;
+                }
+                Some(Value::ptr(ptr))
+            }
+        }
+        Some("set") => {
+            let ptr = regs.first()?.as_ptr()?;
+            let idx = regs.get(1).and_then(|v| v.as_int()).unwrap_or(-1);
+            if idx < 0 {
+                return Some(Value::nil());
+            }
+            let idx = idx as usize;
+            let val = regs.get(2).copied().unwrap_or(Value::nil());
+            let len = callbacks.array_len(ptr).unwrap_or(0);
+            if idx >= len {
+                return Some(Value::nil());
+            }
+            let bytes = len.checked_mul(std::mem::size_of::<Value>())?;
+            let new_ptr = callbacks.alloc(bytes, HeapTypeTag::Array)?;
+            unsafe {
+                let dst = std::slice::from_raw_parts_mut(new_ptr as *mut Value, len);
+                dst.fill(Value::nil());
+                for i in 0..len {
+                    let item = if i == idx {
+                        val
+                    } else {
+                        callbacks.array_get(ptr, i).unwrap_or_else(Value::nil)
+                    };
+                    if let Some(child) = item.as_ptr() {
+                        if !callbacks.retain_container_child(child) {
+                            callbacks.drop_ref(new_ptr);
+                            return Some(Value::nil());
+                        }
+                    }
+                    dst[i] = item;
+                }
+                Some(Value::ptr(new_ptr))
+            }
+        }
+        Some("slice") => {
+            let ptr = regs.first()?.as_ptr()?;
+            let len = callbacks.array_len(ptr).unwrap_or(0);
+            let raw_start = regs.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            let raw_end = regs.get(2).and_then(|v| v.as_int()).unwrap_or(-1);
+            let start = raw_start.max(0) as usize;
+            let end = if raw_end < 0 || raw_end as usize > len {
+                len
+            } else {
+                raw_end as usize
+            };
+            if start > end {
+                return Some(Value::nil());
+            }
+            Some(callbacks.array_slice(ptr, start, end))
+        }
+        Some("compact") => {
+            let ptr = regs.first()?.as_ptr()?;
+            Some(Value::bool(callbacks.array_compact(ptr)))
+        }
+        Some("range") => {
+            let start = regs.first().and_then(|v| v.as_int()).unwrap_or(0);
+            let end = regs.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = if end > start {
+                (end - start) as usize
+            } else {
+                0
+            };
+            let bytes = len.checked_mul(std::mem::size_of::<Value>())?;
+            let ptr = callbacks.alloc(bytes, HeapTypeTag::Array)?;
+            unsafe {
+                let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, len);
+                for (i, slot) in slots.iter_mut().enumerate() {
+                    *slot = Value::int(start + i as i64);
+                }
+                Some(Value::ptr(ptr))
+            }
+        }
+        _ => None,
+    }
+}
+
 impl ActorVmCallbacks for StandaloneVmCallbacks {
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
         self.heap.alloc(size, type_tag)
@@ -967,18 +1495,8 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
     }
 
     fn array_len(&self, ptr: *mut u8) -> Option<usize> {
-        // SAFETY: `ptr` is a valid heap pointer from a prior Array allocation.
-        // `ActorHeap::header_of` computes the OrcaHeader immediately preceding
-        // the payload — this is sound when ptr was returned by heap.alloc().
-        unsafe {
-            let header = &*ActorHeap::header_of(ptr);
-            if header.type_tag == HeapTypeTag::Array {
-                let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
-                Some(payload_size / std::mem::size_of::<Value>())
-            } else {
-                None
-            }
-        }
+        // SAFETY: ptr is a live VM heap pointer.
+        unsafe { heap_array_len(ptr) }
     }
 
     fn spawn_actor(
@@ -1343,195 +1861,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
             }
         }
         if effect_name == "Array" {
-            match op_name {
-                Some("length") => {
-                    let arr_ptr = regs
-                        .first()
-                        .and_then(|v| v.as_ptr())
-                        .unwrap_or(std::ptr::null_mut());
-                    let len = if !arr_ptr.is_null() {
-                        self.array_len(arr_ptr).unwrap_or(0) as i64
-                    } else {
-                        0
-                    };
-                    return Some(Value::int(len));
-                }
-                Some("push") => {
-                    let arr_ptr = regs
-                        .first()
-                        .and_then(|v| v.as_ptr())
-                        .unwrap_or(std::ptr::null_mut());
-                    let elem = regs.get(1).copied().unwrap_or(Value::nil());
-                    let len = if !arr_ptr.is_null() {
-                        self.array_len(arr_ptr).unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    let new_len = len + 1;
-                    let size = new_len
-                        .checked_mul(std::mem::size_of::<Value>())
-                        .unwrap_or(0);
-                    if let Some(new_ptr) = self.heap.alloc(size, HeapTypeTag::Array) {
-                        unsafe {
-                            let new_slots =
-                                std::slice::from_raw_parts_mut(new_ptr as *mut Value, new_len);
-                            // Copy existing elements, retaining heap refs.
-                            if !arr_ptr.is_null() {
-                                let old_slots =
-                                    std::slice::from_raw_parts(arr_ptr as *const Value, len);
-                                for (i, slot) in old_slots.iter().enumerate() {
-                                    new_slots[i] = *slot;
-                                    if let Some(ptr) = slot.as_ptr() {
-                                        self.gc.local_ref(&self.heap, ptr);
-                                    }
-                                }
-                            }
-                            // Store new element, retaining if heap value.
-                            new_slots[len] = elem;
-                            if let Some(ptr) = elem.as_ptr() {
-                                self.gc.local_ref(&self.heap, ptr);
-                            }
-                        }
-                        return Some(unsafe {
-                            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
-                            Value::ptr(new_ptr)
-                        });
-                    }
-                    return Some(Value::nil());
-                }
-                Some("new") => {
-                    let n = regs.first().and_then(|v| v.as_int()).unwrap_or(0);
-                    if n < 0 {
-                        return Some(Value::nil());
-                    }
-                    let n = n as usize;
-                    let init = regs.get(1).copied().unwrap_or(Value::nil());
-                    let size = n.checked_mul(std::mem::size_of::<Value>()).unwrap_or(0);
-                    if let Some(new_ptr) = self.heap.alloc(size, HeapTypeTag::Array) {
-                        unsafe {
-                            let slots = std::slice::from_raw_parts_mut(new_ptr as *mut Value, n);
-                            for slot in slots.iter_mut() {
-                                *slot = init;
-                                if let Some(ptr) = init.as_ptr() {
-                                    self.gc.local_ref(&self.heap, ptr);
-                                }
-                            }
-                        }
-                        return Some(unsafe {
-                            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
-                            Value::ptr(new_ptr)
-                        });
-                    }
-                    return Some(Value::nil());
-                }
-                Some("set") => {
-                    let arr_ptr = regs
-                        .first()
-                        .and_then(|v| v.as_ptr())
-                        .unwrap_or(std::ptr::null_mut());
-                    let idx = regs.get(1).and_then(|v| v.as_int()).unwrap_or(-1);
-                    let val = regs.get(2).copied().unwrap_or(Value::nil());
-                    if arr_ptr.is_null() || idx < 0 {
-                        return Some(Value::nil());
-                    }
-                    let idx = idx as usize;
-                    let len = self.array_len(arr_ptr).unwrap_or(0);
-                    if idx >= len {
-                        return Some(Value::nil());
-                    }
-                    let size = len.checked_mul(std::mem::size_of::<Value>()).unwrap_or(0);
-                    if let Some(new_ptr) = self.heap.alloc(size, HeapTypeTag::Array) {
-                        unsafe {
-                            let new_slots =
-                                std::slice::from_raw_parts_mut(new_ptr as *mut Value, len);
-                            let old_slots =
-                                std::slice::from_raw_parts(arr_ptr as *const Value, len);
-                            for i in 0..len {
-                                let src = if i == idx { val } else { old_slots[i] };
-                                new_slots[i] = src;
-                                if let Some(ptr) = src.as_ptr() {
-                                    self.gc.local_ref(&self.heap, ptr);
-                                }
-                            }
-                        }
-                        return Some(unsafe {
-                            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
-                            Value::ptr(new_ptr)
-                        });
-                    }
-                    return Some(Value::nil());
-                }
-                Some("slice") => {
-                    let arr_ptr = regs
-                        .first()
-                        .and_then(|v| v.as_ptr())
-                        .unwrap_or(std::ptr::null_mut());
-                    let start = regs.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-                    let end = regs.get(2).and_then(|v| v.as_int()).unwrap_or(-1);
-                    let len = if !arr_ptr.is_null() {
-                        self.array_len(arr_ptr).unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    let start = start.max(0) as usize;
-                    let end = if end < 0 || end as usize > len {
-                        len
-                    } else {
-                        end as usize
-                    };
-                    if start > end {
-                        return Some(Value::nil());
-                    }
-                    let new_len = end - start;
-                    let size = new_len
-                        .checked_mul(std::mem::size_of::<Value>())
-                        .unwrap_or(0);
-                    if let Some(new_ptr) = self.heap.alloc(size, HeapTypeTag::Array) {
-                        unsafe {
-                            let new_slots =
-                                std::slice::from_raw_parts_mut(new_ptr as *mut Value, new_len);
-                            let old_slots =
-                                std::slice::from_raw_parts(arr_ptr as *const Value, len);
-                            for i in 0..new_len {
-                                let src = old_slots[start + i];
-                                new_slots[i] = src;
-                                if let Some(ptr) = src.as_ptr() {
-                                    self.gc.local_ref(&self.heap, ptr);
-                                }
-                            }
-                        }
-                        return Some(unsafe {
-                            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
-                            Value::ptr(new_ptr)
-                        });
-                    }
-                    return Some(Value::nil());
-                }
-                Some("range") => {
-                    let start = regs.first().and_then(|v| v.as_int()).unwrap_or(0);
-                    let end = regs.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-                    let len = if end > start {
-                        (end - start) as usize
-                    } else {
-                        0
-                    };
-                    let size = len.checked_mul(std::mem::size_of::<Value>()).unwrap_or(0);
-                    if let Some(new_ptr) = self.heap.alloc(size, HeapTypeTag::Array) {
-                        unsafe {
-                            let slots = std::slice::from_raw_parts_mut(new_ptr as *mut Value, len);
-                            for i in 0..len {
-                                slots[i] = Value::int(start + i as i64);
-                            }
-                        }
-                        return Some(unsafe {
-                            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
-                            Value::ptr(new_ptr)
-                        });
-                    }
-                    return Some(Value::nil());
-                }
-                _ => return None,
-            }
+            return perform_array_builtin(self, op_name, regs);
         }
         if effect_name == "StrBuilder" {
             return strbuilder_op(self, constants, op_name.unwrap_or(""), regs);
@@ -2703,18 +3033,18 @@ impl VM {
         self.debug_hook = hook;
     }
 
-    /// Read the elements of a heap-allocated array value.
+    /// Read the logical elements of a heap-allocated Array or ArrayView.
     pub fn array_elements(&self, v: Value) -> Option<Vec<Value>> {
         let ptr = v.as_ptr()?;
+        // SAFETY: pointer-tagged VM array values refer to live ORCA-managed
+        // allocations. heap_array_* validates Array/ArrayView shape.
         unsafe {
-            let header = &*ActorHeap::header_of(ptr);
-            if header.type_tag != HeapTypeTag::Array {
-                return None;
+            let len = heap_array_len(ptr)?;
+            let mut out = Vec::with_capacity(len);
+            for idx in 0..len {
+                out.push(heap_array_get(ptr, idx)?);
             }
-            let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
-            let len = payload_size / std::mem::size_of::<Value>();
-            let slots = std::slice::from_raw_parts(ptr as *const Value, len);
-            Some(slots.to_vec())
+            Some(out)
         }
     }
 
@@ -4237,27 +4567,7 @@ impl VM {
             .unwrap_or(0) as usize;
         let val = self.frames[frame_idx].regs[instr.op3 as usize];
         if !arr_ptr.is_null() {
-            if let Some(len) = self.actor_callbacks.array_len(arr_ptr) {
-                if idx < len {
-                    if let Some(ptr) = val.as_ptr() {
-                        self.actor_callbacks.retain_ref(ptr);
-                    }
-                    // SAFETY: The bounds check above (idx < len) guarantees
-                    // `idx` is within the allocated array. `arr_ptr` is a valid
-                    // ActorHeap pointer from a prior ArrLoad/Alloc. The
-                    // read-modify-write of the slot (old → drop_ref, new →
-                    // retain_ref) follows the standard ArrStore write-barrier
-                    // contract.
-                    unsafe {
-                        let slot = (arr_ptr as *mut Value).add(idx);
-                        let old = *slot;
-                        *slot = val;
-                        if let Some(old_ptr) = old.as_ptr() {
-                            self.actor_callbacks.drop_ref(old_ptr);
-                        }
-                    }
-                }
-            }
+            let _ = self.actor_callbacks.array_store(arr_ptr, idx, val);
         }
         Ok(())
     }
@@ -4373,15 +4683,9 @@ impl VM {
             .as_int()
             .unwrap_or(0) as usize;
         let val = if !arr_ptr.is_null() {
-            if let Some(len) = self.actor_callbacks.array_len(arr_ptr) {
-                if idx < len {
-                    unsafe { *((arr_ptr as *const Value).add(idx)) }
-                } else {
-                    Value::nil()
-                }
-            } else {
-                Value::nil()
-            }
+            self.actor_callbacks
+                .array_get(arr_ptr, idx)
+                .unwrap_or_else(Value::nil)
         } else {
             Value::nil()
         };
@@ -6085,6 +6389,451 @@ fn module_with_handler_table(bindings: Vec<crate::bytecode::HandlerBinding>) -> 
 mod vm_tests {
     use super::*;
     use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
+
+    fn test_array_backing(callbacks: &mut StandaloneVmCallbacks, values: &[i64]) -> Value {
+        let bytes = values.len() * std::mem::size_of::<Value>();
+        let ptr = callbacks
+            .alloc(bytes, HeapTypeTag::Array)
+            .expect("array allocation");
+        unsafe {
+            let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, values.len());
+            for (slot, value) in slots.iter_mut().zip(values.iter().copied()) {
+                *slot = Value::int(value);
+            }
+            Value::ptr(ptr)
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestOwnedCallbacks {
+        actor_id: u64,
+        heap: ActorHeap,
+        gc: crate::runtime::OrcaGc,
+    }
+
+    impl TestOwnedCallbacks {
+        fn new(actor_id: u64) -> Self {
+            let mut heap = ActorHeap::new(64 * 1024);
+            heap.set_actor_id(actor_id);
+            Self {
+                actor_id,
+                heap,
+                gc: crate::runtime::OrcaGc::new(actor_id),
+            }
+        }
+    }
+
+    impl ActorVmCallbacks for TestOwnedCallbacks {
+        fn current_actor_id(&self) -> Option<u64> {
+            Some(self.actor_id)
+        }
+
+        fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
+            self.heap.alloc(size, type_tag)
+        }
+
+        fn drop_ref(&mut self, ptr: *mut u8) {
+            unsafe {
+                self.gc.drop_local_ref(&mut self.heap, ptr);
+            }
+        }
+
+        fn retain_ref(&mut self, ptr: *mut u8) {
+            unsafe { self.gc.local_ref(&self.heap, ptr) }
+        }
+
+        fn spawn_actor(
+            &mut self,
+            _module: &CodeModule,
+            _spawn_pc: usize,
+            _behavior_idx: usize,
+            _init: Vec<(String, Value)>,
+        ) -> Value {
+            Value::actor_ref(0)
+        }
+
+        fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+    }
+
+    #[test]
+    fn test_array_slice_is_zero_copy_view() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let source = test_array_backing(&mut callbacks, &[10, 20, 30, 40, 50]);
+        let source_ptr = source.as_ptr().unwrap();
+
+        let view = perform_array_builtin(
+            &mut callbacks,
+            Some("slice"),
+            &[source, Value::int(1), Value::int(4)],
+        )
+        .expect("Array.slice result");
+        let view_ptr = view.as_ptr().expect("slice must be heap-backed");
+
+        unsafe {
+            let header = &*ActorHeap::header_of(view_ptr);
+            assert_eq!(header.type_tag, HeapTypeTag::ArrayView);
+            assert_eq!(
+                header.payload_size,
+                ARRAY_VIEW_SLOTS * std::mem::size_of::<Value>()
+            );
+            let slots = std::slice::from_raw_parts(view_ptr as *const Value, ARRAY_VIEW_SLOTS);
+            assert_eq!(slots[0].as_ptr(), Some(source_ptr));
+            assert_eq!(slots[1].as_int(), Some(1));
+            assert_eq!(slots[2].as_int(), Some(3));
+        }
+
+        assert_eq!(callbacks.array_len(view_ptr), Some(3));
+        assert_eq!(
+            callbacks
+                .array_get(view_ptr, 0)
+                .and_then(|value| value.as_int()),
+            Some(20)
+        );
+        assert_eq!(
+            callbacks
+                .array_get(view_ptr, 1)
+                .and_then(|value| value.as_int()),
+            Some(30)
+        );
+        assert_eq!(
+            callbacks
+                .array_get(view_ptr, 2)
+                .and_then(|value| value.as_int()),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn test_foreign_array_slice_materializes_in_current_owner_heap() {
+        let mut owner = TestOwnedCallbacks::new(11);
+        let bytes = 4 * std::mem::size_of::<Value>();
+        let source_ptr = owner
+            .alloc(bytes, HeapTypeTag::Array)
+            .expect("foreign source allocation");
+        unsafe {
+            let slots = std::slice::from_raw_parts_mut(source_ptr as *mut Value, 4);
+            slots.copy_from_slice(&[
+                Value::int(10),
+                Value::int(20),
+                Value::int(30),
+                Value::int(40),
+            ]);
+        }
+        let source_ref_before = unsafe { (*ActorHeap::header_of(source_ptr)).ref_count };
+
+        let mut receiver = TestOwnedCallbacks::new(22);
+        let sliced = receiver.array_slice(source_ptr, 1, 3);
+        let sliced_ptr = sliced.as_ptr().expect("materialized local slice");
+
+        unsafe {
+            let header = &*ActorHeap::header_of(sliced_ptr);
+            assert_eq!(header.type_tag, HeapTypeTag::Array);
+            assert_eq!(header.actor_id, 22);
+            assert_eq!(
+                (*ActorHeap::header_of(source_ptr)).ref_count,
+                source_ref_before,
+                "foreign backing must not be retained through receiver local RC"
+            );
+        }
+        assert_eq!(receiver.array_len(sliced_ptr), Some(2));
+        assert_eq!(
+            receiver
+                .array_get(sliced_ptr, 0)
+                .and_then(|value| value.as_int()),
+            Some(20)
+        );
+        assert_eq!(
+            receiver
+                .array_get(sliced_ptr, 1)
+                .and_then(|value| value.as_int()),
+            Some(30)
+        );
+
+        // The materialized slice has no lifetime dependency on the foreign
+        // source allocation. Dropping the owner's sole source reference must
+        // not affect receiver reads.
+        owner.drop_ref(source_ptr);
+        assert_eq!(
+            receiver
+                .array_get(sliced_ptr, 0)
+                .and_then(|value| value.as_int()),
+            Some(20)
+        );
+        assert_eq!(
+            receiver
+                .array_get(sliced_ptr, 1)
+                .and_then(|value| value.as_int()),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn test_foreign_pointer_slice_fails_closed() {
+        let mut owner = TestOwnedCallbacks::new(11);
+        let child = owner
+            .alloc(std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("foreign child allocation");
+        unsafe {
+            *(child as *mut Value) = Value::int(77);
+        }
+
+        let source = owner
+            .alloc(std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("foreign source allocation");
+        // The source array owns a same-owner local ref to child.
+        owner.retain_ref(child);
+        unsafe {
+            *(source as *mut Value) = Value::ptr(child);
+        }
+
+        let child_ref_before = unsafe { (*ActorHeap::header_of(child)).ref_count };
+        let mut receiver = TestOwnedCallbacks::new(22);
+        let sliced = receiver.array_slice(source, 0, 1);
+
+        assert!(
+            sliced.is_nil(),
+            "foreign pointer-valued slices must fail closed until the runtime has container-lifetime foreign edges"
+        );
+        assert_eq!(
+            unsafe { (*ActorHeap::header_of(child)).ref_count },
+            child_ref_before,
+            "failed materialization must not perturb the foreign child's local refcount"
+        );
+    }
+
+    #[test]
+    fn test_empty_slice_does_not_pin_backing_array() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let source = test_array_backing(&mut callbacks, &[1, 2, 3, 4]);
+        let source_ptr = source.as_ptr().unwrap();
+        let before = unsafe { (*ActorHeap::header_of(source_ptr)).ref_count };
+
+        let empty = callbacks.array_slice(source_ptr, 2, 2);
+        let empty_ptr = empty.as_ptr().expect("empty slice is a heap array");
+        unsafe {
+            let header = &*ActorHeap::header_of(empty_ptr);
+            assert_eq!(header.type_tag, HeapTypeTag::Array);
+            assert_eq!(header.payload_size, 0);
+            assert_eq!(
+                (*ActorHeap::header_of(source_ptr)).ref_count,
+                before,
+                "empty slice must not retain its backing"
+            );
+        }
+        assert_eq!(callbacks.array_len(empty_ptr), Some(0));
+    }
+
+    #[test]
+    fn test_nested_array_slices_flatten_to_original_backing() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let source = test_array_backing(&mut callbacks, &[1, 2, 3, 4, 5]);
+        let source_ptr = source.as_ptr().unwrap();
+
+        let first = callbacks.array_slice(source_ptr, 1, 5);
+        let first_ptr = first.as_ptr().unwrap();
+        let second = callbacks.array_slice(first_ptr, 1, 3);
+        let second_ptr = second.as_ptr().unwrap();
+
+        unsafe {
+            let slots = std::slice::from_raw_parts(second_ptr as *const Value, ARRAY_VIEW_SLOTS);
+            assert_eq!(slots[0].as_ptr(), Some(source_ptr));
+            assert_ne!(slots[0].as_ptr(), Some(first_ptr));
+            assert_eq!(slots[1].as_int(), Some(2));
+            assert_eq!(slots[2].as_int(), Some(2));
+        }
+        assert_eq!(
+            callbacks
+                .array_get(second_ptr, 0)
+                .and_then(|value| value.as_int()),
+            Some(3)
+        );
+        assert_eq!(
+            callbacks
+                .array_get(second_ptr, 1)
+                .and_then(|value| value.as_int()),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn test_array_compact_releases_oversized_backing() {
+        const LARGE_LEN: usize = 131_072; // 1 MiB of Value payload.
+
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let payload_bytes = LARGE_LEN * std::mem::size_of::<Value>();
+        let source_ptr = callbacks
+            .alloc(payload_bytes, HeapTypeTag::Array)
+            .expect("large backing allocation");
+        unsafe {
+            let slots = std::slice::from_raw_parts_mut(source_ptr as *mut Value, LARGE_LEN);
+            slots.fill(Value::int(7));
+        }
+
+        let view = callbacks.array_slice(source_ptr, LARGE_LEN / 2, LARGE_LEN / 2 + 2);
+        let view_ptr = view.as_ptr().expect("small slice view");
+        assert_eq!(
+            unsafe { (*ActorHeap::header_of(view_ptr)).type_tag },
+            HeapTypeTag::ArrayView
+        );
+
+        // Simulate the original array binding going out of scope. The view's
+        // counted backing reference keeps the 1 MiB source alive.
+        callbacks.drop_ref(source_ptr);
+
+        let mut retained_before = 0usize;
+        let mut backing_live_before = false;
+        callbacks.heap.iter_live_objects(|_, payload, size| {
+            retained_before += size;
+            backing_live_before |= payload == source_ptr;
+        });
+        assert!(backing_live_before, "view must retain its backing array");
+        assert!(
+            retained_before >= payload_bytes,
+            "small view should demonstrate full backing retention: retained={retained_before}, backing={payload_bytes}"
+        );
+
+        let compacted = perform_array_builtin(&mut callbacks, Some("compact"), &[view])
+            .expect("Array.compact result");
+        assert_eq!(compacted.as_bool(), Some(true));
+
+        let mut retained_after = 0usize;
+        let mut backing_live_after = false;
+        callbacks.heap.iter_live_objects(|_, payload, size| {
+            retained_after += size;
+            backing_live_after |= payload == source_ptr;
+        });
+        assert!(
+            !backing_live_after,
+            "compaction must release the oversized original backing"
+        );
+        assert_eq!(
+            callbacks
+                .array_get(view_ptr, 0)
+                .and_then(|value| value.as_int()),
+            Some(7)
+        );
+        assert_eq!(
+            callbacks
+                .array_get(view_ptr, 1)
+                .and_then(|value| value.as_int()),
+            Some(7)
+        );
+        assert!(
+            retained_after <= 64,
+            "2-element compact view should retain only tiny payloads, got {retained_after} bytes"
+        );
+        assert!(
+            retained_before > retained_after * 10_000,
+            "expected a material retained-memory reduction: before={retained_before}, after={retained_after}"
+        );
+
+        callbacks.drop_ref(view_ptr);
+        assert_eq!(callbacks.heap.live_count(), 0);
+    }
+
+    #[test]
+    fn test_array_view_store_retains_pointer_before_releasing_old_backing() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+
+        let kept_child = callbacks
+            .alloc(std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("kept child");
+        let replacement_child = callbacks
+            .alloc(std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("replacement child");
+        unsafe {
+            *(kept_child as *mut Value) = Value::int(11);
+            *(replacement_child as *mut Value) = Value::int(22);
+        }
+
+        let source_ptr = callbacks
+            .alloc(3 * std::mem::size_of::<Value>(), HeapTypeTag::Array)
+            .expect("source array");
+        callbacks.retain_container_child(kept_child);
+        callbacks.retain_container_child(replacement_child);
+        unsafe {
+            let source = std::slice::from_raw_parts_mut(source_ptr as *mut Value, 3);
+            source[0] = Value::ptr(kept_child);
+            source[1] = Value::int(0);
+            source[2] = Value::ptr(replacement_child);
+        }
+
+        // Drop the allocation references so source is the sole owner of each
+        // pointer child. The replacement value is then read from outside the
+        // logical view and used as the first COW store value.
+        callbacks.drop_ref(kept_child);
+        callbacks.drop_ref(replacement_child);
+
+        let view = callbacks.array_slice(source_ptr, 0, 2);
+        let view_ptr = view.as_ptr().unwrap();
+        let replacement = callbacks.array_get(source_ptr, 2).unwrap();
+        callbacks.drop_ref(source_ptr);
+
+        assert!(callbacks.array_store(view_ptr, 1, replacement));
+        let stored = callbacks
+            .array_get(view_ptr, 1)
+            .and_then(|value| value.as_ptr());
+        assert_eq!(stored, Some(replacement_child));
+        assert_eq!(
+            callbacks
+                .array_get(replacement_child, 0)
+                .and_then(|value| value.as_int()),
+            Some(22)
+        );
+
+        callbacks.drop_ref(view_ptr);
+        assert_eq!(callbacks.heap.live_count(), 0);
+    }
+
+    #[test]
+    fn test_array_view_store_detaches_copy_on_write() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let source = test_array_backing(&mut callbacks, &[10, 20, 30, 40]);
+        let source_ptr = source.as_ptr().unwrap();
+        let view = callbacks.array_slice(source_ptr, 1, 3);
+        let view_ptr = view.as_ptr().unwrap();
+
+        assert!(callbacks.array_store(view_ptr, 0, Value::int(99)));
+
+        // Source is unchanged.
+        assert_eq!(
+            callbacks
+                .array_get(source_ptr, 1)
+                .and_then(|value| value.as_int()),
+            Some(20)
+        );
+        assert_eq!(
+            callbacks
+                .array_get(source_ptr, 2)
+                .and_then(|value| value.as_int()),
+            Some(30)
+        );
+
+        // View now owns a detached two-element Array.
+        assert_eq!(
+            callbacks
+                .array_get(view_ptr, 0)
+                .and_then(|value| value.as_int()),
+            Some(99)
+        );
+        assert_eq!(
+            callbacks
+                .array_get(view_ptr, 1)
+                .and_then(|value| value.as_int()),
+            Some(30)
+        );
+        unsafe {
+            let slots = std::slice::from_raw_parts(view_ptr as *const Value, ARRAY_VIEW_SLOTS);
+            let detached = slots[0].as_ptr().expect("detached backing");
+            assert_ne!(detached, source_ptr);
+            assert_eq!(
+                (&*ActorHeap::header_of(detached)).type_tag,
+                HeapTypeTag::Array
+            );
+            assert_eq!(slots[1].as_int(), Some(0));
+            assert_eq!(slots[2].as_int(), Some(2));
+        }
+    }
 
     /// A NULL C string return (nil from cstr_to_value) must pass through
     /// instead of erroring on the missing pointer.

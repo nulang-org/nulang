@@ -1669,3 +1669,136 @@ fn test_may_suspend_analysis() {
         "peephole must recover the direct callee fib"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ArrayView native helper parity
+// ---------------------------------------------------------------------------
+
+fn make_array_view_fixture() -> (crate::vm::StandaloneVmCallbacks, crate::vm::Value, *mut u8) {
+    use crate::runtime::heap::TypeTag as HeapTypeTag;
+    use crate::vm::{perform_array_builtin, ActorVmCallbacks, Value};
+
+    let mut callbacks = crate::vm::StandaloneVmCallbacks::new();
+    let bytes = 4 * std::mem::size_of::<Value>();
+    let base_ptr = callbacks
+        .alloc(bytes, HeapTypeTag::Array)
+        .expect("array fixture allocation");
+    unsafe {
+        let slots = std::slice::from_raw_parts_mut(base_ptr as *mut Value, 4);
+        slots.copy_from_slice(&[
+            Value::int(10),
+            Value::int(20),
+            Value::int(30),
+            Value::int(40),
+        ]);
+    }
+    let base = unsafe { Value::ptr(base_ptr) };
+    let view = perform_array_builtin(
+        &mut callbacks,
+        Some("slice"),
+        &[base, Value::int(1), Value::int(3)],
+    )
+    .expect("Array.slice should return a value");
+
+    let view_ptr = view.as_ptr().expect("slice should be heap-backed");
+    let tag = unsafe { (*crate::runtime::heap::ActorHeap::header_of(view_ptr)).type_tag };
+    assert_eq!(
+        tag,
+        HeapTypeTag::ArrayView,
+        "same-owner slice fixture must exercise the zero-copy ArrayView path"
+    );
+    (callbacks, view, base_ptr)
+}
+
+#[test]
+fn test_jit_arrload_reads_array_view_via_runtime_helper() {
+    use crate::vm::{ActorVmCallbacks, Value};
+
+    let (mut callbacks, view, _base_ptr) = make_array_view_fixture();
+    let instructions = vec![Instruction::new3(OpCode::ArrLoad, 0, 1, 2)];
+    let mut jit = make_jit();
+    let ptr = unsafe {
+        jit.compile_region(
+            0,
+            0,
+            instructions.len(),
+            &instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("ArrLoad region should compile");
+
+    let mut regs = [Value::nil().as_raw(); 256];
+    regs[0] = view.as_raw();
+    regs[1] = Value::int(1).as_raw();
+
+    unsafe {
+        crate::jit::runtime::set_jit_callbacks(&mut callbacks);
+        let func: extern "C" fn(*mut u64, *const u64) = std::mem::transmute(ptr);
+        func(regs.as_mut_ptr(), std::ptr::null());
+        crate::jit::runtime::clear_jit_callbacks();
+    }
+
+    let loaded = unsafe { Value::from_raw(regs[2]) };
+    assert_eq!(loaded.as_int(), Some(30));
+    assert_eq!(
+        callbacks
+            .array_get(view.as_ptr().unwrap(), 0)
+            .and_then(|value| value.as_int()),
+        Some(20),
+        "native read must not mutate the view"
+    );
+}
+
+#[test]
+fn test_jit_arrstore_detaches_array_view_copy_on_write() {
+    use crate::vm::{ActorVmCallbacks, Value};
+
+    let (mut callbacks, view, base_ptr) = make_array_view_fixture();
+    let view_ptr = view.as_ptr().unwrap();
+    let instructions = vec![Instruction::new3(OpCode::ArrStore, 0, 1, 2)];
+    let mut jit = make_jit();
+    let ptr = unsafe {
+        jit.compile_region(
+            0,
+            0,
+            instructions.len(),
+            &instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("ArrStore region should compile");
+
+    let mut regs = [Value::nil().as_raw(); 256];
+    regs[0] = view.as_raw();
+    regs[1] = Value::int(0).as_raw();
+    regs[2] = Value::int(99).as_raw();
+
+    unsafe {
+        crate::jit::runtime::set_jit_callbacks(&mut callbacks);
+        let func: extern "C" fn(*mut u64, *const u64) = std::mem::transmute(ptr);
+        func(regs.as_mut_ptr(), std::ptr::null());
+        crate::jit::runtime::clear_jit_callbacks();
+    }
+
+    assert_eq!(
+        callbacks
+            .array_get(view_ptr, 0)
+            .and_then(|value| value.as_int()),
+        Some(99),
+        "compiled ArrStore must detach and update the view"
+    );
+    assert_eq!(
+        callbacks
+            .array_get(view_ptr, 1)
+            .and_then(|value| value.as_int()),
+        Some(30)
+    );
+    assert_eq!(
+        callbacks
+            .array_get(base_ptr, 1)
+            .and_then(|value| value.as_int()),
+        Some(20),
+        "copy-on-write must preserve the original backing array"
+    );
+}
