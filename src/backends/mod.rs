@@ -706,6 +706,23 @@ mod tests {
 
     #[cfg(feature = "python")]
     #[test]
+    fn test_foreign_interop_owned_python_roundtrip() {
+        let _ = pyo3::Python::attach(|_py| ());
+
+        let mut fi = DefaultForeignInterop::new().expect("failed to create DefaultForeignInterop");
+        fi.import("math").expect("failed to import math");
+
+        let request = crate::runtime::ForeignCallRequest::new(
+            "math",
+            "sqrt",
+            vec![crate::runtime::OwnedForeignValue::Float(81.0)],
+        );
+        let result = fi.call_owned(&request).expect("owned Python call failed");
+        assert_eq!(result, crate::runtime::OwnedForeignValue::Float(9.0));
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
     fn test_foreign_interop_python_roundtrip() {
         // Ensure Python is initialized (auto-initialize feature handles this).
         let _ = pyo3::Python::attach(|_py| ());
