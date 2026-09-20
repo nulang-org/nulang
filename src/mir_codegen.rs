@@ -761,7 +761,7 @@ impl MirCodegen {
             mir::RValue::Panic(msg) => {
                 // The Panic opcode reads register 0 for the message.
                 self.load_constant(0, &Constant::String(msg.clone()));
-                self.emit(Instruction::new0(OpCode::Panic));
+                self.emit(Instruction::new0(OpCode::Panic));
             }
             mir::RValue::Load(id) => {
                 let src = self.local_reg(*id);
@@ -1489,7 +1489,7 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
 //     operand is a float local: the VM's F* handlers coerce the int
 //     constant to a float, and IEEE semantics differ at ±0.0/NaN
 //     (e.g. x * 0.0 is NaN for infinite x, and -0.0 + 0.0 = +0.0);
-//   - int arithmetic folds with i64 wrapping ops — the VM computes in i64
+//   - int arithmetic folds with i64 wrapping ops — the VM computes in i64
 //     and truncates to the 48-bit payload on `Value::int`, so a folded
 //     `Const::Int` reloaded through the constant pool truncates to the
 //     identical 48-bit result;
@@ -2301,7 +2301,7 @@ fn stmt_uses(stmt: &mir::Stmt) -> Vec<(usize, UseKind)> {
         ],
         mir::Stmt::EnterHandle { .. } | mir::Stmt::PopHandler => Vec::new(),
         mir::Stmt::Emit { args, .. } => {
-            args.iter().map(|a| (a.0 as usize, UseKind::Copy)).collect()
+            args.iter().map(|a| (a.0 as usize, UseKind::Copy)).collect()
         }
         // StateSet stores into actor state without retaining, so the stored
         // value must keep its register reference: treat it as a copy.
@@ -3127,7 +3127,7 @@ mod tests {
             !module
                 .instructions
                 .iter()
-                .any(|i| i.opcode == OpCode::Receive),
+                .any(|i| i.opcode == OpCode::Receive),
             "receive-after must not emit the legacy pop-any Receive"
         );
     }
