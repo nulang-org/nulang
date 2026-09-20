@@ -86,6 +86,16 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
             .map(|((_, name), id)| (name.clone(), id.0))
             .collect()
     });
+    let schema_name = actor
+        .bytecode_module
+        .as_ref()
+        .and_then(|module| {
+            crate::runtime::schema_identity::canonical_schema_name_for_runtime_actor(
+                module,
+                &actor.name,
+            )
+        })
+        .map(str::to_owned);
     let snapshot = crate::runtime::persistence::ActorSnapshot {
         actor_id,
         sequence: seq,
@@ -93,6 +103,7 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
         waiting_signal: actor.waiting_signal.clone(),
         crdt_snapshot,
         crdt_field_map,
+        schema_name,
         authority_tokens,
     };
     // RFC 0014 §3: re-spawn-opted actors replicate the snapshot to their
