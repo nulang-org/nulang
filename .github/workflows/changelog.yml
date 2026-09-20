@@ -6,6 +6,12 @@ on:
     # Only check PRs that introduce user-visible changes.
     # Draft PRs are exempt until marked ready.
 
+# A newer commit on the same PR/head makes the older validation result stale.
+# Keep event types separate so scheduled/default-branch runs do not cancel PR runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
