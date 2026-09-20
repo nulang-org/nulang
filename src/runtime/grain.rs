@@ -7,7 +7,7 @@
 //! persisted snapshot.
 
 use super::persistence::StateModel;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// Largest value representable by the current NaN-boxed ActorRef payload.
@@ -144,6 +144,8 @@ pub struct ActivationStamp {
 pub enum ActivationDirectoryError {
     Exhausted,
     EpochExhausted,
+    AuthorityRequired,
+    StaleAuthority,
 }
 
 impl fmt::Display for ActivationDirectoryError {
@@ -154,6 +156,12 @@ impl fmt::Display for ActivationDirectoryError {
             }
             ActivationDirectoryError::EpochExhausted => {
                 write!(f, "virtual actor activation epoch space exhausted")
+            }
+            ActivationDirectoryError::AuthorityRequired => {
+                write!(f, "virtual actor requires an externally granted activation epoch")
+            }
+            ActivationDirectoryError::StaleAuthority => {
+                write!(f, "virtual actor activation authority is stale")
             }
         }
     }
@@ -168,6 +176,7 @@ pub struct ActivationDirectory {
     by_grain: HashMap<GrainId, ActivationStamp>,
     by_handle: HashMap<ActivationHandle, GrainId>,
     last_epoch: HashMap<GrainId, ActivationEpoch>,
+    externally_fenced: HashSet<GrainId>,
 }
 
 impl Default for ActivationDirectory {
@@ -183,6 +192,7 @@ impl ActivationDirectory {
             by_grain: HashMap::new(),
             by_handle: HashMap::new(),
             last_epoch: HashMap::new(),
+            externally_fenced: HashSet::new(),
         }
     }
 
@@ -201,6 +211,9 @@ impl ActivationDirectory {
         if let Some(stamp) = self.by_grain.get(&grain_id).copied() {
             return Ok(stamp);
         }
+        if self.externally_fenced.contains(&grain_id) {
+            return Err(ActivationDirectoryError::AuthorityRequired);
+        }
 
         let raw = self.next_handle;
         let handle = ActivationHandle::new(raw).ok_or(ActivationDirectoryError::Exhausted)?;
@@ -217,6 +230,81 @@ impl ActivationDirectory {
         let stamp = ActivationStamp { handle, epoch };
 
         self.last_epoch.insert(grain_id.clone(), epoch);
+        self.by_grain.insert(grain_id.clone(), stamp);
+        self.by_handle.insert(handle, grain_id);
+        Ok(stamp)
+    }
+
+    /// Observe an epoch established by an external/distributed authority.
+    ///
+    /// A strictly newer observation invalidates any older live local activation
+    /// and prevents autonomous reactivation. The caller must later install an
+    /// explicit ownership grant with `install_authoritative_activation`.
+    ///
+    /// Returns the local activation stamp that was fenced, if any.
+    pub fn observe_authoritative_epoch(
+        &mut self,
+        grain_id: GrainId,
+        epoch: ActivationEpoch,
+    ) -> Option<ActivationStamp> {
+        if self
+            .last_epoch
+            .get(&grain_id)
+            .is_some_and(|known| *known >= epoch)
+        {
+            return None;
+        }
+
+        self.last_epoch.insert(grain_id.clone(), epoch);
+        self.externally_fenced.insert(grain_id.clone());
+
+        let stale = self
+            .by_grain
+            .get(&grain_id)
+            .copied()
+            .filter(|stamp| stamp.epoch < epoch);
+        if let Some(stamp) = stale {
+            self.by_grain.remove(&grain_id);
+            self.by_handle.remove(&stamp.handle);
+        }
+        stale
+    }
+
+    /// Install an activation epoch granted by the distributed ownership layer.
+    ///
+    /// This is the only path that clears an external fence. It trusts the caller
+    /// to have established node ownership (lease/quorum/consensus policy lives
+    /// above this local directory) and rejects grants older than the highest
+    /// epoch already observed for the full logical identity.
+    pub fn install_authoritative_activation(
+        &mut self,
+        grain_id: GrainId,
+        epoch: ActivationEpoch,
+    ) -> Result<ActivationStamp, ActivationDirectoryError> {
+        if let Some(current) = self.by_grain.get(&grain_id).copied() {
+            return if current.epoch == epoch {
+                Ok(current)
+            } else {
+                Err(ActivationDirectoryError::StaleAuthority)
+            };
+        }
+        if self
+            .last_epoch
+            .get(&grain_id)
+            .is_some_and(|known| *known > epoch)
+        {
+            return Err(ActivationDirectoryError::StaleAuthority);
+        }
+
+        let raw = self.next_handle;
+        let handle = ActivationHandle::new(raw).ok_or(ActivationDirectoryError::Exhausted)?;
+        self.next_handle = raw
+            .checked_add(1)
+            .ok_or(ActivationDirectoryError::Exhausted)?;
+        let stamp = ActivationStamp { handle, epoch };
+
+        self.last_epoch.insert(grain_id.clone(), epoch);
+        self.externally_fenced.remove(&grain_id);
         self.by_grain.insert(grain_id.clone(), stamp);
         self.by_handle.insert(handle, grain_id);
         Ok(stamp)
@@ -432,6 +520,68 @@ mod tests {
         assert_eq!(b1.epoch, ActivationEpoch::INITIAL);
         assert_eq!(a2.epoch.get(), a1.epoch.get() + 1);
         assert_eq!(directory.epoch_for(&b), Some(ActivationEpoch::INITIAL));
+    }
+
+    #[test]
+    fn external_epoch_fences_stale_local_activation_until_authority_is_installed() {
+        let mut directory = ActivationDirectory::new();
+        let grain = GrainId::new("User", "distributed-fence");
+
+        let local = directory.resolve_or_activate(grain.clone()).unwrap();
+        let epoch3 = ActivationEpoch::new(3).unwrap();
+        assert_eq!(
+            directory.observe_authoritative_epoch(grain.clone(), epoch3),
+            Some(local)
+        );
+        assert!(!directory.is_current(&grain, local));
+        assert_eq!(
+            directory.resolve_or_activate(grain.clone()),
+            Err(ActivationDirectoryError::AuthorityRequired)
+        );
+
+        let granted = directory
+            .install_authoritative_activation(grain.clone(), epoch3)
+            .unwrap();
+        assert_eq!(granted.epoch, epoch3);
+        assert_ne!(granted.handle, local.handle);
+        assert!(directory.is_current(&grain, granted));
+        assert_eq!(directory.resolve_or_activate(grain).unwrap(), granted);
+    }
+
+    #[test]
+    fn stale_external_authority_grant_is_rejected() {
+        let mut directory = ActivationDirectory::new();
+        let grain = GrainId::new("User", "stale-grant");
+        let epoch4 = ActivationEpoch::new(4).unwrap();
+        directory.observe_authoritative_epoch(grain.clone(), epoch4);
+
+        assert_eq!(
+            directory.install_authoritative_activation(
+                grain,
+                ActivationEpoch::new(3).unwrap()
+            ),
+            Err(ActivationDirectoryError::StaleAuthority)
+        );
+    }
+
+    #[test]
+    fn stale_external_observation_does_not_fence_newer_authority() {
+        let mut directory = ActivationDirectory::new();
+        let grain = GrainId::new("User", "newer-authority");
+        let epoch5 = ActivationEpoch::new(5).unwrap();
+        let current = directory
+            .install_authoritative_activation(grain.clone(), epoch5)
+            .unwrap();
+
+        assert_eq!(
+            directory.observe_authoritative_epoch(
+                grain.clone(),
+                ActivationEpoch::new(4).unwrap()
+            ),
+            None
+        );
+        assert!(directory.is_current(&grain, current));
+        assert_eq!(directory.resolve_or_activate(grain).unwrap(), current);
     }
 
     #[test]
