@@ -4787,7 +4787,8 @@ impl Runtime {
     /// instead of the message journal, restoring the current step index and
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
-        let snapshot = self.persistence.load_snapshot(actor_id)?;
+        let (snapshot_schema_version, snapshot) =
+            self.persistence.load_snapshot_versioned(actor_id)?;
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
@@ -4813,6 +4814,7 @@ impl Runtime {
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
         actor.persistent = true;
+        actor.schema_version = snapshot_schema_version;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
@@ -5076,6 +5078,7 @@ impl Runtime {
         actor_id: u64,
         module: &crate::bytecode::CodeModule,
         snapshot: &ActorSnapshot,
+        schema_version: u32,
         is_workflow: bool,
         is_agent: bool,
     ) -> Result<Actor, crate::authority_runtime::RuntimeAuthorityError> {
@@ -5110,6 +5113,7 @@ impl Runtime {
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
         actor.persistent = true;
+        actor.schema_version = schema_version;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
@@ -5184,13 +5188,14 @@ impl Runtime {
             grain_type.compensation_offsets.clone(),
         );
 
-        let snapshot = self.persistence.load_snapshot(stable_actor_id);
+        let snapshot = self.persistence.load_snapshot_versioned(stable_actor_id);
 
-        let actor = if let Some(ref snap) = snapshot {
+        let actor = if let Some((schema_version, ref snap)) = snapshot {
             Self::restore_actor_from_snapshot(
                 stable_actor_id,
                 &grain_type.module,
                 snap,
+                schema_version,
                 false,
                 false,
             )
@@ -5294,9 +5299,21 @@ impl Runtime {
             }
         };
 
-        // Parse the durable state snapshot.
-        let snapshot: ActorSnapshot = match serde_json::from_slice(&snapshot_json) {
-            Ok(s) => s,
+        // Parse the durable state snapshot. Missing schema metadata is legacy v1.
+        let snapshot_text = match std::str::from_utf8(&snapshot_json) {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(
+                    "nulang-migrate: bad snapshot UTF-8 for actor {}: {}",
+                    actor_id,
+                    e
+                );
+                return false;
+            }
+        };
+        let decoded = match crate::persistence_schema::decode_record::<ActorSnapshot>(snapshot_text)
+        {
+            Ok(decoded) => decoded,
             Err(e) => {
                 tracing::warn!(
                     "nulang-migrate: bad snapshot JSON for actor {}: {}",
@@ -5306,6 +5323,8 @@ impl Runtime {
                 return false;
             }
         };
+        let schema_version = decoded.schema_version;
+        let snapshot = decoded.record;
 
         let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
         let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
@@ -5314,6 +5333,7 @@ impl Runtime {
             actor_id,
             &module,
             &snapshot,
+            schema_version,
             is_workflow,
             is_agent,
         ) {
