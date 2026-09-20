@@ -61,6 +61,12 @@ two major versions.*
   distributed operations, I/O, and missing proof metadata reject the contract.
   Native, WASM, and WasmFX reuse the same bytecode proof before backend-specific
   code generation so changing backends cannot silently weaken the guarantee.
+- **Iso-arena cost visibility** (Experimental). Mechanical-cost reports reuse
+  the runtime's existing escape analysis to mark activation-local heap sites as
+  arena-eligible and separately count sites that must remain on the general
+  actor heap/ORCA path. Arena eligibility remains an allocation strategy, not a
+  relaxation of `@noalloc`, and strings/record copies remain general allocation
+  sites until their runtime storage paths support arenas.
 
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
