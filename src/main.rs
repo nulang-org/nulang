@@ -529,6 +529,7 @@ fn main() {
                     "--color",
                     "--help",
                     "--emit-stdlib-docs",
+                    "--emit-wit",
                     "--emit-signals",
                     "--rewrite-signals",
                     "-r",
