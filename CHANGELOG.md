@@ -45,6 +45,24 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Typed WIT capability manifests — 2026-09-20
+- **Compiler-checked effect rows can now drive WIT capability worlds**
+  (Experimental, `src/witgen.rs`, `src/effect_checker.rs`, `src/main.rs`).
+  `nulang --emit-wit <out.wit> <file.nula>` runs the normal frontend and
+  derives component imports from checked effect rows instead of scanning source
+  text for `perform` strings. Effect collection includes module functions,
+  actor behaviors/initializers/state defaults, desugared state machines, and
+  workflow steps/compensations. Open rows and effects without a complete WIT
+  mapping fail closed rather than silently disappearing from the manifest.
+  Existing WIT host definitions for Time, Timer, Random, Signal, Inference, and
+  IO were aligned with the current stdlib registry; coarse `Http`/`Net`
+  remains intentionally unsupported until operation-sensitive lowering can
+  distinguish client calls from `Http.serve`.
+- **Frontend effect analysis is reused by web tooling** (Experimental).
+  Signal-graph emission and client-signal rewriting now consume the
+  `EffectChecker` produced by the normal frontend instead of running a second
+  redundant effect-check pass.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
