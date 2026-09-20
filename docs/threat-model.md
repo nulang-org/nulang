@@ -64,7 +64,7 @@
 | V1 | **JIT code injection** | JIT compilation is from MIR bytecode, not arbitrary machine code. `compile_region` stops at `Ret`. | Implemented. |
 | V2 | **Type confusion in JIT** | `typed_compiler` strips NaN-tag guards only when `TypeMetadata` proves register types. Falls back to scalar compilation on ambiguity. | Implemented. |
 | V3 | **Division-by-zero in JIT** | `IDiv`/`IMod` always emit runtime-helper calls (`nulang_idiv`/`nulang_imod`), never raw `sdiv`. | Implemented. |
-| V4 | **SIMD out-of-bounds access** | SIMD lowering only processes `ArrayLen`-bounded loops. Scalar epilogue handles remainder. | Implemented. |
+| V4 | **SIMD out-of-bounds access** | Production SIMD is limited to proven Int64 kernel shapes. Before direct memory access, generated code validates each participating value is an Array and that lhs/rhs/destination lengths all cover the scalar trip count. Guard failure occurs before side effects and triggers a one-shot VM deopt to the original bounds-checked bytecode. | Implemented. |
 
 ### 2.5 Persistence & Storage (Medium)
 
