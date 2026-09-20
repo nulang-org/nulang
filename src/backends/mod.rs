@@ -676,6 +676,59 @@ mod tests {
     }
 
     #[test]
+    fn jit_value_register_hook_preserves_legacy_backends() {
+        struct LegacyJit;
+
+        impl JitBackend for LegacyJit {
+            fn is_compiled(&self, _module_idx: usize, _pc: usize) -> bool {
+                true
+            }
+
+            fn record_and_check_hot(&mut self, _module_idx: usize, _pc: usize) -> bool {
+                true
+            }
+
+            fn compiled_region_len(&self, _module_idx: usize, _pc: usize) -> Option<usize> {
+                Some(1)
+            }
+
+            fn compiled_count(&self) -> usize {
+                1
+            }
+
+            fn typed_compiled_count(&self) -> usize {
+                0
+            }
+
+            fn reset_hot_counters(&mut self) {}
+
+            fn tiered_execute_step_typed(
+                &mut self,
+                _module_idx: usize,
+                _pc: usize,
+                _module: &CodeModule,
+                regs: &mut [u64; 256],
+                _constants: &[u64],
+            ) -> TieredAction {
+                regs[0] = Value::int(42).to_bits();
+                TieredAction::RanJit
+            }
+        }
+
+        let mut jit = LegacyJit;
+        let module = CodeModule::new("legacy-jit-hook");
+        let mut regs = [Value::nil(); 256];
+
+        // SAFETY: regs is a live, uniquely-borrowed 256-element Value array.
+        let action = unsafe {
+            jit.tiered_execute_value_regs(0, 0, &module, regs.as_mut_ptr(), &[])
+        };
+
+        assert_eq!(action, TieredAction::RanJit);
+        assert_eq!(regs[0].as_int(), Some(42));
+    }
+
+    #[test]
     fn test_default_crypto_provider_hash_and_random() {
         let cp = DefaultCryptoProvider::new();
         // hash is deterministic
