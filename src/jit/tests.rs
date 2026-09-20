@@ -1545,9 +1545,7 @@ fn test_tier2_simd_promotion_replaces_cached_scalar_pointer() {
         jit.simd_regions.contains(&(0, 0)),
         "hot vectorizable region must be marked as SIMD-promoted"
     );
-    let after = unsafe { jit.get_compiled(0, 0) }
-        .expect("promoted function")
-        as usize;
+    let after = unsafe { jit.get_compiled(0, 0) }.expect("promoted function") as usize;
     assert_ne!(
         before, after,
         "tier-2 must replace the cached tier-1 function pointer"
