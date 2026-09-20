@@ -828,7 +828,7 @@ fn main() {
         // compiler. This is the durable-distribution path — a `.nbc` minted
         // in 2026 runs on any conforming runtime in 2126.
         if path.ends_with(".nbc") {
-            if let Err(e) = run_nbc_file(path, opts.verify_source.as_deref()) {
+            if let Err(e) = run_nbc_file(path, opts.verify_source.as_deref(), opts.store_path.as_deref()) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
@@ -2433,7 +2433,7 @@ fn compile_source_to_nbc(
 /// no compiler invocation or source parse. Pure modules run directly in the VM;
 /// actor/workflow modules use `run_with_runtime` so spawn/send/state semantics
 /// match source execution.
-fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
+fn run_nbc_file(path: &str, verify_source: Option<&str>, store_path: Option<&str>) -> NuResult<()> {
     let bytes = std::fs::read(path).map_err(|e| nulang::types::NuError::VMError {
         msg: format!("cannot read .nbc file '{path}': {e}"),
         span: Span::default(),
@@ -2474,7 +2474,7 @@ fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
     }
 
     let constants = artifact.module.constants.clone();
-    let (value, _runtime) = run_nbc_module(artifact.module)?;
+    let (value, _runtime) = run_nbc_module(artifact.module, store_path)?;
 
     let result_str = if value.is_string() || value.is_ptr() {
         nulang::vm::resolve_value_string(&constants, value)
@@ -2496,14 +2496,35 @@ fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
 /// and scheduler, exactly like the bytecode source path in `run_source`.
 fn run_nbc_module(
     module: nulang::bytecode::CodeModule,
+    store_path: Option<&str>,
 ) -> NuResult<(
     nulang::vm::Value,
     Option<std::rc::Rc<std::cell::RefCell<nulang::runtime::Runtime>>>,
 )> {
     let has_actors = !module.actor_metadata.is_empty() || !module.behaviors.is_empty();
+    let has_durable = module.actor_metadata.iter().any(|meta| {
+        meta.persistent
+            || meta.is_workflow
+            || meta.state_models.iter().any(|(_, model)| {
+                matches!(
+                    model,
+                    nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
+                )
+            })
+    });
+    let store_dir = if has_actors && has_durable {
+        Some(
+            store_path
+                .map(str::to_owned)
+                .or_else(|| std::env::var("NULANG_STORE_PATH").ok())
+                .unwrap_or_else(|| ".nulang/store".to_string()),
+        )
+    } else {
+        None
+    };
 
     if has_actors {
-        let (value, runtime) = run_with_runtime(module, None, None)?;
+        let (value, runtime) = run_with_runtime(module, None, store_dir.as_deref())?;
 
         let failures = runtime.borrow().workflow_failures();
         if !failures.is_empty() {
@@ -2695,7 +2716,7 @@ mod tests {
             .expect("serialized actor module should deserialize");
 
         let (_value, runtime) =
-            run_nbc_module(artifact.module).expect("nbc actor program should run");
+            run_nbc_module(artifact.module, None).expect("nbc actor program should run");
         let runtime = runtime.expect("actor nbc must execute with a real Runtime");
         let rt = runtime.borrow();
         let actor = rt.actors.values().next().expect("one actor should exist");
