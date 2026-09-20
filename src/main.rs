@@ -1082,7 +1082,7 @@ fn print_help() {
     println!("  --lsp            Start Language Server (stdio)");
     println!("  --dap            Start Debug Adapter (stdio; program via launch request)");
     print!("  --backend <b>    Backend: bytecode (default) | core-vm");
-    if cfg!(feature = "native-codegen") {
+    if cfg!(feature = "native-aot") {
         print!(" | native");
     }
     if cfg!(feature = "wasm-backend") {
@@ -1090,7 +1090,7 @@ fn print_help() {
     }
     println!();
     println!("                   core-vm: frozen Core interpreter (Stage 3 bootstrap)");
-    if cfg!(feature = "native-codegen") {
+    if cfg!(feature = "native-aot") {
         println!("                   native: pure-functional subset only (no effects,");
         println!("                   actors, or FFI — errors name the unsupported");
         println!("                   construct; use bytecode for full-language programs)");
@@ -1103,7 +1103,7 @@ fn print_help() {
         println!("                   wasmfx*: suspending effects lower to WasmFX stack");
         println!("                   switching (LLM.ask, Signal.wait, ReceiveWait)");
     }
-    if cfg!(feature = "native-codegen") {
+    if cfg!(feature = "native-aot") {
         println!(
             "  --target <t>     Target ISA for native backend: native (default) | ptx | riscv64"
         );
@@ -1881,7 +1881,7 @@ fn run_source(
             msg: "wasm backend not compiled in (enable 'wasm-backend' feature)".into(),
             span: Span::default(),
         }),
-        #[cfg(feature = "native-codegen")]
+        #[cfg(feature = "native-aot")]
         "native" => {
             let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
             let mir = nulang::mir_lower::lower_module(&hir)?;
@@ -1986,7 +1986,7 @@ fn run_source(
             }
             Ok(())
         }
-        #[cfg(not(feature = "native-codegen"))]
+        #[cfg(not(feature = "native-aot"))]
         "native" => Err(nulang::types::NuError::VMError {
             msg: "native backend not compiled in (enable 'native-codegen' feature)".into(),
             span: Span::default(),
