@@ -45,6 +45,22 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Function performance contracts — 2026-09-20
+- **Effect-backed and MIR-backed performance contracts** (Experimental,
+  `src/ast.rs`, `src/effect_checker.rs`, `src/performance.rs`). Functions
+  may declare `@no_block()`, `@no_suspend()`, and `@no_alloc()`.
+  Blocking/suspension contracts are checked against the transitive effect
+  graph. Allocation freedom is checked after MIR lowering and closure inlining
+  against a conservative transitive summary covering managed-heap creation,
+  allocation-prone runtime operations, and unresolved indirect calls.
+- **Source-directed JIT hotness** (Experimental, `src/mir_codegen.rs`,
+  `src/bytecode.rs`, `src/jit/mod.rs`). `@hot()` is preserved through
+  AST → HIR → MIR → bytecode and lowers the Cranelift tier-up threshold from
+  1000 to 100 interpreted executions only within the annotated function's
+  bytecode range. The range metadata is optional/default-empty in `.nbc`
+  metadata so older artifacts remain readable and execution semantics are
+  unchanged.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
