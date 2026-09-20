@@ -161,7 +161,8 @@ impl ProtocolCompatibility {
 ///
 /// Missing schemas fail closed: callers must not reinterpret an unknown digest
 /// as compatible merely because the behavior name being invoked happens to
-/// exist locally.
+/// exist locally. Digest inequality alone is never treated as evidence of
+/// compatibility; different ids require canonical-schema comparison.
 #[derive(Debug, Clone, Default)]
 pub struct ProtocolRegistry {
     schemas: BTreeMap<ProtocolId, ProtocolSchema>,
