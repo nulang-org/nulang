@@ -5,8 +5,10 @@
 //! distinction explicit lets future contracts choose the guarantee they need:
 //! a managed-heap-free kernel is weaker than a fully allocator-free hot path.
 
+use crate::ast::PerformanceContract;
 use crate::bytecode::Constant;
 use crate::mir::{self, FuncRef, RValue, Stmt};
+use crate::types::{NuError, NuResult, Span};
 
 /// Why executing a MIR function may allocate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -179,6 +181,57 @@ pub fn analyze_function_allocations(module: &mir::Module) -> Vec<AllocationSumma
     }
 
     summaries
+}
+
+
+fn allocation_risk_label(risk: AllocationRisk) -> &'static str {
+    match risk {
+        AllocationRisk::ManagedHeap => "managed heap allocation",
+        AllocationRisk::Runtime => "allocation-prone runtime operation",
+        AllocationRisk::UnknownCall => "unknown indirect call",
+    }
+}
+
+/// Validate MIR-backed performance contracts after lowering and MIR
+/// optimization/inlining.
+///
+/// `@no_alloc()` is intentionally stricter than "no obvious heap literal":
+/// the entire transitive direct-call graph must be free of managed-heap
+/// allocation, allocation-prone runtime operations, and unknown indirect
+/// calls. That makes the contract a usable latency guarantee instead of an
+/// optimizer hint.
+pub fn validate_performance_contracts(module: &mir::Module) -> NuResult<()> {
+    let summaries = analyze_function_allocations(module);
+
+    for (function, summary) in module.functions.iter().zip(summaries.iter()) {
+        if !function
+            .performance_contracts
+            .contains(&PerformanceContract::NoAlloc)
+        {
+            continue;
+        }
+
+        if let Some(risk) = summary.transitive.first().copied() {
+            let all_risks = summary
+                .transitive
+                .iter()
+                .copied()
+                .map(allocation_risk_label)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(NuError::VMError {
+                msg: format!(
+                    "function '{}' violates @no_alloc(): {} detected in its optimized transitive MIR ({})",
+                    function.name,
+                    allocation_risk_label(risk),
+                    all_risks
+                ),
+                span: Span::default(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
