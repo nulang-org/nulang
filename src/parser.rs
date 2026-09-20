@@ -727,6 +727,16 @@ impl Parser {
         self.skip_newlines();
         let public = self.consume_if(&TokenKind::Pub);
         self.skip_newlines();
+        if annotations
+            .iter()
+            .any(|a| matches!(a, crate::ast::FunctionAnnotation::NoAlloc))
+            && !matches!(self.peek_kind(), TokenKind::Fn)
+        {
+            return Err(NuError::parse_error(
+                "@noalloc may only annotate a function declaration".to_string(),
+                self.current_span(),
+            ));
+        }
         match self.peek_kind() {
             TokenKind::Fn => self.parse_function(public, annotations),
             TokenKind::Actor
