@@ -45,6 +45,9 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Direct JIT register-file execution — 2026-09-20
+- **Non-reentrant Cranelift regions now execute directly against the VM frame's 256 tagged-word registers** (`src/vm.rs`, `src/jit/mod.rs`, `src/backends/mod.rs`). `Value` has an explicit transparent one-`u64` representation, and pure compiled regions use a raw register pointer instead of copying 256 values into a temporary array before native entry and back afterward. Regions containing direct Nulang calls retain snapshot isolation because a re-entrant call may grow the VM frame vector. The public `JitBackend` contract remains source-compatible: alternative backends inherit a default copy-based adapter unless they opt into the direct-register hook.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor

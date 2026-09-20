@@ -105,6 +105,11 @@ pub struct JitSession {
     /// Regions compiled through the type-directed (guard-stripped) path in
     /// `typed_compiler`, i.e. where inferred register types were available.
     typed_regions: FxHashSet<(usize, usize)>,
+    /// Compiled regions that can re-enter the VM through a native direct
+    /// Nulang call. These must execute against a register snapshot because a
+    /// re-entrant call can grow/reallocate the VM frame Vec and invalidate a
+    /// raw pointer into the caller frame.
+    reentrant_regions: FxHashSet<(usize, usize)>,
     /// Per-module "may suspend" vectors (indexed by function-table index),
     /// computed lazily from each module's bytecode: true if the function
     /// transitively performs an effect that can suspend (or calls one).
@@ -164,6 +169,7 @@ impl JitSession {
             hot_counts: Vec::new(),
             last_compiled_probe: None,
             typed_regions: FxHashSet::default(),
+            reentrant_regions: FxHashSet::default(),
             may_suspend: FxHashMap::default(),
             recursive: FxHashMap::default(),
             builder_context: FunctionBuilderContext::new(),
@@ -317,6 +323,11 @@ impl JitSession {
             Ok(ptr) => {
                 self.compiled
                     .insert((module_idx, start_offset), (ptr, num_instrs));
+                if native_calls.is_empty() {
+                    self.reentrant_regions.remove(&(module_idx, start_offset));
+                } else {
+                    self.reentrant_regions.insert((module_idx, start_offset));
+                }
                 Some(std::mem::transmute(ptr))
             }
             Err(_) => None,
@@ -1103,4 +1114,87 @@ impl crate::backends::JitBackend for JitSession {
 
         crate::backends::TieredAction::Interpret
     }
+
+    unsafe fn tiered_execute_value_regs(
+        &mut self,
+        module_idx: usize,
+        pc: usize,
+        module: &crate::bytecode::CodeModule,
+        regs: *mut crate::vm::Value,
+        constants: &[u64],
+    ) -> crate::backends::TieredAction {
+        // Value is #[repr(transparent)] over one u64 tagged word. Pure regions
+        // can therefore execute directly on the caller frame. Regions that can
+        // re-enter Nulang keep the legacy snapshot isolation because a nested
+        // call may reallocate VM::frames and invalidate `regs`.
+        let raw_regs = regs.cast::<u64>();
+        let instructions = &module.instructions;
+
+        if let Some(func) = unsafe { self.get_compiled(module_idx, pc) } {
+            if self.reentrant_regions.contains(&(module_idx, pc)) {
+                let mut snapshot = [0u64; 256];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(raw_regs, snapshot.as_mut_ptr(), 256);
+                }
+                func(snapshot.as_mut_ptr(), constants.as_ptr());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(snapshot.as_ptr(), raw_regs, 256);
+                }
+            } else {
+                func(raw_regs, constants.as_ptr());
+            }
+            self.record_tier2_and_maybe_promote(module_idx, pc, instructions);
+            return crate::backends::TieredAction::RanJit;
+        }
+
+        if self.record_and_check_hot(module_idx, pc) {
+            let ms = self.may_suspend_for(module_idx, module).to_vec();
+            let rc = self.recursive_for(module_idx, module).to_vec();
+            let (region_len, native_calls) =
+                find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
+            if region_len >= 3 {
+                let meta = typed_compiler::infer_reg_types(module, pc);
+                let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
+                if let Some(func) = unsafe {
+                    self.compile_region_typed(
+                        module_idx,
+                        pc,
+                        region_len,
+                        instructions,
+                        meta_ref,
+                        &native_calls,
+                    )
+                } {
+                    if native_calls.is_empty() {
+                        func(raw_regs, constants.as_ptr());
+                    } else {
+                        let mut snapshot = [0u64; 256];
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                raw_regs,
+                                snapshot.as_mut_ptr(),
+                                256,
+                            );
+                        }
+                        func(snapshot.as_mut_ptr(), constants.as_ptr());
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                snapshot.as_ptr(),
+                                raw_regs,
+                                256,
+                            );
+                        }
+                    }
+                    return crate::backends::TieredAction::RanJit;
+                }
+            }
+
+            if module_idx < self.hot_counts.len() && pc < self.hot_counts[module_idx].len() {
+                self.hot_counts[module_idx][pc] = 0;
+            }
+        }
+
+        crate::backends::TieredAction::Interpret
+    }
+
 }

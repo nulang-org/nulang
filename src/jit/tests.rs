@@ -14,6 +14,42 @@ fn test_jit_session_creation() {
 }
 
 #[test]
+fn test_reentrant_regions_keep_snapshot_isolation() {
+    use std::collections::HashMap;
+
+    let mut pure_jit = make_jit();
+    let pure = vec![
+        Instruction::new3(OpCode::IAdd, 0, 1, 2),
+        Instruction::new3(OpCode::ISub, 2, 1, 3),
+        Instruction::new3(OpCode::IMul, 3, 1, 4),
+    ];
+    let pure_ptr = unsafe {
+        pure_jit.compile_region(0, 0, pure.len(), &pure, &HashMap::new())
+    };
+    assert!(pure_ptr.is_some(), "pure region should compile");
+    assert!(
+        !pure_jit.reentrant_regions.contains(&(0, 0)),
+        "pure region must be eligible for direct frame-register execution"
+    );
+
+    let mut call_jit = make_jit();
+    let call_region = vec![
+        Instruction::new1(OpCode::Const0, 0),
+        Instruction::new3(OpCode::Call, 0, 0, 1),
+        Instruction::new3(OpCode::IAdd, 1, 0, 2),
+    ];
+    let native_calls = HashMap::from([(1usize, 0usize)]);
+    let call_ptr = unsafe {
+        call_jit.compile_region(0, 0, call_region.len(), &call_region, &native_calls)
+    };
+    assert!(call_ptr.is_some(), "direct-call region should compile");
+    assert!(
+        call_jit.reentrant_regions.contains(&(0, 0)),
+        "direct-call region must retain register snapshot isolation"
+    );
+}
+
+#[test]
 fn test_hot_counter() {
     let mut jit = make_jit();
     assert!(!jit.record_and_check_hot(0, 0));

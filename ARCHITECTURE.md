@@ -388,9 +388,12 @@ fallback when selective receive (`ReceiveMatch` 0x8F, shipped — see
 `lower_receive` in `src/mir_lower.rs`) finds no matching arm;
 `FOpen`/`FRead`/`FWrite`/`FClose` are stubs.
 
-**JIT tiering** (`src/jit/`): the VM keeps an optional `JitSession`. Before
-each instruction it snapshots the frame registers into a `[u64; 256]` and
-calls `jit::tiered_execute_step_typed`:
+**JIT tiering** (`src/jit/`): the VM keeps an optional `JitSession`. Each
+interpreted instruction pays only the hotness/compiled-region probe. When a non-reentrant region executes natively, the built-in Cranelift backend
+receives a raw pointer to the frame's transparent one-`u64` `Value` register
+file, avoiding a 256-register copy on entry and another on exit. Regions that
+contain direct Nulang calls retain snapshot isolation because nested calls can
+grow the VM frame vector:
 
 1. If a compiled function exists for `(module, pc)`, run it — its ABI is
    `extern "C" fn(*mut u64 regs, *const u64 constants)`.
