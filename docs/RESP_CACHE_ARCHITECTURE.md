@@ -257,12 +257,43 @@ until the controller reconciles it. Probe request ids use the same bounded
 retry/correlation and target replay machinery as remote command and transfer
 ids.
 
-This convergence report is intentionally **not restart proof**. Import fences,
-conflict counters, and source-controller ACK history are currently in memory.
-A controller or target process restart can therefore erase evidence needed to
-reconstruct why a source is empty. Automated commit after restart must wait for
-a persisted migration journal/checkpoint that records intent, exported batch
-identity, accepted ACKs, and reconciliation state.
+The source controller can optionally persist migration proof in
+`CacheMigrationJournal`. The journal records the migration's started epoch and
+physical source/target identity, then fsyncs the exact TransferBatch envelope
+before it may enter NUL0. A matching application TransferAck is fsynced before
+any generation-fenced source deletion. Source live-entry counts and convergence
+observations are journaled as progress evidence. Recovery can therefore resend
+the exact prior batch—with the same transfer id, source generation tokens, TTL
+snapshot, and transport epoch—instead of guessing by re-exporting a changed
+source.
+
+Journal records use a small versioned binary format with per-record BLAKE3
+checksums. Complete checksum failures are corruption and fail closed. A
+crash-truncated final record is discarded back to the last valid boundary
+before new appends continue. Transfer ids cannot be rebound to different
+requests or ACKs, an ACK cannot precede its durable send record, and old
+persisted convergence does not authorize commit after controller recovery: a
+new probe id and fresh exact-epoch target observation are required.
+
+The ownership commit path itself now consumes this proof. On the source node,
+`install_placement` detects a remote migration being committed, requires a
+current `CacheRemoteMigrationConvergence` for the exact migration and current
+placement epoch, and rejects the publication when that proof is absent or not
+ready. With journaling enabled, commit intent is fsynced before publishing the
+new owner and completion is fsynced afterward. If publication fails, an abort
+record is appended. If the process fails after publication but before the
+completion append, replay exposes a pending commit epoch: the outcome is
+explicitly ambiguous and must be reconciled rather than assumed.
+
+This makes **controller recovery** durable, but deliberately does not pretend
+that an ephemeral CacheStore can survive a cache-service process restart. Each
+service build generates a random source-data incarnation and every migration
+intent is bound to it. Reopening an old journal from a different incarnation
+fails closed. Likewise, a restarted target loses its import-fence state; a
+fresh convergence probe then reports fewer fences than the source journal
+expects and durable convergence fails. Full cache-process restart recovery
+therefore requires a durable CacheStore/target-import-state mode in addition to
+this controller journal.
 
 The same cluster layer serves topology discovery without touching CacheStore:
 `CLUSTER KEYSLOT` uses the exact router hash, `CLUSTER SHARDS` is the primary
@@ -329,11 +360,10 @@ must be measured separately from steady-state command execution.
 
 ## Next implementation sequence
 
-1. Persist in-flight migration intent, exported batch identity, accepted ACKs,
-   source drain state, and target reconciliation state so controller/target
-   restart can safely resume or refuse commit.
-2. Add restart recovery that reconstructs the migration controller from that
-   journal and re-probes both sides before any ownership publication.
+1. Add an explicit durable CacheStore mode (WAL/snapshot plus target import-fence
+   restoration) before supporting full cache-process restart during migration.
+2. Reconcile journaled pending commit intents against durable placement/control
+   state after a process restart; never infer the outcome from an empty source.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 4. Allow topology publication to add/remove advertised remote endpoints without
