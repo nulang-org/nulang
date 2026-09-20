@@ -3262,12 +3262,7 @@ impl CacheShardServer {
                     .map_err(CacheSnapshotError::Io)
                     .and_then(|wall_anchor| {
                         let snapshot_now_ms = self.clock.now_ms();
-                        write_cache_snapshot_at(
-                            path,
-                            &self.store,
-                            snapshot_now_ms,
-                            wall_anchor,
-                        )
+                        write_cache_snapshot_at(path, &self.store, snapshot_now_ms, wall_anchor)
                     });
                 let _ = reply.send(result);
             }
