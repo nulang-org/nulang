@@ -45,6 +45,14 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Actor protocol rolling-upgrade compatibility — 2026-09-20
+- **Directional structural compatibility** (Experimental, `src/protocol.rs`).
+  A receiver is compatible with an existing client when it preserves every
+  required behavior with the exact same parameter and response contracts;
+  additive receiver behaviors are allowed. Removing a required behavior or
+  changing an existing signature is incompatible. V1 intentionally avoids
+  implicit field/default/variance rules.
+
 ### Typed actor protocol checking — 2026-09-20
 - **Static protocol validation for known actor references** (Experimental,
   `src/actor_protocol.rs`, RFC 0023). Actor `send`/`ask` calls whose receiver
