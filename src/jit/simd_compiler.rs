@@ -327,18 +327,15 @@ pub fn compile_simd_region(
 
     // Validate all array operands through the runtime before touching heap
     // memory directly. u64::MAX is the helper's invalid/non-array sentinel.
-    let lhs_len_call = builder.ins().call(
-        helpers[&RuntimeHelper::SimdArrayLen],
-        &[lhs_base_tagged],
-    );
-    let rhs_len_call = builder.ins().call(
-        helpers[&RuntimeHelper::SimdArrayLen],
-        &[rhs_base_tagged],
-    );
-    let dst_len_call = builder.ins().call(
-        helpers[&RuntimeHelper::SimdArrayLen],
-        &[dst_base_tagged],
-    );
+    let lhs_len_call = builder
+        .ins()
+        .call(helpers[&RuntimeHelper::SimdArrayLen], &[lhs_base_tagged]);
+    let rhs_len_call = builder
+        .ins()
+        .call(helpers[&RuntimeHelper::SimdArrayLen], &[rhs_base_tagged]);
+    let dst_len_call = builder
+        .ins()
+        .call(helpers[&RuntimeHelper::SimdArrayLen], &[dst_base_tagged]);
     let lhs_len = builder.inst_results(lhs_len_call)[0];
     let rhs_len = builder.inst_results(rhs_len_call)[0];
     let dst_len = builder.inst_results(dst_len_call)[0];
@@ -368,15 +365,9 @@ pub fn compile_simd_region(
     // deopt before side effects and let the original bounds-checked bytecode
     // execute once in the interpreter.
     let invalid_len = builder.ins().iconst(types::I64, -1);
-    let lhs_valid = builder
-        .ins()
-        .icmp(IntCC::NotEqual, lhs_len, invalid_len);
-    let rhs_valid = builder
-        .ins()
-        .icmp(IntCC::NotEqual, rhs_len, invalid_len);
-    let dst_valid = builder
-        .ins()
-        .icmp(IntCC::NotEqual, dst_len, invalid_len);
+    let lhs_valid = builder.ins().icmp(IntCC::NotEqual, lhs_len, invalid_len);
+    let rhs_valid = builder.ins().icmp(IntCC::NotEqual, rhs_len, invalid_len);
+    let dst_valid = builder.ins().icmp(IntCC::NotEqual, dst_len, invalid_len);
     let lhs_cover = builder
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, lhs_len, trip_count);
@@ -391,13 +382,9 @@ pub fn compile_simd_region(
     let full_coverage = builder.ins().band(lhs_cover, rhs_cover);
     let full_coverage = builder.ins().band(full_coverage, dst_cover);
     let safe_to_vectorize = builder.ins().band(valid_inputs, full_coverage);
-    builder.ins().brif(
-        safe_to_vectorize,
-        validated_entry,
-        &[],
-        deopt_block,
-        &[],
-    );
+    builder
+        .ins()
+        .brif(safe_to_vectorize, validated_entry, &[], deopt_block, &[]);
 
     builder.switch_to_block(deopt_block);
     let restart = builder.ins().iconst(types::I64, 0);
