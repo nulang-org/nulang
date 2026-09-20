@@ -83,6 +83,42 @@ mod tests {
     }
 
     #[test]
+    fn live_bytecode_actor_exposes_compiler_protocol_id() {
+        let module = compile(
+            r#"
+            actor Account {
+                behavior balance() -> Int { 0 }
+            }
+            "#,
+        );
+        let expected = module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Account")
+            .and_then(|meta| meta.protocol_id)
+            .expect("compiled protocol id");
+        let behavior_idx = module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Account")
+            .and_then(|meta| meta.behavior_indices.first())
+            .copied()
+            .expect("behavior index");
+
+        let mut runtime = Runtime::new();
+        let actor_id = runtime
+            .spawn_from_module(&module, behavior_idx, vec![])
+            .as_actor_id()
+            .expect("actor ref");
+
+        assert_eq!(
+            runtime.actor_protocol_id(actor_id),
+            Some(ProtocolId::from_bytes(expected))
+        );
+        assert_eq!(runtime.actors.get(&actor_id).unwrap().name, "Account");
+    }
+
+    #[test]
     fn synthetic_runtime_name_fails_closed() {
         let module = compile(
             r#"
