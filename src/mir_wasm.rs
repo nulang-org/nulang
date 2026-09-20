@@ -257,6 +257,7 @@ impl WasmBackend {
     // ── Compile ───────────────────────────────────────────────────
 
     pub fn compile(&mut self, mir: &mir::Module, _module_name: &str) -> NuResult<Vec<u8>> {
+        crate::cost_model::prove_noalloc_contracts(mir)?;
         self.foreign_functions = mir.foreign_functions.clone();
         // Pre-scan: build the module-wide record field name → slot index map
         // (mirrors the AOT backend) so Record literals and LoadFieldNamed agree.

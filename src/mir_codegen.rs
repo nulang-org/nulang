@@ -294,6 +294,23 @@ impl MirCodegen {
         // treat main as the entry point (matching the legacy compiler).
         let effective_main = main_idx.or(user_main_idx);
 
+        // Enforce source-level @noalloc only after optimization and bytecode
+        // emission, so the contract is checked against the code that will
+        // actually execute. Direct calls are validated transitively by the
+        // cost model; unresolved indirect calls and allocation-capable runtime
+        // boundaries fail closed.
+        if let Err(violations) = crate::cost_model::validate_noalloc_contracts(mir, &self.module) {
+            let details = violations
+                .iter()
+                .map(|v| format!("@noalloc fn '{}': {}", v.function, v.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(compile_err(
+                format!("noalloc contract violation: {}", details),
+                Span::default(),
+            ));
+        }
+
         // Actor behaviors compile through the exact same machinery as
         // ordinary functions, but land in CodeModule.behaviors instead of
         // function_table — Spawn/Send/Ask reference them by index there,
@@ -2948,6 +2965,7 @@ mod tests {
                 effect: crate::types::EffectRow::empty(),
                 cap: crate::types::Capability::Ref,
                 placement: None,
+                no_alloc: false,
                 body: {
                     let mut b = crate::hir::Body::new();
                     b.push(crate::hir::Stmt::Let {
@@ -2992,6 +3010,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            no_alloc: false,
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
@@ -3023,6 +3042,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            no_alloc: false,
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
@@ -3267,6 +3287,74 @@ mod optimize_tests {
 
     fn has_opcode(module: &CodeModule, op: OpCode) -> bool {
         module.instructions.iter().any(|i| i.opcode == op)
+    }
+
+    #[test]
+    fn test_noalloc_pure_function_compiles() {
+        let source = r#"
+@noalloc
+fn add(a: Int, b: Int) -> Int { a + b }
+
+fn main() -> Int { add(20, 22) }
+"#;
+        let module = compile_source(source).expect("pure @noalloc function should compile");
+        assert!(
+            module.debug_functions.iter().any(|f| f.name == "add"),
+            "expected add in compiled module"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_direct_heap_allocation() {
+        let source = r#"
+@noalloc
+fn make() { [1, 2, 3] }
+
+fn main() -> Int { 0 }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc function with an array allocation must fail")
+            .to_string();
+        assert!(
+            err.contains("noalloc contract violation") && err.contains("ArrAlloc"),
+            "unexpected @noalloc diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_transitive_allocating_callee() {
+        let source = r#"
+fn make() { [1, 2] }
+
+@noalloc
+fn wrapper() { make() }
+
+fn main() -> Int { 0 }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc must be transitive across direct calls")
+            .to_string();
+        assert!(
+            err.contains("wrapper") && err.contains("make"),
+            "unexpected transitive @noalloc diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_indirect_call_target() {
+        let source = r#"
+@noalloc
+fn apply(f, x) { f(x) }
+
+fn main() -> Int { 0 }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc must fail closed for indirect calls")
+            .to_string();
+        assert!(
+            err.contains("indirect/closure call target cannot be proven allocation-free"),
+            "unexpected indirect-call @noalloc diagnostic: {err}"
+        );
     }
 
     #[test]

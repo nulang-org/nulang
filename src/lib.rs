@@ -28,6 +28,7 @@ pub mod cir_analysis;
 pub mod cir_lower;
 pub mod content_identity;
 pub mod core_vm;
+pub mod cost_model;
 #[cfg(feature = "native-codegen")]
 pub mod cranelift_utils;
 pub mod dap;

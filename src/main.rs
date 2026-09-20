@@ -10,6 +10,7 @@
 //!   nulang agent <init|run|chat|goals|graph>
 //!   nulang nula <new|build|build-wasm|test|run|add|remove|publish|deploy|watch|doc>
 //!   nulang fmt [--check] [<file>]
+//!   nulang costs <FILE> [--json] [--deny-allocations]
 //!
 //! Options:
 //!   -r, --repl               Start interactive REPL
@@ -261,6 +262,16 @@ fn main() {
 
     if args[1] == "nula" {
         if let Err(e) = nulang::package::commands::run(&args[2..]) {
+            print_error(&e, true);
+            std::process::exit(exit_code(&e));
+        }
+        return;
+    }
+
+    // Static mechanical-cost inspection over compiled bytecode. This keeps
+    // cost analysis out of normal execution and makes it usable as a CI gate.
+    if args[1] == "costs" {
+        if let Err(e) = run_costs_cmd(&args[2..]) {
             print_error(&e, true);
             std::process::exit(exit_code(&e));
         }
@@ -1070,6 +1081,7 @@ fn print_help() {
     println!("       nulang --lsp");
     println!("       nulang --dap");
     println!("       nulang fmt [--check] [<file>]");
+    println!("       nulang costs <FILE> [--json] [--deny-allocations]");
     println!("       nulang node --listen <ADDR> [--seed <ADDR>] [--expected-nodes <N>]");
     println!("       nulang --doc");
     println!();
@@ -1128,6 +1140,10 @@ fn print_help() {
     println!("  --deny-warnings  Treat warnings (e.g. RFC 0015 deprecations) as errors");
     println!("  --bench [N]      Benchmark: run N times (default 10), print timing stats");
     println!("  fmt [--check] [<file>]  Format file(s); no file → all src/**/*.nula");
+    println!("  costs <FILE> [--json] [--deny-allocations]");
+    println!(
+        "                   Show static bytecode cost sites; optionally fail CI on allocations"
+    );
     println!("  -v, --verbose    Show bytecode and AST");
     println!("  --metrics-port <N>  Start Prometheus metrics server on port N");
     println!("  --emit-signals <file> Emit signal graph JSON for the web framework");
@@ -1205,6 +1221,74 @@ fn emit_stdlib_docs(dir: &str) -> Result<(), String> {
         file.write_all(page.as_bytes())
             .map_err(|e| format!("Cannot write '{}': {}", filename.display(), e))?;
     }
+    Ok(())
+}
+
+/// Compile a source file and report structural bytecode costs.
+///
+/// This is deliberately static: counts are bytecode sites, not dynamic event
+/// counts. A single allocation inside a loop is reported once, while runtime
+/// profiling remains responsible for telling users how frequently it executes.
+fn run_costs_cmd(args: &[String]) -> NuResult<()> {
+    let mut file: Option<&str> = None;
+    let mut json = false;
+    let mut deny_allocations = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--deny-allocations" => deny_allocations = true,
+            flag if flag.starts_with('-') => {
+                return Err(NuError::VMError {
+                    msg: format!("unknown costs option '{}'", flag),
+                    span: Span::default(),
+                });
+            }
+            path if file.is_none() => file = Some(path),
+            other => {
+                return Err(NuError::VMError {
+                    msg: format!("unexpected costs argument '{}'", other),
+                    span: Span::default(),
+                });
+            }
+        }
+    }
+
+    let file = file.ok_or_else(|| NuError::VMError {
+        msg: "usage: nulang costs <FILE> [--json] [--deny-allocations]".into(),
+        span: Span::default(),
+    })?;
+    let source = std::fs::read_to_string(file).map_err(|e| NuError::VMError {
+        msg: format!("cannot read '{}': {}", file, e),
+        span: Span::default(),
+    })?;
+
+    let (ast, type_checker) = run_frontend(&source, Some(file), false, &[], false)?;
+    let module = compile_with_new_pipeline(&ast, "costs", &type_checker)?;
+    let report = nulang::cost_model::analyze_module(&module);
+
+    if json {
+        let rendered = serde_json::to_string_pretty(&report).map_err(|e| NuError::VMError {
+            msg: format!("failed to serialize cost report: {}", e),
+            span: Span::default(),
+        })?;
+        println!("{}", rendered);
+    } else {
+        print!("{}", report.render_text());
+    }
+
+    if deny_allocations && !report.is_allocation_free() {
+        return Err(NuError::VMError {
+            msg: format!(
+                "mechanical-cost gate failed: {} allocation site(s) detected ({} heap, {} string materialization)",
+                report.total.allocation_sites,
+                report.total.heap_allocation_sites,
+                report.total.string_materialization_sites,
+            ),
+            span: Span::default(),
+        });
+    }
+
     Ok(())
 }
 
