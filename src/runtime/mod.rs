@@ -2849,7 +2849,7 @@ impl Runtime {
         if let Some(actor) = self.actors.get_mut(&dlq_id) {
             let _ = actor.mailbox.push_local(Message {
                 behavior_id: 0,
-                payload: Arc::new(vec![Value::int(1)]),
+                payload: mailbox::MessagePayload::from_slice(&[Value::int(1)]),
                 sender: 0, // DLQ system message has no sender
                 priority: MessagePriority::System,
                 trace_id: None,
