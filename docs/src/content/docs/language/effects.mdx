@@ -101,8 +101,10 @@ are:
 | `StrBuilder` | `new`, `push`, `to_string`, `len`, `reset` | Efficient string building |
 | `FS` | `read`, `write`, `append`, `exists` | File-system access |
 | `Env` | `get` | Environment variables |
-| `Process` | `run` | Shell command execution |
+| `Process` | `run` | Trusted/standalone shell command execution |
 | `Debug` | `inspect` | Labeled value inspection |
+
+> `Process.run` is intentionally not dispatched by actor-backed production runtimes. The standalone VM implementation uses `/bin/sh -c`, which inherits host OS authority and is therefore unsuitable for untrusted actor execution until a separate isolated process sandbox with explicit resource and filesystem/network policy exists.
 | `Test` | `assert`, `assert_eq`, `assert_true` | Test assertions |
 | `Random` | `int` | Random numbers |
 | `Time` | `now` | Wall-clock time |
