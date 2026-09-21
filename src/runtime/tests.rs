@@ -2319,11 +2319,15 @@ fn test_recover_actor_migrates_snapshot_and_historical_events_without_rewriting_
     assert_eq!(committed.state.get("bonus"), Some(&PersistedValue::Int(15)));
 
     let journal = rt.persistence.read_events(actor_id);
-    assert_eq!(
-        journal,
-        vec![historical],
-        "RFC 0008 migration must never rewrite historical event rows"
-    );
+    assert_eq!(journal.len(), 1, "historical event count must remain unchanged");
+    let persisted = &journal[0];
+    assert_eq!(persisted.sequence, historical.sequence);
+    assert_eq!(persisted.schema_owner, historical.schema_owner);
+    assert_eq!(persisted.schema_version, historical.schema_version);
+    assert_eq!(persisted.field_name, historical.field_name);
+    assert_eq!(persisted.event_name, historical.event_name);
+    assert_eq!(persisted.args, historical.args);
+    assert_eq!(persisted.value, historical.value);
 }
 
 #[test]
