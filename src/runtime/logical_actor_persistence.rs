@@ -48,6 +48,10 @@ pub enum LogicalActorCommitError {
         current: u64,
         attempted: u64,
     },
+    ConflictingJournalSequence {
+        grain_id: GrainId,
+        sequence: u64,
+    },
 }
 
 impl fmt::Display for LogicalActorCommitError {
@@ -75,6 +79,15 @@ impl fmt::Display for LogicalActorCommitError {
                 grain_id.actor_name(),
                 attempted,
                 current
+            ),
+            LogicalActorCommitError::ConflictingJournalSequence {
+                grain_id,
+                sequence,
+            } => write!(
+                f,
+                "conflicting journal payload for {} at committed sequence {}",
+                grain_id.actor_name(),
+                sequence
             ),
         }
     }
@@ -192,10 +205,17 @@ impl FencedLogicalActorStore {
         entry: JournalEntry,
     ) -> Result<(), LogicalActorCommitError> {
         self.authorize(stamp)?;
-        self.journals
-            .entry(stamp.grain_id.clone())
-            .or_default()
-            .push(entry);
+        let journal = self.journals.entry(stamp.grain_id.clone()).or_default();
+        if let Some(existing) = journal.iter().find(|existing| existing.sequence == entry.sequence) {
+            if existing.behavior_id == entry.behavior_id && existing.payload == entry.payload {
+                return Ok(());
+            }
+            return Err(LogicalActorCommitError::ConflictingJournalSequence {
+                grain_id: stamp.grain_id.clone(),
+                sequence: entry.sequence,
+            });
+        }
+        journal.push(entry);
         Ok(())
     }
 
@@ -376,6 +396,33 @@ mod tests {
         assert_eq!(
             store.load_snapshot(&second).unwrap().state.get("value"),
             Some(&PersistedValue::Int(22))
+        );
+    }
+
+    #[test]
+    fn journal_replay_is_idempotent_but_conflicting_sequence_fails_closed() {
+        let mut store = FencedLogicalActorStore::new();
+        let grain = GrainId::new("Account", "journal-idempotence");
+        store
+            .grant_ownership(grain.clone(), NodeId(1), handle(1), epoch(1))
+            .unwrap();
+        let stamp = LogicalActorCommitStamp::new(grain.clone(), NodeId(1), epoch(1));
+
+        store.append_journal(&stamp, journal(1)).unwrap();
+        store.append_journal(&stamp, journal(1)).unwrap();
+        assert_eq!(store.read_journal(&grain).len(), 1);
+
+        let conflicting = JournalEntry {
+            sequence: 1,
+            behavior_id: 7,
+            payload: vec![PersistedValue::Int(999)],
+        };
+        assert_eq!(
+            store.append_journal(&stamp, conflicting),
+            Err(LogicalActorCommitError::ConflictingJournalSequence {
+                grain_id: grain,
+                sequence: 1,
+            })
         );
     }
 
