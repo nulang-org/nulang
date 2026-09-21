@@ -1940,7 +1940,6 @@ fn test_memory_store_latest_sequence() {
         actor_id: 1,
         sequence: 5,
         semantic_id: None,
-
         artifact_id: None,
         state: HashMap::new(),
         waiting_signal: None,
@@ -1972,7 +1971,6 @@ fn test_libsql_store_save_load_snapshot() {
         actor_id: 1,
         sequence: 3,
         semantic_id: None,
-
         artifact_id: None,
         state,
         waiting_signal: None,
@@ -2029,7 +2027,6 @@ fn test_libsql_store_latest_sequence() {
             actor_id: 1,
             sequence: 5,
             semantic_id: None,
-
             artifact_id: None,
             state: HashMap::new(),
             waiting_signal: None,
@@ -2060,7 +2057,6 @@ fn test_libsql_store_clear() {
             actor_id: 1,
             sequence: 1,
             semantic_id: None,
-
             artifact_id: None,
             state: HashMap::new(),
             waiting_signal: None,
@@ -2099,7 +2095,6 @@ fn test_libsql_store_persists_to_disk() {
                 actor_id: 1,
                 sequence: 1,
                 semantic_id: None,
-
                 artifact_id: None,
                 state,
                 waiting_signal: None,
@@ -2142,7 +2137,6 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             actor_id: 1,
             sequence: 3,
             semantic_id: None,
-
             artifact_id: None,
             state: HashMap::new(),
             waiting_signal: None,
@@ -2164,7 +2158,6 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             actor_id: 1,
             sequence: 4,
             semantic_id: None,
-
             artifact_id: None,
             state: HashMap::new(),
             waiting_signal: None,
@@ -2210,7 +2203,6 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
                 actor_id: 1,
                 sequence: 3,
                 semantic_id: None,
-
                 artifact_id: None,
                 state: HashMap::new(),
                 waiting_signal: None,
@@ -4110,7 +4102,6 @@ fn test_actor_migration_between_two_nodes() {
             actor_id,
             sequence: actor.sequence,
             semantic_id: None,
-
             artifact_id: None,
             state,
             waiting_signal: actor.waiting_signal.clone(),
