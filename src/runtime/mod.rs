@@ -5700,39 +5700,62 @@ impl Runtime {
         actor_id: u64,
         module: &crate::bytecode::CodeModule,
         snapshot: &ActorSnapshot,
-        is_workflow: bool,
-        is_agent: bool,
+        definition_index: Option<usize>,
+        fallback_is_workflow: bool,
+        fallback_is_agent: bool,
     ) -> Result<Actor, crate::authority_runtime::RuntimeAuthorityError> {
         let authority_manifest =
             crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)?;
-        let offsets: Vec<usize> = crate::runtime::spawn::bytecode_offsets_for(module, is_workflow);
-        let compensation_offsets: Vec<Option<usize>> = if is_workflow {
-            module
-                .actor_metadata
-                .iter()
-                .find(|m| m.is_workflow)
+        let selected_meta = definition_index.and_then(|index| module.actor_metadata.get(index));
+        let is_workflow = selected_meta
+            .map(|meta| meta.is_workflow)
+            .unwrap_or(fallback_is_workflow);
+        let is_agent = selected_meta
+            .map(|meta| meta.is_agent)
+            .unwrap_or(fallback_is_agent);
+        let offsets: Vec<usize> = if is_workflow {
+            selected_meta
+                .or_else(|| module.actor_metadata.iter().find(|meta| meta.is_workflow))
                 .map(|meta| {
                     meta.behavior_indices
                         .iter()
-                        .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
+                        .filter_map(|&index| module.behaviors.get(index))
+                        .map(|behavior| behavior.code_offset)
+                        .collect()
+                })
+                .unwrap_or_else(|| module.behaviors.iter().map(|b| b.code_offset).collect())
+        } else {
+            module.behaviors.iter().map(|b| b.code_offset).collect()
+        };
+        let compensation_offsets: Vec<Option<usize>> = if is_workflow {
+            selected_meta
+                .or_else(|| module.actor_metadata.iter().find(|meta| meta.is_workflow))
+                .map(|meta| {
+                    meta.behavior_indices
+                        .iter()
+                        .filter_map(|&index| module.behaviors.get(index))
+                        .map(|behavior| behavior.compensate_offset)
                         .collect()
                 })
                 .unwrap_or_else(|| {
                     module
                         .behaviors
                         .iter()
-                        .map(|b| b.compensate_offset.map(|o| o as usize))
+                        .map(|behavior| behavior.compensate_offset)
                         .collect()
                 })
         } else {
             module
                 .behaviors
                 .iter()
-                .map(|b| b.compensate_offset.map(|o| o as usize))
+                .map(|behavior| behavior.compensate_offset)
                 .collect()
         };
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        let actor_name = selected_meta
+            .map(|meta| meta.name.clone())
+            .unwrap_or_else(|| format!("actor_{}", actor_id));
+        let mut actor = Actor::new(actor_id, actor_name, 0);
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
@@ -5744,12 +5767,19 @@ impl Runtime {
         actor.compensation_offsets = compensation_offsets;
 
         // Restore per-field state-model tracking.
-        actor.state_models = module
-            .actor_metadata
-            .iter()
-            .flat_map(|m| &m.state_models)
-            .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
-            .collect();
+        actor.state_models = if let Some(meta) = selected_meta {
+            meta.state_models
+                .iter()
+                .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+                .collect()
+        } else {
+            module
+                .actor_metadata
+                .iter()
+                .flat_map(|meta| &meta.state_models)
+                .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+                .collect()
+        };
 
         // Restore durable state fields from the snapshot.
         for (name, value) in &snapshot.state {
@@ -5765,15 +5795,28 @@ impl Runtime {
         }
 
         // Fill in declared initial values for fields not touched above.
-        for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
-            if actor.get_state_field(name).is_some() {
-                continue;
+        if let Some(meta) = selected_meta {
+            for (name, c) in &meta.state_defaults {
+                if actor.get_state_field(name).is_some() {
+                    continue;
+                }
+                let v = match c {
+                    crate::bytecode::Constant::String(s) => actor.allocate_string(s),
+                    other => crate::vm::constant_to_value(other),
+                };
+                actor.set_state_field(name, v);
             }
-            let v = match c {
-                crate::bytecode::Constant::String(s) => actor.allocate_string(s),
-                other => crate::vm::constant_to_value(other),
-            };
-            actor.set_state_field(name, v);
+        } else {
+            for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+                if actor.get_state_field(name).is_some() {
+                    continue;
+                }
+                let v = match c {
+                    crate::bytecode::Constant::String(s) => actor.allocate_string(s),
+                    other => crate::vm::constant_to_value(other),
+                };
+                actor.set_state_field(name, v);
+            }
         }
 
         Ok(actor)
@@ -5847,10 +5890,26 @@ impl Runtime {
         };
 
         let mut actor = if let Some(ref snap) = snapshot {
+            let definition_index = {
+                let mut matches = grain_type
+                    .module
+                    .actor_metadata
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, meta)| meta.name == grain_id.grain_type)
+                    .map(|(index, _)| index);
+                let index = matches.next();
+                if matches.next().is_some() {
+                    None
+                } else {
+                    index
+                }
+            };
             Self::restore_actor_from_snapshot(
                 stable_actor_id,
                 &grain_type.module,
                 snap,
+                definition_index,
                 false,
                 false,
             )
