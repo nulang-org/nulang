@@ -7,28 +7,61 @@
 //! `perform Effect.op(...)` call resolves to when no user handler is
 //! installed.
 //!
-//! ## Standard library modules (`.nula` files in `src/stdlib/`)
+//! ## Nulang-authored standard-library modules
 //!
-//! | Module | File | Description |
-//! |--------|------|-------------|
-//! | `std.core` | `core.nula` | Core types (`Option[T]`, `Result[T, E]`) and combinators (auto-loaded). |
-//! | `std.math` | `math.nula` | Math functions: `abs`, `min`, `max`, `clamp`, `pow`, `factorial`, `gcd`, `sqrt`. |
-//! | `std.list` | `list.nula` | Functional list combinators: `map`, `filter`, `fold`, `append`, `reverse`, `sort`, etc. |
-//! | `std.string` | `string.nula` | String operations: `trim`, `split`, `join`, `replace`, `to_upper`, `to_lower`, etc. |
-//! | `std.map` | `map.nula` | Int→Int key-value map via sorted arrays: `insert`, `get`, `remove`, `contains`. |
-//! | `std.set` | `set.nula` | Int set via sorted arrays: `insert`, `contains`, `remove`. |
-//! | `std.result` | `result.nula` | Extra Result combinators: `unwrap`, `map`, `is_ok`, `is_err`. |
-//! | `std.option` | `option.nula` | Extra Option combinators: `unwrap`, `map`, `is_some`, `is_none`. |
-//! | `std.datetime` | `datetime.nula` | DateTime record type and operations: `now` (stub), `new`, `is_valid`. |
-//! | `std.http` | `http.nula` | HTTP client via built-in `Http` effect: `get`, `post`. |
-//! | `std.fs` | `fs.nula` | Filesystem I/O via built-in `FS` effect: `read`, `write`, `append`, `exists`. |
-//! | `std.json` | `json.nula` | JSON parsing and serialization: `parse`, `stringify`, field accessors. |
-//! | `std.test` | `test.nula` | Testing primitives: `assert_eq`, `assert_true`, `assert_false`, `fail`. |
+//! Canonical module metadata lives in `spec/stdlib/v0alpha1.json` and is
+//! materialized into this crate by `scripts/generate_stdlib.py`. Package
+//! mirrors declared by that manifest are generated from the in-tree source and
+//! verified in CI. Built-in effect operations remain executable compiler/runtime
+//! registry data below; consumers can access both surfaces through this module.
 //!
-//! The wiring itself lives elsewhere:
 
 use crate::types::Span;
 use crate::types::{NuError, NuResult};
+
+
+/// Stability tier for a Nulang-authored standard-library module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StabilityTier {
+    Frozen,
+    Stable,
+    Experimental,
+}
+
+impl StabilityTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Frozen => "frozen",
+            Self::Stable => "stable",
+            Self::Experimental => "experimental",
+        }
+    }
+}
+
+/// Canonical metadata for one Nulang-authored standard-library module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StdlibModule {
+    pub name: &'static str,
+    pub import_path: &'static str,
+    pub source_path: &'static str,
+    pub stability: StabilityTier,
+    pub description: &'static str,
+    /// Generated package mirror path when this module is also published as an
+    /// official seed package.
+    pub package_mirror: Option<&'static str>,
+}
+
+include!("stdlib_modules.generated.rs");
+
+/// Canonical descriptors for Nulang-authored stdlib modules.
+pub const fn modules() -> &'static [StdlibModule] {
+    STDLIB_MODULES
+}
+
+/// Look up one Nulang-authored stdlib module by its short name.
+pub fn module(name: &str) -> Option<&'static StdlibModule> {
+    STDLIB_MODULES.iter().find(|module| module.name == name)
+}
 
 // ---------------------------------------------------------------------------
 // BuiltinOp: one built-in effect operation
