@@ -1234,7 +1234,15 @@ fn cmd_build_wasm() -> NuResult<()> {
 
     eprintln!("Building {} (WASM AOT)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+    let caps = capability_args();
+    let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
+    nulang_exe(
+        &[
+            &["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str],
+            &cap_refs[..],
+        ]
+        .concat(),
+    )?;
     println!("WASM AOT build succeeded.");
     Ok(())
 }
