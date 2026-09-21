@@ -31,6 +31,12 @@ macro_rules! define_id {
                 &self.0
             }
 
+            /// Reconstruct an identity from an already-verified canonical
+            /// digest, for versioned persistence/wire envelopes.
+            pub const fn from_digest_bytes(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+
             pub fn to_hex(self) -> String {
                 hex::encode(self.0)
             }
