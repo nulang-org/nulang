@@ -769,50 +769,92 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(e) = check_source(
+
+        let warnings = match check_source(
             &source,
             Some(&path),
-            opts.verbose,
+            opts.verbose && !opts.json,
             opts.all_errors,
             &opts.with_capabilities,
-            opts.deny_warnings,
+            !opts.json,
         ) {
-            let code = exit_code(&e);
-            if opts.json {
-                // Machine-readable mode: the JSON report is the ONLY output on
-                // stdout; nothing human-rendered is printed.
-                let diags = if opts.all_errors {
+            Ok(warnings) => warnings,
+            Err(e) => {
+                let code = exit_code(&e);
+                if opts.json {
+                    // Machine-readable mode: the JSON report is the ONLY output
+                    // on stdout; nothing human-rendered is printed.
+                    let diags = if opts.all_errors {
+                        let all = collect_all_frontend_errors(&source, Some(&path));
+                        if all.is_empty() {
+                            nulang::json_diagnostics::diagnostics_from_error(&e)
+                        } else {
+                            all.iter()
+                                .flat_map(nulang::json_diagnostics::diagnostics_from_error)
+                                .collect()
+                        }
+                    } else {
+                        nulang::json_diagnostics::diagnostics_from_error(&e)
+                    };
+                    let report = nulang::json_diagnostics::JsonReport::new(
+                        "check",
+                        Some(path.clone()),
+                        diags,
+                    );
+                    print!("{}", report.to_json_string());
+                } else if opts.all_errors {
                     let all = collect_all_frontend_errors(&source, Some(&path));
                     if all.is_empty() {
-                        nulang::json_diagnostics::diagnostics_from_error(&e)
+                        print_error(&e, use_color);
                     } else {
-                        all.iter()
-                            .flat_map(nulang::json_diagnostics::diagnostics_from_error)
-                            .collect()
+                        for err in &all {
+                            print_error(err, use_color);
+                        }
                     }
                 } else {
-                    nulang::json_diagnostics::diagnostics_from_error(&e)
-                };
-                let report =
-                    nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
-                print!("{}", report.to_json_string());
-            } else if opts.all_errors {
-                let all = collect_all_frontend_errors(&source, Some(&path));
-                if all.is_empty() {
                     print_error(&e, use_color);
-                } else {
-                    for err in &all {
-                        print_error(err, use_color);
-                    }
                 }
+                std::process::exit(code);
+            }
+        };
+
+        // Strict check mode is applied after warning collection so JSON can
+        // preserve the actual warning diagnostics as well as the escalation.
+        if opts.deny_warnings && !warnings.is_empty() {
+            let e = nulang::types::NuError::parse_error(
+                format!(
+                    "aborting due to {} warning{} (--deny-warnings)",
+                    warnings.len(),
+                    if warnings.len() == 1 { "" } else { "s" }
+                ),
+                warnings[0].span,
+            );
+            let code = exit_code(&e);
+            if opts.json {
+                let mut diags: Vec<_> = warnings
+                    .iter()
+                    .map(nulang::json_diagnostics::diagnostic_from_warning)
+                    .collect();
+                diags.extend(nulang::json_diagnostics::diagnostics_from_error(&e));
+                let report = nulang::json_diagnostics::JsonReport::new(
+                    "check",
+                    Some(path.clone()),
+                    diags,
+                );
+                print!("{}", report.to_json_string());
             } else {
                 print_error(&e, use_color);
             }
             std::process::exit(code);
         }
+
         if opts.json {
+            let diags = warnings
+                .iter()
+                .map(nulang::json_diagnostics::diagnostic_from_warning)
+                .collect();
             let report =
-                nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), Vec::new());
+                nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
             print!("{}", report.to_json_string());
         } else {
             println!("Type check passed.");
