@@ -117,6 +117,8 @@ pub struct ActorDef {
     pub type_params: Vec<String>,
     pub persistent: bool,
     pub state_fields: Vec<(String, StateModel, Type, Operand)>,
+    /// Backend-independent logical access paths declared on durable state.
+    pub indexes: Vec<crate::ast::IndexDecl>,
     pub behaviors: Vec<BehaviorDef>,
     pub init: Vec<(String, Operand)>,
     /// Typed event declarations from an `events` block (entity only).
