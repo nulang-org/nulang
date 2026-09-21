@@ -1311,6 +1311,10 @@ fn cmd_build_wasm_target(aot: bool) -> NuResult<()> {
         if aot { "WASM + AOT" } else { "portable WASM" }
     );
     eprintln!("  Compiling {}...", entry.display());
+    // Never let an internal semantic handoff from a previous build survive
+    // into this build. A successful compiler invocation must produce the file
+    // consumed below.
+    let _ = std::fs::remove_file(&semantic_path);
     nulang_exe(
         &[
             &[
