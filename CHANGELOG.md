@@ -42,6 +42,16 @@ version + migration.*
 
 ## Stable tier
 
+### Unified durable change stream — 2026-09-21
+- **Runtime-owned durable change feed** (Experimental, `src/runtime/change_stream.rs`).
+  Existing actor message journals, event-sourced mutations, and workflow events
+  are exposed through one deterministic per-actor stream. A composite
+  `(sequence, lane, ordinal)` cursor makes resume lossless even when multiple
+  durable records share one actor sequence. The API is storage-agnostic across
+  Memory/JSON/libSQL backends and is intended as the common source for future
+  incremental views, index maintenance, analytics projections, replication,
+  and external CDC.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 

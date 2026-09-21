@@ -132,15 +132,22 @@ pub(crate) fn spawn_actor_with_id(
             }
             state
         };
-        let _ = rt.persistence.append_workflow_event(
+        if let Err(error) = crate::runtime::workflow::commit_workflow_event(
+            rt,
             id,
             WorkflowEvent::WorkflowStarted {
                 sequence: seq,
                 name: workflow_name.as_ref().unwrap().clone(),
                 state,
             },
-        );
-        crate::runtime::workflow::checkpoint_actor(rt, id);
+        ) {
+            tracing::warn!(
+                "nulang-persist: workflow start commit failed for actor {} at sequence {}: {}",
+                id,
+                seq,
+                error
+            );
+        }
     }
     rt.enqueue_actor(id);
     id

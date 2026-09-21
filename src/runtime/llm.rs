@@ -473,14 +473,21 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                         }
                     }
                     let seq = (*self_ptr).next_sequence(actor_id);
-                    let _ = (*self_ptr).persistence.append_workflow_event(
+                    if let Err(error) = crate::runtime::workflow::commit_workflow_event(
+                        &mut *self_ptr,
                         actor_id,
                         WorkflowEvent::StepCompleted {
                             sequence: seq,
                             step_name: suspended.step_name,
                         },
-                    );
-                    (*self_ptr).checkpoint_actor(actor_id);
+                    ) {
+                        tracing::warn!(
+                            "nulang-persist: LLM-resumed workflow completion commit failed for actor {} at sequence {}: {}",
+                            actor_id,
+                            seq,
+                            error
+                        );
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {

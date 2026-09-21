@@ -18,6 +18,7 @@ pub mod cache_pipeline;
 pub mod cache_routing;
 #[cfg(feature = "cache-server")]
 pub mod cache_server;
+pub mod change_stream;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
@@ -97,6 +98,7 @@ pub use cache_routing::*;
 pub use cache_server::*;
 pub use callbacks::RuntimeVmCallbacks;
 pub(crate) use callbacks::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks};
+pub use change_stream::*;
 pub use cluster::*;
 pub use crdt::*;
 pub use crdt_manager::*;
@@ -1629,14 +1631,19 @@ impl Runtime {
                         }
                     }
                     let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
+                    if let Err(error) = workflow::commit_workflow_event(
+                        self,
                         actor_id,
                         WorkflowEvent::StepCompleted {
                             sequence: seq,
                             step_name,
                         },
-                    );
-                    self.checkpoint_actor(actor_id);
+                    ) {
+                        warn!(
+                            "nulang-persist: resumed workflow completion commit failed for actor {} at sequence {}: {}",
+                            actor_id, seq, error
+                        );
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -3872,7 +3879,15 @@ impl Runtime {
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        self.checkpoint_actor(actor_id);
+                        // Ordinary actors still checkpoint directly. A user
+                        // workflow step is checkpointed together with its
+                        // StepCompleted event below, so there is no dual-write
+                        // window between the state and the workflow journal.
+                        if !self.actor_is_workflow(actor_id)
+                            || self.is_internal_behavior(actor_id, behavior_idx)
+                        {
+                            self.checkpoint_actor(actor_id);
+                        }
                         processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
@@ -3886,24 +3901,30 @@ impl Runtime {
                         processed = false;
                     }
                     Err(e) => {
-                        self.checkpoint_actor(actor_id);
-                        // A workflow step failed: record the failure (durable
-                        // StepFailed event — SPEC2 §10 known-issue #5: step
-                        // failures were silent, exit 0, no diagnostic), then
-                        // run saga compensations for previously completed
-                        // steps in reverse order.
+                        // A workflow failure is one durable transition: the
+                        // StepFailed record and the resulting checkpoint share
+                        // a sequence and commit atomically. Plain actors retain
+                        // the ordinary snapshot-only checkpoint path.
                         if self.actor_is_workflow(actor_id) {
                             let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
+                            if let Err(error) = workflow::commit_workflow_event(
+                                self,
                                 actor_id,
                                 WorkflowEvent::StepFailed {
                                     sequence: seq,
                                     step_name,
                                     error: format!("{}", e),
                                 },
-                            );
+                            ) {
+                                warn!(
+                                    "nulang-persist: workflow failure commit failed for actor {} at sequence {}: {}",
+                                    actor_id, seq, error
+                                );
+                            }
                             self.run_saga_compensation(actor_id, behavior_idx);
+                        } else {
+                            self.checkpoint_actor(actor_id);
                         }
                         processed = false;
                     }
@@ -3913,18 +3934,9 @@ impl Runtime {
                 && self.actor_is_workflow(actor_id)
                 && !self.is_internal_behavior(actor_id, behavior_idx)
             {
-                let seq = self.next_sequence(actor_id);
-                let step_name = self.step_name_for(actor_id, behavior_idx);
-                let _ = self.persistence.append_workflow_event(
-                    actor_id,
-                    WorkflowEvent::StepCompleted {
-                        sequence: seq,
-                        step_name,
-                    },
-                );
                 // Synthetic parallel steps do not increment step_index in their
                 // bytecode (so signal-waiting branches do not double-increment);
-                // advance it here when the step completes.
+                // advance it before building the atomic completion snapshot.
                 if self.is_parallel_step(actor_id, behavior_idx) {
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         if let Some(n) =
@@ -3934,7 +3946,21 @@ impl Runtime {
                         }
                     }
                 }
-                self.checkpoint_actor(actor_id);
+                let seq = self.next_sequence(actor_id);
+                let step_name = self.step_name_for(actor_id, behavior_idx);
+                if let Err(error) = workflow::commit_workflow_event(
+                    self,
+                    actor_id,
+                    WorkflowEvent::StepCompleted {
+                        sequence: seq,
+                        step_name,
+                    },
+                ) {
+                    warn!(
+                        "nulang-persist: workflow completion commit failed for actor {} at sequence {}: {}",
+                        actor_id, seq, error
+                    );
+                }
             }
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
@@ -4451,14 +4477,21 @@ impl Runtime {
                             }
                         }
                         let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = workflow::commit_workflow_event(
+                            &mut *self_ptr,
                             actor_id,
                             crate::runtime::WorkflowEvent::StepCompleted {
                                 sequence: seq,
                                 step_name: suspended.step_name.clone(),
                             },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                        ) {
+                            tracing::warn!(
+                                "nulang-persist: timer-resumed workflow completion commit failed for actor {} at sequence {}: {}",
+                                actor_id,
+                                seq,
+                                error
+                            );
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
@@ -4544,14 +4577,21 @@ impl Runtime {
                             }
                         }
                         let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = workflow::commit_workflow_event(
+                            &mut *self_ptr,
                             actor_id,
                             WorkflowEvent::StepCompleted {
                                 sequence: seq,
                                 step_name: suspended.step_name,
                             },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                        ) {
+                            tracing::warn!(
+                                "nulang-persist: receive-resumed workflow completion commit failed for actor {} at sequence {}: {}",
+                                actor_id,
+                                seq,
+                                error
+                            );
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(VmSuspension::ReceiveWait)) => {

@@ -4,9 +4,9 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::vm::Value;
@@ -251,6 +251,12 @@ impl WorkflowEvent {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WorkflowCommitRecord {
+    event: WorkflowEvent,
+    snapshot: ActorSnapshot,
+}
+
 /// Persistence backend trait. Implementations may be in-memory or disk-backed.
 pub trait PersistenceStore: Send + Sync {
     /// Persist a snapshot of durable actor state.
@@ -265,11 +271,71 @@ pub trait PersistenceStore: Send + Sync {
     /// Read all journal entries for an actor in order.
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry>;
 
+    /// Read at most `limit` journal entries whose sequence is greater than or
+    /// equal to `start_sequence`. Backends should override this with a native
+    /// range scan; the default preserves compatibility for custom stores.
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        self.read_journal(actor_id)
+            .into_iter()
+            .filter(|entry| entry.sequence >= start_sequence)
+            .take(limit)
+            .collect()
+    }
+
     /// Append a workflow event to the actor's event journal.
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()>;
 
+    /// Atomically publish one workflow event and the checkpoint produced by
+    /// that same logical transition. The event and snapshot must share a
+    /// sequence number.
+    ///
+    /// Built-in durable backends override this with a native transaction,
+    /// write batch, or single-record commit log. The default keeps third-party
+    /// stores source-compatible but cannot guarantee atomicity.
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+        self.append_workflow_event(actor_id, event)?;
+        self.save_snapshot(snapshot)
+    }
+
     /// Read all workflow events for an actor in order.
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent>;
+
+    /// Read at most `limit` workflow events starting at an inclusive actor
+    /// sequence. See `scan_journal_from` for the compatibility contract.
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        self.read_workflow_events(actor_id)
+            .into_iter()
+            .filter(|event| event.sequence() >= start_sequence)
+            .take(limit)
+            .collect()
+    }
 
     /// Append a `TimerSet` workflow event.
     fn append_timer_set(
@@ -386,8 +452,40 @@ pub trait PersistenceStore: Send + Sync {
     /// Append an event to the actor's event-sourcing log.
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()>;
 
+    /// Append one logical group of event-sourced field mutations.
+    ///
+    /// Backends with transactional/batch primitives should override this so
+    /// either the full group becomes durable or none of it does. The default
+    /// preserves compatibility for custom stores but only provides sequential
+    /// append semantics.
+    fn append_events(&mut self, actor_id: u64, entries: &[EventEntry]) -> io::Result<()> {
+        for entry in entries {
+            self.append_event(actor_id, entry.clone())?;
+        }
+        Ok(())
+    }
+
     /// Read all event-sourcing entries for an actor in order.
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry>;
+
+    /// Read at most `limit` event-sourced mutations starting at an inclusive
+    /// actor sequence. Multiple fields may legally share one sequence and must
+    /// remain in deterministic append order.
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        self.read_events(actor_id)
+            .into_iter()
+            .filter(|entry| entry.sequence >= start_sequence)
+            .take(limit)
+            .collect()
+    }
 
     /// Highest sequence number known for the actor.
     fn latest_sequence(&self, actor_id: u64) -> u64;
@@ -439,11 +537,44 @@ impl PersistenceStore for MemoryStore {
         self.journals.get(&actor_id).cloned().unwrap_or_default()
     }
 
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        let Some(entries) = self.journals.get(&actor_id) else {
+            return Vec::new();
+        };
+        let start = entries.partition_point(|entry| entry.sequence < start_sequence);
+        entries[start..].iter().take(limit).cloned().collect()
+    }
+
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
         self.workflow_events
             .entry(actor_id)
             .or_default()
             .push(event);
+        Ok(())
+    }
+
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+        self.workflow_events
+            .entry(actor_id)
+            .or_default()
+            .push(event);
+        self.snapshots.insert(actor_id, snapshot);
         Ok(())
     }
 
@@ -454,13 +585,47 @@ impl PersistenceStore for MemoryStore {
             .unwrap_or_default()
     }
 
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        let Some(events) = self.workflow_events.get(&actor_id) else {
+            return Vec::new();
+        };
+        let start = events.partition_point(|event| event.sequence() < start_sequence);
+        events[start..].iter().take(limit).cloned().collect()
+    }
+
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         self.events.entry(actor_id).or_default().push(entry);
         Ok(())
     }
 
+    fn append_events(&mut self, actor_id: u64, entries: &[EventEntry]) -> io::Result<()> {
+        self.events
+            .entry(actor_id)
+            .or_default()
+            .extend(entries.iter().cloned());
+        Ok(())
+    }
+
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
         self.events.get(&actor_id).cloned().unwrap_or_default()
+    }
+
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        let Some(entries) = self.events.get(&actor_id) else {
+            return Vec::new();
+        };
+        let start = entries.partition_point(|entry| entry.sequence < start_sequence);
+        entries[start..].iter().take(limit).cloned().collect()
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
@@ -530,9 +695,79 @@ impl JsonFileStore {
         self.actor_dir(actor_id).join("workflow_events.jsonl")
     }
 
+    fn workflow_commits_path(&self, actor_id: u64) -> PathBuf {
+        self.actor_dir(actor_id).join("workflow_commits.jsonl")
+    }
+
+    fn read_workflow_commits(&self, actor_id: u64) -> Vec<WorkflowCommitRecord> {
+        let file = match fs::File::open(self.workflow_commits_path(actor_id)) {
+            Ok(file) => file,
+            Err(_) => return Vec::new(),
+        };
+        BufReader::new(file)
+            .lines()
+            .filter_map(Result::ok)
+            .filter_map(|line| serde_json::from_str(&line).ok())
+            .collect()
+    }
+
+    fn repair_workflow_commit_tail(&self, actor_id: u64) -> io::Result<()> {
+        let path = self.workflow_commits_path(actor_id);
+        let file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let bytes = fs::read(&path)?;
+        if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+            return Ok(());
+        }
+
+        let valid_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|position| position + 1)
+            .unwrap_or(0);
+        file.set_len(valid_len as u64)?;
+        file.sync_all()
+    }
+
     fn events_path(&self, actor_id: u64) -> PathBuf {
         self.actor_dir(actor_id).join("events.jsonl")
     }
+}
+
+fn scan_jsonl<T, F>(path: PathBuf, start_sequence: u64, limit: usize, sequence: F) -> Vec<T>
+where
+    T: serde::de::DeserializeOwned,
+    F: Fn(&T) -> u64,
+{
+    if limit == 0 {
+        return Vec::new();
+    }
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(limit.min(1024));
+    for line in BufReader::new(file).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let value: T = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if sequence(&value) < start_sequence {
+            continue;
+        }
+        out.push(value);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
 }
 
 impl PersistenceStore for JsonFileStore {
@@ -556,23 +791,40 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
-        let path = self.snapshot_path(actor_id);
-        // A missing file is the normal "no snapshot yet" case — stay silent.
-        let data = fs::read_to_string(&path).ok()?;
-        match serde_json::from_str(&data) {
-            Ok(snapshot) => Some(snapshot),
-            Err(e) => {
-                // A present-but-unparseable snapshot means corruption (e.g. an
-                // older non-atomic write); log it instead of silently resetting
-                // the actor's durable state on recovery.
-                warn!(
-                    "nulang-persist: failed to parse snapshot for actor {} at {}: {}",
-                    actor_id,
-                    path.display(),
-                    e
-                );
-                None
+        let standalone = {
+            let path = self.snapshot_path(actor_id);
+            match fs::read_to_string(&path) {
+                Ok(data) => match serde_json::from_str(&data) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        warn!(
+                            "nulang-persist: failed to parse snapshot for actor {} at {}: {}",
+                            actor_id,
+                            path.display(),
+                            error
+                        );
+                        None
+                    }
+                },
+                Err(_) => None,
             }
+        };
+        let committed = self
+            .read_workflow_commits(actor_id)
+            .into_iter()
+            .last()
+            .map(|record| record.snapshot);
+
+        match (standalone, committed) {
+            (Some(standalone), Some(committed)) => {
+                if committed.sequence >= standalone.sequence {
+                    Some(committed)
+                } else {
+                    Some(standalone)
+                }
+            }
+            (Some(snapshot), None) | (None, Some(snapshot)) => Some(snapshot),
+            (None, None) => None,
         }
     }
 
@@ -604,6 +856,20 @@ impl PersistenceStore for JsonFileStore {
             .collect()
     }
 
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        scan_jsonl(
+            self.journal_path(actor_id),
+            start_sequence,
+            limit,
+            |entry: &JournalEntry| entry.sequence,
+        )
+    }
+
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
         let dir = self.actor_dir(actor_id);
         fs::create_dir_all(&dir)?;
@@ -621,15 +887,79 @@ impl PersistenceStore for JsonFileStore {
         Ok(())
     }
 
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+        let dir = self.actor_dir(actor_id);
+        fs::create_dir_all(&dir)?;
+        self.repair_workflow_commit_tail(actor_id)?;
+        let path = self.workflow_commits_path(actor_id);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let record = WorkflowCommitRecord { event, snapshot };
+        let json = serde_json::to_string(&record)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        writeln!(file, "{}", json)?;
+        file.sync_all()
+    }
+
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        let mut by_sequence = BTreeMap::new();
         let path = self.workflow_events_path(actor_id);
-        let data = match fs::read_to_string(path) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
-        };
-        data.lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        if let Ok(data) = fs::read_to_string(path) {
+            for event in data
+                .lines()
+                .filter_map(|line| serde_json::from_str::<WorkflowEvent>(line).ok())
+            {
+                by_sequence.insert(event.sequence(), event);
+            }
+        }
+        for record in self.read_workflow_commits(actor_id) {
+            by_sequence.insert(record.event.sequence(), record.event);
+        }
+        by_sequence.into_values().collect()
+    }
+
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let legacy = scan_jsonl(
+            self.workflow_events_path(actor_id),
+            start_sequence,
+            limit,
+            WorkflowEvent::sequence,
+        );
+        let committed: Vec<WorkflowCommitRecord> = scan_jsonl(
+            self.workflow_commits_path(actor_id),
+            start_sequence,
+            limit,
+            |record: &WorkflowCommitRecord| record.event.sequence(),
+        );
+        let mut by_sequence = BTreeMap::new();
+        for event in legacy {
+            by_sequence.insert(event.sequence(), event);
+        }
+        for record in committed {
+            by_sequence.insert(record.event.sequence(), record.event);
+        }
+        by_sequence.into_values().take(limit).collect()
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
@@ -660,6 +990,20 @@ impl PersistenceStore for JsonFileStore {
         data.lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
+    }
+
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        scan_jsonl(
+            self.events_path(actor_id),
+            start_sequence,
+            limit,
+            |entry: &EventEntry| entry.sequence,
+        )
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
@@ -924,6 +1268,34 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // v2 permits one event-sourced mutation per field at the same actor
+            // sequence. The legacy table keyed only by (actor_id, sequence),
+            // which silently made multi-field event sourcing backend-dependent.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS events_v2 (
+                    actor_id INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    field_name TEXT NOT NULL,
+                    event_name TEXT NOT NULL,
+                    args TEXT NOT NULL,
+                    value TEXT NOT NULL DEFAULT '1',
+                    PRIMARY KEY (actor_id, sequence, ordinal),
+                    UNIQUE (actor_id, sequence, field_name)
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "INSERT OR IGNORE INTO events_v2
+                    (actor_id, sequence, ordinal, field_name, event_name, args, value)
+                 SELECT actor_id, sequence, 0, field_name, event_name, args, value
+                 FROM events",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
@@ -1121,6 +1493,58 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = match conn
+                .query(
+                    "SELECT sequence, behavior_id, payload FROM journal
+                     WHERE actor_id = ?1 AND sequence >= ?2
+                     ORDER BY sequence ASC LIMIT ?3",
+                    libsql::params![actor_id as i64, start_sequence as i64, limit],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(_) => return Vec::new(),
+            };
+            let mut entries = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                let seq: i64 = match row.get(0) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let behavior_id: i64 = match row.get(1) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let payload_json: String = match row.get(2) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let payload = match serde_json::from_str(&payload_json) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                entries.push(JournalEntry {
+                    sequence: seq as u64,
+                    behavior_id: behavior_id as u16,
+                    payload,
+                });
+            }
+            entries
+        })
+    }
+
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
         let event_json = serde_json::to_string(&event)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1133,6 +1557,87 @@ impl PersistenceStore for LibsqlStore {
             .await
             .map(|_| ())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })
+    }
+
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+
+        let event_json = serde_json::to_string(&event)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let state_json = serde_json::to_string(&snapshot.state)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let authority_json = serde_json::to_string(&snapshot.authority_tokens)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let conn = self.conn();
+
+        self.rt.block_on(async {
+            conn.execute("BEGIN IMMEDIATE", ())
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+            let result: io::Result<()> = async {
+                conn.execute(
+                    "INSERT INTO workflow_events (actor_id, sequence, event)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(actor_id, sequence) DO UPDATE SET event=excluded.event",
+                    libsql::params![actor_id as i64, event.sequence() as i64, event_json],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+                conn.execute(
+                    "INSERT INTO snapshots
+                        (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(actor_id) DO UPDATE SET
+                        sequence=excluded.sequence,
+                        state=excluded.state,
+                        waiting_signal=excluded.waiting_signal,
+                        crdt_snapshot=excluded.crdt_snapshot,
+                        crdt_field_map=excluded.crdt_field_map,
+                        authority_tokens=excluded.authority_tokens",
+                    libsql::params![
+                        actor_id as i64,
+                        snapshot.sequence as i64,
+                        state_json,
+                        snapshot.waiting_signal.as_deref(),
+                        crdt_json.as_str(),
+                        crdt_field_map_json.as_str(),
+                        authority_json.as_str()
+                    ],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                Ok(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string())),
+                Err(error) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -1170,6 +1675,44 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = match conn
+                .query(
+                    "SELECT event FROM workflow_events
+                     WHERE actor_id = ?1 AND sequence >= ?2
+                     ORDER BY sequence ASC LIMIT ?3",
+                    libsql::params![actor_id as i64, start_sequence as i64, limit],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(_) => return Vec::new(),
+            };
+            let mut events = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                let event_json: String = match row.get(0) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                if let Ok(event) = serde_json::from_str(&event_json) {
+                    events.push(event);
+                }
+            }
+            events
+        })
+    }
+
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         let args_json = serde_json::to_string(&entry.args)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1178,9 +1721,81 @@ impl PersistenceStore for LibsqlStore {
             let value_json = serde_json::to_string(&entry.value)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             conn.execute(
-                "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                libsql::params![actor_id as i64, entry.sequence as i64, entry.field_name, entry.event_name, args_json, value_json],
-            ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+                "INSERT INTO events_v2
+                    (actor_id, sequence, ordinal, field_name, event_name, args, value)
+                 SELECT ?1, ?2, COALESCE(MAX(ordinal) + 1, 0), ?3, ?4, ?5, ?6
+                 FROM events_v2 WHERE actor_id = ?1 AND sequence = ?2
+                 ON CONFLICT(actor_id, sequence, field_name) DO UPDATE SET
+                    event_name = excluded.event_name,
+                    args = excluded.args,
+                    value = excluded.value",
+                libsql::params![
+                    actor_id as i64,
+                    entry.sequence as i64,
+                    entry.field_name,
+                    entry.event_name,
+                    args_json,
+                    value_json
+                ],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })
+    }
+
+    fn append_events(&mut self, actor_id: u64, entries: &[EventEntry]) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn();
+        self.rt.block_on(async {
+            conn.execute("BEGIN IMMEDIATE", ())
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            let result: io::Result<()> = async {
+                for entry in entries {
+                    let args_json = serde_json::to_string(&entry.args)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    let value_json = serde_json::to_string(&entry.value)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    conn.execute(
+                        "INSERT INTO events_v2
+                            (actor_id, sequence, ordinal, field_name, event_name, args, value)
+                         SELECT ?1, ?2, COALESCE(MAX(ordinal) + 1, 0), ?3, ?4, ?5, ?6
+                         FROM events_v2 WHERE actor_id = ?1 AND sequence = ?2
+                         ON CONFLICT(actor_id, sequence, field_name) DO UPDATE SET
+                            event_name = excluded.event_name,
+                            args = excluded.args,
+                            value = excluded.value",
+                        libsql::params![
+                            actor_id as i64,
+                            entry.sequence as i64,
+                            entry.field_name.as_str(),
+                            entry.event_name.as_str(),
+                            args_json,
+                            value_json
+                        ],
+                    )
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                }
+                Ok(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string())),
+                Err(err) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    Err(err)
+                }
+            }
         })
     }
 
@@ -1189,8 +1804,8 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = match conn
                 .query(
-                    "SELECT sequence, field_name, event_name, args, value FROM events
-                 WHERE actor_id = ?1 ORDER BY sequence ASC",
+                    "SELECT sequence, field_name, event_name, args, value FROM events_v2
+                 WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
                     libsql::params![actor_id as i64],
                 )
                 .await
@@ -1246,6 +1861,72 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = match conn
+                .query(
+                    "SELECT sequence, field_name, event_name, args, value FROM events_v2
+                     WHERE actor_id = ?1 AND sequence >= ?2
+                     ORDER BY sequence ASC, ordinal ASC LIMIT ?3",
+                    libsql::params![actor_id as i64, start_sequence as i64, limit],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(_) => return Vec::new(),
+            };
+            let mut entries = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                let sequence: i64 = match row.get(0) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let field_name: String = match row.get(1) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let event_name: String = match row.get(2) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let args_json: String = match row.get(3) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let value_json: String = match row.get(4) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let args = match serde_json::from_str(&args_json) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let value = match serde_json::from_str(&value_json) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                entries.push(EventEntry {
+                    sequence: sequence as u64,
+                    field_name,
+                    event_name,
+                    args,
+                    value,
+                });
+            }
+            entries
+        })
+    }
+
     fn latest_sequence(&self, actor_id: u64) -> u64 {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -1275,7 +1956,7 @@ impl PersistenceStore for LibsqlStore {
             }.await;
             let event_seq: Option<i64> = async {
                 let mut rows = conn.query(
-                    "SELECT sequence FROM events WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                    "SELECT sequence FROM events_v2 WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
                     libsql::params![actor_id as i64],
                 ).await.ok()?;
                 let row = rows.next().await.ok()??;
@@ -1314,6 +1995,13 @@ impl PersistenceStore for LibsqlStore {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
                 "DELETE FROM events WHERE actor_id = ?1",
+                libsql::params![actor_id as i64],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "DELETE FROM events_v2 WHERE actor_id = ?1",
                 libsql::params![actor_id as i64],
             )
             .await
@@ -1370,6 +2058,14 @@ impl RocksDbStore {
         let mut key = [0u8; 16];
         key[..8].copy_from_slice(&actor_id.to_be_bytes());
         key[8..].copy_from_slice(&sequence.to_be_bytes());
+        key
+    }
+
+    fn actor_event_key(actor_id: u64, sequence: u64, field_name: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(16 + field_name.len());
+        key.extend_from_slice(&actor_id.to_be_bytes());
+        key.extend_from_slice(&sequence.to_be_bytes());
+        key.extend_from_slice(field_name.as_bytes());
         key
     }
 
@@ -1440,6 +2136,39 @@ impl PersistenceStore for RocksDbStore {
         entries
     }
 
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let cf = match self.cf(Self::CF_JOURNAL) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let start = Self::actor_seq_key(actor_id, start_sequence);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        let mut entries = Vec::with_capacity(limit.min(1024));
+        while entries.len() < limit {
+            let Some(Ok((key, value))) = iter.next() else {
+                break;
+            };
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(entry) = serde_json::from_slice::<JournalEntry>(&value) {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
         let cf = self.cf(Self::CF_WORKFLOW_EVENTS)?;
         let json = serde_json::to_string(&event)
@@ -1454,6 +2183,40 @@ impl PersistenceStore for RocksDbStore {
         self.db
             .flush_wal(true)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+
+        let workflow_cf = self.cf(Self::CF_WORKFLOW_EVENTS)?;
+        let snapshot_cf = self.cf(Self::CF_SNAPSHOTS)?;
+        let event_json = serde_json::to_vec(&event)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let snapshot_json = serde_json::to_vec(&snapshot)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(
+            workflow_cf,
+            Self::actor_seq_key(actor_id, event.sequence()),
+            event_json,
+        );
+        batch.put_cf(snapshot_cf, Self::actor_key(actor_id), snapshot_json);
+        self.db
+            .write(batch)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
     }
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
@@ -1478,6 +2241,39 @@ impl PersistenceStore for RocksDbStore {
         events
     }
 
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let cf = match self.cf(Self::CF_WORKFLOW_EVENTS) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let start = Self::actor_seq_key(actor_id, start_sequence);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        let mut events = Vec::with_capacity(limit.min(1024));
+        while events.len() < limit {
+            let Some(Ok((key, value))) = iter.next() else {
+                break;
+            };
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(event) = serde_json::from_slice::<WorkflowEvent>(&value) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         let cf = self.cf(Self::CF_EVENTS)?;
         let json = serde_json::to_string(&entry)
@@ -1485,9 +2281,32 @@ impl PersistenceStore for RocksDbStore {
         self.db
             .put_cf(
                 cf,
-                Self::actor_seq_key(actor_id, entry.sequence),
+                Self::actor_event_key(actor_id, entry.sequence, &entry.field_name),
                 json.as_bytes(),
             )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn append_events(&mut self, actor_id: u64, entries: &[EventEntry]) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let cf = self.cf(Self::CF_EVENTS)?;
+        let mut batch = rocksdb::WriteBatch::default();
+        for entry in entries {
+            let json = serde_json::to_vec(entry)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            batch.put_cf(
+                cf,
+                Self::actor_event_key(actor_id, entry.sequence, &entry.field_name),
+                json,
+            );
+        }
+        self.db
+            .write(batch)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         self.db
             .flush_wal(true)
@@ -1506,6 +2325,39 @@ impl PersistenceStore for RocksDbStore {
             rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
         );
         while let Some(Ok((key, value))) = iter.next() {
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(entry) = serde_json::from_slice::<EventEntry>(&value) {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let cf = match self.cf(Self::CF_EVENTS) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let start = Self::actor_seq_key(actor_id, start_sequence);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        let mut entries = Vec::with_capacity(limit.min(1024));
+        while entries.len() < limit {
+            let Some(Ok((key, value))) = iter.next() else {
+                break;
+            };
             if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
                 break;
             }
@@ -1551,8 +2403,9 @@ impl PersistenceStore for RocksDbStore {
         ] {
             let cf = self.cf(cf_name)?;
             // Start from the bare actor prefix.  Snapshot keys are exactly 8
-            // bytes; journal/event keys are 16 bytes (actor || sequence).
-            // Both layouts sort contiguously under the actor prefix.
+            // bytes; journal/workflow keys start with actor || sequence and event keys
+            // additionally carry the field name. All layouts remain contiguous
+            // under the actor prefix.
             let actor_key = Self::actor_key(actor_id);
             let mut iter = self.db.iterator_cf(
                 cf,
@@ -1654,6 +2507,30 @@ impl PostgresStore {
                 value TEXT NOT NULL DEFAULT '1',
                 PRIMARY KEY (actor_id, sequence)
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS events_v2 (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                ordinal BIGINT NOT NULL,
+                field_name TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                args TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '1',
+                PRIMARY KEY (actor_id, sequence, ordinal),
+                UNIQUE (actor_id, sequence, field_name)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "INSERT INTO events_v2
+                (actor_id, sequence, ordinal, field_name, event_name, args, value)
+             SELECT actor_id, sequence, 0, field_name, event_name, args, value
+             FROM events
+             ON CONFLICT (actor_id, sequence, field_name) DO NOTHING",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1790,6 +2667,45 @@ impl PersistenceStore for PostgresStore {
             .collect()
     }
 
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut conn = match self.conn.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Vec::new(),
+        };
+        let start_sequence = i64::try_from(start_sequence).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = match conn.query(
+            "SELECT sequence, behavior_id, payload FROM journal
+             WHERE actor_id = $1 AND sequence >= $2
+             ORDER BY sequence ASC LIMIT $3",
+            &[&(actor_id as i64), &start_sequence, &limit],
+        ) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let sequence: i64 = row.get(0);
+                let behavior_id: i32 = row.get(1);
+                let payload_json: String = row.get(2);
+                let payload = serde_json::from_str(&payload_json).ok()?;
+                Some(JournalEntry {
+                    sequence: sequence as u64,
+                    behavior_id: behavior_id as u16,
+                    payload,
+                })
+            })
+            .collect()
+    }
+
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
         let event_json = serde_json::to_string(&event)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1803,6 +2719,69 @@ impl PersistenceStore for PostgresStore {
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(())
+    }
+
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+
+        let event_json = serde_json::to_string(&event)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let state_json = serde_json::to_string(&snapshot.state)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let authority_json = serde_json::to_string(&snapshot.authority_tokens)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut conn = self.conn.lock().unwrap();
+        let mut tx = conn
+            .transaction()
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+        tx.execute(
+            "INSERT INTO workflow_events (actor_id, sequence, event)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (actor_id, sequence) DO UPDATE SET event = EXCLUDED.event",
+            &[&(actor_id as i64), &(event.sequence() as i64), &event_json],
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+        tx.execute(
+            "INSERT INTO snapshots
+                (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (actor_id) DO UPDATE SET
+                sequence = EXCLUDED.sequence,
+                state = EXCLUDED.state,
+                waiting_signal = EXCLUDED.waiting_signal,
+                crdt_snapshot = EXCLUDED.crdt_snapshot,
+                crdt_field_map = EXCLUDED.crdt_field_map,
+                authority_tokens = EXCLUDED.authority_tokens",
+            &[
+                &(actor_id as i64),
+                &(snapshot.sequence as i64),
+                &state_json,
+                &snapshot.waiting_signal.as_deref(),
+                &crdt_json.as_str(),
+                &crdt_field_map_json.as_str(),
+                &authority_json.as_str(),
+            ],
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+        tx.commit()
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
     }
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
@@ -1826,6 +2805,38 @@ impl PersistenceStore for PostgresStore {
             .collect()
     }
 
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut conn = match self.conn.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Vec::new(),
+        };
+        let start_sequence = i64::try_from(start_sequence).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = match conn.query(
+            "SELECT event FROM workflow_events
+             WHERE actor_id = $1 AND sequence >= $2
+             ORDER BY sequence ASC LIMIT $3",
+            &[&(actor_id as i64), &start_sequence, &limit],
+        ) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let event_json: String = row.get(0);
+                serde_json::from_str(&event_json).ok()
+            })
+            .collect()
+    }
+
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         let args_json = serde_json::to_string(&entry.args)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1833,10 +2844,11 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (actor_id, sequence) DO UPDATE SET
-               field_name = EXCLUDED.field_name,
+            "INSERT INTO events_v2
+                (actor_id, sequence, ordinal, field_name, event_name, args, value)
+             SELECT $1, $2, COALESCE(MAX(ordinal) + 1, 0), $3, $4, $5, $6
+             FROM events_v2 WHERE actor_id = $1 AND sequence = $2
+             ON CONFLICT (actor_id, sequence, field_name) DO UPDATE SET
                event_name = EXCLUDED.event_name,
                args = EXCLUDED.args,
                value = EXCLUDED.value",
@@ -1853,14 +2865,51 @@ impl PersistenceStore for PostgresStore {
         Ok(())
     }
 
+    fn append_events(&mut self, actor_id: u64, entries: &[EventEntry]) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let mut tx = conn
+            .transaction()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        for entry in entries {
+            let args_json = serde_json::to_string(&entry.args)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let value_json = serde_json::to_string(&entry.value)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            tx.execute(
+                "INSERT INTO events_v2
+                    (actor_id, sequence, ordinal, field_name, event_name, args, value)
+                 SELECT $1, $2, COALESCE(MAX(ordinal) + 1, 0), $3, $4, $5, $6
+                 FROM events_v2 WHERE actor_id = $1 AND sequence = $2
+                 ON CONFLICT (actor_id, sequence, field_name) DO UPDATE SET
+                    event_name = EXCLUDED.event_name,
+                    args = EXCLUDED.args,
+                    value = EXCLUDED.value",
+                &[
+                    &(actor_id as i64),
+                    &(entry.sequence as i64),
+                    &entry.field_name,
+                    &entry.event_name,
+                    &args_json,
+                    &value_json,
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
         let mut conn = match self.conn.lock() {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
         let rows = match conn.query(
-            "SELECT sequence, field_name, event_name, args, value FROM events
-             WHERE actor_id = $1 ORDER BY sequence ASC",
+            "SELECT sequence, field_name, event_name, args, value FROM events_v2
+             WHERE actor_id = $1 ORDER BY sequence ASC, ordinal ASC",
             &[&(actor_id as i64)],
         ) {
             Ok(r) => r,
@@ -1877,6 +2926,50 @@ impl PersistenceStore for PostgresStore {
                 let value: PersistedValue = serde_json::from_str(&value_json).ok()?;
                 Some(EventEntry {
                     sequence: seq as u64,
+                    field_name,
+                    event_name,
+                    args,
+                    value,
+                })
+            })
+            .collect()
+    }
+
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut conn = match self.conn.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Vec::new(),
+        };
+        let start_sequence = i64::try_from(start_sequence).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = match conn.query(
+            "SELECT sequence, field_name, event_name, args, value FROM events_v2
+             WHERE actor_id = $1 AND sequence >= $2
+             ORDER BY sequence ASC, ordinal ASC LIMIT $3",
+            &[&(actor_id as i64), &start_sequence, &limit],
+        ) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let sequence: i64 = row.get(0);
+                let field_name: String = row.get(1);
+                let event_name: String = row.get(2);
+                let args_json: String = row.get(3);
+                let value_json: String = row.get(4);
+                let args = serde_json::from_str(&args_json).ok()?;
+                let value = serde_json::from_str(&value_json).ok()?;
+                Some(EventEntry {
+                    sequence: sequence as u64,
                     field_name,
                     event_name,
                     args,
@@ -1917,7 +3010,7 @@ impl PersistenceStore for PostgresStore {
             .map(|row| row.get(0));
         let event_seq: Option<i64> = conn
             .query_opt(
-                "SELECT sequence FROM events WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
+                "SELECT sequence FROM events_v2 WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
                 &[&(actor_id as i64)],
             )
             .ok()
@@ -1932,7 +3025,13 @@ impl PersistenceStore for PostgresStore {
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        for table in ["snapshots", "journal", "workflow_events", "events"] {
+        for table in [
+            "snapshots",
+            "journal",
+            "workflow_events",
+            "events",
+            "events_v2",
+        ] {
             conn.execute(
                 &format!("DELETE FROM {} WHERE actor_id = $1", table),
                 &[&(actor_id as i64)],
@@ -2679,5 +3778,138 @@ mod postgres_store_tests {
         assert_eq!(store.read_events(actor_id).len(), 1);
         assert_eq!(store.latest_sequence(actor_id), 2);
         store.clear(actor_id).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod workflow_atomic_commit_tests {
+    use super::*;
+
+    fn snapshot(actor_id: u64, sequence: u64) -> ActorSnapshot {
+        let mut state = HashMap::new();
+        state.insert("step_index".to_string(), PersistedValue::Int(2));
+        ActorSnapshot {
+            actor_id,
+            sequence,
+            state,
+            waiting_signal: None,
+            crdt_snapshot: None,
+            crdt_field_map: None,
+            authority_tokens: BTreeSet::new(),
+        }
+    }
+
+    fn completed(sequence: u64) -> WorkflowEvent {
+        WorkflowEvent::StepCompleted {
+            sequence,
+            step_name: "settle".to_string(),
+        }
+    }
+
+    #[test]
+    fn memory_workflow_commit_publishes_event_and_snapshot_at_one_sequence() {
+        let mut store = MemoryStore::new();
+        store
+            .commit_workflow_event_and_snapshot(41, completed(7), snapshot(41, 7))
+            .unwrap();
+
+        let events = store.read_workflow_events(41);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence(), 7);
+        assert_eq!(store.load_snapshot(41).unwrap().sequence, 7);
+        assert_eq!(store.latest_sequence(41), 7);
+    }
+
+    #[test]
+    fn workflow_commit_rejects_mismatched_sequence_without_partial_memory_write() {
+        let mut store = MemoryStore::new();
+        let error = store
+            .commit_workflow_event_and_snapshot(42, completed(8), snapshot(42, 9))
+            .expect_err("mismatched workflow commit must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(store.read_workflow_events(42).is_empty());
+        assert!(store.load_snapshot(42).is_none());
+    }
+
+    #[test]
+    fn json_workflow_commit_recovers_event_and_snapshot_from_one_commit_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_workflow_commit_test_{}_{}",
+            std::process::id(),
+            43
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        {
+            let mut store = JsonFileStore::new(&dir).unwrap();
+            store
+                .commit_workflow_event_and_snapshot(43, completed(11), snapshot(43, 11))
+                .unwrap();
+            assert!(store.workflow_commits_path(43).exists());
+            assert!(!store.workflow_events_path(43).exists());
+        }
+
+        let reopened = JsonFileStore::new(&dir).unwrap();
+        let events = reopened.read_workflow_events(43);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence(), 11);
+        let recovered = reopened.load_snapshot(43).unwrap();
+        assert_eq!(recovered.sequence, 11);
+        assert_eq!(
+            recovered.state.get("step_index"),
+            Some(&PersistedValue::Int(2))
+        );
+        assert_eq!(reopened.latest_sequence(43), 11);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_workflow_commit_repairs_partial_trailing_record_before_append() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_workflow_commit_tail_test_{}_{}",
+            std::process::id(),
+            45
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut store = JsonFileStore::new(&dir).unwrap();
+        store
+            .commit_workflow_event_and_snapshot(45, completed(1), snapshot(45, 1))
+            .unwrap();
+
+        let path = store.workflow_commits_path(45);
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(br#"{"event":"#).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        store
+            .commit_workflow_event_and_snapshot(45, completed(2), snapshot(45, 2))
+            .unwrap();
+
+        let events = store.read_workflow_events(45);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence(), 1);
+        assert_eq!(events[1].sequence(), 2);
+        assert_eq!(store.load_snapshot(45).unwrap().sequence, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn libsql_workflow_commit_is_visible_as_one_sequence() {
+        let mut store = LibsqlStore::in_memory().unwrap();
+        store
+            .commit_workflow_event_and_snapshot(44, completed(13), snapshot(44, 13))
+            .unwrap();
+
+        let events = store.read_workflow_events(44);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence(), 13);
+        assert_eq!(store.load_snapshot(44).unwrap().sequence, 13);
+        assert_eq!(store.latest_sequence(44), 13);
     }
 }
