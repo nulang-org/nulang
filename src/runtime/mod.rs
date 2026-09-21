@@ -5094,6 +5094,153 @@ impl Runtime {
             .unwrap_or(false)
     }
 
+    fn prepare_recovery_artifact_for_snapshot(
+        &mut self,
+        actor_id: u64,
+        snapshot: &ActorSnapshot,
+    ) -> Result<(), RecoveryIdentityError> {
+        let Some(raw_artifact_id) = snapshot.artifact_id.as_deref() else {
+            return Ok(());
+        };
+        let artifact_id = raw_artifact_id.parse::<crate::content_identity::ArtifactId>().map_err(
+            |_| RecoveryIdentityError::InvalidArtifactId {
+                actor_id,
+                value: raw_artifact_id.to_string(),
+            },
+        )?;
+        let raw_semantic_id = snapshot
+            .semantic_id
+            .as_deref()
+            .ok_or(RecoveryIdentityError::IncompleteIdentity { actor_id })?;
+        let expected_semantic = raw_semantic_id
+            .parse::<crate::content_identity::SemanticId>()
+            .map_err(|_| RecoveryIdentityError::InvalidSemanticId {
+                actor_id,
+                value: raw_semantic_id.to_string(),
+            })?;
+
+        if let Some((module, _, _)) = self.recovery_modules.get(&actor_id) {
+            if module.artifact_id() == Some(artifact_id) {
+                let actual = module.semantic_id.ok_or_else(|| {
+                    RecoveryIdentityError::CorruptHistoricalArtifact {
+                        actor_id,
+                        artifact_id,
+                        message: "identified recovery artifact has no SemanticId".to_string(),
+                    }
+                })?;
+                if actual != expected_semantic {
+                    return Err(RecoveryIdentityError::HistoricalSemanticMismatch {
+                        actor_id,
+                        expected: expected_semantic,
+                        actual,
+                    });
+                }
+                return Ok(());
+            }
+        }
+
+        let retained = match self.persistence.load_artifact(artifact_id) {
+            Ok(Some(artifact)) => artifact,
+            Ok(None) => {
+                return Err(RecoveryIdentityError::MissingHistoricalArtifact {
+                    actor_id,
+                    artifact_id,
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                return Err(RecoveryIdentityError::RetentionUnsupported {
+                    actor_id,
+                    artifact_id,
+                })
+            }
+            Err(error) => {
+                return Err(RecoveryIdentityError::CorruptHistoricalArtifact {
+                    actor_id,
+                    artifact_id,
+                    message: error.to_string(),
+                })
+            }
+        };
+        let module = retained.restore_module(artifact_id).map_err(|error| {
+            RecoveryIdentityError::CorruptHistoricalArtifact {
+                actor_id,
+                artifact_id,
+                message: error.to_string(),
+            }
+        })?;
+        let actual_semantic = module.semantic_id.ok_or_else(|| {
+            RecoveryIdentityError::CorruptHistoricalArtifact {
+                actor_id,
+                artifact_id,
+                message: "restored historical artifact has no SemanticId".to_string(),
+            }
+        })?;
+        if actual_semantic != expected_semantic {
+            return Err(RecoveryIdentityError::HistoricalSemanticMismatch {
+                actor_id,
+                expected: expected_semantic,
+                actual: actual_semantic,
+            });
+        }
+
+        let is_workflow = module.actor_metadata.iter().any(|meta| meta.is_workflow);
+        let offsets = crate::runtime::spawn::bytecode_offsets_for(&module, is_workflow);
+        let compensation_offsets: Vec<Option<usize>> = if is_workflow {
+            module
+                .actor_metadata
+                .iter()
+                .find(|meta| meta.is_workflow)
+                .map(|meta| {
+                    meta.behavior_indices
+                        .iter()
+                        .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    module
+                        .behaviors
+                        .iter()
+                        .map(|behavior| behavior.compensate_offset.map(|o| o as usize))
+                        .collect()
+                })
+        } else {
+            module
+                .behaviors
+                .iter()
+                .map(|behavior| behavior.compensate_offset.map(|o| o as usize))
+                .collect()
+        };
+        self.recovery_modules
+            .insert(actor_id, (module, offsets, compensation_offsets));
+        Ok(())
+    }
+
+    /// Verify and, when necessary, load the exact historical artifact pinned
+    /// by a durable snapshot. This is the machine-readable pre-replay identity
+    /// gate used by checked recovery.
+    pub fn prepare_recovery_artifact(
+        &mut self,
+        actor_id: u64,
+    ) -> Result<(), RecoveryIdentityError> {
+        let snapshot = self
+            .persistence
+            .load_snapshot(actor_id)
+            .ok_or(RecoveryIdentityError::SnapshotMissing { actor_id })?;
+        self.prepare_recovery_artifact_for_snapshot(actor_id, &snapshot)
+    }
+
+    /// Checked durable recovery preserving the exact reason strong identity
+    /// validation failed.
+    pub fn recover_actor_checked(
+        &mut self,
+        actor_id: u64,
+        identity_policy: RecoveryIdentityPolicy,
+    ) -> Result<u64, RecoveryIdentityError> {
+        self.prepare_recovery_artifact(actor_id)?;
+        self.recover_actor_with_identity_policy(actor_id, identity_policy)
+            .ok_or(RecoveryIdentityError::RecoveryFailed { actor_id })
+    }
+
     /// Recover a persistent actor from the latest snapshot and replay the journal.
     ///
     /// For workflow actors the durable workflow event journal is replayed
@@ -5115,6 +5262,11 @@ impl Runtime {
         identity_policy: RecoveryIdentityPolicy,
     ) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+
+        if let Err(error) = self.prepare_recovery_artifact_for_snapshot(actor_id, &snapshot) {
+            warn!("nulang-recover: {}", error);
+            return None;
+        }
 
         let recovery_semantic_id = self
             .recovery_modules
