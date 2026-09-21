@@ -55,13 +55,13 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		<label class="sr-only" for="hero-source">Nulang source code</label>
 		<textarea id="hero-source" class="hero-source" spellcheck="false">{starter}</textarea>
 		<div class="hero-playground-footer">
-			<button class="hero-run" type="button" disabled>
-				<span class="run-label">Loading compiler…</span>
+			<button class="hero-run" type="button">
+				<span class="run-label">Run</span>
 				<span aria-hidden="true">▶</span>
 			</button>
 			<span class="hero-runtime-note">Runs locally in WebAssembly</span>
 		</div>
-		<pre class="hero-output" aria-live="polite">Compiler loading…</pre>
+		<pre class="hero-output" aria-live="polite">Compiler loads on first run.</pre>
 	</div>
 </div>
 
@@ -77,39 +77,61 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		if (!source || !run || !label || !output) return;
 
 		let wasm = null;
+		let compilerPromise = null;
 
 		const setError = (message) => {
 			output.textContent = message;
 			output.classList.add('is-error');
-			run.disabled = true;
-			label.textContent = 'Compiler unavailable';
+			run.disabled = false;
+			label.textContent = 'Retry';
 		};
 
-		fetch('/playground/nulang_playground.wasm')
-			.then((response) => {
-				if (!response.ok) throw new Error('HTTP ' + response.status);
-				return response.arrayBuffer();
-			})
-			.then((bytes) => WebAssembly.instantiate(bytes, {}))
-			.then(({ instance }) => {
-				wasm = instance.exports;
-				if (
-					typeof wasm.nulang_alloc !== 'function' ||
-					typeof wasm.nulang_run !== 'function' ||
-					typeof wasm.nulang_free !== 'function'
-				) {
-					throw new Error('missing compiler exports');
-				}
-				run.disabled = false;
-				label.textContent = 'Run';
-				output.textContent = 'Compiler ready. Press Run.';
-			})
-			.catch(() => {
-				setError('Browser compiler unavailable. Open the full playground or build Nulang locally.');
-			});
+		async function loadCompiler() {
+			if (wasm) return wasm;
+			if (compilerPromise) return compilerPromise;
 
-		function execute() {
-			if (!wasm) return;
+			run.disabled = true;
+			label.textContent = 'Loading…';
+			output.classList.remove('is-error');
+			output.textContent = 'Loading browser compiler…';
+
+			compilerPromise = fetch('/playground/nulang_playground.wasm')
+				.then((response) => {
+					if (!response.ok) throw new Error('HTTP ' + response.status);
+					return response.arrayBuffer();
+				})
+				.then((bytes) => WebAssembly.instantiate(bytes, {}))
+				.then(({ instance }) => {
+					const exports = instance.exports;
+					if (
+						typeof exports.nulang_alloc !== 'function' ||
+						typeof exports.nulang_run !== 'function' ||
+						typeof exports.nulang_free !== 'function'
+					) {
+						throw new Error('missing compiler exports');
+					}
+					wasm = exports;
+					run.disabled = false;
+					label.textContent = 'Run';
+					return wasm;
+				})
+				.catch((error) => {
+					compilerPromise = null;
+					setError('Browser compiler unavailable. Open the full playground or build Nulang locally.');
+					throw error;
+				});
+
+			return compilerPromise;
+		}
+
+		async function execute() {
+			if (!wasm) {
+				try {
+					await loadCompiler();
+				} catch {
+					return;
+				}
+			}
 			output.classList.remove('is-error');
 			const encoded = new TextEncoder().encode(source.value);
 			const ptr = wasm.nulang_alloc(encoded.length);
