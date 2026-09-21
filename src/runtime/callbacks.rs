@@ -793,6 +793,11 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         constants: &[crate::bytecode::Constant],
         regs: &[crate::vm::Value],
     ) -> Option<crate::vm::Value> {
+        if effect_name == "Secret" {
+            let mut rt = self.runtime.borrow_mut();
+            let actor_id = rt.current_actor;
+            return rt.perform_secret_builtin(actor_id, op_name, constants, regs);
+        }
         if effect_name == "Workflow" && op_name == Some("query") {
             let workflow_id = regs.get(0)?.as_actor_id()?;
             let string_id = regs.get(1)?.as_string_id()?;
@@ -1602,6 +1607,14 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         regs: &[crate::vm::Value],
     ) -> Option<crate::vm::Value> {
         unsafe {
+            if effect_name == "Secret" {
+                return (*self.runtime).perform_secret_builtin(
+                    Some(self.actor_id),
+                    op_name,
+                    constants,
+                    regs,
+                );
+            }
             if effect_name == "Workflow" && op_name == Some("query") {
                 let workflow_id = regs.get(0)?.as_actor_id()?;
                 let string_id = regs.get(1)?.as_string_id()?;
