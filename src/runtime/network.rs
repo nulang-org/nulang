@@ -4079,7 +4079,7 @@ impl NetworkTransport for DeterministicNetworkTransport {
                         match sender.try_send(held) {
                             Ok(()) => {}
                             Err(mpsc::TrySendError::Full(error)) => {
-                                self.held.insert(to_node, error.0);
+                                self.held.insert(to_node, error);
                             }
                             Err(mpsc::TrySendError::Disconnected(_)) => {}
                         }
@@ -4116,7 +4116,7 @@ impl NetworkTransport for DeterministicNetworkTransport {
             if let Some(sender) = self.get_incoming_sender(to) {
                 match sender.try_send(pkt) {
                     Ok(()) => {}
-                    Err(mpsc::TrySendError::Full(error)) => retry.push((to, error.0)),
+                    Err(mpsc::TrySendError::Full(error)) => retry.push((to, error)),
                     Err(mpsc::TrySendError::Disconnected(_)) => {}
                 }
             }
