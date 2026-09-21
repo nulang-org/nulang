@@ -117,7 +117,6 @@ fn bench_jit_function_call_loop(c: &mut Criterion) {
 }
 
 
-\
 /// Measure where first-run JIT tiering becomes profitable against the pure
 /// interpreter for the same arithmetic loop.
 ///
