@@ -6,8 +6,8 @@ use nulang::compiler_identity::{
 };
 use nulang::content_identity::SemanticId;
 use nulang::runtime::{
-    ActorSnapshot, JsonFileStore, PersistenceStore, RecoveryIdentityError,
-    RecoveryIdentityPolicy, RetainedArtifact, Runtime,
+    ActorSnapshot, JsonFileStore, PersistenceStore, RecoveryIdentityError, RecoveryIdentityPolicy,
+    RetainedArtifact, Runtime,
 };
 
 fn proven_module(label: &str) -> CodeModule {
