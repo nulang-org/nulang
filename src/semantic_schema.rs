@@ -17,7 +17,8 @@ use crate::content_identity::SemanticId;
 use crate::hir;
 use crate::mir;
 use crate::semantic_identity::{
-    canonical_actor_definition_mir_bytes, canonical_mir_bytes, SemanticIdentityError,
+    canonical_actor_definition_mir_bytes, canonical_actor_definition_mir_bytes_at,
+    canonical_mir_bytes, SemanticIdentityError,
 };
 use crate::types::{Capability, Effect, EffectRow, PrimitiveType, Region, Type, TypeVar};
 
@@ -158,17 +159,50 @@ where
     let Some(mir_bytes) = canonical_actor_definition_mir_bytes(mir, mir_actor_name)? else {
         return Ok(None);
     };
+    Ok(Some(semantic_id_for_actor_definition_bytes(
+        &mir_bytes,
+        schema,
+        dependency_semantic_ids,
+    )))
+}
+
+/// Index-addressed typed definition identity. This is the canonical compiler
+/// integration path because actor metadata short names are not globally unique.
+pub fn semantic_id_for_actor_definition_at<I>(
+    mir: &mir::Module,
+    actor_index: usize,
+    schema: &ActorStateSchema,
+    dependency_semantic_ids: I,
+) -> Result<Option<SemanticId>, SemanticIdentityError>
+where
+    I: IntoIterator<Item = SemanticId>,
+{
+    let Some(mir_bytes) = canonical_actor_definition_mir_bytes_at(mir, actor_index)? else {
+        return Ok(None);
+    };
+    Ok(Some(semantic_id_for_actor_definition_bytes(
+        &mir_bytes,
+        schema,
+        dependency_semantic_ids,
+    )))
+}
+
+fn semantic_id_for_actor_definition_bytes<I>(
+    mir_bytes: &[u8],
+    schema: &ActorStateSchema,
+    dependency_semantic_ids: I,
+) -> SemanticId
+where
+    I: IntoIterator<Item = SemanticId>,
+{
     let schema_bytes = canonical_actor_state_schema_bytes(std::slice::from_ref(schema));
 
     let mut bytes = Vec::new();
     put_bytes(&mut bytes, TYPED_ACTOR_DEFINITION_SEMANTIC_VERSION);
-    put_bytes(&mut bytes, &mir_bytes);
+    put_bytes(&mut bytes, mir_bytes);
     put_bytes(&mut bytes, &schema_bytes);
 
-    Ok(Some(SemanticId::from_canonical_bytes(
-        &bytes,
-        dependency_semantic_ids,
-    )))
+    SemanticId::from_canonical_bytes(&bytes, dependency_semantic_ids)
 }
 
 /// Derive definition-scoped semantic identities for every lowered actor.
@@ -196,7 +230,12 @@ where
     }
 
     let mut identities = Vec::with_capacity(schemas.len());
-    for (actor, schema) in mir.actor_metadata.iter().zip(schemas.iter()) {
+    for (actor_index, (actor, schema)) in mir
+        .actor_metadata
+        .iter()
+        .zip(schemas.iter())
+        .enumerate()
+    {
         let schema_short_name = schema
             .actor_name
             .rsplit("::")
@@ -209,14 +248,14 @@ where
             });
         }
 
-        let semantic_id = semantic_id_for_actor_definition(
+        let semantic_id = semantic_id_for_actor_definition_at(
             mir,
-            &actor.name,
+            actor_index,
             schema,
             dependencies.iter().copied(),
         )?
         .ok_or_else(|| ActorDefinitionIdentityError::MissingMirActor(actor.name.clone()))?;
-        identities.push((actor.name.clone(), semantic_id));
+        identities.push((schema.actor_name.clone(), semantic_id));
     }
 
     Ok(identities)
@@ -736,6 +775,45 @@ mod tests {
             canonical_actor_state_schema_bytes(&[schemas[0].clone()]),
             canonical_actor_state_schema_bytes(&[schemas[1].clone()])
         );
+    }
+
+    #[test]
+    fn typed_definition_ids_preserve_duplicate_short_names_by_actor_index() {
+        let field_ty = primitive(PrimitiveType::Int);
+        let hir = hir::Module {
+            name: "typed".to_string(),
+            decls: vec![
+                hir::Decl::Module {
+                    name: "Billing".to_string(),
+                    exports: Vec::new(),
+                    decls: vec![hir::Decl::Actor(actor_def(
+                        "Counter",
+                        "value",
+                        field_ty.clone(),
+                    ))],
+                    span: Span::default(),
+                },
+                hir::Decl::Module {
+                    name: "Inventory".to_string(),
+                    exports: Vec::new(),
+                    decls: vec![hir::Decl::Actor(actor_def(
+                        "Counter",
+                        "other",
+                        field_ty,
+                    ))],
+                    span: Span::default(),
+                },
+            ],
+        };
+        let mut mir = mir::Module::new("typed");
+        mir.actor_metadata.push(ActorMeta::new("Counter"));
+        mir.actor_metadata.push(ActorMeta::new("Counter"));
+
+        let ids = actor_definition_semantic_ids_for_typed_program(&hir, &mir, []).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0].0, "typed::Billing::Counter");
+        assert_eq!(ids[1].0, "typed::Inventory::Counter");
+        assert_ne!(ids[0].1, ids[1].1);
     }
 
     #[test]
