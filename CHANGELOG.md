@@ -1555,6 +1555,11 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Artifact-backed durable actor recovery — 2026-09-21
+- **Strongly identified snapshots can now recover by their retained historical `ArtifactId`** through `Runtime::recover_actor_from_artifact_store`. The runtime verifies the retained executable/runtime sidecar, selects exactly one actor definition by the snapshot's definition-scoped `SemanticId`, and reuses the existing durable replay path.
+- **Recovery metadata now records the exact actor-definition index.** Mixed modules no longer infer actor/workflow/agent role, local defaults, or state models from unrelated definitions in the same module.
+- **Historical artifact recovery remains fail-closed.** Legacy snapshots without `ArtifactId`, missing runtime sidecars, unknown definition identities, ambiguous definition identities, or incompatible retained artifacts are rejected rather than guessed.
+
 ### Versioned runtime artifact manifests — 2026-09-21
 - **Retained NBC v1 artifacts can now carry an additive immutable runtime manifest** with whole-program `ArtifactId`/`SemanticId` codegen provenance plus definition-scoped semantic identities parallel to actor metadata. Frozen NBC v1 remains unchanged.
 - **The artifact store can rehydrate a fully identified `CodeModule` directly from retained bytes.** Runtime sidecars are independently versioned, BLAKE3-verified, no-clobber, and checked against the retained artifact ID and decoded NBC definition layout before identities are restored.

@@ -516,6 +516,20 @@ pub(crate) fn register_recovery_module(
     compensation_offsets: Vec<Option<usize>>,
     definition_semantic_id: Option<crate::content_identity::SemanticId>,
 ) {
+    let definition_index = definition_semantic_id.and_then(|definition_id| {
+        let mut matches = module
+            .actor_semantic_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| **candidate == definition_id)
+            .map(|(index, _)| index);
+        let index = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(index)
+    });
+
     rt.recovery_modules
         .insert(actor_id, (module, offsets, compensation_offsets));
     match definition_semantic_id {
@@ -524,6 +538,14 @@ pub(crate) fn register_recovery_module(
         }
         None => {
             rt.recovery_definition_semantic_ids.remove(&actor_id);
+        }
+    }
+    match definition_index {
+        Some(index) => {
+            rt.recovery_definition_indices.insert(actor_id, index);
+        }
+        None => {
+            rt.recovery_definition_indices.remove(&actor_id);
         }
     }
 }
