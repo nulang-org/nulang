@@ -31,7 +31,7 @@ pub enum MessagePayload {
         len: u8,
         values: [Value; INLINE_MESSAGE_VALUES],
     },
-    Shared(Arc<Vec<Value>>),
+    Shared(Arc<[Value]>),
 }
 
 impl MessagePayload {
@@ -45,7 +45,7 @@ impl MessagePayload {
                 values: inline,
             }
         } else {
-            MessagePayload::Shared(Arc::new(values.to_vec()))
+            MessagePayload::Shared(Arc::from(values))
         }
     }
 
@@ -54,7 +54,7 @@ impl MessagePayload {
         if values.len() <= INLINE_MESSAGE_VALUES {
             Self::from_slice(&values)
         } else {
-            MessagePayload::Shared(Arc::new(values))
+            MessagePayload::Shared(Arc::from(values))
         }
     }
 
@@ -62,7 +62,7 @@ impl MessagePayload {
     pub fn as_slice(&self) -> &[Value] {
         match self {
             MessagePayload::Inline { len, values } => &values[..*len as usize],
-            MessagePayload::Shared(values) => values.as_slice(),
+            MessagePayload::Shared(values) => values.as_ref(),
         }
     }
 
