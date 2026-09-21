@@ -3084,17 +3084,20 @@ mod tests {
                 sender_node,
                 priority,
                 trace_id,
+                delivery_id,
                 ..
             } => {
                 assert_eq!(target_actor, 42);
                 assert_eq!(behavior_name, "handle_msg");
                 assert_eq!(content_hash, None);
+        assert_eq!(delivery_id, None);
                 assert_eq!(sender_actor, 100);
                 assert_eq!(sender_node.0, local_node.0); // Same underlying u64
                 assert_eq!(priority, MessagePriority::Normal);
                 assert_eq!(payload.len(), 2);
                 assert_eq!(string_table, vec!["hello".to_string()]);
                 assert_eq!(trace_id.as_deref(), Some(trace));
+                assert_eq!(delivery_id, Some(77));
             }
             other => panic!("expected ActorMessage packet, got {:?}", other),
         }
@@ -3124,8 +3127,15 @@ mod tests {
         let result = resolver.parse_packet(packet);
         assert!(result.is_some());
 
-        let (target, behavior_name, msg, string_table, _object_table, content_hash) =
-            result.unwrap();
+        let (
+            target,
+            behavior_name,
+            msg,
+            string_table,
+            _object_table,
+            content_hash,
+            delivery_id,
+        ) = result.unwrap();
         assert_eq!(target, 77);
         assert_eq!(behavior_name, "inc");
         assert_eq!(content_hash, None);
