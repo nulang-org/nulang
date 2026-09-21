@@ -237,6 +237,14 @@ fn fabric_tracked_publish_reports_local_transport_backpressure_without_ticket() 
     }
     assert!(saturated, "bounded transport channel should saturate");
 
+    let untracked = a
+        .fabric_publish_report("events.created", &[Value::int(0)])
+        .unwrap();
+    assert_eq!(untracked.selected, 1);
+    assert_eq!(untracked.forwarded_remote, 0);
+    assert_eq!(untracked.backpressured, 1);
+    assert_eq!(untracked.rejected, 0);
+
     let report = a
         .fabric_publish_tracked("events.created", &[Value::int(1)])
         .unwrap();
