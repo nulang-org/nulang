@@ -215,10 +215,10 @@ pub fn bind_request_arguments(
         if binding.source == RouteBindingSource::Body {
             if let Some(codec) = &binding.codec {
                 let actual_media_type = request_media_type(values.headers);
-                if actual_media_type
-                    .as_deref()
-                    .is_none_or(|actual| !actual.eq_ignore_ascii_case(&codec.media_type))
-                {
+                if !matches!(
+                    actual_media_type.as_deref(),
+                    Some(actual) if actual.eq_ignore_ascii_case(&codec.media_type)
+                ) {
                     return Err(error(
                         binding,
                         RequestDecodeErrorKind::UnsupportedMediaType,
@@ -443,7 +443,11 @@ mod tests {
             handler_param: source_name.into(),
             handler_index: index,
             ty: Some(ty.into()),
-            codec: None,
+            codec: if source == RouteBindingSource::Body {
+                crate::web::codec::body_codec_for_type(Some(ty))
+            } else {
+                None
+            },
         }
     }
 
@@ -474,6 +478,92 @@ mod tests {
         assert_eq!(args[0].value, Constant::Int(42));
         assert_eq!(args[1].value, Constant::Int(25));
         assert_eq!(args[2].value, Constant::String("abc".into()));
+    }
+
+    #[test]
+    fn typed_json_body_validates_media_and_preserves_encoded_text() {
+        let empty = HashMap::new();
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        )];
+        let values = RequestBindingValues {
+            path: &empty,
+            query: &empty,
+            headers: &headers,
+            cookies: &empty,
+            body: Some(r#"{"name":"Ada"}"#),
+            form: &empty,
+        };
+
+        let args = bind_request_arguments(
+            &[binding(
+                RouteBindingSource::Body,
+                "body",
+                0,
+                "Json[CreateUser]",
+            )],
+            1,
+            &values,
+        )
+        .unwrap();
+
+        assert_eq!(
+            args[0].value,
+            Constant::String(r#"{"name":"Ada"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn malformed_json_body_is_structured_400() {
+        let empty = HashMap::new();
+        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        let values = RequestBindingValues {
+            path: &empty,
+            query: &empty,
+            headers: &headers,
+            cookies: &empty,
+            body: Some("{"),
+            form: &empty,
+        };
+
+        let error = bind_request_arguments(
+            &[binding(RouteBindingSource::Body, "body", 0, "Json[User]")],
+            1,
+            &values,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, RequestDecodeErrorKind::InvalidBody);
+        assert_eq!(error.http_status(), 400);
+        assert_eq!(error.code(), "invalid_request_body");
+        assert_eq!(error.problem_details()["expected_media_type"], "application/json");
+    }
+
+    #[test]
+    fn typed_json_body_rejects_wrong_media_type_with_415() {
+        let empty = HashMap::new();
+        let headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
+        let values = RequestBindingValues {
+            path: &empty,
+            query: &empty,
+            headers: &headers,
+            cookies: &empty,
+            body: Some(r#"{"name":"Ada"}"#),
+            form: &empty,
+        };
+
+        let error = bind_request_arguments(
+            &[binding(RouteBindingSource::Body, "body", 0, "Json[User]")],
+            1,
+            &values,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, RequestDecodeErrorKind::UnsupportedMediaType);
+        assert_eq!(error.http_status(), 415);
+        assert_eq!(error.code(), "unsupported_request_media_type");
+        assert_eq!(error.problem_details()["expected_media_type"], "application/json");
     }
 
     #[test]
