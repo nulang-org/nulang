@@ -257,7 +257,6 @@ struct WorkflowCommitRecord {
     snapshot: ActorSnapshot,
 }
 
-
 /// Persistence backend trait. Implementations may be in-memory or disk-backed.
 pub trait PersistenceStore: Send + Sync {
     /// Persist a snapshot of durable actor state.
@@ -3126,10 +3125,12 @@ mod json_file_store_tests {
         assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
 
         // The atomic (temp + rename) write must not leave its temp file behind.
-        assert!(!store
-            .snapshot_path(1)
-            .with_file_name("snapshot.json.tmp")
-            .exists());
+        assert!(
+            !store
+                .snapshot_path(1)
+                .with_file_name("snapshot.json.tmp")
+                .exists()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
