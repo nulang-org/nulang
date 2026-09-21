@@ -219,6 +219,15 @@ pub(crate) fn send_distributed_tracked(
     behavior: &str,
     args: &[Value],
 ) -> Option<u64> {
+    try_send_distributed_tracked(rt, target, behavior, args).delivery_id
+}
+
+pub(crate) fn try_send_distributed_tracked(
+    rt: &mut Runtime,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+) -> crate::runtime::TrackedSendAdmission {
     send_distributed_impl(rt, target, behavior, args, true)
 }
 
@@ -228,37 +237,57 @@ fn send_distributed_impl(
     behavior: &str,
     args: &[Value],
     tracked: bool,
-) -> Option<u64> {
+) -> crate::runtime::TrackedSendAdmission {
     if !rt.distributed.enabled {
         let actor_id = match target {
             ActorAddress::Local { actor_id } => actor_id,
             ActorAddress::Remote { actor_id, .. } => actor_id,
         };
-        rt.send_message(actor_id, behavior, args);
-        return None;
+        return crate::runtime::TrackedSendAdmission {
+            admission: rt.send_message(actor_id, behavior, args),
+            delivery_id: None,
+        };
     }
     if let ActorAddress::Local { actor_id } = target {
-        rt.send_message(actor_id, behavior, args);
-        return None;
+        return crate::runtime::TrackedSendAdmission {
+            admission: rt.send_message(actor_id, behavior, args),
+            delivery_id: None,
+        };
     }
-    let mut transport = rt.distributed.transport.take()?;
+
+    let mut transport = match rt.distributed.transport.take() {
+        Some(transport) => transport,
+        None => {
+            return crate::runtime::TrackedSendAdmission {
+                admission: crate::runtime::MessageAdmission::Rejected,
+                delivery_id: None,
+            }
+        }
+    };
     let cluster = match rt.distributed.cluster.take() {
-        Some(c) => c,
+        Some(cluster) => cluster,
         None => {
             rt.distributed.transport = Some(transport);
-            return None;
+            return crate::runtime::TrackedSendAdmission {
+                admission: crate::runtime::MessageAdmission::Rejected,
+                delivery_id: None,
+            };
         }
     };
     let mut resolver = match rt.distributed.resolver.take() {
-        Some(r) => r,
+        Some(resolver) => resolver,
         None => {
             rt.distributed.transport = Some(transport);
             rt.distributed.cluster = Some(cluster);
-            return None;
+            return crate::runtime::TrackedSendAdmission {
+                admission: crate::runtime::MessageAdmission::Rejected,
+                delivery_id: None,
+            };
         }
     };
-    let delivery_id = if tracked {
-        distributed::send_distributed_tracked(
+
+    let result = if tracked {
+        distributed::try_send_distributed_tracked(
             rt,
             &mut transport,
             &cluster,
@@ -277,12 +306,16 @@ fn send_distributed_impl(
             behavior,
             args,
         );
-        None
+        crate::runtime::TrackedSendAdmission {
+            admission: crate::runtime::MessageAdmission::Forwarded,
+            delivery_id: None,
+        }
     };
+
     rt.distributed.transport = Some(transport);
     rt.distributed.cluster = Some(cluster);
     rt.distributed.resolver = Some(resolver);
-    delivery_id
+    result
 }
 
 /// Process incoming network packets and cluster actions.
