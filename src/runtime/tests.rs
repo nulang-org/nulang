@@ -1967,11 +1967,23 @@ fn test_libsql_store_save_load_snapshot() {
     let mut store = LibsqlStore::in_memory().unwrap();
     let mut state = HashMap::new();
     state.insert("count".to_string(), PersistedValue::Int(42));
+    let definition_id =
+        crate::content_identity::SemanticId::from_canonical_bytes(b"sqlite-definition", []);
+    let program_id =
+        crate::content_identity::SemanticId::from_canonical_bytes(b"sqlite-program", []);
+    let artifact_id = crate::content_identity::ArtifactId::from_semantic(
+        program_id,
+        "nulang-test",
+        "portable-nulang-vm",
+        "nbc-v1",
+        "bytecode",
+        std::iter::empty::<&str>(),
+    );
     let snapshot = ActorSnapshot {
         actor_id: 1,
         sequence: 3,
-        semantic_id: None,
-        artifact_id: None,
+        semantic_id: Some(definition_id.to_string()),
+        artifact_id: Some(artifact_id.to_string()),
         state,
         waiting_signal: None,
         crdt_snapshot: None,
@@ -1983,6 +1995,8 @@ fn test_libsql_store_save_load_snapshot() {
     let loaded = store.load_snapshot(1).unwrap();
     assert_eq!(loaded.actor_id, 1);
     assert_eq!(loaded.sequence, 3);
+    assert_eq!(loaded.semantic_id.as_deref(), Some(definition_id.to_string().as_str()));
+    assert_eq!(loaded.artifact_id.as_deref(), Some(artifact_id.to_string().as_str()));
     assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
 }
 
@@ -2095,6 +2109,7 @@ fn test_libsql_store_persists_to_disk() {
                 actor_id: 1,
                 sequence: 1,
                 semantic_id: None,
+                artifact_id: None,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2202,6 +2217,7 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
                 actor_id: 1,
                 sequence: 3,
                 semantic_id: None,
+                artifact_id: None,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3])]),
