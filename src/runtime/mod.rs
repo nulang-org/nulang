@@ -5207,18 +5207,38 @@ impl Runtime {
                 }
             };
         let workflow_events = self.persistence.read_workflow_events(actor_id);
-        let is_workflow = self
+        let recovery_definition_index = self.recovery_definition_indices.get(&actor_id).copied();
+        let selected_recovery_meta = self
             .recovery_modules
             .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_workflow))
+            .and_then(|(module, _, _)| {
+                recovery_definition_index.and_then(|index| module.actor_metadata.get(index))
+            })
+            .cloned();
+        let is_workflow = selected_recovery_meta
+            .as_ref()
+            .map(|meta| meta.is_workflow)
+            .or_else(|| {
+                self.recovery_modules
+                    .get(&actor_id)
+                    .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_workflow))
+            })
             .unwrap_or(!workflow_events.is_empty());
-        let is_agent = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_agent))
+        let is_agent = selected_recovery_meta
+            .as_ref()
+            .map(|meta| meta.is_agent)
+            .or_else(|| {
+                self.recovery_modules
+                    .get(&actor_id)
+                    .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_agent))
+            })
             .unwrap_or(false);
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        let actor_name = selected_recovery_meta
+            .as_ref()
+            .map(|meta| meta.name.clone())
+            .unwrap_or_else(|| format!("actor_{}", actor_id));
+        let mut actor = Actor::new(actor_id, actor_name, 0);
         actor.definition_semantic_id = verified_definition_semantic_id;
         actor.execution_artifact_id = verified_execution_artifact_id;
         actor.persistent = true;
@@ -5267,17 +5287,26 @@ impl Runtime {
         }
         // Parse cached retry/fallback configs from restored state for agents.
         if is_agent {
-            if let Some(module) = actor
-                .bytecode_module
+            let selected_defaults = selected_recovery_meta
                 .as_ref()
-                .or_else(|| self.recovery_modules.get(&actor_id).map(|(m, _, _)| m))
-            {
+                .map(|meta| meta.state_defaults.as_slice());
+            if let Some(defaults) = selected_defaults {
+                for (name, c) in defaults {
+                    if let crate::bytecode::Constant::String(json) = c {
+                        if name == "retry_config" {
+                            actor.retry_config = serde_json::from_str(json).ok();
+                        } else if name == "fallback_config" {
+                            actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
+                        }
+                    }
+                }
+            } else if let Some(module) = self.recovery_modules.get(&actor_id).map(|(m, _, _)| m) {
                 for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
                     if let crate::bytecode::Constant::String(json) = c {
                         if name == "retry_config" {
-                            actor.retry_config = serde_json::from_str(&json).ok();
+                            actor.retry_config = serde_json::from_str(json).ok();
                         } else if name == "fallback_config" {
-                            actor.fallback_config = serde_json::from_str(&json).unwrap_or_default();
+                            actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
                         }
                     }
                 }
@@ -5320,7 +5349,18 @@ impl Runtime {
         // persisted events legitimately has no value yet either, but
         // that's a separate, pre-existing question this fix doesn't
         // change.
-        if let Some(module) = self.recovery_modules.get(&actor_id).map(|(m, _, _)| m) {
+        if let Some(meta) = selected_recovery_meta.as_ref() {
+            for (name, c) in &meta.state_defaults {
+                if actor.get_state_field(name).is_some() {
+                    continue;
+                }
+                let v = match c {
+                    crate::bytecode::Constant::String(s) => actor.allocate_string(s),
+                    other => crate::vm::constant_to_value(other),
+                };
+                actor.set_state_field(name, v);
+            }
+        } else if let Some(module) = self.recovery_modules.get(&actor_id).map(|(m, _, _)| m) {
             for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
                 if actor.get_state_field(name).is_some() {
                     continue;
@@ -5348,12 +5388,19 @@ impl Runtime {
             // would drop Durable fields from the snapshot entirely, and
             // EventSourced fields would stop accumulating via emitted
             // events.
-            actor.state_models = module
-                .actor_metadata
-                .iter()
-                .flat_map(|m| &m.state_models)
-                .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
-                .collect();
+            actor.state_models = if let Some(meta) = selected_recovery_meta.as_ref() {
+                meta.state_models
+                    .iter()
+                    .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+                    .collect()
+            } else {
+                module
+                    .actor_metadata
+                    .iter()
+                    .flat_map(|m| &m.state_models)
+                    .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+                    .collect()
+            };
         }
         if is_workflow {
             self.actors.insert(actor_id, actor);
