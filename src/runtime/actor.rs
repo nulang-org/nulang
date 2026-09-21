@@ -189,6 +189,10 @@ pub struct Actor {
     pub iso_arena: crate::iso_arena::IsoArena,
     pub state_data: HashMap<String, Value>, // Named actor state fields
     pub state_models: HashMap<String, StateModel>, // Persistence model per field
+    /// Ephemeral per-field mutation revisions used by reactive query
+    /// dependency tracking. Revisions intentionally reset when an actor is
+    /// reconstructed; subscriptions/query handlers are also ephemeral today.
+    state_revisions: HashMap<String, u64>,
     pub event_log: Vec<(String, Vec<Value>)>, // Emitted events for event_sourced actors
     /// Last persisted event sequence per EventSourced field, for compaction tracking.
     pub event_sourced_sequences: HashMap<String, u64>,
@@ -342,6 +346,7 @@ impl Actor {
             iso_arena: crate::iso_arena::IsoArena::new(),
             state_data: HashMap::new(),
             state_models: HashMap::new(),
+            state_revisions: HashMap::new(),
             event_log: Vec::new(),
             event_sourced_sequences: HashMap::new(),
             event_sourced_compaction_interval: 100,
@@ -529,6 +534,13 @@ impl Actor {
         let name_str = name.into();
         self.dirty_fields.insert(name_str.clone());
         self.state_data.insert(name_str.clone(), value);
+        let revision = self.state_revisions.entry(name_str.clone()).or_insert(0);
+        *revision = revision.wrapping_add(1);
+        // Reserve zero for "never written" even after the practically
+        // unreachable u64 wraparound.
+        if *revision == 0 {
+            *revision = 1;
+        }
 
         // Auto-sync CRDT fields on mutation
         if let Some(StateModel::Crdt(_crdt_type)) = self.state_models.get(&name_str) {
@@ -539,6 +551,15 @@ impl Actor {
     /// Get a named state field.
     pub fn get_state_field(&self, name: &str) -> Option<Value> {
         self.state_data.get(name).copied()
+    }
+
+    /// Ephemeral mutation revision for one state field.
+    ///
+    /// Revision 0 means the field has not been written since this actor
+    /// instance was constructed. The token is for in-process reactive query
+    /// invalidation, not durable state identity.
+    pub fn state_revision(&self, name: &str) -> u64 {
+        self.state_revisions.get(name).copied().unwrap_or(0)
     }
 
     /// Check if the actor has exceeded its per-turn reduction quota and should yield.
