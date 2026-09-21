@@ -4,7 +4,7 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -251,6 +251,13 @@ impl WorkflowEvent {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WorkflowCommitRecord {
+    event: WorkflowEvent,
+    snapshot: ActorSnapshot,
+}
+
+
 /// Persistence backend trait. Implementations may be in-memory or disk-backed.
 pub trait PersistenceStore: Send + Sync {
     /// Persist a snapshot of durable actor state.
@@ -286,6 +293,29 @@ pub trait PersistenceStore: Send + Sync {
 
     /// Append a workflow event to the actor's event journal.
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()>;
+
+    /// Atomically publish one workflow event and the checkpoint produced by
+    /// that same logical transition. The event and snapshot must share a
+    /// sequence number.
+    ///
+    /// Built-in durable backends override this with a native transaction,
+    /// write batch, or single-record commit log. The default keeps third-party
+    /// stores source-compatible but cannot guarantee atomicity.
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+        self.append_workflow_event(actor_id, event)?;
+        self.save_snapshot(snapshot)
+    }
 
     /// Read all workflow events for an actor in order.
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent>;
@@ -532,6 +562,26 @@ impl PersistenceStore for MemoryStore {
         Ok(())
     }
 
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+        self.workflow_events
+            .entry(actor_id)
+            .or_default()
+            .push(event);
+        self.snapshots.insert(actor_id, snapshot);
+        Ok(())
+    }
+
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
         self.workflow_events
             .get(&actor_id)
@@ -655,6 +705,21 @@ impl JsonFileStore {
         self.actor_dir(actor_id).join("workflow_events.jsonl")
     }
 
+    fn workflow_commits_path(&self, actor_id: u64) -> PathBuf {
+        self.actor_dir(actor_id).join("workflow_commits.jsonl")
+    }
+
+    fn read_workflow_commits(&self, actor_id: u64) -> Vec<WorkflowCommitRecord> {
+        let path = self.workflow_commits_path(actor_id);
+        let data = match fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(_) => return Vec::new(),
+        };
+        data.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
     fn events_path(&self, actor_id: u64) -> PathBuf {
         self.actor_dir(actor_id).join("events.jsonl")
     }
@@ -714,23 +779,40 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
-        let path = self.snapshot_path(actor_id);
-        // A missing file is the normal "no snapshot yet" case — stay silent.
-        let data = fs::read_to_string(&path).ok()?;
-        match serde_json::from_str(&data) {
-            Ok(snapshot) => Some(snapshot),
-            Err(e) => {
-                // A present-but-unparseable snapshot means corruption (e.g. an
-                // older non-atomic write); log it instead of silently resetting
-                // the actor's durable state on recovery.
-                warn!(
-                    "nulang-persist: failed to parse snapshot for actor {} at {}: {}",
-                    actor_id,
-                    path.display(),
-                    e
-                );
-                None
+        let standalone = {
+            let path = self.snapshot_path(actor_id);
+            match fs::read_to_string(&path) {
+                Ok(data) => match serde_json::from_str(&data) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        warn!(
+                            "nulang-persist: failed to parse snapshot for actor {} at {}: {}",
+                            actor_id,
+                            path.display(),
+                            error
+                        );
+                        None
+                    }
+                },
+                Err(_) => None,
             }
+        };
+        let committed = self
+            .read_workflow_commits(actor_id)
+            .into_iter()
+            .last()
+            .map(|record| record.snapshot);
+
+        match (standalone, committed) {
+            (Some(standalone), Some(committed)) => {
+                if committed.sequence >= standalone.sequence {
+                    Some(committed)
+                } else {
+                    Some(standalone)
+                }
+            }
+            (Some(snapshot), None) | (None, Some(snapshot)) => Some(snapshot),
+            (None, None) => None,
         }
     }
 
@@ -793,15 +875,47 @@ impl PersistenceStore for JsonFileStore {
         Ok(())
     }
 
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+        let dir = self.actor_dir(actor_id);
+        fs::create_dir_all(&dir)?;
+        let path = self.workflow_commits_path(actor_id);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let record = WorkflowCommitRecord { event, snapshot };
+        let json = serde_json::to_string(&record)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        writeln!(file, "{}", json)?;
+        file.sync_all()
+    }
+
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        let mut by_sequence = BTreeMap::new();
         let path = self.workflow_events_path(actor_id);
-        let data = match fs::read_to_string(path) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
-        };
-        data.lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        if let Ok(data) = fs::read_to_string(path) {
+            for event in data
+                .lines()
+                .filter_map(|line| serde_json::from_str::<WorkflowEvent>(line).ok())
+            {
+                by_sequence.insert(event.sequence(), event);
+            }
+        }
+        for record in self.read_workflow_commits(actor_id) {
+            by_sequence.insert(record.event.sequence(), record.event);
+        }
+        by_sequence.into_values().collect()
     }
 
     fn scan_workflow_events_from(
@@ -810,12 +924,29 @@ impl PersistenceStore for JsonFileStore {
         start_sequence: u64,
         limit: usize,
     ) -> Vec<WorkflowEvent> {
-        scan_jsonl(
+        if limit == 0 {
+            return Vec::new();
+        }
+        let legacy = scan_jsonl(
             self.workflow_events_path(actor_id),
             start_sequence,
             limit,
             WorkflowEvent::sequence,
-        )
+        );
+        let committed: Vec<WorkflowCommitRecord> = scan_jsonl(
+            self.workflow_commits_path(actor_id),
+            start_sequence,
+            limit,
+            |record: &WorkflowCommitRecord| record.event.sequence(),
+        );
+        let mut by_sequence = BTreeMap::new();
+        for event in legacy {
+            by_sequence.insert(event.sequence(), event);
+        }
+        for record in committed {
+            by_sequence.insert(record.event.sequence(), record.event);
+        }
+        by_sequence.into_values().take(limit).collect()
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
