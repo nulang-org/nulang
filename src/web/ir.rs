@@ -11,6 +11,7 @@ use crate::web::bindings::{compile_route_bindings, RouteBindingContract};
 use crate::web::contracts::{HandlerParamContract, RouteContract, RouteParamContract};
 use crate::web::modules::ModuleRegistry;
 use crate::web::package_contracts::compile_contracts_from_tree;
+use crate::web::response::{response_contract, ResponseContract};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -39,6 +40,10 @@ pub struct IrRoute {
     pub bindings: Vec<RouteBindingContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_type: Option<String>,
+    /// Structured transport semantics derived from the declared response type.
+    /// This remains additive/optional for Deployment IR v1 compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ResponseContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
     /// Declared handler effect row. These are semantic effects, not middleware
@@ -136,6 +141,7 @@ pub fn generate_deployment_ir(
                 .map(|compilation| compilation.bindings)
                 .unwrap_or_default(),
             response_type: contract.and_then(|c| c.response_type.clone()),
+            response: contract.and_then(|c| response_contract(c.response_type.as_deref())),
             error_type: contract.and_then(|c| c.error_type.clone()),
             effects: contract.map(|c| c.effects.clone()).unwrap_or_default(),
             reference_capability: contract.and_then(|c| c.reference_capability.clone()),
