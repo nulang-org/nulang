@@ -533,6 +533,7 @@ mod authority_tests {
     use super::*;
     use crate::authority::AuthorityGrant;
     use crate::bytecode::CodeModule;
+    use crate::runtime::persistence::PersistenceStore;
 
     fn secret_manifest(name: &str) -> AuthorityManifest {
         AuthorityManifest::from_tokens([format!("Secret::Read({name})")].iter().map(String::as_str))
