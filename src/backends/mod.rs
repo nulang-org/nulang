@@ -316,12 +316,11 @@ pub trait Transport: Send {
     );
     fn try_send(
         &mut self,
-        to_node: crate::runtime::NodeId,
-        to_addr: std::net::SocketAddr,
-        packet: crate::runtime::Packet,
+        _to_node: crate::runtime::NodeId,
+        _to_addr: std::net::SocketAddr,
+        _packet: crate::runtime::Packet,
     ) -> crate::runtime::TransportAdmission {
-        self.send(to_node, to_addr, packet);
-        crate::runtime::TransportAdmission::Accepted
+        crate::runtime::TransportAdmission::Rejected
     }
     fn receive(&self) -> Vec<crate::runtime::IncomingPacket>;
     fn node_id(&self) -> crate::runtime::NodeId;
