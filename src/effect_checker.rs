@@ -1155,6 +1155,10 @@ impl EffectChecker {
         for decl in &flat {
             self.check_decl(decl)?;
         }
+        // RFC 0008 migrations are replay transformations, not ordinary
+        // effect-handled application code. Enforce their stricter purity
+        // contract in the same public module pipeline used by CLI/LSP/FFI.
+        crate::migration_purity::check_module(decls)?;
         check_durable_determinism(&flat)?;
         self.check_resource_grants()?;
         Ok(())

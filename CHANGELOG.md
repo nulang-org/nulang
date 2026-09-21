@@ -42,6 +42,9 @@ version + migration.*
 
 ## Stable tier
 
+### RFC 0008 migration purity enforcement — 2026-09-21
+- **Entity migrations now fail compilation when they contain effects or other replay-unsafe operations** (`src/migration_purity.rs`, `src/effect_checker.rs`). The compiler rejects direct or transitive `perform`, `spawn`, `send`, `ask`, receive/suspension, actor migration, grain lookup, continuation resume, defer/errdefer, and direct extern/FFI calls while preserving pure helper calls and replay-stream `emit`. The gate runs through the public effect-checking pipeline used by CLI, LSP, REPL, DAP, FFI, and tests.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
