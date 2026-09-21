@@ -13,6 +13,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+fn noop_test_behavior(_actor: &mut Actor, _args: &[Value]) {}
+
+fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
+    rt.actors
+        .get_mut(&actor_id)
+        .expect("test actor exists")
+        .register_behavior(name, noop_test_behavior);
+}
+
 #[test]
 fn test_authority_snapshot_round_trip_recovery() {
     let mut rt = Runtime::new();
@@ -297,6 +306,8 @@ fn test_run_scheduler_processes_all_actors() {
     let mut rt = Runtime::new();
     let a1 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
     let a2 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
+    declare_test_behavior(&mut rt, a1, "add");
+    declare_test_behavior(&mut rt, a2, "add");
     rt.send_message(a1, "add", &[Value::int(10)]);
     rt.send_message(a2, "add", &[Value::int(20)]);
     rt.run_scheduler();
@@ -372,6 +383,8 @@ fn test_actor_set_priority_changes_scheduling() {
     let mut rt = Runtime::new();
     let a = rt.spawn_actor(Box::new(|| vec![]));
     let b = rt.spawn_actor(Box::new(|| vec![]));
+    declare_test_behavior(&mut rt, a, "noop");
+    declare_test_behavior(&mut rt, b, "noop");
     // Drain the spawn-time queue entries (both enqueued at Normal).
     assert_eq!(rt.scheduler.dequeue(), Some(a));
     assert_eq!(rt.scheduler.dequeue(), Some(b));
@@ -1257,6 +1270,7 @@ fn test_distributed_remote_address_local_fallback() {
     // the distribution wrapper: distributed disabled → local delivery.
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_actor(Box::new(|| vec![("val".to_string(), Value::int(0))]));
+    declare_test_behavior(&mut rt, actor_id, "test");
 
     // Distributed is disabled by default: a remote address still delivers.
     let remote_addr = ActorAddress::remote(NodeId::LOCAL, actor_id);
