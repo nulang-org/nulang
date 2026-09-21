@@ -273,8 +273,16 @@ impl MigrationManifest {
     }
 
     /// Deterministic identity for the declarative migration topology.
+    ///
+    /// Artifact-local executable bindings are deliberately excluded: adding
+    /// an unrelated function may shift function-table indices without
+    /// changing the source migration contract.
     pub fn digest(&self) -> Result<String, MigrationManifestError> {
-        let json = self.to_json()?;
+        let mut topology = self.clone();
+        for contract in &mut topology.contracts {
+            contract.state_function_index = None;
+        }
+        let json = topology.to_json()?;
         Ok(blake3::hash(json.as_bytes()).to_hex().to_string())
     }
 }
@@ -332,6 +340,25 @@ mod tests {
         let restored = MigrationManifest::from_json(&json).unwrap();
         assert_eq!(restored, manifest);
         assert_eq!(restored.digest().unwrap(), manifest.digest().unwrap());
+    }
+
+    #[test]
+    fn topology_digest_ignores_artifact_local_state_function_binding() {
+        let (version, migrations) = entity_version_and_migrations(
+            r#"
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                migration from 1 to 2 {
+                    state => { self.balance = self.balance + 1 }
+                }
+            }
+            "#,
+        );
+        let mut manifest = MigrationManifest::from_decls(version, &migrations).unwrap();
+        let topology_digest = manifest.digest().unwrap();
+        manifest.contracts[0].state_function_index = Some(17);
+        assert_eq!(manifest.digest().unwrap(), topology_digest);
     }
 
     #[test]
