@@ -159,12 +159,10 @@ fn choose(value: Choice) -> Int {
         .find(|diagnostic| diagnostic["code"] == "W0201")
         .expect("W0201 must be present in JSON diagnostics");
     assert_eq!(warning["severity"], "warning");
-    assert!(
-        warning["message"]
-            .as_str()
-            .expect("warning message")
-            .contains("No")
-    );
+    assert!(warning["message"]
+        .as_str()
+        .expect("warning message")
+        .contains("No"));
     assert!(
         !stderr.contains("warning[W0201]"),
         "JSON mode must not also emit the human warning renderer: {stderr:?}"
@@ -207,8 +205,7 @@ fn choose(value: Choice) -> Int {
     assert!(
         diags
             .iter()
-            .any(|diagnostic| diagnostic["code"] == "W0201"
-                && diagnostic["severity"] == "warning"),
+            .any(|diagnostic| diagnostic["code"] == "W0201" && diagnostic["severity"] == "warning"),
         "strict mode must retain the original warning: {diags:?}"
     );
     assert!(
