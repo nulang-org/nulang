@@ -59,6 +59,14 @@ fn preflight_persistent_snapshot(
             expected_schema_name,
         )
         .map_err(|error| error.to_string())?;
+    } else if let Some(schema_name) = snapshot
+        .schema_name
+        .as_deref()
+        .filter(|schema_name| !schema_name.is_empty())
+    {
+        return Err(format!(
+            "persisted actor schema '{schema_name}' cannot be activated without compiler-owned schema context"
+        ));
     }
 
     Ok(Some((snapshot, manifest)))
@@ -688,6 +696,47 @@ mod authority_tests {
         assert!(
             !rt.actors.contains_key(&actor_id),
             "schema mismatch must not publish a runnable actor"
+        );
+    }
+
+    #[test]
+    fn schema_bound_restart_without_schema_context_fails_closed() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut rt = Runtime::new();
+        let actor_id = 910_004;
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                schema_name: Some("Counter".to_string()),
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            None,
+        );
+
+        assert_eq!(returned, actor_id);
+        assert!(
+            !init_ran.get(),
+            "schema-bound snapshot must not initialize without schema context"
+        );
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "schema-bound snapshot must not publish through a generic spawn"
         );
     }
 

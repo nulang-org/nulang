@@ -7125,7 +7125,6 @@ fn test_send_to_grain_cross_shard_routes_and_hydrates() {
     );
 }
 
-
 #[test]
 fn p0_unknown_named_send_is_rejected() {
     fn increment(actor: &mut Actor, _args: &[Value]) {
