@@ -1555,6 +1555,11 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Versioned runtime artifact manifests — 2026-09-21
+- **Retained NBC v1 artifacts can now carry an additive immutable runtime manifest** with whole-program `ArtifactId`/`SemanticId` codegen provenance plus definition-scoped semantic identities parallel to actor metadata. Frozen NBC v1 remains unchanged.
+- **The artifact store can rehydrate a fully identified `CodeModule` directly from retained bytes.** Runtime sidecars are independently versioned, BLAKE3-verified, no-clobber, and checked against the retained artifact ID and decoded NBC definition layout before identities are restored.
+- **Source-only changes remain idempotent.** `SourceId` is intentionally excluded from the runtime sidecar because it does not participate in executable identity; conflicting definition provenance, missing sidecars, and tampered sidecars fail closed instead of being guessed.
+
 ### Exact executable provenance for durable actors — 2026-09-21
 - **Durable actors now keep definition compatibility and executable provenance as separate identities.** `SemanticId` continues to gate actor/entity/workflow definition compatibility, while an optional `ArtifactId` sidecar identifies the exact compiler/codegen artifact that activated the actor.
 - **Snapshots persist `artifact_id` additively and fail closed when it is present.** Ordinary recovery, deterministic persistent respawn, grain hydration, and supervised restart require the same exact recovery artifact. Older snapshots without `ArtifactId` remain explicitly unverified and are not silently upgraded merely because current code has artifact provenance.
