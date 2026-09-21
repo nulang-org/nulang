@@ -2,6 +2,7 @@
 
 use crate::bytecode::Constant;
 use crate::web::bindings::{RouteBindingContract, RouteBindingSource};
+use crate::web::codec::validate_encoded_body;
 use crate::web::runtime_bindings::BoundRouteArgument;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -21,6 +22,8 @@ pub struct RequestBindingValues<'a> {
 pub enum RequestDecodeErrorKind {
     Missing,
     InvalidType,
+    InvalidBody,
+    UnsupportedMediaType,
     DuplicateHandlerSlot,
     InvalidHandlerSlot,
     IncompleteBindingPlan,
@@ -34,6 +37,7 @@ pub struct RequestDecodeError {
     pub handler_param: Option<String>,
     pub handler_index: Option<usize>,
     pub expected_type: Option<String>,
+    pub expected_media_type: Option<String>,
     pub message: String,
 }
 
@@ -43,7 +47,10 @@ impl RequestDecodeError {
     pub fn is_client_error(&self) -> bool {
         matches!(
             self.kind,
-            RequestDecodeErrorKind::Missing | RequestDecodeErrorKind::InvalidType
+            RequestDecodeErrorKind::Missing
+                | RequestDecodeErrorKind::InvalidType
+                | RequestDecodeErrorKind::InvalidBody
+                | RequestDecodeErrorKind::UnsupportedMediaType
         )
     }
 
@@ -53,10 +60,15 @@ impl RequestDecodeError {
     /// those are compiler/runtime defects and must not be presented as client
     /// mistakes.
     pub fn http_status(&self) -> u16 {
-        if self.is_client_error() {
-            400
-        } else {
-            500
+        match self.kind {
+            RequestDecodeErrorKind::UnsupportedMediaType => 415,
+            kind if matches!(
+                kind,
+                RequestDecodeErrorKind::Missing
+                    | RequestDecodeErrorKind::InvalidType
+                    | RequestDecodeErrorKind::InvalidBody
+            ) => 400,
+            _ => 500,
         }
     }
 
@@ -66,6 +78,8 @@ impl RequestDecodeError {
         match self.kind {
             RequestDecodeErrorKind::Missing => "missing_request_input",
             RequestDecodeErrorKind::InvalidType => "invalid_request_input",
+            RequestDecodeErrorKind::InvalidBody => "invalid_request_body",
+            RequestDecodeErrorKind::UnsupportedMediaType => "unsupported_request_media_type",
             RequestDecodeErrorKind::DuplicateHandlerSlot => "duplicate_handler_slot",
             RequestDecodeErrorKind::InvalidHandlerSlot => "invalid_handler_slot",
             RequestDecodeErrorKind::IncompleteBindingPlan => "incomplete_binding_plan",
@@ -106,6 +120,12 @@ impl RequestDecodeError {
                 fields.insert(
                     "expected_type".to_string(),
                     Value::String(expected_type.clone()),
+                );
+            }
+            if let Some(expected_media_type) = &self.expected_media_type {
+                fields.insert(
+                    "expected_media_type".to_string(),
+                    Value::String(expected_media_type.clone()),
                 );
             }
             if !self.is_client_error() {
@@ -149,6 +169,7 @@ pub fn bind_request_arguments(
             handler_param: None,
             handler_index: None,
             expected_type: None,
+            expected_media_type: None,
             message: format!(
                 "route handler has {handler_param_count} parameters; VM ABI supports at most {}",
                 u8::MAX
@@ -191,6 +212,30 @@ pub fn bind_request_arguments(
                 ),
             )
         })?;
+        if binding.source == RouteBindingSource::Body {
+            if let Some(codec) = &binding.codec {
+                let actual_media_type = request_media_type(values.headers);
+                if actual_media_type
+                    .as_deref()
+                    .is_none_or(|actual| !actual.eq_ignore_ascii_case(&codec.media_type))
+                {
+                    return Err(error(
+                        binding,
+                        RequestDecodeErrorKind::UnsupportedMediaType,
+                        format!(
+                            "body input '{}' requires Content-Type {}, got {}",
+                            binding.source_name,
+                            codec.media_type,
+                            actual_media_type.as_deref().unwrap_or("<missing>")
+                        ),
+                    ));
+                }
+                validate_encoded_body(codec, raw).map_err(|message| {
+                    error(binding, RequestDecodeErrorKind::InvalidBody, message)
+                })?;
+            }
+        }
+
         let value = decode_scalar_constant(raw, binding.ty.as_deref()).map_err(|message| {
             error(
                 binding,
@@ -220,6 +265,7 @@ pub fn bind_request_arguments(
                 handler_param: None,
                 handler_index: Some(index),
                 expected_type: None,
+                expected_media_type: None,
                 message: format!("handler parameter slot {index} has no request binding"),
             })
         })
@@ -238,6 +284,7 @@ fn error(
         handler_param: Some(binding.handler_param.clone()),
         handler_index: Some(binding.handler_index),
         expected_type: binding.ty.clone(),
+        expected_media_type: binding.codec.as_ref().map(|codec| codec.media_type.clone()),
         message,
     }
 }
@@ -269,6 +316,21 @@ fn source_name(source: RouteBindingSource) -> &'static str {
         RouteBindingSource::Body => "body",
         RouteBindingSource::Form => "form",
     }
+}
+
+fn request_media_type(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|value| !value.is_empty())
 }
 
 pub fn decode_scalar_constant(raw: &str, ty: Option<&str>) -> Result<Constant, String> {
