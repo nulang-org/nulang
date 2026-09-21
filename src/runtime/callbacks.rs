@@ -2776,6 +2776,78 @@ mod host_authority_tests {
     }
 
     #[test]
+    fn runtime_secret_handle_requires_exact_authority_and_is_not_plaintext() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let actor_id = 800_007;
+        {
+            let mut rt = runtime.borrow_mut();
+            rt.actors
+                .insert(actor_id, Actor::new(actor_id, "secret-authority", 8));
+            rt.current_actor = Some(actor_id);
+        }
+
+        let module = {
+            let mut module = crate::bytecode::CodeModule::new("secret-authority");
+            module.add_constant(Constant::String("PAYMENTS_KEY".into()));
+            module
+        };
+        let regs = [Value::string(0)];
+        let mut callbacks = super::RuntimeVmCallbacks::new(runtime.clone());
+
+        let denied = callbacks
+            .perform_builtin_effect_in_module("Secret", Some("get"), &module, &regs)
+            .expect("denied Secret.get must be handled");
+        assert!(denied.is_nil());
+        assert!(runtime.borrow().secrets.is_empty());
+
+        {
+            let mut rt = runtime.borrow_mut();
+            let manifest =
+                AuthorityManifest::from_tokens(["Secret::Read(PAYMENTS_KEY)"]).unwrap();
+            rt.actors
+                .get_mut(&actor_id)
+                .unwrap()
+                .install_authority_manifest(&manifest);
+        }
+
+        let handle = callbacks
+            .perform_builtin_effect_in_module("Secret", Some("get"), &module, &regs)
+            .expect("authorized Secret.get must return a handle");
+        let handle_id = handle.as_int().expect("secret runtime value is an opaque handle id");
+        assert!(handle_id > 0);
+        assert!(
+            !handle.is_string() && !handle.is_ptr(),
+            "Secret.get must not return VM-visible plaintext/string storage"
+        );
+        assert_eq!(
+            runtime
+                .borrow()
+                .secrets
+                .resolve_name(actor_id, handle_id as u64),
+            Some("PAYMENTS_KEY")
+        );
+
+        let valid = callbacks
+            .perform_builtin_effect_in_module("Secret", Some("valid"), &module, &[handle])
+            .expect("Secret.valid must be handled");
+        assert_eq!(valid.as_bool(), Some(true));
+
+        let revoked = callbacks
+            .perform_builtin_effect_in_module("Secret", Some("revoke"), &module, &[handle])
+            .expect("Secret.revoke must be handled");
+        assert_eq!(revoked.as_bool(), Some(true));
+
+        let valid = callbacks
+            .perform_builtin_effect_in_module("Secret", Some("valid"), &module, &[handle])
+            .expect("Secret.valid must be handled after revoke");
+        assert_eq!(valid.as_bool(), Some(false));
+    }
+
+    #[test]
     fn actor_host_access_is_deny_by_default_and_exact_match_only() {
         let mut rt = Runtime::new();
         let actor_id = 800_001;
