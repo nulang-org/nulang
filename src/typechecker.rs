@@ -3636,6 +3636,21 @@ impl TypeChecker {
                 declared_ty.clone()
             };
 
+            if effective_ty.contains_secret()
+                && !matches!(model, crate::ast::StateModel::Local)
+            {
+                return Err(NuError::TypeError {
+                    msg: format!(
+                        "secret-bearing actor state '{}' must be local; durable/event-sourced/CRDT state cannot persist Secret values",
+                        field_name
+                    ),
+                    span: default_expr.span(),
+                    expected_type: Some("state local".to_string()),
+                    found_type: Some(format!("{model:?}")),
+                    similar_names: None,
+                });
+            }
+
             if let crate::ast::StateModel::Crdt(crdt_type) = model {
                 let expected_ty = match crdt_type {
                     crate::ast::CrdtType::LWWRegister => Type::string(),
@@ -5478,6 +5493,18 @@ mod tests {
             result.is_ok(),
             "pure Secret flow should remain legal: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn test_durable_actor_state_rejects_secret_values() {
+        let result = check_src(
+            "actor Vault { state durable token: Secret[String] = perform Secret.get(\"TOKEN\") }",
+        );
+        let err = result.expect_err("durable Secret state must fail");
+        assert!(
+            err.to_string().contains("must be local"),
+            "unexpected error: {err}"
         );
     }
 
