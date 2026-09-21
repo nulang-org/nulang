@@ -18,6 +18,7 @@ expanding the language kernel.
 - spherical WGS84 great-circle distance
 - WKT writers for points, line strings, and single-ring polygons
 - dependency-free immutable `RTree[CRS, T]` bulk loading and intersection queries
+- leaf-level STR packing, point queries, contained-by queries, and traversal statistics
 - dependency-free implementation using portable Nulang float primitives
 
 ## Usage
@@ -67,7 +68,7 @@ Planned extensions:
 6. GDAL-backed vector/raster I/O
 7. spatial stream and actor-partition helpers
 
-The initial R-tree loader preserves input order and focuses on correctness, CRS safety, and pruning. STR/Hilbert packing and mutable insert/delete operations are follow-on optimizations rather than requirements for the core API.
+The initial R-tree loader preserves input order and focuses on correctness, CRS safety, and pruning. `rtree_bulk_load_str` adds leaf-level Sort-Tile-Recursive-style packing while reusing the stable parent builder. Point and contained-by queries share the same CRS safety, and `rtree_query_intersects_with_stats` exposes nodes tested, entries tested, and matches for tuning and benchmarks. Mutable insert/delete operations remain follow-on work.
 
 Those integrations should be split into optional packages/components so the
 core `nulang-geo` package remains dependency-light and portable.
@@ -83,4 +84,4 @@ nulang nula test
 The suite covers CRS-tagged point and aggregate construction, bounds and
 envelopes, coordinate validation, unit conversion, planar distance/length/area/
 centroid, WKT output, an equatorial great-circle reference distance, and
-compile-fail regressions for cross-CRS operations, mixed-CRS line strings, and cross-CRS R-tree queries.
+compile-fail regressions for cross-CRS operations, mixed-CRS line strings, cross-CRS R-tree box queries, and cross-CRS R-tree point queries. A reproducible `benches/rtree_query.nula` workload can be run with `nulang --bench N benches/rtree_query.nula` for before/after comparisons.
