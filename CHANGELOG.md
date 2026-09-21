@@ -42,6 +42,19 @@ version + migration.*
 
 ## Stable tier
 
+### Distributed actor protocol schema descriptors — 2026-09-21
+- **Bounded canonical schema wire envelope** (Experimental, `src/protocol_wire.rs`).
+  The new versioned `NUPS` descriptor serializes compiler-owned actor protocol
+  metadata independently of VM memory layout, verifies the declared
+  `ProtocolId` on decode, rejects oversized/truncated/trailing data, and is
+  declaration-order deterministic. This allows runtimes to exchange/cache the
+  schemas needed for directional rolling-upgrade checks without changing the
+  frozen NUL0 header or requiring a centralized schema-registry service.
+- **Direct digest decoding for protocol actor references.** Protocol ids are
+  decoded directly from their canonical 32-byte representation rather than
+  round-tripping through hexadecimal text.
+
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
