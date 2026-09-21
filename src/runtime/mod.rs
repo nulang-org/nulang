@@ -300,6 +300,16 @@ pub(crate) enum MessageAdmission {
     Rejected,
 }
 
+/// Policy for histories created before strong semantic identity was persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryIdentityPolicy {
+    /// Reject any snapshot that cannot prove which semantics produced it.
+    Strict,
+    /// Permit legacy snapshots that lack semantic identity, while still
+    /// rejecting malformed identities and all identified-code mismatches.
+    LegacyCompatible,
+}
+
 pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
@@ -5002,7 +5012,71 @@ impl Runtime {
     /// instead of the message journal, restoring the current step index and
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
+        self.recover_actor_with_identity_policy(actor_id, RecoveryIdentityPolicy::LegacyCompatible)
+    }
+
+    /// Recover a persistent actor under an explicit semantic-identity policy.
+    ///
+    /// Any snapshot that already carries strong semantic identity is always
+    /// fail-closed: recovery code must carry the same compiler-derived ID.
+    /// `LegacyCompatible` exists only for pre-identity histories and never
+    /// upgrades them to verified provenance.
+    pub fn recover_actor_with_identity_policy(
+        &mut self,
+        actor_id: u64,
+        identity_policy: RecoveryIdentityPolicy,
+    ) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+
+        let recovery_semantic_id = self
+            .recovery_modules
+            .get(&actor_id)
+            .and_then(|(module, _, _)| module.semantic_id);
+
+        match snapshot.semantic_id.as_deref() {
+            Some(persisted) => {
+                let persisted = match persisted.parse::<crate::content_identity::SemanticId>() {
+                    Ok(id) => id,
+                    Err(error) => {
+                        warn!(
+                            "nulang-recover: refusing actor {} with malformed semantic identity: {}",
+                            actor_id, error
+                        );
+                        return None;
+                    }
+                };
+                match recovery_semantic_id {
+                    Some(current) if current == persisted => {}
+                    Some(current) => {
+                        warn!(
+                            "nulang-recover: refusing actor {}: persisted semantic identity {} does not match recovery code {}",
+                            actor_id, persisted, current
+                        );
+                        return None;
+                    }
+                    None => {
+                        warn!(
+                            "nulang-recover: refusing actor {}: persisted semantic identity {} has no identified recovery code",
+                            actor_id, persisted
+                        );
+                        return None;
+                    }
+                }
+            }
+            None if identity_policy == RecoveryIdentityPolicy::Strict => {
+                warn!(
+                    "nulang-recover: refusing actor {}: legacy snapshot has no semantic identity",
+                    actor_id
+                );
+                return None;
+            }
+            None => {
+                warn!(
+                    "nulang-recover: actor {} uses legacy snapshot without verified semantic provenance",
+                    actor_id
+                );
+            }
+        }
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
