@@ -258,6 +258,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             type_params,
             persistent,
             state_fields,
+            indexes,
             behaviors,
             init,
             virtual_,
@@ -280,6 +281,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                     (n.clone(), *m, lower_runtime_type(t), op)
                 })
                 .collect(),
+            indexes: indexes.clone(),
             behaviors: behaviors
                 .iter()
                 .map(|b| lower_behavior(b, apply_handlers))
