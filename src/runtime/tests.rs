@@ -1024,6 +1024,7 @@ fn dyn_worker_module(default_count: i64) -> crate::bytecode::CodeModule {
         state_models: vec![("count".to_string(), crate::ast::StateModel::Local)],
         state_defaults: vec![("count".to_string(), Constant::Int(default_count))],
         behavior_indices: vec![0],
+        apply_handlers: vec![],
         type_hash: None,
         version: 1,
         migrations: String::new(),
@@ -2025,6 +2026,51 @@ impl PersistenceStore for RejectingSnapshotCommitStore {
 }
 
 #[test]
+fn test_compiler_emits_private_replayable_apply_handler_metadata() {
+    let module = compile_state_migration_module(
+        r#"
+        entity Counter {
+            state event_sourced count: Int = 0
+            events
+                | Incremented(by: Int)
+            apply
+                | Incremented(by) => { self.count = self.count + by }
+
+            behavior inc(by: Int) {
+                emit Incremented(by)
+            }
+        }
+        "#,
+    );
+
+    let meta = module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == "Counter")
+        .expect("Counter metadata");
+    assert_eq!(meta.apply_handlers.len(), 1);
+    let handler = &meta.apply_handlers[0];
+    assert_eq!(handler.event, "Incremented");
+    assert_eq!(handler.param_count, 1);
+    assert!(
+        handler.function_index < module.function_table.len(),
+        "apply handler must bind a real private function-table slot"
+    );
+
+    let expected_name = "Counter.$apply_Incremented";
+    let indexed_offset = module.function_table[handler.function_index];
+    assert_eq!(
+        module.function_offset_by_name(expected_name),
+        Some(indexed_offset),
+        "metadata must resolve to the canonical compiler-owned function identity"
+    );
+    assert!(
+        module.behaviors.iter().all(|behavior| behavior.name != expected_name),
+        "replay apply functions must never enter the actor behavior table"
+    );
+}
+
+#[test]
 fn test_recover_actor_executes_and_commits_state_migration_before_publication() {
     let module = compile_state_migration_module(
         r#"
@@ -2878,6 +2924,7 @@ fn test_vm_spawn_creates_persistent_actor() {
         state_models: vec![("balance".to_string(), crate::ast::StateModel::Durable)],
         state_defaults: vec![("balance".to_string(), Constant::Int(100))],
         behavior_indices: vec![0],
+        apply_handlers: vec![],
         type_hash: None,
         version: 1,
         migrations: String::new(),
@@ -2942,6 +2989,7 @@ fn test_vm_spawn_creates_non_persistent_actor() {
         state_models: vec![("count".to_string(), crate::ast::StateModel::Local)],
         state_defaults: vec![("count".to_string(), Constant::Int(0))],
         behavior_indices: vec![0],
+        apply_handlers: vec![],
         type_hash: None,
         version: 1,
         migrations: String::new(),
@@ -4577,6 +4625,7 @@ fn test_actor_migration_between_two_nodes() {
         state_models: vec![("count".to_string(), crate::ast::StateModel::Durable)],
         state_defaults: vec![("count".to_string(), Constant::Int(0))],
         behavior_indices: vec![0],
+        apply_handlers: vec![],
         type_hash: None,
         version: 1,
         migrations: String::new(),
@@ -7681,6 +7730,7 @@ fn counter_grain_module() -> crate::bytecode::CodeModule {
         state_models: vec![("count".to_string(), crate::ast::StateModel::Durable)],
         state_defaults: vec![("count".to_string(), Constant::Int(0))],
         behavior_indices: vec![0],
+        apply_handlers: vec![],
         type_hash: None,
         version: 1,
         migrations: String::new(),
