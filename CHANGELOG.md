@@ -45,6 +45,19 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### First-party geospatial package — 2026-09-20
+- **`@nulang/geo` foundations** (Experimental, `packages/nulang-geo/`).
+  Adds CRS-tagged `Point[CRS]` and `BoundingBox[CRS]` records with WGS84,
+  Web Mercator, and local Cartesian marker types; WGS84 coordinate validation
+  and longitude normalization; bounding-box containment/intersection; planar
+  Euclidean distance; canonical meter-based `Distance` values; and spherical
+  WGS84 great-circle distance. The implementation is pure user-space Nulang,
+  preserving the Core Admission Rule rather than adding GIS-specific syntax or
+  runtime concepts.
+- **First-party package regression coverage** (Experimental, CI). The Nula
+  package job now runs `packages/nulang-geo`'s test suite so library/compiler
+  compatibility is continuously checked.
+
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
   A receiver may serve an older required protocol when it preserves every
