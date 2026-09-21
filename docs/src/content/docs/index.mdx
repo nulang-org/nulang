@@ -6,20 +6,18 @@ hero:
   title: Build software that <span class="hero-emphasis">survives failure.</span>
   tagline: Nulang is an alpha actor-based language with Hindley-Milner inference, algebraic effects, capability types, supervision, and persistent actors in one runtime.
   actions:
-    - text: Get Started
-      link: /getting-started/installation/
+    - text: Try Nulang
+      link: /playground/
       icon: right-arrow
       variant: primary
-    - text: Try in Browser
-      link: /playground/
+    - text: Read the Docs
+      link: /getting-started/installation/
       icon: right-arrow
       variant: secondary
 ---
 
-import SupervisionTree from '../../components/animations/SupervisionTree.astro';
-import DistributionDemo from '../../components/animations/DistributionDemo.astro';
-import AIPipeline from '../../components/animations/AIPipeline.astro';
 import GcDemo from '../../components/animations/GcDemo.astro';
+import ArchitectureMap from '../../components/ArchitectureMap.astro';
 import ScrollReveal from '../../components/ScrollReveal.astro';
 import FeatureGrid from '../../components/FeatureGrid.astro';
 import Steps from '../../components/Steps.astro';
@@ -31,53 +29,12 @@ import EvidenceGrid from '../../components/EvidenceGrid.astro';
   <GcDemo />
 </MetricsBand>
 
-<div class="nu-section">
+<div class="nu-section architecture-section">
   <div class="nu-container">
-    <div class="nu-section-header">
-      <h2>A coherent model for resilient systems</h2>
-      <p class="nu-section-subhead">Start with stable actor, type, and effect primitives. Opt into experimental distribution, native/WASM backends, and AI features when you need them.</p>
-    </div>
-
-    <div class="pillars-grid">
-      <div class="pillar-card">
-        <div class="feature-icon-chip">
-          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon">
-            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-          </svg>
-        </div>
-        <h3>Supervision + persistent actors</h3>
-        <p>Use links, monitors, and supervision for failure containment. Persistent actors checkpoint and journal durable state so the runtime can hydrate it from a durable store after restart.</p>
-        <div class="pillar-demo">
-          <SupervisionTree />
-        </div>
-      </div>
-      <div class="pillar-card">
-        <div class="feature-icon-chip">
-          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon">
-            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-          </svg>
-        </div>
-        <h3>AI runtime <small>(experimental)</small></h3>
-        <p>Feature-gated LLM providers, agent pipelines, debates, supervisor teams, and memory are available for experimentation without making AI part of the frozen language core.</p>
-        <div class="pillar-demo">
-          <AIPipeline />
-        </div>
-      </div>
-      <div class="pillar-card">
-        <div class="feature-icon-chip">
-          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon">
-            <circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/>
-          </svg>
-        </div>
-        <h3>Multi-node distribution <small>(experimental)</small></h3>
-        <p>Location-transparent send/ask over TCP and gossip membership are implemented. Multi-node behavior remains experimental, and source-level CRDT state wiring is still evolving.</p>
-        <div class="pillar-demo">
-          <DistributionDemo />
-        </div>
-      </div>
-    </div>
+    <ArchitectureMap />
   </div>
 </div>
+
 
 <div class="nu-section" style="padding-top: 0;">
   <div class="nu-container">
