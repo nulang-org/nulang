@@ -1211,7 +1211,7 @@ impl crate::vm::ActorVmCallbacks for AotActorCallbacks {
         unsafe {
             let _ = (*target_actor).mailbox.push_local(crate::runtime::Message {
                 behavior_id,
-                payload: std::sync::Arc::from(args),
+                payload: std::sync::Arc::new(args.to_vec()),
                 sender: (*self.actor).id,
                 priority: crate::runtime::MessagePriority::Normal,
                 trace_id: None,
