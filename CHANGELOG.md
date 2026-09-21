@@ -42,6 +42,19 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-emitted Behavior Manifest — 2026-09-21
+- **RFC 0020 Behavior Manifest emission is now executable tooling** (Experimental,
+  `src/behavior_manifest.rs`, `src/main.rs`, `src/package/commands.rs`).
+  The compiler can emit a `nulang.behavior/v0alpha1` sidecar bound to the exact
+  Wasm artifact and compiler executable. Effects are derived from checked
+  effect rows; public function interfaces and actor protocol identities reuse
+  canonical compiler type/protocol encodings; durable actor state schemas are
+  content-derived from checked HIR; exact spawn-time external-authority grants
+  are preserved from MIR. `nula build-wasm --emit-behavior-manifest` adds
+  package source-tree and lockfile provenance without changing ordinary builds.
+  Unsupported or unprovable semantics fail closed rather than being inferred
+  from deployment configuration.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
