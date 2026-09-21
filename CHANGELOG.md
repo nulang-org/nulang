@@ -43,7 +43,7 @@ version + migration.*
 ## Stable tier
 
 ### Runtime hot-path performance wave — 2026-09-21
-- **Actor message and JIT hot paths are leaner** (Experimental, `src/runtime/actor.rs`, `src/runtime/mailbox.rs`, `src/jit/mod.rs`). Flight recording now allocates lazily, stores three raw inline payload samples, and renders human-readable summaries only on demand; rejected mailbox admissions are not recorded as deliveries. Immutable message payloads use `Arc<[Value]>` instead of `Arc<Vec<Value>>`, eliminating the extra Vec backing allocation. Tier-2 JIT bookkeeping is dense per-PC state, scalar regions skip fruitless promotion counting, and typed regions can genuinely replace their cached tier-1 function with SIMD code; static SIMD rejection disables further retries.
+- **Actor recorder and JIT hot paths are leaner** (Experimental, `src/runtime/actor.rs`, `src/runtime/mod.rs`, `src/jit/mod.rs`). Flight recording now allocates lazily, stores three raw inline payload samples, and renders human-readable summaries only on demand; rejected mailbox admissions are not recorded as deliveries. Tier-2 JIT bookkeeping is dense per-PC state, scalar regions skip fruitless promotion counting, and typed regions can genuinely replace their cached tier-1 function with SIMD code; static SIMD rejection disables further retries. Message payload representation is intentionally unchanged here so the separate inline-small-payload experiment can be benchmarked and reviewed independently.
 
 
 ### Typed process host authority — 2026-09-20
