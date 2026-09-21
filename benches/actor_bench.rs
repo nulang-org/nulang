@@ -1,7 +1,7 @@
 //! Actor throughput and density benchmarks.
 
 use criterion::{black_box, criterion_group, BatchSize, Criterion};
-use nulang::runtime::{Actor, Runtime};
+use nulang::runtime::{Actor, MessagePayload, Runtime};
 use nulang::vm::Value;
 
 fn noop(_actor: &mut Actor, _args: &[Value]) {}
@@ -82,9 +82,28 @@ fn bench_idle_actor_spawn(c: &mut Criterion) {
     });
 }
 
+
+fn bench_message_payload_construction(c: &mut Criterion) {
+    let small = [Value::int(1)];
+    let large = [Value::int(1); 8];
+
+    c.bench_function("actor/payload_construct_inline_1", |b| {
+        b.iter(|| {
+            black_box(MessagePayload::from_slice(black_box(&small)));
+        })
+    });
+
+    c.bench_function("actor/payload_construct_shared_8", |b| {
+        b.iter(|| {
+            black_box(MessagePayload::from_slice(black_box(&large)));
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_spawn_send_receive,
     bench_message_throughput,
-    bench_idle_actor_spawn
+    bench_idle_actor_spawn,
+    bench_message_payload_construction
 );
