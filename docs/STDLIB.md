@@ -11,6 +11,7 @@ import stdlib::math
 import stdlib::list
 import stdlib::test
 import stdlib::fs
+import stdlib::http
 import stdlib::core
 import stdlib::set
 import stdlib::map
@@ -185,29 +186,43 @@ fn my_tests() {
 
 ## Module: fs
 
-Filesystem I/O via the built-in `FS` effect. Operations are `perform FS.read`,
-`perform FS.write`, `perform FS.append`, and `perform FS.exists`.
-
-Effect annotations (`! {FS}`) mean callers must handle or propagate the `FS`
-effect.
+Filesystem I/O wrappers over the built-in `FS` effect. The raw effect keeps its
+legacy nil-on-host-error behavior; the stdlib wrappers convert that into
+`Result` values.
 
 | Function | Signature | Description |
 |---|---|---|
-| `read` | `fn read(path: String) -> String ! {FS}` | Read entire file contents into a string. Returns nil if the file cannot be read. |
-| `write` | `fn write(path: String, content: String) -> Unit ! {FS}` | Write a string to a file, overwriting existing content. Creates the file if needed. Returns nil on failure. |
-| `append` | `fn append(path: String, content: String) -> Unit ! {FS}` | Append a string to the end of a file. Creates the file if needed. Returns nil on failure. |
-| `exists` | `fn exists(path: String) -> Bool ! {FS}` | Check whether a file or directory exists at the given path. |
+| `read` | `fn read(path: String) -> Result[String, FsError] ! {FS}` | Read entire file contents, returning `Error(ReadFailed(path))` on host failure. |
+| `write` | `fn write(path: String, content: String) -> Result[Unit, FsError] ! {FS}` | Write/replace a file, returning `Error(WriteFailed(path))` on host failure. |
+| `append` | `fn append(path: String, content: String) -> Result[Unit, FsError] ! {FS}` | Append to a file, returning `Error(AppendFailed(path))` on host failure. |
+| `exists` | `fn exists(path: String) -> Bool ! {FS}` | Check whether a file or directory exists. The raw host ABI cannot yet distinguish not-found from metadata errors. |
 
 ### Usage
 
 ```nula
 import stdlib::fs
 
-let content = read("data.txt")
-write("output.txt", "Hello, world!")
-append("log.txt", "another line\n")
-let ok = exists("config.json")  // true or false
+match read("data.txt") {
+    Ok(content) => perform IO.print(content),
+    Error(ReadFailed(path)) => perform IO.print("could not read " + path),
+}
 ```
+
+---
+
+## Module: http
+
+HTTP client wrappers over the built-in `Http` effect. The raw effect still
+returns `nil` on request failure; these wrappers make that failure explicit.
+
+| Function | Signature | Description |
+|---|---|---|
+| `get` | `fn get(url: String) -> Result[String, HttpError] ! {Http}` | GET a URL, returning `Error(GetFailed(url))` if the raw request fails. |
+| `post` | `fn post(url: String, body: String) -> Result[String, HttpError] ! {Http}` | POST a body, returning `Error(PostFailed(url))` if the raw request fails. |
+
+The current raw Http ABI does not preserve status/transport error details, so
+the wrapper reports the failed operation and URL rather than inventing a more
+specific cause.
 
 ---
 
