@@ -48,6 +48,22 @@ pub enum ActorPriority {
 
 // -- Flight recorder (deterministic replay support) ---------------------
 
+
+/// Number of diagnostic flight-recorder entries retained per actor.
+///
+/// Disabled by default because recording formats payload values on every
+/// message. Developers can opt in with `NULANG_FLIGHT_RECORDER_ENTRIES`.
+fn configured_flight_recorder_entries() -> usize {
+    static ENTRIES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ENTRIES.get_or_init(|| {
+        std::env::var("NULANG_FLIGHT_RECORDER_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+
 /// A single entry in an actor's flight-recorder trace.  Captures enough
 /// information to deterministically replay the message sequence that led
 /// to a crash or unexpected behavior.
@@ -83,7 +99,10 @@ impl FlightRecorder {
     /// Create a new flight recorder retaining up to `max_entries` messages.
     pub fn new(max_entries: usize) -> Self {
         FlightRecorder {
-            entries: Vec::with_capacity(max_entries),
+            // Keep the default-disabled recorder allocation-free. When enabled,
+            // the Vec grows on the first recorded message instead of reserving
+            // potentially tens of KiB for every actor at spawn time.
+            entries: Vec::new(),
             cursor: 0,
             next_seq: 0,
             max_entries,
@@ -92,6 +111,13 @@ impl FlightRecorder {
 
     /// Record a message delivery.
     pub fn record(&mut self, sender: u64, behavior_id: u16, payload: &[Value]) {
+        // Flight recording is a diagnostic feature, not part of the actor
+        // semantics. Keep the production hot path allocation/formatting-free
+        // when the recorder is disabled.
+        if self.max_entries == 0 {
+            return;
+        }
+
         let seq = self.next_seq;
         self.next_seq += 1;
 
@@ -221,6 +247,10 @@ pub struct Actor {
     pub trap_exits: bool,    // If true, exit signals become messages instead of killing this actor
     /// Scheduling priority, consulted by the scheduler on every enqueue.
     pub priority: ActorPriority,
+    /// True while this actor has one outstanding run-queue entry. Owned by
+    /// the shard scheduler thread; used to coalesce repeated wakeups/messages
+    /// into a single scheduler task.
+    pub(crate) scheduled: bool,
     pub reduction_count: u32, // Lifetime messages handled (monotonic progress metric)
     turn_reductions: u32,     // Messages handled in the current scheduling turn
     pub max_reductions: u32,  // Max reductions per turn before yield (preemption)
@@ -361,6 +391,7 @@ impl Actor {
             links: Vec::new(),
             trap_exits: false,
             priority: ActorPriority::Normal,
+            scheduled: false,
             jit_safepoint_counter: crate::backends::JIT_SAFEPOINT_BUDGET,
             jit_yield_pending: false,
             reduction_count: 0,
@@ -385,7 +416,7 @@ impl Actor {
             receive_wait: None,
             timer_sleep_fired: false,
             retry_config: None,
-            flight_recorder: FlightRecorder::new(1000),
+            flight_recorder: FlightRecorder::new(configured_flight_recorder_entries()),
             fallback_config: Vec::new(),
             hibernation_state: None,
             idle_ms: 0,
