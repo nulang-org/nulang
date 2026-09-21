@@ -77,7 +77,8 @@ fn index_rejects_ephemeral_local_state() {
     .expect_err("local state cannot be indexed");
 
     assert!(
-        err.to_string().contains("cannot reference local field 'cache'"),
+        err.to_string()
+            .contains("cannot reference local field 'cache'"),
         "unexpected error: {err}"
     );
 }
