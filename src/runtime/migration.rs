@@ -14,13 +14,14 @@ use crate::runtime::heap::{ActorHeap, TypeTag};
 use crate::runtime::persistence::{ActorSnapshot, PersistedValue, StateModel};
 use crate::vm::{ActorVmCallbacks, DistributedVmCallbacks, PerformAsyncResult, SignalWaitResult, Value, VM};
 
-/// Durable-history facts gathered by the caller before attempting a state-only
-/// migration. V1 deliberately refuses histories that would need semantic replay
-/// under a different schema.
+/// Durable-history facts that still constrain snapshot-state migration.
+///
+/// Event history is intentionally absent: RFC 0008 event rows are migrated
+/// independently in memory by event_replay after the snapshot schema is
+/// revision-fenced.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct StateMigrationHistory {
     pub has_pending_message_journal: bool,
-    pub has_event_history: bool,
     pub has_workflow_history: bool,
 }
 
@@ -49,9 +50,11 @@ impl ViolationFlag {
 
 /// VM callbacks for one unpublished migration actor.
 ///
-/// Only heap ownership and state get/set are real. Every operation capable of
-/// producing an external side effect records a violation. Compiler purity is
-/// the first line of defense; these callbacks are the artifact/runtime fence.
+/// Heap ownership and explicitly permitted state access are real. Event
+/// transforms may additionally install an in-memory emit capture sink. Every
+/// other operation capable of producing an external side effect records a
+/// violation. Compiler purity is the first line of defense; these callbacks
+/// are the artifact/runtime fence.
 struct MigrationActorCallbacks {
     actor: *mut Actor,
     violation: ViolationFlag,
