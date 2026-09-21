@@ -240,6 +240,19 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Emit an event in the current actor.  Default is a no-op.
     fn emit_event(&mut self, _event: &str, _args: &[Value]) {}
 
+    /// Authorize a direct VM side effect that bypasses built-in effect
+    /// dispatch. `target` identifies the heap object being mutated when the
+    /// opcode writes through a pointer. Runtime query callbacks use this to
+    /// permit writes to query-owned temporary allocations while rejecting
+    /// mutation of actor-state objects.
+    fn authorize_vm_side_effect(
+        &mut self,
+        _operation: &str,
+        _target: Option<*mut u8>,
+    ) -> bool {
+        true
+    }
+
     /// Authorize one foreign-function call before any library is loaded or
     /// symbol resolved. Standalone callbacks retain the historic ambient
     /// behavior; runtime-backed actor callbacks override this and require an
@@ -5417,6 +5430,16 @@ impl VM {
                 self.step_arrload(frame_idx, instr)?;
             }
             OpCode::ArrStore => {
+                let target = frame.regs[instr.op1 as usize].as_ptr();
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("Array.store", target)
+                {
+                    return Err(NuError::runtime_error(
+                        "Array.store denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
                 self.step_arrstore(frame_idx, instr)?;
             }
             OpCode::ArrLen => {
@@ -5455,6 +5478,16 @@ impl VM {
                 };
             }
             OpCode::RecS => {
+                let target = frame.regs[instr.op1 as usize].as_ptr();
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("Record.store", target)
+                {
+                    return Err(NuError::runtime_error(
+                        "Record.store denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
                 self.step_recs(frame_idx, instr)?;
             }
             OpCode::RecL => {
@@ -5486,6 +5519,16 @@ impl VM {
                 };
             }
             OpCode::FieldS => {
+                let target = frame.regs[instr.op1 as usize].as_ptr();
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("Field.store", target)
+                {
+                    return Err(NuError::runtime_error(
+                        "Field.store denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
                 self.step_fields(frame_idx, instr)?;
             }
             OpCode::FieldL => {
@@ -5700,20 +5743,85 @@ impl VM {
                 self.step_sconcat(frame_idx, module_idx, instr)?;
             }
             OpCode::SPrint => {
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("IO.print", None)
+                {
+                    return Err(NuError::runtime_error(
+                        "IO.print denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
                 self.emit_output(&frame.regs[instr.op1 as usize].to_string_repr());
             }
             OpCode::SRead => {
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("IO.read", None)
+                {
+                    return Err(NuError::runtime_error(
+                        "IO.read denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
                 self.step_sread(frame_idx, module_idx, instr)?;
             }
             OpCode::FOpen => {
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("FS.open", None)
+                {
+                    return Err(NuError::runtime_error(
+                        "FS.open denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
                 frame.regs[instr.op2 as usize] = Value::nil();
             }
             OpCode::FRead => {
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("FS.read", None)
+                {
+                    return Err(NuError::runtime_error(
+                        "FS.read denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
                 frame.regs[instr.op2 as usize] = Value::nil();
             }
-            OpCode::FWrite => {}
-            OpCode::FClose => {}
+            OpCode::FWrite => {
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("FS.write", None)
+                {
+                    return Err(NuError::runtime_error(
+                        "FS.write denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
+            }
+            OpCode::FClose => {
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("FS.close", None)
+                {
+                    return Err(NuError::runtime_error(
+                        "FS.close denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
+            }
             OpCode::Print => {
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("IO.print", None)
+                {
+                    return Err(NuError::runtime_error(
+                        "IO.print denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
                 self.emit_output(&format!(
                     "{}\n",
                     frame.regs[instr.op1 as usize].to_string_repr()
@@ -5721,8 +5829,27 @@ impl VM {
             }
 
             // -- Debug & Meta --
-            OpCode::DbgBreak => {}
+            OpCode::DbgBreak => {
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("Debug.break", None)
+                {
+                    return Err(NuError::runtime_error(
+                        "Debug.break denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
+            }
             OpCode::DbgPrint => {
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("Debug.print", None)
+                {
+                    return Err(NuError::runtime_error(
+                        "Debug.print denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
                 eprintln!("=== Debug: Register State ===");
                 for i in (0..256).step_by(8) {
                     let mut line = format!("R{:03}-R{:03}: ", i, i + 7);
@@ -5733,6 +5860,15 @@ impl VM {
                 }
             }
             OpCode::DbgStack => {
+                if !self
+                    .actor_callbacks
+                    .authorize_vm_side_effect("Debug.stack", None)
+                {
+                    return Err(NuError::runtime_error(
+                        "Debug.stack denied by actor runtime".to_string(),
+                        Span::default(),
+                    ));
+                }
                 eprintln!("=== Debug: Call Stack ===");
                 let mut depth = 0;
                 let mut idx = Some(frame_idx);
