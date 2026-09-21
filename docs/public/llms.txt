@@ -1,9 +1,9 @@
 # Nulang
-> A distributed, actor-based programming language with algebraic effects, row-polymorphic types, and reference capabilities. Built in Rust with a register-based VM, Cranelift JIT, WASM backend, and native AOT compilation.
+> An actor-based programming language with Hindley-Milner inference, algebraic effects, capability types, supervision, persistent actors, and multiple execution modes. Built in Rust.
 
 ## For AI Agents
 
-Nulang is a systems language with static types, algebraic effects, and actor-based distribution. For AI-assisted development: the language has exhaustive type checking that catches bugs before runtime, an effect system that documents side effects, and a frozen core spec that won't drift. Use this file as context when asking an AI to write or analyze Nulang code.
+Nulang is a systems language with static types, algebraic effects, and actor-based distribution. For AI-assisted development: the language has static type checking, an effect system that makes side effects explicit, and published Frozen/Stable/Experimental maturity tiers. The implementation is alpha; multi-node distribution, WASM/native AOT, and the AI runtime remain experimental. Use this file as context when asking an AI to write or analyze Nulang code.
 
 ## When to use Nulang
 - Building fault-tolerant distributed systems with Erlang-style supervision trees.
