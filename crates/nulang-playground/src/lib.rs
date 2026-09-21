@@ -29,6 +29,10 @@ pub mod diagnostic;
 pub mod lexer;
 #[path = "../../../src/ast.rs"]
 pub mod ast;
+#[path = "../../../src/authority.rs"]
+pub mod authority;
+#[path = "../../../src/actor_protocol.rs"]
+pub mod actor_protocol;
 #[path = "../../../src/effect_checker.rs"]
 pub mod effect_checker;
 #[path = "../../../src/prelude_source.rs"]
