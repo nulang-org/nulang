@@ -26,7 +26,6 @@ pub enum RuntimePrimitive {
     Time,
 }
 
-
 pub use crate::actor_semantics::{
     ActorActivation, ActorDurability, ActorOriginConflict, ActorSemantics, ActorSurfaceOrigin,
 };
@@ -158,7 +157,6 @@ impl crate::bytecode::ActorMeta {
         )
     }
 }
-
 
 impl crate::runtime::Actor {
     /// Return orthogonal semantic dimensions for a live runtime actor.
