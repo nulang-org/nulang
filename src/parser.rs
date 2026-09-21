@@ -7258,6 +7258,49 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_entity_indexes() {
+        let ast = parse(
+            r#"entity Customer {
+                state email: String = "a@example.com"
+                state company: String = "Acme"
+                state status: String = "active"
+                unique index email
+                index by_company_status { company, status }
+            }"#,
+        )
+        .unwrap();
+
+        match &ast.decls[0] {
+            Decl::Actor { indexes, .. } => {
+                assert_eq!(indexes.len(), 2);
+                assert!(indexes[0].unique);
+                assert_eq!(indexes[0].name, "email");
+                assert_eq!(indexes[0].fields, vec!["email"]);
+                assert!(!indexes[1].unique);
+                assert_eq!(indexes[1].name, "by_company_status");
+                assert_eq!(indexes[1].fields, vec!["company", "status"]);
+            }
+            other => panic!("expected entity actor declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_index_rejected_on_ephemeral_actor() {
+        let result = parse(
+            r#"actor Session {
+                state token: String = "x"
+                index token
+            }"#,
+        );
+        match result {
+            Err(NuError::ParseError { msg, .. }) => {
+                assert!(msg.contains("indexes require a persistent actor or entity"));
+            }
+            other => panic!("expected index persistence error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_entity_decl() {
         let source = r#"entity Counter {
             state count = 0
