@@ -121,10 +121,12 @@ let immutable = 1
 var mutable = 0
 ```
 
-The current parser represents a module-level mutable declaration as
-`let var mutable = 0`; Phase 0 preserves that declaration spelling rather
-than converting it into an expression-position `var`. Unifying module and
-local mutable syntax is a later parser change, not a formatter rewrite.
+The current parser accepts historical top-level `let var` input but lowers
+top-level script bindings into the synthetic main body. The formatter therefore
+canonicalizes the semantic form back to ordinary `var mutable = 0` and must
+never expose the synthetic `__main` wrapper. Parser tests preserve the
+mutability bit through that lowering so formatting cannot silently turn a
+mutable binding immutable.
 
 Do not emit Rust-style `let mut`.
 
@@ -210,13 +212,15 @@ Complete RFC 0015:
 - remove `catch` and `fail` after the deprecation window;
 - stop using `nil` as an error sentinel in public stdlib APIs.
 
-Prefer readable signature sugar such as:
+Canonical recoverable failure uses the type directly:
 
 ```nulang
-fn load(id: Id) -> User throws LoadError
+fn load(id: Id) -> Result[User, LoadError]
 ```
 
-over adding more meanings to `!`.
+RFC 0015 deprecates both historical typed-error shorthands (`T ! E` and
+`throws E`). This leaves `! {Effects}` with one signature-level meaning:
+the algebraic-effect row.
 
 ### Phase 2 — pure primitive cleanup
 
@@ -274,6 +278,12 @@ continues to expose exact `iso/trn/ref/val/box/tag/lineariso` controls for
 systems code.
 
 This is not permission to weaken sendability or linear-consumption checks.
+
+Phase 4 also owns the remaining `&` notation audit. Today `&` participates
+in borrowing/reference syntax while `&`/related spellings also serve bitwise
+operations. Any simplification must preserve explicit ownership boundaries but
+should prefer one obvious spelling per semantic role rather than relying only
+on parser context.
 
 ### Phase 5 — shrink permanent keyword surface
 
