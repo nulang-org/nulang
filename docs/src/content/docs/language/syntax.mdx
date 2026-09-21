@@ -232,26 +232,37 @@ let fib = fn(n) {
 } in fib(10)
 ```
 
-`if cond then a else b` returns `a` when `cond` is truthy, `b` otherwise. The block form (`if cond { a } else { b }`) is equivalent.
+`if cond then a else b` returns `a` when `cond` is truthy, `b` otherwise.
+Blocks are allowed as branch expressions, but `then` remains required:
+`if cond then { a } else { b }`.
 
-## Effect Annotations
+## Errors and Effect Annotations
 
-Function signatures declare their effects with `!` or `throws` followed by an effect row:
+Typed recoverable errors and algebraic effect rows are separate contracts.
+
+Use `throws ErrorType` as the readable typed-error spelling:
+
+```nulang
+fn load_user(id: Int) -> User throws LoadError {
+    // returns Ok(User) / Error(LoadError) under the current Result model
+    load(id)
+}
+```
+
+Effect rows use `! {Effect, ...}`:
 
 ```nulang
 // Pure function — no effects
 fn add(x: Int, y: Int) -> Int = x + y
 
-// Effectful — performs IO (effect row after return type)
 fn greet() -> Unit ! {IO} {
     perform IO.print("Hello")
 }
-
-// throws is an alias for !
-fn log(msg: String) -> Unit throws {IO} {
-    perform IO.print(msg)
-}
 ```
+
+The parser also accepts the older `-> T ! ErrorType` typed-error form.
+RFC 0032 proposes reducing the overload on `!` in a later, separately
+reviewed syntax phase.
 
 See [Algebraic Effects](/language/effects/) for the full effect system.
 
