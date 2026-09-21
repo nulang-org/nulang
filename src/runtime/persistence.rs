@@ -2034,6 +2034,28 @@ impl PersistenceStore for PostgresStore {
 mod json_file_store_tests {
     use super::*;
 
+    #[test]
+    fn test_runtime_state_model_semantics_match_language_model() {
+        let cases = [
+            (StateModel::Local, crate::ast::StateModel::Local),
+            (StateModel::Durable, crate::ast::StateModel::Durable),
+            (StateModel::EventSourced, crate::ast::StateModel::EventSourced),
+            (
+                StateModel::Crdt(crate::ast::CrdtType::ORSet),
+                crate::ast::StateModel::Crdt(crate::ast::CrdtType::ORSet),
+            ),
+        ];
+
+        for (runtime, language) in cases {
+            assert_eq!(runtime.consistency(), language.consistency());
+            assert_eq!(runtime.durability(), language.durability());
+            assert_eq!(
+                runtime.requires_single_writer(),
+                language.requires_single_writer()
+            );
+        }
+    }
+
     /// Unique scratch dir per test (the suite runs tests in parallel, and a
     /// re-run must not see a previous run's leftover files).
     fn fresh_dir(tag: &str) -> PathBuf {
