@@ -1069,6 +1069,7 @@ impl Parser {
         self.expect(TokenKind::LBrace)?;
 
         let mut state_fields = Vec::new();
+        let mut indexes: Vec<crate::ast::IndexDecl> = Vec::new();
         let mut behaviors = Vec::new();
         let mut initializer: Option<(String, Vec<crate::ast::Param>, Expr)> = None;
         let mut version: u32 = 1;
@@ -1158,9 +1159,39 @@ impl Parser {
                     self.advance(); // consume 'migration'
                     migrations.push(self.parse_migration_body()?);
                 }
+                // Secondary indexes are contextual entity metadata, not global
+                // database DDL. Keeping the words contextual avoids reserving new
+                // language keywords while the data-kernel surface is Experimental.
+                TokenKind::Ident(ref s) if s == "index" => {
+                    if !persistent {
+                        return Err(NuError::parse_error(
+                            "indexes require a persistent actor or entity".to_string(),
+                            self.current_span(),
+                        ));
+                    }
+                    self.advance(); // consume 'index'
+                    indexes.push(self.parse_index_decl(false)?);
+                }
+                TokenKind::Ident(ref s) if s == "unique" => {
+                    if !persistent {
+                        return Err(NuError::parse_error(
+                            "indexes require a persistent actor or entity".to_string(),
+                            self.current_span(),
+                        ));
+                    }
+                    self.advance(); // consume 'unique'
+                    let keyword = self.expect_ident("'index' after 'unique'")?;
+                    if keyword != "index" {
+                        return Err(NuError::parse_error(
+                            format!("Expected 'index' after 'unique', got '{}'", keyword),
+                            self.current_span(),
+                        ));
+                    }
+                    indexes.push(self.parse_index_decl(true)?);
+                }
                 _ => {
                     return Err(NuError::parse_error(format!(
-                            "Expected 'state', 'behavior', 'initial', 'version', 'events', 'apply', or 'migration' in actor body, got {}",
+                            "Expected 'state', 'behavior', 'initial', 'version', 'events', 'apply', 'migration', or index declaration in actor body, got {}",
                             self.peek_kind()
                         ), self.current_span()));
                 }
@@ -1174,6 +1205,7 @@ impl Parser {
             type_params,
             persistent,
             state_fields,
+            indexes,
             behaviors,
             init: vec![],
             backend,
@@ -1186,6 +1218,48 @@ impl Parser {
             virtual_,
             key_params,
             implements,
+            span,
+        })
+    }
+
+    /// Parse a logical secondary index after the contextual `index`
+    /// keyword. A single-field index may omit the field block:
+    ///
+    /// ```text
+    /// unique index email
+    /// index by_company_status { company, status }
+    /// ```
+    fn parse_index_decl(&mut self, unique: bool) -> NuResult<crate::ast::IndexDecl> {
+        let span = self.current_span();
+        let name = self.expect_ident("index name")?;
+        let fields = if self.consume_if(&TokenKind::LBrace) {
+            self.skip_newlines();
+            let mut fields = Vec::new();
+            while !self.match_token(&TokenKind::RBrace) && !self.is_at_end() {
+                fields.push(self.expect_ident("indexed state field")?);
+                self.skip_newlines();
+                if self.consume_if(&TokenKind::Comma) {
+                    self.skip_newlines();
+                } else {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RBrace)?;
+            if fields.is_empty() {
+                return Err(NuError::parse_error(
+                    format!("index '{}' must contain at least one state field", name),
+                    span,
+                ));
+            }
+            fields
+        } else {
+            vec![name.clone()]
+        };
+        self.skip_newlines_semicolons();
+        Ok(crate::ast::IndexDecl {
+            name,
+            fields,
+            unique,
             span,
         })
     }
