@@ -87,10 +87,20 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
             .collect()
     });
     let semantic_id = actor.definition_semantic_id.map(|id| id.to_string());
+    let artifact_id = if semantic_id.is_some() {
+        actor
+            .bytecode_module
+            .as_ref()
+            .and_then(crate::bytecode::CodeModule::artifact_id)
+            .map(|id| id.to_string())
+    } else {
+        None
+    };
     let snapshot = crate::runtime::persistence::ActorSnapshot {
         actor_id,
         sequence: seq,
         semantic_id,
+        artifact_id,
         state,
         waiting_signal: actor.waiting_signal.clone(),
         crdt_snapshot,
