@@ -8,6 +8,7 @@
 // PROJ, GDAL, H3/S2, GeoArrow, and GeoParquet adapters belong in follow-on
 // packages/extensions once the pure-Nulang API is stable.
 
+
 /// Marker type for WGS84 geographic coordinates stored as x=longitude,
 /// y=latitude. This follows OGC:CRS84 axis order. It deliberately does not
 /// claim strict EPSG:4326 axis semantics, whose formal axis order is
@@ -1031,5 +1032,360 @@ pub fn rtree_query_intersects_with_stats[CRS, T](
             let result: RTreeQueryResult[T] = { values: [], stats: rtree_empty_query_stats() };
             result
         },
+    }
+}
+
+
+
+fn geojson_position_string(p: Point[Wgs84]) -> String {
+    "[" + perform Float.to_string(p.x) + "," + perform Float.to_string(p.y) + "]"
+}
+
+/// Serialize a WGS84 point as RFC 7946 GeoJSON.
+///
+/// GeoJSON uses longitude/latitude order and does not carry a custom CRS
+/// member. Restricting the function to Point[Wgs84] prevents projected/local
+/// coordinates from being emitted as standard GeoJSON.
+pub fn point_to_geojson(p: Point[Wgs84]) -> String {
+    "{\"type\":\"Point\",\"coordinates\":" + geojson_position_string(p) + "}"
+}
+
+/// Serialize a WGS84 line string as RFC 7946 GeoJSON.
+pub fn line_string_to_geojson(line: LineString[Wgs84]) -> String {
+    var result = "{\"type\":\"LineString\",\"coordinates\":[";
+    var i = 0;
+    let n = perform Array.length(line.points);
+    while i < n {
+        if i > 0 then { result = result + "," } else {};
+        result = result + geojson_position_string(line.points[i]);
+        i = i + 1
+    };
+    result + "]}"
+}
+
+/// Serialize a single-ring WGS84 polygon as RFC 7946 GeoJSON.
+///
+/// Internal Polygon rings are implicitly closed; GeoJSON linear rings are
+/// explicitly closed, so the writer repeats the first position when needed.
+pub fn polygon_to_geojson(shape: Polygon[Wgs84]) -> String {
+    var result = "{\"type\":\"Polygon\",\"coordinates\":[[";
+    let n = perform Array.length(shape.ring);
+    var i = 0;
+    while i < n {
+        if i > 0 then { result = result + "," } else {};
+        result = result + geojson_position_string(shape.ring[i]);
+        i = i + 1
+    };
+    if n > 0 then {
+        let first = shape.ring[0];
+        let last = shape.ring[n - 1];
+        if first.x != last.x || first.y != last.y then {
+            if n > 0 then { result = result + "," } else {};
+            result = result + geojson_position_string(first)
+        } else {}
+    } else {};
+    result + "]]}"
+}
+
+pub type GeoJsonNumberParse = {
+    value: Float,
+    pos: Int,
+    ok: Bool
+}
+
+pub type GeoJsonPositionParse = {
+    point: Point[Wgs84],
+    pos: Int,
+    ok: Bool
+}
+
+pub type GeoJsonPointsParse = {
+    points: [Point[Wgs84]],
+    pos: Int,
+    ok: Bool
+}
+
+fn geojson_skip_ws(source: String, start: Int) -> Int {
+    var p = start;
+    let n = perform String.length(source);
+    while p < n {
+        let c = perform String.charAt(source, p);
+        if c == 32 || c == 9 || c == 10 || c == 13 then {
+            p = p + 1
+        } else {
+            return p
+        }
+    };
+    p
+}
+
+fn geojson_find(source: String, needle: String, start: Int) -> Int {
+    let source_len = perform String.length(source);
+    let needle_len = perform String.length(needle);
+    var p = start;
+    while p + needle_len <= source_len {
+        if perform String.substring(source, p, needle_len) == needle then {
+            return p
+        } else {};
+        p = p + 1
+    };
+    -1
+}
+
+fn geojson_member_value_pos(source: String, key: String) -> Int {
+    let key_pos = geojson_find(source, "\"" + key + "\"", 0);
+    if key_pos < 0 then {
+        -1
+    } else {
+        var p = key_pos + perform String.length(key) + 2;
+        p = geojson_skip_ws(source, p);
+        if p >= perform String.length(source) ||
+           perform String.charAt(source, p) != 58 then {
+            -1
+        } else {
+            geojson_skip_ws(source, p + 1)
+        }
+    }
+}
+
+fn geojson_geometry_type(source: String) -> String {
+    let p = geojson_member_value_pos(source, "type");
+    if p < 0 then {
+        ""
+    } else if perform String.substring(source, p, 7) == "\"Point\"" then {
+        "Point"
+    } else if perform String.substring(source, p, 12) == "\"LineString\"" then {
+        "LineString"
+    } else if perform String.substring(source, p, 9) == "\"Polygon\"" then {
+        "Polygon"
+    } else {
+        ""
+    }
+}
+
+fn geojson_is_digit(c: Int) -> Bool {
+    c >= 48 && c <= 57
+}
+
+fn geojson_parse_number(source: String, start: Int) -> GeoJsonNumberParse {
+    let n = perform String.length(source);
+    var p = geojson_skip_ws(source, start);
+    let begin = p;
+    if p < n && perform String.charAt(source, p) == 45 then { p = p + 1 } else {};
+
+    let int_start = p;
+    while p < n && geojson_is_digit(perform String.charAt(source, p)) {
+        p = p + 1
+    };
+    if p == int_start then {
+        let invalid_number: GeoJsonNumberParse = { value: 0.0, pos: start, ok: false };
+        return invalid_number
+    } else {};
+
+    if p < n && perform String.charAt(source, p) == 46 then {
+        p = p + 1;
+        let frac_start = p;
+        while p < n && geojson_is_digit(perform String.charAt(source, p)) {
+            p = p + 1
+        };
+        if p == frac_start then {
+            let invalid_number: GeoJsonNumberParse = { value: 0.0, pos: start, ok: false };
+            return invalid_number
+        } else {}
+    } else {};
+
+    if p < n then {
+        let e = perform String.charAt(source, p);
+        if e == 101 || e == 69 then {
+            p = p + 1;
+            if p < n then {
+                let sign = perform String.charAt(source, p);
+                if sign == 43 || sign == 45 then { p = p + 1 } else {}
+            } else {};
+            let exp_start = p;
+            while p < n && geojson_is_digit(perform String.charAt(source, p)) {
+                p = p + 1
+            };
+            if p == exp_start then {
+                let invalid_number: GeoJsonNumberParse = { value: 0.0, pos: start, ok: false };
+                return invalid_number
+            } else {}
+        } else {}
+    } else {};
+
+    let raw = perform String.substring(source, begin, p - begin);
+    let parsed: GeoJsonNumberParse = { value: perform String.to_float(raw), pos: p, ok: true };
+    parsed
+}
+
+fn geojson_parse_position(source: String, start: Int) -> GeoJsonPositionParse {
+    let n = perform String.length(source);
+    var p = geojson_skip_ws(source, start);
+    if p >= n || perform String.charAt(source, p) != 91 then {
+        let invalid_position: GeoJsonPositionParse = { point: wgs84(0.0, 0.0), pos: start, ok: false };
+        return invalid_position
+    } else {};
+    p = geojson_skip_ws(source, p + 1);
+
+    let x = geojson_parse_number(source, p);
+    if !x.ok then {
+        let invalid_position: GeoJsonPositionParse = { point: wgs84(0.0, 0.0), pos: start, ok: false };
+        return invalid_position
+    } else {};
+    p = geojson_skip_ws(source, x.pos);
+    if p >= n || perform String.charAt(source, p) != 44 then {
+        let invalid_position: GeoJsonPositionParse = { point: wgs84(0.0, 0.0), pos: start, ok: false };
+        return invalid_position
+    } else {};
+
+    let y = geojson_parse_number(source, p + 1);
+    if !y.ok then {
+        let invalid_position: GeoJsonPositionParse = { point: wgs84(0.0, 0.0), pos: start, ok: false };
+        return invalid_position
+    } else {};
+    p = geojson_skip_ws(source, y.pos);
+
+    // A third ordinate (or any extra array item) is intentionally rejected.
+    if p >= n || perform String.charAt(source, p) != 93 then {
+        let invalid_position: GeoJsonPositionParse = { point: wgs84(0.0, 0.0), pos: start, ok: false };
+        return invalid_position
+    } else {};
+
+    let point_value = wgs84(x.value, y.value);
+    if !is_valid_wgs84(point_value) then {
+        let invalid_position: GeoJsonPositionParse = { point: point_value, pos: start, ok: false };
+        fail
+    } else {
+        let parsed: GeoJsonPositionParse = { point: point_value, pos: p + 1, ok: true };
+        parsed
+    }
+}
+
+fn geojson_parse_positions(source: String, start: Int) -> GeoJsonPointsParse {
+    let n = perform String.length(source);
+    var p = geojson_skip_ws(source, start);
+    if p >= n || perform String.charAt(source, p) != 91 then {
+        let invalid_points: GeoJsonPointsParse = { points: [], pos: start, ok: false };
+        return invalid_points
+    } else {};
+    p = geojson_skip_ws(source, p + 1);
+
+    var points: [Point[Wgs84]] = [];
+    if p < n && perform String.charAt(source, p) == 93 then {
+        let empty: GeoJsonPointsParse = { points: points, pos: p + 1, ok: true };
+        return empty
+    } else {};
+
+    var done = false;
+    while !done {
+        let item = geojson_parse_position(source, p);
+        if !item.ok then {
+            let invalid_points: GeoJsonPointsParse = { points: [], pos: start, ok: false };
+            return invalid_points
+        } else {};
+        points = perform Array.push(points, item.point);
+        p = geojson_skip_ws(source, item.pos);
+        if p >= n then {
+            let invalid_points: GeoJsonPointsParse = { points: [], pos: start, ok: false };
+            return invalid_points
+        } else {};
+        let sep = perform String.charAt(source, p);
+        if sep == 44 then {
+            p = geojson_skip_ws(source, p + 1)
+        } else if sep == 93 then {
+            p = p + 1;
+            done = true
+        } else {
+            let invalid_points: GeoJsonPointsParse = { points: [], pos: start, ok: false };
+            return invalid_points
+        }
+    };
+    let parsed: GeoJsonPointsParse = { points: points, pos: p, ok: true };
+    parsed
+}
+
+/// Parse a strict 2D RFC 7946 Point.
+pub fn point_from_geojson(source: String) -> Option[Point[Wgs84]] {
+    if geojson_geometry_type(source) != "Point" then {
+        None
+    } else {
+        let p = geojson_member_value_pos(source, "coordinates");
+        if p < 0 then {
+            None
+        } else {
+            let parsed = geojson_parse_position(source, p);
+            if parsed.ok then Some(parsed.point) else None
+        }
+    }
+}
+
+/// Parse a strict 2D RFC 7946 LineString with at least two positions.
+pub fn line_string_from_geojson(source: String) -> Option[LineString[Wgs84]] {
+    if geojson_geometry_type(source) != "LineString" then {
+        None
+    } else {
+        let p = geojson_member_value_pos(source, "coordinates");
+        if p < 0 then {
+            None
+        } else {
+            let parsed = geojson_parse_positions(source, p);
+            if parsed.ok && perform Array.length(parsed.points) >= 2 then {
+                Some(line_string(parsed.points, WGS84))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Parse a strict 2D RFC 7946 Polygon with exactly one explicitly closed ring.
+///
+/// Polygon holes are rejected because the current Polygon type is single-ring.
+pub fn polygon_from_geojson(source: String) -> Option[Polygon[Wgs84]] {
+    if geojson_geometry_type(source) != "Polygon" then {
+        None
+    } else {
+        let n = perform String.length(source);
+        var p = geojson_member_value_pos(source, "coordinates");
+        if p < 0 || p >= n || perform String.charAt(source, p) != 91 then {
+            None
+        } else {
+            p = geojson_skip_ws(source, p + 1);
+            let ring_parse = geojson_parse_positions(source, p);
+            if !ring_parse.ok then {
+                None
+            } else {
+                p = geojson_skip_ws(source, ring_parse.pos);
+                // Exactly one ring: after the ring, the outer coordinates
+                // array must close immediately rather than contain a hole.
+                if p >= n || perform String.charAt(source, p) != 93 then {
+                    None
+                } else {
+                    let points = ring_parse.points;
+                    let count = perform Array.length(points);
+                    if count < 4 then {
+                        None
+                    } else {
+                        let first = points[0];
+                        let last = points[count - 1];
+                        if first.x != last.x || first.y != last.y then {
+                            None
+                        } else {
+                            var ring: [Point[Wgs84]] = [];
+                            var i = 0;
+                            while i < count - 1 {
+                                ring = perform Array.push(ring, points[i]);
+                                i = i + 1
+                            };
+                            if perform Array.length(ring) >= 3 then {
+                                Some(polygon(ring, WGS84))
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
