@@ -19,7 +19,7 @@ fn main() {
   let v = parse("{\"a\": 1, \"b\": [true, null]}")
   perform IO.print(stringify(v))                  // {"a":1,"b":[true,null]}
   perform IO.print(get_string(v, "a", "?"))       // compatibility: caller default
-  let strict = get(v, "b")                         // Option[JsonValue]
+  let strict = get_field(v, "b")                         // Option[JsonValue]
   let name = get_string_opt(v, "name")             // Option[String]
 }
 ```
@@ -30,7 +30,7 @@ fn main() {
 |----------|-------------|
 | `parse(json: String) -> JsonValue` | Recursive-descent parser; trailing content ignored, empty input → `JsonNull`. |
 | `stringify(value: JsonValue) -> String` | Compact encoder with full string escaping. |
-| `get(obj, key) -> Option[JsonValue]` | Strict field lookup; distinguishes missing from `Some(JsonNull)`. |
+| `get_field(obj, key) -> Option[JsonValue]` | Strict field lookup; distinguishes missing from `Some(JsonNull)`. |
 | `as_string(value) -> Option[String]` | Strict string projection. |
 | `as_number(value) -> Option[Float]` | Strict numeric projection. |
 | `as_bool(value) -> Option[Bool]` | Strict boolean projection. |
