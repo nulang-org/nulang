@@ -26,8 +26,9 @@ pub struct StateVersion {
 
 /// The state fields observed while evaluating one query.
 ///
-/// Keys are `(actor_id, field_name)`; values are the field revision observed
-/// at the first read. First-read semantics deliberately make a result stale if
+/// Dependencies are grouped by actor id and field name; each value is the
+/// actor incarnation plus field revision observed at the first read.
+/// First-read semantics deliberately make a result stale if
 /// a handler mutates a field after reading it, even if it later reads the field
 /// again. Query handlers are intended to be read-only, but this keeps the
 /// dependency primitive conservative until purity is enforced statically.
@@ -39,11 +40,11 @@ pub struct StateReadSet {
 impl StateReadSet {
     /// Number of distinct actor-field dependencies.
     pub fn len(&self) -> usize {
-        self.dependencies.values().map(BTreeMap::len).sum()
+        self.dependencies.values().map(|fields| fields.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.dependencies.values().all(BTreeMap::is_empty)
+        self.dependencies.values().all(|fields| fields.is_empty())
     }
 
     /// Version observed for one actor-state field.
