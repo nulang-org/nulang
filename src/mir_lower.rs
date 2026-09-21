@@ -152,18 +152,6 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 migrations: String::new(),
             });
         }
-        hir::Decl::Workflow { name, .. } => {
-            unreachable!(
-                "workflow '{}' should be desugared to an actor by HIR lowering (desugar_workflow)",
-                name
-            );
-        }
-        hir::Decl::Agent { name, .. } => {
-            unreachable!(
-                "agent '{}' should be desugared to an actor by HIR lowering (desugar_agent)",
-                name
-            );
-        }
         hir::Decl::Module { decls, .. } => {
             for d in decls {
                 reserve_decl(ctx, d)?;
