@@ -1585,6 +1585,13 @@ impl PersistenceStore for LibsqlStore {
             .await
             .map(|_| ())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "DELETE FROM events_v2 WHERE actor_id = ?1",
+                libsql::params![actor_id as i64],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
@@ -1866,9 +1873,10 @@ impl PersistenceStore for RocksDbStore {
             Self::CF_EVENTS,
         ] {
             let cf = self.cf(cf_name)?;
-            // Start from the bare actor prefix.  Snapshot keys are exactly 8
-            // bytes; journal/event keys are 16 bytes (actor || sequence).
-            // Both layouts sort contiguously under the actor prefix.
+            // Start from the bare actor prefix. Snapshot keys are exactly 8
+            // bytes; journal/workflow keys are 16 bytes and event keys are
+            // either legacy 16-byte actor||sequence or v2 actor||sequence||field.
+            // Every layout sorts contiguously under the actor prefix.
             let actor_key = Self::actor_key(actor_id);
             let mut iter = self.db.iterator_cf(
                 cf,
