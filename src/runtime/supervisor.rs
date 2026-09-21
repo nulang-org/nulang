@@ -134,6 +134,8 @@ pub struct RestartTemplate {
     pub behaviors: Vec<(String, fn(&mut Actor, &[Value]))>,
     /// Definition-scoped semantic identity captured from the child.
     pub definition_semantic_id: Option<crate::content_identity::SemanticId>,
+    /// Exact compiler/backend artifact captured from the child, when known.
+    pub artifact_id: Option<crate::content_identity::ArtifactId>,
     /// Bytecode module backing the child's bytecode behaviors, if any.
     pub bytecode_module: Option<crate::bytecode::CodeModule>,
     /// Bytecode behavior offsets by behavior id.
@@ -358,6 +360,7 @@ impl Supervisor {
             template.definition_semantic_id
         };
         new_actor.definition_semantic_id = verified_definition_semantic_id;
+        new_actor.artifact_id = template.artifact_id;
 
         if let Some(ref snap) = snapshot {
             for (name, value) in &snap.state {
