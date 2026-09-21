@@ -56,8 +56,11 @@ use super::fabric_stream_epoch::{
     FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
 };
 use super::mailbox::{Message, MessagePriority};
-use super::network::{NetworkTransport, Packet};
-use super::{ActorAdmissionStatus, ClusterState, NodeId, NodeStatus};
+use super::network::{NetworkTransport, Packet, TransportAdmission};
+use super::{
+    ActorAdmissionStatus, ClusterState, MessageAdmission, NodeId, NodeStatus,
+    TrackedSendAdmission,
+};
 use crate::runtime::Runtime;
 use crate::types::ExitReason;
 use crate::vm::Value;
@@ -802,9 +805,7 @@ pub fn send_distributed(
     );
 }
 
-/// Send a distributed message and request a terminal destination admission
-/// response. Returns a sender-local delivery id only when the message was
-/// actually handed to the remote transport.
+/// Compatibility tracked-send API returning only the asynchronous delivery id.
 pub fn send_distributed_tracked(
     runtime: &mut Runtime,
     transport: &mut dyn NetworkTransport,
@@ -814,6 +815,22 @@ pub fn send_distributed_tracked(
     behavior: &str,
     args: &[Value],
 ) -> Option<u64> {
+    try_send_distributed_tracked(
+        runtime, transport, cluster, resolver, target, behavior, args,
+    )
+    .delivery_id
+}
+
+/// Non-blocking tracked send with precise immediate admission.
+pub fn try_send_distributed_tracked(
+    runtime: &mut Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    resolver: &mut AddressResolver,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+) -> TrackedSendAdmission {
     send_distributed_inner(
         runtime, transport, cluster, resolver, target, behavior, args, true,
     )
@@ -828,12 +845,12 @@ fn send_distributed_inner(
     behavior: &str,
     args: &[Value],
     tracked: bool,
-) -> Option<u64> {
+) -> TrackedSendAdmission {
     match resolver.resolve(cluster, target) {
-        ResolveResult::Local { actor_id } => {
-            runtime.send_message(actor_id, behavior, args);
-            None
-        }
+        ResolveResult::Local { actor_id } => TrackedSendAdmission {
+            admission: runtime.send_message(actor_id, behavior, args),
+            delivery_id: None,
+        },
         ResolveResult::Remote { node_id, actor_id } => {
             crate::runtime::distribution::record_remote_ref(runtime, node_id, actor_id);
             let (payload, string_table) = match resolve_wire_strings(runtime, args) {
@@ -845,7 +862,10 @@ fn send_distributed_inner(
                     );
                     let sender = runtime.current_actor.unwrap_or(0);
                     notify_delivery_failed(runtime, sender, "string payload unresolvable");
-                    return None;
+                    return TrackedSendAdmission {
+                        admission: MessageAdmission::Rejected,
+                        delivery_id: None,
+                    };
                 }
             };
             let (payload, object_table) = match resolve_wire_objects(runtime, &payload) {
@@ -857,7 +877,10 @@ fn send_distributed_inner(
                     );
                     let sender = runtime.current_actor.unwrap_or(0);
                     notify_delivery_failed(runtime, sender, "object ref unresolvable");
-                    return None;
+                    return TrackedSendAdmission {
+                        admission: MessageAdmission::Rejected,
+                        delivery_id: None,
+                    };
                 }
             };
             let Some(node_info) = cluster.get_node(node_id) else {
@@ -867,7 +890,10 @@ fn send_distributed_inner(
                 );
                 let sender = runtime.current_actor.unwrap_or(0);
                 notify_delivery_failed(runtime, sender, "target node left cluster");
-                return None;
+                return TrackedSendAdmission {
+                    admission: MessageAdmission::Rejected,
+                    delivery_id: None,
+                };
             };
 
             let content_hash = try_lookup_content_hash(runtime, behavior);
@@ -877,10 +903,13 @@ fn send_distributed_inner(
                     Some(delivery_id) => Some(delivery_id),
                     None => {
                         warn!(
-                            "nulang-net: refusing tracked send to actor {} on node {:?}: pending admission table is full",
+                            "nulang-net: backpressure tracking send to actor {} on node {:?}: pending admission table is full",
                             actor_id, node_id
                         );
-                        return None;
+                        return TrackedSendAdmission {
+                            admission: MessageAdmission::Backpressured,
+                            delivery_id: None,
+                        };
                     }
                 }
             } else {
@@ -900,14 +929,47 @@ fn send_distributed_inner(
             );
 
             let net_node_id = NodeId(node_id.0);
-            transport.send(net_node_id, node_info.address, packet);
-            delivery_id
+            if tracked {
+                match transport.try_send(net_node_id, node_info.address, packet) {
+                    TransportAdmission::Accepted => TrackedSendAdmission {
+                        admission: MessageAdmission::Forwarded,
+                        delivery_id,
+                    },
+                    TransportAdmission::Backpressured => {
+                        if let Some(delivery_id) = delivery_id {
+                            runtime.abandon_remote_admission(delivery_id);
+                        }
+                        TrackedSendAdmission {
+                            admission: MessageAdmission::Backpressured,
+                            delivery_id: None,
+                        }
+                    }
+                    TransportAdmission::Rejected => {
+                        if let Some(delivery_id) = delivery_id {
+                            runtime.abandon_remote_admission(delivery_id);
+                        }
+                        TrackedSendAdmission {
+                            admission: MessageAdmission::Rejected,
+                            delivery_id: None,
+                        }
+                    }
+                }
+            } else {
+                transport.send(net_node_id, node_info.address, packet);
+                TrackedSendAdmission {
+                    admission: MessageAdmission::Forwarded,
+                    delivery_id: None,
+                }
+            }
         }
         ResolveResult::Unresolvable { reason } => {
             warn!("nulang-net: dropping message to {:?}: {}", target, reason);
             let sender = runtime.current_actor.unwrap_or(0);
             notify_delivery_failed(runtime, sender, &reason);
-            None
+            TrackedSendAdmission {
+                admission: MessageAdmission::Rejected,
+                delivery_id: None,
+            }
         }
     }
 }
