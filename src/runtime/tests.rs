@@ -6485,7 +6485,7 @@ fn test_remote_actor_send_reports_transport_backpressure_without_blocking() {
     let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10012);
     let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
-    let mut transport_a =
+    let transport_a =
         DeterministicNetworkTransport::bind_with_bus(addr_a, bus.clone()).unwrap();
     let transport_b = DeterministicNetworkTransport::bind_with_bus(addr_b, bus).unwrap();
     let node_b = transport_b.node_id();
@@ -6505,6 +6505,7 @@ fn test_remote_actor_send_reports_transport_backpressure_without_blocking() {
     rt.remote_refs.insert(REMOTE_ACTOR, node_b);
 
     // Fill B's bounded receive channel through A's real transport.
+    let local_node = rt.distributed.node_id.unwrap_or(NodeId::LOCAL);
     let mut saturated = false;
     for i in 0..4096_u64 {
         let admission = rt
@@ -6516,7 +6517,7 @@ fn test_remote_actor_send_reports_transport_backpressure_without_blocking() {
                 node_b,
                 addr_b,
                 Packet::Heartbeat {
-                    node_id: rt.distributed.node_id.unwrap_or(NodeId::LOCAL),
+                    node_id: local_node,
                     timestamp: i,
                 },
             );
