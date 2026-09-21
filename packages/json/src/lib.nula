@@ -336,6 +336,77 @@ pub fn stringify(value: JsonValue) -> String {
 }
 
 
+
+/// Look up a field in a JSON object without inventing a default.
+///
+/// Returns Some(value) only when `obj` is an object containing `key`.
+/// A present JSON null is therefore distinct from an absent key:
+/// `Some(JsonNull)` versus `None`.
+pub fn get_field(obj: JsonValue, key: String) -> Option[JsonValue] {
+    match obj {
+        JsonObject(fields) => {
+            var i = 0;
+            let len = perform Array.length(fields);
+            while i < len {
+                let pair = fields[i];
+                if pair.0 == key then { return Some(pair.1) } else {};
+                i = i + 1
+            };
+            None
+        },
+        _ => None,
+    }
+}
+
+/// Strictly project a JSON string value.
+pub fn as_string(value: JsonValue) -> Option[String] {
+    match value {
+        JsonString(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// Strictly project a JSON numeric value.
+pub fn as_number(value: JsonValue) -> Option[Float] {
+    match value {
+        JsonNumber(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// Strictly project a JSON boolean value.
+pub fn as_bool(value: JsonValue) -> Option[Bool] {
+    match value {
+        JsonBool(b) => Some(b),
+        _ => None,
+    }
+}
+
+/// Strict string-field lookup. Missing keys, non-object inputs, and wrong
+/// field types all return None instead of collapsing into a caller default.
+pub fn get_string_opt(obj: JsonValue, key: String) -> Option[String] {
+    match get_field(obj, key) {
+        Some(value) => as_string(value),
+        None => None,
+    }
+}
+
+/// Strict numeric-field lookup.
+pub fn get_number_opt(obj: JsonValue, key: String) -> Option[Float] {
+    match get_field(obj, key) {
+        Some(value) => as_number(value),
+        None => None,
+    }
+}
+
+/// Strict boolean-field lookup.
+pub fn get_bool_opt(obj: JsonValue, key: String) -> Option[Bool] {
+    match get_field(obj, key) {
+        Some(value) => as_bool(value),
+        None => None,
+    }
+}
+
 /// Get a string field from a JSON object, or return a default.
 pub fn get_string(obj: JsonValue, key: String, default: String) -> String {
     match obj {
