@@ -3503,6 +3503,126 @@ mod tests {
         transport_b.shutdown();
     }
 
+    #[test]
+    fn test_tracked_remote_send_reports_terminal_admission() {
+        use crate::runtime::network::DeterministicNetworkTransport;
+        use crate::runtime::{Mailbox, NetworkTransport};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let addr_a = addr(31_101);
+        let addr_b = addr(31_102);
+        let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+
+        let mut transport_a =
+            DeterministicNetworkTransport::bind_with_bus(addr_a, bus.clone()).unwrap();
+        let mut transport_b =
+            DeterministicNetworkTransport::bind_with_bus(addr_b, bus).unwrap();
+        let node_a = transport_a.node_id();
+        let node_b = transport_b.node_id();
+        transport_a.register_on_bus();
+        transport_b.register_on_bus();
+        transport_a.connect(node_b, addr_b).unwrap();
+        transport_b.connect(node_a, addr_a).unwrap();
+
+        let mut cluster_a = ClusterState::new(node_a, addr_a);
+        cluster_a.handle_heartbeat(node_b, addr_b);
+        let mut cluster_b = ClusterState::new(node_b, addr_b);
+        cluster_b.handle_heartbeat(node_a, addr_a);
+        let mut resolver_a = AddressResolver::new(node_a);
+        let mut resolver_b = AddressResolver::new(node_b);
+        let mut runtime_a = Runtime::new();
+        let mut runtime_b = Runtime::new();
+
+        let actor_b =
+            runtime_b.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+        {
+            let actor = runtime_b.actors.get_mut(&actor_b).unwrap();
+            actor.mailbox = Mailbox::new(1);
+            actor.register_behavior("inc", |actor, _args| {
+                let count = actor
+                    .get_state_field("count")
+                    .and_then(|value| value.as_int())
+                    .unwrap_or(0);
+                actor.set_state_field("count", Value::int(count + 1));
+            });
+        }
+
+        let target = ActorAddress::remote(node_b, actor_b);
+        let accepted = send_distributed_tracked(
+            &mut runtime_a,
+            &mut transport_a,
+            &cluster_a,
+            &mut resolver_a,
+            target,
+            "inc",
+            &[],
+        )
+        .expect("remote send should return a delivery id");
+        let backpressured = send_distributed_tracked(
+            &mut runtime_a,
+            &mut transport_a,
+            &cluster_a,
+            &mut resolver_a,
+            target,
+            "inc",
+            &[],
+        )
+        .expect("second remote send should return a delivery id");
+        let rejected = send_distributed_tracked(
+            &mut runtime_a,
+            &mut transport_a,
+            &cluster_a,
+            &mut resolver_a,
+            target,
+            "missing_behavior",
+            &[],
+        )
+        .expect("rejected remote send was still handed to the destination");
+
+        process_network_packets(
+            &mut runtime_b,
+            &mut transport_b,
+            &mut cluster_b,
+            &mut resolver_b,
+        );
+        process_network_packets(
+            &mut runtime_a,
+            &mut transport_a,
+            &mut cluster_a,
+            &mut resolver_a,
+        );
+
+        assert_eq!(
+            runtime_a.take_remote_admission(accepted),
+            Some(ActorAdmissionStatus::Accepted)
+        );
+        assert_eq!(
+            runtime_a.take_remote_admission(backpressured),
+            Some(ActorAdmissionStatus::Backpressured)
+        );
+        assert_eq!(
+            runtime_a.take_remote_admission(rejected),
+            Some(ActorAdmissionStatus::Rejected)
+        );
+        assert_eq!(runtime_b.actors.get(&actor_b).unwrap().mailbox.len(), 1);
+        assert_eq!(runtime_b.dlq_depth(), 1);
+
+        runtime_b.run_scheduler();
+        assert_eq!(
+            runtime_b
+                .actors
+                .get(&actor_b)
+                .unwrap()
+                .get_state_field("count")
+                .and_then(|value| value.as_int()),
+            Some(1)
+        );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
     // -- 18. Cross-node string payloads --------------------------------------
 
     #[test]
