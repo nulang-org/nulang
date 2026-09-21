@@ -335,6 +335,7 @@ pub(crate) fn spawn_from_module(
     };
     if let Some(actor) = rt.actors.get_mut(&id) {
         actor.definition_semantic_id = definition_semantic_id;
+        actor.artifact_id = module.artifact_id;
         actor.bytecode_module = Some(module.clone());
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
