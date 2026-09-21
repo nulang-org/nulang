@@ -1533,3 +1533,11 @@ in this version; they are recorded here to establish their tier.
 No stability promise. The 0.x series is the alpha development track. Language
 version 1.0.0-frozen is the first version with a published stability contract;
 everything before it is implicitly Experimental.
+
+## Experimental tier
+
+### Canonical Option/Result modules and combinators — 2026-09-21
+- **The prelude is the single owner of `Option` and `Result`.** `stdlib::option` and `stdlib::result` no longer redeclare the ADTs; they operate on the auto-imported canonical prelude types.
+- **Small algebraic combinator core.** Option adds `and_then`, `or_else`, `unwrap_or`, `unwrap_or_else`, `filter`, and `ok_or`. Result adds `map_err`, `and_then`, `or_else`, `unwrap_or`, `unwrap_or_else`, and `to_option`. Collection-oriented helpers such as `map2`, `sequence`, and `traverse` remain in the Experimental `result-ext` package.
+- **Aborting unwrap remains legacy for now.** `unwrap` still uses the existing assertion path because explicit `panic` is not yet supported by the native AOT backend; moving stdlib unwrap to `panic` before backend parity would make ordinary library code backend-dependent.
+
