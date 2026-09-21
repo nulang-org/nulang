@@ -177,9 +177,12 @@ fn main() {
     }
 
     // Adoption-friendly package shortcuts. Keep `nulang nula <cmd>` as the
-    // complete package-manager surface, while making the common first-run
-    // path discoverable directly from the main executable.
-    if matches!(args[1].as_str(), "new" | "dev") {
+    // complete package-manager surface, while making the common inner-loop
+    // commands discoverable directly from the main executable.
+    if matches!(
+        args[1].as_str(),
+        "new" | "dev" | "build" | "test" | "run"
+    ) {
         if let Err(e) = nulang::package::commands::run(&args[1..]) {
             print_error(&e, true);
             std::process::exit(exit_code(&e));
@@ -1081,6 +1084,9 @@ fn print_help() {
     println!("       nulang --dap");
     println!("       nulang new <path> [--template <name>]");
     println!("       nulang dev [--port <port>]");
+    println!("       nulang build");
+    println!("       nulang test [--filter <pattern>]");
+    println!("       nulang run [--watch]");
     println!("       nulang fmt [--check] [<file>]");
     println!("       nulang node --listen <ADDR> [--seed <ADDR>] [--expected-nodes <N>]");
     println!("       nulang --doc");
@@ -1130,6 +1136,9 @@ fn print_help() {
     );
     println!("  new <path>       Scaffold a package (shortcut for 'nula new')");
     println!("  dev              Start package dev server (shortcut for 'nula dev')");
+    println!("  build            Build the current package (shortcut for 'nula build')");
+    println!("  test             Test the current package (shortcut for 'nula test')");
+    println!("  run              Run the current package (shortcut for 'nula run')");
     println!(
         "  nula <cmd>       Full package manager (new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, clean)"
     );
