@@ -42,6 +42,9 @@ version + migration.*
 
 ## Stable tier
 
+### CI release-lane de-duplication — 2026-09-21
+- **Release CI keeps optimized build coverage without rerunning the entire test suite** (`.github/workflows/ci.yml`). The full suite remains authoritative in Build & Test; Release Build now verifies `cargo build --release` plus representative optimized regressions for raw-value provenance, nominal actor protocols, and durable actor-turn semantic closure, reducing runner pressure while preserving release-mode semantic coverage.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
