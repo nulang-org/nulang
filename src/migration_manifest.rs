@@ -288,6 +288,9 @@ impl MigrationManifest {
         let mut topology = self.clone();
         for contract in &mut topology.contracts {
             contract.state_function_index = None;
+            for event in &mut contract.event_transforms {
+                event.function_index = None;
+            }
         }
         let json = topology.to_json()?;
         Ok(blake3::hash(json.as_bytes()).to_hex().to_string())
@@ -347,6 +350,40 @@ mod tests {
         let restored = MigrationManifest::from_json(&json).unwrap();
         assert_eq!(restored, manifest);
         assert_eq!(restored.digest().unwrap(), manifest.digest().unwrap());
+    }
+
+    #[test]
+    fn topology_digest_ignores_artifact_local_event_function_binding() {
+        let (version, migrations) = entity_version_and_migrations(
+            r#"
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                events
+                    | Deposited(amount: Int)
+                migration from 1 to 2 {
+                    events {
+                        | LegacyDeposit(amount) => emit Deposited(amount)
+                        | other => other
+                    }
+                }
+            }
+            "#,
+        );
+
+        let mut manifest = MigrationManifest::from_decls(version, &migrations).unwrap();
+        let original = manifest.digest().unwrap();
+        let named = manifest.contracts[0]
+            .event_transforms
+            .iter_mut()
+            .find(|event| !event.catch_all)
+            .expect("named event arm");
+        named.function_index = Some(91);
+        assert_eq!(
+            manifest.digest().unwrap(),
+            original,
+            "artifact-local event bytecode indices must not affect migration topology identity"
+        );
     }
 
     #[test]

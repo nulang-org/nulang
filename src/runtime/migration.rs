@@ -14,14 +14,21 @@ use crate::runtime::heap::{ActorHeap, TypeTag};
 use crate::runtime::persistence::{ActorSnapshot, PersistedValue, StateModel};
 use crate::vm::{ActorVmCallbacks, DistributedVmCallbacks, PerformAsyncResult, SignalWaitResult, Value, VM};
 
-/// Durable-history facts gathered by the caller before attempting a state-only
-/// migration. V1 deliberately refuses histories that would need semantic replay
-/// under a different schema.
+/// Durable-history facts that still constrain snapshot-state migration.
+///
+/// Event history is intentionally absent: RFC 0008 event rows are migrated
+/// independently in memory by event_replay after the snapshot schema is
+/// revision-fenced.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct StateMigrationHistory {
     pub has_pending_message_journal: bool,
-    pub has_event_history: bool,
     pub has_workflow_history: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CapturedMigrationEvent {
+    pub event_name: String,
+    pub args: Vec<PersistedValue>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -43,13 +50,16 @@ impl ViolationFlag {
 
 /// VM callbacks for one unpublished migration actor.
 ///
-/// Only heap ownership and state get/set are real. Every operation capable of
-/// producing an external side effect records a violation. Compiler purity is
-/// the first line of defense; these callbacks are the artifact/runtime fence.
+/// Heap ownership and explicitly permitted state access are real. Event
+/// transforms may additionally install an in-memory emit capture sink. Every
+/// other operation capable of producing an external side effect records a
+/// violation. Compiler purity is the first line of defense; these callbacks
+/// are the artifact/runtime fence.
 struct MigrationActorCallbacks {
     actor: *mut Actor,
     violation: ViolationFlag,
     allowed_state_fields: Option<std::collections::HashSet<String>>,
+    captured_events: Option<Arc<Mutex<Vec<CapturedMigrationEvent>>>>,
 }
 
 impl std::fmt::Debug for MigrationActorCallbacks {
@@ -68,7 +78,16 @@ impl MigrationActorCallbacks {
             actor: actor as *mut Actor,
             violation,
             allowed_state_fields,
+            captured_events: None,
         }
+    }
+
+    fn with_event_capture(
+        mut self,
+        captured_events: Arc<Mutex<Vec<CapturedMigrationEvent>>>,
+    ) -> Self {
+        self.captured_events = Some(captured_events);
+        self
     }
 
     fn state_field_allowed(&self, field: &str) -> bool {
@@ -192,9 +211,41 @@ impl ActorVmCallbacks for MigrationActorCallbacks {
         Value::nil()
     }
 
-    fn emit_event(&mut self, event: &str, _args: &[Value]) {
-        self.violation
-            .record(format!("migration attempted to emit event '{event}'"));
+    fn emit_event(&mut self, event: &str, args: &[Value]) {
+        let Some(captured) = self.captured_events.as_ref() else {
+            self.violation
+                .record(format!("migration attempted to emit event '{event}'"));
+            return;
+        };
+
+        // SAFETY: event-transform execution owns the unpublished actor for the
+        // full VM call. Persist emitted values immediately so no heap pointer
+        // escapes the isolated actor lifetime.
+        let actor = unsafe { &*self.actor };
+        let mut persisted = Vec::with_capacity(args.len());
+        for (index, value) in args.iter().enumerate() {
+            match persist_isolated_value(
+                actor,
+                &format!("migration event '{event}' argument {index}"),
+                value,
+            ) {
+                Ok(value) => persisted.push(value),
+                Err(error) => {
+                    self.violation.record(error);
+                    return;
+                }
+            }
+        }
+
+        match captured.lock() {
+            Ok(mut events) => events.push(CapturedMigrationEvent {
+                event_name: event.to_string(),
+                args: persisted,
+            }),
+            Err(_) => self
+                .violation
+                .record("migration event capture buffer was poisoned"),
+        }
     }
 
     fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
@@ -571,6 +622,66 @@ pub(crate) fn run_isolated_actor_function(
     Ok(result)
 }
 
+/// Execute one RFC 0008 historical-event transform.
+///
+/// Event migration may emit zero or more replacement events into an in-memory
+/// replay stream. State access is denied in this first executable slice: the
+/// RFC defines `self` as old-version state, and exposing already-migrated
+/// current state would be semantically incorrect. Once an authentic
+/// old-version state view is available this fence can be widened explicitly.
+pub(crate) fn run_isolated_event_transform(
+    module: &CodeModule,
+    actor_id: u64,
+    function_idx: usize,
+    args: &[PersistedValue],
+    context: &str,
+) -> Result<Vec<CapturedMigrationEvent>, String> {
+    let mut actor = Actor::new(actor_id, "migration-event-transform".to_string(), 0);
+    actor.persistent = true;
+    actor.bytecode_module = Some(module.clone());
+
+    let vm_args: Vec<Value> = args
+        .iter()
+        .map(|value| value.to_value_on_heap(&mut actor))
+        .collect();
+    let violation = ViolationFlag::default();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+
+    let callbacks = MigrationActorCallbacks::new(
+        &mut actor,
+        violation.clone(),
+        Some(std::collections::HashSet::new()),
+    )
+    .with_event_capture(captured.clone());
+
+    let offset = *module.function_table.get(function_idx).ok_or_else(|| {
+        format!("{context} references missing function index {function_idx}")
+    })?;
+
+    let mut vm = VM::new();
+    vm.load_module(module.clone());
+    vm.set_actor_callbacks(Box::new(callbacks));
+    vm.set_distributed_callbacks(Box::new(MigrationDistributedCallbacks {
+        violation: violation.clone(),
+    }));
+
+    vm.call_function(0, offset, &vm_args)
+        .map_err(|error| format!("{context} failed: {error}"))?;
+
+    if let Some(reason) = violation.take() {
+        return Err(format!(
+            "{context} violated the isolated event-transform boundary: {reason}"
+        ));
+    }
+
+    let events = captured
+        .lock()
+        .map_err(|_| format!("{context} event capture buffer was poisoned"))?
+        .clone();
+    Ok(events)
+}
+
+
 /// Execute a state-only migration chain against an unpublished actor and
 /// return an upgraded snapshot. `Ok(None)` means no upgrade is required.
 ///
@@ -601,12 +712,6 @@ pub(crate) fn migrate_snapshot_state(
             meta.name
         ));
     }
-    if history.has_event_history {
-        return Err(format!(
-            "state-only migration for '{}' refuses event-sourced history until event migration is implemented",
-            meta.name
-        ));
-    }
     if history.has_pending_message_journal {
         return Err(format!(
             "state-only migration for '{}' refuses old-schema journal entries newer than the snapshot",
@@ -631,20 +736,11 @@ pub(crate) fn migrate_snapshot_state(
     }
 
     for (field, model) in &meta.state_models {
-        match model {
-            crate::ast::StateModel::EventSourced => {
-                return Err(format!(
-                    "state-only migration for '{}' refuses event-sourced field '{}'",
-                    meta.name, field
-                ));
-            }
-            crate::ast::StateModel::Crdt(_) => {
-                return Err(format!(
-                    "state-only migration for '{}' refuses CRDT field '{}'",
-                    meta.name, field
-                ));
-            }
-            crate::ast::StateModel::Local | crate::ast::StateModel::Durable => {}
+        if matches!(model, crate::ast::StateModel::Crdt(_)) {
+            return Err(format!(
+                "state migration for '{}' refuses CRDT field '{}'",
+                meta.name, field
+            ));
         }
     }
 
@@ -674,12 +770,6 @@ pub(crate) fn migrate_snapshot_state(
     })?;
 
     for step in &plan {
-        if !step.event_transforms.is_empty() {
-            return Err(format!(
-                "migration {} -> {} for '{}' declares event transforms; event migration execution is not implemented",
-                step.from_version, step.to_version, meta.name
-            ));
-        }
         if step.has_state_transform && step.state_function_index.is_none() {
             return Err(format!(
                 "migration {} -> {} for '{}' has a state transform but no private executable function binding",
@@ -718,13 +808,26 @@ pub(crate) fn migrate_snapshot_state(
         actor.set_state_field(name, value);
     }
 
+    // State migration may inspect fields that physically existed in the old
+    // snapshot (including fields removed by the current schema) and may write
+    // current durable fields. Event-sourced state is not snapshot-backed in
+    // this runtime, so exposing it here would invent an old-version value.
+    let mut allowed_state_fields: std::collections::HashSet<String> =
+        snapshot.state.keys().cloned().collect();
+    allowed_state_fields.extend(
+        meta.state_models
+            .iter()
+            .filter(|(_, model)| matches!(model, crate::ast::StateModel::Durable))
+            .map(|(name, _)| name.clone()),
+    );
+
     let violation = ViolationFlag::default();
     let mut vm = VM::new();
     vm.load_module(module.clone());
     vm.set_actor_callbacks(Box::new(MigrationActorCallbacks::new(
         &mut actor,
         violation.clone(),
-        None,
+        Some(allowed_state_fields),
     )));
     vm.set_distributed_callbacks(Box::new(MigrationDistributedCallbacks {
         violation: violation.clone(),
@@ -924,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_event_sourced_schema_until_event_executor_exists() {
+    fn state_migration_refuses_unsnapshotted_event_sourced_state_access() {
         let module = compile_module(
             r#"
             entity Counter {
@@ -950,7 +1053,10 @@ mod tests {
             StateMigrationHistory::default(),
         )
         .unwrap_err();
-        assert!(error.contains("event-sourced field"), "{error}");
+        assert!(
+            error.contains("forbidden state field 'count'"),
+            "event-sourced state is reconstructed from history, not invented during snapshot migration: {error}"
+        );
     }
 
     #[test]
