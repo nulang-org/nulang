@@ -2996,6 +2996,24 @@ mod tests {
         assert_eq!(manifest.contracts[0].from_version, 1);
         assert_eq!(manifest.contracts[0].to_version, 2);
         assert!(manifest.contracts[0].has_state_transform);
+
+        let function_idx = manifest.contracts[0]
+            .state_function_index
+            .expect("state transform must bind a private function");
+        assert!(
+            function_idx < module.functions.len(),
+            "migration function index must be in the ordinary function table"
+        );
+        assert_eq!(
+            module.functions[function_idx].name,
+            "Account.$migration_state_1_2"
+        );
+        assert!(
+            !module.actor_metadata[0]
+                .behavior_indices
+                .contains(&function_idx),
+            "migration function must not be an actor behavior"
+        );
     }
 
     #[test]
