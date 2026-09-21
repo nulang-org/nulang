@@ -1,6 +1,6 @@
 # RFC 0015: Error-Model Consolidation
 
-- **Status:** Draft
+- **Status:** Accepted
 - **Tier:** Stable (removes Stable-tier surface; touches Frozen-tier runtime
   semantics for integer division)
 - **Author:** AI assistant
@@ -12,10 +12,11 @@
 ## Summary
 
 Nulang today has at least six overlapping ways to represent and propagate
-failure. This RFC consolidates on one model: **`Result[T, E]` values with
-`?` propagation as the base layer, algebraic effects as the checked-effects
-layer, and actor supervision for faults** — and removes `catch` (both
-forms), `fail`, and nil-on-error arithmetic. Integer division/modulo by
+failure. This RFC consolidates on one model: **explicit `Result[T, E]` values
+with `?` propagation as the base layer, algebraic effects as the
+checked-effects layer, and actor supervision for faults** — and removes
+`catch` (both forms), `fail`, the typed-error signature shorthands `T ! E`
+and `throws E`, and nil-on-error arithmetic. Integer division/modulo by
 zero becomes a runtime fault; float division/modulo by zero follows IEEE
 754 (`inf`/`NaN`).
 
@@ -39,13 +40,11 @@ The current surface gives programmers six answers to "how do I fail?":
    the caller's convention. (SPEC2's status section describes `fail
    Error(...)` as "structured short-circuit return" — accurate only
    because the programmer writes the `Error(...)` constructor by hand.)
-5. **`T ! E` return types + `?`** — `! E` is parsed as an error-type
-   annotation (`src/parser.rs:663-690`) and the typechecker wraps the
-   declared return type as `Result[ret_type, error_type]`
-   (`src/typechecker.rs:1199-1207`). `?` desugars to a `match` on
-   `Ok`/`Error` with early `return Error(e)` (`src/parser.rs:2603-2637`);
-   `?.` is nil-safe chaining (`src/parser.rs:2567-2600`). `throws` is an
-   accepted alias for the second `!` (`src/parser.rs:669,676`).
+5. **Typed-error signature shorthands + `?`** — both `-> T ! E` and
+   `-> T throws E` are parser sugar for `-> Result[T, E]`. `?` desugars to a
+   `match` on `Ok`/`Error` with early `return Error(e)`. The shorthand saves
+   little syntax while overloading `!`, duplicating `Result`, and giving the
+   language two spellings for one recoverable-failure type.
 6. **Effects-as-exceptions** — `perform`/`handle` with continuation
    capture and resume (`src/vm.rs` Perform/Resume/Unwind/Handle opcodes;
    SPEC2 §4.4), plus supervision (links, monitors, exit signals;
@@ -68,11 +67,11 @@ convergence on a single model.
 
 ### Target model (kept surface)
 
-- **Base layer — `Result[T, E]` + `?`.** Recoverable, expected failures
-  are values. `T ! E` remains as signature sugar for
-  `Result[T, E]` (`src/typechecker.rs:1199-1207` already implements it
-  this way). `?` is the sole propagation operator. `?.` stays (it is
-  `nil` chaining, orthogonal to errors).
+- **Base layer — explicit `Result[T, E]` + `?`.** Recoverable, expected
+  failures are values. `?` is the sole propagation operator. `?.` stays (it
+  is `nil` chaining, orthogonal to errors). Typed-error signature sugar is
+  deprecated because it duplicates `Result` and overloads `!`; `! {Effects}`
+  remains exclusively the algebraic-effect row annotation.
 - **Checked-effects layer — effects-as-exceptions.** Where an operation
   is effectful anyway (IO, FS, Http), failure is an effect operation
   result handled by the enclosing handler, resumable per SPEC2 §4.4.2.
@@ -130,6 +129,26 @@ Because both `catch` and `fail` are pure parser desugars with no AST,
 typechecker, or bytecode representation of their own, removal is a
 parser-only change plus the diagnostic.
 
+### Typed-error signature shorthand is removed
+
+Both historical forms are removed in v2:
+
+```nulang
+// before
+fn load(path: String) -> Config ! IOError ! {FS} { ... }
+
+// also before
+fn load(path: String) -> Config throws IOError ! {FS} { ... }
+
+// after
+fn load(path: String) -> Result[Config, IOError] ! {FS} { ... }
+```
+
+This is a source-only migration: both shorthand forms already lower to the
+same `Result[T, E]` type. Keeping `! {Effects}` for effects while requiring
+explicit `Result` for recoverable failures gives each notation one semantic
+role.
+
 ### Division/modulo by zero
 
 - **`Int` division and modulo by zero raise a runtime fault** (VM
@@ -155,8 +174,8 @@ parser-only change plus the diagnostic.
 
 ## Tier Classification
 
-- `catch` / `fail` removal: **Stable-tier** syntax removal — requires
-  this RFC plus the deprecation cycle below.
+- `catch` / `fail` / typed-error shorthand removal: **Stable-tier** syntax
+  removal — requires this RFC plus the deprecation cycle below.
 - Integer div/mod-by-zero semantics: **Frozen-tier** runtime behavior
   (the VM is a frozen artifact). Per `GOVERNANCE.md` this is the class
   of change that normally requires a major-version bump; see the phased
@@ -173,9 +192,9 @@ bytecode format — breaking source changes are cheaper now than they will
 ever be again):
 
 1. **v1.x (next release): deprecation warnings.** The parser continues
-   to accept `catch` (both prefix forms and the postfix form) and
-   `fail`, emitting an RFC 0010-style deprecation warning naming the
-   replacement (`match` / `return`). SPEC2 and PITFALLS mark the
+   to accept `catch` (both prefix forms and the postfix form), `fail`,
+   `-> T ! E`, and `-> T throws E`, emitting migration warnings naming the
+   replacements (`match`, `return`, and explicit `Result[T, E]`). SPEC2 and PITFALLS mark the
    constructs deprecated. A `nula fmt --migrate-rfc-0015` rewrite pass
    performs the mechanical rewrites above (the desugar targets are
    already known to the parser, so the tool is a syntax-level rewrite).
@@ -184,8 +203,9 @@ ever be again):
    deprecation warning in the VM; float div/mod switches to IEEE
    immediately (the old float-nil behavior has no defenders — it
    satisfies neither the static type nor IEEE).
-3. **v2.0: errors.** `catch`/`fail` are parse errors with a "removed by
-   RFC 0015, use `match`/`return`" message. Integer div/mod by zero
+3. **v2.0: errors.** `catch`/`fail` and typed-error signature shorthands are
+   parse errors with migration diagnostics pointing to `match`, `return`, and
+   explicit `Result[T, E]`. Integer div/mod by zero
    raises the runtime fault. The Frozen-tier bump is taken here, once,
    as the single 2.0 breaking batch anticipated by SPEC2 Appendix E.
 
@@ -233,4 +253,15 @@ above.
 
 ## Resolution
 
-(Pending.)
+**Accepted 2026-09-21.**
+
+The target error model is three-layered and intentionally non-overlapping:
+explicit `Result[T, E] + ?` for expected recoverable failure, algebraic
+effects for checked interaction, and actor faults/supervision for unexpected
+failure. The v1 migration phase keeps legacy syntax executable but warns;
+v2 removes `catch`, `fail`, `T ! E`, and `throws E`. The `! {Effects}`
+surface remains, reducing `!` to its effect-row role in function signatures.
+
+The arithmetic behavior changes remain gated to the v2 semantic transition and
+must be implemented with backend differential tests before this RFC is marked
+Implemented.
