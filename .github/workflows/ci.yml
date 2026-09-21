@@ -356,6 +356,7 @@ jobs:
 
       - name: Run matched 1k / 10k actor workloads
         run: |
+          set -o pipefail
           mkdir -p /tmp/beam-parity-results
           /tmp/nulang-beam-target/release/examples/beam_parity 1000 10000 \
             | tee /tmp/beam-parity-results/nulang.csv
@@ -364,6 +365,7 @@ jobs:
 
       - name: Render comparison
         run: |
+          set -o pipefail
           python3 scripts/compare_beam_parity.py \
             --nulang /tmp/beam-parity-results/nulang.csv \
             --beam /tmp/beam-parity-results/beam.csv \
@@ -415,6 +417,7 @@ jobs:
 
       - name: Run same-host density ladder
         run: |
+          set -o pipefail
           mkdir -p /tmp/nulang-density-results/base /tmp/nulang-density-results/candidate
           for count in 10000 100000; do
             /tmp/nulang-density-target-base/release/examples/actor_density "$count" \
@@ -425,6 +428,7 @@ jobs:
 
       - name: Compare memory and throughput
         run: |
+          set -o pipefail
           python3 scripts/compare_actor_density.py \
             --base-dir /tmp/nulang-density-results/base \
             --candidate-dir /tmp/nulang-density-results/candidate \
