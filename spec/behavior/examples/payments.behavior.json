@@ -16,8 +16,10 @@
   },
   "host_abi": {
     "schema": "nulang.host-effects/v0alpha1",
-    "required_operations": [],
-    "requires_legacy_extension_dispatch": false
+    "required_operations": [
+      "nulang.host-effects/v0alpha1:nulang:storage/string#Write"
+    ],
+    "requires_legacy_extension_dispatch": true
   },
   "interfaces": [
     {
