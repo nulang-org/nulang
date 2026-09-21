@@ -1089,7 +1089,7 @@ fn compile_with_new_pipeline(
 ) -> NuResult<crate::bytecode::CodeModule> {
     let hir = crate::hir_lower::lower_module(ast, &type_checker.inferred_decl_types);
     let mut mir = crate::mir_lower::lower_module(&hir)?;
-    crate::mir_codegen::compile_mir(&mut mir, name)
+    crate::compiler_identity::compile_typed_bytecode(&hir, &mut mir, [], name)
 }
 
 /// Parse source code into an AST module.
