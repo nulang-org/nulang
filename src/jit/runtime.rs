@@ -2,8 +2,8 @@
 
 use crate::bytecode::Constant;
 use crate::value_layout::{
-    is_float_raw, sext48, tag_int, INT48_MAX, INT48_MIN, PAYLOAD_MASK, TAG_CLOSURE, TAG_INT,
-    TAG_MASK, TAG_PTR, TAG_STRING,
+    as_int_or_one, as_int_or_zero, is_float_raw, tag_int, INT48_MAX, INT48_MIN, PAYLOAD_MASK,
+    TAG_CLOSURE, TAG_INT, TAG_MASK, TAG_PTR, TAG_STRING,
 };
 use crate::vm::Value;
 use std::cell::{Cell, UnsafeCell};
@@ -130,27 +130,6 @@ pub extern "C" fn nulang_imod(a: u64, b: u64) -> u64 {
         return Value::nil().as_raw();
     }
     tag_int(as_int_or_zero(a) % bv)
-}
-
-/// Denominator for div/mod, matching the interpreter's `as_int().unwrap_or(1)`:
-/// a non-int-tagged denominator is 1 (no div-by-zero), while a tagged int 0
-/// still yields div-by-zero → nil.
-pub(crate) fn as_int_or_one(v: u64) -> i64 {
-    if (v & TAG_MASK) == TAG_INT {
-        sext48(v & PAYLOAD_MASK)
-    } else {
-        1
-    }
-}
-
-/// Extract the integer payload like the interpreter's `as_int().unwrap_or(0)`:
-/// non-int-tagged values contribute 0.
-pub(crate) fn as_int_or_zero(v: u64) -> i64 {
-    if (v & TAG_MASK) == TAG_INT {
-        sext48(v & PAYLOAD_MASK)
-    } else {
-        0
-    }
 }
 
 /// Extract the raw payload pointer from a NaN-boxed value, or null.
@@ -1377,16 +1356,7 @@ define_aot_ask!(nulang_aot_ask_8, a0, a1, a2, a3, a4, a5, a6, a7);
 // sandbox allow-list is not applied because AOT native code is trusted.
 
 pub(crate) fn aot_ctype_from_tag(tag: u64) -> crate::ffi::marshal::CType {
-    match tag {
-        0 => crate::ffi::marshal::CType::I64,
-        1 => crate::ffi::marshal::CType::F64,
-        2 => crate::ffi::marshal::CType::Bool,
-        3 => crate::ffi::marshal::CType::CStr,
-        4 => crate::ffi::marshal::CType::VoidPtr,
-        5 => crate::ffi::marshal::CType::Unit,
-        6 => crate::ffi::marshal::CType::Value,
-        _ => crate::ffi::marshal::CType::Unit,
-    }
+    crate::ffi::marshal::ctype_from_tag(tag)
 }
 
 fn aot_ffi_call_impl(lib_raw: u64, sym_raw: u64, sig: u64, args: &[u64]) -> Value {
@@ -1611,6 +1581,7 @@ unsafe fn call_closure_dispatch(fn_ptr: u64, all: &[u64]) -> u64 {
     }
 }
 
+#[cfg(feature = "native-aot")]
 macro_rules! define_aot_call_closure {
     ($name:ident, $($arg:ident),*) => {
         /// Invoke a closure value: an uncaptured closure is a tagged fn index
@@ -1654,14 +1625,23 @@ macro_rules! define_aot_call_closure {
     };
 }
 
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_0,);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_1, a0);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_2, a0, a1);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_3, a0, a1, a2);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_4, a0, a1, a2, a3);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_5, a0, a1, a2, a3, a4);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_6, a0, a1, a2, a3, a4, a5);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_7, a0, a1, a2, a3, a4, a5, a6);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_8, a0, a1, a2, a3, a4, a5, a6, a7);
 
 // ---------------------------------------------------------------------------
@@ -1677,6 +1657,7 @@ define_aot_call_closure!(nulang_aot_call_closure_8, a0, a1, a2, a3, a4, a5, a6, 
 // (LLM.ask, Timer.sleep with a positive delay) degrade to nil — the native
 // backend has no VM suspension, so the actor cannot be parked mid-behavior.
 
+#[cfg(feature = "native-aot")]
 macro_rules! define_aot_perform_async {
     ($name:ident, $($arg:ident),*) => {
         /// Dispatch an async effect from AOT-compiled code.
@@ -1705,14 +1686,23 @@ macro_rules! define_aot_perform_async {
     };
 }
 
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_0,);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_1, a0);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_2, a0, a1);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_3, a0, a1, a2);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_4, a0, a1, a2, a3);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_5, a0, a1, a2, a3, a4);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_6, a0, a1, a2, a3, a4, a5);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_7, a0, a1, a2, a3, a4, a5, a6);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_8, a0, a1, a2, a3, a4, a5, a6, a7);
 
 // ---------------------------------------------------------------------------

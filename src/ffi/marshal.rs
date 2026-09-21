@@ -50,6 +50,24 @@ pub fn ffi_type_to_ctype(t: &FfiType) -> Option<CType> {
     }
 }
 
+/// Decode the compact three-bit C ABI type tag used by compiled backends.
+///
+/// The encoding belongs to the FFI ABI, not to JIT/AOT implementation
+/// machinery, so portable backends must resolve it here rather than through
+/// `crate::jit`.
+pub fn ctype_from_tag(tag: u64) -> CType {
+    match tag {
+        0 => CType::I64,
+        1 => CType::F64,
+        2 => CType::Bool,
+        3 => CType::CStr,
+        4 => CType::VoidPtr,
+        5 => CType::Unit,
+        6 => CType::Value,
+        _ => CType::Unit,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Conversion helpers: Value -> C argument
 // ---------------------------------------------------------------------------

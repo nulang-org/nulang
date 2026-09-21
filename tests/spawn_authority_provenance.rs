@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 use nulang::aot::AotModule;
 use nulang::bytecode::OpCode;
 use nulang::lexer::Lexer;
@@ -284,7 +284,7 @@ fn main() { spawn Child {} }
     assert!(rt.actors.contains_key(&900_001));
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 fn sorted_actor_manifests(rt: &Runtime) -> Vec<Vec<String>> {
     let mut manifests: Vec<Vec<String>> = rt
         .actors
@@ -295,7 +295,7 @@ fn sorted_actor_manifests(rt: &Runtime) -> Vec<Vec<String>> {
     manifests
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 #[test]
 fn vm_and_native_agree_on_exact_site_spawn_authority() {
     let source = r#"
@@ -330,7 +330,7 @@ fn main() {
     assert_eq!(native_manifests, expected);
 }
 
-#[cfg(feature = "native-codegen")]
+#[cfg(feature = "native-aot")]
 #[test]
 fn vm_and_native_both_reject_parent_authority_escalation_before_creation() {
     let source = r#"

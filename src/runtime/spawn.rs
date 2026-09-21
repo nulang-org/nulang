@@ -334,7 +334,7 @@ pub(crate) fn spawn_from_module(
         }
     }
     // Wire AOT-native dispatch only when native codegen is present.
-    #[cfg(feature = "native-codegen")]
+    #[cfg(feature = "native-aot")]
     if let Some(meta) = meta.as_ref() {
         if !matches!(role, ActorRole::Workflow) {
             let module_ptr = rt.aot_modules.get(&meta.name).copied();

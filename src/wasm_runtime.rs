@@ -494,8 +494,8 @@ fn host_arith_fi(a: u64, b: u64, fop: fn(f64, f64) -> f64, iop: fn(i64, i64) -> 
     } else {
         // Non-float, non-string operands (e.g. arrays) → 0, matching the
         // interpreter's `as_int().unwrap_or(0)`.
-        let ia = crate::jit::runtime::as_int_or_zero(a);
-        let ib = crate::jit::runtime::as_int_or_zero(b);
+        let ia = crate::value_layout::as_int_or_zero(a);
+        let ib = crate::value_layout::as_int_or_zero(b);
         value_layout::tag_int(iop(ia, ib)) as i64
     }
 }
@@ -535,11 +535,11 @@ fn host_div(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error
         }
         Ok(value_layout::float_bits(f64::from_bits(a) / denom) as i64)
     } else {
-        let denom = crate::jit::runtime::as_int_or_one(b);
+        let denom = crate::value_layout::as_int_or_one(b);
         if denom == 0 {
             return Ok(value_layout::TAG_NIL as i64);
         }
-        Ok(value_layout::tag_int(crate::jit::runtime::as_int_or_zero(a) / denom) as i64)
+        Ok(value_layout::tag_int(crate::value_layout::as_int_or_zero(a) / denom) as i64)
     }
 }
 fn host_mod(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error> {
@@ -552,11 +552,11 @@ fn host_mod(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error
         }
         Ok(value_layout::float_bits(f64::from_bits(a) % denom) as i64)
     } else {
-        let denom = crate::jit::runtime::as_int_or_one(b);
+        let denom = crate::value_layout::as_int_or_one(b);
         if denom == 0 {
             return Ok(value_layout::TAG_NIL as i64);
         }
-        Ok(value_layout::tag_int(crate::jit::runtime::as_int_or_zero(a) % denom) as i64)
+        Ok(value_layout::tag_int(crate::value_layout::as_int_or_zero(a) % denom) as i64)
     }
 }
 
@@ -648,9 +648,9 @@ fn host_ffi_call_impl(
     let mut params: Vec<crate::ffi::marshal::CType> = Vec::with_capacity(args.len());
     for i in 0..args.len() {
         let tag = (sig >> (3 + 3 * i as u32)) & 0b111;
-        params.push(crate::jit::runtime::aot_ctype_from_tag(tag));
+        params.push(crate::ffi::marshal::ctype_from_tag(tag));
     }
-    let ret = crate::jit::runtime::aot_ctype_from_tag(ret_tag);
+    let ret = crate::ffi::marshal::ctype_from_tag(ret_tag);
     let signature = crate::ffi::marshal::Signature::new(params.clone(), ret);
     let func = {
         let registry = crate::ffi::native::FFI_REGISTRY
@@ -774,8 +774,8 @@ fn host_pow(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error
     if value_layout::is_float_raw(a) && value_layout::is_float_raw(b) {
         return Ok(value_layout::float_bits(f64::from_bits(a).powf(f64::from_bits(b))) as i64);
     }
-    let base = crate::jit::runtime::as_int_or_zero(a);
-    let exp = crate::jit::runtime::as_int_or_zero(b);
+    let base = crate::value_layout::as_int_or_zero(a);
+    let exp = crate::value_layout::as_int_or_zero(b);
     if exp < 0 {
         return Ok(value_layout::TAG_NIL as i64);
     }

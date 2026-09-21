@@ -157,6 +157,37 @@ jobs:
         run: cargo check --tests --no-default-features
 
   # -----------------------------------------------------------------------
+  # Backend feature boundaries — prove JIT can build without AOT and WASM
+  # does not implicitly enable Nulang's native backend surface.
+  # -----------------------------------------------------------------------
+  backend-profiles:
+    name: Backend feature profiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check JIT-only profile
+        run: cargo check --all-targets --no-default-features --features jit-codegen
+
+      - name: Test JIT-only library
+        run: cargo test --lib --no-default-features --features jit-codegen
+
+      - name: Check native AOT profile
+        run: cargo check --all-targets --no-default-features --features native-aot
+
+      - name: Check WASM-only profile
+        run: cargo check --all-targets --no-default-features --features wasm-backend
+
+      - name: Verify dependency ownership
+        run: bash scripts/check_mobile_runtime_profile.sh
+
+  # -----------------------------------------------------------------------
   # WASM backend
   # -----------------------------------------------------------------------
   wasm-backend:
