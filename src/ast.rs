@@ -1099,7 +1099,43 @@ pub fn desugar_state_machine(
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstModule {
     pub name: String,
+    /// Names explicitly exported with `pub` from this source module.
+    ///
+    /// This is module-boundary metadata, distinct from implementation
+    /// declarations: private helpers remain in `decls` so exported
+    /// declarations can still reference them during whole-module compilation.
+    pub exports: Vec<String>,
     pub decls: Vec<Decl>,
+}
+
+impl Decl {
+    /// Stable source-level name for declarations that may participate in a
+    /// module export/import surface. Anonymous declarations (imports, extern
+    /// blocks, impl blocks, and module-level let bindings) return `None`.
+    pub fn export_name(&self) -> Option<&str> {
+        match self {
+            Decl::Function { name, .. }
+            | Decl::Actor { name, .. }
+            | Decl::StateMachine { name, .. }
+            | Decl::TypeAlias { name, .. }
+            | Decl::RecordType { name, .. }
+            | Decl::VariantType { name, .. }
+            | Decl::EffectDecl { name, .. }
+            | Decl::Module { name, .. }
+            | Decl::Workflow { name, .. }
+            | Decl::Agent { name, .. }
+            | Decl::Database { name, .. }
+            | Decl::CrdtDecl { name, .. }
+            | Decl::NamedHandler { name, .. }
+            | Decl::Class { name, .. }
+            | Decl::Signal { name, .. }
+            | Decl::Given { name, .. } => Some(name.as_str()),
+            Decl::Extern { .. }
+            | Decl::Import { .. }
+            | Decl::Impl { .. }
+            | Decl::LetBinding { .. } => None,
+        }
+    }
 }
 
 impl Expr {
@@ -1236,6 +1272,7 @@ mod tests {
     fn test_ast_module_new() {
         let m = AstModule {
             name: "test".to_string(),
+            exports: vec![],
             decls: vec![],
         };
         assert_eq!(m.name, "test");

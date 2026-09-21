@@ -4918,6 +4918,7 @@ mod tests {
         let mut tc = TypeChecker::new();
         let module = AstModule {
             name: "test".to_string(),
+            exports: vec![],
             decls: vec![],
         };
         let ty = tc.check_module(&module).unwrap();
@@ -4929,6 +4930,7 @@ mod tests {
         let mut tc = TypeChecker::new();
         let module = AstModule {
             name: "test".to_string(),
+            exports: vec![],
             decls: vec![Decl::Function {
                 name: "add1".to_string(),
                 type_params: vec![],
@@ -4965,6 +4967,7 @@ mod tests {
         let mut tc = TypeChecker::new();
         let module = AstModule {
             name: "test".to_string(),
+            exports: vec![],
             decls: vec![
                 Decl::Module {
                     name: "Foo".to_string(),
@@ -5031,6 +5034,7 @@ mod tests {
         let mut tc = TypeChecker::new();
         let module = AstModule {
             name: "test".to_string(),
+            exports: vec![],
             decls: vec![Decl::Module {
                 name: "Foo".to_string(),
                 exports: vec![],
@@ -5186,6 +5190,7 @@ mod tests {
         let mut tc = TypeChecker::new();
         let module = AstModule {
             name: "test".to_string(),
+            exports: vec![],
             decls: vec![Decl::Function {
                 name: "io_fn".to_string(),
                 type_params: vec![],
@@ -5250,6 +5255,7 @@ mod tests {
     fn test_extern_function_available_with_ffi_effect() {
         let module = AstModule {
             name: "main".to_string(),
+            exports: vec![],
             decls: vec![
                 Decl::Extern {
                     library: "libm.so.6".to_string(),
@@ -5321,6 +5327,7 @@ mod tests {
     fn test_extern_unsupported_param_type_errors() {
         let module = AstModule {
             name: "main".to_string(),
+            exports: vec![],
             decls: vec![Decl::Extern {
                 library: "lib".to_string(),
                 funcs: vec![ExternFunc {
@@ -5352,6 +5359,7 @@ mod tests {
     fn test_extern_unsupported_return_type_errors() {
         let module = AstModule {
             name: "main".to_string(),
+            exports: vec![],
             decls: vec![Decl::Extern {
                 library: "lib".to_string(),
                 funcs: vec![ExternFunc {
