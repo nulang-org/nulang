@@ -227,10 +227,19 @@ jobs:
             "$GITHUB_WORKSPACE/target/debug/nulang" nula build --target wasm
           )
           test -f "$tmp/portable-pkg/.nula/dist/portable-pkg.wasm"
-          python3 - "$tmp/portable-pkg/.nula/dist/portable-pkg.wasm" <<'PY'
-          import pathlib, sys
-          p = pathlib.Path(sys.argv[1])
-          assert p.read_bytes()[:4] == b"\x00asm", p
+          test -f "$tmp/portable-pkg/.nula/dist/portable-pkg.behavior.json"
+          python3 - "$tmp/portable-pkg/.nula/dist/portable-pkg.wasm" "$tmp/portable-pkg/.nula/dist/portable-pkg.behavior.json" <<\'PY\'
+          import json, pathlib, sys
+          wasm = pathlib.Path(sys.argv[1])
+          manifest = pathlib.Path(sys.argv[2])
+          data = wasm.read_bytes()
+          assert data[:4] == b"\\x00asm", wasm
+          payload = json.loads(manifest.read_text())
+          assert payload["schema"] == "nulang.behavior/v0alpha1"
+          digest = payload["artifact"]["digest"]
+          assert digest.startswith("blake3:") and len(digest) == len("blake3:") + 64
+          assert payload["artifact"]["kind"] == "wasm-module"
+          assert payload["completeness"]["effects"] == "not-emitted"
           PY
 
   # -----------------------------------------------------------------------
