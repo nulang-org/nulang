@@ -28,12 +28,12 @@ pub struct MigrationContractMeta {
     pub from_version: u32,
     pub to_version: u32,
     pub has_state_transform: bool,
-    /// Artifact-local hidden behavior index for the compiled state transform.
+    /// Artifact-local private function-table index for the compiled state transform.
     ///
     /// Topology-only/legacy manifests may omit this. Runtime execution must
     /// require a binding before applying a state transform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_behavior_index: Option<usize>,
+    pub state_function_index: Option<usize>,
     pub event_transforms: Vec<MigrationEventMeta>,
 }
 
@@ -118,7 +118,7 @@ impl MigrationContractMeta {
             from_version: decl.from_version,
             to_version: decl.to_version,
             has_state_transform: decl.state_body.is_some(),
-            state_behavior_index: None,
+            state_function_index: None,
             event_transforms,
         }
     }
