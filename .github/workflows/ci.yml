@@ -244,9 +244,15 @@ jobs:
           digest = payload["artifact"]["digest"]
           assert digest.startswith("blake3:") and len(digest) == len("blake3:") + 64
           assert payload["artifact"]["kind"] == "wasm-module"
-          assert payload["completeness"]["effects"] == "compiler-module-conservative"
-          assert payload["completeness"]["actors"] == "compiler-derived-with-per-actor-status"
-          main = next(x for x in payload["effects"] if x["subject_kind"] == "function" and x["subject"] == "main")
+          assert payload["compiler"]["digest"].startswith("blake3:")
+          completeness = payload["extensions"]["nulang.org/completeness"]
+          assert completeness["effects"] == "compiler-module-conservative"
+          assert completeness["actors"] == "compiler-derived-with-per-actor-status"
+          io_effect = next(x for x in payload["effects"] if x["effect"] == "IO")
+          assert io_effect["class"] == "external"
+          assert io_effect["replay"] == "nonreplayable"
+          compiler_semantics = payload["extensions"]["nulang.org/compiler-semantics"]
+          main = next(x for x in compiler_semantics["effects"] if x["subject_kind"] == "function" and x["subject"] == "main")
           assert "IO" in main["effects"], main
           assert not (pathlib.Path(sys.argv[2]).parent / ".portable-pkg.compiler-semantics.json").exists()
           PY
