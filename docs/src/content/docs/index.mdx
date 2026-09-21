@@ -23,6 +23,7 @@ import Steps from '../../components/Steps.astro';
 import TerminalCard from '../../components/TerminalCard.astro';
 import MetricsBand from '../../components/MetricsBand.astro';
 import EvidenceGrid from '../../components/EvidenceGrid.astro';
+import ResourceRail from '../../components/ResourceRail.astro';
 
 <MetricsBand />
 
@@ -107,27 +108,11 @@ $ NULANG_STORE_PATH=.nulang/store nulang counter.nula`} />
 
 <div class="nu-section" style="padding-top: 0;">
   <div class="nu-container">
-    <h2>Learn & Contribute</h2>
-    <p>Nulang.org is the home for the <strong>language</strong> — documentation, tutorials, and the open-source community. For managed deployment and platform work, explore Nulang Cloud.</p>
-
-    <div class="learn-grid">
-      <a href="/getting-started/installation/" class="learn-card">
-        <h3>Read the docs</h3>
-        <p>Installation, syntax, types, and the standard library.</p>
-      </a>
-      <a href="/tutorial/" class="learn-card">
-        <h3>Follow the tutorial</h3>
-        <p>Build your first actor-based program step by step.</p>
-      </a>
-      <a href="https://github.com/nulang-org/nulang" class="learn-card" target="_blank" rel="noopener noreferrer">
-        <h3>Contribute on GitHub</h3>
-        <p>Issues, discussions, and pull requests welcome.</p>
-      </a>
-      <a href="https://www.nulang.cloud" class="learn-card learn-card-accent" target="_blank" rel="noopener noreferrer">
-        <h3>Explore Nulang Cloud</h3>
-        <p>Managed runtime, deployment, and platform tooling for Nulang applications.</p>
-      </a>
+    <div class="nu-section-header">
+      <h2>Keep going</h2>
+      <p class="nu-section-subhead">Read the language docs, follow the tutorial, inspect the implementation, or explore the managed platform.</p>
     </div>
+    <ResourceRail />
   </div>
 </div>
 
