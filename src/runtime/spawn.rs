@@ -445,6 +445,29 @@ pub(crate) fn register_recovery_module(
     offsets: Vec<usize>,
     compensation_offsets: Vec<Option<usize>>,
 ) {
+    if module.artifact_id().is_some() {
+        match crate::runtime::persistence::RetainedArtifact::from_proven_module(&module) {
+            Ok(artifact) => {
+                if let Err(error) = rt.persistence.save_artifact(artifact) {
+                    if error.kind() != std::io::ErrorKind::Unsupported {
+                        tracing::warn!(
+                            "nulang-artifact: failed to retain recovery artifact for actor {}: {}",
+                            actor_id,
+                            error
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "nulang-artifact: refusing to mark actor {} artifact retained: {}",
+                    actor_id,
+                    error
+                );
+            }
+        }
+    }
+
     rt.recovery_modules
         .insert(actor_id, (module, offsets, compensation_offsets));
 }
