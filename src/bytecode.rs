@@ -683,6 +683,10 @@ pub struct CodeModule {
     /// share a short runtime name. Frozen NBC v1 does not serialize these.
     #[serde(skip)]
     pub actor_semantic_ids: Vec<crate::content_identity::SemanticId>,
+    /// Compiler-produced identity for this exact code-generation artifact.
+    /// Additive sidecar only; frozen NBC v1 deliberately excludes it.
+    #[serde(skip)]
+    pub artifact_identity: Option<crate::artifact_identity::ArtifactIdentityManifest>,
     pub constants: Vec<Constant>,
     pub instructions: Vec<Instruction>,
     pub behaviors: Vec<BehaviorTableEntry>,
@@ -738,6 +742,7 @@ impl CodeModule {
             name: name.into(),
             semantic_id: None,
             actor_semantic_ids: Vec::new(),
+            artifact_identity: None,
             constants: Vec::new(),
             instructions: Vec::new(),
             behaviors: Vec::new(),
@@ -793,6 +798,14 @@ impl CodeModule {
             return None;
         }
         self.actor_semantic_id_at(actor_index)
+    }
+
+    /// Strong code-generation identity attached by a typed compiler entry
+    /// point, if this module has proven provenance.
+    pub fn artifact_id(&self) -> Option<crate::content_identity::ArtifactId> {
+        self.artifact_identity
+            .as_ref()
+            .map(crate::artifact_identity::ArtifactIdentityManifest::artifact_id)
     }
 
     pub fn add_actor_meta(&mut self, meta: ActorMeta) -> usize {
