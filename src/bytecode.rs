@@ -544,6 +544,11 @@ pub struct ApplyHandlerMeta {
     pub event: String,
     pub param_count: usize,
     pub function_index: usize,
+    /// True only when the compiler proved the handler stays inside the
+    /// conservative deterministic event-projection subset. Legacy artifacts
+    /// default to false and therefore fail closed for executable replay.
+    #[serde(default)]
+    pub replay_safe: bool,
 }
 
 /// Actor metadata for durable execution.
