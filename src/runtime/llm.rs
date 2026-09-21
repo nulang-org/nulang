@@ -131,8 +131,8 @@ impl Default for LlmState {
 // ---------------------------------------------------------------------------
 
 use super::{
-    agent, compute_backoff, suspension_marker, BytecodeDistributedCallbacks,
-    BytecodeRuntimeCallbacks, Runtime,
+    BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, agent, compute_backoff,
+    suspension_marker,
 };
 use crate::primitives::ActorRole;
 use crate::runtime::persistence::WorkflowEvent;
