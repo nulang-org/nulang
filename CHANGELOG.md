@@ -42,6 +42,9 @@ version + migration.*
 
 ## Stable tier
 
+### CI runner timeout hardening — 2026-09-21
+- **Required GitHub Actions lanes now have explicit job timeouts** (`.github/workflows/ci.yml`, `.github/workflows/codeql.yml`). Release/WASM/compiler jobs can no longer occupy shared runners indefinitely after a deadlock or hung test; benchmark and formal-analysis lanes retain larger bounded budgets appropriate to their workloads.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
