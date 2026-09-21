@@ -151,6 +151,11 @@ fn required_host_authority(
         ("DB", Some("query")) => other("DB", "Query", None),
         ("Python", Some(op)) if !op.is_empty() => other("Python", op, None),
         ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
+        ("Compute", Some("device")) => other("Compute", "Use", Some(string_arg(0)?)),
+        ("Compute", Some("default_device")) => other("Compute", "Use", Some("auto".to_string())),
+        // Tensor operations execute inside the Nulang runtime and therefore
+        // need no external host authority. Compute.device_name only inspects
+        // an already-authorized opaque device handle.
         // Inference/LLM asks are runtime-mediated: the node already holds the
         // provider configuration and the runtime dispatches completion, so an
         // actor performing `LLM.ask` does not cross the host boundary the way
@@ -793,6 +798,12 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         constants: &[crate::bytecode::Constant],
         regs: &[crate::vm::Value],
     ) -> Option<crate::vm::Value> {
+        if effect_name == "Tensor" {
+            return crate::vm::perform_tensor_builtin(self, op_name, regs);
+        }
+        if effect_name == "Compute" {
+            return crate::vm::perform_compute_builtin(self, op_name, constants, regs);
+        }
         if effect_name == "Workflow" && op_name == Some("query") {
             let workflow_id = regs.get(0)?.as_actor_id()?;
             let string_id = regs.get(1)?.as_string_id()?;
