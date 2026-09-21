@@ -804,7 +804,7 @@ impl StdLib {
                     op: "run",
                     signature: "run(cmd: String) -> String",
                     implemented_in: ImplSite::StandaloneVm,
-                    description: "Execute a shell command via /bin/sh -c and return its stdout; returns nil on error or non-zero exit.",
+                    description: "Trusted/standalone host primitive: execute a shell command via /bin/sh -c and return stdout; actor-backed runtimes do not dispatch it until an isolated process sandbox exists.",
                 },
                 BuiltinOp {
                     name: "System.arg",
