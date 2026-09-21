@@ -8,6 +8,50 @@ use std::collections::BTreeSet;
 
 use crate::hir::ActorDef;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntitySchema {
+    pub name: String,
+    pub fields: Vec<String>,
+    pub indexes: Vec<crate::ast::IndexDecl>,
+}
+
+impl From<&ActorDef> for EntitySchema {
+    fn from(actor: &ActorDef) -> Self {
+        Self {
+            name: actor.name.clone(),
+            fields: actor
+                .state_fields
+                .iter()
+                .map(|(name, _, _, _)| name.clone())
+                .collect(),
+            indexes: actor.indexes.clone(),
+        }
+    }
+}
+
+/// Collect the compact durable-data schemas needed by the runtime.
+///
+/// HIR behavior bodies, tools, workflow metadata, and other compiler-only
+/// details are intentionally excluded so this type can become a versioned
+/// artifact boundary later without serializing HIR wholesale.
+pub fn collect_entity_schemas(module: &crate::hir::Module) -> Vec<EntitySchema> {
+    fn collect(decls: &[crate::hir::Decl], out: &mut Vec<EntitySchema>) {
+        for decl in decls {
+            match decl {
+                crate::hir::Decl::Actor(actor) if actor.persistent => {
+                    out.push(EntitySchema::from(actor));
+                }
+                crate::hir::Decl::Module { decls, .. } => collect(decls, out),
+                _ => {}
+            }
+        }
+    }
+
+    let mut schemas = Vec::new();
+    collect(&module.decls, &mut schemas);
+    schemas
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryPredicateKind {
     Eq,
@@ -141,17 +185,20 @@ pub fn plan_entity_query(
     actor: &ActorDef,
     predicates: &[QueryPredicate],
 ) -> Result<LogicalQueryPlan, String> {
-    let fields: BTreeSet<&str> = actor
-        .state_fields
-        .iter()
-        .map(|(name, _, _, _)| name.as_str())
-        .collect();
+    plan_schema_query(&EntitySchema::from(actor), predicates)
+}
+
+pub fn plan_schema_query(
+    schema: &EntitySchema,
+    predicates: &[QueryPredicate],
+) -> Result<LogicalQueryPlan, String> {
+    let fields: BTreeSet<&str> = schema.fields.iter().map(String::as_str).collect();
 
     for predicate in predicates {
         if !fields.contains(predicate.field.as_str()) {
             return Err(format!(
                 "query on '{}' references unknown state field '{}'",
-                actor.name, predicate.field
+                schema.name, predicate.field
             ));
         }
     }
@@ -163,7 +210,7 @@ pub fn plan_entity_query(
         .collect();
 
     let mut selected: Option<(&crate::ast::IndexDecl, usize, bool)> = None;
-    for index in &actor.indexes {
+    for index in &schema.indexes {
         let matched_prefix = index
             .fields
             .iter()
@@ -216,7 +263,7 @@ pub fn plan_entity_query(
         .collect();
 
     Ok(LogicalQueryPlan {
-        entity: actor.name.clone(),
+        entity: schema.name.clone(),
         access,
         residual_predicates,
     })
@@ -360,8 +407,13 @@ mod tests {
 
     #[test]
     fn scan_diagnostic_suggests_equality_index_without_cost_guessing() {
+        let schema = EntitySchema {
+            name: "Customer".to_string(),
+            fields: vec!["company".to_string(), "status".to_string()],
+            indexes: vec![],
+        };
         let predicates = vec![QueryPredicate::eq("company"), QueryPredicate::eq("status")];
-        let plan = plan_entity_query(&actor(), &[QueryPredicate::eq("status")]).unwrap();
+        let plan = plan_schema_query(&schema, &predicates).unwrap();
         let diagnostics = diagnose_query_plan(&plan, &predicates);
 
         assert_eq!(diagnostics[0].code, "NQ001");
