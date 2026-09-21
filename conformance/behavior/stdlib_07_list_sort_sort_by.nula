@@ -3,7 +3,7 @@
 import stdlib::list
 
 fn main() {
-    let show = fn(opt) {
+    let show = fn(opt: Option[Int]) {
         match opt {
             Some(x) => perform Int.to_string(x),
             None => "None",
