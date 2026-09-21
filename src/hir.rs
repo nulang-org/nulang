@@ -8,11 +8,8 @@
 //!     already lowered to canonical actor semantics;
 //!   - actor/module structure and typed patterns are preserved.
 
-use crate::ast::{BinOp, CrdtType, Expr, Literal, Pattern, StateModel, UnOp};
+use crate::ast::{BinOp, Literal, Pattern, StateModel, UnOp};
 use crate::types::{Capability, EffectRow, Span, Type};
-
-// Re-exported AST types used in HIR declarations
-pub use crate::ast::{DatabaseColumn, DatabaseTable};
 
 // ---------------------------------------------------------------------------
 // Module and declarations
@@ -66,11 +63,6 @@ pub enum Decl {
         items: Vec<String>,
         span: Span,
     },
-    Database {
-        name: String,
-        tables: Vec<DatabaseTable>,
-        span: Span,
-    },
     ExternBlock {
         library: String,
         funcs: Vec<ExternFunc>,
@@ -79,11 +71,6 @@ pub enum Decl {
     Constant {
         name: String,
         body: Body,
-        span: Span,
-    },
-    CrdtDecl {
-        name: String,
-        fields: Vec<(String, CrdtType, Type, Expr)>,
         span: Span,
     },
 }
