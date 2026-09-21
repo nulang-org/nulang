@@ -666,12 +666,21 @@ mod tests {
     #[test]
     fn test_flight_recorder_is_lazy_and_formats_on_demand() {
         let mut recorder = FlightRecorder::new(4);
-        assert_eq!(recorder.entries.capacity(), 0, "construction must not preallocate");
+        assert_eq!(
+            recorder.entries.capacity(),
+            0,
+            "construction must not preallocate"
+        );
 
         recorder.record(
             7,
             2,
-            &[Value::int(11), Value::bool(true), Value::int(33), Value::int(44)],
+            &[
+                Value::int(11),
+                Value::bool(true),
+                Value::int(33),
+                Value::int(44),
+            ],
         );
 
         assert_eq!(recorder.entries.len(), 1);
