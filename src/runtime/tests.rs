@@ -4065,6 +4065,7 @@ fn test_actor_migration_between_two_nodes() {
         module.clone(),
         offsets.clone(),
         comp_offsets.clone(),
+        None,
     );
 
     // Build the migration payload manually (same logic as the callback).
