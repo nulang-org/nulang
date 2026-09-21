@@ -302,6 +302,13 @@ pub enum MessageAdmission {
     Rejected,
 }
 
+/// Terminal admission reported by a remote node for a tracked actor message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteMessageAdmission {
+    pub delivery_id: u64,
+    pub status: ActorAdmissionStatus,
+}
+
 impl MessageAdmission {
     /// True only when this process admitted the message to a local mailbox or
     /// cross-shard delivery queue.
@@ -354,6 +361,10 @@ pub struct Runtime {
     pub cluster_config: ClusterConfig,
     // Acknowledged packet sequence numbers (transport-level reliability).
     pub acked_packets: HashSet<u64>,
+    /// Monotonic sender-local correlation id for tracked cross-node messages.
+    next_remote_delivery_id: u64,
+    /// Terminal destination admission results received from remote nodes.
+    remote_message_admissions: HashMap<u64, ActorAdmissionStatus>,
 
     // Cross-node supervision (RFC 0012)
     pub remote_links: supervision::RemoteLinkRegistry,
@@ -615,6 +626,8 @@ impl Runtime {
             distributed: DistributedContext::new(),
             cluster_config: ClusterConfig::default(),
             acked_packets: HashSet::new(),
+            next_remote_delivery_id: 1,
+            remote_message_admissions: HashMap::new(),
             remote_links: supervision::RemoteLinkRegistry::new(),
             remote_monitors: supervision::RemoteMonitorRegistry::new(),
             migrated_actors: HashMap::new(),
@@ -6540,8 +6553,55 @@ impl Runtime {
         distribution::drain_acked(self)
     }
 
+    /// Send a distributed actor message and request a destination admission
+    /// result. Returns a sender-local delivery id only for a cross-node send.
+    ///
+    /// The returned id is independent of the NUL0 packet sequence number:
+    /// transport ACKs prove packet processing, while remote admission proves
+    /// destination mailbox acceptance/backpressure/rejection.
+    pub fn send_distributed_tracked(
+        &mut self,
+        target: ActorAddress,
+        behavior: &str,
+        args: &[Value],
+    ) -> Option<u64> {
+        distribution::send_distributed_tracked(self, target, behavior, args)
+    }
+
     pub fn send_distributed(&mut self, target: ActorAddress, behavior: &str, args: &[Value]) {
         distribution::send_distributed(self, target, behavior, args)
+    }
+
+    /// Remove one terminal remote admission result by delivery id.
+    pub fn take_remote_admission(&mut self, delivery_id: u64) -> Option<ActorAdmissionStatus> {
+        self.remote_message_admissions.remove(&delivery_id)
+    }
+
+    /// Drain terminal remote admission results in delivery-id order.
+    pub fn drain_remote_admissions(&mut self) -> Vec<RemoteMessageAdmission> {
+        let mut admissions: Vec<_> = std::mem::take(&mut self.remote_message_admissions)
+            .into_iter()
+            .map(|(delivery_id, status)| RemoteMessageAdmission {
+                delivery_id,
+                status,
+            })
+            .collect();
+        admissions.sort_by_key(|entry| entry.delivery_id);
+        admissions
+    }
+
+    pub(crate) fn allocate_remote_delivery_id(&mut self) -> u64 {
+        let delivery_id = self.next_remote_delivery_id.max(1);
+        self.next_remote_delivery_id = delivery_id.wrapping_add(1).max(1);
+        delivery_id
+    }
+
+    pub(crate) fn record_remote_admission(
+        &mut self,
+        delivery_id: u64,
+        status: ActorAdmissionStatus,
+    ) {
+        self.remote_message_admissions.insert(delivery_id, status);
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
