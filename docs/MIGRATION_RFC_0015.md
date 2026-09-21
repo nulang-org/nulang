@@ -1,13 +1,15 @@
-# RFC 0015 migration: `catch` / `fail` → `Result` + `?` + `T ! E`
+# RFC 0015 migration: consolidate on `Result` + `?` + effects + supervision
 
 RFC 0015 (Error-Model Consolidation) deprecates the legacy `catch` and
-`fail` constructs. Phase 1 (current release) emits warnings only — code
-keeps compiling and running identically. They become hard errors in v2.0.
+`fail` constructs and typed-error signature shorthands. Phase 1 (current
+release) emits warnings only — code keeps compiling and running identically.
+They become hard errors in v2.0.
 
 | Construct | Warning | Replacement |
 |-----------|---------|-------------|
 | `catch expr fallback`, `catch expr { \| pat => body, ... }`, `expr catch fallback` | `W0101` | `match` on `Ok`/`Error` |
 | `fail expr` | `W0102` | `return` |
+| `-> T ! E`, `-> T throws E` | `W0103` | `-> Result[T, E]` |
 
 Warnings are printed to stderr with a source snippet. Pass
 `--deny-warnings` to turn them into build errors (e.g. in CI, to prevent
@@ -40,11 +42,11 @@ match read_config(path) {
 }
 ```
 
-When you don't need a local fallback, prefer propagating with `?` under
-an error-type signature (`T ! E` is sugar for `Result[T, E]`):
+When you don't need a local fallback, propagate with `?` from an explicit
+`Result[T, E]` return type:
 
 ```nulang
-fn load(path: String) -> Config ! Error {
+fn load(path: String) -> Result[Config, Error] {
   let text = read_file(path)?   // propagates Error(e) to the caller
   parse_config(text)
 }
@@ -57,19 +59,43 @@ error wrapping of its own. Rename the keyword:
 
 ```nulang
 // before (deprecated)
-fn head(l: List[Int]) -> Int ! Error {
+fn head(l: List[Int]) -> Result[Int, Error] {
   if empty(l) { fail Error("empty list") }
   first(l)
 }
 
 // after
-fn head(l: List[Int]) -> Int ! Error {
+fn head(l: List[Int]) -> Result[Int, Error] {
   if empty(l) { return Error("empty list") }
   first(l)
 }
 ```
 
-## Division by zero (Phase 2, not yet in effect)
+## Migrating typed-error signatures (W0103)
+
+Typed-error syntax currently lowers to `Result[T, E]`, so migration is
+mechanical and does not change runtime representation:
+
+```nulang
+// before (deprecated)
+fn load(path: String) -> Config ! IOError ! {FS} {
+  read_config(path)?
+}
+
+// also deprecated
+fn load(path: String) -> Config throws IOError ! {FS} {
+  read_config(path)?
+}
+
+// after
+fn load(path: String) -> Result[Config, IOError] ! {FS} {
+  read_config(path)?
+}
+```
+
+This deliberately leaves `! {FS}` in one role only: algebraic-effect rows.
+Recoverable errors are values (`Result`), while actor faults remain the
+supervision layer.## Division by zero (Phase 2, not yet in effect)
 
 RFC 0015 also changes division semantics — integer div/mod by zero will
 become a runtime fault and float div/mod will follow IEEE 754 — but that

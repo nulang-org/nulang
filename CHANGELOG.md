@@ -42,6 +42,20 @@ version + migration.*
 
 ## Stable tier
 
+### RFC 0015 error-model consolidation migration — 2026-09-21
+- **Typed-error signature shorthand is now deprecated.** `-> T ! E` and
+  `-> T throws E` continue to parse and lower exactly as before during the
+  migration window but emit `W0103`. Use explicit `-> Result[T, E]`; `?`
+  remains the propagation operator and `! {Effects}` remains the effect-row
+  annotation.
+- Existing `catch` (`W0101`) and `fail` (`W0102`) deprecations are
+  unchanged, but their migration guidance now targets explicit `Result`
+  signatures.
+- RFC 0015 is Accepted for the v2 transition: recoverable errors are values,
+  effects are checked interaction, and unexpected faults are handled by actor
+  supervision.
+
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 

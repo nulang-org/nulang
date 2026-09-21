@@ -948,14 +948,22 @@ impl Parser {
             None
         };
         // Error type and/or effect annotation.
-        // `! { ... }` → effect row.  `! Type` → error type.
+        //
+        // `! { ... }` remains the effect-row surface. Historical typed-error
+        // shorthands (`! ErrorType` and `throws ErrorType`) are accepted during
+        // the RFC 0015 migration window but warn: recoverable failure is
+        // canonically an explicit `Result[Ok, Err]` return type.
         let error_type;
         let effect;
-        if self.consume_if(&TokenKind::Bang) {
+        if self.peek_kind() == &TokenKind::Bang {
+            let annotation_span = self.current_span();
+            self.advance();
             if self.peek_kind() == &TokenKind::LBrace {
                 error_type = None;
                 effect = Some(self.parse_effect_row()?);
             } else {
+                self.warnings
+                    .push(NuWarning::deprecated_error_signature(annotation_span));
                 error_type = Some(self.parse_type()?);
                 effect = if self.consume_if(&TokenKind::Bang) || self.consume_if(&TokenKind::Throws)
                 {
@@ -964,11 +972,15 @@ impl Parser {
                     None
                 };
             }
-        } else if self.consume_if(&TokenKind::Throws) {
+        } else if self.peek_kind() == &TokenKind::Throws {
+            let annotation_span = self.current_span();
+            self.advance();
             if self.peek_kind() == &TokenKind::LBrace {
                 error_type = None;
                 effect = Some(self.parse_effect_row()?);
             } else {
+                self.warnings
+                    .push(NuWarning::deprecated_error_signature(annotation_span));
                 error_type = Some(self.parse_type()?);
                 effect = if self.consume_if(&TokenKind::Bang) || self.consume_if(&TokenKind::Throws)
                 {
@@ -8954,5 +8966,48 @@ mod tests {
     fn test_parse_par_requires_brace() {
         let result = parse_expr("par");
         assert!(result.is_err(), "bare 'par' must be a parse error");
+    }
+
+    #[test]
+    fn test_typed_error_signature_emits_rfc0015_warning() {
+        let mut lexer = crate::lexer::Lexer::new(
+            "fn parse() -> Int ! String { return Error(\"bad\") }",
+        );
+        let tokens = lexer.lex().unwrap();
+        let mut parser = Parser::new(tokens);
+        let _ = parser.parse_module().unwrap();
+        let warnings = parser.take_warnings();
+        assert!(
+            warnings.iter().any(|warning| warning.code == "W0103"),
+            "expected W0103 for `T ! E`, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_throws_error_signature_emits_rfc0015_warning() {
+        let mut lexer = crate::lexer::Lexer::new(
+            "fn parse() -> Int throws String { return Error(\"bad\") }",
+        );
+        let tokens = lexer.lex().unwrap();
+        let mut parser = Parser::new(tokens);
+        let _ = parser.parse_module().unwrap();
+        let warnings = parser.take_warnings();
+        assert!(
+            warnings.iter().any(|warning| warning.code == "W0103"),
+            "expected W0103 for `throws E`, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_effect_row_bang_does_not_emit_typed_error_warning() {
+        let mut lexer = crate::lexer::Lexer::new("fn print() -> Unit ! {IO} { unit }");
+        let tokens = lexer.lex().unwrap();
+        let mut parser = Parser::new(tokens);
+        let _ = parser.parse_module().unwrap();
+        let warnings = parser.take_warnings();
+        assert!(
+            warnings.iter().all(|warning| warning.code != "W0103"),
+            "effect rows must retain `! {{..}}` without typed-error warning: {warnings:?}"
+        );
     }
 }

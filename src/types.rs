@@ -1566,7 +1566,7 @@ impl NuWarning {
             help: Some(
                 "`catch` is deprecated by RFC 0015 and will be removed in v2.0 — \
                  rewrite as `match expr { | Ok(x) => x, | Error(e) => ... }` \
-                 and propagate errors with `?` under a `T ! E` signature"
+                 and propagate errors with `?` from an explicit `Result[T, E]` return type"
                     .to_string(),
             ),
         }
@@ -1580,14 +1580,28 @@ impl NuWarning {
             span,
             help: Some(
                 "`fail` is deprecated by RFC 0015 and will be removed in v2.0 — \
-                 use `return` with an explicit `Error(...)` value under a \
-                 `T ! E` signature"
+                 use `return` with an explicit `Error(...)` value from a \
+                 `Result[T, E]`-returning function"
                     .to_string(),
             ),
         }
     }
 
-    /// Plain-text one-line rendering, used when no SourceMap is installed.
+    /// `W0103` — deprecated typed-error signature sugar (RFC 0015).
+    pub fn deprecated_error_signature(span: Span) -> Self {
+        NuWarning {
+            code: "W0103",
+            msg: "use of deprecated typed-error signature shorthand".to_string(),
+            span,
+            help: Some(
+                "RFC 0015 makes recoverable failure explicit: replace \
+                 `-> T ! E` or `-> T throws E` with `-> Result[T, E]`; \
+                 `?` continues to propagate `Error(e)`, while `! {Effects}` \
+                 remains the algebraic-effect annotation"
+                    .to_string(),
+            ),
+        }
+    }    /// Plain-text one-line rendering, used when no SourceMap is installed.
     pub fn format_plain(&self) -> String {
         let mut out = format!("warning[{}]: {}", self.code, self.msg);
         let line = self.span.line();
