@@ -118,7 +118,6 @@ fn legacy_snapshot_requires_explicit_legacy_compatible_policy() {
     assert_eq!(compatible.recover_actor(actor_id), Some(actor_id));
 }
 
-
 #[test]
 fn legacy_nbc_transport_rejects_self_asserted_semantic_identity() {
     let actor_id = 410_005;
