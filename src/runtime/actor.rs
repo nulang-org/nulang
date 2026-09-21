@@ -5,6 +5,20 @@ use super::*;
 use crate::runtime::object_store::ObjectId;
 use crate::vm::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static STATE_INCARNATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn fresh_state_incarnation() -> u64 {
+    let value = STATE_INCARNATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if value == 0 {
+        // Zero is reserved for invalid/uninitialized identity. Reaching this
+        // requires process-local u64 exhaustion; recover with the next token.
+        STATE_INCARNATION_COUNTER.fetch_add(1, Ordering::Relaxed)
+    } else {
+        value
+    }
+}
 
 /// Actor state machine: Created → Running → Waiting → Suspended → Terminated
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +207,10 @@ pub struct Actor {
     /// dependency tracking. Revisions intentionally reset when an actor is
     /// reconstructed; subscriptions/query handlers are also ephemeral today.
     state_revisions: HashMap<String, u64>,
+    /// Process-local identity for this concrete Actor instance. A recovered or
+    /// restarted actor receives a new incarnation even when its actor id is
+    /// preserved, so old reactive read sets cannot become current by accident.
+    state_incarnation: u64,
     pub event_log: Vec<(String, Vec<Value>)>, // Emitted events for event_sourced actors
     /// Last persisted event sequence per EventSourced field, for compaction tracking.
     pub event_sourced_sequences: HashMap<String, u64>,
@@ -347,6 +365,7 @@ impl Actor {
             state_data: HashMap::new(),
             state_models: HashMap::new(),
             state_revisions: HashMap::new(),
+            state_incarnation: fresh_state_incarnation(),
             event_log: Vec::new(),
             event_sourced_sequences: HashMap::new(),
             event_sourced_compaction_interval: 100,
@@ -560,6 +579,11 @@ impl Actor {
     /// invalidation, not durable state identity.
     pub fn state_revision(&self, name: &str) -> u64 {
         self.state_revisions.get(name).copied().unwrap_or(0)
+    }
+
+    /// Process-local identity of this concrete actor activation.
+    pub fn state_incarnation(&self) -> u64 {
+        self.state_incarnation
     }
 
     /// Check if the actor has exceeded its per-turn reduction quota and should yield.
