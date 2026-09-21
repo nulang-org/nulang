@@ -404,6 +404,9 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
 pub(crate) struct StandaloneVmCallbacks {
     heap: ActorHeap,
     gc: crate::runtime::OrcaGc,
+    /// Deny ambient host authority for actor-free execution. When enabled,
+    /// resource effects return nil instead of touching the host.
+    deny_ambient_host_effects: bool,
     /// Test hook: when set, `IO.print` output is recorded here instead of
     /// written to stdout.
     io_output: Option<std::rc::Rc<std::cell::RefCell<Vec<String>>>>,
@@ -419,6 +422,7 @@ impl StandaloneVmCallbacks {
         Self {
             heap,
             gc: crate::runtime::OrcaGc::new(0),
+            deny_ambient_host_effects: false,
             io_output: None,
             routes: Vec::new(),
         }
@@ -1006,6 +1010,20 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
         constants: &[Constant],
         regs: &[Value],
     ) -> Option<Value> {
+        if self.deny_ambient_host_effects
+            && matches!(
+                effect_name,
+                "FS" | "Http" | "Env" | "Process" | "System" | "DB" | "Python" | "Realtime"
+            )
+        {
+            return Some(Value::nil());
+        }
+        if self.deny_ambient_host_effects
+            && effect_name == "Web"
+            && op_name == Some("serve_static")
+        {
+            return Some(Value::nil());
+        }
         if effect_name == "Actor" || effect_name == "Otp" {
             return Some(Value::nil());
         }
@@ -2840,6 +2858,21 @@ impl VM {
         let idx = self.current_frame_idx?;
         let f = self.frames.get(idx)?;
         self.modules.get(f.module_idx).and_then(|m| m.line_at(f.pc))
+    }
+
+    /// Enable or disable deny-by-default host authority for standalone VM
+    /// execution. The sandboxed profile blocks filesystem, network/HTTP,
+    /// environment, process, system, database, Python, realtime, and
+    /// filesystem-backed Web effects. It also denies dynamic FFI.
+    pub fn set_sandboxed_host_effects(&mut self, enabled: bool) {
+        if let Some(sb) = (&mut *self.actor_callbacks as &mut dyn std::any::Any)
+            .downcast_mut::<StandaloneVmCallbacks>()
+        {
+            sb.deny_ambient_host_effects = enabled;
+        }
+        if enabled {
+            self.set_ffi_sandbox(true, Vec::new());
+        }
     }
 
     /// Enable FFI sandboxing, restricting calls to the given library paths.
