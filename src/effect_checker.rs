@@ -1081,6 +1081,7 @@ impl EffectChecker {
                 behaviors,
                 state_fields,
                 init,
+                migrations,
                 ..
             } => {
                 for b in behaviors {
@@ -1094,6 +1095,26 @@ impl EffectChecker {
                 }
                 for (_, expr) in init {
                     self.infer_effects(&ctx, expr)?;
+                }
+
+                // RFC 0008 migration bodies execute during replay and must be
+                // deterministic. Enforce an empty effect row even when the
+                // surrounding actor behaviors are allowed to perform effects.
+                let pure = EffectRow::empty();
+                for migration in migrations {
+                    if let Some(state_body) = &migration.state_body {
+                        self.check_effects(&ctx, state_body, &pure)?;
+                    }
+                    for (event_name, event_params, event_body) in &migration.event_migrations {
+                        let base = self.shadowed.len();
+                        self.shadowed.extend(event_params.iter().cloned());
+                        if event_name == "other" && event_params.is_empty() {
+                            self.shadowed.push(event_name.clone());
+                        }
+                        let result = self.check_effects(&ctx, event_body, &pure);
+                        self.shadowed.truncate(base);
+                        result?;
+                    }
                 }
                 Ok(())
             }
