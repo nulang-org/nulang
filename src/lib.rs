@@ -18,6 +18,9 @@ pub mod authority_host;
 mod authority_runtime;
 pub use authority_runtime::RuntimeAuthorityError;
 pub mod backends;
+#[cfg(feature = "wasm-backend")]
+pub mod behavior_build;
+pub mod behavior_manifest;
 #[cfg(test)]
 pub mod benchmarks;
 pub mod bytecode;

@@ -11,6 +11,51 @@ thread_local! {
     /// Cleared at the start of every top-level `resolve_imports` call so that
     /// repeated compilations in the same process do not reuse stale ASTs.
     static IMPORT_CACHE: RefCell<BTreeMap<PathBuf, Vec<Decl>>> = const { RefCell::new(BTreeMap::new()) };
+    /// Exact source bytes consumed while resolving the current top-level
+    /// compilation unit. Kept beside the AST cache so provenance consumers can
+    /// bind to the same bytes that were parsed rather than re-reading files.
+    static IMPORT_SOURCES: RefCell<BTreeMap<PathBuf, Vec<u8>>> = const { RefCell::new(BTreeMap::new()) };
+    /// Per-thread package-module search path used by integrated compiler calls.
+    /// This avoids process-global NULANG_MODULE_PATH mutation when package
+    /// builds run concurrently in tests or embedding hosts.
+    static MODULE_PATH_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with an explicit package-module search path for this thread.
+///
+/// `None` preserves the ambient NULANG_MODULE_PATH behavior. The previous
+/// override is restored even if `f` unwinds.
+pub fn with_module_path_override<T>(module_path: Option<&str>, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<String>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MODULE_PATH_OVERRIDE.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+
+    let previous = MODULE_PATH_OVERRIDE.with(|slot| {
+        std::mem::replace(&mut *slot.borrow_mut(), module_path.map(ToOwned::to_owned))
+    });
+    let _reset = Reset(previous);
+    f()
+}
+
+/// Resolve imports and return the exact imported source bytes consumed by this
+/// resolution. The root module's bytes are supplied by its caller and are not
+/// included here.
+///
+/// This is intentionally a thin wrapper around `resolve_imports`: compilation
+/// and provenance share one resolver read, eliminating a filesystem TOCTOU
+/// window between semantic analysis and source identity calculation.
+pub fn resolve_imports_with_sources(
+    module: &mut AstModule,
+    current_file: &Path,
+    stack: &mut HashSet<PathBuf>,
+) -> NuResult<Vec<Vec<u8>>> {
+    resolve_imports(module, current_file, stack)?;
+    Ok(IMPORT_SOURCES.with(|sources| sources.borrow().values().cloned().collect()))
 }
 
 pub fn resolve_imports(
@@ -20,6 +65,7 @@ pub fn resolve_imports(
 ) -> NuResult<()> {
     if stack.is_empty() {
         IMPORT_CACHE.with(|c| c.borrow_mut().clear());
+        IMPORT_SOURCES.with(|sources| sources.borrow_mut().clear());
     }
 
     let canonical_file = current_file
@@ -69,6 +115,11 @@ pub fn resolve_imports(
             msg: format!("cannot read '{}': {}", import_path, e),
             span: Span::default(),
         })?;
+        IMPORT_SOURCES.with(|sources| {
+            sources
+                .borrow_mut()
+                .insert(resolved_canonical.clone(), source.as_bytes().to_vec());
+        });
         let tokens = Lexer::new(&source)
             .lex()
             .map_err(|e| NuError::RuntimeError {
@@ -293,7 +344,9 @@ fn filter_decls(decls: Vec<Decl>, items: &[String]) -> Vec<Decl> {
 /// files; the bare import maps to `<dir>/lib.nula`, and subpaths map to
 /// `<dir>/<subpath>.nula`.
 fn resolve_module_path(module: &str) -> PathBuf {
-    let entries = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
+    let entries = MODULE_PATH_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(|| std::env::var("NULANG_MODULE_PATH").unwrap_or_default());
     let mut chosen_dir: Option<PathBuf> = None;
     let mut chosen_prefix = String::new();
     for entry in entries.split(';') {
@@ -378,16 +431,36 @@ mod tests {
 
     #[test]
     fn test_resolve_module_path() {
-        std::env::set_var("NULANG_MODULE_PATH", "@nulang/auth=/tmp/nulang_auth_mod");
-        let base = std::path::Path::new(".");
-        assert_eq!(
-            resolve_path(base, "@nulang/auth"),
-            std::path::PathBuf::from("/tmp/nulang_auth_mod/lib.nula")
-        );
-        assert_eq!(
-            resolve_path(base, "@nulang/auth/session"),
-            std::path::PathBuf::from("/tmp/nulang_auth_mod/session.nula")
-        );
-        std::env::remove_var("NULANG_MODULE_PATH");
+        with_module_path_override(Some("@nulang/auth=/tmp/nulang_auth_mod"), || {
+            let base = std::path::Path::new(".");
+            assert_eq!(
+                resolve_path(base, "@nulang/auth"),
+                std::path::PathBuf::from("/tmp/nulang_auth_mod/lib.nula")
+            );
+            assert_eq!(
+                resolve_path(base, "@nulang/auth/session"),
+                std::path::PathBuf::from("/tmp/nulang_auth_mod/session.nula")
+            );
+        });
+    }
+
+    #[test]
+    fn module_path_override_is_scoped_and_nested() {
+        with_module_path_override(Some("outer=/tmp/outer"), || {
+            assert_eq!(
+                resolve_path(std::path::Path::new("."), "@nulang/outer"),
+                std::path::PathBuf::from("/tmp/outer/lib.nula")
+            );
+            with_module_path_override(Some("inner=/tmp/inner"), || {
+                assert_eq!(
+                    resolve_path(std::path::Path::new("."), "@nulang/inner"),
+                    std::path::PathBuf::from("/tmp/inner/lib.nula")
+                );
+            });
+            assert_eq!(
+                resolve_path(std::path::Path::new("."), "@nulang/outer"),
+                std::path::PathBuf::from("/tmp/outer/lib.nula")
+            );
+        });
     }
 }
