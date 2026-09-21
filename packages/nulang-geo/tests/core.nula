@@ -1,0 +1,48 @@
+import lib
+
+fn main() {
+    let p = cartesian(3.0, 4.0);
+    let origin = cartesian(0.0, 0.0);
+    perform Test.assert(
+        approx_equal(distance_2d(origin, p), 5.0, 0.000001),
+        "cartesian distance should use Euclidean geometry"
+    );
+
+    let normalized = normalize_longitude(540.0);
+    perform Test.assert(
+        approx_equal(normalized, 180.0, 0.000001),
+        "longitude normalization should wrap into [-180, 180]"
+    );
+
+    let brasilia = wgs84(-47.8828, -15.7939);
+    perform Test.assert(is_valid_wgs84(brasilia), "Brasilia coordinate should be valid WGS84");
+    perform Test.assert(
+        !is_valid_wgs84(wgs84(181.0, 0.0)),
+        "longitude beyond 180 should be invalid"
+    );
+
+    let bounds = bounding_box(-48.1, -16.0, -47.7, -15.6, WGS84);
+    perform Test.assert(contains(bounds, brasilia), "bounds should contain Brasilia");
+
+    let overlap = bounding_box(-47.9, -15.9, -47.5, -15.5, WGS84);
+    perform Test.assert(intersects(bounds, overlap), "overlapping bounds should intersect");
+
+    let separate = bounding_box(-50.0, -18.0, -49.0, -17.0, WGS84);
+    perform Test.assert(!intersects(bounds, separate), "separate bounds should not intersect");
+
+    let one_degree = geodesic_distance(wgs84(0.0, 0.0), wgs84(1.0, 0.0));
+    perform Test.assert(
+        approx_equal(one_degree.meters, 111195.0, 100.0),
+        "one degree longitude at equator should be about 111.195 km"
+    );
+
+    let one_km = kilometers(1.0);
+    perform Test.assert(
+        approx_equal(one_km.meters, 1000.0, 0.000001),
+        "kilometers should convert to meters"
+    );
+    perform Test.assert(
+        approx_equal(in_kilometers(one_km), 1.0, 0.000001),
+        "distance should convert back to kilometers"
+    )
+}
