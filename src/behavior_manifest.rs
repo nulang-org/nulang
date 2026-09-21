@@ -45,6 +45,7 @@ pub struct CompilerIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostAbiRequirement {
     /// Versioned compiler-owned host ABI required by this exact artifact.
     pub schema: String,
@@ -198,6 +199,7 @@ pub struct Provenance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BehaviorManifest {
     pub schema: String,
     pub package: PackageIdentity,
@@ -215,6 +217,52 @@ pub struct BehaviorManifest {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extensions: BTreeMap<String, serde_json::Value>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestAdmissionError {
+    InvalidJson(String),
+    UnsupportedManifestSchema { found: String },
+    ArtifactDigestMismatch { expected: String, actual: String },
+    UnsupportedHostAbiSchema { found: String },
+    NonCanonicalHostOperationInventory,
+    UnknownHostOperation { canonical_id: String },
+    LegacyExtensionDispatchRequired,
+}
+
+impl std::fmt::Display for ManifestAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJson(error) => write!(f, "invalid Behavior Manifest JSON: {error}"),
+            Self::UnsupportedManifestSchema { found } => write!(
+                f,
+                "unsupported Behavior Manifest schema '{found}' (expected '{BEHAVIOR_MANIFEST_SCHEMA}')"
+            ),
+            Self::ArtifactDigestMismatch { expected, actual } => write!(
+                f,
+                "Behavior Manifest artifact digest mismatch: manifest={expected}, artifact={actual}"
+            ),
+            Self::UnsupportedHostAbiSchema { found } => write!(
+                f,
+                "unsupported host-effect ABI schema '{found}' (expected '{}')",
+                crate::host_effect_abi::HOST_EFFECT_ABI_SCHEMA
+            ),
+            Self::NonCanonicalHostOperationInventory => write!(
+                f,
+                "Behavior Manifest host operation inventory must be sorted and duplicate-free"
+            ),
+            Self::UnknownHostOperation { canonical_id } => write!(
+                f,
+                "Behavior Manifest requires unknown canonical host operation '{canonical_id}'"
+            ),
+            Self::LegacyExtensionDispatchRequired => write!(
+                f,
+                "artifact requires legacy/custom source-name host dispatch; canonical-only admission refuses it"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ManifestAdmissionError {}
 
 /// Inputs whose identity comes from the build/package layer rather than
 /// language semantics.
@@ -291,6 +339,72 @@ impl BehaviorManifest {
             },
             extensions: BTreeMap::new(),
         })
+    }
+
+    /// Parse a manifest and enforce the canonical deployment contract against
+    /// the exact executable artifact bytes supplied by the caller.
+    ///
+    /// This is intentionally stricter than raw serde deserialization: an
+    /// artifact is not admissible merely because its JSON is structurally
+    /// readable.
+    pub fn parse_for_canonical_host(
+        manifest_bytes: &[u8],
+        artifact_bytes: &[u8],
+    ) -> Result<Self, ManifestAdmissionError> {
+        let manifest: Self = serde_json::from_slice(manifest_bytes)
+            .map_err(|error| ManifestAdmissionError::InvalidJson(error.to_string()))?;
+        manifest.validate_for_canonical_host(artifact_bytes)?;
+        Ok(manifest)
+    }
+
+    /// Validate the enforcement-relevant artifact + host-ABI binding.
+    pub fn validate_for_canonical_host(
+        &self,
+        artifact_bytes: &[u8],
+    ) -> Result<(), ManifestAdmissionError> {
+        if self.schema != BEHAVIOR_MANIFEST_SCHEMA {
+            return Err(ManifestAdmissionError::UnsupportedManifestSchema {
+                found: self.schema.clone(),
+            });
+        }
+
+        let actual_digest = digest(artifact_bytes);
+        if self.artifact.digest != actual_digest {
+            return Err(ManifestAdmissionError::ArtifactDigestMismatch {
+                expected: self.artifact.digest.clone(),
+                actual: actual_digest,
+            });
+        }
+
+        if self.host_abi.schema != crate::host_effect_abi::HOST_EFFECT_ABI_SCHEMA {
+            return Err(ManifestAdmissionError::UnsupportedHostAbiSchema {
+                found: self.host_abi.schema.clone(),
+            });
+        }
+
+        let mut canonical = self.host_abi.required_operations.clone();
+        canonical.sort();
+        canonical.dedup();
+        if canonical != self.host_abi.required_operations {
+            return Err(ManifestAdmissionError::NonCanonicalHostOperationInventory);
+        }
+
+        for canonical_id in &self.host_abi.required_operations {
+            let known = crate::host_effect_abi::HOST_OPERATIONS
+                .iter()
+                .any(|operation| operation.canonical_id() == *canonical_id);
+            if !known {
+                return Err(ManifestAdmissionError::UnknownHostOperation {
+                    canonical_id: canonical_id.clone(),
+                });
+            }
+        }
+
+        if self.host_abi.requires_legacy_extension_dispatch {
+            return Err(ManifestAdmissionError::LegacyExtensionDispatchRequired);
+        }
+
+        Ok(())
     }
 
     /// Deterministic UTF-8 JSON. Struct field order is fixed, maps are
@@ -695,5 +809,139 @@ mod tests {
             .to_canonical_json()
             .unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn canonical_host_validation_binds_exact_artifact_and_host_abi() {
+        let artifact = b"wasm-artifact";
+        let mut checker = EffectChecker::new();
+        let manifest = BehaviorManifest::from_checked_module(
+            ManifestBuildInput {
+                package_name: "admission",
+                package_version: "0.1.0",
+                language_version: "1.0.0-frozen",
+                artifact_kind: ArtifactKind::WasmModule,
+                artifact_bytes: artifact,
+                compiler_implementation: "nulang-rust-test",
+                compiler_version: "test",
+                compiler_bytes: b"compiler",
+                host_abi: HostAbiRequirement {
+                    schema: crate::host_effect_abi::HOST_EFFECT_ABI_SCHEMA.to_string(),
+                    required_operations: vec![
+                        "nulang.host-effects/v0alpha1:nulang:storage/string#Write".to_string(),
+                    ],
+                    requires_legacy_extension_dispatch: false,
+                },
+                source_bytes: b"source",
+                dependency_bytes: b"lock",
+            },
+            &mut checker,
+            &[],
+        )
+        .unwrap();
+
+        let json = manifest.to_canonical_json().unwrap();
+        let parsed = BehaviorManifest::parse_for_canonical_host(&json, artifact).unwrap();
+        assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn canonical_host_validation_fails_closed_on_binding_or_abi_mismatch() {
+        let artifact = b"wasm-artifact";
+        let mut checker = EffectChecker::new();
+        let base = BehaviorManifest::from_checked_module(
+            ManifestBuildInput {
+                package_name: "admission",
+                package_version: "0.1.0",
+                language_version: "1.0.0-frozen",
+                artifact_kind: ArtifactKind::WasmModule,
+                artifact_bytes: artifact,
+                compiler_implementation: "nulang-rust-test",
+                compiler_version: "test",
+                compiler_bytes: b"compiler",
+                host_abi: HostAbiRequirement {
+                    schema: crate::host_effect_abi::HOST_EFFECT_ABI_SCHEMA.to_string(),
+                    required_operations: vec![
+                        "nulang.host-effects/v0alpha1:nulang:storage/string#Write".to_string(),
+                    ],
+                    requires_legacy_extension_dispatch: false,
+                },
+                source_bytes: b"source",
+                dependency_bytes: b"lock",
+            },
+            &mut checker,
+            &[],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            base.validate_for_canonical_host(b"different-artifact"),
+            Err(ManifestAdmissionError::ArtifactDigestMismatch { .. })
+        ));
+
+        let mut wrong_schema = base.clone();
+        wrong_schema.schema = "nulang.behavior/v999".into();
+        assert!(matches!(
+            wrong_schema.validate_for_canonical_host(artifact),
+            Err(ManifestAdmissionError::UnsupportedManifestSchema { .. })
+        ));
+
+        let mut wrong_abi = base.clone();
+        wrong_abi.host_abi.schema = "nulang.host-effects/v999".into();
+        assert!(matches!(
+            wrong_abi.validate_for_canonical_host(artifact),
+            Err(ManifestAdmissionError::UnsupportedHostAbiSchema { .. })
+        ));
+
+        let mut unknown = base.clone();
+        unknown.host_abi.required_operations =
+            vec!["nulang.host-effects/v0alpha1:nulang:unknown/op#run".into()];
+        assert!(matches!(
+            unknown.validate_for_canonical_host(artifact),
+            Err(ManifestAdmissionError::UnknownHostOperation { .. })
+        ));
+
+        let mut legacy = base.clone();
+        legacy.host_abi.requires_legacy_extension_dispatch = true;
+        assert!(matches!(
+            legacy.validate_for_canonical_host(artifact),
+            Err(ManifestAdmissionError::LegacyExtensionDispatchRequired)
+        ));
+    }
+
+    #[test]
+    fn canonical_host_validation_rejects_ambiguous_operation_inventory() {
+        let artifact = b"wasm-artifact";
+        let operation =
+            "nulang.host-effects/v0alpha1:nulang:storage/string#Write".to_string();
+        let mut checker = EffectChecker::new();
+        let mut manifest = BehaviorManifest::from_checked_module(
+            ManifestBuildInput {
+                package_name: "admission",
+                package_version: "0.1.0",
+                language_version: "1.0.0-frozen",
+                artifact_kind: ArtifactKind::WasmModule,
+                artifact_bytes: artifact,
+                compiler_implementation: "nulang-rust-test",
+                compiler_version: "test",
+                compiler_bytes: b"compiler",
+                host_abi: HostAbiRequirement {
+                    schema: crate::host_effect_abi::HOST_EFFECT_ABI_SCHEMA.to_string(),
+                    required_operations: vec![operation.clone()],
+                    requires_legacy_extension_dispatch: false,
+                },
+                source_bytes: b"source",
+                dependency_bytes: b"lock",
+            },
+            &mut checker,
+            &[],
+        )
+        .unwrap();
+
+        manifest.host_abi.required_operations = vec![operation.clone(), operation];
+        assert!(matches!(
+            manifest.validate_for_canonical_host(artifact),
+            Err(ManifestAdmissionError::NonCanonicalHostOperationInventory)
+        ));
     }
 }
