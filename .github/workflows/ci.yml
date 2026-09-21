@@ -222,13 +222,18 @@ jobs:
           cargo build --bin nulang --features wasm-backend
           tmp="$(mktemp -d)"
           ./target/debug/nulang nula new "$tmp/portable-pkg"
+          cat > "$tmp/portable-pkg/src/main.nula" <<'NULA'
+          fn main() {
+            perform IO.print("semantic-smoke")
+          }
+          NULA
           (
             cd "$tmp/portable-pkg"
             "$GITHUB_WORKSPACE/target/debug/nulang" nula build --target wasm
           )
           test -f "$tmp/portable-pkg/.nula/dist/portable-pkg.wasm"
           test -f "$tmp/portable-pkg/.nula/dist/portable-pkg.behavior.json"
-          python3 - "$tmp/portable-pkg/.nula/dist/portable-pkg.wasm" "$tmp/portable-pkg/.nula/dist/portable-pkg.behavior.json" <<\'PY\'
+          python3 - "$tmp/portable-pkg/.nula/dist/portable-pkg.wasm" "$tmp/portable-pkg/.nula/dist/portable-pkg.behavior.json" <<'PY'
           import json, pathlib, sys
           wasm = pathlib.Path(sys.argv[1])
           manifest = pathlib.Path(sys.argv[2])
@@ -239,7 +244,11 @@ jobs:
           digest = payload["artifact"]["digest"]
           assert digest.startswith("blake3:") and len(digest) == len("blake3:") + 64
           assert payload["artifact"]["kind"] == "wasm-module"
-          assert payload["completeness"]["effects"] == "not-emitted"
+          assert payload["completeness"]["effects"] == "compiler-module-conservative"
+          assert payload["completeness"]["actors"] == "compiler-derived-with-per-actor-status"
+          main = next(x for x in payload["effects"] if x["subject_kind"] == "function" and x["subject"] == "main")
+          assert "IO" in main["effects"], main
+          assert not (pathlib.Path(sys.argv[2]).parent / ".portable-pkg.compiler-semantics.json").exists()
           PY
 
   # -----------------------------------------------------------------------

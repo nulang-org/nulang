@@ -114,6 +114,7 @@ fn main() {
                 opts.verbose,
                 &opts.backend,
                 opts.out_file.as_deref(),
+                opts.emit_semantic_inventory.as_deref(),
                 opts.metrics_port,
                 &opts.target,
                 &opts.with_capabilities,
@@ -416,6 +417,15 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            "--emit-semantic-inventory" => {
+                if i + 1 < args.len() {
+                    opts.emit_semantic_inventory = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --emit-semantic-inventory requires a file path argument");
+                    std::process::exit(1);
+                }
+            }
             "--rewrite-signals" => {
                 if i + 1 < args.len() {
                     opts.rewrite_signals = Some(args[i + 1].clone());
@@ -533,6 +543,7 @@ fn main() {
                     "--help",
                     "--emit-stdlib-docs",
                     "--emit-signals",
+                    "--emit-semantic-inventory",
                     "--rewrite-signals",
                     "-r",
                     "-e",
@@ -693,6 +704,7 @@ fn main() {
                         v,
                         &b,
                         None,
+                        opts.emit_semantic_inventory.as_deref(),
                         None,
                         &opts.target,
                         &opts.with_capabilities,
@@ -737,6 +749,7 @@ fn main() {
                         opts.verbose,
                         &opts.backend,
                         opts.out_file.as_deref(),
+                        opts.emit_semantic_inventory.as_deref(),
                         opts.metrics_port,
                         &opts.target,
                         &opts.with_capabilities,
@@ -756,6 +769,7 @@ fn main() {
                 opts.verbose,
                 &opts.backend,
                 opts.out_file.as_deref(),
+                opts.emit_semantic_inventory.as_deref(),
                 opts.metrics_port,
                 &opts.target,
                 &opts.with_capabilities,
@@ -917,6 +931,7 @@ fn main() {
                         verbose,
                         backend,
                         out_file,
+                        opts.emit_semantic_inventory.as_deref(),
                         opts.metrics_port,
                         &opts.target,
                         &opts.with_capabilities,
@@ -936,6 +951,7 @@ fn main() {
                 opts.verbose,
                 &opts.backend,
                 opts.out_file.as_deref(),
+                opts.emit_semantic_inventory.as_deref(),
                 opts.metrics_port,
                 &opts.target,
                 &opts.with_capabilities,
@@ -971,6 +987,7 @@ fn main() {
             opts.verbose,
             &opts.backend,
             opts.out_file.as_deref(),
+            opts.emit_semantic_inventory.as_deref(),
             opts.metrics_port,
             &opts.target,
             &opts.with_capabilities,
@@ -1005,6 +1022,8 @@ struct Options {
     emit_stdlib_docs: Option<String>,
     /// Output file for the compile-time signal graph (`.nula/dist/app.signals.json`).
     emit_signals: Option<String>,
+    /// Compiler-owned semantic inventory consumed by the package Behavior Manifest.
+    emit_semantic_inventory: Option<String>,
     /// Output file for the client-side signal micro-runtime (`.nula/dist/app.client.js`).
     rewrite_signals: Option<String>,
     /// Color mode: "auto" (default), "always", or "never".
@@ -1056,6 +1075,7 @@ impl Default for Options {
             verify_source: None,
             emit_stdlib_docs: None,
             emit_signals: None,
+            emit_semantic_inventory: None,
             rewrite_signals: None,
             color: "auto".to_string(),
             init: None,
@@ -1154,6 +1174,7 @@ fn print_help() {
     println!("  -v, --verbose    Show bytecode and AST");
     println!("  --metrics-port <N>  Start Prometheus metrics server on port N");
     println!("  --emit-signals <file> Emit signal graph JSON for the web framework");
+    println!("  --emit-semantic-inventory <file> Emit compiler semantic inventory JSON");
     println!("  --rewrite-signals <file> Rewrite HTML for signals and emit client JS");
     println!("  --store <uri>    Durable store URI for programs declaring durable");
     println!("                   entities (default: $NULANG_STORE_PATH or .nulang/store/).");
@@ -1753,6 +1774,32 @@ fn run_frontend(
     Ok((ast, type_checker))
 }
 
+fn emit_compiler_semantic_inventory(
+    path: &str,
+    ast: &nulang::ast::AstModule,
+    with_capabilities: &[String],
+) -> NuResult<()> {
+    let mut effect_checker = EffectChecker::new();
+    effect_checker.set_resource_grants(with_capabilities);
+    effect_checker.check_module(&ast.decls)?;
+    let inventory =
+        nulang::semantic_inventory::CompilerSemanticInventory::from_checked_module(
+            ast,
+            &mut effect_checker,
+        )?;
+    let mut bytes = serde_json::to_vec_pretty(&inventory).map_err(|error| {
+        nulang::types::NuError::VMError {
+            msg: format!("failed to encode compiler semantic inventory: {error}"),
+            span: Span::default(),
+        }
+    })?;
+    bytes.push(b'\n');
+    std::fs::write(path, bytes).map_err(|error| nulang::types::NuError::VMError {
+        msg: format!("failed to write compiler semantic inventory {path}: {error}"),
+        span: Span::default(),
+    })
+}
+
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
 fn run_source(
     source: &str,
@@ -1760,6 +1807,7 @@ fn run_source(
     verbose: bool,
     backend: &str,
     out_file: Option<&str>,
+    semantic_inventory_out: Option<&str>,
     metrics_port: Option<u16>,
     target: &str,
     with_capabilities: &[String],
@@ -1768,6 +1816,11 @@ fn run_source(
 ) -> NuResult<()> {
     let (ast, type_checker) =
         run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+
+    if let Some(path) = semantic_inventory_out {
+        emit_compiler_semantic_inventory(path, &ast, with_capabilities)?;
+    }
+
     match backend {
         #[cfg(feature = "wasm-backend")]
         "wasm" => {

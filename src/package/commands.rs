@@ -9,6 +9,9 @@ use crate::package::behavior_manifest::BehaviorManifest;
 use crate::package::lockfile::{Lockfile, LOCKFILE_FILE};
 use crate::package::manifest::{Dependency, DependencyDetail, Manifest, MANIFEST_FILE};
 use crate::package::resolver::resolve;
+use crate::semantic_inventory::{
+    CompilerSemanticInventory, COMPILER_SEMANTIC_INVENTORY_SCHEMA,
+};
 use crate::types::{NuError, NuResult, Span};
 use crate::web::modules::{ModuleRegistry, ModuleSpec};
 
@@ -1296,6 +1299,8 @@ fn cmd_build_wasm_target(aot: bool) -> NuResult<()> {
 
     let wasm_path = dist_dir.join(format!("{}.wasm", name));
     let wasm_path_str = wasm_path.to_string_lossy().into_owned();
+    let semantic_path = dist_dir.join(format!(".{}.compiler-semantics.json", name));
+    let semantic_path_str = semantic_path.to_string_lossy().into_owned();
     let backend = if aot { "wasm-aot" } else { "wasm" };
     let caps = capability_args();
     let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
@@ -1306,27 +1311,74 @@ fn cmd_build_wasm_target(aot: bool) -> NuResult<()> {
         if aot { "WASM + AOT" } else { "portable WASM" }
     );
     eprintln!("  Compiling {}...", entry.display());
+    // Never let an internal semantic handoff from a previous build survive
+    // into this build. A successful compiler invocation must produce the file
+    // consumed below.
+    let _ = std::fs::remove_file(&semantic_path);
     nulang_exe(
         &[
-            &["--backend", backend, "--out", &wasm_path_str, &entry_str],
+            &[
+                "--backend",
+                backend,
+                "--out",
+                &wasm_path_str,
+                "--emit-semantic-inventory",
+                &semantic_path_str,
+                &entry_str,
+            ],
             &cap_refs[..],
         ]
         .concat(),
     )?;
 
-    let behavior_manifest =
-        BehaviorManifest::for_wasm(&root, &manifest, &wasm_path).map_err(|error| {
+    let semantic_bytes = std::fs::read(&semantic_path).map_err(|error| {
+        NuError::PackageError {
+            msg: format!(
+                "compiler did not emit semantic inventory {}: {error}",
+                semantic_path.display()
+            ),
+            span: Span::default(),
+        }
+    })?;
+    let semantic_inventory =
+        CompilerSemanticInventory::from_json(&semantic_bytes).map_err(|error| {
             NuError::PackageError {
-                msg: format!("cannot construct behavior manifest: {error}"),
+                msg: format!(
+                    "invalid compiler semantic inventory {}: {error}",
+                    semantic_path.display()
+                ),
                 span: Span::default(),
             }
         })?;
+    if semantic_inventory.schema != COMPILER_SEMANTIC_INVENTORY_SCHEMA {
+        return Err(NuError::PackageError {
+            msg: format!(
+                "unsupported compiler semantic inventory schema '{}' (expected '{}')",
+                semantic_inventory.schema, COMPILER_SEMANTIC_INVENTORY_SCHEMA
+            ),
+            span: Span::default(),
+        });
+    }
+
+    let behavior_manifest =
+        BehaviorManifest::for_wasm(&root, &manifest, &wasm_path)
+            .and_then(|manifest| manifest.with_compiler_semantics(&semantic_inventory))
+            .map_err(|error| {
+                NuError::PackageError {
+                    msg: format!("cannot construct behavior manifest: {error}"),
+                    span: Span::default(),
+                }
+            })?;
     let behavior_path = behavior_manifest.write_next_to(&wasm_path).map_err(|error| {
         NuError::PackageError {
             msg: format!("cannot emit behavior manifest: {error}"),
             span: Span::default(),
         }
     })?;
+
+    // The compiler semantic inventory is an internal handoff. The public
+    // package contract is the artifact-bound Behavior Manifest.
+    let _ = std::fs::remove_file(&semantic_path);
 
     println!("Build succeeded: {}", wasm_path.display());
     println!("Behavior manifest: {}", behavior_path.display());

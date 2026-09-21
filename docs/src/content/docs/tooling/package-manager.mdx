@@ -301,14 +301,22 @@ dependency resolution, language-version checks, module-path setup, and declared
 capability forwarding as the normal package build before invoking the WASM
 backend.
 
-The adjacent `*.behavior.json` file is the first implementation slice of the
-RFC 0020 Behavior Manifest. It is bound to the exact emitted WASM bytes with a
-BLAKE3 digest and records package/language/compiler identity plus source and
-lockfile provenance. Until compiler semantic inventories land, its
-`completeness` object explicitly marks effects, actor protocols, durability,
-and replay metadata as `not-emitted`; package capabilities are labelled
-`declared-not-inferred` rather than being presented as compiler-derived
-authority.
+The adjacent `*.behavior.json` file is the compiler/package contract defined
+by RFC 0020. It is bound to the exact emitted WASM bytes with a BLAKE3 digest
+and records package/language/compiler identity plus source and lockfile
+provenance.
+
+The compiler also contributes a conservative semantic inventory covering every
+declared module function, actor behavior, and workflow step/compensation.
+Effect entries contain compiler-inferred body effects, and resource-gated
+effects derive coarse required authority categories (`fs`, `net`, `os`).
+Actor protocol IDs reuse the canonical structural protocol hash and are emitted
+only when the behavior signatures are stable enough to hash; otherwise each
+actor carries an explicit incomplete status instead of a guessed identity.
+
+Package-declared capabilities remain separately labelled as declarations.
+Interfaces, durable-state schemas/migrations, and replay classifications are
+still marked `not-emitted` until their compiler-owned contracts land.
 
 For a Wasmtime-precompiled sidecar:
 
