@@ -9,13 +9,14 @@ expanding the language kernel.
 
 ## Current scope
 
-- CRS-tagged `Point[CRS]` and `BoundingBox[CRS]` values
+- CRS-tagged `Point[CRS]`, `BoundingBox[CRS]`, `LineString[CRS]`, and `Polygon[CRS]` values
 - marker types for WGS84 (CRS84-style longitude/latitude storage), Web Mercator, and local Cartesian coordinates
 - WGS84 range validation and longitude normalization
 - axis-aligned bounding-box containment/intersection
-- planar Euclidean distance
+- planar Euclidean distance, line length, polygon perimeter, area, centroid, and envelopes
 - typed `Distance` values with meter/kilometer/mile conversion
 - spherical WGS84 great-circle distance
+- WKT writers for points, line strings, and single-ring polygons
 - dependency-free implementation using portable Nulang float primitives
 
 ## Usage
@@ -40,8 +41,15 @@ This matches OGC:CRS84 ordering rather than EPSG:4326's formal latitude-first
 axis order.
 
 CRS parameters are shared across spatial operations, so APIs such as
-`contains`, `intersects`, and `distance_2d` require compatible instantiated
-point/bounds types.
+`contains`, `intersects`, `distance_2d`, `line_string`, and `polygon`
+require compatible instantiated geometry types.
+
+Planar operations such as `line_string_length`, `polygon_area`, and
+`polygon_centroid` operate in raw CRS coordinate units. They are appropriate
+for Cartesian/projected coordinates; they do not turn longitude/latitude
+degrees into metric length or geodesic area. Use `geodesic_distance` for the
+current WGS84 metric-distance path, and keep survey-grade geodesic geometry in
+the future PROJ/GEOS-backed extensions.
 
 ## Design boundary
 
@@ -69,6 +77,7 @@ From this package directory:
 nulang nula test
 ```
 
-The initial suite covers CRS-tagged point construction, bounds predicates,
-coordinate validation, unit conversion, planar distance, and an equatorial
-great-circle reference distance.
+The suite covers CRS-tagged point and aggregate construction, bounds and
+envelopes, coordinate validation, unit conversion, planar distance/length/area/
+centroid, WKT output, an equatorial great-circle reference distance, and
+compile-fail regressions for cross-CRS operations and mixed-CRS line strings.
