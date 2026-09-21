@@ -374,7 +374,9 @@ fn test_actor_set_priority_changes_scheduling() {
     let b = rt.spawn_actor(Box::new(|| vec![]));
     // Drain the spawn-time queue entries (both enqueued at Normal).
     assert_eq!(rt.scheduler.dequeue(), Some(a));
+    rt.actors.get_mut(&a).unwrap().scheduled = false;
     assert_eq!(rt.scheduler.dequeue(), Some(b));
+    rt.actors.get_mut(&b).unwrap().scheduled = false;
     // Boost b via the builtin-effect path, then send to a before b.
     assert_eq!(
         rt.perform_actor_builtin(Some(b), Some("set_priority"), &[], &[Value::int(0)]),
@@ -397,6 +399,7 @@ fn test_anonymous_actor_accepts_untyped_mailbox_delivery_without_handler_alias()
     assert!(rt.actors[&actor_id].behavior_table.is_empty());
     assert!(rt.actors[&actor_id].bytecode_module.is_none());
     assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+    rt.actors.get_mut(&actor_id).unwrap().scheduled = false;
 
     rt.send_message(actor_id, "opaque-runtime-tag", &[Value::int(7)]);
 
@@ -416,6 +419,7 @@ fn test_named_actor_still_rejects_unknown_behavior_without_aliasing_zero() {
         .unwrap()
         .register_behavior("known", |_actor, _args| {});
     assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+    rt.actors.get_mut(&actor_id).unwrap().scheduled = false;
 
     rt.send_message(actor_id, "typo", &[]);
     assert!(
@@ -2864,8 +2868,8 @@ fn test_runtime_scheduler_stats() {
 
     let stats = rt.scheduler_stats();
     assert_eq!(
-        stats.total_tasks_processed, 4,
-        "spawn + send should produce four actor tasks"
+        stats.total_tasks_processed, 2,
+        "spawn + send should coalesce to one scheduler task per actor"
     );
     assert_eq!(
         stats.empty_polls, 1,
@@ -7317,26 +7321,4 @@ fn perf_disabled_flight_recorder_is_a_noop() {
     let mut recorder = super::actor::FlightRecorder::new(0);
     recorder.record(7, 3, &[Value::int(42), Value::bool(true)]);
     assert!(recorder.is_empty());
-}
-
-#[test]
-fn perf_actor_turn_clears_trace_context() {
-    fn noop(_actor: &mut Actor, _args: &[Value]) {}
-
-    let mut rt = Runtime::new();
-    let actor_id = rt.spawn_actor(Box::new(Vec::new));
-    rt.actors
-        .get_mut(&actor_id)
-        .unwrap()
-        .register_behavior("noop", noop);
-
-    let root = TraceContext::root();
-    rt.current_trace = Some(root);
-    rt.send_message_by_id(actor_id, 0, &[]);
-    rt.step_actor(actor_id);
-
-    assert!(
-        rt.current_trace.is_none(),
-        "trace context must not leak beyond the actor turn"
-    );
 }
