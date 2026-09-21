@@ -7319,7 +7319,6 @@ fn perf_disabled_flight_recorder_is_a_noop() {
     assert!(recorder.is_empty());
 }
 
-
 #[test]
 fn perf_actor_turn_clears_trace_context() {
     fn noop(_actor: &mut Actor, _args: &[Value]) {}
