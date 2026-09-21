@@ -890,6 +890,8 @@ impl LibsqlStore {
                 "CREATE TABLE IF NOT EXISTS snapshots (
                     actor_id INTEGER PRIMARY KEY,
                     sequence INTEGER NOT NULL,
+                    schema_owner TEXT,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
                     state TEXT NOT NULL,
                     waiting_signal TEXT,
                     crdt_snapshot TEXT,
@@ -900,6 +902,17 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // RFC 0008 durable schema identity. Existing rows predate explicit
+            // metadata and therefore remain version 1 with no owner.
+            let _ = conn
+                .execute("ALTER TABLE snapshots ADD COLUMN schema_owner TEXT", ())
+                .await;
+            let _ = conn
+                .execute(
+                    "ALTER TABLE snapshots ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+                    (),
+                )
+                .await;
             // Migrate databases created before the waiting_signal column existed.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN waiting_signal TEXT", ())
@@ -1032,9 +1045,9 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
+                "INSERT INTO snapshots (actor_id, sequence, schema_owner, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, schema_owner=excluded.schema_owner, schema_version=excluded.schema_version, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
+                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, snapshot.schema_owner.as_deref(), snapshot.schema_version as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
@@ -1044,18 +1057,20 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = conn
                 .query(
-                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
+                    "SELECT sequence, schema_owner, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
                     libsql::params![actor_id as i64],
                 )
                 .await
                 .ok()?;
             let row = rows.next().await.ok()??;
             let sequence: i64 = row.get(0).ok()?;
-            let state_json: String = row.get(1).ok()?;
-            let waiting_signal: Option<String> = row.get(2).ok()?;
-            let crdt_json: Option<String> = row.get(3).ok()?;
-            let crdt_field_map_json: Option<String> = row.get(4).ok()?;
-            let authority_json: Option<String> = row.get(5).ok()?;
+            let schema_owner: Option<String> = row.get(1).ok()?;
+            let schema_version: i64 = row.get(2).ok()?;
+            let state_json: String = row.get(3).ok()?;
+            let waiting_signal: Option<String> = row.get(4).ok()?;
+            let crdt_json: Option<String> = row.get(5).ok()?;
+            let crdt_field_map_json: Option<String> = row.get(6).ok()?;
+            let authority_json: Option<String> = row.get(7).ok()?;
             let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
@@ -1081,6 +1096,8 @@ impl PersistenceStore for LibsqlStore {
             Some(ActorSnapshot {
                 actor_id,
                 sequence: sequence as u64,
+                schema_owner,
+                schema_version: schema_version as u32,
                 state,
                 waiting_signal,
                 crdt_snapshot,
@@ -1639,12 +1656,24 @@ impl PostgresStore {
             "CREATE TABLE IF NOT EXISTS snapshots (
                 actor_id BIGINT PRIMARY KEY,
                 sequence BIGINT NOT NULL,
+                schema_owner TEXT,
+                schema_version BIGINT NOT NULL DEFAULT 1,
                 state TEXT NOT NULL,
                 waiting_signal TEXT,
                 crdt_snapshot TEXT,
                 crdt_field_map TEXT,
                 authority_tokens TEXT
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS schema_owner TEXT",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS schema_version BIGINT NOT NULL DEFAULT 1",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1704,10 +1733,12 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO snapshots (actor_id, sequence, schema_owner, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (actor_id) DO UPDATE SET
                sequence = EXCLUDED.sequence,
+               schema_owner = EXCLUDED.schema_owner,
+               schema_version = EXCLUDED.schema_version,
                state = EXCLUDED.state,
                waiting_signal = EXCLUDED.waiting_signal,
                crdt_snapshot = EXCLUDED.crdt_snapshot,
@@ -1716,6 +1747,8 @@ impl PersistenceStore for PostgresStore {
             &[
                 &(snapshot.actor_id as i64),
                 &(snapshot.sequence as i64),
+                &snapshot.schema_owner.as_deref(),
+                &(snapshot.schema_version as i64),
                 &state_json,
                 &snapshot.waiting_signal.as_deref(),
                 &crdt_json.as_str(),
@@ -1731,17 +1764,19 @@ impl PersistenceStore for PostgresStore {
         let mut conn = self.conn.lock().unwrap();
         let row = conn
             .query_one(
-                "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens
+                "SELECT sequence, schema_owner, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens
                  FROM snapshots WHERE actor_id = $1",
                 &[&(actor_id as i64)],
             )
             .ok()?;
         let sequence: i64 = row.get(0);
-        let state_json: String = row.get(1);
-        let waiting_signal: Option<String> = row.get(2);
-        let crdt_json: Option<String> = row.get(3);
-        let crdt_field_map_json: Option<String> = row.get(4);
-        let authority_json: Option<String> = row.get(5);
+        let schema_owner: Option<String> = row.get(1);
+        let schema_version: i64 = row.get(2);
+        let state_json: String = row.get(3);
+        let waiting_signal: Option<String> = row.get(4);
+        let crdt_json: Option<String> = row.get(5);
+        let crdt_field_map_json: Option<String> = row.get(6);
+        let authority_json: Option<String> = row.get(7);
         let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> =
             crdt_json.and_then(|j| serde_json::from_str(&j).ok());
         let crdt_field_map: Option<HashMap<String, u64>> =
@@ -1763,6 +1798,8 @@ impl PersistenceStore for PostgresStore {
         Some(ActorSnapshot {
             actor_id,
             sequence: sequence as u64,
+            schema_owner,
+            schema_version: schema_version as u32,
             state,
             waiting_signal,
             crdt_snapshot,
