@@ -2261,8 +2261,9 @@ pub fn process_network_packets(
                     // string table; a message whose strings cannot be
                     // interned is dropped rather than delivered with
                     // dangling pool ids.
-                    // Clone the Arc payload into a mutable Vec, intern the
-                    // strings, then wrap the result back into a fresh Arc.
+                    // Materialize the immutable payload into a mutable Vec,
+                    // intern the strings, then rebuild the optimized
+                    // inline/shared payload representation.
                     let mut payload_vec = msg.payload.as_slice().to_vec();
                     if !intern_wire_strings(runtime, target_actor, &mut payload_vec, &string_table)
                     {
