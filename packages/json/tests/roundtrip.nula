@@ -33,6 +33,51 @@ fn main() {
   assert(!get_bool(obj, "stable", true), "get_bool hit")
   assert(get_bool(obj, "missing", true), "get_bool default")
 
+  // ── strict Option-based accessors ────────────────────────────────────
+  assert(
+    match get(obj, "name") {
+      Some(JsonString(value)) => value == "nulang",
+      _ => false,
+    },
+    "get returns exact JsonValue")
+  assert(
+    match get(obj, "missing") {
+      None => true,
+      _ => false,
+    },
+    "get distinguishes missing")
+  assert(
+    match get_string_opt(obj, "name") {
+      Some(value) => value == "nulang",
+      None => false,
+    },
+    "get_string_opt hit")
+  assert(
+    match get_string_opt(obj, "version") {
+      None => true,
+      _ => false,
+    },
+    "get_string_opt wrong type")
+  assert(
+    match get_number_opt(obj, "version") {
+      Some(value) => value == 1.0,
+      None => false,
+    },
+    "get_number_opt hit")
+  assert(
+    match get_bool_opt(obj, "stable") {
+      Some(value) => !value,
+      None => false,
+    },
+    "get_bool_opt hit")
+  let null_obj = parse("{\"value\": null}")
+  assert(
+    match get(null_obj, "value") {
+      Some(JsonNull) => true,
+      _ => false,
+    },
+    "get distinguishes null from missing")
+
   // ── accessors on non-objects return the default ──────────────────────
   assert(get_string(JsonNull, "k", "d") == "d", "get_string on null")
   assert(get_number(JsonBool(true), "k", 7.0) == 7.0, "get_number on bool")
