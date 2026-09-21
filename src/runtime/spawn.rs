@@ -607,6 +607,8 @@ mod authority_tests {
             std::collections::HashMap::new(),
             true,
             None,
+            None,
+            1,
         );
 
         assert_eq!(returned, actor_id);
@@ -652,6 +654,8 @@ mod authority_tests {
             std::collections::HashMap::new(),
             true,
             None,
+            None,
+            1,
         );
 
         assert_eq!(returned, actor_id);
@@ -661,4 +665,48 @@ mod authority_tests {
             "invalid authority must not publish a runnable actor"
         );
     }
+
+    #[test]
+    fn incompatible_restart_schema_fails_before_init_or_publish() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut rt = Runtime::new();
+        let actor_id = 910_003;
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                schema_owner: Some("Counter".to_string()),
+                schema_version: 1,
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            Some("Counter"),
+            2,
+        );
+
+        assert_eq!(returned, actor_id);
+        assert!(
+            !init_ran.get(),
+            "schema mismatch must abort before actor initialization"
+        );
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "schema mismatch must not publish a runnable actor"
+        );
+    }
+
 }
