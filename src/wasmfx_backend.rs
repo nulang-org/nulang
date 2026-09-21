@@ -182,6 +182,14 @@ impl WasmFxBackend {
                     }
 
                     if let mir::Stmt::Assign { op, .. } = stmt {
+                        if matches!(op, mir::RValue::Panic(..)) {
+                            return Err(crate::types::NuError::VMError {
+                                msg: "WasmFX backend restricted profile: runtime panic is not supported yet; use the bytecode backend"
+                                    .into(),
+                                span: crate::types::Span::default(),
+                            });
+                        }
+
                         if let mir::RValue::Call {
                             func: mir::FuncRef::Local(_),
                             ..
