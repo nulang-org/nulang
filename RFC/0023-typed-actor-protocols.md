@@ -141,14 +141,44 @@ behavior sentinels.
 `send` versus `ask` is delivery metadata rather than a property of a behavior
 declaration, so delivery mode is intentionally excluded from `ProtocolId`.
 
+## Phase 5: distributed schema descriptors
+
+Protocol ids on messages are sufficient for exact matching, but directional
+rolling-upgrade compatibility requires both canonical schemas. Requiring every
+node to preload the same centralized registry would reintroduce the operational
+scaffolding this protocol model is intended to remove.
+
+The experimental `NUPS` descriptor in `src/protocol_wire.rs` therefore
+provides a separate, versioned schema envelope containing only semantic
+protocol metadata:
+
+- the declared `ProtocolId`;
+- the human-readable schema name (excluded from identity);
+- behavior names in canonical order;
+- parameter, response, and full-signature `ProtocolTypeId` digests.
+
+The decoder is bounded, rejects unknown versions and trailing bytes, and
+recomputes the `ProtocolId` before returning a schema. VM object layout,
+bytecode offsets, runtime actor ids, source locations, and transport placement
+are deliberately absent.
+
+`NUPS` is not a change to the frozen NUL0 packet header. Ordinary messages
+continue to carry the compact `PRT0` required-protocol extension. Schema
+descriptors can be exchanged or cached out of band when a node needs to prove
+compatibility between different protocol ids.
+
+This phase provides registry *distribution*, not external IDL projection:
+OpenAPI/JSON Schema/Protobuf generation still requires a later canonical type
+descriptor that preserves enough semantic structure to render those formats.
+
 ## Future phases
 
 1. Add explicit protocol intersection/composition syntax for reusable named capabilities.
 2. Introduce a user-facing structural protocol type (`ActorRef[P]` or equivalent) for parameters, fields, collections, and public APIs.
 3. Support protocol intersection and capability attenuation, e.g. `ActorRef[Readable & Observable]`.
-4. Include protocol/version metadata in distributed actor references and wire negotiation.
-5. Check rolling-upgrade compatibility between protocol versions.
-6. Generate schema/IDL metadata from typed actor protocols for remote messaging and tooling.
+4. Add cache/gossip policy for distributing verified `NUPS` descriptors between nodes.
+5. Generate external IDL projections (OpenAPI, JSON Schema, Protobuf/WIT where representable) from compiler-owned canonical types.
+6. Add compatibility diagnostics that can render structural type diffs rather than digest-only differences.
 
 ## Non-goals
 
