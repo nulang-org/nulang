@@ -778,5 +778,4 @@ mod authority_tests {
             "incompatible event-only state must not publish a runnable actor"
         );
     }
-
 }
