@@ -5013,7 +5013,6 @@ impl Runtime {
                 .read_journal(actor_id)
                 .iter()
                 .any(|entry| entry.sequence > snapshot.sequence),
-            has_event_history: !self.persistence.read_events(actor_id).is_empty(),
             has_workflow_history: !self
                 .persistence
                 .read_workflow_events(actor_id)
