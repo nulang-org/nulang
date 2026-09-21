@@ -247,6 +247,48 @@ let b = between(0, 10, 5)          // true
 
 ---
 
+## Module: option
+
+`Option[T] = Some(T) | None` is defined once in the auto-imported prelude.
+`stdlib::option` provides operations on that canonical type.
+
+| Function | Description |
+|---|---|
+| `map(opt, f)` | Transform a present value. |
+| `and_then(opt, f)` | Chain an Option-returning function. |
+| `or_else(opt, f)` | Lazily recover from `None`. |
+| `unwrap_or(opt, default)` | Return the value or an eager default. |
+| `unwrap_or_else(opt, f)` | Return the value or compute a default lazily. |
+| `filter(opt, pred)` | Keep a present value only if it satisfies the predicate. |
+| `ok_or(opt, err)` | Convert to `Result[T, E]`. |
+| `is_some(opt)` / `is_none(opt)` | Test the variant. |
+| `unwrap(opt)` | Legacy aborting unwrap. Prefer total alternatives in portable code. |
+
+---
+
+## Module: result
+
+`Result[T, E] = Ok(T) | Error(E)` is defined once in the auto-imported
+prelude. `stdlib::result` provides operations on that canonical type.
+
+| Function | Description |
+|---|---|
+| `map(r, f)` | Transform a successful value. |
+| `map_err(r, f)` | Transform the error channel. |
+| `and_then(r, f)` | Chain a Result-returning function. |
+| `or_else(r, f)` | Recover from an error, optionally changing its type. |
+| `unwrap_or(r, default)` | Return success or an eager default. |
+| `unwrap_or_else(r, f)` | Return success or compute a fallback from the error. |
+| `to_option(r)` | Discard the error and convert to `Option[T]`. |
+| `is_ok(r)` / `is_err(r)` | Test the variant. |
+| `unwrap(r)` | Legacy aborting unwrap. Prefer total alternatives in portable code. |
+
+Higher-order collection operations such as `map2`, `sequence`, and
+`traverse` remain in the official `result-ext` package rather than growing
+the permanent standard library surface.
+
+---
+
 ## Module: set
 
 Integer set operations. Sets are represented as `[Int]` arrays with no
