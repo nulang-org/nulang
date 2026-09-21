@@ -42,6 +42,10 @@ version + migration.*
 
 ## Stable tier
 
+### Runtime hot-path performance wave — 2026-09-21
+- **Actor message and JIT hot paths are leaner** (Experimental, `src/runtime/actor.rs`, `src/runtime/mailbox.rs`, `src/jit/mod.rs`). Flight recording now allocates lazily, stores three raw inline payload samples, and renders human-readable summaries only on demand; rejected mailbox admissions are not recorded as deliveries. Immutable message payloads use `Arc<[Value]>` instead of `Arc<Vec<Value>>`, eliminating the extra Vec backing allocation. Tier-2 JIT bookkeeping is dense per-PC state, scalar regions skip fruitless promotion counting, and typed regions can genuinely replace their cached tier-1 function with SIMD code; static SIMD rejection disables further retries.
+
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
