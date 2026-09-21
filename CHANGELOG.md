@@ -1557,6 +1557,10 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Idle actor allocation footprint — 2026-09-21
+- **Idle actors reserve substantially less memory.** The actor flight recorder now allocates its entry buffer lazily, and a newly created actor starts with a 2 KiB ORCA bump block instead of 16 KiB while retaining the existing chained-growth path. A same-host 10k/100k A/B CI gate compares the change against its benchmark base and rejects material spawn/fan-out regressions.
+
+
 ### Actor runtime BEAM-parity performance baselines — 2026-09-21
 - **Actor performance evidence is reproducible.** Adds same-host Nulang/BEAM spawn, mailbox-flood, and fan-out benchmarks plus a fixed-host density probe from 10k through 1M actors. The benchmark-only slice establishes the measurement gate for actor-density changes without changing runtime semantics.
 
