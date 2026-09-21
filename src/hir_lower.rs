@@ -310,14 +310,15 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             migration_state_bodies: migrations
                 .iter()
                 .filter_map(|migration| {
-                    migration.state_body.as_ref().map(|state_body| {
-                        hir::MigrationStateBody {
+                    migration
+                        .state_body
+                        .as_ref()
+                        .map(|state_body| hir::MigrationStateBody {
                             from_version: migration.from_version,
                             to_version: migration.to_version,
                             body: with_fresh_defer_stack(|| lower_body(state_body)),
                             span: migration.span,
-                        }
-                    })
+                        })
                 })
                 .collect(),
             is_workflow: false,
