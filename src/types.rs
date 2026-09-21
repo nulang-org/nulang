@@ -808,6 +808,44 @@ pub const ACTOR_REF_TYPE_NAME: &str = "ActorRef";
 pub const UNSPECIFIED_ACTOR_PROTOCOL_TYPE_NAME: &str = "__UnspecifiedActorProtocolType";
 
 impl Type {
+    /// Whether values of this source type have an explicit stable encoding in
+    /// the durable runtime today.
+    ///
+    /// Keep this predicate deliberately narrower than "serializable in
+    /// principle": durable admission must agree with PersistedValue rather
+    /// than guessing encodings for heap aggregates. Nominal wrappers erase to
+    /// their underlying representation, and ActorRef[P] erases to an actor
+    /// reference, so both inherit the corresponding stable codec.
+    pub fn has_stable_durable_codec(&self) -> bool {
+        if self.actor_ref_protocol().is_some() {
+            return true;
+        }
+
+        match self {
+            Type::Primitive(
+                PrimitiveType::Int
+                | PrimitiveType::Float
+                | PrimitiveType::Bool
+                | PrimitiveType::String
+                | PrimitiveType::Nil
+                | PrimitiveType::Unit,
+            ) => true,
+            Type::Actor { .. } => true,
+            Type::Nominal { underlying, .. } => underlying.has_stable_durable_codec(),
+            Type::Var(_)
+            | Type::Primitive(PrimitiveType::Never | PrimitiveType::Address)
+            | Type::Tuple(_)
+            | Type::Record(_)
+            | Type::Variant(_)
+            | Type::Array(_)
+            | Type::Function { .. }
+            | Type::App { .. }
+            | Type::Reference { .. }
+            | Type::Scheme { .. }
+            | Type::Skolem(_) => false,
+        }
+    }
+
     /// Construct the compile-time-only structural actor-reference type
     /// `ActorRef[P]`. `P` is expected to be a record whose fields map
     /// behavior names to function signatures.
