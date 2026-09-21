@@ -245,3 +245,233 @@ pub fn approx_equal(a: Float, b: Float, tolerance: Float) -> Bool {
     let magnitude = if d < 0.0 then -d else d;
     magnitude <= tolerance
 }
+
+
+/// An ordered sequence of points in a single CRS.
+pub type LineString[CRS] = {
+    points: [Point[CRS]],
+    crs: CRS
+}
+
+/// A single-ring polygon in a single CRS.
+///
+/// The ring is implicitly closed: callers do not need to repeat the first
+/// point at the end. Repeating it is accepted and contributes a zero-length
+/// closing segment.
+pub type Polygon[CRS] = {
+    ring: [Point[CRS]],
+    crs: CRS
+}
+
+/// Construct a line string from CRS-compatible points.
+pub fn line_string[CRS](points: [Point[CRS]], crs: CRS) -> LineString[CRS] {
+    let result: LineString[CRS] = { points: points, crs: crs };
+    result
+}
+
+/// Construct a single-ring polygon from CRS-compatible points.
+pub fn polygon[CRS](ring: [Point[CRS]], crs: CRS) -> Polygon[CRS] {
+    let result: Polygon[CRS] = { ring: ring, crs: crs };
+    result
+}
+
+/// A line string is structurally valid when it has at least two points.
+pub fn is_valid_line_string[CRS](line: LineString[CRS]) -> Bool {
+    perform Array.length(line.points) >= 2
+}
+
+/// A single-ring polygon is structurally valid when it has at least three
+/// vertices. Topological self-intersection checks are intentionally deferred
+/// to the future GEOS-backed extension.
+pub fn is_valid_polygon[CRS](shape: Polygon[CRS]) -> Bool {
+    perform Array.length(shape.ring) >= 3
+}
+
+/// Compute the axis-aligned envelope of points.
+///
+/// Empty input has no envelope and returns None.
+pub fn points_envelope[CRS](
+    points: [Point[CRS]],
+    crs: CRS
+) -> Option[BoundingBox[CRS]] {
+    let n = perform Array.length(points);
+    if n == 0 then {
+        None
+    } else {
+        var min_x = points[0].x;
+        var min_y = points[0].y;
+        var max_x = points[0].x;
+        var max_y = points[0].y;
+        var i = 1;
+        while i < n {
+            let p = points[i];
+            if p.x < min_x then { min_x = p.x } else {};
+            if p.y < min_y then { min_y = p.y } else {};
+            if p.x > max_x then { max_x = p.x } else {};
+            if p.y > max_y then { max_y = p.y } else {};
+            i = i + 1
+        };
+        Some(bounding_box(min_x, min_y, max_x, max_y, crs))
+    }
+}
+
+/// Compute a line string's axis-aligned envelope.
+pub fn line_string_envelope[CRS](
+    line: LineString[CRS]
+) -> Option[BoundingBox[CRS]] {
+    points_envelope(line.points, line.crs)
+}
+
+/// Compute a polygon ring's axis-aligned envelope.
+pub fn polygon_envelope[CRS](
+    shape: Polygon[CRS]
+) -> Option[BoundingBox[CRS]] {
+    points_envelope(shape.ring, shape.crs)
+}
+
+/// Sum Euclidean segment lengths along a line string.
+pub fn line_string_length[CRS](line: LineString[CRS]) -> Float {
+    let n = perform Array.length(line.points);
+    if n < 2 then {
+        0.0
+    } else {
+        var total = 0.0;
+        var i = 1;
+        while i < n {
+            total = total + distance_2d(line.points[i - 1], line.points[i]);
+            i = i + 1
+        };
+        total
+    }
+}
+
+/// Compute the closed-ring perimeter of a polygon.
+pub fn polygon_perimeter[CRS](shape: Polygon[CRS]) -> Float {
+    let n = perform Array.length(shape.ring);
+    if n < 2 then {
+        0.0
+    } else {
+        var total = 0.0;
+        var i = 0;
+        while i < n {
+            let j = if i + 1 == n then 0 else i + 1;
+            total = total + distance_2d(shape.ring[i], shape.ring[j]);
+            i = i + 1
+        };
+        total
+    }
+}
+
+/// Compute signed planar area with the shoelace formula.
+///
+/// Positive/negative sign reflects vertex winding order.
+pub fn polygon_signed_area[CRS](shape: Polygon[CRS]) -> Float {
+    let n = perform Array.length(shape.ring);
+    if n < 3 then {
+        0.0
+    } else {
+        var twice_area = 0.0;
+        var i = 0;
+        while i < n {
+            let j = if i + 1 == n then 0 else i + 1;
+            twice_area =
+                twice_area +
+                shape.ring[i].x * shape.ring[j].y -
+                shape.ring[j].x * shape.ring[i].y;
+            i = i + 1
+        };
+        twice_area / 2.0
+    }
+}
+
+/// Compute non-negative planar polygon area in squared CRS units.
+pub fn polygon_area[CRS](shape: Polygon[CRS]) -> Float {
+    let signed = polygon_signed_area(shape);
+    if signed < 0.0 then -signed else signed
+}
+
+/// Compute the planar centroid of a non-degenerate polygon.
+///
+/// Invalid or zero-area rings return None.
+pub fn polygon_centroid[CRS](shape: Polygon[CRS]) -> Option[Point[CRS]] {
+    let n = perform Array.length(shape.ring);
+    if n < 3 then {
+        None
+    } else {
+        var twice_area = 0.0;
+        var x_sum = 0.0;
+        var y_sum = 0.0;
+        var i = 0;
+        while i < n {
+            let j = if i + 1 == n then 0 else i + 1;
+            let cross =
+                shape.ring[i].x * shape.ring[j].y -
+                shape.ring[j].x * shape.ring[i].y;
+            twice_area = twice_area + cross;
+            x_sum = x_sum + (shape.ring[i].x + shape.ring[j].x) * cross;
+            y_sum = y_sum + (shape.ring[i].y + shape.ring[j].y) * cross;
+            i = i + 1
+        };
+        let magnitude = if twice_area < 0.0 then -twice_area else twice_area;
+        if magnitude <= 0.000000000000001 then {
+            None
+        } else {
+            Some(point(
+                x_sum / (3.0 * twice_area),
+                y_sum / (3.0 * twice_area),
+                shape.crs
+            ))
+        }
+    }
+}
+
+fn coordinate_wkt[CRS](p: Point[CRS]) -> String {
+    perform Float.to_string(p.x) + " " + perform Float.to_string(p.y)
+}
+
+/// Serialize a point as OGC Well-Known Text.
+pub fn point_to_wkt[CRS](p: Point[CRS]) -> String {
+    "POINT (" + coordinate_wkt(p) + ")"
+}
+
+/// Serialize a line string as OGC Well-Known Text.
+pub fn line_string_to_wkt[CRS](line: LineString[CRS]) -> String {
+    let n = perform Array.length(line.points);
+    if n == 0 then {
+        "LINESTRING EMPTY"
+    } else {
+        var result = "LINESTRING (";
+        var i = 0;
+        while i < n {
+            if i > 0 then { result = result + ", " } else {};
+            result = result + coordinate_wkt(line.points[i]);
+            i = i + 1
+        };
+        result + ")"
+    }
+}
+
+/// Serialize a single-ring polygon as OGC Well-Known Text.
+///
+/// The stored ring is implicitly closed; the writer repeats the first
+/// coordinate when the caller did not already do so.
+pub fn polygon_to_wkt[CRS](shape: Polygon[CRS]) -> String {
+    let n = perform Array.length(shape.ring);
+    if n == 0 then {
+        "POLYGON EMPTY"
+    } else {
+        var result = "POLYGON ((";
+        var i = 0;
+        while i < n {
+            if i > 0 then { result = result + ", " } else {};
+            result = result + coordinate_wkt(shape.ring[i]);
+            i = i + 1
+        };
+        let first = shape.ring[0];
+        let last = shape.ring[n - 1];
+        if first.x != last.x || first.y != last.y then {
+            result = result + ", " + coordinate_wkt(first)
+        } else {};
+        result + "))"
+    }
+}
