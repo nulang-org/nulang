@@ -355,9 +355,9 @@ pub trait PersistenceStore: Send + Sync {
     /// Persist a snapshot of durable actor state.
     ///
     /// Contract: returning `Err` must not expose the replacement snapshot as
-    /// the current committed snapshot. Recovery migrations rely on this
-    /// commit-before-publication boundary. Built-in file stores use
-    /// temp-file + rename and SQL stores use one atomic upsert statement.
+    /// the current committed snapshot. Normal checkpoints use this operation.
+    /// Schema migration additionally requires `compare_and_swap_snapshot`
+    /// so a transform cannot overwrite state that changed after it was read.
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()>;
 
     /// Atomically replace an existing snapshot only when its durable revision
