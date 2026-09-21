@@ -14,9 +14,7 @@
 
 use crate::artifact_identity::{ArtifactIdentityError, ArtifactIdentityManifest};
 use crate::content_identity::ArtifactId;
-use crate::runtime_artifact_manifest::{
-    RuntimeArtifactManifest, RuntimeArtifactManifestError,
-};
+use crate::runtime_artifact_manifest::{RuntimeArtifactManifest, RuntimeArtifactManifestError};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -675,10 +673,7 @@ mod tests {
         )
     }
 
-    fn runtime_module(
-        identity: &ArtifactIdentityManifest,
-        definition: SemanticId,
-    ) -> CodeModule {
+    fn runtime_module(identity: &ArtifactIdentityManifest, definition: SemanticId) -> CodeModule {
         let mut module = CodeModule::new("retained-runtime");
         module.semantic_id = Some(identity.semantic_id());
         module.artifact_id = Some(identity.artifact_id());
@@ -800,8 +795,7 @@ mod tests {
         let identity = manifest(b"source");
         let definition = SemanticId::from_canonical_bytes(b"counter-definition", []);
         let module = runtime_module(&identity, definition);
-        let runtime_manifest =
-            RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
+        let runtime_manifest = RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
         let bytes = module.to_nbc(None).unwrap();
 
         let outcome = store
@@ -810,7 +804,9 @@ mod tests {
         assert_eq!(outcome.artifact, RetainOutcome::Stored);
         assert_eq!(outcome.runtime_manifest, RetainOutcome::Stored);
 
-        let restored = store.load_identified_module(identity.artifact_id()).unwrap();
+        let restored = store
+            .load_identified_module(identity.artifact_id())
+            .unwrap();
         assert_eq!(restored.semantic_id, Some(identity.semantic_id()));
         assert_eq!(restored.artifact_id, Some(identity.artifact_id()));
         assert_eq!(restored.actor_semantic_ids, vec![definition]);
@@ -826,8 +822,7 @@ mod tests {
 
         let definition = SemanticId::from_canonical_bytes(b"counter-definition", []);
         let module = runtime_module(&first, definition);
-        let runtime_manifest =
-            RuntimeArtifactManifest::from_module(&module, &first).unwrap();
+        let runtime_manifest = RuntimeArtifactManifest::from_module(&module, &first).unwrap();
         let bytes = module.to_nbc(None).unwrap();
 
         store
@@ -873,8 +868,7 @@ mod tests {
         let identity = manifest(b"source");
         let definition = SemanticId::from_canonical_bytes(b"counter-definition", []);
         let module = runtime_module(&identity, definition);
-        let runtime_manifest =
-            RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
+        let runtime_manifest = RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
         store
             .retain_runtime(&identity, &runtime_manifest, &module.to_nbc(None).unwrap())
             .unwrap();
@@ -898,7 +892,9 @@ mod tests {
         let identity = manifest(b"source");
         let definition = SemanticId::from_canonical_bytes(b"counter-definition", []);
         let module = runtime_module(&identity, definition);
-        store.retain(&identity, &module.to_nbc(None).unwrap()).unwrap();
+        store
+            .retain(&identity, &module.to_nbc(None).unwrap())
+            .unwrap();
 
         assert!(matches!(
             store.load_identified_module(identity.artifact_id()),
