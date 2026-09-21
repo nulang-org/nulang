@@ -3271,10 +3271,20 @@ impl Runtime {
             .get(&actor_id)
             .and_then(|actor| actor.definition_semantic_id)
             .map(|id| id.to_string());
+        let artifact_id = if semantic_id.is_some() {
+            self.actors
+                .get(&actor_id)
+                .and_then(|actor| actor.bytecode_module.as_ref())
+                .and_then(crate::bytecode::CodeModule::artifact_id)
+                .map(|id| id.to_string())
+        } else {
+            None
+        };
         Some(ActorSnapshot {
             actor_id,
             sequence,
             semantic_id,
+            artifact_id,
             state,
             waiting_signal,
             crdt_snapshot,
