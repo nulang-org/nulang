@@ -2049,6 +2049,7 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
+                semantic_id: None,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2111,6 +2112,7 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 5,
+                semantic_id: None,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2140,6 +2142,7 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 1,
+                semantic_id: None,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2176,6 +2179,7 @@ mod json_file_store_tests {
                 .save_snapshot(ActorSnapshot {
                     actor_id: 1,
                     sequence: 1,
+                    semantic_id: None,
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
@@ -2215,6 +2219,7 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 9,
+                semantic_id: None,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2336,6 +2341,7 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
+                semantic_id: None,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2392,6 +2398,7 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 5,
+                semantic_id: None,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2421,6 +2428,7 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 1,
+                semantic_id: None,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2457,6 +2465,7 @@ mod rocksdb_store_tests {
                 .save_snapshot(ActorSnapshot {
                     actor_id: 1,
                     sequence: 1,
+                    semantic_id: None,
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
@@ -2528,6 +2537,7 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 3,
+                semantic_id: None,
                 state,
                 waiting_signal: Some("signal".to_string()),
                 crdt_snapshot: None,
@@ -2593,6 +2603,7 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 5,
+                semantic_id: None,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2626,6 +2637,7 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 1,
+                semantic_id: None,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
