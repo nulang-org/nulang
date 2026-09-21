@@ -2,9 +2,9 @@ name: Docs Sync
 
 # Regenerate derived docs (stdlib reference + API reference) whenever the
 # compiler, standard library, examples, docs source, or this workflow change
-# on the main branch. The updated docs are committed back to main, the Astro
-# site is built to verify the result, and DeepWiki is pinged to encourage
-# re-indexing. Cloudflare Pages then redeploys https://nulang.org from main.
+# on the main branch. The generated outputs are proposed through a dedicated
+# pull request so protected-main rules remain authoritative. The Astro site is
+# built before the PR is opened, and DeepWiki is pinged to encourage re-indexing.
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -73,13 +73,17 @@ jobs:
           cd docs
           pnpm install --frozen-lockfile
           pnpm run build
-        # Deployment is handled by the Cloudflare Pages Git integration,
-        # which triggers on every push to main. This step validates the build
-        # before any generated docs are committed.
+        # Deployment remains handled by the Cloudflare Pages Git integration.
+        # This step validates the exact generated site before assets are
+        # proposed to protected main through the generated-assets PR.
 
       - name: Open or update generated-assets PR
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Optional PAT/GitHub-App token avoids the approval gate GitHub
+          # applies to PR workflows created by GITHUB_TOKEN. Without it, the
+          # generated-assets PR is still created safely but a maintainer must
+          # approve its workflow runs in the PR UI.
+          GH_TOKEN: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
