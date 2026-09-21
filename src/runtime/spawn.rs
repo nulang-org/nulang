@@ -588,10 +588,7 @@ mod authority_tests {
             self.inner.lock().unwrap().append_journal(actor_id, entry)
         }
 
-        fn read_journal(
-            &self,
-            actor_id: u64,
-        ) -> Vec<crate::runtime::persistence::JournalEntry> {
+        fn read_journal(&self, actor_id: u64) -> Vec<crate::runtime::persistence::JournalEntry> {
             self.inner.lock().unwrap().read_journal(actor_id)
         }
 
@@ -612,10 +609,7 @@ mod authority_tests {
         }
 
         fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
-            self.inner
-                .lock()
-                .unwrap()
-                .read_workflow_events(actor_id)
+            self.inner.lock().unwrap().read_workflow_events(actor_id)
         }
 
         fn append_event(
@@ -666,13 +660,14 @@ mod authority_tests {
         assert_ne!(actor_id, 0);
         assert!(!rt.actors.contains_key(&actor_id));
         let manager = rt.crdt_manager.as_ref().unwrap();
-        assert!(manager.field_map.keys().all(|(owner, _)| *owner != actor_id));
-        assert!(
-            manager
-                .field_reverse
-                .values()
-                .all(|(owner, _)| *owner != actor_id)
-        );
+        assert!(manager
+            .field_map
+            .keys()
+            .all(|(owner, _)| *owner != actor_id));
+        assert!(manager
+            .field_reverse
+            .values()
+            .all(|(owner, _)| *owner != actor_id));
     }
 
     #[test]
