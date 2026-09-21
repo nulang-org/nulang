@@ -14,7 +14,8 @@ use crate::ast::{
 };
 use crate::lexer::Lexer;
 use crate::parser::Parser;
-use crate::types::EffectRow;
+use crate::types::{EffectRow, PrimitiveType, Type};
+use crate::web::codec::{builtin_json_schema, JsonSchemaContract, JsonSchemaFieldContract};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -51,6 +52,10 @@ pub struct HandlerParamContract {
     pub capability: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<RequestParamBindingContract>,
+    /// Structural JSON schema for an explicit typed whole-body binding, when
+    /// every payload field can be represented without guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_schema: Option<JsonSchemaContract>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +255,9 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
         })
         .collect();
 
+    let mut record_types = HashMap::new();
+    collect_record_types(&module.decls, &mut record_types);
+
     let mut raw_routes = Vec::new();
     collect_routes_in_module(module, &mut raw_routes);
 
@@ -317,7 +325,12 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
                     m.params
                         .iter()
                         .map(|param| {
-                            handler_param_contract(param, m.request_bindings.get(&param.name))
+                            handler_param_contract(
+                                param,
+                                m.request_bindings.get(&param.name),
+                                &record_types,
+                                &transparent_aliases,
+                            )
                         })
                         .collect()
                 })
@@ -414,12 +427,148 @@ fn request_source_contract(source: WebRequestParamSource) -> RequestParamSource 
 fn handler_param_contract(
     param: &Param,
     request: Option<&RequestParamBindingContract>,
+    record_types: &HashMap<String, Vec<(String, Type)>>,
+    transparent_aliases: &HashMap<String, String>,
 ) -> HandlerParamContract {
+    let body_schema = match (request, param.ty.as_ref()) {
+        (Some(binding), Some(ty)) if binding.source == RequestParamSource::Body => {
+            json_body_schema(ty, record_types, transparent_aliases)
+        }
+        _ => None,
+    };
     HandlerParamContract {
         name: param.name.clone(),
         ty: param.ty.as_ref().map(ToString::to_string),
         capability: param.cap.map(|cap| cap.to_string()),
         request: request.cloned(),
+        body_schema,
+    }
+}
+
+fn collect_record_types(
+    decls: &[Decl],
+    out: &mut HashMap<String, Vec<(String, Type)>>,
+) {
+    for decl in decls {
+        match decl {
+            Decl::RecordType { name, fields, .. } => {
+                out.insert(name.clone(), fields.clone());
+            }
+            Decl::Module { decls, .. } => collect_record_types(decls, out),
+            _ => {}
+        }
+    }
+}
+
+fn json_body_schema(
+    ty: &Type,
+    record_types: &HashMap<String, Vec<(String, Type)>>,
+    transparent_aliases: &HashMap<String, String>,
+) -> Option<JsonSchemaContract> {
+    let rendered = ty.to_string();
+    let payload = rendered
+        .strip_prefix("Json[")?
+        .strip_suffix(']')?
+        .trim();
+    if let Some(schema) = builtin_json_schema(payload) {
+        return Some(schema);
+    }
+
+    let payload = canonical_type_name(payload, transparent_aliases);
+    json_schema_for_named_type(&payload, record_types, transparent_aliases, &mut Vec::new())
+}
+
+fn json_schema_for_named_type(
+    name: &str,
+    record_types: &HashMap<String, Vec<(String, Type)>>,
+    transparent_aliases: &HashMap<String, String>,
+    visiting: &mut Vec<String>,
+) -> Option<JsonSchemaContract> {
+    let name = canonical_type_name(name, transparent_aliases);
+    if let Some(schema) = builtin_json_schema(&name) {
+        return Some(schema);
+    }
+    if visiting.iter().any(|current| current == &name) {
+        return None;
+    }
+    let fields = record_types.get(&name)?;
+    visiting.push(name.clone());
+    let schema_fields = fields
+        .iter()
+        .map(|(field_name, field_ty)| {
+            Some(JsonSchemaFieldContract {
+                name: field_name.clone(),
+                schema: json_schema_for_type(
+                    field_ty,
+                    record_types,
+                    transparent_aliases,
+                    visiting,
+                )?,
+            })
+        })
+        .collect::<Option<Vec<_>>>();
+    visiting.pop();
+
+    Some(JsonSchemaContract::Object {
+        type_name: Some(name),
+        fields: schema_fields?,
+    })
+}
+
+fn json_schema_for_type(
+    ty: &Type,
+    record_types: &HashMap<String, Vec<(String, Type)>>,
+    transparent_aliases: &HashMap<String, String>,
+    visiting: &mut Vec<String>,
+) -> Option<JsonSchemaContract> {
+    match ty {
+        Type::Primitive(PrimitiveType::String) => Some(JsonSchemaContract::String),
+        Type::Primitive(PrimitiveType::Bool) => Some(JsonSchemaContract::Bool),
+        Type::Primitive(PrimitiveType::Int) => Some(JsonSchemaContract::Int),
+        Type::Primitive(PrimitiveType::Float) => Some(JsonSchemaContract::Float),
+        Type::Array(item) => Some(JsonSchemaContract::Array {
+            items: Box::new(json_schema_for_type(
+                item,
+                record_types,
+                transparent_aliases,
+                visiting,
+            )?),
+        }),
+        Type::Record(fields) => {
+            let schema_fields = fields
+                .iter()
+                .map(|(field_name, field_ty)| {
+                    Some(JsonSchemaFieldContract {
+                        name: field_name.clone(),
+                        schema: json_schema_for_type(
+                            field_ty,
+                            record_types,
+                            transparent_aliases,
+                            visiting,
+                        )?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(JsonSchemaContract::Object {
+                type_name: None,
+                fields: schema_fields,
+            })
+        }
+        Type::Nominal { underlying, .. } => json_schema_for_type(
+            underlying,
+            record_types,
+            transparent_aliases,
+            visiting,
+        ),
+        _ => {
+            let rendered = canonical_type_name(&ty.to_string(), transparent_aliases);
+            json_schema_for_named_type(
+                &rendered,
+                record_types,
+                transparent_aliases,
+                visiting,
+            )
+        }
     }
 }
 
