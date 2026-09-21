@@ -17,9 +17,15 @@ The workflow:
 3. Runs `docs/scripts/sync-playground.mjs`, which copies the browser bundle to
    `docs/public/playground/`.
 4. Builds the Astro documentation site as a validation gate.
-5. Commits the generated `docs/public/playground/` bundle back to `main`.
-6. Cloudflare Pages deploys the resulting site, including
+5. Commits the generated `docs/public/playground/` bundle back to `main`
+   with a normal deployable commit.
+6. Cloudflare Pages deploys that generated revision, including
    `/playground/index.html` and `/playground/nulang_playground.wasm`.
+
+The production Pages build fails closed if the generated WASM does not yet
+exist. That means the source merge cannot briefly publish an interactive hero
+or playground shell that points at a missing compiler; the previous successful
+deployment remains live until Docs Sync commits the generated artifact.
 
 The generated WASM is intentionally not maintained by hand. The workflow
 refreshes it from compiler sources so the hosted playground cannot silently
@@ -56,10 +62,11 @@ before Astro. The script always refreshes the HTML/CSS/JS shell from
 `playground/web/`.
 
 If `playground/web/nulang_playground.wasm` exists, it refreshes the public
-WASM too. If Rust/WASM tooling is unavailable (for example a lightweight local
-or Cloudflare docs build), it preserves the already-generated
-`docs/public/playground/nulang_playground.wasm`. The authoritative rebuild
-happens in Docs Sync on `main`.
+WASM too. Otherwise it preserves an already-generated
+`docs/public/playground/nulang_playground.wasm`. Lightweight local and preview
+builds may continue without that artifact, but the production Cloudflare Pages
+build on `main` refuses to deploy when it is missing. The authoritative
+rebuild happens in Docs Sync on `main`.
 
 ## Verification after deployment
 
