@@ -119,6 +119,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                None,
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -342,6 +343,51 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            "--emit-behavior-manifest" => {
+                if i + 1 < args.len() {
+                    opts.behavior_manifest_out = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --emit-behavior-manifest requires a file path");
+                    std::process::exit(1);
+                }
+            }
+            "--behavior-package-name" => {
+                if i + 1 < args.len() {
+                    opts.behavior_package_name = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --behavior-package-name requires a value");
+                    std::process::exit(1);
+                }
+            }
+            "--behavior-package-version" => {
+                if i + 1 < args.len() {
+                    opts.behavior_package_version = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --behavior-package-version requires a value");
+                    std::process::exit(1);
+                }
+            }
+            "--behavior-source-digest" => {
+                if i + 1 < args.len() {
+                    opts.behavior_source_digest = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --behavior-source-digest requires a digest");
+                    std::process::exit(1);
+                }
+            }
+            "--behavior-dependency-digest" => {
+                if i + 1 < args.len() {
+                    opts.behavior_dependency_digest = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --behavior-dependency-digest requires a digest");
+                    std::process::exit(1);
+                }
+            }
             "--store" => {
                 if i + 1 < args.len() {
                     opts.store_path = Some(args[i + 1].clone());
@@ -509,6 +555,11 @@ fn main() {
                     "--doc",
                     "--backend",
                     "--out",
+                    "--emit-behavior-manifest",
+                    "--behavior-package-name",
+                    "--behavior-package-version",
+                    "--behavior-source-digest",
+                    "--behavior-dependency-digest",
                     "--emit-nbc",
                     "--verify",
                     "--bench",
@@ -685,6 +736,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        None,
                     ) {
                         print_error(&e, uc);
                     }
@@ -729,6 +781,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        None,
                     )
                 },
                 n,
@@ -748,6 +801,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                None,
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -852,10 +906,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.deny_warnings,
             ) {
-                Ok((ast, _)) => {
-                    let mut checker = nulang::effect_checker::EffectChecker::new();
-                    checker.set_resource_grants(&opts.with_capabilities);
-                    let _ = checker.check_module(&ast.decls);
+                Ok((ast, _, checker)) => {
                     let graph = nulang::web::reactivity::analyze_module(&ast, Some(&checker));
                     if let Err(e) = std::fs::write(out, graph.to_json()) {
                         eprintln!("Error: Cannot write signal graph '{}': {}", out, e);
@@ -909,6 +960,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        None,
                     )
                 },
                 n,
@@ -928,6 +980,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                behavior_manifest_request(&opts, path),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -963,6 +1016,7 @@ fn main() {
             &opts.with_capabilities,
             opts.store_path.as_deref(),
             opts.deny_warnings,
+            None,
         ) {
             print_error(&e, use_color);
             std::process::exit(exit_code(&e));
@@ -983,6 +1037,14 @@ struct Options {
     verbose: bool,
     backend: String,
     out_file: Option<String>,
+    /// Optional Behavior Manifest sidecar output. This is intentionally
+    /// opt-in while RFC 0020 remains experimental.
+    behavior_manifest_out: Option<String>,
+    /// Package/provenance overrides supplied by the package manager.
+    behavior_package_name: Option<String>,
+    behavior_package_version: Option<String>,
+    behavior_source_digest: Option<String>,
+    behavior_dependency_digest: Option<String>,
     /// Compile the input to a `.nbc` artifact and write it, don't run.
     emit_nbc: bool,
     /// When running a `.nbc` artifact, verify its recorded source hash against
@@ -1039,6 +1101,11 @@ impl Default for Options {
             verbose: false,
             backend: "bytecode".to_string(),
             out_file: None,
+            behavior_manifest_out: None,
+            behavior_package_name: None,
+            behavior_package_version: None,
+            behavior_source_digest: None,
+            behavior_dependency_digest: None,
             emit_nbc: false,
             verify_source: None,
             emit_stdlib_docs: None,
@@ -1112,6 +1179,11 @@ fn print_help() {
         println!("  --out <file>     Output file for WASM backends (default: out.wasm)");
     }
     println!("  --out <file>     Output path for --emit-nbc (default: <FILE> with .nbc extension)");
+    println!("  --emit-behavior-manifest <file>  Emit RFC 0020 Behavior Manifest sidecar for WASM builds");
+    println!("  --behavior-package-name <name>   Override manifest package name");
+    println!("  --behavior-package-version <ver> Override manifest package version");
+    println!("  --behavior-source-digest <hash>  Supply package source-tree digest");
+    println!("  --behavior-dependency-digest <hash> Supply dependency-lock digest");
     println!("  <FILE>.nbc       Run a pre-compiled .nbc artifact directly (no compiler invoked)");
     println!(
         "  --verify <src>   When running a .nbc artifact, verify its source hash against <src>"
@@ -1557,7 +1629,11 @@ fn run_frontend(
     verbose: bool,
     with_capabilities: &[String],
     deny_warnings: bool,
-) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
+) -> NuResult<(
+    nulang::ast::AstModule,
+    nulang::typechecker::TypeChecker,
+    EffectChecker,
+)> {
     let ps = nulang::prelude_source::PRELUDE_SOURCE;
     let mut pl = Lexer::new(ps);
     nulang::types::set_source_map_with_file(ps, Some("<prelude>"));
@@ -1727,7 +1803,141 @@ fn run_frontend(
         }
     }
 
-    Ok((ast, type_checker))
+    Ok((ast, type_checker, effect_checker))
+}
+
+#[derive(Debug, Clone)]
+struct BehaviorManifestRequest {
+    out_path: String,
+    package_name: String,
+    package_version: String,
+    source_digest: Option<String>,
+    dependency_digest: Option<String>,
+}
+
+fn behavior_manifest_request(opts: &Options, source_path: &str) -> Option<BehaviorManifestRequest> {
+    let out_path = opts.behavior_manifest_out.clone()?;
+    let package_name = opts.behavior_package_name.clone().unwrap_or_else(|| {
+        std::path::Path::new(source_path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("app")
+            .to_string()
+    });
+    Some(BehaviorManifestRequest {
+        out_path,
+        package_name,
+        package_version: opts
+            .behavior_package_version
+            .clone()
+            .unwrap_or_else(|| "0.0.0".to_string()),
+        source_digest: opts.behavior_source_digest.clone(),
+        dependency_digest: opts.behavior_dependency_digest.clone(),
+    })
+}
+
+fn validate_behavior_digest(field: &str, digest: &str) -> NuResult<()> {
+    let Some((algorithm, hex)) = digest.split_once(':') else {
+        return Err(NuError::VMError {
+            msg: format!("{field} must be an algorithm-prefixed digest"),
+            span: Span::default(),
+        });
+    };
+    let valid_hex = hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !matches!(algorithm, "blake3" | "sha256") || !valid_hex {
+        return Err(NuError::VMError {
+            msg: format!("{field} must be a lowercase 256-bit blake3/sha256 digest"),
+            span: Span::default(),
+        });
+    }
+    Ok(())
+}
+
+fn compiler_behavior_digest() -> NuResult<String> {
+    let executable = std::env::current_exe().map_err(|error| NuError::VMError {
+        msg: format!("cannot resolve compiler executable for Behavior Manifest: {error}"),
+        span: Span::default(),
+    })?;
+    let bytes = std::fs::read(&executable).map_err(|error| NuError::VMError {
+        msg: format!(
+            "cannot hash compiler executable '{}' for Behavior Manifest: {error}",
+            executable.display()
+        ),
+        span: Span::default(),
+    })?;
+    Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
+}
+
+fn emit_behavior_manifest_sidecar(
+    request: &BehaviorManifestRequest,
+    source: &str,
+    artifact_bytes: &[u8],
+    effect_checker: &EffectChecker,
+    hir: &nulang::hir::Module,
+    mir: &nulang::mir::Module,
+) -> NuResult<()> {
+    use nulang::behavior_manifest::{
+        ArtifactKind, BehaviorManifest, BehaviorManifestInput,
+    };
+
+    let source_digest = request
+        .source_digest
+        .clone()
+        .unwrap_or_else(|| format!("blake3:{}", blake3::hash(source.as_bytes()).to_hex()));
+    let dependency_digest = request
+        .dependency_digest
+        .clone()
+        .unwrap_or_else(|| format!("blake3:{}", blake3::hash(&[]).to_hex()));
+    validate_behavior_digest("behavior source digest", &source_digest)?;
+    validate_behavior_digest("behavior dependency digest", &dependency_digest)?;
+    let compiler_digest = compiler_behavior_digest()?;
+
+    let manifest = BehaviorManifest::from_checked_program(BehaviorManifestInput {
+        package_name: &request.package_name,
+        package_version: &request.package_version,
+        language_version: nulang::format::constants::LANGUAGE_VERSION_STR,
+        artifact_kind: ArtifactKind::WasmModule,
+        artifact_bytes,
+        compiler_digest: &compiler_digest,
+        source_digest: &source_digest,
+        dependency_digest: &dependency_digest,
+        effect_checker,
+        hir: Some(hir),
+        mir: Some(mir),
+    })
+    .map_err(|error| NuError::VMError {
+        msg: format!("failed to derive Behavior Manifest: {error}"),
+        span: Span::default(),
+    })?;
+
+    let mut json = manifest.to_pretty_json().map_err(|error| NuError::VMError {
+        msg: format!("failed to serialize Behavior Manifest: {error}"),
+        span: Span::default(),
+    })?;
+    json.push('\n');
+
+    let output = std::path::Path::new(&request.out_path);
+    if let Some(parent) = output.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|error| NuError::VMError {
+            msg: format!(
+                "failed to create Behavior Manifest directory '{}': {error}",
+                parent.display()
+            ),
+            span: Span::default(),
+        })?;
+    }
+    std::fs::write(output, json).map_err(|error| NuError::VMError {
+        msg: format!(
+            "failed to write Behavior Manifest '{}': {error}",
+            output.display()
+        ),
+        span: Span::default(),
+    })?;
+    println!("Wrote {} (Behavior Manifest)", output.display());
+    Ok(())
 }
 
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
@@ -1742,9 +1952,20 @@ fn run_source(
     with_capabilities: &[String],
     store_path: Option<&str>,
     deny_warnings: bool,
+    behavior_manifest: Option<BehaviorManifestRequest>,
 ) -> NuResult<()> {
-    let (ast, type_checker) =
+    let (ast, type_checker, effect_checker) =
         run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+
+    if behavior_manifest.is_some()
+        && !matches!(backend, "wasm" | "wasm-run" | "wasm-aot")
+    {
+        return Err(NuError::VMError {
+            msg: "--emit-behavior-manifest currently requires a wasm, wasm-run, or wasm-aot backend".into(),
+            span: Span::default(),
+        });
+    }
+
     match backend {
         #[cfg(feature = "wasm-backend")]
         "wasm" => {
@@ -1764,6 +1985,16 @@ fn run_source(
                 }
             })?;
             println!("Wrote {} ({} bytes)", wasm_file, wasm_bytes.len());
+            if let Some(request) = behavior_manifest.as_ref() {
+                emit_behavior_manifest_sidecar(
+                    request,
+                    source,
+                    &wasm_bytes,
+                    &effect_checker,
+                    &hir,
+                    &mir,
+                )?;
+            }
             return Ok(());
         }
         #[cfg(feature = "wasm-backend")]
@@ -1783,6 +2014,16 @@ fn run_source(
                     span: Span::default(),
                 }
             })?;
+            if let Some(request) = behavior_manifest.as_ref() {
+                emit_behavior_manifest_sidecar(
+                    request,
+                    source,
+                    &wasm_bytes,
+                    &effect_checker,
+                    &hir,
+                    &mir,
+                )?;
+            }
             // Run via the host runtime directly (not `WasmBackend::run`) so
             // the Wasmtime store stays alive while the program result is
             // stringified — a string result's bytes live in linear memory
@@ -1821,6 +2062,16 @@ fn run_source(
                 }
             })?;
             println!("Wrote {} ({} bytes)", wasm_file, wasm_bytes.len());
+            if let Some(request) = behavior_manifest.as_ref() {
+                emit_behavior_manifest_sidecar(
+                    request,
+                    source,
+                    &wasm_bytes,
+                    &effect_checker,
+                    &hir,
+                    &mir,
+                )?;
+            }
             nulang::wasm_runtime::aot_compile(&wasm_file, &cwasm_file)?;
             println!("Wrote {} (precompiled)", cwasm_file);
             return Ok(());
@@ -2297,7 +2548,8 @@ fn check_source(
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+    let (_ast, _tc, _effects) =
+        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
 
     if verbose {
         println!("Effect check passed.");
@@ -2388,15 +2640,13 @@ fn compile_source_to_nbc(
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (mut ast, type_checker) =
+    let (mut ast, type_checker, mut effect_checker) =
         run_frontend(source, None, false, with_capabilities, deny_warnings)?;
 
     // Optional web-framework pass: rewrite HTML for signals/actions and emit the
     // generic client-side micro-runtime. This runs after effect checking so
     // action placements are known.
     if let Some(client_js_path) = rewrite_signals {
-        let mut effect_checker = EffectChecker::new();
-        effect_checker.check_module(&ast.decls)?;
         for msg in &effect_checker.diagnostics {
             eprintln!("{}", msg);
         }
@@ -2634,7 +2884,7 @@ mod tests {
                 c
             }
         "#;
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+        let (ast, type_checker, _effects) = run_frontend(source, None, false, &[], false)
             .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
