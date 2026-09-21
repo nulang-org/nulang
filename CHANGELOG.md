@@ -49,6 +49,18 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Fail-closed durable value persistence — 2026-09-20
+- **Lossless persistence admission** (Experimental, `src/runtime/persistence.rs`).
+  Durable snapshots, journals, event-sourced writes, workflow-start records,
+  and actor migration snapshots now use a fallible VM-value encoder. Primitive
+  values, actor references, compiler string constants, and runtime heap strings
+  are preserved exactly; unsupported heap/object/closure values are rejected
+  instead of silently becoming `Nil`.
+- Persistent native calls now fail before handler execution when their journal
+  payload cannot be encoded or written, preventing unjournaled mutations.
+  Workflow activation is deferred until the exact bytecode module is attached
+  and its initial durable record plus checkpoint succeed.
+
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
   A receiver may serve an older required protocol when it preserves every
