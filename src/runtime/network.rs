@@ -695,6 +695,10 @@ pub enum Packet {
         nbc_bytes: Vec<u8>,
         /// JSON-serialized [`ActorSnapshot`](crate::runtime::persistence::ActorSnapshot).
         snapshot_json: Vec<u8>,
+        /// Additive versioned runtime-artifact identity manifest. Absent for
+        /// legacy/unidentified migrations. Encoded as a trailing NUL0-v1
+        /// extension so historical readers safely ignore it.
+        runtime_manifest_json: Option<Vec<u8>>,
     },
     /// A positive "goodbye" from a node that is shutting down (RFC 0014 §1
     /// path 1): the sender declares its durable re-spawn-opted actors
@@ -713,6 +717,8 @@ pub enum Packet {
         nbc_bytes: Vec<u8>,
         snapshot_json: Vec<u8>,
         epoch: u64,
+        /// Same additive provenance extension as `MigrateActor`.
+        runtime_manifest_json: Option<Vec<u8>>,
     },
 }
 
@@ -850,11 +856,14 @@ impl Packet {
         if payload.len() < json_off + 4 + json_len {
             return None;
         }
-        let snapshot_json = payload[json_off + 4..json_off + 4 + json_len].to_vec();
+        let snapshot_end = json_off + 4 + json_len;
+        let snapshot_json = payload[json_off + 4..snapshot_end].to_vec();
+        let runtime_manifest_json = read_runtime_manifest_tail(payload, snapshot_end)?;
         Some(Packet::MigrateActor {
             actor_id,
             nbc_bytes,
             snapshot_json,
+            runtime_manifest_json,
         })
     }
 
@@ -1083,12 +1092,14 @@ impl Packet {
                 actor_id,
                 nbc_bytes,
                 snapshot_json,
+                runtime_manifest_json,
             } => {
                 buf.extend_from_slice(&actor_id.to_be_bytes());
                 buf.extend_from_slice(&(nbc_bytes.len() as u32).to_be_bytes());
                 buf.extend_from_slice(nbc_bytes);
                 buf.extend_from_slice(&(snapshot_json.len() as u32).to_be_bytes());
                 buf.extend_from_slice(snapshot_json);
+                write_runtime_manifest_tail(buf, runtime_manifest_json.as_deref());
             }
             Packet::NodeGoodbye { node_id, durable } => {
                 buf.extend_from_slice(&node_id.0.to_be_bytes());
@@ -1103,6 +1114,7 @@ impl Packet {
                 nbc_bytes,
                 snapshot_json,
                 epoch,
+                runtime_manifest_json,
             } => {
                 buf.extend_from_slice(&actor_id.to_be_bytes());
                 buf.extend_from_slice(&(nbc_bytes.len() as u32).to_be_bytes());
@@ -1110,6 +1122,7 @@ impl Packet {
                 buf.extend_from_slice(&(snapshot_json.len() as u32).to_be_bytes());
                 buf.extend_from_slice(snapshot_json);
                 buf.extend_from_slice(&epoch.to_be_bytes());
+                write_runtime_manifest_tail(buf, runtime_manifest_json.as_deref());
             }
         }
     }
@@ -1497,13 +1510,17 @@ impl Packet {
         if payload.len() < json_off + 4 + json_len + 8 {
             return None;
         }
-        let snapshot_json = payload[json_off + 4..json_off + 4 + json_len].to_vec();
-        let epoch = read_u64(payload, json_off + 4 + json_len)?;
+        let snapshot_end = json_off + 4 + json_len;
+        let snapshot_json = payload[json_off + 4..snapshot_end].to_vec();
+        let epoch = read_u64(payload, snapshot_end)?;
+        let runtime_manifest_json =
+            read_runtime_manifest_tail(payload, snapshot_end.checked_add(8)?)?;
         Some(Packet::ShadowReplicate {
             actor_id,
             nbc_bytes,
             snapshot_json,
             epoch,
+            runtime_manifest_json,
         })
     }
 
@@ -1549,6 +1566,41 @@ impl Packet {
         })
     }
 }
+const RUNTIME_MANIFEST_TAIL_MAGIC: &[u8; 4] = b"RAM0";
+
+fn write_runtime_manifest_tail(buf: &mut Vec<u8>, manifest: Option<&[u8]>) {
+    let Some(manifest) = manifest else {
+        return;
+    };
+    let Ok(len) = u32::try_from(manifest.len()) else {
+        return;
+    };
+    buf.extend_from_slice(RUNTIME_MANIFEST_TAIL_MAGIC);
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(manifest);
+}
+
+fn read_runtime_manifest_tail(payload: &[u8], offset: usize) -> Option<Option<Vec<u8>>> {
+    if offset >= payload.len() {
+        return Some(None);
+    }
+    if payload.len() < offset.checked_add(4)? {
+        return Some(None);
+    }
+    if payload.get(offset..offset + 4)? != RUNTIME_MANIFEST_TAIL_MAGIC {
+        // Unknown additive NUL0-v1 extensions remain ignored.
+        return Some(None);
+    }
+    let len_offset = offset.checked_add(4)?;
+    let len = read_u32(payload, len_offset)? as usize;
+    let start = len_offset.checked_add(4)?;
+    let end = start.checked_add(len)?;
+    if end > payload.len() {
+        return None;
+    }
+    Some(Some(payload[start..end].to_vec()))
+}
+
 // ---------------------------------------------------------------------------
 // Value (de)serialization helpers
 // ---------------------------------------------------------------------------
