@@ -1045,6 +1045,47 @@ fn ack_packet(
     }
 }
 
+/// Return the behavior name that proves ownership of a requested content hash.
+///
+/// The cache key alone is not evidence: callers must verify that the decoded
+/// module itself carries the requested behavior hash before serving or caching
+/// it.
+fn behavior_name_for_content_hash<'a>(
+    module: &'a crate::bytecode::CodeModule,
+    content_hash: &[u8; 32],
+) -> Option<&'a str> {
+    module
+        .behaviors
+        .iter()
+        .find(|entry| entry.content_hash.as_ref() == Some(content_hash))
+        .map(|entry| entry.name.as_str())
+}
+
+/// Decode fetched NBC bytes and verify the response's claimed behavior identity
+/// before the module is admitted to the content-addressed cache.
+///
+/// A peer-provided cache key is untrusted metadata. Only a behavior entry
+/// embedded in the decoded module can prove that the bytes belong under that
+/// content hash.
+fn decode_verified_fetched_behavior(
+    bytes: &[u8],
+    behavior_name: &str,
+    content_hash: &[u8; 32],
+) -> Result<crate::bytecode::CodeModule, String> {
+    let artifact = crate::bytecode::CodeModule::from_nbc(bytes)
+        .map_err(|error| format!("deserialization error: {error}"))?;
+    let module = artifact.module;
+    let matches_identity = module.behaviors.iter().any(|entry| {
+        entry.name == behavior_name && entry.content_hash.as_ref() == Some(content_hash)
+    });
+    if !matches_identity {
+        return Err(
+            "decoded module does not contain the claimed behavior/content hash".to_string(),
+        );
+    }
+    Ok(module)
+}
+
 pub fn process_network_packets(
     runtime: &mut Runtime,
     transport: &mut dyn NetworkTransport,
@@ -1255,19 +1296,19 @@ pub fn process_network_packets(
                         break;
                     }
                 }
-                // Also check the behavior cache
+                // Also check the behavior cache. The cache key is only a lookup
+                // hint: prove the cached module still contains the requested hash
+                // before serving bytes onward to another node.
                 if nbc_bytes.is_none() {
                     if let Some(cached) = runtime.behavior_cache.get(&content_hash) {
-                        match cached.to_nbc(None) {
-                            Ok(bytes) => {
-                                nbc_bytes = Some(bytes);
-                                behavior_name = cached
-                                    .behaviors
-                                    .first()
-                                    .map(|b| b.name.clone())
-                                    .unwrap_or_default();
+                        if let Some(name) = behavior_name_for_content_hash(cached, &content_hash) {
+                            match cached.to_nbc(None) {
+                                Ok(bytes) => {
+                                    nbc_bytes = Some(bytes);
+                                    behavior_name = name.to_string();
+                                }
+                                Err(_) => {}
                             }
-                            Err(_) => {}
                         }
                     }
                 }
@@ -1292,9 +1333,9 @@ pub fn process_network_packets(
                 nbc_bytes,
             } => {
                 if let Some(bytes) = nbc_bytes {
-                    match crate::bytecode::CodeModule::from_nbc(&bytes) {
-                        Ok(artifact) => {
-                            runtime.behavior_cache.insert(content_hash, artifact.module);
+                    match decode_verified_fetched_behavior(&bytes, &behavior_name, &content_hash) {
+                        Ok(module) => {
+                            runtime.behavior_cache.insert(content_hash, module);
                             // Retry any messages that were waiting for this bytecode
                             let pending = runtime.pending_fetched_messages.remove(&content_hash);
                             if let Some(messages) = pending {
@@ -1383,19 +1424,21 @@ pub fn process_network_packets(
                                 }
                             }
                         }
-                        Err(e) => {
+                        Err(error) => {
                             warn!(
-                                "nulang-net: failed to deserialize fetched bytecode for '{}': {}",
-                                behavior_name, e
+                                "nulang-net: rejecting fetched bytecode for '{}': {}",
+                                behavior_name, error
                             );
-                            // Drop pending messages for this hash on deserialize failure
+                            // Never retain poisoned content-addressed entries. Pending
+                            // deliveries fail so they cannot hang indefinitely waiting on
+                            // an identity that the response did not prove.
                             let pending = runtime.pending_fetched_messages.remove(&content_hash);
                             if let Some(messages) = pending {
                                 for (_, _, msg, _, _) in messages {
                                     notify_delivery_failed(
                                         runtime,
                                         msg.sender,
-                                        "bytecode fetch failed: deserialization error",
+                                        "bytecode fetch failed: content identity mismatch",
                                     );
                                 }
                             }
@@ -1406,7 +1449,11 @@ pub fn process_network_packets(
                     let pending = runtime.pending_fetched_messages.remove(&content_hash);
                     if let Some(messages) = pending {
                         for (_, _, msg, _, _) in messages {
-                            notify_delivery_failed(runtime, msg.sender, "bytecode fetch failed: sender does not have the requested behavior");
+                            notify_delivery_failed(
+                                runtime,
+                                msg.sender,
+                                "bytecode fetch failed: sender does not have the requested behavior",
+                            );
                         }
                     }
                 }
@@ -2646,6 +2693,47 @@ fn intern_wire_objects(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn test_fetched_behavior_bytes_must_prove_claimed_content_identity() {
+        use crate::bytecode::{BehaviorTableEntry, CodeModule};
+
+        let behavior = |name: &str, hash: [u8; 32]| BehaviorTableEntry {
+            name: name.to_string(),
+            param_count: 0,
+            code_offset: 0,
+            local_count: 0,
+            effect_mask: 0,
+            compensate_offset: None,
+            content_hash: Some(hash),
+            source_location: None,
+            parallel_branches: None,
+        };
+
+        let requested_hash = [0xCC; 32];
+        let mut module = CodeModule::new("fetched-identity");
+        module.behaviors.push(behavior("first", [0xAA; 32]));
+        module.behaviors.push(behavior("target", requested_hash));
+        let bytes = module.to_nbc(None).expect("serialize test module");
+
+        assert_eq!(
+            behavior_name_for_content_hash(&module, &requested_hash),
+            Some("target"),
+            "multi-behavior caches must serve the behavior that owns the requested hash"
+        );
+        assert!(
+            decode_verified_fetched_behavior(&bytes, "target", &requested_hash).is_ok(),
+            "matching NBC bytes should be admitted"
+        );
+        assert!(
+            decode_verified_fetched_behavior(&bytes, "first", &requested_hash).is_err(),
+            "a peer cannot relabel a different behavior under the requested hash"
+        );
+        assert!(
+            decode_verified_fetched_behavior(&bytes, "target", &[0xDD; 32]).is_err(),
+            "a cache key supplied by the peer is not proof of bytecode identity"
+        );
+    }
 
     #[test]
     fn test_resolve_verified_behavior_rejects_mismatched_hot_reload_hash() {
