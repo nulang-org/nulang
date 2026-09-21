@@ -2452,21 +2452,20 @@ fn compile_source_to_nbc(
                 msg: format!("failed to encode artifact identity manifest: {e}"),
                 span: Span::default(),
             })?;
-    std::fs::write(&identity_path, identity_json).map_err(|e| {
-        nulang::types::NuError::VMError {
-            msg: format!("failed to write {identity_path}: {e}"),
-            span: Span::default(),
-        }
+    std::fs::write(&identity_path, identity_json).map_err(|e| nulang::types::NuError::VMError {
+        msg: format!("failed to write {identity_path}: {e}"),
+        span: Span::default(),
     })?;
 
     let runtime_manifest_path = format!("{out_path}.runtime.json");
-    let runtime_manifest_json = artifact
-        .runtime_manifest
-        .to_json()
-        .map_err(|e| nulang::types::NuError::VMError {
-            msg: format!("failed to encode runtime artifact manifest: {e}"),
-            span: Span::default(),
-        })?;
+    let runtime_manifest_json =
+        artifact
+            .runtime_manifest
+            .to_json()
+            .map_err(|e| nulang::types::NuError::VMError {
+                msg: format!("failed to encode runtime artifact manifest: {e}"),
+                span: Span::default(),
+            })?;
     std::fs::write(&runtime_manifest_path, runtime_manifest_json).map_err(|e| {
         nulang::types::NuError::VMError {
             msg: format!("failed to write {runtime_manifest_path}: {e}"),
