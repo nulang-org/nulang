@@ -1,0 +1,30 @@
+import lib
+
+fn main() {
+    let entries = [
+        rtree_entry(bounding_box(0.0, 0.0, 1.0, 1.0, CARTESIAN), 1),
+        rtree_entry(bounding_box(2.0, 0.0, 3.0, 1.0, CARTESIAN), 2),
+        rtree_entry(bounding_box(4.0, 0.0, 5.0, 1.0, CARTESIAN), 3),
+        rtree_entry(bounding_box(6.0, 0.0, 7.0, 1.0, CARTESIAN), 4),
+        rtree_entry(bounding_box(8.0, 0.0, 9.0, 1.0, CARTESIAN), 5),
+        rtree_entry(bounding_box(10.0, 0.0, 11.0, 1.0, CARTESIAN), 6),
+        rtree_entry(bounding_box(12.0, 0.0, 13.0, 1.0, CARTESIAN), 7),
+        rtree_entry(bounding_box(14.0, 0.0, 15.0, 1.0, CARTESIAN), 8)
+    ];
+    let tree = rtree_bulk_load_str(entries, CARTESIAN, 2);
+    let result = rtree_query_intersects_with_stats(
+        tree,
+        bounding_box(3.9, -1.0, 5.1, 2.0, CARTESIAN)
+    );
+    perform Test.assert(
+        result.stats.matches == 1 &&
+        result.stats.nodes_tested > 0 &&
+        result.stats.entries_tested > 0 &&
+        result.stats.entries_tested < tree.size,
+        "query stats should prove subtree pruning reduced entry checks"
+    );
+    perform Test.assert(
+        perform Array.length(result.values) == 1 && result.values[0] == 3,
+        "instrumented query should preserve results"
+    )
+}

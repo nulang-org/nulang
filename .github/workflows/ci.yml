@@ -128,6 +128,47 @@ jobs:
       - name: Run nula test
         run: cd test-pkg && ../target/release/nulang nula test
 
+      - name: Test first-party geospatial package
+        run: cd packages/nulang-geo && ../../target/release/nulang nula test
+
+      - name: Verify geospatial CRS type safety
+        run: |
+          cd packages/nulang-geo
+          if ../../target/release/nulang --check tests/compile_fail/crs_mismatch.nula > /tmp/nulang-geo-crs.out 2>&1; then
+            echo "::error::cross-CRS distance unexpectedly type-checked"
+            cat /tmp/nulang-geo-crs.out
+            exit 1
+          fi
+          grep -q "expected constructor 'CARTESIAN', found constructor 'WGS84'" /tmp/nulang-geo-crs.out
+
+          if ../../target/release/nulang --check tests/compile_fail/mixed_crs_line_string.nula > /tmp/nulang-geo-line-crs.out 2>&1; then
+            echo "::error::mixed-CRS line string unexpectedly type-checked"
+            cat /tmp/nulang-geo-line-crs.out
+            exit 1
+          fi
+          grep -Eq "expected constructor '(WGS84|CARTESIAN)', found constructor '(CARTESIAN|WGS84)'" /tmp/nulang-geo-line-crs.out
+
+          if ../../target/release/nulang --check tests/compile_fail/mixed_crs_rtree_query.nula > /tmp/nulang-geo-rtree-crs.out 2>&1; then
+            echo "::error::cross-CRS R-tree query unexpectedly type-checked"
+            cat /tmp/nulang-geo-rtree-crs.out
+            exit 1
+          fi
+          grep -q "expected constructor 'CARTESIAN', found constructor 'WGS84'" /tmp/nulang-geo-rtree-crs.out
+
+          if ../../target/release/nulang --check tests/compile_fail/mixed_crs_rtree_point_query.nula > /tmp/nulang-geo-rtree-point-crs.out 2>&1; then
+            echo "::error::cross-CRS R-tree point query unexpectedly type-checked"
+            cat /tmp/nulang-geo-rtree-point-crs.out
+            exit 1
+          fi
+          grep -q "expected constructor 'CARTESIAN', found constructor 'WGS84'" /tmp/nulang-geo-rtree-point-crs.out
+
+          if ../../target/release/nulang --check tests/compile_fail/cartesian_geojson_writer.nula > /tmp/nulang-geo-geojson-crs.out 2>&1; then
+            echo "::error::Cartesian geometry unexpectedly serialized as RFC 7946 GeoJSON"
+            cat /tmp/nulang-geo-geojson-crs.out
+            exit 1
+          fi
+          grep -q "expected constructor 'WGS84', found constructor 'CARTESIAN'" /tmp/nulang-geo-geojson-crs.out
+
       - name: Verify documentation examples
         run: NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
   # -----------------------------------------------------------------------

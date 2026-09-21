@@ -1,0 +1,6 @@
+// Must fail: RFC 7946 GeoJSON writers accept WGS84 geometries only.
+import lib
+
+fn main() {
+    point_to_geojson(cartesian(1.0, 2.0))
+}

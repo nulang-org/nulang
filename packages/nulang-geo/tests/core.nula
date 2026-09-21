@@ -1,0 +1,166 @@
+import lib
+
+fn main() {
+    let p = cartesian(3.0, 4.0);
+    let origin = cartesian(0.0, 0.0);
+    perform Test.assert(
+        approx_equal(distance_2d(origin, p), 5.0, 0.000001),
+        "cartesian distance should use Euclidean geometry"
+    );
+
+    let normalized = normalize_longitude(540.0);
+    perform Test.assert(
+        approx_equal(normalized, 180.0, 0.000001),
+        "longitude normalization should wrap into [-180, 180]"
+    );
+
+    let brasilia = wgs84(-47.8828, -15.7939);
+    perform Test.assert(is_valid_wgs84(brasilia), "Brasilia coordinate should be valid WGS84");
+    perform Test.assert(
+        !is_valid_wgs84(wgs84(181.0, 0.0)),
+        "longitude beyond 180 should be invalid"
+    );
+
+    let bounds = bounding_box(-48.1, -16.0, -47.7, -15.6, WGS84);
+    perform Test.assert(contains(bounds, brasilia), "bounds should contain Brasilia");
+
+    let overlap = bounding_box(-47.9, -15.9, -47.5, -15.5, WGS84);
+    perform Test.assert(intersects(bounds, overlap), "overlapping bounds should intersect");
+
+    let separate = bounding_box(-50.0, -18.0, -49.0, -17.0, WGS84);
+    perform Test.assert(!intersects(bounds, separate), "separate bounds should not intersect");
+
+    let one_degree = geodesic_distance(wgs84(0.0, 0.0), wgs84(1.0, 0.0));
+    perform Test.assert(
+        approx_equal(one_degree.meters, 111195.0, 100.0),
+        "one degree longitude at equator should be about 111.195 km"
+    );
+
+    let one_km = kilometers(1.0);
+    perform Test.assert(
+        approx_equal(one_km.meters, 1000.0, 0.000001),
+        "kilometers should convert to meters"
+    );
+    perform Test.assert(
+        approx_equal(in_kilometers(one_km), 1.0, 0.000001),
+        "distance should convert back to kilometers"
+    )
+
+    let route = line_string(
+        [cartesian(0.0, 0.0), cartesian(3.0, 4.0), cartesian(6.0, 4.0)],
+        CARTESIAN
+    );
+    perform Test.assert(is_valid_line_string(route), "three-point line should be valid");
+    perform Test.assert(
+        approx_equal(line_string_length(route), 8.0, 0.000001),
+        "line length should sum segment lengths"
+    );
+
+    let rect = polygon(
+        [cartesian(0.0, 0.0), cartesian(4.0, 0.0), cartesian(4.0, 3.0), cartesian(0.0, 3.0)],
+        CARTESIAN
+    );
+    perform Test.assert(is_valid_polygon(rect), "rectangle should be a valid polygon");
+    perform Test.assert(
+        approx_equal(polygon_area(rect), 12.0, 0.000001),
+        "rectangle area should use the shoelace formula"
+    );
+    perform Test.assert(
+        approx_equal(polygon_perimeter(rect), 14.0, 0.000001),
+        "rectangle perimeter should close the ring implicitly"
+    );
+
+    match polygon_centroid(rect) {
+        Some(center) => {
+            perform Test.assert(
+                approx_equal(center.x, 2.0, 0.000001) &&
+                approx_equal(center.y, 1.5, 0.000001),
+                "rectangle centroid should be at its geometric center"
+            )
+        },
+        None => perform Test.assert(false, "non-degenerate rectangle should have a centroid"),
+    };
+
+    match polygon_envelope(rect) {
+        Some(env) => {
+            perform Test.assert(
+                approx_equal(env.min_x, 0.0, 0.000001) &&
+                approx_equal(env.min_y, 0.0, 0.000001) &&
+                approx_equal(env.max_x, 4.0, 0.000001) &&
+                approx_equal(env.max_y, 3.0, 0.000001),
+                "polygon envelope should cover all vertices"
+            )
+        },
+        None => perform Test.assert(false, "non-empty polygon should have an envelope"),
+    };
+
+    let degenerate = polygon(
+        [cartesian(0.0, 0.0), cartesian(1.0, 1.0), cartesian(2.0, 2.0)],
+        CARTESIAN
+    );
+    match polygon_centroid(degenerate) {
+        Some(_) => perform Test.assert(false, "zero-area polygon should not have a centroid"),
+        None => perform Test.assert(true, "zero-area polygon correctly has no centroid"),
+    };
+
+    perform Test.assert(
+        point_to_wkt(cartesian(2.0, 1.5)) == "POINT (2 1.5)",
+        "point WKT should use x/y coordinate order"
+    );
+    perform Test.assert(
+        line_string_to_wkt(route) == "LINESTRING (0 0, 3 4, 6 4)",
+        "line string WKT should preserve point order"
+    );
+    perform Test.assert(
+        polygon_to_wkt(rect) == "POLYGON ((0 0, 4 0, 4 3, 0 3, 0 0))",
+        "polygon WKT should close an implicit ring"
+    )
+
+    let indexed = [
+        rtree_entry(bounding_box(0.0, 0.0, 1.0, 1.0, CARTESIAN), 10),
+        rtree_entry(bounding_box(2.0, 0.0, 3.0, 1.0, CARTESIAN), 20),
+        rtree_entry(bounding_box(4.0, 0.0, 5.0, 1.0, CARTESIAN), 30),
+        rtree_entry(bounding_box(6.0, 0.0, 7.0, 1.0, CARTESIAN), 40),
+        rtree_entry(bounding_box(8.0, 0.0, 9.0, 1.0, CARTESIAN), 50)
+    ];
+    let index = rtree_bulk_load(indexed, CARTESIAN, 2);
+    perform Test.assert(index.size == 5, "R-tree should preserve entry count");
+    perform Test.assert(index.fanout == 2, "R-tree should preserve normalized fanout");
+
+    let hits = rtree_query_intersects(
+        index,
+        bounding_box(2.5, -1.0, 6.2, 2.0, CARTESIAN)
+    );
+    perform Test.assert(
+        perform Array.length(hits) == 3,
+        "R-tree query should return each intersecting entry exactly once"
+    );
+    perform Test.assert(
+        hits[0] == 20 && hits[1] == 30 && hits[2] == 40,
+        "R-tree query should preserve deterministic traversal order"
+    );
+
+    let misses = rtree_query_intersects(
+        index,
+        bounding_box(20.0, 20.0, 21.0, 21.0, CARTESIAN)
+    );
+    perform Test.assert(
+        perform Array.length(misses) == 0,
+        "R-tree should prune a disjoint query"
+    );
+
+    let empty_index = rtree_bulk_load([], CARTESIAN, 1);
+    perform Test.assert(
+        empty_index.size == 0 && empty_index.fanout == 2,
+        "empty R-tree should be valid and normalize fanout"
+    );
+    perform Test.assert(
+        perform Array.length(
+            rtree_query_intersects(
+                empty_index,
+                bounding_box(0.0, 0.0, 1.0, 1.0, CARTESIAN)
+            )
+        ) == 0,
+        "empty R-tree query should return no values"
+    )
+}

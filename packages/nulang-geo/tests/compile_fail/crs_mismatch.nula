@@ -1,0 +1,8 @@
+// Must fail to type-check: planar distance requires points in the same CRS.
+import lib
+
+fn main() {
+    let projected = cartesian(0.0, 0.0);
+    let geographic = wgs84(0.0, 0.0);
+    distance_2d(projected, geographic)
+}

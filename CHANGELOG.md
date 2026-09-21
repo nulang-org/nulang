@@ -49,6 +49,29 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### First-party geospatial package — 2026-09-20
+- **`@nulang/geo` foundations** (Experimental, `packages/nulang-geo/`).
+  Adds CRS-tagged `Point[CRS]` and `BoundingBox[CRS]` records with WGS84,
+  Web Mercator, and local Cartesian marker types; WGS84 coordinate validation
+  and longitude normalization; bounding-box containment/intersection; planar
+  Euclidean distance; canonical meter-based `Distance` values; spherical
+  WGS84 great-circle distance; CRS-tagged `LineString[CRS]` and single-ring
+  `Polygon[CRS]`; envelopes; planar line length/perimeter/area/centroid; and
+  WKT writers for points, line strings, and polygons; strict 2D RFC 7946 GeoJSON
+  readers/writers for WGS84 Point, LineString, and single-ring Polygon; plus a dependency-free
+  immutable `RTree[CRS, T]` with bulk loading, hierarchical bounding-box
+  pruning, intersection queries, leaf-level STR-style packing, point queries,
+  contained-by queries, and optional traversal statistics for tuning. The
+  implementation is
+  pure user-space Nulang,
+  preserving the Core Admission Rule rather than adding GIS-specific syntax or
+  runtime concepts.
+- **First-party package regression coverage** (Experimental, CI). The Nula
+  package job now runs `packages/nulang-geo`'s test suite and compile-fail
+  CRS fixtures so library/compiler compatibility and aggregate/index CRS safety
+  are continuously checked, including both box and point index queries and the
+  WGS84-only GeoJSON writer boundary.
+
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
   A receiver may serve an older required protocol when it preserves every

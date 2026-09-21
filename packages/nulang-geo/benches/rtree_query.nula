@@ -1,0 +1,27 @@
+import lib
+
+fn main() {
+    var entries = [];
+    var i = 0;
+    while i < 256 {
+        let col = i - (i / 16) * 16;
+        let row = i / 16;
+        let x = perform Int.to_float(col) * 2.0;
+        let y = perform Int.to_float(row) * 2.0;
+        entries = perform Array.push(
+            entries,
+            rtree_entry(
+                bounding_box(x, y, x + 1.0, y + 1.0, CARTESIAN),
+                i
+            )
+        );
+        i = i + 1
+    };
+
+    let tree = rtree_bulk_load_str(entries, CARTESIAN, 8);
+    let hits = rtree_query_intersects(
+        tree,
+        bounding_box(10.0, 10.0, 20.0, 20.0, CARTESIAN)
+    );
+    perform Array.length(hits)
+}

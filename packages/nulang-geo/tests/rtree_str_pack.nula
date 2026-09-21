@@ -1,0 +1,26 @@
+import lib
+
+fn main() {
+    let entries = [
+        rtree_entry(bounding_box(8.0, 8.0, 9.0, 9.0, CARTESIAN), 9),
+        rtree_entry(bounding_box(0.0, 0.0, 1.0, 1.0, CARTESIAN), 1),
+        rtree_entry(bounding_box(8.0, 0.0, 9.0, 1.0, CARTESIAN), 3),
+        rtree_entry(bounding_box(0.0, 8.0, 1.0, 9.0, CARTESIAN), 7),
+        rtree_entry(bounding_box(4.0, 4.0, 5.0, 5.0, CARTESIAN), 5),
+        rtree_entry(bounding_box(2.0, 2.0, 3.0, 3.0, CARTESIAN), 4),
+        rtree_entry(bounding_box(6.0, 6.0, 7.0, 7.0, CARTESIAN), 6),
+        rtree_entry(bounding_box(2.0, 8.0, 3.0, 9.0, CARTESIAN), 8),
+        rtree_entry(bounding_box(6.0, 0.0, 7.0, 1.0, CARTESIAN), 2)
+    ];
+    let tree = rtree_bulk_load_str(entries, CARTESIAN, 2);
+    perform Test.assert(tree.size == 9, "STR tree should preserve entry count");
+
+    let hits = rtree_query_intersects(
+        tree,
+        bounding_box(-1.0, -1.0, 7.2, 3.2, CARTESIAN)
+    );
+    perform Test.assert(
+        perform Array.length(hits) == 3,
+        "STR-packed tree should preserve intersection correctness"
+    )
+}
