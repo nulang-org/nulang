@@ -1,0 +1,252 @@
+// @nulang/geo — foundational geospatial types and algorithms for Nulang.
+//
+// This package deliberately keeps GIS concerns out of the language kernel.
+// It provides CRS-tagged point/bounds values, validation, planar geometry,
+// and geodesic distance on WGS84 using only portable Nulang primitives.
+//
+// Current scope is intentionally small and dependency-free. Native GEOS,
+// PROJ, GDAL, H3/S2, GeoArrow, and GeoParquet adapters belong in follow-on
+// packages/extensions once the pure-Nulang API is stable.
+
+/// Marker type for WGS84 longitude/latitude coordinates (EPSG:4326 / OGC CRS84
+/// axis convention: x=longitude, y=latitude).
+pub type Wgs84 = WGS84
+
+/// Marker type for Web Mercator coordinates (EPSG:3857, meters).
+pub type WebMercator = WEB_MERCATOR
+
+/// Marker type for arbitrary local Cartesian coordinates.
+pub type Cartesian = CARTESIAN
+
+/// A 2D point tagged with its coordinate reference system at the type level.
+///
+/// The CRS field is intentionally retained as a phantom-like runtime marker so
+/// Point[Wgs84] and Point[Cartesian] remain distinct instantiated record types.
+pub type Point[CRS] = {
+    x: Float,
+    y: Float,
+    crs: CRS
+}
+
+/// An axis-aligned bounding box tagged with its coordinate reference system.
+///
+/// For geographic coordinates this represents a simple non-antimeridian
+/// interval. Dateline-wrapping bounds will use a dedicated type in a later
+/// release rather than overloading this representation.
+pub type BoundingBox[CRS] = {
+    min_x: Float,
+    min_y: Float,
+    max_x: Float,
+    max_y: Float,
+    crs: CRS
+}
+
+/// Distance represented canonically in meters.
+pub type Distance = {
+    meters: Float
+}
+
+/// Construct a CRS-tagged point.
+pub fn point[CRS](x: Float, y: Float, crs: CRS) -> Point[CRS] {
+    { x: x, y: y, crs: crs }
+}
+
+/// Construct a WGS84 point using longitude (x), latitude (y) axis order.
+pub fn wgs84(longitude: Float, latitude: Float) -> Point[Wgs84] {
+    point(longitude, latitude, WGS84)
+}
+
+/// Construct a Web Mercator point in meters.
+pub fn web_mercator(x_meters: Float, y_meters: Float) -> Point[WebMercator] {
+    point(x_meters, y_meters, WEB_MERCATOR)
+}
+
+/// Construct a local Cartesian point.
+pub fn cartesian(x: Float, y: Float) -> Point[Cartesian] {
+    point(x, y, CARTESIAN)
+}
+
+/// Construct a normalized axis-aligned bounding box.
+///
+/// Inputs may be supplied in either order; the returned bounds always satisfy
+/// min_x <= max_x and min_y <= max_y.
+pub fn bounding_box[CRS](
+    x1: Float,
+    y1: Float,
+    x2: Float,
+    y2: Float,
+    crs: CRS
+) -> BoundingBox[CRS] {
+    let min_x = if x1 <= x2 then x1 else x2;
+    let max_x = if x1 <= x2 then x2 else x1;
+    let min_y = if y1 <= y2 then y1 else y2;
+    let max_y = if y1 <= y2 then y2 else y1;
+    {
+        min_x: min_x,
+        min_y: min_y,
+        max_x: max_x,
+        max_y: max_y,
+        crs: crs
+    }
+}
+
+/// Return true when a WGS84 point is inside legal lon/lat ranges.
+pub fn is_valid_wgs84(p: Point[Wgs84]) -> Bool {
+    p.x >= -180.0 && p.x <= 180.0 &&
+    p.y >= -90.0 && p.y <= 90.0
+}
+
+/// Normalize longitude into [-180, 180].
+pub fn normalize_longitude(longitude: Float) -> Float {
+    var value = longitude;
+    while value > 180.0 {
+        value = value - 360.0
+    };
+    while value < -180.0 {
+        value = value + 360.0
+    };
+    value
+}
+
+/// Return true when p is inside or on the edge of bounds.
+///
+/// CRS compatibility is enforced by the shared generic CRS parameter.
+pub fn contains[CRS](bounds: BoundingBox[CRS], p: Point[CRS]) -> Bool {
+    p.x >= bounds.min_x && p.x <= bounds.max_x &&
+    p.y >= bounds.min_y && p.y <= bounds.max_y
+}
+
+/// Return true when two axis-aligned bounds overlap or touch.
+///
+/// CRS compatibility is enforced by the shared generic CRS parameter.
+pub fn intersects[CRS](a: BoundingBox[CRS], b: BoundingBox[CRS]) -> Bool {
+    a.min_x <= b.max_x && a.max_x >= b.min_x &&
+    a.min_y <= b.max_y && a.max_y >= b.min_y
+}
+
+/// Expand bounds by dx/dy coordinate units in each direction.
+pub fn expand[CRS](
+    bounds: BoundingBox[CRS],
+    dx: Float,
+    dy: Float
+) -> BoundingBox[CRS] {
+    {
+        min_x: bounds.min_x - dx,
+        min_y: bounds.min_y - dy,
+        max_x: bounds.max_x + dx,
+        max_y: bounds.max_y + dy,
+        crs: bounds.crs
+    }
+}
+
+/// Return the squared Euclidean distance between points in the same CRS.
+///
+/// Prefer this for comparisons because it avoids a square root.
+pub fn distance_squared[CRS](a: Point[CRS], b: Point[CRS]) -> Float {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    dx * dx + dy * dy
+}
+
+/// Return Euclidean distance in the coordinate units of the CRS.
+pub fn distance_2d[CRS](a: Point[CRS], b: Point[CRS]) -> Float {
+    perform Float.sqrt(distance_squared(a, b))
+}
+
+/// Construct a distance from meters.
+pub fn meters(value: Float) -> Distance {
+    { meters: value }
+}
+
+/// Construct a distance from kilometers.
+pub fn kilometers(value: Float) -> Distance {
+    { meters: value * 1000.0 }
+}
+
+/// Read a distance in kilometers.
+pub fn in_kilometers(distance: Distance) -> Float {
+    distance.meters / 1000.0
+}
+
+/// Read a distance in miles.
+pub fn in_miles(distance: Distance) -> Float {
+    distance.meters / 1609.344
+}
+
+/// Convert degrees to radians.
+pub fn degrees_to_radians(degrees: Float) -> Float {
+    degrees * 0.017453292519943295
+}
+
+/// Convert radians to degrees.
+pub fn radians_to_degrees(radians: Float) -> Float {
+    radians * 57.29577951308232
+}
+
+fn pi() -> Float {
+    3.141592653589793
+}
+
+/// atan(z) for z >= 0.
+///
+/// Float.atan/atan2 are not runtime primitives yet. This implementation starts
+/// from a compact approximation on [0,1], then performs Newton refinement
+/// against tan(x). For z > 1 it uses atan(z) = pi/2 - atan(1/z).
+fn atan_nonnegative(z: Float) -> Float {
+    if z <= 0.0 then {
+        0.0
+    } else if z > 1.0 then {
+        pi() / 2.0 - atan_nonnegative(1.0 / z)
+    } else {
+        var x = z * (0.97239411 - 0.19194795 * z * z);
+        var i = 0;
+        while i < 4 {
+            let c = perform Float.cos(x);
+            x = x - (perform Float.tan(x) - z) * c * c;
+            i = i + 1
+        };
+        x
+    }
+}
+
+/// Great-circle distance between two WGS84 lon/lat points.
+///
+/// Uses the haversine formula with the IUGG mean Earth radius (6,371,008.8 m).
+/// The result is a spherical distance; applications requiring survey-grade
+/// ellipsoidal geodesics should use the future PROJ-backed extension.
+pub fn geodesic_distance(a: Point[Wgs84], b: Point[Wgs84]) -> Distance {
+    let lat1 = degrees_to_radians(a.y);
+    let lat2 = degrees_to_radians(b.y);
+    let dlat = lat2 - lat1;
+    let dlon = degrees_to_radians(b.x - a.x);
+
+    let sin_dlat = perform Float.sin(dlat / 2.0);
+    let sin_dlon = perform Float.sin(dlon / 2.0);
+
+    var h =
+        sin_dlat * sin_dlat +
+        perform Float.cos(lat1) * perform Float.cos(lat2) *
+        sin_dlon * sin_dlon;
+
+    // Clamp accumulated floating-point error before sqrt.
+    if h < 0.0 then { h = 0.0 } else {};
+    if h > 1.0 then { h = 1.0 } else {};
+
+    let y = perform Float.sqrt(h);
+    let x = perform Float.sqrt(1.0 - h);
+    let angle =
+        if x <= 0.000000000000001 then pi()
+        else 2.0 * atan_nonnegative(y / x);
+
+    meters(6371008.8 * angle)
+}
+
+/// Return true when two floats differ by no more than tolerance.
+///
+/// Useful in geospatial tests and algorithms where exact float equality is
+/// inappropriate.
+pub fn approx_equal(a: Float, b: Float, tolerance: Float) -> Bool {
+    let d = a - b;
+    let magnitude = if d < 0.0 then -d else d;
+    magnitude <= tolerance
+}
