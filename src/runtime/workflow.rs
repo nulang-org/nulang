@@ -100,7 +100,7 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
     // byte-identical copy of exactly what the local store will hold.
     rt.maybe_shadow_replicate(actor_id, &snapshot);
     let _ = rt.persistence.save_snapshot(snapshot);
-    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+    if let Some(actor) = rt.kernel.actors.get_mut(&actor_id) {
         actor.sequence = seq;
         actor.dirty_fields.clear();
     }
