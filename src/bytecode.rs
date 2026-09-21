@@ -677,6 +677,11 @@ pub struct CodeModule {
     /// owns embedded identity.
     #[serde(skip)]
     pub semantic_id: Option<crate::content_identity::SemanticId>,
+    /// Compiler-produced artifact provenance for this exact bytecode build.
+    /// Like `semantic_id`, this is an additive sidecar and is deliberately
+    /// excluded from frozen NBC v1 serialization.
+    #[serde(skip)]
+    pub artifact_identity: Option<crate::artifact_identity::ArtifactIdentityManifest>,
     pub constants: Vec<Constant>,
     pub instructions: Vec<Instruction>,
     pub behaviors: Vec<BehaviorTableEntry>,
@@ -731,6 +736,7 @@ impl CodeModule {
         CodeModule {
             name: name.into(),
             semantic_id: None,
+            artifact_identity: None,
             constants: Vec::new(),
             instructions: Vec::new(),
             behaviors: Vec::new(),
@@ -749,6 +755,14 @@ impl CodeModule {
             debug_functions: Vec::new(),
             export_table: Vec::new(),
         }
+    }
+
+    /// Strong code-generation identity attached by a typed compiler entry
+    /// point, if this module has proven provenance.
+    pub fn artifact_id(&self) -> Option<crate::content_identity::ArtifactId> {
+        self.artifact_identity
+            .as_ref()
+            .map(crate::artifact_identity::ArtifactIdentityManifest::artifact_id)
     }
 
     pub fn add_actor_meta(&mut self, meta: ActorMeta) -> usize {
