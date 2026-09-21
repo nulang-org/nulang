@@ -157,7 +157,7 @@ pub(crate) fn store_llm_completion(
     rt.llm.inflight_count = rt.llm.inflight_count.saturating_sub(1);
     match result {
         Ok(response) => {
-            if let Some(actor) = rt.actors.get_mut(&actor_id) {
+            if let Some(actor) = rt.kernel.actors.get_mut(&actor_id) {
                 actor.llm_inflight = false;
                 actor.llm_pending_prompt = None;
                 actor.llm_completed = Some(Ok(response));
