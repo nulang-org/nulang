@@ -310,6 +310,115 @@ pub enum RecoveryIdentityPolicy {
     LegacyCompatible,
 }
 
+/// Machine-readable failures encountered before durable replay begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryIdentityError {
+    SnapshotMissing {
+        actor_id: u64,
+    },
+    InvalidArtifactId {
+        actor_id: u64,
+        value: String,
+    },
+    InvalidDefinitionSemanticId {
+        actor_id: u64,
+        value: String,
+    },
+    IncompleteArtifactProvenance {
+        actor_id: u64,
+    },
+    RetentionUnsupported {
+        actor_id: u64,
+        artifact_id: crate::content_identity::ArtifactId,
+    },
+    MissingHistoricalArtifact {
+        actor_id: u64,
+        artifact_id: crate::content_identity::ArtifactId,
+    },
+    CorruptHistoricalArtifact {
+        actor_id: u64,
+        artifact_id: crate::content_identity::ArtifactId,
+        message: String,
+    },
+    HistoricalDefinitionMissing {
+        actor_id: u64,
+        artifact_id: crate::content_identity::ArtifactId,
+        definition_semantic_id: crate::content_identity::SemanticId,
+    },
+    HistoricalDefinitionMismatch {
+        actor_id: u64,
+        expected: crate::content_identity::SemanticId,
+        actual: crate::content_identity::SemanticId,
+    },
+    RecoveryFailed {
+        actor_id: u64,
+    },
+}
+
+impl std::fmt::Display for RecoveryIdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SnapshotMissing { actor_id } => {
+                write!(f, "no durable snapshot exists for actor {actor_id}")
+            }
+            Self::InvalidArtifactId { actor_id, value } => {
+                write!(f, "actor {actor_id} has invalid persisted ArtifactId {value:?}")
+            }
+            Self::InvalidDefinitionSemanticId { actor_id, value } => write!(
+                f,
+                "actor {actor_id} has invalid persisted definition SemanticId {value:?}"
+            ),
+            Self::IncompleteArtifactProvenance { actor_id } => write!(
+                f,
+                "actor {actor_id} snapshot has ArtifactId without definition SemanticId"
+            ),
+            Self::RetentionUnsupported {
+                actor_id,
+                artifact_id,
+            } => write!(
+                f,
+                "actor {actor_id} requires historical artifact {artifact_id}, but this persistence backend does not support artifact retention"
+            ),
+            Self::MissingHistoricalArtifact {
+                actor_id,
+                artifact_id,
+            } => write!(
+                f,
+                "actor {actor_id} requires missing historical artifact {artifact_id}"
+            ),
+            Self::CorruptHistoricalArtifact {
+                actor_id,
+                artifact_id,
+                message,
+            } => write!(
+                f,
+                "actor {actor_id} historical artifact {artifact_id} is invalid: {message}"
+            ),
+            Self::HistoricalDefinitionMissing {
+                actor_id,
+                artifact_id,
+                definition_semantic_id,
+            } => write!(
+                f,
+                "actor {actor_id} historical artifact {artifact_id} does not contain definition {definition_semantic_id}"
+            ),
+            Self::HistoricalDefinitionMismatch {
+                actor_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "actor {actor_id} definition identity mismatch: expected {expected}, got {actual}"
+            ),
+            Self::RecoveryFailed { actor_id } => {
+                write!(f, "actor {actor_id} failed recovery after identity validation")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RecoveryIdentityError {}
+
 pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
