@@ -189,10 +189,6 @@ fn actor_inventory(
 
     for behavior in behaviors {
         let inferred_row = effect_checker.infer_effects(&ctx, &behavior.body)?;
-        let protocol_row = behavior
-            .effect
-            .clone()
-            .unwrap_or_else(|| inferred_row.clone());
         let (effect_names, open_effects) = row_parts(&inferred_row);
         behavior_inventory.push(SemanticBehavior {
             name: behavior.name.clone(),
@@ -209,6 +205,13 @@ fn actor_inventory(
         if protocol_error.is_some() {
             continue;
         }
+        let Some(protocol_row) = behavior.effect.clone() else {
+            protocol_error = Some(format!(
+                "behavior '{}' has no explicit effect contract",
+                behavior.name
+            ));
+            continue;
+        };
         let Some(response) = behavior.ret_type.clone() else {
             protocol_error = Some(format!(
                 "behavior '{}' has no explicit return type",
@@ -428,6 +431,26 @@ mod tests {
             .as_deref()
             .is_some_and(|id| id.starts_with("blake3:")));
         assert_eq!(effects[0].effects, vec!["Net"]);
+    }
+
+    #[test]
+    fn inferred_effects_do_not_synthesize_protocol_contracts() {
+        let behaviors = vec![behavior(
+            "ping",
+            vec![("value", Type::int())],
+            Some(Type::int()),
+            None,
+        )];
+        let mut checker = EffectChecker::new();
+        let (actor, _) =
+            actor_inventory("Worker", &behaviors, &mut checker).unwrap();
+
+        assert_eq!(actor.protocol_status, "incomplete-signature");
+        assert!(actor.protocol_id.is_none());
+        assert!(actor
+            .protocol_error
+            .as_deref()
+            .is_some_and(|message| message.contains("effect contract")));
     }
 
     #[test]
