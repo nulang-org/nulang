@@ -9,6 +9,7 @@
     "package",
     "artifact",
     "compiler",
+    "host_abi",
     "interfaces",
     "actors",
     "effects",
@@ -30,6 +31,9 @@
     },
     "compiler": {
       "$ref": "#/$defs/compiler"
+    },
+    "host_abi": {
+      "$ref": "#/$defs/host_abi"
     },
     "interfaces": {
       "type": "array",
@@ -109,6 +113,34 @@
         "implementation": { "$ref": "#/$defs/name" },
         "version": { "type": "string", "minLength": 1, "maxLength": 128 },
         "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "host_abi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "required_operations",
+        "requires_legacy_extension_dispatch"
+      ],
+      "properties": {
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "required_operations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "requires_legacy_extension_dispatch": {
+          "type": "boolean"
+        }
       }
     },
     "interface": {
