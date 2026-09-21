@@ -51,6 +51,33 @@ where
     ))
 }
 
+/// Compile one typed HIR/MIR program to bytecode and attach its proven
+/// backend-independent semantic identity as an in-memory sidecar.
+///
+/// Low-level `mir_codegen::compile_mir` intentionally remains available for
+/// tests/fuzzers/backend work and produces an unproven `CodeModule` with no
+/// semantic identity. Durable/runtime entry points should use this function
+/// when typed HIR is available.
+pub fn compile_typed_bytecode<D>(
+    hir: &hir::Module,
+    mir: &mut mir::Module,
+    dependency_semantic_ids: D,
+    name: &str,
+) -> crate::types::NuResult<crate::bytecode::CodeModule>
+where
+    D: IntoIterator<Item = SemanticId>,
+{
+    let semantic_id = semantic_id_for_typed_program(hir, mir, dependency_semantic_ids).map_err(
+        |error| crate::types::NuError::VMError {
+            msg: format!("cannot derive canonical semantic identity: {error}"),
+            span: crate::types::Span::default(),
+        },
+    )?;
+    let mut module = crate::mir_codegen::compile_mir(mir, name)?;
+    module.semantic_id = Some(semantic_id);
+    Ok(module)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
