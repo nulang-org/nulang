@@ -132,6 +132,100 @@ fn check_json_passing_source_is_ok_with_empty_diagnostics() {
 }
 
 #[test]
+fn check_json_success_includes_pattern_coverage_warning() {
+    let dir = temp_dir("coverage_warning");
+    let src = write_temp(
+        &dir,
+        "warning.nula",
+        r#"
+type Choice = Yes | No
+fn choose(value: Choice) -> Int {
+    match value {
+        | Yes => 1
+    }
+}
+"#,
+    );
+
+    let (code, stdout, stderr) = run_check_json(&src);
+    assert_eq!(code, 0, "warnings are non-fatal by default: {stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must parse as JSON: {e}\n{stdout:?}"));
+    assert_eq!(v["ok"], true);
+
+    let diags = v["diagnostics"].as_array().expect("diagnostics array");
+    let warning = diags
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "W0201")
+        .expect("W0201 must be present in JSON diagnostics");
+    assert_eq!(warning["severity"], "warning");
+    assert!(
+        warning["message"]
+            .as_str()
+            .expect("warning message")
+            .contains("No")
+    );
+    assert!(
+        !stderr.contains("warning[W0201]"),
+        "JSON mode must not also emit the human warning renderer: {stderr:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_json_deny_warnings_preserves_warning_before_escalation() {
+    let dir = temp_dir("coverage_deny");
+    let src = write_temp(
+        &dir,
+        "warning.nula",
+        r#"
+type Choice = Yes | No
+fn choose(value: Choice) -> Int {
+    match value {
+        | Yes => 1
+    }
+}
+"#,
+    );
+
+    let out = Command::new(nulang_exe())
+        .args(["--json", "--deny-warnings", "--check"])
+        .arg(&src)
+        .env("NULANG_STDLIB", stdlib_dir())
+        .output()
+        .expect("run nulang --check --json --deny-warnings");
+    assert!(!out.status.success(), "strict warnings must fail the check");
+
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must parse as JSON: {e}\n{stdout:?}"));
+    assert_eq!(v["ok"], false);
+
+    let diags = v["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        diags
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "W0201"
+                && diagnostic["severity"] == "warning"),
+        "strict mode must retain the original warning: {diags:?}"
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|diagnostic| diagnostic["severity"] == "error"),
+        "strict mode must add an error diagnostic: {diags:?}"
+    );
+    assert!(
+        !stderr.contains("warning[W0201]"),
+        "JSON mode must not also emit the human warning renderer: {stderr:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn check_without_json_keeps_human_output() {
     let dir = temp_dir("human");
     let src = write_temp(&dir, "ok.nula", "fn main() = 1\n");
