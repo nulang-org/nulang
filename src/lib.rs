@@ -77,6 +77,7 @@ pub mod registry;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
+pub mod scheduler_fairness;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;
