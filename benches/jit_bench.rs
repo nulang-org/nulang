@@ -116,7 +116,6 @@ fn bench_jit_function_call_loop(c: &mut Criterion) {
     });
 }
 
-
 /// Measure where first-run JIT tiering becomes profitable against the pure
 /// interpreter for the same arithmetic loop.
 ///
@@ -147,21 +146,17 @@ fn bench_jit_tiering_profitability(c: &mut Criterion) {
             },
         );
 
-        group.bench_with_input(
-            BenchmarkId::new("interp", trips),
-            &module,
-            |b, module| {
-                b.iter_batched(
-                    || {
-                        let mut vm = VM::new_without_jit();
-                        vm.load_module(module.clone());
-                        vm
-                    },
-                    |mut vm| black_box(vm.run().unwrap()),
-                    BatchSize::SmallInput,
-                )
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("interp", trips), &module, |b, module| {
+            b.iter_batched(
+                || {
+                    let mut vm = VM::new_without_jit();
+                    vm.load_module(module.clone());
+                    vm
+                },
+                |mut vm| black_box(vm.run().unwrap()),
+                BatchSize::SmallInput,
+            )
+        });
     }
 
     group.finish();
