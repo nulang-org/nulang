@@ -2126,9 +2126,10 @@ impl Runtime {
             .behavior_table
             .iter()
             .any(|entry| !entry.name.is_empty());
-        let has_named_bytecode = actor.bytecode_module.as_ref().is_some_and(|module| {
-            module.behaviors.iter().any(|entry| !entry.name.is_empty())
-        });
+        let has_named_bytecode = actor
+            .bytecode_module
+            .as_ref()
+            .is_some_and(|module| module.behaviors.iter().any(|entry| !entry.name.is_empty()));
 
         if has_named_native || has_named_bytecode {
             None
