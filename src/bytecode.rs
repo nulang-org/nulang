@@ -670,6 +670,13 @@ pub struct ExportTableEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeModule {
     pub name: String,
+    /// Compiler-derived backend-independent semantic identity for this typed
+    /// program. This is an in-memory sidecar only: frozen NBC v1 intentionally
+    /// does not serialize it. Modules loaded from legacy/raw NBC therefore
+    /// remain explicitly unproven (`None`) until a versioned artifact format
+    /// owns embedded identity.
+    #[serde(skip)]
+    pub semantic_id: Option<crate::content_identity::SemanticId>,
     pub constants: Vec<Constant>,
     pub instructions: Vec<Instruction>,
     pub behaviors: Vec<BehaviorTableEntry>,
@@ -723,6 +730,7 @@ impl CodeModule {
     pub fn new(name: impl Into<String>) -> Self {
         CodeModule {
             name: name.into(),
+            semantic_id: None,
             constants: Vec::new(),
             instructions: Vec::new(),
             behaviors: Vec::new(),
