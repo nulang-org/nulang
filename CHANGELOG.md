@@ -1557,6 +1557,9 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Single-pass LSP diagnostics parsing — 2026-09-21
+- **LSP diagnostics reuse their parsed AST.** Document open and debounced changes now populate `DocumentState.ast` from the frontend pass that already produced diagnostics, removing a guaranteed second lex+parse of the same source while preserving diagnostics and editor semantics.
+
 ### Standard-library Option lookup contracts — 2026-09-21
 - **Collection absence is explicit.** Experimental `stdlib::map.get`, `stdlib::list.index_of`, and `stdlib::list.find` now return `Option` instead of sentinel `-1` values. `max_of`, `min_of`, `min_by`, and `max_by` now return `None` for empty inputs. Conformance fixtures and stdlib tests pin the new contracts. This is source-breaking for Experimental stdlib callers that compared missing results with integer sentinels.
 
