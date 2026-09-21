@@ -67,12 +67,13 @@ pub fn compile_typed_bytecode<D>(
 where
     D: IntoIterator<Item = SemanticId>,
 {
-    let semantic_id = semantic_id_for_typed_program(hir, mir, dependency_semantic_ids).map_err(
-        |error| crate::types::NuError::VMError {
-            msg: format!("cannot derive canonical semantic identity: {error}"),
-            span: crate::types::Span::default(),
-        },
-    )?;
+    let semantic_id =
+        semantic_id_for_typed_program(hir, mir, dependency_semantic_ids).map_err(|error| {
+            crate::types::NuError::VMError {
+                msg: format!("cannot derive canonical semantic identity: {error}"),
+                span: crate::types::Span::default(),
+            }
+        })?;
     let mut module = crate::mir_codegen::compile_mir(mir, name)?;
     module.semantic_id = Some(semantic_id);
     Ok(module)
