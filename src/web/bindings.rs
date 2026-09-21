@@ -85,6 +85,7 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
 
         let codec = if request.source == RouteBindingSource::Body {
             body_codec_for_type(ty.as_deref())
+                .map(|codec| codec.with_schema(handler_param.body_schema.clone()))
         } else {
             None
         };
