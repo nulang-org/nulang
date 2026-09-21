@@ -5163,6 +5163,174 @@ impl Runtime {
             .unwrap_or(false)
     }
 
+    fn prepare_recovery_artifact_for_snapshot(
+        &mut self,
+        actor_id: u64,
+        snapshot: &ActorSnapshot,
+    ) -> Result<(), RecoveryIdentityError> {
+        let Some(raw_artifact_id) = snapshot.artifact_id.as_deref() else {
+            return Ok(());
+        };
+        let artifact_id = raw_artifact_id
+            .parse::<crate::content_identity::ArtifactId>()
+            .map_err(|_| RecoveryIdentityError::InvalidArtifactId {
+                actor_id,
+                value: raw_artifact_id.to_string(),
+            })?;
+        let raw_definition_semantic_id = snapshot
+            .semantic_id
+            .as_deref()
+            .ok_or(RecoveryIdentityError::IncompleteArtifactProvenance { actor_id })?;
+        let expected_definition_semantic_id = raw_definition_semantic_id
+            .parse::<crate::content_identity::SemanticId>()
+            .map_err(|_| RecoveryIdentityError::InvalidDefinitionSemanticId {
+                actor_id,
+                value: raw_definition_semantic_id.to_string(),
+            })?;
+
+        if let Some((module, _, _)) = self.recovery_modules.get(&actor_id) {
+            if module.artifact_id() == Some(artifact_id) {
+                match self.recovery_definition_semantic_ids.get(&actor_id).copied() {
+                    Some(actual) if actual == expected_definition_semantic_id => return Ok(()),
+                    Some(actual) => {
+                        return Err(RecoveryIdentityError::HistoricalDefinitionMismatch {
+                            actor_id,
+                            expected: expected_definition_semantic_id,
+                            actual,
+                        })
+                    }
+                    None => {
+                        return Err(RecoveryIdentityError::CorruptHistoricalArtifact {
+                            actor_id,
+                            artifact_id,
+                            message: "exact recovery artifact has no definition semantic identity"
+                                .to_string(),
+                        })
+                    }
+                }
+            }
+        }
+
+        let retained = match self.persistence.load_artifact(artifact_id) {
+            Ok(Some(artifact)) => artifact,
+            Ok(None) => {
+                return Err(RecoveryIdentityError::MissingHistoricalArtifact {
+                    actor_id,
+                    artifact_id,
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                return Err(RecoveryIdentityError::RetentionUnsupported {
+                    actor_id,
+                    artifact_id,
+                })
+            }
+            Err(error) => {
+                return Err(RecoveryIdentityError::CorruptHistoricalArtifact {
+                    actor_id,
+                    artifact_id,
+                    message: error.to_string(),
+                })
+            }
+        };
+
+        let module = retained.restore_module(artifact_id).map_err(|error| {
+            RecoveryIdentityError::CorruptHistoricalArtifact {
+                actor_id,
+                artifact_id,
+                message: error.to_string(),
+            }
+        })?;
+
+        let mut matching_definitions = module
+            .actor_semantic_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| (*id == expected_definition_semantic_id).then_some(index));
+        let Some(definition_index) = matching_definitions.next() else {
+            return Err(RecoveryIdentityError::HistoricalDefinitionMissing {
+                actor_id,
+                artifact_id,
+                definition_semantic_id: expected_definition_semantic_id,
+            });
+        };
+        if matching_definitions.next().is_some() {
+            return Err(RecoveryIdentityError::CorruptHistoricalArtifact {
+                actor_id,
+                artifact_id,
+                message: format!(
+                    "definition semantic identity {} appears more than once",
+                    expected_definition_semantic_id
+                ),
+            });
+        }
+        let meta = module.actor_metadata.get(definition_index).ok_or_else(|| {
+            RecoveryIdentityError::CorruptHistoricalArtifact {
+                actor_id,
+                artifact_id,
+                message: format!(
+                    "definition identity index {} has no actor metadata",
+                    definition_index
+                ),
+            }
+        })?;
+
+        let offsets = if meta.is_workflow {
+            meta.behavior_indices
+                .iter()
+                .map(|&index| module.behaviors[index].code_offset)
+                .collect()
+        } else {
+            crate::runtime::spawn::bytecode_offsets_for(&module, false)
+        };
+        let compensation_offsets = if meta.is_workflow {
+            meta.behavior_indices
+                .iter()
+                .map(|&index| {
+                    module.behaviors[index]
+                        .compensate_offset
+                        .map(|offset| offset as usize)
+                })
+                .collect()
+        } else {
+            module
+                .behaviors
+                .iter()
+                .map(|behavior| behavior.compensate_offset.map(|offset| offset as usize))
+                .collect()
+        };
+
+        self.recovery_modules
+            .insert(actor_id, (module, offsets, compensation_offsets));
+        self.recovery_definition_semantic_ids
+            .insert(actor_id, expected_definition_semantic_id);
+        Ok(())
+    }
+
+    /// Verify and, when necessary, load the exact historical artifact pinned
+    /// by a durable snapshot before any replay or state mutation occurs.
+    pub fn prepare_recovery_artifact(
+        &mut self,
+        actor_id: u64,
+    ) -> Result<(), RecoveryIdentityError> {
+        let snapshot = self
+            .persistence
+            .load_snapshot(actor_id)
+            .ok_or(RecoveryIdentityError::SnapshotMissing { actor_id })?;
+        self.prepare_recovery_artifact_for_snapshot(actor_id, &snapshot)
+    }
+
+    /// Checked durable recovery preserving the exact strong-identity failure.
+    pub fn recover_actor_checked(
+        &mut self,
+        actor_id: u64,
+        identity_policy: RecoveryIdentityPolicy,
+    ) -> Result<u64, RecoveryIdentityError> {
+        self.prepare_recovery_artifact(actor_id)?;
+        self.recover_actor_with_identity_policy(actor_id, identity_policy)
+            .ok_or(RecoveryIdentityError::RecoveryFailed { actor_id })
+    }
+
     /// Verify the definition-scoped semantic provenance of one snapshot.
     ///
     /// Identified histories always require an exact definition identity match.
@@ -5222,6 +5390,11 @@ impl Runtime {
         identity_policy: RecoveryIdentityPolicy,
     ) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+
+        if let Err(error) = self.prepare_recovery_artifact_for_snapshot(actor_id, &snapshot) {
+            warn!("nulang-recover: refusing {error}");
+            return None;
+        }
 
         let recovery_definition_semantic_id = self
             .recovery_definition_semantic_ids
