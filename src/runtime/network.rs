@@ -1577,7 +1577,7 @@ impl Packet {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(payload.get(..32)?);
         Some(Packet::FetchArtifactRequest {
-            artifact_id: crate::content_identity::ArtifactId::from_bytes(bytes),
+            artifact_id: crate::content_identity::ArtifactId::from_digest_bytes(bytes),
         })
     }
 
@@ -1587,7 +1587,7 @@ impl Packet {
         }
         let mut id_bytes = [0u8; 32];
         id_bytes.copy_from_slice(payload.get(..32)?);
-        let artifact_id = crate::content_identity::ArtifactId::from_bytes(id_bytes);
+        let artifact_id = crate::content_identity::ArtifactId::from_digest_bytes(id_bytes);
         match *payload.get(32)? {
             0 => Some(Packet::FetchArtifactResponse {
                 artifact_id,
