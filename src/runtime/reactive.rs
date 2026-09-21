@@ -11,7 +11,7 @@
 //! which makes an outer query depend on fields read by nested queries.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Runtime-local identity of one actor-state field value.
 ///
@@ -141,6 +141,154 @@ impl StateReadSet {
         version: ActorTurnVersion,
     ) {
         self.pointer_actor_turns.entry(actor_id).or_insert(version);
+    }
+}
+
+/// Stable process-local identifier for a reactive workflow-query subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubscriptionId(pub u64);
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReactiveSubscription {
+    pub actor_id: u64,
+    pub query_name: String,
+    pub reads: StateReadSet,
+}
+
+/// In-process subscription registry with reverse dependency indexes.
+///
+/// Values are deliberately not retained here: VM values may contain actor-heap
+/// pointers. A subscriber receives the initial value directly and refreshes
+/// after an invalidation, keeping ownership at the query call boundary.
+#[derive(Debug, Default)]
+pub(crate) struct ReactiveSubscriptionRegistry {
+    next_id: u64,
+    subscriptions: BTreeMap<SubscriptionId, ReactiveSubscription>,
+    field_index: BTreeMap<(u64, String), BTreeSet<SubscriptionId>>,
+    pointer_turn_index: BTreeMap<u64, BTreeSet<SubscriptionId>>,
+}
+
+impl ReactiveSubscriptionRegistry {
+    pub(crate) fn register(
+        &mut self,
+        actor_id: u64,
+        query_name: String,
+        reads: StateReadSet,
+    ) -> SubscriptionId {
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
+        let id = SubscriptionId(self.next_id);
+        self.index(id, &reads);
+        self.subscriptions.insert(
+            id,
+            ReactiveSubscription {
+                actor_id,
+                query_name,
+                reads,
+            },
+        );
+        id
+    }
+
+    pub(crate) fn remove(&mut self, id: SubscriptionId) -> bool {
+        let Some(subscription) = self.subscriptions.remove(&id) else {
+            return false;
+        };
+        self.unindex(id, &subscription.reads);
+        true
+    }
+
+    pub(crate) fn get(&self, id: SubscriptionId) -> Option<&ReactiveSubscription> {
+        self.subscriptions.get(&id)
+    }
+
+    pub(crate) fn replace_reads(
+        &mut self,
+        id: SubscriptionId,
+        reads: StateReadSet,
+    ) -> bool {
+        let Some(old_reads) = self
+            .subscriptions
+            .get(&id)
+            .map(|subscription| subscription.reads.clone())
+        else {
+            return false;
+        };
+        self.unindex(id, &old_reads);
+        self.index(id, &reads);
+        if let Some(subscription) = self.subscriptions.get_mut(&id) {
+            subscription.reads = reads;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn candidates(
+        &self,
+        actor_id: u64,
+        dirty_fields: impl IntoIterator<Item = String>,
+        turn_changed: bool,
+    ) -> BTreeSet<SubscriptionId> {
+        let mut candidates = BTreeSet::new();
+        for field in dirty_fields {
+            if let Some(ids) = self.field_index.get(&(actor_id, field)) {
+                candidates.extend(ids.iter().copied());
+            }
+        }
+        if turn_changed {
+            if let Some(ids) = self.pointer_turn_index.get(&actor_id) {
+                candidates.extend(ids.iter().copied());
+            }
+        }
+        candidates
+    }
+
+    fn index(&mut self, id: SubscriptionId, reads: &StateReadSet) {
+        for (actor_id, field, _) in reads.iter() {
+            self.field_index
+                .entry((actor_id, field.to_string()))
+                .or_default()
+                .insert(id);
+        }
+        for (actor_id, _) in reads.pointer_turn_iter() {
+            self.pointer_turn_index
+                .entry(actor_id)
+                .or_default()
+                .insert(id);
+        }
+    }
+
+    fn unindex(&mut self, id: SubscriptionId, reads: &StateReadSet) {
+        for (actor_id, field, _) in reads.iter() {
+            let key = (actor_id, field.to_string());
+            let empty = self
+                .field_index
+                .get_mut(&key)
+                .map(|ids| {
+                    ids.remove(&id);
+                    ids.is_empty()
+                })
+                .unwrap_or(false);
+            if empty {
+                self.field_index.remove(&key);
+            }
+        }
+        for (actor_id, _) in reads.pointer_turn_iter() {
+            let empty = self
+                .pointer_turn_index
+                .get_mut(&actor_id)
+                .map(|ids| {
+                    ids.remove(&id);
+                    ids.is_empty()
+                })
+                .unwrap_or(false);
+            if empty {
+                self.pointer_turn_index.remove(&actor_id);
+            }
+        }
     }
 }
 
@@ -353,6 +501,84 @@ mod tests {
                 })
             },
         ));
+    }
+
+    #[test]
+    fn pointer_state_reads_depend_on_actor_turn_revision() {
+        use crate::runtime::{Actor, Runtime};
+        use crate::vm::Value;
+
+        let mut rt = Runtime::new();
+        let mut actor = Actor::new(55, "pointer-query-target", 8);
+        let pointer = actor.allocate_string("hello");
+        assert!(pointer.as_ptr().is_some());
+        actor.set_state_field("payload", pointer);
+        rt.actors.insert(55, actor);
+
+        rt.begin_reactive_query_tracking();
+        rt.record_reactive_state_read(55, "payload");
+        let reads = rt.finish_reactive_query_tracking().unwrap();
+
+        assert!(reads.pointer_turn_version(55).is_some());
+        assert!(rt.state_read_set_is_current(&reads));
+
+        rt.actors.get_mut(&55).unwrap().begin_reactive_turn();
+        assert!(
+            !rt.state_read_set_is_current(&reads),
+            "a later actor turn must conservatively invalidate pointer-backed reads"
+        );
+    }
+
+    #[test]
+    fn subscription_registry_indexes_exact_fields_and_pointer_turns() {
+        let mut registry = ReactiveSubscriptionRegistry::default();
+
+        let mut scalar_reads = StateReadSet::default();
+        scalar_reads.record(
+            1,
+            "name",
+            StateVersion {
+                incarnation: 1,
+                revision: 2,
+            },
+        );
+        let scalar = registry.register(1, "scalar".into(), scalar_reads);
+
+        let mut pointer_reads = StateReadSet::default();
+        pointer_reads.record(
+            2,
+            "payload",
+            StateVersion {
+                incarnation: 2,
+                revision: 1,
+            },
+        );
+        pointer_reads.record_pointer_turn(
+            2,
+            ActorTurnVersion {
+                incarnation: 2,
+                turn_revision: 9,
+            },
+        );
+        let pointer = registry.register(2, "pointer".into(), pointer_reads);
+
+        assert_eq!(
+            registry.candidates(1, ["other".to_string()], false),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            registry.candidates(1, ["name".to_string()], false),
+            BTreeSet::from([scalar])
+        );
+        assert_eq!(
+            registry.candidates(2, std::iter::empty::<String>(), true),
+            BTreeSet::from([pointer])
+        );
+
+        assert!(registry.remove(scalar));
+        assert!(registry
+            .candidates(1, ["name".to_string()], false)
+            .is_empty());
     }
 
     #[test]
