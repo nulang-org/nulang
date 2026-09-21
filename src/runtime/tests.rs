@@ -7285,7 +7285,6 @@ fn p0_cross_shard_named_send_resolves_only_on_owner() {
     );
 }
 
-
 #[test]
 fn identified_migration_preserves_exact_provenance_and_selected_definition() {
     use crate::artifact_identity::ArtifactIdentityManifest;
@@ -7456,10 +7455,6 @@ fn identified_migration_rejects_missing_provenance_without_downgrade() {
     .unwrap();
 
     let mut runtime = Runtime::new();
-    assert!(!runtime.receive_migrated_actor(
-        actor_id,
-        nbc_bytes,
-        snapshot_json,
-    ));
+    assert!(!runtime.receive_migrated_actor(actor_id, nbc_bytes, snapshot_json,));
     assert!(!runtime.actors.contains_key(&actor_id));
 }
