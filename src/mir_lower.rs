@@ -2878,6 +2878,56 @@ mod tests {
         assert_eq!(mir_module.name, "test");
     }
 
+    #[test]
+    fn test_entity_migration_manifest_reaches_actor_metadata() {
+        let module = lower_source(
+            r#"
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                migration from 1 to 2 {
+                    state => { self.balance = self.balance + 1 }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let meta = module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Account")
+            .expect("Account actor metadata");
+        let manifest =
+            crate::migration_manifest::MigrationManifest::from_json(&meta.migrations).unwrap();
+        assert_eq!(manifest.target_version, 2);
+        assert_eq!(manifest.contracts.len(), 1);
+        assert_eq!(manifest.contracts[0].from_version, 1);
+        assert_eq!(manifest.contracts[0].to_version, 2);
+        assert!(manifest.contracts[0].has_state_transform);
+    }
+
+    #[test]
+    fn test_entity_migration_gap_fails_before_artifact_lowering() {
+        let error = lower_source(
+            r#"
+            entity Account {
+                version: 3
+                state balance: Int = 0
+                migration from 2 to 3 {
+                    state => { self.balance = self.balance + 1 }
+                }
+            }
+            "#,
+        )
+        .expect_err("incomplete migration chain must fail lowering");
+
+        assert!(
+            error.to_string().contains("missing migration transition 1 -> 2"),
+            "unexpected error: {error}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Peephole: temp/Load fusion (keeps codegen's drop planning effective)
     // -----------------------------------------------------------------------
