@@ -668,6 +668,45 @@ mod authority_tests {
     }
 
     #[test]
+    fn legacy_restart_does_not_adopt_current_code_provenance() {
+        let mut rt = Runtime::new();
+        let actor_id = 910_003;
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let semantic_id =
+            crate::content_identity::SemanticId::from_canonical_bytes(b"current-definition", []);
+        let artifact_id = crate::content_identity::ArtifactId::from_semantic(
+            semantic_id,
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=0"],
+        );
+
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            Some(semantic_id),
+            Some(artifact_id),
+        );
+
+        assert_eq!(returned, actor_id);
+        let actor = rt.actors.get(&actor_id).expect("persistent actor published");
+        assert_eq!(actor.definition_semantic_id, None);
+        assert_eq!(actor.execution_artifact_id, None);
+    }
+
+    #[test]
     fn malformed_legacy_restart_authority_fails_before_init_or_publish() {
         use std::cell::Cell;
         use std::rc::Rc;
