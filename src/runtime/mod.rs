@@ -2501,7 +2501,7 @@ impl Runtime {
         // Grain hydration: a resident grain actor that is hibernated should be
         // woken before the new message is delivered.
         if self.actor_grain_id.contains_key(&target_id) {
-            if let Some(actor) = self.actors.get_mut(&target_id) {
+            if let Some(actor) = self.kernel.actors.get_mut(&target_id) {
                 if actor.is_hibernated() {
                     if let Some(vm) = self.vm.as_mut() {
                         if let Err(e) = actor.wake_from_hibernation(vm) {
@@ -2579,10 +2579,10 @@ impl Runtime {
             priority: MessagePriority::Normal,
             trace_id: out_trace.clone(),
         };
-        let admission = if let Some(actor) = self.actors.get_mut(&target_id) {
+        let admission = if let Some(actor) = self.kernel.actors.get_mut(&target_id) {
             actor
                 .flight_recorder
-                .record(self.current_actor.unwrap_or(0), behavior_id, args);
+                .record(self.kernel.current_actor.unwrap_or(0), behavior_id, args);
             if actor.mailbox.push_local(msg).is_ok() {
                 // Activity resets the dehydration idle timer.
                 actor.idle_ms = 0;
@@ -3285,7 +3285,7 @@ impl Runtime {
                 self.vm = Some(crate::vm::VM::new());
             }
             let vm = self.vm.as_mut().unwrap();
-            let hibernated = if let Some(actor) = self.actors.get_mut(&actor_id) {
+            let hibernated = if let Some(actor) = self.kernel.actors.get_mut(&actor_id) {
                 match actor.hibernate(vm, &module_hash) {
                     Ok(_) => true,
                     Err(ref e) if e == "No active frame" => {
@@ -5154,7 +5154,7 @@ impl Runtime {
         // not covered by the snapshot get fresh replicas while recovered fields
         // reuse their restored CrdtIds.
         if let Some(ref mut mgr) = self.crdt_manager {
-            if let Some(actor) = self.actors.get(&actor_id) {
+            if let Some(actor) = self.kernel.actors.get(&actor_id) {
                 mgr.register_actor_fields(actor_id, actor);
             }
         }
@@ -5581,7 +5581,7 @@ impl Runtime {
         }
         self.actors.insert(actor_id, actor);
         if let Some(ref mut mgr) = self.crdt_manager {
-            if let Some(actor) = self.actors.get(&actor_id) {
+            if let Some(actor) = self.kernel.actors.get(&actor_id) {
                 mgr.register_actor_fields(actor_id, actor);
             }
         }
