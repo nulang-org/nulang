@@ -677,7 +677,11 @@ impl Runtime {
     /// VM callbacks call this immediately before returning a state value.
     /// Reads outside a tracked query are effectively free apart from the
     /// empty-scope check inside the tracker.
+    #[inline]
     pub(crate) fn record_reactive_state_read(&self, actor_id: u64, field: &str) {
+        if !self.reactive_reads.is_active() {
+            return;
+        }
         if let Some(actor) = self.actors.get(&actor_id) {
             self.reactive_reads.record(
                 actor_id,
