@@ -84,7 +84,7 @@ pub fn compile_wasm_behavior(input: BehaviorBuildInput<'_>) -> NuResult<Behavior
     let mut wasm_backend = crate::backends::DefaultWasmBackend;
     let wasm_bytes = wasm_backend.compile(&mir, input.package_name)?;
 
-    let manifest = BehaviorManifest::from_checked_module(
+    let manifest = BehaviorManifest::from_checked_module_with_hir(
         ManifestBuildInput {
             package_name: input.package_name,
             package_version: input.package_version,
@@ -100,6 +100,7 @@ pub fn compile_wasm_behavior(input: BehaviorBuildInput<'_>) -> NuResult<Behavior
         },
         &mut effect_checker,
         &ast.decls,
+        &hir,
     )?;
 
     Ok(BehaviorBuildOutput {

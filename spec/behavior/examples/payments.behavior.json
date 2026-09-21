@@ -33,7 +33,7 @@
       "name": "PaymentProcessor",
       "protocol": "payment.v1",
       "durability": "durable",
-      "state_schema": "payment-state/v7"
+      "state_schema": "blake3:5555555555555555555555555555555555555555555555555555555555555555"
     }
   ],
   "effects": [
@@ -70,7 +70,7 @@
     {
       "owner": "PaymentProcessor",
       "persistence": "durable",
-      "schema": "payment-state/v7",
+      "schema": "blake3:5555555555555555555555555555555555555555555555555555555555555555",
       "migration_contract": "blake3:2222222222222222222222222222222222222222222222222222222222222222"
     }
   ],
@@ -96,6 +96,8 @@
     "source_digest": "blake3:3333333333333333333333333333333333333333333333333333333333333333",
     "dependency_digest": "blake3:4444444444444444444444444444444444444444444444444444444444444444",
     "interface_digests": [],
-    "state_schema_digests": []
+    "state_schema_digests": [
+      "blake3:5555555555555555555555555555555555555555555555555555555555555555"
+    ]
   }
 }

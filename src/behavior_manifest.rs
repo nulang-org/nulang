@@ -9,9 +9,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ast::{Decl, Expr, WorkflowItem};
+use crate::ast::{Decl, Expr, StateModel, WorkflowItem};
 use crate::effect_checker::{flatten_decls, EffectChecker, EffectContext};
-use crate::types::{Effect, NuResult};
+use crate::types::{
+    canonical_type_bytes, Effect, EffectRow, NuError, NuResult, Type, RECORD_ROW_TAIL_FIELD,
+};
 
 pub const BEHAVIOR_MANIFEST_SCHEMA: &str = "nulang.behavior/v0alpha1";
 
@@ -151,6 +153,14 @@ pub struct DurabilityDecl {
     pub migration_contract: Option<String>,
 }
 
+/// Compiler-derived durable-state inventory attached to a checked manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DurabilityInventory {
+    pub actors: Vec<ActorDecl>,
+    pub durability: Vec<DurabilityDecl>,
+    pub state_schema_digests: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayDecl {
     pub effect: String,
@@ -286,6 +296,25 @@ pub struct ManifestBuildInput<'a> {
 }
 
 impl BehaviorManifest {
+    /// Build v0alpha1 from the same checked HIR that produced the executable.
+    ///
+    /// This is the canonical integrated build path. Actor durability and state
+    /// schema identities are derived from typed HIR rather than re-parsing
+    /// source text or inspecting backend-specific artifact bytes.
+    pub fn from_checked_module_with_hir(
+        input: ManifestBuildInput<'_>,
+        effect_checker: &mut EffectChecker,
+        decls: &[Decl],
+        hir: &crate::hir::Module,
+    ) -> NuResult<Self> {
+        let mut manifest = Self::from_checked_module(input, effect_checker, decls)?;
+        let inventory = durability_inventory_from_hir(hir)?;
+        manifest.actors = inventory.actors;
+        manifest.durability = inventory.durability;
+        manifest.provenance.state_schema_digests = inventory.state_schema_digests;
+        Ok(manifest)
+    }
+
     /// Build v0alpha1 from checked compiler semantics.
     ///
     /// `effect_checker.check_module(...)` must have succeeded before this is
@@ -416,6 +445,214 @@ impl BehaviorManifest {
 
 pub fn digest(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+const STATE_SCHEMA_DOMAIN: &[u8] = b"nulang.state-schema/v0alpha1\0";
+
+/// Derive deployment-visible actor durability and stable state schema identity
+/// from checked HIR.
+///
+/// The digest describes recovery-relevant schema, not implementation bytes:
+/// actor schema version, every non-local state field (name, persistence model,
+/// canonical compiler type), and typed durable event payload declarations.
+/// Local-only state is deliberately excluded because it is discarded on
+/// recovery. Migration contracts remain absent until RFC 0008 has an actual
+/// runtime trigger and versioned persistence semantics.
+pub fn durability_inventory_from_hir(module: &crate::hir::Module) -> NuResult<DurabilityInventory> {
+    let mut actors = Vec::new();
+    let mut durability = Vec::new();
+    let mut state_schema_digests = std::collections::BTreeSet::new();
+
+    collect_hir_durability(
+        &module.decls,
+        &mut actors,
+        &mut durability,
+        &mut state_schema_digests,
+    )?;
+
+    actors.sort_by(|a, b| a.name.cmp(&b.name));
+    durability.sort_by(|a, b| a.owner.cmp(&b.owner));
+
+    Ok(DurabilityInventory {
+        actors,
+        durability,
+        state_schema_digests: state_schema_digests.into_iter().collect(),
+    })
+}
+
+fn collect_hir_durability(
+    decls: &[crate::hir::Decl],
+    actors: &mut Vec<ActorDecl>,
+    durability: &mut Vec<DurabilityDecl>,
+    state_schema_digests: &mut std::collections::BTreeSet<String>,
+) -> NuResult<()> {
+    for decl in decls {
+        match decl {
+            crate::hir::Decl::Actor(actor) => {
+                let has_persistent_state = actor
+                    .state_fields
+                    .iter()
+                    .any(|(_, model, _, _)| !matches!(model, StateModel::Local));
+                // Explicit non-local state is a deployment durability
+                // requirement even when the source omitted the persistent
+                // modifier. This is conservative for the mixed legacy surface
+                // where state models and the actor persistence flag remain
+                // represented separately.
+                let is_durable =
+                    actor.persistent || has_persistent_state || !actor.events.is_empty();
+                let persistence = if is_durable {
+                    PersistenceClass::Durable
+                } else {
+                    PersistenceClass::Transient
+                };
+                let state_schema = if is_durable {
+                    let schema = durable_state_schema_digest(actor)?;
+                    state_schema_digests.insert(schema.clone());
+                    Some(schema)
+                } else {
+                    None
+                };
+
+                actors.push(ActorDecl {
+                    name: actor.name.clone(),
+                    durability: persistence,
+                    protocol: None,
+                    state_schema: state_schema.clone(),
+                });
+                durability.push(DurabilityDecl {
+                    owner: actor.name.clone(),
+                    persistence,
+                    schema: state_schema,
+                    // RFC 0008 syntax exists, but runtime migration triggering
+                    // remains inert. Emitting a migration contract digest here
+                    // would falsely advertise an enforcement guarantee.
+                    migration_contract: None,
+                });
+            }
+            crate::hir::Decl::Module { decls, .. } => {
+                collect_hir_durability(decls, actors, durability, state_schema_digests)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn durable_state_schema_digest(actor: &crate::hir::ActorDef) -> NuResult<String> {
+    let mut bytes = STATE_SCHEMA_DOMAIN.to_vec();
+    bytes.extend_from_slice(&actor.version.to_le_bytes());
+
+    let mut fields: Vec<_> = actor
+        .state_fields
+        .iter()
+        .filter(|(_, model, _, _)| !matches!(model, StateModel::Local))
+        .collect();
+    fields.sort_by(|a, b| a.0.cmp(&b.0));
+    bytes.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+
+    for (name, model, ty, _) in fields {
+        put_schema_str(&mut bytes, name);
+        put_state_model(&mut bytes, *model);
+        let runtime_ty = ty.erase_actor_protocols();
+        ensure_closed_schema_type(
+            &runtime_ty,
+            &format!("state field '{}' on actor '{}'", name, actor.name),
+            actor.span,
+        )?;
+        put_schema_bytes(&mut bytes, &canonical_type_bytes(&runtime_ty));
+    }
+
+    let mut events: Vec<_> = actor.events.iter().collect();
+    events.sort_by(|a, b| a.name.cmp(&b.name));
+    bytes.extend_from_slice(&(events.len() as u32).to_le_bytes());
+    for event in events {
+        put_schema_str(&mut bytes, &event.name);
+        bytes.extend_from_slice(&(event.params.len() as u32).to_le_bytes());
+        for (param_name, param_ty) in &event.params {
+            put_schema_str(&mut bytes, param_name);
+            let runtime_ty = param_ty.erase_actor_protocols();
+            ensure_closed_schema_type(
+                &runtime_ty,
+                &format!(
+                    "event '{}.{}' parameter '{}'",
+                    actor.name, event.name, param_name
+                ),
+                event.span,
+            )?;
+            put_schema_bytes(&mut bytes, &canonical_type_bytes(&runtime_ty));
+        }
+    }
+
+    Ok(digest(&bytes))
+}
+
+fn put_state_model(out: &mut Vec<u8>, model: StateModel) {
+    match model {
+        StateModel::Local => out.push(0),
+        StateModel::Durable => out.push(1),
+        StateModel::EventSourced => out.push(2),
+        StateModel::Crdt(kind) => {
+            out.push(3);
+            out.push(kind.to_u8());
+        }
+    }
+}
+
+fn put_schema_str(out: &mut Vec<u8>, value: &str) {
+    put_schema_bytes(out, value.as_bytes());
+}
+
+fn put_schema_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    out.extend_from_slice(value);
+}
+
+/// Canonical type bytes include compiler variable/skolem IDs, so deployment
+/// identities reject unresolved/open types instead of hashing process-local
+/// identifiers.
+fn ensure_closed_schema_type(ty: &Type, surface: &str, span: crate::types::Span) -> NuResult<()> {
+    if schema_type_is_closed(ty) {
+        Ok(())
+    } else {
+        Err(NuError::type_error(
+            format!(
+                "cannot emit deterministic durable state schema for {surface}: type {ty} is unresolved or open"
+            ),
+            span,
+        ))
+    }
+}
+
+fn schema_type_is_closed(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) | Type::Skolem(_) | Type::Scheme { .. } => false,
+        Type::Primitive(_) => true,
+        Type::Tuple(items) => items.iter().all(schema_type_is_closed),
+        Type::Record(fields) => fields
+            .iter()
+            .all(|(name, ty)| name != RECORD_ROW_TAIL_FIELD && schema_type_is_closed(ty)),
+        Type::Variant(cases) => cases.iter().all(|(_, payload)| {
+            payload
+                .as_ref()
+                .map_or(true, |payload| schema_type_is_closed(payload))
+        }),
+        Type::Array(item) => schema_type_is_closed(item),
+        Type::Function {
+            param, ret, effect, ..
+        } => {
+            schema_type_is_closed(param)
+                && schema_type_is_closed(ret)
+                && matches!(effect, EffectRow::Closed(_))
+        }
+        Type::Actor { state, behavior } => {
+            schema_type_is_closed(state) && schema_type_is_closed(behavior)
+        }
+        Type::App { constructor, args } => {
+            schema_type_is_closed(constructor) && args.iter().all(schema_type_is_closed)
+        }
+        Type::Reference { inner, .. } => schema_type_is_closed(inner),
+        Type::Nominal { underlying, .. } => schema_type_is_closed(underlying),
+    }
 }
 
 /// Collect every effect that can be reached through an executable declaration
@@ -728,6 +965,185 @@ mod tests {
         let mut checker = EffectChecker::new();
         checker.check_module(&ast.decls).expect("effect check");
         (ast, checker)
+    }
+
+    fn checked_hir(source: &str) -> crate::hir::Module {
+        let tokens = Lexer::new(source).lex().expect("lex");
+        let ast = Parser::new(tokens).parse_module().expect("parse");
+        let mut checker = crate::typechecker::TypeChecker::new();
+        checker.check_module(&ast).expect("typecheck");
+        crate::hir_lower::lower_module(&ast, &checker.inferred_decl_types)
+    }
+
+    fn actor_schema(inventory: &DurabilityInventory, name: &str) -> Option<String> {
+        inventory
+            .actors
+            .iter()
+            .find(|actor| actor.name == name)
+            .and_then(|actor| actor.state_schema.clone())
+    }
+
+    #[test]
+    fn durability_inventory_marks_transient_and_durable_actors() {
+        let hir = checked_hir(
+            r#"
+            actor Ephemeral {
+                state local scratch: Int = 0
+                behavior get() { self.scratch }
+            }
+
+            persistent actor Counter {
+                state durable count: Int = 0
+                behavior get() { self.count }
+            }
+            "#,
+        );
+        let inventory = durability_inventory_from_hir(&hir).expect("inventory");
+
+        let ephemeral = inventory
+            .actors
+            .iter()
+            .find(|actor| actor.name == "Ephemeral")
+            .unwrap();
+        assert_eq!(ephemeral.durability, PersistenceClass::Transient);
+        assert_eq!(ephemeral.state_schema, None);
+
+        let counter = inventory
+            .actors
+            .iter()
+            .find(|actor| actor.name == "Counter")
+            .unwrap();
+        assert_eq!(counter.durability, PersistenceClass::Durable);
+        assert!(counter.state_schema.is_some());
+        assert_eq!(inventory.state_schema_digests.len(), 1);
+    }
+
+    #[test]
+    fn durable_schema_is_independent_of_state_declaration_order_and_local_state() {
+        let first = checked_hir(
+            r#"
+            persistent actor Counter {
+                state durable count: Int = 0
+                state durable label: String = "x"
+                state local scratch: Int = 0
+                behavior get() { self.count }
+            }
+            "#,
+        );
+        let reordered = checked_hir(
+            r#"
+            persistent actor Counter {
+                state local scratch: String = "ignored"
+                state durable label: String = "different-default"
+                state durable count: Int = 99
+                behavior get() { self.count }
+            }
+            "#,
+        );
+
+        let first = durability_inventory_from_hir(&first).unwrap();
+        let reordered = durability_inventory_from_hir(&reordered).unwrap();
+        assert_eq!(
+            actor_schema(&first, "Counter"),
+            actor_schema(&reordered, "Counter")
+        );
+    }
+
+    #[test]
+    fn durable_schema_changes_with_persistence_model_or_field_type() {
+        let base = checked_hir(
+            r#"
+            persistent actor Counter {
+                state durable value: Int = 0
+                behavior get() { self.value }
+            }
+            "#,
+        );
+        let event_sourced = checked_hir(
+            r#"
+            persistent actor Counter {
+                state event_sourced value: Int = 0
+                behavior get() { self.value }
+            }
+            "#,
+        );
+        let different_type = checked_hir(
+            r#"
+            persistent actor Counter {
+                state durable value: String = "0"
+                behavior get() { self.value }
+            }
+            "#,
+        );
+
+        let base = durability_inventory_from_hir(&base).unwrap();
+        let event_sourced = durability_inventory_from_hir(&event_sourced).unwrap();
+        let different_type = durability_inventory_from_hir(&different_type).unwrap();
+
+        assert_ne!(
+            actor_schema(&base, "Counter"),
+            actor_schema(&event_sourced, "Counter")
+        );
+        assert_ne!(
+            actor_schema(&base, "Counter"),
+            actor_schema(&different_type, "Counter")
+        );
+    }
+
+    #[test]
+    fn durable_schema_includes_entity_event_payload_contract() {
+        let int_event = checked_hir(
+            r#"
+            entity Counter {
+                state count: Int = 0
+                events
+                    | Incremented(by: Int)
+                behavior get() { self.count }
+            }
+            "#,
+        );
+        let string_event = checked_hir(
+            r#"
+            entity Counter {
+                state count: Int = 0
+                events
+                    | Incremented(by: String)
+                behavior get() { self.count }
+            }
+            "#,
+        );
+
+        let int_event = durability_inventory_from_hir(&int_event).unwrap();
+        let string_event = durability_inventory_from_hir(&string_event).unwrap();
+        assert_ne!(
+            actor_schema(&int_event, "Counter"),
+            actor_schema(&string_event, "Counter")
+        );
+    }
+
+    #[test]
+    fn durability_inventory_does_not_claim_inert_migration_contracts() {
+        let hir = checked_hir(
+            r#"
+            entity Counter {
+                version: 2
+                state count: Int = 0
+                behavior get() { self.count }
+                migration from 1 to 2 {
+                    state => { self.count = 1 }
+                }
+            }
+            "#,
+        );
+        let inventory = durability_inventory_from_hir(&hir).unwrap();
+        let durability = inventory
+            .durability
+            .iter()
+            .find(|entry| entry.owner == "Counter")
+            .unwrap();
+        assert_eq!(durability.persistence, PersistenceClass::Durable);
+        assert!(durability.schema.is_some());
+        assert_eq!(durability.migration_contract, None);
     }
 
     #[test]

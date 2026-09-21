@@ -248,6 +248,23 @@ Conceptual entry:
 
 The manifest need not contain raw state schema definitions if those are independently content-addressed.
 
+The current v0alpha1 compiler derives a domain-separated state-schema digest
+from the same checked HIR used to produce the executable. The canonical input
+contains the entity schema version, every non-local state field sorted by name
+(field name, persistence model, canonical compiler type), and typed event
+payload declarations sorted by event name. Local-only fields and initial
+default values are excluded because they do not define recovered durable
+layout. Actor protocol metadata is erased to its runtime actor-reference shape
+before hashing; protocol compatibility remains a separate manifest concern.
+
+Canonical emission fails closed on unresolved/open types because the canonical
+type encoding would otherwise contain compiler-local type/skolem identities.
+
+The compiler deliberately emits no `migration_contract` yet. RFC 0008 syntax
+currently lacks runtime migration triggering and versioned persistence
+enforcement, so publishing a migration digest would overstate what deployment
+can safely rely on.
+
 ## Replay and external side effects
 
 Replay metadata exists to prevent deployment/runtime layers from over-claiming exactly-once behavior.

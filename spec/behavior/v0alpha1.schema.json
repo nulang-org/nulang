@@ -162,7 +162,7 @@
         "name": { "$ref": "#/$defs/name" },
         "protocol": { "type": "string", "maxLength": 512 },
         "durability": { "enum": ["transient", "durable"] },
-        "state_schema": { "type": "string", "maxLength": 512 }
+        "state_schema": { "$ref": "#/$defs/digest" }
       }
     },
     "effect": {
@@ -218,7 +218,7 @@
       "properties": {
         "owner": { "$ref": "#/$defs/name" },
         "persistence": { "enum": ["transient", "durable"] },
-        "schema": { "type": "string", "maxLength": 512 },
+        "schema": { "$ref": "#/$defs/digest" },
         "migration_contract": { "$ref": "#/$defs/digest" }
       }
     },

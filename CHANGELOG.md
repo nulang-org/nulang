@@ -111,6 +111,20 @@ two major versions.*
   or open contracts fail closed. Protocol type hashes now use the canonical
   content encoding rather than information-erasing NTIR.
 
+### Compiler-derived durable state schema identity — 2026-09-21
+- **Behavior Manifest durability inventory** (Experimental, RFC 0020,
+  `src/behavior_manifest.rs`, `src/behavior_build.rs`). Canonical Wasm
+  builds now derive actor persistence class and durable state schema digests
+  from the same checked HIR that produced the executable. Schema identity is
+  domain-separated and includes entity schema version, non-local state field
+  names/models/canonical compiler types, and typed event payload contracts;
+  local-only state and initial default values do not perturb compatibility
+  identity. Actor and durability inventories are sorted, and provenance carries
+  the sorted unique state-schema digest set.
+- Migration-contract identity remains intentionally absent: RFC 0008 migration
+  syntax still has no runtime trigger/versioned persistence enforcement, so the
+  manifest does not advertise a guarantee the runtime cannot execute.
+
 ### Artifact-bound Behavior Manifest host ABI metadata — 2026-09-20
 - **Single-pass Behavior Manifest emission** (Experimental, RFC 0020,
   `src/behavior_build.rs`, `src/behavior_manifest.rs`). The compiler can
