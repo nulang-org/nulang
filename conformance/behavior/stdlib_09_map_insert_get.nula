@@ -1,17 +1,22 @@
 // stdlib::map — insert/get over {key, value} record arrays.
 // SPEC2.md 14.3 writes `Map.insert(phonebook, "Carol", v)` and
 // `Map.get(phonebook, "Alice")`; the implemented signatures are
-// insert(k, v, m) and get(k, m) — key first. get returns -1 for a
-// missing key, not Some(...).
+// insert(k, v, m) and get(k, m) — key first. get returns Option[value].
 import stdlib::map
 
 fn main() {
+    let show = fn(opt) {
+        match opt {
+            Some(x) => x,
+            None => "None",
+        }
+    }
     let phonebook = insert("Alice", "555-1234", insert("Bob", "555-5678", []))
-    perform IO.print(get("Alice", phonebook))
-    perform IO.print(get("Bob", phonebook))
-    perform IO.print(perform Int.to_string(get("Zed", phonebook)))
+    perform IO.print(show(get("Alice", phonebook)))
+    perform IO.print(show(get("Bob", phonebook)))
+    perform IO.print(show(get("Zed", phonebook)))
     let updated = insert("Carol", "555-9012", phonebook)
-    perform IO.print(get("Carol", updated))
+    perform IO.print(show(get("Carol", updated)))
     let overwritten = insert("Alice", "000", phonebook)
-    perform IO.print(get("Alice", overwritten))
+    perform IO.print(show(get("Alice", overwritten)))
 }
