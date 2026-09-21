@@ -32,6 +32,9 @@ pub struct BehaviorBuildInput<'a> {
     pub compiler_implementation: &'a str,
     pub compiler_version: &'a str,
     pub compiler_bytes: &'a [u8],
+    /// Explicit package-module path (same format as NULANG_MODULE_PATH).
+    /// None preserves ambient resolver behavior.
+    pub module_path: Option<&'a str>,
     pub with_capabilities: &'a [String],
     pub deny_warnings: bool,
 }
@@ -64,12 +67,15 @@ pub fn compile_wasm_behavior(input: BehaviorBuildInput<'_>) -> NuResult<Behavior
         span: Span::default(),
     })?;
 
-    let (ast, type_checker, mut effect_checker, imported_sources) = checked_module(
-        source,
-        input.source_path,
-        input.with_capabilities,
-        input.deny_warnings,
-    )?;
+    let (ast, type_checker, mut effect_checker, imported_sources) =
+        crate::resolver::with_module_path_override(input.module_path, || {
+            checked_module(
+                source,
+                input.source_path,
+                input.with_capabilities,
+                input.deny_warnings,
+            )
+        })?;
     let source_closure = canonical_source_closure(&source_bytes, &imported_sources);
 
     let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
@@ -448,6 +454,7 @@ mod tests {
             compiler_implementation: "nulang-rust-test",
             compiler_version: "test",
             compiler_bytes: b"compiler",
+            module_path: None,
             with_capabilities: &[],
             deny_warnings: false,
         })
@@ -468,6 +475,7 @@ mod tests {
             compiler_implementation: "nulang-rust-test",
             compiler_version: "test",
             compiler_bytes: b"compiler",
+            module_path: None,
             with_capabilities: &[],
             deny_warnings: false,
         })
