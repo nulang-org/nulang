@@ -983,6 +983,21 @@ fn verify_behavior_hash(
     }
 }
 
+/* Resolve a behavior name only when the currently installed implementation
+ * satisfies the sender's content-hash contract.  Hot reload/fetch paths must
+ * use this helper instead of resolving the name and trusting the cache key:
+ * a cached module can be malformed or stale and may not actually contain the
+ * requested implementation hash. */
+fn resolve_verified_behavior(
+    runtime: &Runtime,
+    target_actor: u64,
+    behavior_name: &str,
+    sender_hash: &[u8; 32],
+) -> Option<u16> {
+    let behavior_id = runtime.behavior_id_for(target_actor, behavior_name)?;
+    verify_behavior_hash(runtime, target_actor, behavior_id, sender_hash).then_some(behavior_id)
+}
+
 /// Try to look up the content hash for a behavior name in the current
 /// actor's bytecode module. Returns `None` if no current actor context,
 /// no bytecode module, or the behavior has no content hash.
@@ -1309,24 +1324,24 @@ pub fn process_network_packets(
                                         &cached,
                                         &behavior_name,
                                     );
-                                    // Resolve behavior_id against the updated module
-                                    msg.behavior_id = runtime
-                                        .behavior_id_for(target_actor, &behavior_name)
-                                        .unwrap_or(0);
-                                    // Verify the hash now matches
-                                    if !verify_behavior_hash(
+                                    // Resolve and verify against the requested hash.
+                                    // A successful fetch that lacks the requested name OR
+                                    // installs a stale/malformed implementation is a failed
+                                    // delivery, never permission to run behavior 0.
+                                    let Some(behavior_id) = resolve_verified_behavior(
                                         runtime,
                                         target_actor,
-                                        msg.behavior_id,
+                                        &behavior_name,
                                         &content_hash,
-                                    ) {
+                                    ) else {
                                         notify_delivery_failed(
                                             runtime,
                                             msg.sender,
-                                            "behavior content hash still mismatched after fetch",
+                                            "behavior missing or content hash mismatched after fetch",
                                         );
                                         continue;
-                                    }
+                                    };
+                                    msg.behavior_id = behavior_id;
                                     // Intern string and object payloads, then deliver
                                     let mut payload_vec = (*msg.payload).clone();
                                     if !intern_wire_strings(
@@ -2152,13 +2167,23 @@ pub fn process_network_packets(
                         );
                     }
                     // Resolve the behavior name against the target actor's
-                    // behavior table — the same rule local sends use
-                    // (`Runtime::send_message`). An unknown name falls back
-                    // to behavior 0, mirroring `send_message`'s
-                    // `unwrap_or(0)`.
-                    msg.behavior_id = runtime
-                        .behavior_id_for(target_actor, &behavior_name)
-                        .unwrap_or(0);
+                    // behavior table. Unknown names must never alias behavior 0.
+                    // If the sender attached a content hash, keep fetch-on-demand
+                    // viable with an invalid sentinel until the hash path loads the
+                    // missing implementation; the sentinel is never delivered.
+                    match runtime.behavior_id_for(target_actor, &behavior_name) {
+                        Some(behavior_id) => msg.behavior_id = behavior_id,
+                        None if content_hash.is_some() => msg.behavior_id = u16::MAX,
+                        None => {
+                            warn!(
+                                "nulang-net: rejecting message to actor {}: unknown behavior '{}'",
+                                target_actor, behavior_name
+                            );
+                            notify_delivery_failed(runtime, msg.sender, "unknown behavior");
+                            ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+                            continue;
+                        }
+                    }
                     // If the sender attached a content hash, verify it
                     // against the local behavior table.
                     if let Some(sender_hash) = content_hash {
@@ -2173,10 +2198,29 @@ pub fn process_network_packets(
                             if let Some(cached) = cached_module {
                                 // Hot-reload: install the cached module
                                 hot_reload_behavior(runtime, target_actor, &cached, &behavior_name);
-                                // Retry resolution after hot-reload
-                                msg.behavior_id = runtime
-                                    .behavior_id_for(target_actor, &behavior_name)
-                                    .unwrap_or(0);
+                                // Re-resolve AND re-verify after hot reload.  The
+                                // cache key alone is not evidence that the installed
+                                // module actually contains the requested implementation.
+                                let Some(behavior_id) = resolve_verified_behavior(
+                                    runtime,
+                                    target_actor,
+                                    &behavior_name,
+                                    &sender_hash,
+                                ) else {
+                                    notify_delivery_failed(
+                                        runtime,
+                                        msg.sender,
+                                        "behavior missing or content hash mismatched after hot reload",
+                                    );
+                                    ack_packet(
+                                        transport,
+                                        cluster,
+                                        incoming.from_node,
+                                        incoming.seq,
+                                    );
+                                    continue;
+                                };
+                                msg.behavior_id = behavior_id;
                             } else {
                                 // Request the bytecode from the sender
                                 warn!(
@@ -2602,6 +2646,62 @@ fn intern_wire_objects(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn test_resolve_verified_behavior_rejects_mismatched_hot_reload_hash() {
+        use crate::bytecode::{BehaviorTableEntry, CodeModule};
+
+        let mut runtime = Runtime::new();
+        let actor_id = runtime.spawn_actor(Box::new(Vec::new));
+
+        let module_with_hash = |hash: [u8; 32]| {
+            let mut module = CodeModule::new("hash-verification");
+            module.behaviors.push(BehaviorTableEntry {
+                name: "store".to_string(),
+                param_count: 0,
+                code_offset: 0,
+                local_count: 0,
+                effect_mask: 0,
+                compensate_offset: None,
+                content_hash: Some(hash),
+                source_location: None,
+                parallel_branches: None,
+            });
+            module
+        };
+
+        {
+            let actor = runtime.actors.get_mut(&actor_id).unwrap();
+            actor.bytecode_module = Some(module_with_hash([0xAA; 32]));
+            actor.bytecode_offsets = vec![0];
+        }
+
+        let requested_hash = [0xCC; 32];
+        hot_reload_behavior(
+            &mut runtime,
+            actor_id,
+            &module_with_hash([0xBB; 32]),
+            "store",
+        );
+
+        assert_eq!(
+            resolve_verified_behavior(&runtime, actor_id, "store", &requested_hash),
+            None,
+            "a cached module must not be trusted merely because it was stored under the requested hash"
+        );
+
+        hot_reload_behavior(
+            &mut runtime,
+            actor_id,
+            &module_with_hash(requested_hash),
+            "store",
+        );
+        assert_eq!(
+            resolve_verified_behavior(&runtime, actor_id, "store", &requested_hash),
+            Some(0),
+            "matching reloaded behavior should remain deliverable"
+        );
+    }
 
     /// Helper: create a loopback address on a given port.
     fn addr(port: u16) -> SocketAddr {
@@ -3210,8 +3310,8 @@ mod tests {
             "remote send must dispatch the named behavior \"inc\""
         );
 
-        // Unknown behavior name: falls back to behavior 0, mirroring
-        // `Runtime::send_message`'s `unwrap_or(0)` for local sends.
+        // Unknown behavior name: reject it without enqueueing or executing
+        // any target handler.
         send_distributed(
             &mut runtime_a,
             &mut transport_a,
@@ -3236,8 +3336,8 @@ mod tests {
             .and_then(|v| v.as_int())
             .unwrap();
         assert_eq!(
-            count, 4,
-            "unknown behavior name must fall back to behavior 0 (\"dec\")"
+            count, 5,
+            "unknown behavior name must leave target state unchanged"
         );
 
         transport_a.shutdown();

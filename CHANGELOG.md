@@ -42,6 +42,10 @@ version + migration.*
 
 ## Stable tier
 
+### Typed process host authority — 2026-09-20
+- **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
+
+
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
@@ -107,6 +111,14 @@ two major versions.*
   or open contracts fail closed. Protocol type hashes now use the canonical
   content encoding rather than information-erasing NTIR.
 
+### Actor dispatch soundness — 2026-09-20
+- **Fail-closed behavior-name resolution** (Stable runtime correction). Local,
+  cross-shard, and remote actor sends no longer map an unknown behavior name to
+  behavior id 0. Name resolution remains on the owning runtime/shard, fetched
+  or hot-reloaded code must still declare the requested behavior, invalid
+  synchronous numeric asks fail explicitly, and a genuinely declared behavior
+  id 0 remains valid.
+
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
   `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
@@ -138,6 +150,11 @@ two major versions.*
   per-connection sequencer and emitted only as the longest contiguous completed
   prefix. Direct responses stay immediate when no earlier async request is
   pending; pipeline saturation is explicit backpressure.
+- **RESP pipeline retained-byte high-water mark** (Experimental,
+  `src/runtime/cache_pipeline.rs`). Deferred direct and completed local/remote
+  responses now contribute to a per-connection byte budget in addition to the
+  pending-entry limit. Crossing the byte high-water mark backpressures further
+  submissions/completions until ordered draining releases retained bytes.
 - **Redis Cluster MOVED redirect mode** (Experimental,
   `src/runtime/cache_cluster.rs`, `src/runtime/cache_dispatch.rs`). Physical
   cache owners can advertise preformatted RESP endpoints. Redirect mode sends
