@@ -1951,6 +1951,7 @@ fn compile_state_migration_module(source: &str) -> CodeModule {
 struct RejectingSnapshotCommitStore {
     inner: MemoryStore,
     reject_snapshot_saves: bool,
+    conflict_winner: Option<ActorSnapshot>,
 }
 
 impl PersistenceStore for RejectingSnapshotCommitStore {
@@ -1962,6 +1963,24 @@ impl PersistenceStore for RejectingSnapshotCommitStore {
             ));
         }
         self.inner.save_snapshot(snapshot)
+    }
+
+    fn compare_and_swap_snapshot(
+        &mut self,
+        expected: &SnapshotRevision,
+        replacement: ActorSnapshot,
+    ) -> std::io::Result<SnapshotCasResult> {
+        if self.reject_snapshot_saves {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected migration snapshot CAS failure",
+            ));
+        }
+        if let Some(winner) = self.conflict_winner.take() {
+            self.inner.save_snapshot(winner)?;
+            return Ok(SnapshotCasResult::Conflict);
+        }
+        self.inner.compare_and_swap_snapshot(expected, replacement)
     }
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
@@ -2053,6 +2072,131 @@ fn test_recover_actor_executes_and_commits_state_migration_before_publication() 
 }
 
 #[test]
+fn test_recover_actor_adopts_current_schema_winner_after_migration_cas_conflict() {
+    let module = compile_state_migration_module(
+        r#"
+        entity Counter {
+            version: 2
+            state durable count: Int = 0
+            migration from 1 to 2 {
+                state => { self.count = self.count + 1 }
+            }
+        }
+        "#,
+    );
+    let actor_id = 919_012;
+    let mut original = ActorSnapshot {
+        actor_id,
+        sequence: 4,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    original
+        .state
+        .insert("count".to_string(), PersistedValue::Int(8));
+
+    let mut winner = ActorSnapshot {
+        actor_id,
+        sequence: 4,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 2,
+        ..ActorSnapshot::default()
+    };
+    winner
+        .state
+        .insert("count".to_string(), PersistedValue::Int(99));
+
+    let mut store = RejectingSnapshotCommitStore {
+        inner: MemoryStore::new(),
+        reject_snapshot_saves: false,
+        conflict_winner: Some(winner),
+    };
+    store.save_snapshot(original).unwrap();
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store);
+    rt.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        Some(actor_id),
+        "a CAS loser may adopt a winner that already committed the current schema"
+    );
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.schema_version, 2);
+    assert_eq!(
+        actor.get_state_field("count").and_then(|value| value.as_int()),
+        Some(99),
+        "the loser must publish the winner's state, never its stale local transform"
+    );
+}
+
+#[test]
+fn test_recover_actor_refuses_cas_winner_that_is_still_old_schema() {
+    let module = compile_state_migration_module(
+        r#"
+        entity Counter {
+            version: 2
+            state durable count: Int = 0
+            migration from 1 to 2 {
+                state => { self.count = self.count + 1 }
+            }
+        }
+        "#,
+    );
+    let actor_id = 919_013;
+    let mut original = ActorSnapshot {
+        actor_id,
+        sequence: 4,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    original
+        .state
+        .insert("count".to_string(), PersistedValue::Int(8));
+
+    // Simulate a concurrent checkpoint/writer winning the revision race
+    // without performing the schema upgrade.
+    let mut winner = ActorSnapshot {
+        actor_id,
+        sequence: 5,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    winner
+        .state
+        .insert("count".to_string(), PersistedValue::Int(20));
+
+    let mut store = RejectingSnapshotCommitStore {
+        inner: MemoryStore::new(),
+        reject_snapshot_saves: false,
+        conflict_winner: Some(winner.clone()),
+    };
+    store.save_snapshot(original).unwrap();
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store);
+    rt.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "a CAS loser must not retry its transform against a changed old-schema snapshot"
+    );
+    assert!(!rt.actors.contains_key(&actor_id));
+    let committed = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(committed.sequence, 5);
+    assert_eq!(committed.schema_version, 1);
+    assert_eq!(
+        committed.state.get("count"),
+        Some(&PersistedValue::Int(20))
+    );
+}
+
+#[test]
 fn test_recover_actor_does_not_publish_when_migration_snapshot_commit_fails() {
     let module = compile_state_migration_module(
         r#"
@@ -2080,6 +2224,7 @@ fn test_recover_actor_does_not_publish_when_migration_snapshot_commit_fails() {
     let mut store = RejectingSnapshotCommitStore {
         inner: MemoryStore::new(),
         reject_snapshot_saves: false,
+        conflict_winner: None,
     };
     store.save_snapshot(snapshot).unwrap();
     store.reject_snapshot_saves = true;
@@ -2209,6 +2354,47 @@ fn test_recover_actor_rejects_invalid_migration_state_function_binding() {
 }
 
 #[test]
+fn test_memory_snapshot_cas_fences_stale_revision() {
+    let mut store = MemoryStore::new();
+    let original = ActorSnapshot {
+        actor_id: 920_001,
+        sequence: 7,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    store.save_snapshot(original.clone()).unwrap();
+    let expected = SnapshotRevision::from_snapshot(&original);
+
+    let replacement = ActorSnapshot {
+        schema_version: 2,
+        ..original.clone()
+    };
+    assert_eq!(
+        store
+            .compare_and_swap_snapshot(&expected, replacement.clone())
+            .unwrap(),
+        SnapshotCasResult::Committed
+    );
+
+    let stale_replacement = ActorSnapshot {
+        schema_version: 3,
+        ..replacement
+    };
+    assert_eq!(
+        store
+            .compare_and_swap_snapshot(&expected, stale_replacement)
+            .unwrap(),
+        SnapshotCasResult::Conflict,
+        "the v1 revision must not overwrite the already-committed v2 snapshot"
+    );
+    assert_eq!(
+        store.load_snapshot(original.actor_id).unwrap().schema_version,
+        2
+    );
+}
+
+#[test]
 fn test_memory_store_latest_sequence() {
     let mut store = MemoryStore::new();
     let snapshot = ActorSnapshot {
@@ -2234,6 +2420,49 @@ fn test_memory_store_latest_sequence() {
         )
         .unwrap();
     assert_eq!(store.latest_sequence(1), 7);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_libsql_snapshot_cas_is_atomic_and_revision_fenced() {
+    let mut store = LibsqlStore::in_memory().unwrap();
+    let mut original = ActorSnapshot {
+        actor_id: 920_002,
+        sequence: 11,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    original
+        .state
+        .insert("count".to_string(), PersistedValue::Int(4));
+    store.save_snapshot(original.clone()).unwrap();
+    let expected = SnapshotRevision::from_snapshot(&original);
+
+    let mut replacement = original.clone();
+    replacement.schema_version = 2;
+    replacement
+        .state
+        .insert("count".to_string(), PersistedValue::Int(5));
+    assert_eq!(
+        store
+            .compare_and_swap_snapshot(&expected, replacement.clone())
+            .unwrap(),
+        SnapshotCasResult::Committed
+    );
+
+    let mut stale = replacement.clone();
+    stale.schema_version = 3;
+    assert_eq!(
+        store.compare_and_swap_snapshot(&expected, stale).unwrap(),
+        SnapshotCasResult::Conflict
+    );
+    let committed = store.load_snapshot(original.actor_id).unwrap();
+    assert_eq!(committed.schema_version, 2);
+    assert_eq!(
+        committed.state.get("count"),
+        Some(&PersistedValue::Int(5))
+    );
 }
 
 #[cfg(feature = "sqlite")]
