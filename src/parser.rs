@@ -8,7 +8,7 @@ use crate::authority::AuthorityGrant;
 use crate::lexer::{Token, TokenKind};
 use crate::types::{
     Capability, Effect, EffectRow, NuError, NuResult, NuWarning, PrimitiveType, Region, Span, Type,
-    TypeVar, ACTOR_REF_TYPE_NAME,
+    TypeVar, ACTOR_REF_TYPE_NAME, DEVICE_TYPE_NAME, TENSOR_TYPE_NAME,
 };
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
@@ -53,7 +53,16 @@ const PREC_PREFIX: u8 = 11; // ! - & (prefix)
 fn is_primitive_type_name(name: &str) -> bool {
     matches!(
         name,
-        "Int" | "Float" | "Bool" | "String" | "Nil" | "Unit" | "Never" | "Address"
+        "Int"
+            | "Float"
+            | "Bool"
+            | "String"
+            | "Nil"
+            | "Unit"
+            | "Never"
+            | "Address"
+            | "Tensor"
+            | "Device"
     )
 }
 
@@ -5453,6 +5462,29 @@ impl Parser {
                 } else {
                     Vec::new()
                 };
+
+                if name == TENSOR_TYPE_NAME {
+                    if args.len() != 1 {
+                        return Err(NuError::parse_error(
+                            format!(
+                                "Tensor expects exactly one element type argument, got {}",
+                                args.len()
+                            ),
+                            name_span,
+                        ));
+                    }
+                    return Ok(Type::tensor(args.into_iter().next().expect("length checked above")));
+                }
+
+                if name == DEVICE_TYPE_NAME {
+                    if !args.is_empty() {
+                        return Err(NuError::parse_error(
+                            format!("Device does not take type arguments, got {}", args.len()),
+                            name_span,
+                        ));
+                    }
+                    return Ok(Type::device());
+                }
 
                 if name == ACTOR_REF_TYPE_NAME {
                     if args.len() != 1 {
