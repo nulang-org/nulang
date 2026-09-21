@@ -682,6 +682,10 @@ pub struct CodeModule {
     /// ArtifactIdentityManifest; frozen NBC v1 intentionally does not embed it.
     #[serde(skip)]
     pub artifact_id: Option<crate::content_identity::ArtifactId>,
+    /// Full compiler/codegen provenance that justified `artifact_id`.
+    /// In-memory only: frozen NBC v1 does not serialize this sidecar.
+    #[serde(skip)]
+    pub artifact_identity_manifest: Option<crate::artifact_identity::ArtifactIdentityManifest>,
     /// Definition-scoped semantic identities for actor/entity/workflow
     /// declarations in this typed module, parallel to `actor_metadata`.
     /// Positional ownership avoids collapsing namespace-distinct actors that
@@ -743,6 +747,7 @@ impl CodeModule {
             name: name.into(),
             semantic_id: None,
             artifact_id: None,
+            artifact_identity_manifest: None,
             actor_semantic_ids: Vec::new(),
             constants: Vec::new(),
             instructions: Vec::new(),
@@ -797,6 +802,7 @@ impl CodeModule {
             }
         }
         self.artifact_id = Some(requested);
+        self.artifact_identity_manifest = Some(manifest.clone());
         Ok(())
     }
 

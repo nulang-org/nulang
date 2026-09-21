@@ -544,6 +544,13 @@ const TYPE_SHADOW_REPLICATE: u8 = 16;
 // Packet
 // ---------------------------------------------------------------------------
 
+/// Byte-verified identity sidecar transported as an additive NUL0-v1 tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeArtifactProvenance {
+    pub nbc_blake3: [u8; 32],
+    pub runtime_manifest_json: Vec<u8>,
+}
+
 /// A packet sent over the network between Nulang nodes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -695,6 +702,10 @@ pub enum Packet {
         nbc_bytes: Vec<u8>,
         /// JSON-serialized [`ActorSnapshot`](crate::runtime::persistence::ActorSnapshot).
         snapshot_json: Vec<u8>,
+        /// Additive byte-verified runtime provenance. Absent for legacy or
+        /// explicitly unverified migrations; historical readers ignore the
+        /// trailing extension.
+        artifact_provenance: Option<RuntimeArtifactProvenance>,
     },
     /// A positive "goodbye" from a node that is shutting down (RFC 0014 §1
     /// path 1): the sender declares its durable re-spawn-opted actors
@@ -713,6 +724,8 @@ pub enum Packet {
         nbc_bytes: Vec<u8>,
         snapshot_json: Vec<u8>,
         epoch: u64,
+        /// Same additive provenance extension as `MigrateActor`.
+        artifact_provenance: Option<RuntimeArtifactProvenance>,
     },
 }
 
@@ -850,11 +863,14 @@ impl Packet {
         if payload.len() < json_off + 4 + json_len {
             return None;
         }
-        let snapshot_json = payload[json_off + 4..json_off + 4 + json_len].to_vec();
+        let snapshot_end = json_off + 4 + json_len;
+        let snapshot_json = payload[json_off + 4..snapshot_end].to_vec();
+        let artifact_provenance = read_runtime_manifest_tail(payload, snapshot_end)?;
         Some(Packet::MigrateActor {
             actor_id,
             nbc_bytes,
             snapshot_json,
+            artifact_provenance,
         })
     }
 
@@ -1083,12 +1099,14 @@ impl Packet {
                 actor_id,
                 nbc_bytes,
                 snapshot_json,
+                artifact_provenance,
             } => {
                 buf.extend_from_slice(&actor_id.to_be_bytes());
                 buf.extend_from_slice(&(nbc_bytes.len() as u32).to_be_bytes());
                 buf.extend_from_slice(nbc_bytes);
                 buf.extend_from_slice(&(snapshot_json.len() as u32).to_be_bytes());
                 buf.extend_from_slice(snapshot_json);
+                write_runtime_manifest_tail(buf, artifact_provenance.as_ref());
             }
             Packet::NodeGoodbye { node_id, durable } => {
                 buf.extend_from_slice(&node_id.0.to_be_bytes());
@@ -1103,6 +1121,7 @@ impl Packet {
                 nbc_bytes,
                 snapshot_json,
                 epoch,
+                artifact_provenance,
             } => {
                 buf.extend_from_slice(&actor_id.to_be_bytes());
                 buf.extend_from_slice(&(nbc_bytes.len() as u32).to_be_bytes());
@@ -1110,6 +1129,7 @@ impl Packet {
                 buf.extend_from_slice(&(snapshot_json.len() as u32).to_be_bytes());
                 buf.extend_from_slice(snapshot_json);
                 buf.extend_from_slice(&epoch.to_be_bytes());
+                write_runtime_manifest_tail(buf, artifact_provenance.as_ref());
             }
         }
     }
@@ -1497,13 +1517,17 @@ impl Packet {
         if payload.len() < json_off + 4 + json_len + 8 {
             return None;
         }
-        let snapshot_json = payload[json_off + 4..json_off + 4 + json_len].to_vec();
-        let epoch = read_u64(payload, json_off + 4 + json_len)?;
+        let snapshot_end = json_off + 4 + json_len;
+        let snapshot_json = payload[json_off + 4..snapshot_end].to_vec();
+        let epoch = read_u64(payload, snapshot_end)?;
+        let artifact_provenance =
+            read_runtime_manifest_tail(payload, snapshot_end.checked_add(8)?)?;
         Some(Packet::ShadowReplicate {
             actor_id,
             nbc_bytes,
             snapshot_json,
             epoch,
+            artifact_provenance,
         })
     }
 
@@ -1549,6 +1573,54 @@ impl Packet {
         })
     }
 }
+const RUNTIME_MANIFEST_TAIL_MAGIC: &[u8; 4] = b"RAM0";
+
+fn write_runtime_manifest_tail(buf: &mut Vec<u8>, provenance: Option<&RuntimeArtifactProvenance>) {
+    let Some(provenance) = provenance else {
+        return;
+    };
+    let Ok(len) = u32::try_from(provenance.runtime_manifest_json.len()) else {
+        return;
+    };
+    buf.extend_from_slice(RUNTIME_MANIFEST_TAIL_MAGIC);
+    buf.extend_from_slice(&provenance.nbc_blake3);
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(&provenance.runtime_manifest_json);
+}
+
+fn read_runtime_manifest_tail(
+    payload: &[u8],
+    offset: usize,
+) -> Option<Option<RuntimeArtifactProvenance>> {
+    if offset >= payload.len() {
+        return Some(None);
+    }
+    if payload.len() < offset.checked_add(4)? {
+        return Some(None);
+    }
+    if payload.get(offset..offset + 4)? != RUNTIME_MANIFEST_TAIL_MAGIC {
+        // Unknown additive NUL0-v1 extensions remain ignored.
+        return Some(None);
+    }
+    let digest_start = offset.checked_add(4)?;
+    let digest_end = digest_start.checked_add(32)?;
+    if digest_end > payload.len() {
+        return None;
+    }
+    let mut nbc_blake3 = [0u8; 32];
+    nbc_blake3.copy_from_slice(payload.get(digest_start..digest_end)?);
+    let len = read_u32(payload, digest_end)? as usize;
+    let start = digest_end.checked_add(4)?;
+    let end = start.checked_add(len)?;
+    if end > payload.len() {
+        return None;
+    }
+    Some(Some(RuntimeArtifactProvenance {
+        nbc_blake3,
+        runtime_manifest_json: payload[start..end].to_vec(),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Value (de)serialization helpers
 // ---------------------------------------------------------------------------
@@ -3772,12 +3844,46 @@ mod tests {
     }
 
     #[test]
+    fn test_packet_migrate_actor_provenance_roundtrip() {
+        let packet = Packet::MigrateActor {
+            actor_id: 42,
+            nbc_bytes: vec![1, 2, 3],
+            snapshot_json: br#"{"actor_id":42}"#.to_vec(),
+            artifact_provenance: Some(RuntimeArtifactProvenance {
+                nbc_blake3: [0xCD; 32],
+                runtime_manifest_json: br#"{"version":1}"#.to_vec(),
+            }),
+        };
+        let bytes = packet.to_bytes(76);
+        let (seq, decoded) = Packet::from_bytes(&bytes).expect("migrate provenance roundtrip");
+        assert_eq!(seq, 76);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_migrate_actor_legacy_without_provenance_roundtrip() {
+        let packet = Packet::MigrateActor {
+            actor_id: 43,
+            nbc_bytes: vec![4, 5, 6],
+            snapshot_json: br#"{"actor_id":43}"#.to_vec(),
+            artifact_provenance: None,
+        };
+        let bytes = packet.to_bytes(75);
+        let (_, decoded) = Packet::from_bytes(&bytes).expect("legacy migrate roundtrip");
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
     fn test_packet_shadow_replicate_roundtrip() {
         let packet = Packet::ShadowReplicate {
             actor_id: 0x1111_2222_3333_4444,
             nbc_bytes: vec![0x4E, 0x55, 0x4C, 0x30, 1, 2, 3, 4],
             snapshot_json: br#"{"actor_id":7}"#.to_vec(),
             epoch: 5,
+            artifact_provenance: Some(RuntimeArtifactProvenance {
+                nbc_blake3: [0xAB; 32],
+                runtime_manifest_json: br#"{"version":1}"#.to_vec(),
+            }),
         };
         let bytes = packet.to_bytes(77);
         let (seq, decoded) = Packet::from_bytes(&bytes).expect("shadow replicate roundtrip");
@@ -3792,6 +3898,7 @@ mod tests {
             nbc_bytes: vec![1, 2, 3, 4, 5],
             snapshot_json: vec![9, 9, 9],
             epoch: 1,
+            artifact_provenance: None,
         };
         let bytes = packet.to_bytes(1);
         let truncated = &bytes[..bytes.len() - 4];
