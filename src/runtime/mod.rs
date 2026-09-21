@@ -7244,6 +7244,7 @@ impl Runtime {
         nbc_bytes: Vec<u8>,
         snapshot_json: Vec<u8>,
         epoch: u64,
+        artifact_provenance: Option<network::RuntimeArtifactProvenance>,
     ) {
         let replace = match self.shadow_replicas.get(&actor_id) {
             Some(existing) => epoch >= existing.epoch,
@@ -7256,6 +7257,7 @@ impl Runtime {
                     nbc_bytes,
                     snapshot_json,
                     epoch,
+                    artifact_provenance,
                 },
             );
         }
@@ -7284,17 +7286,6 @@ impl Runtime {
         if shadow == home {
             return;
         }
-        // Shadow replication still transports frozen NBC v1, which cannot
-        // prove the in-memory semantic-identity sidecar on the receiving node.
-        // Preserve the strongly identified local snapshot, but send an
-        // explicitly legacy/unverified replica until the transport carries a
-        // verifiable artifact manifest.
-        let mut replicated_snapshot = snapshot.clone();
-        replicated_snapshot.semantic_id = None;
-        replicated_snapshot.artifact_id = None;
-        let Ok(snapshot_json) = serde_json::to_vec(&replicated_snapshot) else {
-            return;
-        };
         let module = match self
             .actors
             .get(&actor_id)
@@ -7304,10 +7295,42 @@ impl Runtime {
                     .get(&actor_id)
                     .map(|(m, _, _)| m.clone())
             }) {
-            Some(m) => m,
+            Some(module) => module,
             None => return,
         };
         let Ok(nbc_bytes) = module.to_nbc(None) else {
+            return;
+        };
+        let artifact_provenance = match module.artifact_identity_manifest.as_ref() {
+            Some(identity) => {
+                let Ok(runtime_manifest) =
+                    crate::runtime_artifact_manifest::RuntimeArtifactManifest::from_module(
+                        &module,
+                        identity,
+                    )
+                else {
+                    return;
+                };
+                let Ok(runtime_manifest_json) = runtime_manifest.to_json() else {
+                    return;
+                };
+                Some(network::RuntimeArtifactProvenance {
+                    nbc_blake3: *blake3::hash(&nbc_bytes).as_bytes(),
+                    runtime_manifest_json,
+                })
+            }
+            None => None,
+        };
+        if (snapshot.semantic_id.is_some() || snapshot.artifact_id.is_some())
+            && artifact_provenance.is_none()
+        {
+            tracing::warn!(
+                actor_id,
+                "nulang-shadow: refusing to downgrade identified snapshot without artifact provenance"
+            );
+            return;
+        }
+        let Ok(snapshot_json) = serde_json::to_vec(snapshot) else {
             return;
         };
         let packet = Packet::ShadowReplicate {
@@ -7315,6 +7338,7 @@ impl Runtime {
             nbc_bytes,
             snapshot_json,
             epoch,
+            artifact_provenance,
         };
         let Some(addr) = cluster.get_node(shadow).map(|info| info.address) else {
             return;
@@ -7419,6 +7443,7 @@ pub(crate) struct ShadowReplica {
     pub nbc_bytes: Vec<u8>,
     pub snapshot_json: Vec<u8>,
     pub epoch: u64,
+    pub artifact_provenance: Option<network::RuntimeArtifactProvenance>,
 }
 
 /// Interval (in `sync_crdts` rounds) between full-state repair syncs.
