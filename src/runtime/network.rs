@@ -2810,6 +2810,68 @@ mod tests {
         assert_eq!(decoded, packet);
     }
 
+    #[test]
+    fn test_packet_actor_message_delivery_id_roundtrip() {
+        let packet = Packet::ActorMessage {
+            target_actor: 42,
+            behavior_name: "tracked".to_string(),
+            content_hash: None,
+            payload: vec![Value::int(1)],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 9,
+            sender_node: NodeId(10),
+            priority: MessagePriority::Normal,
+            trace_id: None,
+            delivery_id: Some(0xDEAD_BEEF),
+        };
+
+        let bytes = packet.to_bytes(91);
+        let (seq, decoded) = Packet::from_bytes(&bytes).expect("tracked actor message");
+        assert_eq!(seq, 91);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_actor_message_accepts_pre_admission_encoding() {
+        let packet = Packet::ActorMessage {
+            target_actor: 42,
+            behavior_name: "legacy".to_string(),
+            content_hash: None,
+            payload: vec![Value::int(1)],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 9,
+            sender_node: NodeId(10),
+            priority: MessagePriority::Normal,
+            trace_id: None,
+            delivery_id: None,
+        };
+
+        let mut bytes = packet.to_bytes(92);
+        // Current encoding ends with the additive delivery-id presence flag.
+        // Removing it exactly models an older actor message that ended after
+        // the trace-id field.
+        assert_eq!(bytes.pop(), Some(0));
+        let (_, decoded) = Packet::from_bytes(&bytes).expect("legacy actor message");
+        match decoded {
+            Packet::ActorMessage { delivery_id, .. } => assert_eq!(delivery_id, None),
+            other => panic!("expected actor message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_packet_actor_admission_roundtrip() {
+        let packet = Packet::ActorAdmission {
+            delivery_id: 1234,
+            status: ActorAdmissionStatus::Backpressured,
+        };
+        let bytes = packet.to_bytes(93);
+        let (seq, decoded) = Packet::from_bytes(&bytes).expect("actor admission");
+        assert_eq!(seq, 93);
+        assert_eq!(decoded, packet);
+    }
+
     // ------------------------------------------------------------------
     // 2b. ActorMessage string table roundtrip
     // ------------------------------------------------------------------
