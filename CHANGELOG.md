@@ -46,7 +46,7 @@ version + migration.*
 two major versions.*
 
 ### Finite-domain pattern coverage diagnostics — 2026-09-20
-- **Conservative static match coverage** (Experimental, RFC 0020,
+- **Conservative static match coverage** (Experimental, RFC 0024,
   `src/pattern_coverage.rs`, `src/typechecker.rs`). Matches over closed
   variants and `Bool` emit `W0201` for provably missing witnesses and
   `W0202` for provably redundant arms. Guarded arms do not prove coverage.
