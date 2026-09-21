@@ -37,6 +37,21 @@ Run both on the same machine, with the same CPU governor and otherwise idle
 host. Do not compare GitHub-hosted Criterion results with local BEAM results;
 shared-runner noise and hardware differences make that comparison invalid.
 
+## Automated same-host BEAM evidence
+
+The dedicated `perf/beam-parity*` benchmark PR runs a matched Nulang and
+Erlang/BEAM harness on the same GitHub Actions runner for 1k and 10k actors.
+Both harnesses emit the same CSV schema:
+
+`runtime,benchmark,operations,elapsed_us,ops_per_sec`
+
+The CI summary reports the raw throughput and Nulang/BEAM ratio for actor
+spawn, single-mailbox flood, and one-message-per-actor fan-out. Results are
+informational rather than a pass/fail ranking: the purpose is to establish a
+dated same-host baseline and identify order-of-magnitude gaps that deserve
+profiling. The raw CSV files and rendered summary are retained in the
+`beam-parity-<sha>` workflow artifact.
+
 ## Highest-priority runtime bottleneck: idle actor footprint
 
 `Actor::new` currently creates a 16 KiB initial ORCA heap for every actor even
