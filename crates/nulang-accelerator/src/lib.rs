@@ -18,7 +18,7 @@ use thiserror::Error;
 /// Known helper constructors cover the common backends, while new runtimes can
 /// introduce identifiers without requiring an enum/version bump.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct BackendId(String);
 
 impl BackendId {
@@ -73,13 +73,27 @@ impl fmt::Display for BackendId {
     }
 }
 
+impl TryFrom<String> for BackendId {
+    type Error = AcceleratorError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<BackendId> for String {
+    fn from(value: BackendId) -> Self {
+        value.0
+    }
+}
+
 /// Stable identifier for one locally visible device.
 ///
 /// Backends should namespace identifiers when necessary (for example
 /// "cuda:0" or "metal:registry-id") so identifiers stay unique inside one
 /// runtime registry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct DeviceId(String);
 
 impl DeviceId {
@@ -106,12 +120,26 @@ impl fmt::Display for DeviceId {
     }
 }
 
+impl TryFrom<String> for DeviceId {
+    type Error = AcceleratorError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<DeviceId> for String {
+    fn from(value: DeviceId) -> Self {
+        value.0
+    }
+}
+
 /// Open-ended accelerator feature identifier.
 ///
 /// Features are strings rather than a closed enum because hardware features
 /// evolve faster than Nulang's compatibility surface.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct FeatureId(String);
 
 impl FeatureId {
@@ -151,6 +179,20 @@ impl FeatureId {
 impl fmt::Display for FeatureId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for FeatureId {
+    type Error = AcceleratorError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<FeatureId> for String {
+    fn from(value: FeatureId) -> Self {
+        value.0
     }
 }
 
@@ -673,6 +715,12 @@ mod tests {
 
     #[test]
     fn identifiers_and_requests_round_trip_through_serde() {
+        assert!(serde_json::from_str::<BackendId>("\"\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<BackendId>("\" CUDA \"").unwrap(),
+            BackendId::cuda()
+        );
+
         let request = DeviceRequest {
             requirements: DeviceRequirements {
                 allowed_backends: BTreeSet::from([BackendId::cuda()]),
