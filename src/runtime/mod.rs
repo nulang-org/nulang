@@ -1333,7 +1333,7 @@ impl Runtime {
                     self.route_to_dlq(
                         &Message {
                             behavior_id,
-                            payload: Arc::new(Vec::new()),
+                            payload: Arc::from(Vec::<Value>::new()),
                             sender,
                             priority: MessagePriority::System,
                             trace_id: None,
@@ -1357,7 +1357,7 @@ impl Runtime {
                 self.route_to_dlq(
                     &Message {
                         behavior_id,
-                        payload: Arc::new(Vec::new()),
+                        payload: Arc::from(Vec::<Value>::new()),
                         sender,
                         priority: MessagePriority::System,
                         trace_id: None,
@@ -1369,7 +1369,7 @@ impl Runtime {
             self.route_to_dlq(
                 &Message {
                     behavior_id,
-                    payload: Arc::new(Vec::new()),
+                    payload: Arc::from(Vec::<Value>::new()),
                     sender,
                     priority: MessagePriority::System,
                     trace_id: None,
@@ -2543,7 +2543,7 @@ impl Runtime {
                     self.route_to_dlq(
                         &Message {
                             behavior_id,
-                            payload: Arc::new(args.to_vec()),
+                            payload: Arc::from(args),
                             sender: self.current_actor.unwrap_or(0),
                             priority: MessagePriority::System,
                             trace_id: out_trace.clone(),
@@ -2558,7 +2558,7 @@ impl Runtime {
                     self.route_to_dlq(
                         &Message {
                             behavior_id,
-                            payload: Arc::new(args.to_vec()),
+                            payload: Arc::from(args),
                             sender: self.current_actor.unwrap_or(0),
                             priority: MessagePriority::System,
                             trace_id: out_trace.clone(),
@@ -2585,7 +2585,7 @@ impl Runtime {
     ) -> MessageAdmission {
         let msg = Message {
             behavior_id,
-            payload: Arc::new(args.to_vec()),
+            payload: Arc::from(args),
             sender: self.current_actor.unwrap_or(0),
             priority: MessagePriority::Normal,
             trace_id: out_trace.clone(),
@@ -2606,7 +2606,7 @@ impl Runtime {
                 self.route_to_dlq(
                     &Message {
                         behavior_id,
-                        payload: Arc::new(args.to_vec()),
+                        payload: Arc::from(args),
                         sender: self.current_actor.unwrap_or(0),
                         priority: MessagePriority::System,
                         trace_id: out_trace.clone(),
@@ -2619,7 +2619,7 @@ impl Runtime {
             self.route_to_dlq(
                 &Message {
                     behavior_id,
-                    payload: Arc::new(args.to_vec()),
+                    payload: Arc::from(args),
                     sender: self.current_actor.unwrap_or(0),
                     priority: MessagePriority::System,
                     trace_id: out_trace.clone(),
