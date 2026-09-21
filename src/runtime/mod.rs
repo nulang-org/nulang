@@ -60,6 +60,7 @@ pub mod crdt;
 pub mod crdt_manager;
 pub mod crdt_reg;
 mod distribution;
+mod event_replay;
 mod exit;
 mod http_server;
 #[cfg(feature = "ai-runtime")]
@@ -5207,26 +5208,49 @@ impl Runtime {
                 }
             }
         }
-        // Replay event-sourced events to reconstruct EventSourced fields.
-        // The stored snapshot value (captured after the apply handler ran
-        // during live execution) correctly reconstructs fields with
-        // non-trivial apply handlers.  See
-        // `integration_tests::test_event_sourced_apply_handler_recovery`
-        // which validates this behavior.
+        // Reconstruct EventSourced fields. New compiler artifacts can
+        // deterministically execute replay-safe current-schema apply
+        // projections in an isolated VM, grouping per-field rows by logical
+        // event sequence. Legacy artifacts and handlers outside the proven
+        // replay subset retain the historical post-apply-value fallback.
         let events = self.persistence.read_events(actor_id);
+        let mut executable_replay_applied = false;
         if !events.is_empty() {
-            for entry in &events {
-                let v = entry.value.to_value_on_heap(&mut actor);
-                actor.set_state_field(&entry.field_name, v);
-                let current_seq = actor
-                    .event_sourced_sequences
-                    .get(&entry.field_name)
-                    .copied()
-                    .unwrap_or(0);
-                if entry.sequence > current_seq {
-                    actor
+            if let Some(module) = recovery_module.as_ref() {
+                match event_replay::replay_current_event_history(module, actor_id, &events) {
+                    Ok(Some(replayed)) => {
+                        for (field, value) in replayed.state {
+                            let restored = value.to_value_on_heap(&mut actor);
+                            actor.set_state_field(field, restored);
+                        }
+                        actor.event_sourced_sequences = replayed.field_sequences;
+                        executable_replay_applied = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            "nulang-recover: refusing actor {} because executable event replay failed: {}",
+                            actor_id, error
+                        );
+                        return None;
+                    }
+                }
+            }
+
+            if !executable_replay_applied {
+                for entry in &events {
+                    let v = entry.value.to_value_on_heap(&mut actor);
+                    actor.set_state_field(&entry.field_name, v);
+                    let current_seq = actor
                         .event_sourced_sequences
-                        .insert(entry.field_name.clone(), entry.sequence);
+                        .get(&entry.field_name)
+                        .copied()
+                        .unwrap_or(0);
+                    if entry.sequence > current_seq {
+                        actor
+                            .event_sourced_sequences
+                            .insert(entry.field_name.clone(), entry.sequence);
+                    }
                 }
             }
         }
