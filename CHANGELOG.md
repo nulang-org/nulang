@@ -78,6 +78,16 @@ two major versions.*
   trailing extensions. The receiver's installed protocol remains local runtime
   metadata and is deliberately not trusted from the wire.
 
+### JIT compiled-region dense slots — 2026-09-20
+- **Dense compiled-region lookup** (Experimental, `src/jit/mod.rs`).
+  JIT-compiled region pointers are now stored in per-module dense PC-indexed
+  slots instead of an `FxHashMap<(module_idx, pc), ...>`. The interpreter's
+  per-step compiled-region probe therefore uses bounds checks plus an
+  `Option` load rather than hashing every still-interpreted instruction after
+  the first region tiers up. Compiled-region count, module/PC isolation, and
+  replacement semantics are covered by regression tests; tier thresholds and
+  JIT ABI are unchanged.
+
 ### Typed actor protocol checking — 2026-09-20
 - **Static protocol validation for known actor references** (Experimental,
   `src/actor_protocol.rs`, RFC 0023). Actor `send`/`ask` calls whose receiver
