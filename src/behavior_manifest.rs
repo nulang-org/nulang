@@ -922,15 +922,10 @@ fn main() {
     fn semantic_ordering_and_state_model_identity_do_not_use_internal_enum_order() {
         let manifest = emit(
             r#"
-persistent actor StateKinds {
-    state durable d: Int = 0
-    state event_sourced e: Int = 0
-    state crdt gcounter c: Int = 0
-    behavior touch() { perform IO.print("x") }
-}
 fn main() {
     perform Time.now()
     perform FS.read("/tmp/x")
+    perform IO.print("x")
 }
 "#,
         );
@@ -944,8 +939,24 @@ fn main() {
         sorted_effect_names.sort_unstable();
         assert_eq!(effect_names, sorted_effect_names);
 
-        let schema = manifest.actors[0].state_schema.as_deref().unwrap();
-        assert!(schema.starts_with("blake3:"));
+        assert_eq!(
+            state_model_identity(crate::ast::StateModel::Local),
+            "local"
+        );
+        assert_eq!(
+            state_model_identity(crate::ast::StateModel::Durable),
+            "durable"
+        );
+        assert_eq!(
+            state_model_identity(crate::ast::StateModel::EventSourced),
+            "event-sourced"
+        );
+        assert_eq!(
+            state_model_identity(crate::ast::StateModel::Crdt(
+                crate::ast::CrdtType::GCounter
+            )),
+            "crdt:gcounter"
+        );
     }
 
     #[test]
