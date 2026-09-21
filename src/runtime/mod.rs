@@ -867,11 +867,10 @@ impl Runtime {
                 .iter()
                 .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
                 .collect();
-            let bytecode_offsets =
-                crate::runtime::spawn::bytecode_offsets_for(
-                    module,
-                    meta.semantics().map(|s| s.is_workflow()).unwrap_or(false),
-                );
+            let bytecode_offsets = crate::runtime::spawn::bytecode_offsets_for(
+                module,
+                meta.semantics().map(|s| s.is_workflow()).unwrap_or(false),
+            );
             let compensation_offsets: Vec<Option<usize>> = meta
                 .behavior_indices
                 .iter()
