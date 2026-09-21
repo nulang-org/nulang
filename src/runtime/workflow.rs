@@ -548,9 +548,15 @@ mod query_purity_tests {
         let mut rt = Runtime::new();
         let mut models = HashMap::new();
         models.insert("count".to_string(), StateModel::Durable);
+        models.insert("other".to_string(), StateModel::Durable);
         let actor_id = rt.spawn_workflow_actor(
             "CounterWorkflow",
-            Box::new(|| vec![("count".to_string(), Value::int(7))]),
+            Box::new(|| {
+                vec![
+                    ("count".to_string(), Value::int(7)),
+                    ("other".to_string(), Value::int(1)),
+                ]
+            }),
             models,
         );
         rt.actors.get_mut(&actor_id).unwrap().bytecode_module = Some(query_module());
@@ -611,5 +617,70 @@ mod query_purity_tests {
             })
         );
         assert_eq!(rt.query_workflow(actor_id, "missing"), None);
+    }
+
+    #[test]
+    fn reactive_subscription_batches_invalidations_and_refreshes_dependencies() {
+        let (mut rt, actor_id) = workflow_with_queries();
+
+        let (subscription, initial) = rt
+            .subscribe_workflow_query(actor_id, "read")
+            .expect("pure query subscription should register");
+        assert_eq!(initial.as_int(), Some(7));
+
+        // Initial spawn writes predate the subscription. They are drained but
+        // must not invalidate a read set captured from the current state.
+        assert!(rt.drain_workflow_query_invalidations().is_empty());
+
+        // An unrelated scalar field does not invalidate the subscription.
+        rt.actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .set_state_field("other", Value::int(2));
+        assert!(rt.drain_workflow_query_invalidations().is_empty());
+
+        // Several writes to the same dependency before a drain collapse to one
+        // invalidation. Subscribers observe the final state on refresh.
+        {
+            let actor = rt.actors.get_mut(&actor_id).unwrap();
+            actor.set_state_field("count", Value::int(8));
+            actor.set_state_field("count", Value::int(9));
+        }
+        assert_eq!(
+            rt.drain_workflow_query_invalidations(),
+            vec![subscription]
+        );
+
+        let refreshed = rt
+            .refresh_workflow_query_subscription(subscription)
+            .expect("invalidated subscription should refresh");
+        assert_eq!(refreshed.as_int(), Some(9));
+
+        // With the read set replaced by the refreshed query, no new change
+        // means no duplicate invalidation.
+        assert!(rt.drain_workflow_query_invalidations().is_empty());
+    }
+
+    #[test]
+    fn unsubscribe_removes_reverse_dependency_indexes() {
+        let (mut rt, actor_id) = workflow_with_queries();
+        let (subscription, _) = rt
+            .subscribe_workflow_query(actor_id, "read")
+            .expect("subscription should register");
+        assert!(rt.unsubscribe_workflow_query(subscription));
+        assert!(!rt.unsubscribe_workflow_query(subscription));
+
+        rt.actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .set_state_field("count", Value::int(10));
+        assert!(rt.drain_workflow_query_invalidations().is_empty());
+
+        assert_eq!(
+            rt.refresh_workflow_query_subscription(subscription),
+            Err(crate::runtime::ReactiveSubscriptionError::NotFound(
+                subscription
+            ))
+        );
     }
 }
