@@ -1096,6 +1096,8 @@ impl PersistenceStore for LibsqlStore {
             Some(ActorSnapshot {
                 actor_id,
                 sequence: sequence as u64,
+                schema_owner: None,
+                schema_version: 1,
                 schema_owner,
                 schema_version: schema_version as u32,
                 state,
@@ -1798,6 +1800,8 @@ impl PersistenceStore for PostgresStore {
         Some(ActorSnapshot {
             actor_id,
             sequence: sequence as u64,
+            schema_owner: None,
+            schema_version: 1,
             schema_owner,
             schema_version: schema_version as u32,
             state,
@@ -2093,6 +2097,8 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
+                schema_owner: None,
+                schema_version: 1,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2155,6 +2161,8 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 5,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2184,6 +2192,8 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 1,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2220,6 +2230,8 @@ mod json_file_store_tests {
                 .save_snapshot(ActorSnapshot {
                     actor_id: 1,
                     sequence: 1,
+                    schema_owner: None,
+                    schema_version: 1,
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
@@ -2259,6 +2271,8 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 9,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2380,6 +2394,8 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
+                schema_owner: None,
+                schema_version: 1,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2436,6 +2452,8 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 5,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2465,6 +2483,8 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 1,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2501,6 +2521,8 @@ mod rocksdb_store_tests {
                 .save_snapshot(ActorSnapshot {
                     actor_id: 1,
                     sequence: 1,
+                    schema_owner: None,
+                    schema_version: 1,
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
@@ -2572,6 +2594,8 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 3,
+                schema_owner: None,
+                schema_version: 1,
                 state,
                 waiting_signal: Some("signal".to_string()),
                 crdt_snapshot: None,
@@ -2637,6 +2661,8 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 5,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2670,6 +2696,8 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 1,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
