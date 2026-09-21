@@ -19,6 +19,7 @@ pub mod cache_routing;
 #[cfg(feature = "cache-server")]
 pub mod cache_server;
 pub mod change_stream;
+pub mod data_index;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
@@ -99,6 +100,7 @@ pub use cache_server::*;
 pub use callbacks::RuntimeVmCallbacks;
 pub(crate) use callbacks::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks};
 pub use change_stream::*;
+pub use data_index::*;
 pub use cluster::*;
 pub use crdt::*;
 pub use crdt_manager::*;
