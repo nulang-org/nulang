@@ -48,6 +48,21 @@ fn panic_mir() -> mir::Module {
 }
 
 #[cfg(feature = "native-codegen")]
+fn panic_behavior_mir() -> mir::Module {
+    let mut builder = mir::FunctionBuilder::new("Worker.run", None);
+    let panic_dst = builder.add_temp(Type::unit());
+    builder.assign(
+        panic_dst,
+        RValue::Panic("actor_panic_test".to_string()),
+    );
+    builder.terminate(Terminator::Return(None));
+
+    let mut module = mir::Module::new("backend-actor-panic-parity");
+    module.behaviors.push(builder.build());
+    module
+}
+
+#[cfg(feature = "native-codegen")]
 #[test]
 fn native_panic_surfaces_runtime_error_and_does_not_fall_through() {
     let module = nulang::aot::AotModule::compile(&panic_mir())
@@ -78,6 +93,22 @@ fn bytecode_and_native_both_treat_panic_as_error() {
         .expect("native compile")
         .run();
     assert!(native.is_err(), "native Panic must be an error");
+}
+
+#[cfg(feature = "native-codegen")]
+#[test]
+fn native_actor_behavior_panic_fails_closed_until_actor_fault_propagation_exists() {
+    let err = match nulang::aot::AotModule::compile(&panic_behavior_mir()) {
+        Ok(_) => panic!(
+            "native actor behavior accepted Panic without a scheduler fault propagation channel"
+        ),
+        Err(err) => err.to_string(),
+    };
+
+    assert!(
+        err.contains("native behavior adapter cannot propagate actor faults yet"),
+        "unexpected native actor panic restriction: {err}"
+    );
 }
 
 #[cfg(feature = "wasm-backend")]
