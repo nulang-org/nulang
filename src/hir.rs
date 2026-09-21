@@ -123,6 +123,10 @@ pub struct ActorDef {
     pub events: Vec<crate::ast::EventDecl>,
     /// Apply handlers from an `apply` block (entity only).
     pub apply_handlers: Vec<crate::ast::ApplyHandler>,
+    /// Separately lowered apply-handler bodies used to build compiler-private
+    /// deterministic replay functions. Live behavior lowering still inlines
+    /// apply logic at emit sites for backward-compatible execution semantics.
+    pub apply_handler_bodies: Vec<ApplyHandlerBody>,
     /// Entity schema version (defaults to 1).  RFC 0008.
     pub version: u32,
     /// Source migration declarations retained for canonical artifact topology.
@@ -151,6 +155,14 @@ pub struct ActorDef {
     pub fallback_config: String,
     /// Serialized retry configuration (JSON `Option<AgentRetryConfig>`).
     pub retry_config: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApplyHandlerBody {
+    pub event: String,
+    pub params: Vec<(String, Type)>,
+    pub body: Body,
     pub span: Span,
 }
 
