@@ -701,7 +701,10 @@ mod authority_tests {
         );
 
         assert_eq!(returned, actor_id);
-        let actor = rt.actors.get(&actor_id).expect("persistent actor published");
+        let actor = rt
+            .actors
+            .get(&actor_id)
+            .expect("persistent actor published");
         assert_eq!(actor.definition_semantic_id, None);
         assert_eq!(actor.execution_artifact_id, None);
     }
