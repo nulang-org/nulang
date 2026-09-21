@@ -38,6 +38,9 @@ This document is the design target for Nulang 2.0. The implementation in this re
 
 **Implemented and verified against the source tree:**
 
+- **Nulang 2 development line and accelerator surface** (Experimental, RFC 0025): the active compiler reports language version `2.0.0-dev` while preserving Nulang 1 Core and the v1 NBC/NUL0/value-layout formats. `Tensor[T]` and `Device` are built-in types. The initial typed effects are `Tensor.from_array`, `Tensor.zeros`, `Tensor.shape`, `Tensor.to_array`, `Tensor.add`, `Tensor.matmul`, `Tensor.relu`, `Compute.device`, `Compute.default_device`, and `Compute.device_name`. Bytecode execution currently uses the deterministic CPU reference backend; native accelerator lowering remains Experimental/planned.
+
+
 - Triple-quoted multi-line strings (`\"\"\"...\"\"\"`) and `\u{...}` unicode escapes: standard escapes processed inside triple-quoted strings; interpolation not supported inside them; surrogate/out-of-range code points rejected with a `LexError` — `src/lexer.rs`. (Stable)
 - The core expression language: literals (`Int`, `Float`, `String`, `Bool`, `Unit`, `Nil`), `let` / `let rec` bindings with `in`, `fn` lambdas, tuples, records, arrays, `if`/`then`/`else`, `match` (wildcard, variable, literal, tuple, record, variant, and `@` alias patterns), blocks, the pipe operator `|>`, and the operator set of Chapter 2.
 - Top-level declarations: `fn` (with `[T]` type parameters, `->` return types, `!` effect rows, `: cap` capability annotations, and `@tool` annotations), `type` (alias, record, and variant forms), `effect`, `actor` / `persistent actor`, `entity`, `organization`, `agent`, `workflow`, `module`, `import`, and `extern` FFI blocks.
