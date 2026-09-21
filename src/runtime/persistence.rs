@@ -2097,8 +2097,8 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
-                schema_owner: None,
-                schema_version: 1,
+                schema_owner: Some("Counter".to_string()),
+                schema_version: 3,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2110,6 +2110,8 @@ mod json_file_store_tests {
         let loaded = store.load_snapshot(1).unwrap();
         assert_eq!(loaded.actor_id, 1);
         assert_eq!(loaded.sequence, 3);
+        assert_eq!(loaded.schema_owner.as_deref(), Some("Counter"));
+        assert_eq!(loaded.schema_version, 3);
         assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
 
         // The atomic (temp + rename) write must not leave its temp file behind.
@@ -2118,6 +2120,22 @@ mod json_file_store_tests {
             .with_file_name("snapshot.json.tmp")
             .exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_legacy_snapshot_json_defaults_to_schema_v1() {
+        let legacy = r#"{
+            "actor_id": 7,
+            "sequence": 2,
+            "state": {},
+            "waiting_signal": null,
+            "crdt_snapshot": null,
+            "crdt_field_map": null,
+            "authority_tokens": []
+        }"#;
+        let snapshot: ActorSnapshot = serde_json::from_str(legacy).unwrap();
+        assert_eq!(snapshot.schema_owner, None);
+        assert_eq!(snapshot.schema_version, 1);
     }
 
     #[test]
