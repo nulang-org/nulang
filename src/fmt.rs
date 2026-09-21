@@ -169,14 +169,25 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
         }
         Decl::Actor {
             name,
+            persistent,
             behaviors,
             state_fields,
             indexes,
             ..
         } => {
-            out.push_str(&format!("{}actor {} {{\n", sp, name));
-            for (fnm, _, fty, fdef) in state_fields {
-                out.push_str(&format!("{}    state {}: {}", sp, fnm, fmt_type(fty)));
+            let actor_prefix = if *persistent { "persistent actor" } else { "actor" };
+            out.push_str(&format!("{}{} {} {{\n", sp, actor_prefix, name));
+            for (fnm, model, fty, fdef) in state_fields {
+                out.push_str(&format!("{}    state ", sp));
+                match model {
+                    crate::ast::StateModel::Local => out.push_str("local "),
+                    crate::ast::StateModel::Durable => out.push_str("durable "),
+                    crate::ast::StateModel::EventSourced => out.push_str("event_sourced "),
+                    crate::ast::StateModel::Crdt(kind) => {
+                        out.push_str(&format!("crdt {} ", kind.keyword()));
+                    }
+                }
+                out.push_str(&format!("{}: {}", fnm, fmt_type(fty)));
                 out.push_str(" = ");
                 fmt_expr(out, fdef, indent + 4, had_unhandled);
                 out.push('\n');
