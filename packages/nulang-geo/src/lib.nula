@@ -475,3 +475,205 @@ pub fn polygon_to_wkt[CRS](shape: Polygon[CRS]) -> String {
         result + "))"
     }
 }
+
+
+/// A payload indexed by an axis-aligned bounding box in one CRS.
+pub type RTreeEntry[CRS, T] = {
+    bounds: BoundingBox[CRS],
+    value: T
+}
+
+/// Recursive node for the dependency-free static R-tree.
+///
+/// Leaves store entries. Branches store child nodes. Every node carries the
+/// union of its descendants' bounds so queries can prune whole subtrees.
+pub type RTreeNode[CRS, T] =
+    RTreeLeaf((BoundingBox[CRS], [RTreeEntry[CRS, T]])) |
+    RTreeBranch((BoundingBox[CRS], [RTreeNode[CRS, T]]))
+
+/// Immutable spatial index built in user-space Nulang.
+///
+/// Bulk loading currently preserves caller order when grouping entries. Query
+/// correctness does not depend on packing order; future STR/Hilbert packing can
+/// improve pruning quality without changing this public representation.
+pub type RTree[CRS, T] = {
+    root: Option[RTreeNode[CRS, T]],
+    crs: CRS,
+    size: Int,
+    fanout: Int
+}
+
+/// Construct an index entry.
+pub fn rtree_entry[CRS, T](
+    bounds: BoundingBox[CRS],
+    value: T
+) -> RTreeEntry[CRS, T] {
+    let result: RTreeEntry[CRS, T] = { bounds: bounds, value: value };
+    result
+}
+
+/// Return the minimal axis-aligned bounds covering a and b.
+pub fn union_bounds[CRS](
+    a: BoundingBox[CRS],
+    b: BoundingBox[CRS]
+) -> BoundingBox[CRS] {
+    let min_x = if a.min_x <= b.min_x then a.min_x else b.min_x;
+    let min_y = if a.min_y <= b.min_y then a.min_y else b.min_y;
+    let max_x = if a.max_x >= b.max_x then a.max_x else b.max_x;
+    let max_y = if a.max_y >= b.max_y then a.max_y else b.max_y;
+    bounding_box(min_x, min_y, max_x, max_y, a.crs)
+}
+
+fn rtree_entry_bounds[CRS, T](
+    entries: [RTreeEntry[CRS, T]]
+) -> BoundingBox[CRS] {
+    var bounds = entries[0].bounds;
+    var i = 1;
+    let n = perform Array.length(entries);
+    while i < n {
+        bounds = union_bounds(bounds, entries[i].bounds);
+        i = i + 1
+    };
+    bounds
+}
+
+fn rtree_node_bounds[CRS, T](
+    node: RTreeNode[CRS, T]
+) -> BoundingBox[CRS] {
+    match node {
+        RTreeLeaf((bounds, _)) => bounds,
+        RTreeBranch((bounds, _)) => bounds,
+    }
+}
+
+fn rtree_children_bounds[CRS, T](
+    children: [RTreeNode[CRS, T]]
+) -> BoundingBox[CRS] {
+    var bounds = rtree_node_bounds(children[0]);
+    var i = 1;
+    let n = perform Array.length(children);
+    while i < n {
+        bounds = union_bounds(bounds, rtree_node_bounds(children[i]));
+        i = i + 1
+    };
+    bounds
+}
+
+fn rtree_make_leaf[CRS, T](
+    entries: [RTreeEntry[CRS, T]]
+) -> RTreeNode[CRS, T] {
+    RTreeLeaf(rtree_entry_bounds(entries), entries)
+}
+
+fn rtree_make_branch[CRS, T](
+    children: [RTreeNode[CRS, T]]
+) -> RTreeNode[CRS, T] {
+    RTreeBranch(rtree_children_bounds(children), children)
+}
+
+fn rtree_build_root[CRS, T](
+    nodes: [RTreeNode[CRS, T]],
+    fanout: Int
+) -> RTreeNode[CRS, T] {
+    let n = perform Array.length(nodes);
+    if n == 1 then {
+        nodes[0]
+    } else {
+        var parents: [RTreeNode[CRS, T]] = [];
+        var group: [RTreeNode[CRS, T]] = [];
+        var i = 0;
+        while i < n {
+            group = perform Array.push(group, nodes[i]);
+            if perform Array.length(group) >= fanout then {
+                parents = perform Array.push(parents, rtree_make_branch(group));
+                group = []
+            } else {};
+            i = i + 1
+        };
+        if perform Array.length(group) > 0 then {
+            parents = perform Array.push(parents, rtree_make_branch(group))
+        } else {};
+        rtree_build_root(parents, fanout)
+    }
+}
+
+/// Build an immutable R-tree from entries.
+///
+/// fanout values below 2 are normalized to 2. Empty input produces an empty
+/// tree. The initial loader groups entries in input order; callers that already
+/// have spatially coherent ordering benefit immediately, while future packing
+/// strategies can be added without changing query semantics.
+pub fn rtree_bulk_load[CRS, T](
+    entries: [RTreeEntry[CRS, T]],
+    crs: CRS,
+    fanout: Int
+) -> RTree[CRS, T] {
+    let effective_fanout = if fanout < 2 then 2 else fanout;
+    let n = perform Array.length(entries);
+    if n == 0 then {
+        let empty: RTree[CRS, T] = { root: None, crs: crs, size: 0, fanout: effective_fanout };
+        empty
+    } else {
+        var leaves: [RTreeNode[CRS, T]] = [];
+        var group: [RTreeEntry[CRS, T]] = [];
+        var i = 0;
+        while i < n {
+            group = perform Array.push(group, entries[i]);
+            if perform Array.length(group) >= effective_fanout then {
+                leaves = perform Array.push(leaves, rtree_make_leaf(group));
+                group = []
+            } else {};
+            i = i + 1
+        };
+        if perform Array.length(group) > 0 then {
+            leaves = perform Array.push(leaves, rtree_make_leaf(group))
+        } else {};
+
+        let tree: RTree[CRS, T] = { root: Some(rtree_build_root(leaves, effective_fanout)), crs: crs, size: n, fanout: effective_fanout };
+        tree
+    }
+}
+
+fn rtree_query_node[CRS, T](
+    node: RTreeNode[CRS, T],
+    query: BoundingBox[CRS]
+) -> [T] {
+    match node {
+        RTreeLeaf((bounds, entries)) => {
+            var results: [T] = [];
+            if intersects(bounds, query) then {
+                for entry in entries {
+                    if intersects(entry.bounds, query) then {
+                        results = perform Array.push(results, entry.value)
+                    } else {}
+                }
+            } else {};
+            results
+        },
+        RTreeBranch((bounds, children)) => {
+            var results: [T] = [];
+            if intersects(bounds, query) then {
+                for child in children {
+                    let child_results = rtree_query_node(child, query);
+                    for value in child_results {
+                        results = perform Array.push(results, value)
+                    }
+                }
+            } else {};
+            results
+        },
+    }
+}
+
+/// Return payloads whose entry bounds intersect query.
+///
+/// The shared CRS parameter makes a cross-CRS query a type error.
+pub fn rtree_query_intersects[CRS, T](
+    tree: RTree[CRS, T],
+    query: BoundingBox[CRS]
+) -> [T] {
+    match tree.root {
+        Some(root) => rtree_query_node(root, query),
+        None => [],
+    }
+}
