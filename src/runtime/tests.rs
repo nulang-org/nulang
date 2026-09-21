@@ -386,6 +386,50 @@ fn test_actor_set_priority_changes_scheduling() {
     assert_eq!(rt.scheduler.dequeue(), Some(a));
 }
 
+#[test]
+fn test_anonymous_actor_accepts_untyped_mailbox_delivery_without_handler_alias() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+
+    // Anonymous low-level actors have no declared behavior surface. Preserve
+    // their raw mailbox semantics, but behavior id 0 remains inert because
+    // there is no handler to execute.
+    assert!(rt.actors[&actor_id].behavior_table.is_empty());
+    assert!(rt.actors[&actor_id].bytecode_module.is_none());
+    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+
+    rt.send_message(actor_id, "opaque-runtime-tag", &[Value::int(7)]);
+
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 1);
+    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+
+    rt.run_actor_step(actor_id);
+    assert_eq!(rt.actors[&actor_id].reduction_count, 1);
+    assert!(rt.actors[&actor_id].mailbox.is_empty());
+}
+
+#[test]
+fn test_named_actor_still_rejects_unknown_behavior_without_aliasing_zero() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("known", |_actor, _args| {});
+    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+
+    rt.send_message(actor_id, "typo", &[]);
+    assert!(
+        rt.actors[&actor_id].mailbox.is_empty(),
+        "unknown name must not alias declared behavior id 0"
+    );
+    assert!(rt.scheduler.dequeue().is_none());
+
+    rt.send_message(actor_id, "known", &[]);
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 1);
+    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+}
+
 // ========================================================================
 // Supervisor Tests
 // ========================================================================
