@@ -27,6 +27,9 @@ use crate::bytecode::{
     CodeModule, Constant, DebugFunctionInfo, ForeignFunctionDef, HandlerBinding, HandlerTable,
     Instruction, OpCode,
 };
+use crate::continuation_contract::{
+    ContinuationBoundary, ContinuationLayoutId, ContinuationPointId,
+};
 use crate::mir;
 use crate::types::{NuError, NuResult, PrimitiveType, Span, Type};
 use rustc_hash::FxHashMap;
@@ -71,6 +74,64 @@ struct JumpPatch {
     kind: JumpKind,
 }
 
+/// Artifact-local storage location used to materialize one live value at a
+/// compiler-defined suspension boundary. This is deliberately NOT part of the
+/// portable continuation identity: register/spill placement may change across
+/// backends or recompilations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationCaptureStorage {
+    Register(u8),
+    Spill(u16),
+}
+
+/// One live MIR local that the runtime must materialize before discarding the
+/// current VM/native execution frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuationCaptureSlot {
+    pub local_id: u32,
+    pub semantic_key: String,
+    pub name: Option<String>,
+    pub canonical_type: Vec<u8>,
+    pub capability: String,
+    pub storage: ContinuationCaptureStorage,
+}
+
+/// Compiler-emitted sidecar for one suspension-capable bytecode instruction.
+///
+/// These descriptors are intentionally kept outside `CodeModule` so adding
+/// them does not mutate the frozen NBC v1 metadata body. A future versioned
+/// artifact/Behavior Manifest transport can carry them alongside the artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompilerContinuationPoint {
+    /// Module-absolute bytecode PC of the actual suspension opcode.
+    pub pc: usize,
+    pub callable_name: String,
+    pub boundary: ContinuationBoundary,
+    pub suspension_ordinal: u32,
+    pub point_id: ContinuationPointId,
+    pub layout_id: ContinuationLayoutId,
+    pub resume_local_id: u32,
+    pub resume_storage: ContinuationCaptureStorage,
+    pub live_slots: Vec<ContinuationCaptureSlot>,
+    /// Existing VM handler frames contain table/module indices. Until a
+    /// versioned semantic handler remap lands, hot-patch resume must fail
+    /// closed for functions with effect handler tables.
+    pub requires_handler_remap: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingContinuationPoint {
+    callable_name: String,
+    boundary: ContinuationBoundary,
+    suspension_ordinal: u32,
+    point_id: ContinuationPointId,
+    layout_id: ContinuationLayoutId,
+    resume_local_id: u32,
+    resume_storage: ContinuationCaptureStorage,
+    live_slots: Vec<ContinuationCaptureSlot>,
+    requires_handler_remap: bool,
+}
+
 pub struct MirCodegen {
     module: CodeModule,
     /// Module-wide record field ids, mirroring the stable compiler's layout.
@@ -94,6 +155,10 @@ pub struct MirCodegen {
     /// Cycles through SPILL_TEMP (12), SPILL_TEMP2 (13), SPILL_TEMP3 (14)
     /// so that consecutive spilled reads don't clobber each other.
     spill_read_cycle: u8,
+    /// Continuation metadata emitted alongside, but never inside, NBC v1.
+    continuation_points: Vec<CompilerContinuationPoint>,
+    pending_continuation: Option<PendingContinuationPoint>,
+    current_suspension_ordinal: u32,
 }
 
 impl MirCodegen {
@@ -106,6 +171,9 @@ impl MirCodegen {
             float_locals: Vec::new(),
             spill_map: FxHashMap::default(),
             spill_read_cycle: 0,
+            continuation_points: Vec::new(),
+            pending_continuation: None,
+            current_suspension_ordinal: 0,
         }
     }
 
@@ -222,6 +290,95 @@ impl MirCodegen {
             .add_constant(Constant::String(field.to_string()));
         self.state_field_constants.insert(field.to_string(), idx);
         idx
+    }
+
+    fn continuation_storage(&self, id: mir::LocalId) -> ContinuationCaptureStorage {
+        match self.spill_map.get(&id.0) {
+            Some(slot) => ContinuationCaptureStorage::Spill(*slot),
+            None => ContinuationCaptureStorage::Register((LOCAL_BASE + id.0) as u8),
+        }
+    }
+
+    fn prepare_continuation_point(
+        &mut self,
+        func: &mir::Function,
+        dst: mir::LocalId,
+        boundary: ContinuationBoundary,
+        live_after: &[mir::LocalId],
+    ) {
+        let ordinal = self.current_suspension_ordinal;
+        self.current_suspension_ordinal = self.current_suspension_ordinal.saturating_add(1);
+
+        let point_id = ContinuationPointId::derive(
+            &self.module.name,
+            &func.name,
+            boundary,
+            ordinal,
+        );
+
+        let mut resume_type = Vec::new();
+        if let Some(local) = func.locals.get(dst.0 as usize) {
+            crate::types::write_canonical_type(&local.ty, &mut resume_type);
+        }
+
+        let mut layout = Vec::new();
+        layout.extend_from_slice(b"nulang.compiler-live-layout.v1\0");
+        let mut live_slots = Vec::with_capacity(live_after.len());
+        for id in live_after {
+            let Some(local) = func.locals.get(id.0 as usize) else {
+                continue;
+            };
+            let semantic_key = continuation_local_semantic_key(func, *id);
+            let mut canonical_type = Vec::new();
+            crate::types::write_canonical_type(&local.ty, &mut canonical_type);
+            put_continuation_bytes(&mut layout, semantic_key.as_bytes());
+            put_continuation_bytes(&mut layout, &canonical_type);
+            put_continuation_bytes(&mut layout, local.cap.to_string().as_bytes());
+            live_slots.push(ContinuationCaptureSlot {
+                local_id: id.0,
+                semantic_key,
+                name: local.name.clone(),
+                canonical_type,
+                capability: local.cap.to_string(),
+                storage: self.continuation_storage(*id),
+            });
+        }
+
+        let layout_id = ContinuationLayoutId::derive(point_id, &resume_type, &layout);
+        self.pending_continuation = Some(PendingContinuationPoint {
+            callable_name: func.name.clone(),
+            boundary,
+            suspension_ordinal: ordinal,
+            point_id,
+            layout_id,
+            resume_local_id: dst.0,
+            resume_storage: self.continuation_storage(dst),
+            live_slots,
+            requires_handler_remap: !func.handler_tables.is_empty(),
+        });
+    }
+
+    fn emit_suspension_instruction(&mut self, instr: Instruction) {
+        let pc = self.current_offset();
+        self.emit(instr);
+        if let Some(pending) = self.pending_continuation.take() {
+            self.continuation_points.push(CompilerContinuationPoint {
+                pc,
+                callable_name: pending.callable_name,
+                boundary: pending.boundary,
+                suspension_ordinal: pending.suspension_ordinal,
+                point_id: pending.point_id,
+                layout_id: pending.layout_id,
+                resume_local_id: pending.resume_local_id,
+                resume_storage: pending.resume_storage,
+                live_slots: pending.live_slots,
+                requires_handler_remap: pending.requires_handler_remap,
+            });
+        }
+    }
+
+    pub fn continuation_points(&self) -> &[CompilerContinuationPoint] {
+        &self.continuation_points
     }
 
     pub fn compile_module(&mut self, mir: &mut mir::Module) -> NuResult<&CodeModule> {
@@ -435,6 +592,11 @@ impl MirCodegen {
     }
 
     fn compile_function(&mut self, func: &mir::Function) -> NuResult<usize> {
+        let continuation_start = self.continuation_points.len();
+        self.current_suspension_ordinal = 0;
+        self.pending_continuation = None;
+        let continuation_live_after = continuation_live_after(func);
+
         // Isolate this function's bytecode so block offsets are relative to
         // the function start while still allowing forward jump resolution.
         let mut saved_instructions = Vec::new();
@@ -563,7 +725,11 @@ impl MirCodegen {
                 if let Some(&line) = line_map.get(&(block.id.0, si)) {
                     func_lines.push((self.module.instructions.len(), line));
                 }
-                self.compile_stmt(stmt, func, &mut handle_patches)?;
+                let live_after = continuation_live_after
+                    .get(&(bi, si))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                self.compile_stmt(stmt, func, live_after, &mut handle_patches)?;
                 if let Some(ids) = drop_plan.after_stmt.get(&(bi, si)) {
                     for id in ids {
                         if self.is_spilled(*id) {
@@ -646,6 +812,9 @@ impl MirCodegen {
         self.module.instructions = saved_instructions;
         let code_len = function_code.len();
         self.module.instructions.extend(function_code);
+        for point in &mut self.continuation_points[continuation_start..] {
+            point.pc += function_start;
+        }
 
         // Publish the debugger's pc<->line map and per-function debug info.
         for (rel, line) in func_lines {
@@ -674,12 +843,17 @@ impl MirCodegen {
         &mut self,
         stmt: &mir::Stmt,
         func: &mir::Function,
+        live_after: &[mir::LocalId],
         handle_patches: &mut Vec<(usize, usize)>,
     ) -> NuResult<()> {
         match stmt {
             mir::Stmt::Assign { dst, op } => {
+                if let Some(boundary) = suspension_boundary(op) {
+                    self.prepare_continuation_point(func, *dst, boundary, live_after);
+                }
                 let _spill_dst = self.local_dst(*dst);
                 self.compile_rvalue(_spill_dst, op)?;
+                self.pending_continuation = None;
                 self.spill_write_done(*dst);
             }
             mir::Stmt::StoreFieldNamed { obj, field, src } => {
@@ -982,7 +1156,7 @@ impl MirCodegen {
                 let eff_idx = self
                     .module
                     .add_constant(Constant::String(effect_op.clone()));
-                self.emit(Instruction::new3(
+                self.emit_suspension_instruction(Instruction::new3(
                     OpCode::PerformAsync,
                     ((eff_idx >> 8) & 0xFF) as u8,
                     (eff_idx & 0xFF) as u8,
@@ -991,7 +1165,7 @@ impl MirCodegen {
             }
             mir::RValue::SignalWait { name } => {
                 let name_idx = self.module.add_constant(Constant::String(name.clone()));
-                self.emit(Instruction::new3(
+                self.emit_suspension_instruction(Instruction::new3(
                     OpCode::SignalWait,
                     ((name_idx >> 8) & 0xFF) as u8,
                     (name_idx & 0xFF) as u8,
@@ -1045,7 +1219,7 @@ impl MirCodegen {
                 let spec_idx = self.module.add_constant(Constant::String(spec));
                 let _rtimeout = self.local_reg(*timeout);
                 self.emit(Instruction::new2(OpCode::Move, _rtimeout, SCRATCH0));
-                self.emit(Instruction::new3(
+                self.emit_suspension_instruction(Instruction::new3(
                     OpCode::ReceiveWait,
                     ((spec_idx >> 8) & 0xFF) as u8,
                     (spec_idx & 0xFF) as u8,
@@ -1356,6 +1530,10 @@ impl MirCodegen {
 
     pub fn finish(self) -> CodeModule {
         self.module
+    }
+
+    pub fn finish_with_continuations(self) -> (CodeModule, Vec<CompilerContinuationPoint>) {
+        (self.module, self.continuation_points)
     }
 }
 
@@ -2083,9 +2261,131 @@ fn rvalue_reads(rv: &mir::RValue, out: &mut HashSet<mir::LocalId>) {
 }
 
 pub fn compile_mir(mir: &mut mir::Module, module_name: impl Into<String>) -> NuResult<CodeModule> {
+    let (module, _) = compile_mir_with_continuations(mir, module_name)?;
+    Ok(module)
+}
+
+/// Compile bytecode plus the additive continuation sidecar. The sidecar is not
+/// serialized into NBC v1; callers that need durable/debug deployment metadata
+/// must transport it through a separately versioned manifest.
+pub fn compile_mir_with_continuations(
+    mir: &mut mir::Module,
+    module_name: impl Into<String>,
+) -> NuResult<(CodeModule, Vec<CompilerContinuationPoint>)> {
     let mut codegen = MirCodegen::new(module_name);
     codegen.compile_module(mir)?;
-    Ok(codegen.finish())
+    Ok(codegen.finish_with_continuations())
+}
+
+fn suspension_boundary(rv: &mir::RValue) -> Option<ContinuationBoundary> {
+    match rv {
+        mir::RValue::PerformAsync { effect_op, .. } if effect_op.starts_with("Timer.") => {
+            Some(ContinuationBoundary::Timer)
+        }
+        mir::RValue::PerformAsync { .. } => Some(ContinuationBoundary::Effect),
+        mir::RValue::SignalWait { .. } => Some(ContinuationBoundary::Await),
+        mir::RValue::ReceiveWait { .. } => Some(ContinuationBoundary::Receive),
+        _ => None,
+    }
+}
+
+fn put_continuation_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn continuation_local_semantic_key(func: &mir::Function, id: mir::LocalId) -> String {
+    let index = id.0 as usize;
+    let Some(local) = func.locals.get(index) else {
+        return format!("invalid:{}", id.0);
+    };
+    match &local.name {
+        Some(name) => {
+            let shadow_ordinal = func.locals[..=index]
+                .iter()
+                .filter(|candidate| candidate.name.as_deref() == Some(name.as_str()))
+                .count()
+                .saturating_sub(1);
+            format!("name:{name}#{shadow_ordinal}")
+        }
+        None => format!("temp:{}", id.0),
+    }
+}
+
+/// Conservative backwards liveness used only to decide which semantic values
+/// must be materialized at a suspension boundary. False positives make a
+/// continuation layout stricter; false negatives would be unsafe, so block
+/// joins use may-liveness.
+fn continuation_live_after(
+    func: &mir::Function,
+) -> FxHashMap<(usize, usize), Vec<mir::LocalId>> {
+    let nblocks = func.blocks.len();
+    let mut block_defs: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
+    let mut block_uses: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
+
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for stmt in &block.stmts {
+            for (u, _) in stmt_uses(stmt) {
+                block_uses[bi].insert(u);
+            }
+            if let mir::Stmt::Assign { dst, .. } = stmt {
+                block_defs[bi].insert(dst.0 as usize);
+            }
+        }
+        for (u, _) in terminator_uses(&block.terminator) {
+            block_uses[bi].insert(u);
+        }
+    }
+
+    let mut live_in: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
+    let mut live_out: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
+    loop {
+        let mut changed = false;
+        for bi in (0..nblocks).rev() {
+            let mut out = HashSet::new();
+            for succ in terminator_successors(&func.blocks[bi].terminator) {
+                out.extend(live_in[succ].iter().copied());
+            }
+            let mut inset = out.clone();
+            for d in &block_defs[bi] {
+                inset.remove(d);
+            }
+            inset.extend(block_uses[bi].iter().copied());
+            if inset != live_in[bi] || out != live_out[bi] {
+                live_in[bi] = inset;
+                live_out[bi] = out;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut result = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let mut live = live_out[bi].clone();
+        for (u, _) in terminator_uses(&block.terminator) {
+            live.insert(u);
+        }
+        for (si, stmt) in block.stmts.iter().enumerate().rev() {
+            let mut ids: Vec<_> = live
+                .iter()
+                .filter_map(|idx| func.locals.get(*idx).map(|local| local.id))
+                .collect();
+            ids.sort();
+            ids.dedup();
+            result.insert((bi, si), ids);
+
+            if let mir::Stmt::Assign { dst, .. } = stmt {
+                live.remove(&(dst.0 as usize));
+            }
+            for (u, _) in stmt_uses(stmt) {
+                live.insert(u);
+            }
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -2559,6 +2859,22 @@ mod tests {
         let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
         let mut mir = crate::mir_lower::lower_module(&hir)?;
         compile_mir(&mut mir, "test")
+    }
+
+    fn compile_mir_source_with_continuations(
+        source: &str,
+    ) -> NuResult<(CodeModule, Vec<CompilerContinuationPoint>)> {
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.lex()?;
+        let mut parser = Parser::new(tokens);
+        let ast = parser.parse_module()?;
+
+        let mut type_checker = TypeChecker::new();
+        type_checker.check_module(&ast)?;
+
+        let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir)?;
+        compile_mir_with_continuations(&mut mir, "test")
     }
 
     fn run_mir_source(source: &str) -> NuResult<crate::vm::Value> {
@@ -3069,6 +3385,48 @@ mod tests {
             Some(36),
             "nested module's function should be reachable unqualified"
         );
+    }
+
+    #[test]
+    fn test_receive_after_emits_portable_continuation_sidecar_at_exact_pc() {
+        let source =
+            "let keep = 41 in let received = receive { | Msg(x) => x } after 100 => 0 in keep + received";
+        let (module, points) = compile_mir_source_with_continuations(source).unwrap();
+        let point = points
+            .iter()
+            .find(|point| point.boundary == ContinuationBoundary::Receive)
+            .expect("receive-after must emit a continuation descriptor");
+
+        assert_eq!(module.instructions[point.pc].opcode, OpCode::ReceiveWait);
+        assert!(
+            point.live_slots.iter().any(|slot| slot.name.as_deref() == Some("keep")),
+            "a local used after suspension must be materialized: {:?}",
+            point.live_slots
+        );
+        assert!(
+            point.live_slots.iter().any(|slot| slot.name.as_deref() == Some("received")),
+            "the resume destination is live after the suspension: {:?}",
+            point.live_slots
+        );
+    }
+
+    #[test]
+    fn test_continuation_ids_are_deterministic_but_not_part_of_nbc_v1() {
+        let source = "receive { | Msg(x) => x } after 100 => 0";
+        let (module_a, points_a) = compile_mir_source_with_continuations(source).unwrap();
+        let (module_b, points_b) = compile_mir_source_with_continuations(source).unwrap();
+        assert_eq!(points_a, points_b);
+        assert!(!points_a.is_empty());
+
+        // Existing compile_mir remains byte-for-byte NBC-compatible because
+        // the sidecar is not a CodeModule field.
+        let plain = compile_mir_source(source).unwrap();
+        assert_eq!(
+            module_a.to_nbc(None).unwrap(),
+            plain.to_nbc(None).unwrap(),
+            "continuation descriptors must not mutate frozen NBC v1"
+        );
+        assert_eq!(module_a, module_b);
     }
 
     #[test]
