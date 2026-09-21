@@ -817,7 +817,19 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, Some(name))
+        let id = spawn::spawn_actor_with_models(self, init, state_models, true, Some(name));
+        if let Err(error) = spawn::persist_new_workflow(self, id, name) {
+            tracing::warn!(
+                actor_id = id,
+                workflow = name,
+                %error,
+                "refusing to activate direct workflow without a lossless durable start record"
+            );
+            self.remove_actor_reaping(id);
+            return id;
+        }
+        self.enqueue_actor(id);
+        id
     }
 
     /// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with
@@ -1975,15 +1987,29 @@ impl Runtime {
             self.current_actor = Some(actor_id);
             if self.actor_is_persistent(actor_id) {
                 let seq = self.next_sequence(actor_id);
-                let payload = args.iter().map(PersistedValue::from_value).collect();
-                let _ = self.persistence.append_journal(
-                    actor_id,
-                    JournalEntry {
-                        sequence: seq,
-                        behavior_id,
-                        payload,
-                    },
-                );
+                let payload = args
+                    .iter()
+                    .map(PersistedValue::try_from_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| NuError::VMError {
+                        msg: format!(
+                            "refusing persistent actor call with unsupported journal payload: {error}"
+                        ),
+                        span: Span::default(),
+                    })?;
+                self.persistence
+                    .append_journal(
+                        actor_id,
+                        JournalEntry {
+                            sequence: seq,
+                            behavior_id,
+                            payload,
+                        },
+                    )
+                    .map_err(|error| NuError::VMError {
+                        msg: format!("persistent actor journal write failed: {error}"),
+                        span: Span::default(),
+                    })?;
             }
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 handler(actor, args);
@@ -3166,27 +3192,20 @@ impl Runtime {
                     .copied()
                     .unwrap_or(StateModel::Local);
                 if model == StateModel::Durable || model.is_crdt() {
-                    let persisted = if name == "semantic_memory" || name == "procedural_memory" {
-                        #[cfg(feature = "ai-runtime")]
-                        {
-                            self.vm_value_to_string_in_actor(value, actor)
-                                .map(PersistedValue::String)
-                                .unwrap_or_else(|| {
-                                    PersistedValue::from_value_resolved(
-                                        value,
-                                        actor.bytecode_module.as_ref(),
-                                    )
-                                })
+                    let persisted = match PersistedValue::try_from_value_resolved(
+                        value,
+                        actor.bytecode_module.as_ref(),
+                    ) {
+                        Ok(persisted) => persisted,
+                        Err(error) => {
+                            warn!(
+                                actor_id,
+                                field = %name,
+                                %error,
+                                "nulang-persist: refusing snapshot with unsupported durable value"
+                            );
+                            return None;
                         }
-                        #[cfg(not(feature = "ai-runtime"))]
-                        {
-                            PersistedValue::from_value_resolved(
-                                value,
-                                actor.bytecode_module.as_ref(),
-                            )
-                        }
-                    } else {
-                        PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
                     };
                     state.insert(name.clone(), persisted);
                 }
@@ -3609,17 +3628,9 @@ impl Runtime {
             let behavior_name = self.step_name_for(actor_id, behavior_idx);
             #[cfg(feature = "ai-runtime")]
             if self.actor_is_agent(actor_id) && self.is_semantic_memory_behavior(&behavior_name) {
-                if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
+                if !self.journal_persistent_message(actor_id, msg.behavior_id, &msg.payload) {
+                    self.reject_unjournalable_message(actor_id, &msg);
+                    return;
                 }
                 let content = msg
                     .payload
@@ -3645,17 +3656,9 @@ impl Runtime {
             // Intercept procedural-memory behaviors generated by compile_agent.
             #[cfg(feature = "ai-runtime")]
             if self.actor_is_agent(actor_id) && self.is_procedural_memory_behavior(&behavior_name) {
-                if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
+                if !self.journal_persistent_message(actor_id, msg.behavior_id, &msg.payload) {
+                    self.reject_unjournalable_message(actor_id, &msg);
+                    return;
                 }
                 match behavior_name.as_str() {
                     "store_pattern" => {
@@ -3813,17 +3816,9 @@ impl Runtime {
             if let Some(handler) = handler_fn {
                 if !is_placeholder {
                     // Journal the message before handling so recovery can replay it.
-                    if self.actor_is_persistent(actor_id) {
-                        let seq = self.next_sequence(actor_id);
-                        let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                        let _ = self.persistence.append_journal(
-                            actor_id,
-                            JournalEntry {
-                                sequence: seq,
-                                behavior_id: msg.behavior_id,
-                                payload,
-                            },
-                        );
+                    if !self.journal_persistent_message(actor_id, msg.behavior_id, &msg.payload) {
+                        self.reject_unjournalable_message(actor_id, &msg);
+                        return;
                     }
                     let actor = match self.actors.get_mut(&actor_id) {
                         Some(a) => a,
@@ -3850,17 +3845,9 @@ impl Runtime {
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
                 // Journal before executing bytecode as well.
-                if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
+                if !self.journal_persistent_message(actor_id, msg.behavior_id, &msg.payload) {
+                    self.reject_unjournalable_message(actor_id, &msg);
+                    return;
                 }
                 let payload = msg.payload.clone();
                 // Enable non-blocking LLM suspension for this
@@ -3982,6 +3969,77 @@ impl Runtime {
             .get(&actor_id)
             .map(|a| a.persistent)
             .unwrap_or(false)
+    }
+
+    /// Persist one actor turn before executing it.
+    ///
+    /// Message payloads deliberately use the module-free encoder: a bare
+    /// string-pool id does not carry enough provenance to prove which module
+    /// owns that id, so durable admission rejects it instead of risking a
+    /// cross-module reinterpretation. Heap strings carry their content and are
+    /// safe to persist.
+    fn journal_persistent_message(
+        &mut self,
+        actor_id: u64,
+        behavior_id: u16,
+        payload: &[Value],
+    ) -> bool {
+        if !self.actor_is_persistent(actor_id) {
+            return true;
+        }
+
+        let sequence = self.next_sequence(actor_id);
+        let payload = match payload
+            .iter()
+            .map(PersistedValue::try_from_value)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    actor_id,
+                    behavior_id,
+                    %error,
+                    "nulang-persist: refusing actor turn with unsupported journal payload"
+                );
+                return false;
+            }
+        };
+
+        if let Err(error) = self.persistence.append_journal(
+            actor_id,
+            JournalEntry {
+                sequence,
+                behavior_id,
+                payload,
+            },
+        ) {
+            warn!(
+                actor_id,
+                behavior_id,
+                %error,
+                "nulang-persist: refusing actor turn after journal write failure"
+            );
+            return false;
+        }
+
+        true
+    }
+
+    /// Consume a message that failed durable admission without letting later
+    /// mailbox work become stranded. The rejected turn is routed to the DLQ
+    /// and the actor is re-enqueued when more messages remain.
+    fn reject_unjournalable_message(&mut self, actor_id: u64, msg: &Message) {
+        self.route_to_dlq(msg, "durable journal admission failed");
+        let has_more = self
+            .actors
+            .get(&actor_id)
+            .map(|actor| !actor.mailbox.is_empty())
+            .unwrap_or(false);
+        if has_more {
+            self.enqueue_actor(actor_id);
+        }
+        self.current_actor = None;
     }
 
     fn actor_is_workflow(&self, actor_id: u64) -> bool {
@@ -4654,7 +4712,7 @@ impl Runtime {
     /// The snapshot is skipped entirely when no fields have changed since
     /// the last checkpoint (dirty-bit optimization).
     pub fn checkpoint_actor(&mut self, actor_id: u64) {
-        workflow::checkpoint_actor(self, actor_id)
+        let _ = workflow::checkpoint_actor(self, actor_id);
     }
 
     /// Persist only the suspension marker of a persistent actor whose
