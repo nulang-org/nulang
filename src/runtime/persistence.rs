@@ -202,6 +202,48 @@ impl Default for ActorSnapshot {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRevision {
+    pub actor_id: u64,
+    pub sequence: u64,
+    pub schema_owner: Option<String>,
+    pub schema_version: u32,
+}
+
+impl SnapshotRevision {
+    pub fn from_snapshot(snapshot: &ActorSnapshot) -> Self {
+        Self {
+            actor_id: snapshot.actor_id,
+            sequence: snapshot.sequence,
+            schema_owner: snapshot.schema_owner.clone(),
+            schema_version: snapshot.schema_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotCasResult {
+    Committed,
+    Conflict,
+    Unsupported,
+}
+
+fn validate_snapshot_cas_request(
+    expected: &SnapshotRevision,
+    replacement: &ActorSnapshot,
+) -> io::Result<()> {
+    if expected.actor_id != replacement.actor_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "snapshot CAS actor mismatch: expected actor {}, replacement actor {}",
+                expected.actor_id, replacement.actor_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// A journal entry records a message delivered to an actor.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JournalEntry {
@@ -317,6 +359,23 @@ pub trait PersistenceStore: Send + Sync {
     /// commit-before-publication boundary. Built-in file stores use
     /// temp-file + rename and SQL stores use one atomic upsert statement.
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()>;
+
+    /// Atomically replace an existing snapshot only when its durable revision
+    /// still matches `expected`.
+    ///
+    /// The revision deliberately excludes state bytes: migration fencing cares
+    /// about the durable ordering/schema identity that was actually read and
+    /// transformed. Backends unable to provide a real concurrent conditional
+    /// write must return `Unsupported` rather than emulate CAS with
+    /// read-then-write.
+    fn compare_and_swap_snapshot(
+        &mut self,
+        expected: &SnapshotRevision,
+        replacement: ActorSnapshot,
+    ) -> io::Result<SnapshotCasResult> {
+        validate_snapshot_cas_request(expected, &replacement)?;
+        Ok(SnapshotCasResult::Unsupported)
+    }
 
     /// Load the latest snapshot for an actor, if any.
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot>;
@@ -486,6 +545,25 @@ impl PersistenceStore for MemoryStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
         self.snapshots.insert(snapshot.actor_id, snapshot);
         Ok(())
+    }
+
+    fn compare_and_swap_snapshot(
+        &mut self,
+        expected: &SnapshotRevision,
+        replacement: ActorSnapshot,
+    ) -> io::Result<SnapshotCasResult> {
+        validate_snapshot_cas_request(expected, &replacement)?;
+        let matches = self
+            .snapshots
+            .get(&expected.actor_id)
+            .map(SnapshotRevision::from_snapshot)
+            .as_ref()
+            == Some(expected);
+        if !matches {
+            return Ok(SnapshotCasResult::Conflict);
+        }
+        self.snapshots.insert(replacement.actor_id, replacement);
+        Ok(SnapshotCasResult::Committed)
     }
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
@@ -1095,6 +1173,57 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn compare_and_swap_snapshot(
+        &mut self,
+        expected: &SnapshotRevision,
+        replacement: ActorSnapshot,
+    ) -> io::Result<SnapshotCasResult> {
+        validate_snapshot_cas_request(expected, &replacement)?;
+        let state_json = serde_json::to_string(&replacement.state)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let crdt_json = serde_json::to_string(&replacement.crdt_snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let crdt_field_map_json = serde_json::to_string(&replacement.crdt_field_map)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let authority_json = serde_json::to_string(&replacement.authority_tokens)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let changed = conn
+                .execute(
+                    "UPDATE snapshots
+                     SET sequence = ?1, schema_owner = ?2, schema_version = ?3,
+                         state = ?4, waiting_signal = ?5, crdt_snapshot = ?6,
+                         crdt_field_map = ?7, authority_tokens = ?8
+                     WHERE actor_id = ?9
+                       AND sequence = ?10
+                       AND schema_owner IS ?11
+                       AND schema_version = ?12",
+                    libsql::params![
+                        replacement.sequence as i64,
+                        replacement.schema_owner.as_deref(),
+                        replacement.schema_version as i64,
+                        state_json,
+                        replacement.waiting_signal.as_deref(),
+                        crdt_json.as_str(),
+                        crdt_field_map_json.as_str(),
+                        authority_json.as_str(),
+                        expected.actor_id as i64,
+                        expected.sequence as i64,
+                        expected.schema_owner.as_deref(),
+                        expected.schema_version as i64
+                    ],
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            Ok(if changed == 1 {
+                SnapshotCasResult::Committed
+            } else {
+                SnapshotCasResult::Conflict
+            })
+        })
+    }
+
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -1496,6 +1625,42 @@ impl PersistenceStore for RocksDbStore {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 
+    fn compare_and_swap_snapshot(
+        &mut self,
+        expected: &SnapshotRevision,
+        replacement: ActorSnapshot,
+    ) -> io::Result<SnapshotCasResult> {
+        validate_snapshot_cas_request(expected, &replacement)?;
+        let cf = self.cf(Self::CF_SNAPSHOTS)?;
+        let key = Self::actor_key(expected.actor_id);
+        let Some(current_bytes) = self
+            .db
+            .get_cf(cf, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        else {
+            return Ok(SnapshotCasResult::Conflict);
+        };
+        let current: ActorSnapshot = serde_json::from_slice(&current_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if SnapshotRevision::from_snapshot(&current) != *expected {
+            return Ok(SnapshotCasResult::Conflict);
+        }
+
+        // rocksdb::DB owns an exclusive database lock for writable opens, and
+        // PersistenceStore mutation requires &mut self. Within that
+        // single-writer domain the compare + put is fenced from competing
+        // writers; WAL sync preserves the committed replacement on crash.
+        let json = serde_json::to_string(&replacement)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.db
+            .put_cf(cf, key, json.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(SnapshotCasResult::Committed)
+    }
+
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let cf = self.cf(Self::CF_SNAPSHOTS).ok()?;
         let bytes = self.db.get_cf(cf, Self::actor_key(actor_id)).ok()??;
@@ -1823,6 +1988,54 @@ impl PersistenceStore for PostgresStore {
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(())
+    }
+
+    fn compare_and_swap_snapshot(
+        &mut self,
+        expected: &SnapshotRevision,
+        replacement: ActorSnapshot,
+    ) -> io::Result<SnapshotCasResult> {
+        validate_snapshot_cas_request(expected, &replacement)?;
+        let state_json = serde_json::to_string(&replacement.state)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let crdt_json = serde_json::to_string(&replacement.crdt_snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let crdt_field_map_json = serde_json::to_string(&replacement.crdt_field_map)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let authority_json = serde_json::to_string(&replacement.authority_tokens)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE snapshots
+                 SET sequence = $1, schema_owner = $2, schema_version = $3,
+                     state = $4, waiting_signal = $5, crdt_snapshot = $6,
+                     crdt_field_map = $7, authority_tokens = $8
+                 WHERE actor_id = $9
+                   AND sequence = $10
+                   AND schema_owner IS NOT DISTINCT FROM $11
+                   AND schema_version = $12",
+                &[
+                    &(replacement.sequence as i64),
+                    &replacement.schema_owner.as_deref(),
+                    &(replacement.schema_version as i64),
+                    &state_json,
+                    &replacement.waiting_signal.as_deref(),
+                    &crdt_json.as_str(),
+                    &crdt_field_map_json.as_str(),
+                    &authority_json.as_str(),
+                    &(expected.actor_id as i64),
+                    &(expected.sequence as i64),
+                    &expected.schema_owner.as_deref(),
+                    &(expected.schema_version as i64),
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(if changed == 1 {
+            SnapshotCasResult::Committed
+        } else {
+            SnapshotCasResult::Conflict
+        })
     }
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
