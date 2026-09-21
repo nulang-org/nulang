@@ -635,6 +635,7 @@ impl From<RuntimeArtifactManifestError> for ArtifactStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytecode::{ActorMeta, CodeModule};
     use crate::content_identity::{SemanticId, SourceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -672,6 +673,37 @@ mod tests {
             "bytecode",
             ["opt=0"],
         )
+    }
+
+    fn runtime_module(
+        identity: &ArtifactIdentityManifest,
+        definition: SemanticId,
+    ) -> CodeModule {
+        let mut module = CodeModule::new("retained-runtime");
+        module.semantic_id = Some(identity.semantic_id());
+        module.artifact_id = Some(identity.artifact_id());
+        module.actor_metadata.push(ActorMeta {
+            name: "Counter".to_string(),
+            persistent: true,
+            state_models: vec![],
+            state_defaults: vec![],
+            behavior_indices: vec![],
+            type_hash: None,
+            version: 1,
+            migrations: String::new(),
+            is_workflow: false,
+            is_agent: false,
+            is_organization: false,
+            is_virtual: false,
+            tools: vec![],
+            semantic_memory_dimensions: None,
+            procedural_memory_namespace: None,
+            backend: crate::ast::ActorBackendKind::Native,
+            fallback_config: String::new(),
+            retry_config: String::new(),
+        });
+        module.actor_semantic_ids.push(definition);
+        module
     }
 
     #[test]
@@ -759,5 +791,119 @@ mod tests {
             Err(ArtifactStoreError::NotFound(missing)) if missing == id
         ));
         assert!(!store.contains_verified(id).unwrap());
+    }
+
+    #[test]
+    fn runtime_sidecar_rehydrates_frozen_nbc_identity() {
+        let dir = TestDir::new();
+        let store = FileArtifactStore::new(&dir.0);
+        let identity = manifest(b"source");
+        let definition = SemanticId::from_canonical_bytes(b"counter-definition", []);
+        let module = runtime_module(&identity, definition);
+        let runtime_manifest =
+            RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
+        let bytes = module.to_nbc(None).unwrap();
+
+        let outcome = store
+            .retain_runtime(&identity, &runtime_manifest, &bytes)
+            .unwrap();
+        assert_eq!(outcome.artifact, RetainOutcome::Stored);
+        assert_eq!(outcome.runtime_manifest, RetainOutcome::Stored);
+
+        let restored = store.load_identified_module(identity.artifact_id()).unwrap();
+        assert_eq!(restored.semantic_id, Some(identity.semantic_id()));
+        assert_eq!(restored.artifact_id, Some(identity.artifact_id()));
+        assert_eq!(restored.actor_semantic_ids, vec![definition]);
+    }
+
+    #[test]
+    fn runtime_sidecar_is_idempotent_across_source_only_changes() {
+        let dir = TestDir::new();
+        let store = FileArtifactStore::new(&dir.0);
+        let first = manifest(b"format-a");
+        let reformatted = manifest(b"format-b");
+        assert_eq!(first.artifact_id(), reformatted.artifact_id());
+
+        let definition = SemanticId::from_canonical_bytes(b"counter-definition", []);
+        let module = runtime_module(&first, definition);
+        let runtime_manifest =
+            RuntimeArtifactManifest::from_module(&module, &first).unwrap();
+        let bytes = module.to_nbc(None).unwrap();
+
+        store
+            .retain_runtime(&first, &runtime_manifest, &bytes)
+            .unwrap();
+        let repeated = store
+            .retain_runtime(&reformatted, &runtime_manifest, &bytes)
+            .unwrap();
+        assert_eq!(repeated.artifact, RetainOutcome::AlreadyPresent);
+        assert_eq!(repeated.runtime_manifest, RetainOutcome::AlreadyPresent);
+    }
+
+    #[test]
+    fn conflicting_runtime_sidecar_fails_closed() {
+        let dir = TestDir::new();
+        let store = FileArtifactStore::new(&dir.0);
+        let identity = manifest(b"source");
+        let first_definition = SemanticId::from_canonical_bytes(b"definition-a", []);
+        let second_definition = SemanticId::from_canonical_bytes(b"definition-b", []);
+
+        let first_module = runtime_module(&identity, first_definition);
+        let first_manifest =
+            RuntimeArtifactManifest::from_module(&first_module, &identity).unwrap();
+        let bytes = first_module.to_nbc(None).unwrap();
+        store
+            .retain_runtime(&identity, &first_manifest, &bytes)
+            .unwrap();
+
+        let second_module = runtime_module(&identity, second_definition);
+        let second_manifest =
+            RuntimeArtifactManifest::from_module(&second_module, &identity).unwrap();
+        assert!(matches!(
+            store.retain_runtime_manifest(&second_manifest),
+            Err(ArtifactStoreError::RuntimeManifestCollision { artifact_id })
+                if artifact_id == identity.artifact_id()
+        ));
+    }
+
+    #[test]
+    fn tampered_runtime_sidecar_fails_verification() {
+        let dir = TestDir::new();
+        let store = FileArtifactStore::new(&dir.0);
+        let identity = manifest(b"source");
+        let definition = SemanticId::from_canonical_bytes(b"counter-definition", []);
+        let module = runtime_module(&identity, definition);
+        let runtime_manifest =
+            RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
+        store
+            .retain_runtime(&identity, &runtime_manifest, &module.to_nbc(None).unwrap())
+            .unwrap();
+
+        let path = store.runtime_manifest_path(identity.artifact_id());
+        let mut record = fs::read(&path).unwrap();
+        *record.last_mut().unwrap() ^= 0x01;
+        fs::write(path, record).unwrap();
+
+        assert!(matches!(
+            store.load_runtime_manifest(identity.artifact_id()),
+            Err(ArtifactStoreError::RuntimeManifestDigestMismatch { artifact_id })
+                if artifact_id == identity.artifact_id()
+        ));
+    }
+
+    #[test]
+    fn runtime_loading_requires_sidecar_instead_of_guessing() {
+        let dir = TestDir::new();
+        let store = FileArtifactStore::new(&dir.0);
+        let identity = manifest(b"source");
+        let definition = SemanticId::from_canonical_bytes(b"counter-definition", []);
+        let module = runtime_module(&identity, definition);
+        store.retain(&identity, &module.to_nbc(None).unwrap()).unwrap();
+
+        assert!(matches!(
+            store.load_identified_module(identity.artifact_id()),
+            Err(ArtifactStoreError::RuntimeManifestNotFound(artifact_id))
+                if artifact_id == identity.artifact_id()
+        ));
     }
 }
