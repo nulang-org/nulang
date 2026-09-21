@@ -1965,13 +1965,14 @@ fn test_memory_store_latest_sequence() {
 #[test]
 fn test_libsql_store_save_load_snapshot() {
     let mut store = LibsqlStore::in_memory().unwrap();
+    let artifact_id = "44".repeat(32);
     let mut state = HashMap::new();
     state.insert("count".to_string(), PersistedValue::Int(42));
     let snapshot = ActorSnapshot {
         actor_id: 1,
         sequence: 3,
         semantic_id: None,
-        artifact_id: None,
+        artifact_id: Some(artifact_id.clone()),
         state,
         waiting_signal: None,
         crdt_snapshot: None,
@@ -1983,6 +1984,7 @@ fn test_libsql_store_save_load_snapshot() {
     let loaded = store.load_snapshot(1).unwrap();
     assert_eq!(loaded.actor_id, 1);
     assert_eq!(loaded.sequence, 3);
+    assert_eq!(loaded.artifact_id.as_deref(), Some(artifact_id.as_str()));
     assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
 }
 
