@@ -99,7 +99,7 @@ pub fn decode_protocol_actor_ref_for(
 /// makes a received descriptor safe to place in a local ProtocolRegistry after
 /// transport/authentication policy accepts its source.
 pub fn encode_protocol_schema(schema: &ProtocolSchema) -> Result<Vec<u8>, ProtocolWireError> {
-    if schema.name.as_bytes().len() > MAX_PROTOCOL_SCHEMA_NAME_BYTES {
+    if schema.name.len() > MAX_PROTOCOL_SCHEMA_NAME_BYTES {
         return Err(ProtocolWireError::SchemaLimitExceeded("schema name"));
     }
 
@@ -116,7 +116,7 @@ pub fn encode_protocol_schema(schema: &ProtocolSchema) -> Result<Vec<u8>, Protoc
 
     put_u32(&mut out, members.len())?;
     for member in members {
-        if member.behavior.as_bytes().len() > MAX_PROTOCOL_BEHAVIOR_NAME_BYTES {
+        if member.behavior.len() > MAX_PROTOCOL_BEHAVIOR_NAME_BYTES {
             return Err(ProtocolWireError::SchemaLimitExceeded("behavior name"));
         }
         if member.params.len() > MAX_PROTOCOL_MEMBER_PARAMS {
@@ -216,7 +216,7 @@ fn put_u32(out: &mut Vec<u8>, value: usize) -> Result<(), ProtocolWireError> {
 }
 
 fn put_string(out: &mut Vec<u8>, value: &str) -> Result<(), ProtocolWireError> {
-    put_u32(out, value.as_bytes().len())?;
+    put_u32(out, value.len())?;
     out.extend_from_slice(value.as_bytes());
     Ok(())
 }
