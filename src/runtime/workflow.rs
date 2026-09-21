@@ -10,7 +10,7 @@ use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{ActorSnapshot, EventEntry, PersistedValue, WorkflowEvent};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
-use crate::vm::{Frame, VM, Value};
+use crate::vm::{Frame, Value, VM};
 
 // ---------------------------------------------------------------------------
 // Utility predicates
