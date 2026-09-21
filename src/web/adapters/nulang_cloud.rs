@@ -122,10 +122,17 @@ pub fn admit_behavior_manifest(
         });
     }
 
-    // Compiler output should contain one replay contract per effect. Refuse
-    // incomplete/ambiguous metadata rather than guessing from EffectEntry.
+    // Compiler output should contain exactly one replay contract per effect.
+    // Refuse duplicate/incomplete metadata rather than guessing from the first
+    // matching entry.
     let effect_names: BTreeSet<_> = manifest.effects.iter().map(|e| e.effect.as_str()).collect();
+    if effect_names.len() != manifest.effects.len() {
+        return Err(CloudAdmissionError::DuplicateEffectInventory);
+    }
     let replay_names: BTreeSet<_> = manifest.replay.iter().map(|e| e.effect.as_str()).collect();
+    if replay_names.len() != manifest.replay.len() {
+        return Err(CloudAdmissionError::DuplicateReplayInventory);
+    }
     if effect_names != replay_names {
         let missing = effect_names
             .difference(&replay_names)
@@ -223,6 +230,8 @@ pub enum CloudAdmissionError {
         expected: String,
         actual: String,
     },
+    DuplicateEffectInventory,
+    DuplicateReplayInventory,
     ReplayInventoryMismatch {
         missing: Vec<String>,
         unknown: Vec<String>,
@@ -254,6 +263,12 @@ impl fmt::Display for CloudAdmissionError {
                 f,
                 "Behavior Manifest artifact digest mismatch: manifest {expected}, artifact {actual}"
             ),
+            Self::DuplicateEffectInventory => {
+                write!(f, "Behavior Manifest contains duplicate effect entries")
+            }
+            Self::DuplicateReplayInventory => {
+                write!(f, "Behavior Manifest contains duplicate replay entries")
+            }
             Self::ReplayInventoryMismatch { missing, unknown } => write!(
                 f,
                 "Behavior Manifest replay inventory mismatch: missing={missing:?}, unknown={unknown:?}"
@@ -416,6 +431,21 @@ mod tests {
             &CloudAdmissionPolicy::contract_verification_only(),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn duplicate_replay_contract_is_rejected() {
+        let bytes = b"artifact";
+        let mut manifest = manifest_for(bytes);
+        manifest.replay.push(manifest.replay[0].clone());
+        let err = admit_behavior_manifest(
+            &manifest,
+            ArtifactKind::Bytecode,
+            bytes,
+            &CloudAdmissionPolicy::contract_verification_only(),
+        )
+        .unwrap_err();
+        assert_eq!(err, CloudAdmissionError::DuplicateReplayInventory);
     }
 
     #[test]
