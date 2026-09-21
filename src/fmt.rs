@@ -171,6 +171,7 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             behaviors,
             state_fields,
+            indexes,
             ..
         } => {
             out.push_str(&format!("{}actor {} {{\n", sp, name));
@@ -180,7 +181,20 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
                 fmt_expr(out, fdef, indent + 4, had_unhandled);
                 out.push('\n');
             }
-            if !state_fields.is_empty() && !behaviors.is_empty() {
+            for index in indexes {
+                out.push_str(&format!("{}    ", sp));
+                if index.unique {
+                    out.push_str("unique ");
+                }
+                out.push_str(&format!("index {}", index.name));
+                if !(index.fields.len() == 1 && index.fields[0] == index.name) {
+                    out.push_str(" { ");
+                    out.push_str(&index.fields.join(", "));
+                    out.push_str(" }");
+                }
+                out.push('\n');
+            }
+            if (!state_fields.is_empty() || !indexes.is_empty()) && !behaviors.is_empty() {
                 out.push('\n');
             }
             for (i, b) in behaviors.iter().enumerate() {
