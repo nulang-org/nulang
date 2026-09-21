@@ -12,7 +12,9 @@ use crate::migration_manifest::MigrationManifest;
 use crate::runtime::actor::Actor;
 use crate::runtime::heap::{ActorHeap, TypeTag};
 use crate::runtime::persistence::{ActorSnapshot, PersistedValue, StateModel};
-use crate::vm::{ActorVmCallbacks, DistributedVmCallbacks, PerformAsyncResult, SignalWaitResult, Value, VM};
+use crate::vm::{
+    ActorVmCallbacks, DistributedVmCallbacks, PerformAsyncResult, SignalWaitResult, Value, VM,
+};
 
 /// Durable-history facts gathered by the caller before attempting a state-only
 /// migration. V1 deliberately refuses histories that would need semantic replay
@@ -123,11 +125,7 @@ impl ActorVmCallbacks for MigrationActorCallbacks {
     }
 
     fn get_state_field(&self, field: &str) -> Value {
-        unsafe {
-            (*self.actor)
-                .get_state_field(field)
-                .unwrap_or(Value::nil())
-        }
+        unsafe { (*self.actor).get_state_field(field).unwrap_or(Value::nil()) }
     }
 
     fn set_state_field(&mut self, field: &str, value: Value) {
@@ -154,16 +152,19 @@ impl ActorVmCallbacks for MigrationActorCallbacks {
         _behavior_idx: usize,
         _init: Vec<(String, Value)>,
     ) -> Value {
-        self.violation.record("migration attempted to spawn an actor");
+        self.violation
+            .record("migration attempted to spawn an actor");
         Value::actor_ref(0)
     }
 
     fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {
-        self.violation.record("migration attempted to send an actor message");
+        self.violation
+            .record("migration attempted to send an actor message");
     }
 
     fn ask_actor(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) -> Value {
-        self.violation.record("migration attempted to ask another actor");
+        self.violation
+            .record("migration attempted to ask another actor");
         Value::nil()
     }
 
@@ -201,8 +202,9 @@ impl ActorVmCallbacks for MigrationActorCallbacks {
     }
 
     fn complete_llm(&mut self, model: &str, _prompt: &str) -> Option<String> {
-        self.violation
-            .record(format!("migration attempted LLM request using model '{model}'"));
+        self.violation.record(format!(
+            "migration attempted LLM request using model '{model}'"
+        ));
         None
     }
 
@@ -404,7 +406,11 @@ pub(crate) fn validated_manifest(
     Ok(Some(manifest))
 }
 
-fn persist_migrated_value(actor: &Actor, field: &str, value: &Value) -> Result<PersistedValue, String> {
+fn persist_migrated_value(
+    actor: &Actor,
+    field: &str,
+    value: &Value,
+) -> Result<PersistedValue, String> {
     if let Some(ptr) = value.as_ptr() {
         if ptr.is_null() {
             return Ok(PersistedValue::String(String::new()));
@@ -529,18 +535,20 @@ pub(crate) fn migrate_snapshot_state(
             meta.version
         )
     })?;
-    let plan = manifest.plan_from(snapshot.schema_version).map_err(|error| {
-        format!(
-            "persisted {}@v{} cannot be migrated to {}@v{}: {error}",
-            snapshot
-                .schema_owner
-                .as_deref()
-                .unwrap_or(meta.name.as_str()),
-            snapshot.schema_version,
-            meta.name,
-            meta.version
-        )
-    })?;
+    let plan = manifest
+        .plan_from(snapshot.schema_version)
+        .map_err(|error| {
+            format!(
+                "persisted {}@v{} cannot be migrated to {}@v{}: {error}",
+                snapshot
+                    .schema_owner
+                    .as_deref()
+                    .unwrap_or(meta.name.as_str()),
+                snapshot.schema_version,
+                meta.name,
+                meta.version
+            )
+        })?;
 
     for step in &plan {
         if !step.event_transforms.is_empty() {
@@ -642,10 +650,7 @@ pub(crate) fn migrate_snapshot_state(
                 meta.name, name
             )
         })?;
-        state.insert(
-            name.clone(),
-            persist_migrated_value(&actor, name, &value)?,
-        );
+        state.insert(name.clone(), persist_migrated_value(&actor, name, &value)?);
     }
 
     Ok(Some(ActorSnapshot {
@@ -701,20 +706,16 @@ mod tests {
             .state
             .insert("count".to_string(), PersistedValue::Int(10));
 
-        let upgraded = migrate_snapshot_state(
-            &module,
-            &snapshot,
-            StateMigrationHistory::default(),
-        )
-        .unwrap()
-        .expect("upgrade");
+        let upgraded = migrate_snapshot_state(&module, &snapshot, StateMigrationHistory::default())
+            .unwrap()
+            .expect("upgrade");
 
-        assert_eq!(upgraded.sequence, 7, "migration must not advance journal sequence");
-        assert_eq!(upgraded.schema_version, 2);
         assert_eq!(
-            upgraded.state.get("count"),
-            Some(&PersistedValue::Int(15))
+            upgraded.sequence, 7,
+            "migration must not advance journal sequence"
         );
+        assert_eq!(upgraded.schema_version, 2);
+        assert_eq!(upgraded.state.get("count"), Some(&PersistedValue::Int(15)));
     }
 
     #[test]
@@ -744,17 +745,10 @@ mod tests {
             .state
             .insert("count".to_string(), PersistedValue::Int(4));
 
-        let upgraded = migrate_snapshot_state(
-            &module,
-            &snapshot,
-            StateMigrationHistory::default(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            upgraded.state.get("count"),
-            Some(&PersistedValue::Int(18))
-        );
+        let upgraded = migrate_snapshot_state(&module, &snapshot, StateMigrationHistory::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(upgraded.state.get("count"), Some(&PersistedValue::Int(18)));
         assert_eq!(upgraded.schema_version, 3);
     }
 
@@ -812,12 +806,8 @@ mod tests {
             ..ActorSnapshot::default()
         };
 
-        let error = migrate_snapshot_state(
-            &module,
-            &snapshot,
-            StateMigrationHistory::default(),
-        )
-        .unwrap_err();
+        let error = migrate_snapshot_state(&module, &snapshot, StateMigrationHistory::default())
+            .unwrap_err();
         assert!(error.contains("event-sourced field"), "{error}");
     }
 
@@ -846,13 +836,9 @@ mod tests {
             PersistedValue::String("Ada".to_string()),
         );
 
-        let upgraded = migrate_snapshot_state(
-            &module,
-            &snapshot,
-            StateMigrationHistory::default(),
-        )
-        .unwrap()
-        .unwrap();
+        let upgraded = migrate_snapshot_state(&module, &snapshot, StateMigrationHistory::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             upgraded.state.get("name"),
             Some(&PersistedValue::String("Ada!".to_string()))

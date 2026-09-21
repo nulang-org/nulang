@@ -4993,6 +4993,71 @@ impl Runtime {
             .unwrap_or(false)
     }
 
+    /// Prepare a durable snapshot for activation under `module`.
+    ///
+    /// If the snapshot is already current this is a no-op. Otherwise the
+    /// state-only RFC 0008 executor runs against an unpublished actor and the
+    /// result is committed through the persistence revision CAS before this
+    /// method returns. A conflicting writer is adopted only when its snapshot
+    /// already validates against the current module schema.
+    fn prepare_snapshot_for_module(
+        &mut self,
+        actor_id: u64,
+        module: &crate::bytecode::CodeModule,
+        snapshot: ActorSnapshot,
+    ) -> Result<ActorSnapshot, String> {
+        let history = migration::StateMigrationHistory {
+            has_pending_message_journal: self
+                .persistence
+                .read_journal(actor_id)
+                .iter()
+                .any(|entry| entry.sequence > snapshot.sequence),
+            has_event_history: !self.persistence.read_events(actor_id).is_empty(),
+            has_workflow_history: !self.persistence.read_workflow_events(actor_id).is_empty(),
+        };
+
+        let Some(upgraded) = migration::migrate_snapshot_state(module, &snapshot, history)? else {
+            return Ok(snapshot);
+        };
+
+        let expected_revision = SnapshotRevision::from_snapshot(&snapshot);
+        match self
+            .persistence
+            .compare_and_swap_snapshot(&expected_revision, upgraded.clone())
+        {
+            Ok(SnapshotCasResult::Committed) => {
+                // Replication is downstream of the authoritative local commit.
+                // For an unactivated virtual actor this hook normally has no
+                // respawn policy and is therefore a no-op.
+                self.maybe_shadow_replicate(actor_id, &upgraded);
+                Ok(upgraded)
+            }
+            Ok(SnapshotCasResult::Conflict) => {
+                let winner = self.persistence.load_snapshot(actor_id).ok_or_else(|| {
+                    format!(
+                        "migration CAS conflicted for actor {}, but the winning snapshot could not be reloaded",
+                        actor_id
+                    )
+                })?;
+                Self::validate_snapshot_schema(Some(module), &winner).map_err(|error| {
+                    format!(
+                        "migration CAS conflicted for actor {} and the winning snapshot is not valid for the current schema: {}",
+                        actor_id, error
+                    )
+                })?;
+                Ok(winner)
+            }
+            Ok(SnapshotCasResult::Unsupported) => Err(format!(
+                "persistence backend cannot atomically fence schema migration for actor {}",
+                actor_id
+            )),
+            Err(error) => Err(format!(
+                "migration snapshot CAS failed for actor {}: {}",
+                actor_id, error
+            )),
+        }
+    }
+
     /// Recover a persistent actor from the latest snapshot and replay the journal.
     ///
     /// For workflow actors the durable workflow event journal is replayed
@@ -5009,91 +5074,16 @@ impl Runtime {
             .map(|(module, _, _)| module.clone());
 
         if let Some(module) = recovery_module.as_ref() {
-            let history = migration::StateMigrationHistory {
-                has_pending_message_journal: self
-                    .persistence
-                    .read_journal(actor_id)
-                    .iter()
-                    .any(|entry| entry.sequence > snapshot.sequence),
-                has_event_history: !self.persistence.read_events(actor_id).is_empty(),
-                has_workflow_history: !self
-                    .persistence
-                    .read_workflow_events(actor_id)
-                    .is_empty(),
-            };
-            match migration::migrate_snapshot_state(module, &snapshot, history) {
-                Ok(Some(upgraded)) => {
-                    // Commit-before-publication with an optimistic durable
-                    // revision fence. The executor transformed exactly
-                    // `snapshot`; do not let it overwrite a snapshot whose
-                    // sequence or schema identity changed concurrently.
-                    let expected_revision =
-                        SnapshotRevision::from_snapshot(&snapshot);
-                    match self
-                        .persistence
-                        .compare_and_swap_snapshot(&expected_revision, upgraded.clone())
-                    {
-                        Ok(SnapshotCasResult::Committed) => {
-                            // Shadow replication, when configured, is allowed
-                            // only after the local fenced commit succeeds.
-                            self.maybe_shadow_replicate(actor_id, &upgraded);
-                            snapshot = upgraded;
-                        }
-                        Ok(SnapshotCasResult::Conflict) => {
-                            // Another writer won. Never retry migration against
-                            // the stale input in this recovery attempt. It is
-                            // safe to continue only when the winner already
-                            // committed this artifact's current schema.
-                            let Some(winner) = self.persistence.load_snapshot(actor_id) else {
-                                warn!(
-                                    "nulang-recover: migration CAS conflicted for actor {}, but the winning snapshot could not be reloaded",
-                                    actor_id
-                                );
-                                return None;
-                            };
-                            let winner_current = migration::resolve_snapshot_meta(module, &winner)
-                                .ok()
-                                .flatten()
-                                .map(|meta| {
-                                    winner.schema_version == meta.version
-                                        && winner.schema_owner.as_deref()
-                                            == Some(meta.name.as_str())
-                                })
-                                .unwrap_or(false);
-                            if !winner_current {
-                                warn!(
-                                    "nulang-recover: migration CAS conflicted for actor {} and the winning snapshot is not at the current schema; refusing stale retry",
-                                    actor_id
-                                );
-                                return None;
-                            }
-                            snapshot = winner;
-                        }
-                        Ok(SnapshotCasResult::Unsupported) => {
-                            warn!(
-                                "nulang-recover: persistence backend cannot atomically fence schema migration for actor {}; refusing unsafe upgrade",
-                                actor_id
-                            );
-                            return None;
-                        }
-                        Err(error) => {
-                            warn!(
-                                "nulang-recover: migration snapshot CAS failed for actor {}: {}",
-                                actor_id, error
-                            );
-                            return None;
-                        }
-                    }
-                }
-                Ok(None) => {}
+            snapshot = match self.prepare_snapshot_for_module(actor_id, module, snapshot) {
+                Ok(snapshot) => snapshot,
                 Err(error) => {
                     warn!(
-                        "nulang-recover: refusing actor {} because durable migration failed: {}",
+                        "nulang-recover: refusing actor {} because durable migration preparation failed: {}",
                         actor_id, error
                     );
                     return None;
                 }
-            }
+            };
         }
 
         let (schema_owner, schema_version) =
@@ -5458,18 +5448,20 @@ impl Runtime {
                     meta.version
                 )
             })?;
-            let plan = manifest.plan_from(snapshot.schema_version).map_err(|error| {
-                format!(
-                    "persisted {}@v{} cannot be migrated to {}@v{}: {error}",
-                    snapshot
-                        .schema_owner
-                        .as_deref()
-                        .unwrap_or(meta.name.as_str()),
-                    snapshot.schema_version,
-                    meta.name,
-                    meta.version
-                )
-            })?;
+            let plan = manifest
+                .plan_from(snapshot.schema_version)
+                .map_err(|error| {
+                    format!(
+                        "persisted {}@v{} cannot be migrated to {}@v{}: {error}",
+                        snapshot
+                            .schema_owner
+                            .as_deref()
+                            .unwrap_or(meta.name.as_str()),
+                        snapshot.schema_version,
+                        meta.name,
+                        meta.version
+                    )
+                })?;
             if let Some(step) = plan
                 .iter()
                 .find(|step| step.has_state_transform && step.state_function_index.is_none())
@@ -5624,7 +5616,20 @@ impl Runtime {
             grain_type.compensation_offsets.clone(),
         );
 
-        let snapshot = self.persistence.load_snapshot(stable_actor_id);
+        let snapshot = match self.persistence.load_snapshot(stable_actor_id) {
+            Some(snapshot) => Some(
+                self.prepare_snapshot_for_module(stable_actor_id, &grain_type.module, snapshot)
+                    .map_err(|err| NuError::RuntimeError {
+                        msg: format!(
+                            "failed to prepare durable snapshot for virtual actor {}: {}",
+                            grain_id.actor_name(),
+                            err
+                        ),
+                        span: Span::new(0, 0),
+                    })?,
+            ),
+            None => None,
+        };
 
         let actor = if let Some(ref snap) = snapshot {
             Self::restore_actor_from_snapshot(

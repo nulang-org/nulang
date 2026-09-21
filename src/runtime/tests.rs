@@ -1934,7 +1934,9 @@ fn test_event_sourced_counter_replays_from_event_log() {
 }
 
 fn compile_state_migration_module(source: &str) -> CodeModule {
-    let tokens = crate::lexer::Lexer::new(source).lex().expect("lex migration fixture");
+    let tokens = crate::lexer::Lexer::new(source)
+        .lex()
+        .expect("lex migration fixture");
     let ast = crate::parser::Parser::new(tokens)
         .parse_module()
         .expect("parse migration fixture");
@@ -2056,17 +2058,19 @@ fn test_recover_actor_executes_and_commits_state_migration_before_publication() 
     assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
 
     let committed = rt.persistence.load_snapshot(actor_id).unwrap();
-    assert_eq!(committed.sequence, 7, "schema migration must not invent a message sequence");
-    assert_eq!(committed.schema_version, 2);
     assert_eq!(
-        committed.state.get("count"),
-        Some(&PersistedValue::Int(15))
+        committed.sequence, 7,
+        "schema migration must not invent a message sequence"
     );
+    assert_eq!(committed.schema_version, 2);
+    assert_eq!(committed.state.get("count"), Some(&PersistedValue::Int(15)));
 
     let actor = rt.actors.get(&actor_id).expect("recovered actor published");
     assert_eq!(actor.schema_version, 2);
     assert_eq!(
-        actor.get_state_field("count").and_then(|value| value.as_int()),
+        actor
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
         Some(15)
     );
 }
@@ -2126,7 +2130,9 @@ fn test_recover_actor_adopts_current_schema_winner_after_migration_cas_conflict(
     let actor = rt.actors.get(&actor_id).unwrap();
     assert_eq!(actor.schema_version, 2);
     assert_eq!(
-        actor.get_state_field("count").and_then(|value| value.as_int()),
+        actor
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
         Some(99),
         "the loser must publish the winner's state, never its stale local transform"
     );
@@ -2190,10 +2196,7 @@ fn test_recover_actor_refuses_cas_winner_that_is_still_old_schema() {
     let committed = rt.persistence.load_snapshot(actor_id).unwrap();
     assert_eq!(committed.sequence, 5);
     assert_eq!(committed.schema_version, 1);
-    assert_eq!(
-        committed.state.get("count"),
-        Some(&PersistedValue::Int(20))
-    );
+    assert_eq!(committed.state.get("count"), Some(&PersistedValue::Int(20)));
 }
 
 #[test]
@@ -2389,7 +2392,10 @@ fn test_memory_snapshot_cas_fences_stale_revision() {
         "the v1 revision must not overwrite the already-committed v2 snapshot"
     );
     assert_eq!(
-        store.load_snapshot(original.actor_id).unwrap().schema_version,
+        store
+            .load_snapshot(original.actor_id)
+            .unwrap()
+            .schema_version,
         2
     );
 }
@@ -2459,10 +2465,7 @@ fn test_libsql_snapshot_cas_is_atomic_and_revision_fenced() {
     );
     let committed = store.load_snapshot(original.actor_id).unwrap();
     assert_eq!(committed.schema_version, 2);
-    assert_eq!(
-        committed.state.get("count"),
-        Some(&PersistedValue::Int(5))
-    );
+    assert_eq!(committed.state.get("count"), Some(&PersistedValue::Int(5)));
 }
 
 #[cfg(feature = "sqlite")]
@@ -7486,6 +7489,66 @@ fn test_grain_ref_builtin_unknown_key_returns_nil() {
     let regs = vec![Value::string(0), Value::bool(true)];
     let result = rt.perform_grain_builtin(Some("ref"), &constants, &regs);
     assert_eq!(result, Some(Value::nil()));
+}
+
+#[test]
+fn test_virtual_grain_hydration_migrates_snapshot_before_publication() {
+    let module = compile_state_migration_module(
+        r#"
+        virtual entity Counter(key: String) {
+            version: 2
+            state durable count: Int = 0
+            migration from 1 to 2 {
+                state => { self.count = self.count + 5 }
+            }
+        }
+        "#,
+    );
+
+    let grain_id = GrainId::new("Counter", "migrating-user");
+    let stable_id = grain_actor_id(&grain_id);
+    let mut snapshot = ActorSnapshot {
+        actor_id: stable_id,
+        sequence: 9,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    snapshot
+        .state
+        .insert("count".to_string(), PersistedValue::Int(10));
+
+    let mut rt = Runtime::new();
+    rt.persistence.save_snapshot(snapshot).unwrap();
+    rt.register_module_grains(&module);
+
+    assert_eq!(
+        rt.resolve_or_hydrate_grain(grain_id.clone()).unwrap(),
+        stable_id
+    );
+
+    let committed = rt.persistence.load_snapshot(stable_id).unwrap();
+    assert_eq!(committed.sequence, 9);
+    assert_eq!(committed.schema_version, 2);
+    assert_eq!(committed.state.get("count"), Some(&PersistedValue::Int(15)));
+
+    let actor = rt
+        .actors
+        .get(&stable_id)
+        .expect("migrated grain must be resident");
+    assert_eq!(actor.schema_owner.as_deref(), Some("Counter"));
+    assert_eq!(actor.schema_version, 2);
+    assert_eq!(
+        actor
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
+        Some(15)
+    );
+    assert_eq!(
+        rt.grain_residents.get(&grain_id),
+        Some(&stable_id),
+        "grain identity must be published only after the migrated snapshot is current"
+    );
 }
 
 #[test]

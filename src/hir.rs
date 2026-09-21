@@ -659,6 +659,7 @@ mod tests {
             apply_handlers: vec![],
             version: 1,
             migrations: vec![],
+            migration_state_bodies: vec![],
             is_workflow: false,
             is_organization: false,
             is_agent: false,
