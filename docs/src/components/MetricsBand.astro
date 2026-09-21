@@ -8,14 +8,14 @@ const items = [
     href: 'https://github.com/nulang-org/nulang#project-status--stability',
   },
   {
-    label: 'Stable surfaces',
+    label: 'Stable tier',
     value: 'Types · effects · actors',
     detail: 'RFC + deprecation cycle for breaking changes',
     tone: 'stable',
     href: 'https://github.com/nulang-org/nulang/blob/main/GOVERNANCE.md',
   },
   {
-    label: 'Experimental',
+    label: 'Experimental tier',
     value: 'Distribution · AI · WASM · AOT',
     detail: 'Opt in and validate for your workload',
     tone: 'experimental',
@@ -31,7 +31,7 @@ const items = [
 ];
 ---
 
-<section class="maturity-strip" aria-label="Nulang project maturity">
+<section class="maturity-strip" aria-label="Nulang project maturity and stability tiers">
   <div class="maturity-strip-inner">
     {items.map((item) => (
       <a class:list={['maturity-item', item.tone]} href={item.href} target="_blank" rel="noopener noreferrer">
