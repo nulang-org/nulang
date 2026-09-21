@@ -1096,8 +1096,6 @@ impl PersistenceStore for LibsqlStore {
             Some(ActorSnapshot {
                 actor_id,
                 sequence: sequence as u64,
-                schema_owner: None,
-                schema_version: 1,
                 schema_owner,
                 schema_version: schema_version as u32,
                 state,
@@ -1800,8 +1798,6 @@ impl PersistenceStore for PostgresStore {
         Some(ActorSnapshot {
             actor_id,
             sequence: sequence as u64,
-            schema_owner: None,
-            schema_version: 1,
             schema_owner,
             schema_version: schema_version as u32,
             state,
