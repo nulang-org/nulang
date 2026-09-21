@@ -7,12 +7,8 @@
 
 use std::collections::HashMap;
 
-use criterion::{
-    black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput,
-};
-use nulang::runtime::{
-    ActorSnapshot, JournalEntry, MemoryStore, PersistedValue, PersistenceStore,
-};
+use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
+use nulang::runtime::{ActorSnapshot, JournalEntry, MemoryStore, PersistedValue, PersistenceStore};
 
 fn snapshot_with_payload(payload_bytes: usize) -> ActorSnapshot {
     let mut state = HashMap::new();
@@ -101,14 +97,13 @@ fn bench_checkpoint_json_encode(c: &mut Criterion) {
 fn bench_checkpoint_json_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("persist/checkpoint_json_decode");
     for (label, bytes) in [("1kb", 1024usize), ("1mb", 1024 * 1024)] {
-        let encoded =
-            serde_json::to_vec(&snapshot_with_payload(bytes)).expect("serialize benchmark snapshot");
+        let encoded = serde_json::to_vec(&snapshot_with_payload(bytes))
+            .expect("serialize benchmark snapshot");
         group.throughput(Throughput::Bytes(bytes as u64));
         group.bench_function(label, |b| {
             b.iter(|| {
-                let snapshot: ActorSnapshot =
-                    serde_json::from_slice(black_box(encoded.as_slice()))
-                        .expect("deserialize benchmark snapshot");
+                let snapshot: ActorSnapshot = serde_json::from_slice(black_box(encoded.as_slice()))
+                    .expect("deserialize benchmark snapshot");
                 black_box(snapshot);
             })
         });
@@ -139,9 +134,7 @@ fn bench_memory_journal_read(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("persist/memory_journal_read");
     group.throughput(Throughput::Elements(EVENTS as u64));
-    group.bench_function("1000", |b| {
-        b.iter(|| black_box(store.read_journal(1)))
-    });
+    group.bench_function("1000", |b| b.iter(|| black_box(store.read_journal(1))));
     group.finish();
 }
 
