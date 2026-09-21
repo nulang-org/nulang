@@ -10,7 +10,6 @@ use crate::runtime::heap::{ActorHeap, TypeTag};
 use crate::vm::{Frame, Value};
 #[cfg(feature = "tcp")]
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn noop_test_behavior(_actor: &mut Actor, _args: &[Value]) {}
@@ -142,7 +141,7 @@ fn test_mailbox_push_pop() {
     let mut mb = Mailbox::new(4);
     let msg = Message {
         behavior_id: 0,
-        payload: Arc::new(vec![Value::int(42)]),
+        payload: MessagePayload::from_slice(&[Value::int(42)]),
         sender: 1,
         priority: MessagePriority::Normal,
         trace_id: None,
@@ -185,7 +184,7 @@ fn test_delivery_establishes_child_context_and_inherits() {
             .mailbox
             .push(Message {
                 behavior_id: 0,
-                payload: Arc::new(vec![]),
+                payload: MessagePayload::from_slice(&[]),
                 sender: 0,
                 priority: MessagePriority::Normal,
                 trace_id: Some(incoming.to_string()),

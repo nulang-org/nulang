@@ -55,7 +55,7 @@ use super::fabric_stream_epoch::{
     FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR, FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR,
     FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
 };
-use super::mailbox::{Message, MessagePriority};
+use super::mailbox::{Message, MessagePayload, MessagePriority};
 use super::network::{NetworkTransport, Packet};
 use super::{ClusterState, NodeId, NodeStatus};
 use crate::runtime::Runtime;
@@ -598,7 +598,7 @@ impl AddressResolver {
 
                 let msg = Message {
                     behavior_id: 0, // resolved from behavior_name at delivery
-                    payload: Arc::new(payload),
+                    payload: MessagePayload::from_vec(payload),
                     sender: sender_actor,
                     priority,
                     trace_id,
@@ -1343,7 +1343,7 @@ pub fn process_network_packets(
                                     };
                                     msg.behavior_id = behavior_id;
                                     // Intern string and object payloads, then deliver
-                                    let mut payload_vec = (*msg.payload).clone();
+                                    let mut payload_vec = msg.payload.as_slice().to_vec();
                                     if !intern_wire_strings(
                                         runtime,
                                         target_actor,
@@ -1369,7 +1369,7 @@ pub fn process_network_packets(
                                         );
                                         continue;
                                     }
-                                    msg.payload = Arc::new(payload_vec);
+                                    msg.payload = MessagePayload::from_vec(payload_vec);
                                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
                                         let _ = actor.mailbox.push(msg);
                                         runtime.scheduler.enqueue(target_actor);
@@ -2261,9 +2261,10 @@ pub fn process_network_packets(
                     // string table; a message whose strings cannot be
                     // interned is dropped rather than delivered with
                     // dangling pool ids.
-                    // Clone the Arc payload into a mutable Vec, intern the
-                    // strings, then wrap the result back into a fresh Arc.
-                    let mut payload_vec = (*msg.payload).clone();
+                    // Materialize the immutable payload into a mutable Vec,
+                    // intern the strings, then rebuild the optimized
+                    // inline/shared payload representation.
+                    let mut payload_vec = msg.payload.as_slice().to_vec();
                     if !intern_wire_strings(runtime, target_actor, &mut payload_vec, &string_table)
                     {
                         warn!(
@@ -2289,7 +2290,7 @@ pub fn process_network_packets(
                         );
                         continue;
                     }
-                    msg.payload = Arc::new(payload_vec);
+                    msg.payload = MessagePayload::from_vec(payload_vec);
                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
                         let _ = actor.mailbox.push(msg);
                         runtime.scheduler.enqueue(target_actor);

@@ -731,7 +731,7 @@ mod tests {
         let mut actor = Actor::new(1, "test", 0);
         let msg = Message {
             behavior_id: 1,
-            payload: Arc::new(vec![Value::int(42)]),
+            payload: MessagePayload::from_slice(&[Value::int(42)]),
             sender: 99,
             priority: MessagePriority::Normal,
             trace_id: None,
