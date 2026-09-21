@@ -197,6 +197,11 @@ pub enum ArtifactIdentityError {
         expected: ArtifactId,
         actual: ArtifactId,
     },
+    MissingModuleSemanticIdentity,
+    SemanticIdentityMismatch {
+        module: SemanticId,
+        manifest: SemanticId,
+    },
 }
 
 impl fmt::Display for ArtifactIdentityError {
@@ -213,6 +218,14 @@ impl fmt::Display for ArtifactIdentityError {
             Self::ArtifactIdentityMismatch { expected, actual } => write!(
                 f,
                 "artifact identity mismatch: expected {expected}, got {actual}"
+            ),
+            Self::MissingModuleSemanticIdentity => write!(
+                f,
+                "cannot bind artifact identity to a module without compiler-proven semantic identity"
+            ),
+            Self::SemanticIdentityMismatch { module, manifest } => write!(
+                f,
+                "artifact manifest semantic identity {manifest} does not match module semantic identity {module}"
             ),
         }
     }
