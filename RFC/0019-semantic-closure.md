@@ -232,6 +232,15 @@ memory. A later runtime phase may represent `Secret[T]` as opaque brokered
 handles, short-lived credentials, or KMS/HSM-backed capabilities without
 changing the source-level confidentiality contract.
 
+The first runtime phase uses **actor-scoped opaque handles**. `Secret.get/read`
+does not fetch credential bytes from a provider. It records only the requesting
+actor id and logical secret name in a runtime-owned broker, returning a checked
+integer handle under the static `Secret[String]` type. `Secret.valid` and
+`Secret.revoke` operate on that handle. Handles are revoked when their actor
+exits. Provider-specific operations that actually need credentials must resolve
+them inside the host boundary; a generic plaintext `reveal` operation is not
+part of this design.
+
 ## Contract 5 — Protocol-typed actor references
 
 ### Requirement
