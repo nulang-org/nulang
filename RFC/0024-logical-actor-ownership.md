@@ -1,6 +1,6 @@
 # RFC 0024: Authoritative Logical Actor Ownership Records
 
-- **Status:** Draft — ownership state machine + fenced in-memory persistence reference implemented
+- **Status:** Draft — ownership state machine + fenced in-memory and LibSQL persistence implemented
 - **Tier:** Experimental
 - **Created:** 2026-09-20
 - **Depends on:** RFC 0022 (logical actor identity and activation fencing)
@@ -18,8 +18,11 @@ The record is keyed by the full `GrainId`, carries the compact
 
 The runtime state machine implemented in
 `src/runtime/logical_actor_directory.rs` defines valid ownership transitions.
-`src/runtime/logical_actor_persistence.rs` adds a reference in-memory store
-keyed by full `GrainId` that rejects durable writes from stale nodes/epochs.
+`src/runtime/logical_actor_persistence.rs` defines the fenced storage contract and
+an in-memory reference implementation. `src/runtime/logical_actor_libsql.rs`
+implements the same contract on LibSQL/Turso, storing full logical identities
+and evaluating the owner-node/epoch predicate in the same SQL statement as the
+durable write so stale-writer fencing does not depend on an in-process preflight.
 It deliberately does **not** implement consensus. A control plane must persist
 and serialize these transitions using a linearizable mechanism before runtimes
 treat them as authoritative.
@@ -180,11 +183,12 @@ local execution + epoch-fenced durable commits
 
 1. Persist ownership records in Nulang Cloud with compare-and-swap semantics.
 2. Add ownership epoch/node to virtual-actor routing envelopes.
-3. Adapt production persistence backends to the logical-identity keyed fenced
-   commit contract demonstrated by `FencedLogicalActorStore`.
-4. Feed node failure/migration decisions through authoritative ownership
+3. Extend the fenced persistence contract to PostgreSQL and object-store-backed
+   snapshots where those backends are used for Nulang Cloud.
+4. Add ownership epoch/node to virtual-actor routing envelopes.
+5. Feed node failure/migration decisions through authoritative ownership
    transitions instead of directly respawning by actor number.
-5. Add deterministic partition tests proving stale owners cannot commit after a
+6. Add deterministic partition tests proving stale owners cannot commit after a
    replacement epoch becomes authoritative.
 
 ## Non-goals in this phase
