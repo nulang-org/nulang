@@ -404,6 +404,10 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
 pub(crate) struct StandaloneVmCallbacks {
     heap: ActorHeap,
     gc: crate::runtime::OrcaGc,
+    /// Host-authority policy for actor-free execution. Trusted local scripts,
+    /// explicitly granted execution, and deny-all sandboxes all use the same
+    /// typed authorization boundary.
+    execution_authority: crate::authority::ExecutionAuthority,
     /// Test hook: when set, `IO.print` output is recorded here instead of
     /// written to stdout.
     io_output: Option<std::rc::Rc<std::cell::RefCell<Vec<String>>>>,
@@ -419,6 +423,7 @@ impl StandaloneVmCallbacks {
         Self {
             heap,
             gc: crate::runtime::OrcaGc::new(0),
+            execution_authority: crate::authority::ExecutionAuthority::trusted_ambient(),
             io_output: None,
             routes: Vec::new(),
         }
@@ -945,6 +950,18 @@ pub(crate) fn hashmap_op(
 }
 
 impl ActorVmCallbacks for StandaloneVmCallbacks {
+    fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
+        if library.is_empty() || symbol.is_empty() {
+            return false;
+        }
+        let grant = crate::authority::AuthorityGrant::Other {
+            namespace: "FFI".to_string(),
+            operation: "Call".to_string(),
+            argument: Some(format!("{library}::{symbol}")),
+        };
+        self.execution_authority.allows(&grant)
+    }
+
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
         self.heap.alloc(size, type_tag)
     }
@@ -1006,6 +1023,22 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
         constants: &[Constant],
         regs: &[Value],
     ) -> Option<Value> {
+        match crate::runtime::callbacks::required_host_authority(
+            effect_name,
+            op_name,
+            constants,
+            regs,
+        ) {
+            Ok(Some(grant)) if !self.execution_authority.allows(&grant) => {
+                return Some(Value::nil());
+            }
+            Err(_) => {
+                // Invalid resource descriptions fail closed at the same
+                // boundary rather than falling through to a host operation.
+                return Some(Value::nil());
+            }
+            _ => {}
+        }
         if effect_name == "Actor" || effect_name == "Otp" {
             return Some(Value::nil());
         }
@@ -2840,6 +2873,27 @@ impl VM {
         let idx = self.current_frame_idx?;
         let f = self.frames.get(idx)?;
         self.modules.get(f.module_idx).and_then(|m| m.line_at(f.pc))
+    }
+
+    /// Set top-level host authority for standalone execution.
+    pub fn set_execution_authority(
+        &mut self,
+        authority: crate::authority::ExecutionAuthority,
+    ) {
+        if let Some(sb) = (&mut *self.actor_callbacks as &mut dyn std::any::Any)
+            .downcast_mut::<StandaloneVmCallbacks>()
+        {
+            sb.execution_authority = authority;
+        }
+    }
+
+    /// Compatibility wrapper used by the CLI's `--sandboxed` flag.
+    pub fn set_sandboxed_host_effects(&mut self, enabled: bool) {
+        self.set_execution_authority(if enabled {
+            crate::authority::ExecutionAuthority::deny_all()
+        } else {
+            crate::authority::ExecutionAuthority::trusted_ambient()
+        });
     }
 
     /// Enable FFI sandboxing, restricting calls to the given library paths.
@@ -7201,6 +7255,22 @@ mod vm_tests {
             result.unwrap().is_nil(),
             "RAsk should return nil without runtime"
         );
+    }
+
+    #[test]
+    fn sandboxed_standalone_callbacks_deny_process_execution() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        callbacks.execution_authority = crate::authority::ExecutionAuthority::deny_all();
+        let constants = vec![Constant::String("printf should-not-run".to_string())];
+        let result = callbacks
+            .perform_builtin_effect(
+                "Process",
+                Some("run"),
+                &constants,
+                &[Value::string(0)],
+            )
+            .expect("sandboxed Process.run should be handled as denied");
+        assert!(result.is_nil());
     }
 
     /// Test 21: Gossip records intent and returns unit.

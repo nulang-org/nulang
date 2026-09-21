@@ -125,6 +125,57 @@ pub struct AuthorityManifest {
     grants: BTreeSet<AuthorityGrant>,
 }
 
+/// Ambient host-authority policy for one top-level execution context.
+///
+/// Actor-backed execution continues to use each actor's exact
+/// [`AuthorityManifest`]. This policy governs code executing outside an actor
+/// (CLI scripts, direct NBC execution, and top-level runtime callbacks) so
+/// trusted-local, explicitly granted, and deny-all execution share one
+/// authorization mechanism instead of separate sandbox code paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionAuthority {
+    /// Preserve the trusted-local development contract: host authority is
+    /// ambient and any well-formed host request is permitted.
+    TrustedAmbient,
+    /// Permit only the exact typed grants in this manifest.
+    Explicit(AuthorityManifest),
+    /// Permit no external host authority.
+    DenyAll,
+}
+
+impl Default for ExecutionAuthority {
+    fn default() -> Self {
+        Self::TrustedAmbient
+    }
+}
+
+impl ExecutionAuthority {
+    pub fn trusted_ambient() -> Self {
+        Self::TrustedAmbient
+    }
+
+    pub fn explicit(manifest: AuthorityManifest) -> Self {
+        Self::Explicit(manifest)
+    }
+
+    pub fn deny_all() -> Self {
+        Self::DenyAll
+    }
+
+    /// Authorize one exact host grant under this execution policy.
+    pub fn allows(&self, grant: &AuthorityGrant) -> bool {
+        match self {
+            Self::TrustedAmbient => true,
+            Self::Explicit(manifest) => manifest.allows(grant),
+            Self::DenyAll => false,
+        }
+    }
+
+    pub fn is_deny_all(&self) -> bool {
+        matches!(self, Self::DenyAll)
+    }
+}
+
 impl AuthorityManifest {
     pub fn new() -> Self {
         Self::default()
@@ -386,6 +437,29 @@ fn require_nonempty_argument<'a>(
         ));
     }
     Ok(argument)
+}
+
+#[cfg(test)]
+mod execution_authority_tests {
+    use super::*;
+
+    #[test]
+    fn execution_authority_has_one_exact_match_model() {
+        let fs = AuthorityGrant::FsRead {
+            path: "/srv/data".into(),
+        };
+        let net = AuthorityGrant::NetTcpOut {
+            host: "example.com".into(),
+            port: 443,
+        };
+        let explicit = ExecutionAuthority::explicit(AuthorityManifest::from_grants([fs.clone()]));
+
+        assert!(ExecutionAuthority::trusted_ambient().allows(&fs));
+        assert!(ExecutionAuthority::trusted_ambient().allows(&net));
+        assert!(explicit.allows(&fs));
+        assert!(!explicit.allows(&net));
+        assert!(!ExecutionAuthority::deny_all().allows(&fs));
+    }
 }
 
 #[cfg(test)]

@@ -81,7 +81,7 @@ pub(crate) fn spawn_with_site_authority(
 /// effect may cross the runtime boundary. `None` means the effect is not an
 /// external-authority operation handled by this gate. Invalid resource
 /// descriptions are errors rather than permissive fallbacks.
-fn required_host_authority(
+pub(crate) fn required_host_authority(
     effect_name: &str,
     op_name: Option<&str>,
     constants: &[crate::bytecode::Constant],
@@ -542,11 +542,36 @@ pub(crate) fn perform_realtime_builtin(
 /// and allocate on the current actor's heap.
 pub struct RuntimeVmCallbacks {
     runtime: Rc<RefCell<Runtime>>,
+    execution_authority: crate::authority::ExecutionAuthority,
 }
 
 impl RuntimeVmCallbacks {
     pub fn new(runtime: Rc<RefCell<Runtime>>) -> Self {
-        RuntimeVmCallbacks { runtime }
+        RuntimeVmCallbacks {
+            runtime,
+            execution_authority: crate::authority::ExecutionAuthority::trusted_ambient(),
+        }
+    }
+
+    /// Create runtime callbacks with an explicit top-level execution policy.
+    /// Actor-backed effects continue to use each actor's exact authority
+    /// manifest regardless of this ambient policy.
+    pub fn with_execution_authority(
+        runtime: Rc<RefCell<Runtime>>,
+        execution_authority: crate::authority::ExecutionAuthority,
+    ) -> Self {
+        RuntimeVmCallbacks {
+            runtime,
+            execution_authority,
+        }
+    }
+
+    /// Compatibility constructor for the CLI's deny-all sandbox profile.
+    pub fn new_sandboxed(runtime: Rc<RefCell<Runtime>>) -> Self {
+        Self::with_execution_authority(
+            runtime,
+            crate::authority::ExecutionAuthority::deny_all(),
+        )
     }
 
     /// Allocate a fresh heap string via `self.alloc` (the current actor's
@@ -597,7 +622,18 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
 
     fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
         let rt = self.runtime.borrow();
-        authorize_actor_ffi(&rt, rt.current_actor, library, symbol).is_ok()
+        if let Some(actor_id) = rt.current_actor {
+            return authorize_actor_ffi(&rt, Some(actor_id), library, symbol).is_ok();
+        }
+        if library.is_empty() || symbol.is_empty() {
+            return false;
+        }
+        let grant = crate::authority::AuthorityGrant::Other {
+            namespace: "FFI".to_string(),
+            operation: "Call".to_string(),
+            argument: Some(format!("{library}::{symbol}")),
+        };
+        self.execution_authority.allows(&grant)
     }
 
     fn alloc(&mut self, size: usize, type_tag: crate::runtime::heap::TypeTag) -> Option<*mut u8> {
@@ -1041,14 +1077,30 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             if let Some(result) = rt.check_test_handler(&qualified, regs) {
                 return Some(result);
             }
-            if let Err(error) = authorize_actor_host_effect(
-                &rt,
-                rt.current_actor,
-                effect_name,
-                op_name,
-                &module.constants,
-                regs,
-            ) {
+            let authorization = if let Some(actor_id) = rt.current_actor {
+                authorize_actor_host_effect(
+                    &rt,
+                    Some(actor_id),
+                    effect_name,
+                    op_name,
+                    &module.constants,
+                    regs,
+                )
+            } else {
+                match required_host_authority(
+                    effect_name,
+                    op_name,
+                    &module.constants,
+                    regs,
+                ) {
+                    Ok(Some(grant)) if !self.execution_authority.allows(&grant) => Err(format!(
+                        "top-level execution authority does not grant {grant}"
+                    )),
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            };
+            if let Err(error) = authorization {
                 tracing::warn!(
                     actor_id = ?rt.current_actor,
                     effect = %qualified,
@@ -2941,6 +2993,67 @@ mod host_authority_tests {
             runtime.borrow().http_server.is_none(),
             "denied Http.serve must not bind a socket"
         );
+    }
+
+    #[test]
+    fn sandboxed_actor_free_runtime_denies_host_authority_and_ffi() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let mut callbacks = super::RuntimeVmCallbacks::new_sandboxed(runtime);
+        let mut module = crate::bytecode::CodeModule::new("sandboxed-top-level");
+        module.add_constant(Constant::String("/tmp/ambient.txt".into()));
+        let result = callbacks
+            .perform_builtin_effect_in_module(
+                "FS",
+                Some("read"),
+                &module,
+                &[Value::string(0)],
+            )
+            .expect("sandboxed host effect should be handled as denied");
+        assert!(result.is_nil());
+        assert!(!callbacks.authorize_ffi("libc.so.6", "getpid"));
+    }
+
+    #[test]
+    fn explicit_top_level_authority_allows_only_exact_host_grants() {
+        use crate::authority::{AuthorityGrant, AuthorityManifest, ExecutionAuthority};
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let policy = ExecutionAuthority::explicit(AuthorityManifest::from_grants([
+            AuthorityGrant::FsRead {
+                path: "/tmp/allowed.txt".into(),
+            },
+        ]));
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let mut callbacks = super::RuntimeVmCallbacks::with_execution_authority(runtime, policy);
+        let mut module = crate::bytecode::CodeModule::new("explicit-top-level");
+        module.add_constant(Constant::String("/tmp/allowed.txt".into()));
+        module.add_constant(Constant::String("/tmp/denied.txt".into()));
+
+        assert!(
+            callbacks
+                .perform_builtin_effect_in_module(
+                    "FS",
+                    Some("read"),
+                    &module,
+                    &[Value::string(0)],
+                )
+                .is_some()
+        );
+        let denied = callbacks
+            .perform_builtin_effect_in_module(
+                "FS",
+                Some("read"),
+                &module,
+                &[Value::string(1)],
+            )
+            .expect("denied host effect is handled as nil");
+        assert!(denied.is_nil());
     }
 
     #[test]

@@ -31,8 +31,8 @@
 
 | ID | Threat | Mitigation | Status |
 |---|---|---|---|
-| D1 | **Node impersonation** — attacker spoofs another node's ID in the NUL0 handshake | `TlsConfig::MutualTls` enforces client certs. Node IDs are validated against the TLS identity. | Partial: TLS config exists but is not CLI-wired yet. |
-| D2 | **Wire-protocol tampering** — attacker modifies length-prefixed frames in transit | TLS encrypts the TCP stream. Big-endian frame encoding is deterministic, so truncation is detectable. | Partial: TLS available but not default. |
+| D1 | **Node impersonation** — attacker spoofs another node's ID in the NUL0 handshake | `TlsConfig::MutualTls` enforces client certs. Node IDs are validated against the TLS identity. | Implemented: `nulang node` requires complete mTLS configuration unless `--plaintext` is explicitly supplied. |
+| D2 | **Wire-protocol tampering** — attacker modifies length-prefixed frames in transit | TLS encrypts the TCP stream. Big-endian frame encoding is deterministic, so truncation is detectable. | Implemented: mTLS is the CLI default; plaintext requires explicit insecure opt-out. |
 | D3 | **Split-brain** — network partition causes two clusters to diverge | `StaticQuorumResolver` (configurable via `set_cluster_config`) requires a quorum to accept membership changes. | Available: operator must configure expected node count. |
 | D4 | **CRDT delta flooding** — malicious node sends oversized delta-sync packets | `sync_crdts_delta` limits delta batches to changed entries only. Full sync is rate-limited by `CRDT_FULL_SYNC_INTERVAL` (16 rounds). | Implemented. |
 | D5 | **Remote spawn abuse** — attacker spawns arbitrary behaviors on remote nodes | `register_spawnable_behavior` is required; unknown names return `SpawnResponse{success:false}`. | Implemented. |
@@ -95,7 +95,7 @@ An attacker gains access to a single node and sends a crafted `ActorMessage` to 
 ### Scenario B: Compromised native library
 An attacker replaces a `.so` file that a Nulang program loads via FFI.
 
-- **Mitigation**: `--ffi-sandbox` restricts loading to an explicit allowlist. The operator must enumerate every library. Without the flag, `AllowAll` permits any library (default for development convenience).
+- **Mitigation**: `--ffi-sandbox` restricts loading to an explicit allowlist. The operator must enumerate every library. Trusted-local execution retains `AllowAll` for development compatibility; `--sandboxed` denies dynamic FFI and ambient host-resource effects.
 - **Detection**: `cargo audit` in CI monitors `libloading` for CVEs. No runtime detection exists yet.
 
 ### Scenario C: Untrusted WASM module
@@ -106,7 +106,7 @@ An attacker uploads a `.wasm` module to a Nulang service that runs user code.
 
 ## 4. Security Checklist for Operators
 
-- [ ] Enable `TlsConfig::MutualTls` for all production clusters (not default yet).
+- [x] Mutual TLS is required by `nulang node` unless the operator explicitly selects `--plaintext` for insecure development transport.
 - [ ] Configure `StaticQuorumResolver` with `expected_nodes > 1` to prevent split-brain.
 - [ ] Use `--ffi-sandbox --ffi-allow /path/to/lib.so` in production. Never use `--ffi-sandbox` with an empty allowlist (it will deny all FFI).
 - [ ] Monitor `Mailbox` depths and actor reduction counts for DoS.

@@ -28,6 +28,7 @@
 //!   --emit-nbc               Compile <FILE> to a .nbc artifact; don't run
 //!   <FILE>.nbc               Run a pre-compiled .nbc artifact directly
 //!   --verify <src>           Verify .nbc source hash against <src>
+//!   --sandboxed              Deny ambient host authority (untrusted-code profile)
 //!   nula <cmd>               Package manager (new, init, build, build-wasm, test, run, add, remove, publish, deploy, list, clean)
 //!   --version, -V            Print version and exit
 //!   -v, --verbose            Show bytecode and AST
@@ -119,6 +120,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                        execution_authority_from_sandboxed(opts.sandboxed),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -352,6 +354,7 @@ fn main() {
                 }
             }
             "--ffi-sandbox" => opts.ffi_sandbox = true,
+            "--sandboxed" => opts.sandboxed = true,
             "--iso-arena" => opts.iso_arena = true,
             "--ffi-allow" => {
                 if i + 1 < args.len() {
@@ -514,6 +517,7 @@ fn main() {
                     "--bench",
                     "--json",
                     "--store",
+                    "--sandboxed",
                     "--version",
                     "--verbose",
                     "--color",
@@ -543,6 +547,35 @@ fn main() {
             arg => positional.push(arg.to_string()),
         }
         i += 1;
+    }
+
+    // Resolve the security profile before any compilation or execution.
+    // Trusted-local remains the backwards-compatible default. Sandboxed mode
+    // is intentionally strict: ambient host authority is denied rather than
+    // selectively widened through the coarse --with categories.
+    if opts.sandboxed {
+        if !opts.with_capabilities.is_empty() {
+            eprintln!("Error: --sandboxed cannot be combined with --with; sandboxed execution denies ambient host authority");
+            std::process::exit(1);
+        }
+        if !opts.ffi_allow.is_empty() {
+            eprintln!("Error: --sandboxed cannot be combined with --ffi-allow; dynamic FFI is denied");
+            std::process::exit(1);
+        }
+        // Non-empty sentinel activates the compile-time resource gate while
+        // granting none of fs/net/os.
+        opts.with_capabilities
+            .push("__sandboxed_deny_all".to_string());
+        opts.ffi_sandbox = true;
+    }
+
+    if opts.sandboxed && opts.repl {
+        eprintln!("Error: --sandboxed REPL execution is not yet supported; run a source file, --eval, or .nbc artifact instead");
+        std::process::exit(1);
+    }
+    if opts.sandboxed && opts.dap {
+        eprintln!("Error: --sandboxed DAP execution is not yet supported; run the program directly with --sandboxed");
+        std::process::exit(1);
     }
 
     // Resolve color mode once after all args are parsed.
@@ -685,6 +718,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        execution_authority_from_sandboxed(opts.sandboxed),
                     ) {
                         print_error(&e, uc);
                     }
@@ -729,6 +763,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        execution_authority_from_sandboxed(opts.sandboxed),
                     )
                 },
                 n,
@@ -748,6 +783,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                        execution_authority_from_sandboxed(opts.sandboxed),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -828,7 +864,11 @@ fn main() {
         // compiler. This is the durable-distribution path — a `.nbc` minted
         // in 2026 runs on any conforming runtime in 2126.
         if path.ends_with(".nbc") {
-            if let Err(e) = run_nbc_file(path, opts.verify_source.as_deref()) {
+            if let Err(e) = run_nbc_file(
+                path,
+                opts.verify_source.as_deref(),
+                execution_authority_from_sandboxed(opts.sandboxed),
+            ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
@@ -854,7 +894,9 @@ fn main() {
             ) {
                 Ok((ast, _)) => {
                     let mut checker = nulang::effect_checker::EffectChecker::new();
-                    checker.set_resource_grants(&opts.with_capabilities);
+                    if !opts.with_capabilities.is_empty() {
+                        checker.set_resource_grants(&opts.with_capabilities);
+                    }
                     let _ = checker.check_module(&ast.decls);
                     let graph = nulang::web::reactivity::analyze_module(&ast, Some(&checker));
                     if let Err(e) = std::fs::write(out, graph.to_json()) {
@@ -909,6 +951,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        execution_authority_from_sandboxed(opts.sandboxed),
                     )
                 },
                 n,
@@ -928,6 +971,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                        execution_authority_from_sandboxed(opts.sandboxed),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -963,6 +1007,7 @@ fn main() {
             &opts.with_capabilities,
             opts.store_path.as_deref(),
             opts.deny_warnings,
+                        execution_authority_from_sandboxed(opts.sandboxed),
         ) {
             print_error(&e, use_color);
             std::process::exit(exit_code(&e));
@@ -1007,6 +1052,9 @@ struct Options {
     /// Start a Prometheus-format metrics server on this port.
     metrics_port: Option<u16>,
     ffi_sandbox: bool,
+    /// Deny all ambient host authority for untrusted code. This is stricter
+    /// than --with: FS/network/OS effects and dynamic FFI are unavailable.
+    sandboxed: bool,
     /// Wave D4: enable the per-activation iso-arena allocation path in the
     /// bytecode VM (same as `NULANG_ISO_ARENA=1`). Default off.
     iso_arena: bool,
@@ -1053,6 +1101,7 @@ impl Default for Options {
             bench_count: None,
             metrics_port: None,
             ffi_sandbox: false,
+            sandboxed: false,
             iso_arena: false,
             ffi_allow: Vec::new(),
             with_capabilities: Vec::new(),
@@ -1130,6 +1179,7 @@ fn print_help() {
     println!("  fmt [--check] [<file>]  Format file(s); no file → all src/**/*.nula");
     println!("  -v, --verbose    Show bytecode and AST");
     println!("  --metrics-port <N>  Start Prometheus metrics server on port N");
+    println!("  --sandboxed      Untrusted-code profile: deny ambient FS/network/OS/FFI host authority");
     println!("  --emit-signals <file> Emit signal graph JSON for the web framework");
     println!("  --rewrite-signals <file> Rewrite HTML for signals and emit client JS");
     println!("  --store <uri>    Durable store URI for programs declaring durable");
@@ -1287,7 +1337,7 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
                 println!("  --tls-cert <PATH>     Server certificate (PEM)");
                 println!("  --tls-key <PATH>      Server private key (PEM)");
                 println!("  --tls-ca <PATH>       CA certificate for mutual TLS");
-                println!("  --plaintext           Disable TLS (insecure, dev only)");
+                println!("  --plaintext           Explicitly disable TLS (insecure, development only)");
                 println!("  -h, --help            Show this help message");
                 return Ok(());
             }
@@ -1308,31 +1358,40 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
     let tls_config = if plaintext {
         nulang::runtime::TlsConfig::PlaintextInsecure
     } else {
-        let cert = tls_cert
-            .as_ref()
-            .map(|p| std::fs::read_to_string(p).ok())
-            .flatten()
-            .unwrap_or_default();
-        let key = tls_key
-            .as_ref()
-            .map(|p| std::fs::read_to_string(p).ok())
-            .flatten()
-            .unwrap_or_default();
-        let ca = tls_ca
-            .as_ref()
-            .map(|p| std::fs::read_to_string(p).ok())
-            .flatten()
-            .unwrap_or_default();
-        if cert.is_empty() && key.is_empty() && ca.is_empty() {
-            eprintln!("Warning: no TLS certificates provided; using plaintext transport");
-            nulang::runtime::TlsConfig::PlaintextInsecure
-        } else {
-            nulang::runtime::TlsConfig::MutualTls {
-                ca_cert_pem: ca.into_bytes(),
-                server_cert_pem: cert.into_bytes(),
-                server_key_pem: key.into_bytes(),
-                server_name: None,
+        let (cert_path, key_path, ca_path) = match (
+            tls_cert.as_deref(),
+            tls_key.as_deref(),
+            tls_ca.as_deref(),
+        ) {
+            (Some(cert), Some(key), Some(ca)) => (cert, key, ca),
+            _ => {
+                return Err(NuError::RuntimeError {
+                    msg: "mutual TLS is required for distributed nodes; provide --tls-cert, --tls-key, and --tls-ca, or explicitly opt into insecure development transport with --plaintext".to_string(),
+                    span: Span::default(),
+                })
             }
+        };
+        let read_pem = |kind: &str, path: &str| -> NuResult<String> {
+            let pem = std::fs::read_to_string(path).map_err(|e| NuError::RuntimeError {
+                msg: format!("cannot read {kind} PEM '{path}': {e}"),
+                span: Span::default(),
+            })?;
+            if pem.trim().is_empty() {
+                return Err(NuError::RuntimeError {
+                    msg: format!("{kind} PEM '{path}' is empty"),
+                    span: Span::default(),
+                });
+            }
+            Ok(pem)
+        };
+        let cert = read_pem("TLS certificate", cert_path)?;
+        let key = read_pem("TLS private key", key_path)?;
+        let ca = read_pem("TLS CA certificate", ca_path)?;
+        nulang::runtime::TlsConfig::MutualTls {
+            ca_cert_pem: ca.into_bytes(),
+            server_cert_pem: cert.into_bytes(),
+            server_key_pem: key.into_bytes(),
+            server_name: None,
         }
     };
 
@@ -1636,7 +1695,9 @@ fn run_frontend(
     // typechecker's flatten_decls).
     let flat_decls = nulang::effect_checker::flatten_decls(&ast.decls);
     let mut effect_checker = EffectChecker::new();
-    effect_checker.set_resource_grants(with_capabilities);
+    if !with_capabilities.is_empty() {
+        effect_checker.set_resource_grants(with_capabilities);
+    }
     effect_checker.check_module(&ast.decls)?;
     for msg in &effect_checker.diagnostics {
         eprintln!("{}", msg);
@@ -1730,6 +1791,16 @@ fn run_frontend(
     Ok((ast, type_checker))
 }
 
+fn execution_authority_from_sandboxed(
+    sandboxed: bool,
+) -> nulang::authority::ExecutionAuthority {
+    if sandboxed {
+        nulang::authority::ExecutionAuthority::deny_all()
+    } else {
+        nulang::authority::ExecutionAuthority::trusted_ambient()
+    }
+}
+
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
 fn run_source(
     source: &str,
@@ -1742,6 +1813,7 @@ fn run_source(
     with_capabilities: &[String],
     store_path: Option<&str>,
     deny_warnings: bool,
+    execution_authority: nulang::authority::ExecutionAuthority,
 ) -> NuResult<()> {
     let (ast, type_checker) =
         run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
@@ -2039,7 +2111,13 @@ fn run_source(
                 None
             };
             let value = if has_actors {
-                let (value, runtime) = run_with_runtime(m, metrics_port, store_dir.as_deref())?;
+                let (value, runtime) =
+                    run_with_runtime(
+                        m,
+                        metrics_port,
+                        store_dir.as_deref(),
+                        execution_authority.clone(),
+                    )?;
                 // Surface workflow step failures: a failed step used to be
                 // silent (exit 0, no diagnostic) — SPEC2 §10 known-issue #5.
                 let failures = runtime.borrow().workflow_failures();
@@ -2061,6 +2139,7 @@ fn run_source(
                 value
             } else {
                 let mut vm = VM::new();
+                vm.set_execution_authority(execution_authority.clone());
                 vm.load_module(m);
                 vm.run()?
             };
@@ -2201,6 +2280,7 @@ fn run_with_runtime(
     m: nulang::bytecode::CodeModule,
     metrics_port: Option<u16>,
     store_dir: Option<&str>,
+    execution_authority: nulang::authority::ExecutionAuthority,
 ) -> NuResult<(
     nulang::vm::Value,
     std::rc::Rc<std::cell::RefCell<nulang::runtime::Runtime>>,
@@ -2231,9 +2311,11 @@ fn run_with_runtime(
         let runtime = std::rc::Rc::new(std::cell::RefCell::new(shard_0));
         let mut vm = VM::new();
         vm.load_module(m);
-        vm.set_actor_callbacks(Box::new(nulang::runtime::RuntimeVmCallbacks::new(
+        let callbacks = nulang::runtime::RuntimeVmCallbacks::with_execution_authority(
             runtime.clone(),
-        )));
+            execution_authority.clone(),
+        );
+        vm.set_actor_callbacks(Box::new(callbacks));
         let value = vm.run()?;
         // Drop the VM (and its callback box, which holds an Rc clone) so
         // we can unwrap the Rc below.
@@ -2276,9 +2358,11 @@ fn run_with_runtime(
         runtime.borrow_mut().register_module_grains(&m);
         let mut vm = VM::new();
         vm.load_module(m);
-        vm.set_actor_callbacks(Box::new(nulang::runtime::RuntimeVmCallbacks::new(
+        let callbacks = nulang::runtime::RuntimeVmCallbacks::with_execution_authority(
             runtime.clone(),
-        )));
+            execution_authority.clone(),
+        );
+        vm.set_actor_callbacks(Box::new(callbacks));
         if let Some(port) = metrics_port {
             let _ = runtime.borrow_mut().enable_metrics_server(port);
         }
@@ -2431,7 +2515,11 @@ fn compile_source_to_nbc(
 /// Load and run a `.nbc` artifact directly, optionally verifying its recorded
 /// source hash against a source file. This is the durable-distribution path:
 /// no compiler invocation, no source parse — just `from_nbc` + `VM::run`.
-fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
+fn run_nbc_file(
+    path: &str,
+    verify_source: Option<&str>,
+    execution_authority: nulang::authority::ExecutionAuthority,
+) -> NuResult<()> {
     let bytes = std::fs::read(path).map_err(|e| nulang::types::NuError::VMError {
         msg: format!("cannot read .nbc file '{path}': {e}"),
         span: Span::default(),
@@ -2472,6 +2560,7 @@ fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
     }
 
     let mut vm = VM::new();
+    vm.set_execution_authority(execution_authority.clone());
     vm.load_module(artifact.module);
     let value = vm.run()?;
     let result_str = value.to_string_repr();
@@ -2639,7 +2728,13 @@ mod tests {
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
         let (_value, runtime) =
-            run_with_runtime(module, None, None).expect("actor program should run");
+            run_with_runtime(
+                module,
+                None,
+                None,
+                nulang::authority::ExecutionAuthority::trusted_ambient(),
+            )
+            .expect("actor program should run");
         let rt = runtime.borrow();
         let actor = rt.actors.values().next().expect("one actor should exist");
         assert_eq!(

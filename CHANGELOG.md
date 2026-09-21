@@ -42,6 +42,10 @@ version + migration.*
 
 ## Stable tier
 
+### Unified top-level execution authority — 2026-09-21
+- **Trusted local, explicit-grant, and deny-all execution now share one typed host-authority policy** (Experimental, `src/authority.rs`, `src/vm.rs`, `src/runtime/callbacks.rs`, `src/main.rs`). `ExecutionAuthority::{TrustedAmbient, Explicit, DenyAll}` governs actor-free host boundaries; actor-backed execution continues to use each actor's exact `AuthorityManifest`. The CLI `--sandboxed` flag is now only a convenience that lowers to `DenyAll`, rather than a separate boolean security path. FS/network/Env/Secret/Process/System/DB/Python/Web/Realtime and dynamic FFI authorization converge on the same exact-grant model.
+- **Untrusted execution remains fail-closed at the host boundary.** Malformed resource descriptions are denied before host operations run, explicit policies authorize only exact typed grants, and trusted-local execution preserves the existing ambient development contract.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
