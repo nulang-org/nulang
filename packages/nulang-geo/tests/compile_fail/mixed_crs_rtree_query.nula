@@ -1,0 +1,16 @@
+// Must fail: an R-tree query must use the tree's CRS.
+import lib
+
+fn main() {
+    let entries = [
+        rtree_entry(
+            bounding_box(0.0, 0.0, 1.0, 1.0, CARTESIAN),
+            1
+        )
+    ];
+    let tree = rtree_bulk_load(entries, CARTESIAN, 4);
+    rtree_query_intersects(
+        tree,
+        bounding_box(-1.0, -1.0, 1.0, 1.0, WGS84)
+    )
+}
