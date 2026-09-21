@@ -280,7 +280,7 @@ pub(crate) fn spawn_from_module(
         },
         None => ActorRole::Plain,
     };
-    let definition_semantic_id = meta.and_then(|meta| module.actor_semantic_id(&meta.name));
+    let definition_semantic_id = module.actor_semantic_id_for_behavior(behavior_idx);
 
     let id = if let Some(meta) = meta {
         let state_models: HashMap<String, StateModel> = meta
