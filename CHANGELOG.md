@@ -42,6 +42,9 @@ version + migration.*
 
 ## Stable tier
 
+### WASM guest execution budget — 2026-09-21
+- **Deterministic fuel enforcement across every Wasmtime host path** (Experimental backend hardening, `src/wasm_runtime.rs`, `src/wasm_component_runtime.rs`, `src/wasmfx_runtime.rs`). Wasmtime fuel consumption is enabled for module, Component Model, and WasmFX execution. Each invocation or pooled-component checkout receives a fresh 100,000,000-fuel budget, so non-terminating guest code traps instead of monopolizing a host thread. Caller-supplied module configs cannot accidentally disable this termination boundary. Infinite-loop regressions cover the module and WasmFX runtimes; the threat model now records both fuel enforcement and the already-implemented component import capability gate.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
