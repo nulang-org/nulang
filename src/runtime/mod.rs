@@ -187,7 +187,9 @@ const DEHYDRATE_CHECK_INTERVAL: u64 = 50;
 fn suspension_marker(actor: &Actor, signal_name: Option<String>) -> Option<String> {
     match signal_name {
         Some(name) => Some(name),
-        None if actor.is_workflow => Some(LLM_SUSPEND_MARKER.to_string()),
+        None if actor.semantics().map(|s| s.is_workflow()).unwrap_or(false) => {
+            Some(LLM_SUSPEND_MARKER.to_string())
+        }
         None => None,
     }
 }
@@ -866,7 +868,10 @@ impl Runtime {
                 .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
                 .collect();
             let bytecode_offsets =
-                crate::runtime::spawn::bytecode_offsets_for(module, meta.is_workflow);
+                crate::runtime::spawn::bytecode_offsets_for(
+                    module,
+                    meta.semantics().map(|s| s.is_workflow()).unwrap_or(false),
+                );
             let compensation_offsets: Vec<Option<usize>> = meta
                 .behavior_indices
                 .iter()
@@ -4925,7 +4930,7 @@ impl Runtime {
         let actor_ids: Vec<u64> = self
             .actors
             .iter()
-            .filter(|(_, a)| a.is_workflow)
+            .filter(|(_, a)| a.semantics().map(|s| s.is_workflow()).unwrap_or(false))
             .map(|(id, _)| *id)
             .collect();
         for actor_id in actor_ids {
@@ -5011,7 +5016,11 @@ impl Runtime {
         let is_workflow = self
             .recovery_modules
             .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_workflow))
+            .map(|(m, _, _)| {
+                m.actor_metadata
+                    .iter()
+                    .any(|meta| meta.semantics().map(|s| s.is_workflow()).unwrap_or(false))
+            })
             .unwrap_or(!workflow_events.is_empty());
         let is_agent = self
             .recovery_modules
@@ -5298,7 +5307,7 @@ impl Runtime {
             module
                 .actor_metadata
                 .iter()
-                .find(|m| m.is_workflow)
+                .find(|m| m.semantics().map(|s| s.is_workflow()).unwrap_or(false))
                 .map(|meta| {
                     meta.behavior_indices
                         .iter()
@@ -5519,8 +5528,14 @@ impl Runtime {
             }
         };
 
-        let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
-        let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
+        let is_workflow = module
+            .actor_metadata
+            .iter()
+            .any(|m| m.semantics().map(|s| s.is_workflow()).unwrap_or(false));
+        let is_agent = module
+            .actor_metadata
+            .iter()
+            .any(|m| m.semantics().map(|s| s.is_agent()).unwrap_or(false));
 
         let actor = match Self::restore_actor_from_snapshot(
             actor_id,
@@ -5551,7 +5566,7 @@ impl Runtime {
         let compensation_offsets: Vec<Option<usize>> = module
             .actor_metadata
             .iter()
-            .find(|m| m.is_workflow)
+            .find(|m| m.semantics().map(|s| s.is_workflow()).unwrap_or(false))
             .map(|meta| {
                 meta.behavior_indices
                     .iter()
