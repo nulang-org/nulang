@@ -32,13 +32,13 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Snapshot the durable and CRDT state of a persistent actor.
-pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
+pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> bool {
     let actor = match rt.actors.get(&actor_id) {
         Some(a) => a,
-        None => return,
+        None => return false,
     };
     if !actor.persistent {
-        return;
+        return true;
     }
     let seq = next_sequence(rt, actor_id);
     let mut state = std::collections::HashMap::new();
@@ -49,14 +49,20 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
             .copied()
             .unwrap_or(StateModel::Local);
         if model == StateModel::Durable || model.is_crdt() {
-            let persisted = if name == "semantic_memory" || name == "procedural_memory" {
-                vm_value_to_string_in_actor(value, actor)
-                    .map(PersistedValue::String)
-                    .unwrap_or_else(|| {
-                        PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
-                    })
-            } else {
-                PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
+            let persisted = match PersistedValue::try_from_value_resolved(
+                value,
+                actor.bytecode_module.as_ref(),
+            ) {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    tracing::warn!(
+                        actor_id,
+                        field = %name,
+                        %error,
+                        "nulang-persist: refusing checkpoint with unsupported durable value"
+                    );
+                    return false;
+                }
             };
             state.insert(name.clone(), persisted);
         }
@@ -69,7 +75,7 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
                 actor_id,
                 err
             );
-            return;
+            return false;
         }
     };
     // Snapshot the global CRDT state alongside durable actor fields.
@@ -99,11 +105,19 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
     // deterministic shadow node before the local save, so the replica is a
     // byte-identical copy of exactly what the local store will hold.
     rt.maybe_shadow_replicate(actor_id, &snapshot);
-    let _ = rt.persistence.save_snapshot(snapshot);
+    if let Err(error) = rt.persistence.save_snapshot(snapshot) {
+        tracing::warn!(
+            actor_id,
+            %error,
+            "nulang-persist: checkpoint store write failed"
+        );
+        return false;
+    }
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = seq;
         actor.dirty_fields.clear();
     }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -131,15 +145,50 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
 /// journal and a checkpoint is forced.
 pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
     let is_workflow = actor_is_workflow(rt, actor_id);
+    let event_sourced_names: Vec<String> = rt
+        .actors
+        .get(&actor_id)
+        .map(|actor| {
+            actor
+                .state_models
+                .iter()
+                .filter(|(_, model)| **model == StateModel::EventSourced)
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Preflight every payload that will cross a durable event boundary before
+    // mutating actor state. Ephemeral actors with no event-sourced fields keep
+    // their in-memory-only event behavior.
+    let persisted_args = if is_workflow || !event_sourced_names.is_empty() {
+        let module = rt
+            .actors
+            .get(&actor_id)
+            .and_then(|actor| actor.bytecode_module.as_ref());
+        match args
+            .iter()
+            .map(|value| PersistedValue::try_from_value_resolved(value, module))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(args) => Some(args),
+            Err(error) => {
+                tracing::warn!(
+                    actor_id,
+                    event,
+                    %error,
+                    "nulang-persist: refusing durable event with unsupported payload"
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     let seq = next_sequence(rt, actor_id);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.event_log.push((event.to_string(), args.to_vec()));
-        let event_sourced_names: Vec<String> = actor
-            .state_models
-            .iter()
-            .filter(|(_, model)| **model == StateModel::EventSourced)
-            .map(|(name, _)| name.clone())
-            .collect();
         for name in &event_sourced_names {
             if let Some(n) = actor.get_state_field(name).and_then(|v| v.as_int()) {
                 actor.set_state_field(name, Value::int(n + 1));
@@ -148,10 +197,9 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
         // Persist events for EventSourced fields (non-workflow actors).
         if !is_workflow && !event_sourced_names.is_empty() {
             let module = actor.bytecode_module.as_ref();
-            let persisted_args: Vec<PersistedValue> = args
-                .iter()
-                .map(|v| PersistedValue::from_value_resolved(v, module))
-                .collect();
+            let persisted_args = persisted_args
+                .as_ref()
+                .expect("durable event payload preflighted before mutation");
             for name in &event_sourced_names {
                 // Capture the field's current value AFTER the apply
                 // handler has run and the +1 has been applied.  This
@@ -163,9 +211,30 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     field_name: name.clone(),
                     event_name: event.to_string(),
                     args: persisted_args.clone(),
-                    value: PersistedValue::from_value_resolved(&current_val, module),
+                    value: match PersistedValue::try_from_value_resolved(&current_val, module) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::warn!(
+                                actor_id,
+                                field = %name,
+                                event,
+                                %error,
+                                "nulang-persist: refusing event-sourced write with unsupported state"
+                            );
+                            return;
+                        }
+                    },
                 };
-                let _ = rt.persistence.append_event(actor_id, entry);
+                if let Err(error) = rt.persistence.append_event(actor_id, entry) {
+                    tracing::warn!(
+                        actor_id,
+                        field = %name,
+                        event,
+                        %error,
+                        "nulang-persist: event journal write failed"
+                    );
+                    return;
+                }
             }
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 for name in &event_sourced_names {
@@ -194,22 +263,24 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 actor.set_state_field("parallel_progress", Value::int(current + 1));
             }
         } else {
-            let module = rt
-                .actors
-                .get(&actor_id)
-                .and_then(|a| a.bytecode_module.as_ref());
-            let payload: Vec<PersistedValue> = args
-                .iter()
-                .map(|v| PersistedValue::from_value_resolved(v, module))
-                .collect();
-            let _ = rt.persistence.append_workflow_event(
+            let payload =
+                persisted_args.expect("workflow event payload preflighted before mutation");
+            if let Err(error) = rt.persistence.append_workflow_event(
                 actor_id,
                 WorkflowEvent::Custom {
                     sequence: seq,
                     name: event.to_string(),
                     args: payload,
                 },
-            );
+            ) {
+                tracing::warn!(
+                    actor_id,
+                    event,
+                    %error,
+                    "nulang-persist: workflow event journal write failed"
+                );
+                return;
+            }
         }
         checkpoint_actor(rt, actor_id);
     }

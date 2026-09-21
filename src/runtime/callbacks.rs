@@ -2345,24 +2345,22 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                         .unwrap_or(crate::runtime::persistence::StateModel::Local);
                     if model == crate::runtime::persistence::StateModel::Durable || model.is_crdt()
                     {
-                        let persisted = if name == "semantic_memory" || name == "procedural_memory"
-                        {
-                            crate::runtime::workflow::vm_value_to_string_in_actor(
-                                    value, actor,
-                                )
-                                .map(crate::runtime::persistence::PersistedValue::String)
-                                .unwrap_or_else(|| {
-                                    crate::runtime::persistence::PersistedValue::from_value_resolved(
-                                        value,
-                                        actor.bytecode_module.as_ref(),
-                                    )
-                                })
-                        } else {
-                            crate::runtime::persistence::PersistedValue::from_value_resolved(
+                        let persisted =
+                            match crate::runtime::persistence::PersistedValue::try_from_value_resolved(
                                 value,
                                 actor.bytecode_module.as_ref(),
-                            )
-                        };
+                            ) {
+                                Ok(persisted) => persisted,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        actor_id,
+                                        field = %name,
+                                        %error,
+                                        "nulang-migrate: refusing migration with unsupported durable value"
+                                    );
+                                    return;
+                                }
+                            };
                         state.insert(name.clone(), persisted);
                     }
                 }
