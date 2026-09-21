@@ -423,6 +423,19 @@ pub trait PersistenceStore: Send + Sync {
     /// Append an event to the actor's event-sourcing log.
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()>;
 
+    /// Append one logical group of event-sourced field mutations.
+    ///
+    /// Backends with transactional/batch primitives should override this so
+    /// either the full group becomes durable or none of it does. The default
+    /// preserves compatibility for custom stores but only provides sequential
+    /// append semantics.
+    fn append_events(&mut self, actor_id: u64, entries: &[EventEntry]) -> io::Result<()> {
+        for entry in entries {
+            self.append_event(actor_id, entry.clone())?;
+        }
+        Ok(())
+    }
+
     /// Read all event-sourcing entries for an actor in order.
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry>;
 
@@ -544,6 +557,14 @@ impl PersistenceStore for MemoryStore {
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         self.events.entry(actor_id).or_default().push(entry);
+        Ok(())
+    }
+
+    fn append_events(&mut self, actor_id: u64, entries: &[EventEntry]) -> io::Result<()> {
+        self.events
+            .entry(actor_id)
+            .or_default()
+            .extend(entries.iter().cloned());
         Ok(())
     }
 
@@ -1949,6 +1970,29 @@ impl PersistenceStore for RocksDbStore {
                 Self::actor_event_key(actor_id, entry.sequence, &entry.field_name),
                 json.as_bytes(),
             )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn append_events(&mut self, actor_id: u64, entries: &[EventEntry]) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let cf = self.cf(Self::CF_EVENTS)?;
+        let mut batch = rocksdb::WriteBatch::default();
+        for entry in entries {
+            let json = serde_json::to_vec(entry)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            batch.put_cf(
+                cf,
+                Self::actor_event_key(actor_id, entry.sequence, &entry.field_name),
+                json,
+            );
+        }
+        self.db
+            .write(batch)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         self.db
             .flush_wal(true)
