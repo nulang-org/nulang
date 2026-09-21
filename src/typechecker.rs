@@ -3872,6 +3872,28 @@ impl TypeChecker {
             return Ok((subst, Type::secret(Type::string())));
         }
 
+        if effect == "Secret" && matches!(op, "valid" | "revoke") {
+            if arg_types.len() != 1 {
+                return Err(NuError::TypeError {
+                    msg: format!("Secret.{op} expects exactly one Secret value"),
+                    span,
+                    expected_type: Some("1 Secret argument".to_string()),
+                    found_type: Some(format!("{} arguments", arg_types.len())),
+                    similar_names: None,
+                });
+            }
+            if arg_types[0].secret_inner().is_none() {
+                return Err(NuError::TypeError {
+                    msg: format!("Secret.{op} expects a Secret[T] value"),
+                    span: args[0].span(),
+                    expected_type: Some("Secret[T]".to_string()),
+                    found_type: Some(format!("{}", arg_types[0])),
+                    similar_names: None,
+                });
+            }
+            return Ok((subst, Type::bool()));
+        }
+
         // Unknown operations fail closed even inside the Secret namespace.
         // A Secret operation may accept protected values only when the compiler
         // has an explicit semantic rule for that operation. This prevents a
@@ -5506,6 +5528,24 @@ mod tests {
             err.to_string().contains("must be local"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_secret_handle_operations_are_explicitly_typed() {
+        for source in [
+            "fn f(s: Secret[String]) -> Bool { perform Secret.valid(s) }",
+            "fn f(s: Secret[String]) -> Bool { perform Secret.revoke(s) }",
+        ] {
+            let result = check_src(source);
+            assert!(
+                result.is_ok(),
+                "recognized secret-handle operation must type-check: {:?}",
+                result.err()
+            );
+        }
+
+        let bad = check_src("perform Secret.valid(42)");
+        assert!(bad.is_err(), "Secret.valid must reject non-secret values");
     }
 
     #[test]
