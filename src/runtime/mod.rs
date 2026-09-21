@@ -3621,12 +3621,11 @@ impl Runtime {
             // owner heap) stay alive until this actor exits.
             self.hold_payload_refs(actor_id, &msg.payload);
 
-            // Establish the W3C trace context for this message: a child of
-            // the sender's span when the message carries a traceparent (so
-            // causal chains continue), otherwise a fresh root. The context is
-            // recorded on the runtime so sends performed by the handler below
-            // stamp their outgoing traceparent as children of it. `_span_guard`
-            // keeps the `tracing` span alive for the rest of this dispatch.
+            // Establish W3C trace context only when there is incoming context
+            // to propagate or a TRACE subscriber actually needs a new root.
+            // This keeps ordinary local actor traffic free of trace-id
+            // generation and traceparent formatting. `_span_guard` keeps an
+            // enabled tracing span alive for the rest of this dispatch.
             let trace_ctx = match &msg.trace_id {
                 Some(tp) => TraceContext::from_traceparent(tp)
                     .map(|incoming| incoming.child())
@@ -3676,7 +3675,7 @@ impl Runtime {
                 }
                 self.checkpoint_actor(actor_id);
                 self.current_actor = None;
-                    self.current_trace = None;
+                self.current_trace = None;
                 return;
             }
 
@@ -3800,7 +3799,7 @@ impl Runtime {
                 }
                 self.checkpoint_actor(actor_id);
                 self.current_actor = None;
-                    self.current_trace = None;
+                self.current_trace = None;
                 return;
             }
 
@@ -3811,7 +3810,7 @@ impl Runtime {
                     Some(a) => a,
                     None => {
                         self.current_actor = None;
-                    self.current_trace = None;
+                        self.current_trace = None;
                         return;
                     }
                 };
@@ -3827,7 +3826,7 @@ impl Runtime {
                     Some(a) => a,
                     None => {
                         self.current_actor = None;
-                    self.current_trace = None;
+                        self.current_trace = None;
                         return;
                     }
                 };
@@ -3871,7 +3870,7 @@ impl Runtime {
                         Some(a) => a,
                         None => {
                             self.current_actor = None;
-                    self.current_trace = None;
+                            self.current_trace = None;
                             return;
                         }
                     };
@@ -4019,7 +4018,7 @@ impl Runtime {
         // enqueue_actor can distinguish a real next turn from a self-send
         // during the turn that just completed.
         self.current_actor = None;
-                    self.current_trace = None;
+        self.current_trace = None;
         if should_requeue && requeue {
             self.enqueue_actor(actor_id);
         }
