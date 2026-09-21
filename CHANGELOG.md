@@ -42,6 +42,25 @@ version + migration.*
 
 ## Stable tier
 
+### Canonical formatter semantics and syntax convergence — 2026-09-21
+- **Formatter preserves actor transport semantics** (Experimental tooling,
+  `src/fmt.rs`). `nulang fmt` now retains `remote` on sends and asks and
+  retains literal `timeout` metadata on asks instead of silently rewriting
+  distributed operations into local/default-timeout forms.
+- **Mutable bindings round-trip as valid Nulang syntax.** Local mutable
+  bindings emit `var`; module-level mutable declarations retain the parser's
+  current `let var` declaration form. The formatter no longer invents the
+  non-language `let mut` spelling and preserves explicit type annotations.
+- **Local actor sends have one canonical formatter spelling.** Both accepted
+  local send forms still parse, but formatter output converges on
+  `actor ! behavior(args)`. Explicit `send remote ...` remains keyword
+  syntax because the transport choice changes semantics.
+- **RFC 0032** documents the progressive-DX direction: one formatter-owned
+  canonical spelling now, followed after stabilization gate #231 by separately
+  reviewed work on error-model convergence, pure primitive cleanup, effect
+  syntax, capability progressive disclosure, and keyword-surface reduction.
+  No parser/runtime/effect/capability semantics change in this Phase-0 slice.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 

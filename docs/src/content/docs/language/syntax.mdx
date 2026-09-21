@@ -4,6 +4,17 @@ description: Core Nulang syntax — functions, bindings, control flow, records, 
 ---
 import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 
+## Canonical Syntax
+
+Nulang may temporarily accept more than one spelling while syntax migrates, but
+`nulang fmt` defines the canonical source form. Documentation uses the
+formatter spelling first so projects converge instead of accumulating dialects.
+
+Key canonical forms include `var x = value` for mutable bindings,
+`spawn Actor(...)` for actor construction, and `actor ! message(...)` for
+local asynchronous sends. Explicit remote sends keep the keyword form because
+the transport choice is semantically meaningful.
+
 ## Functions
 
 <CopyMarkdown />
@@ -34,6 +45,18 @@ let y: Int = x + 8
 let pair = (x, y)  // Tuple: (Int, Int)
 ```
 
+## Mutable Bindings
+
+Use `var` only when reassignment is required:
+
+```nulang
+var attempts: Int = 0
+attempts = attempts + 1
+```
+
+The formatter always emits `var` for mutable bindings; it does not use
+Rust-style `let mut`.
+
 ## Control Flow
 
 ### If Expressions
@@ -54,8 +77,8 @@ type Option[T] = Some(T) | None
 
 fn unwrap_or(o: Option[Int], default: Int) -> Int {
     match o {
-        Some(v) => v,
-        None => default
+        | Some(v) => v
+        | None => default
     }
 }
 ```
@@ -65,9 +88,9 @@ Match arms can have guards:
 ```nulang
 let value = 7
 match value {
-    n if n > 0 => "positive",
-    n if n < 0 => "negative",
-    _ => "zero"
+    | n if n > 0 => "positive"
+    | n if n < 0 => "negative"
+    | _ => "zero"
 }
 ```
 
@@ -104,10 +127,23 @@ Construct and match:
 let ok = Ok(42)
 
 match ok {
-    Ok(v) => "Got " + perform Int.to_string(v),
-    Error(e) => "Error: " + e
+    | Ok(v) => "Got " + perform Int.to_string(v)
+    | Error(e) => "Error: " + e
 }
 ```
+
+## String Interpolation
+
+Nulang supports f-strings. This is the preferred interpolation form:
+
+```nulang
+let name = "Ada"
+let count = 3
+let message = f"{name} has {count} jobs"
+```
+
+The older `"value #{expr}"` form is accepted for compatibility; formatting
+should converge new code on f-strings.
 
 ## Arrays
 
@@ -137,38 +173,29 @@ let dbl = fn(x) { x * 2 } in
 
 `x |> f` is equivalent to `f(x)`. Chaining `a |> f |> g |> h` applies `f`, then `g`, then `h` in order.
 
-## Send Operators
+## Actor Sends
 
-There are two syntaxes for sending a message to an actor:
-
-```nulang
-actor Counter {
-    behavior inc() { 0 }
-}
-let counter = spawn Counter {}
-
-// Keyword form
-send counter inc()
-
-// Operator form (equivalent)
-counter ! inc()
-```
-
-Both parse to the same AST. The `!` form is more concise; the `send` form is more readable for complex arguments:
+The canonical local asynchronous send uses `!`, which keeps the actor boundary
+visible without looking like an ordinary function call:
 
 ```nulang
 actor Counter {
     state count: Int = 0
     behavior inc_by(n: Int) { self.count = self.count + n }
-    behavior watch(v: Int) { 0 }
-    behavior get() { self.count }
 }
-let counter = spawn Counter {}
-let w = spawn Counter {}
+let counter = spawn Counter()
 
-w ! watch(7)
-send counter inc_by(5)
-send counter get()
+counter ! inc_by(5)
+```
+
+The parser also accepts `send counter inc_by(5)` for compatibility, but
+`nulang fmt` rewrites local sends to `!`.
+
+When delivery is explicitly forced through the distributed path, keep the
+keyword because `remote` changes semantics:
+
+```nulang
+send remote counter inc_by(5)
 ```
 
 ## Ask Operator
@@ -180,9 +207,18 @@ actor Assistant {
     behavior ask(q: String) -> String { "answer to " + q }
 }
 
-let a = spawn Assistant {} in
+let a = spawn Assistant() in
 ask a ask("What is an actor model?")
 ```
+
+Explicit distributed request/reply can carry a literal transport timeout:
+
+```nulang
+ask remote a ask("status") timeout 2500
+```
+
+The formatter preserves both `remote` and the timeout because they affect
+runtime behavior.
 
 See [AI Agents](/ai/overview/) for agent declarations and tool binding.
 
@@ -196,26 +232,37 @@ let fib = fn(n) {
 } in fib(10)
 ```
 
-`if cond then a else b` returns `a` when `cond` is truthy, `b` otherwise. The block form (`if cond { a } else { b }`) is equivalent.
+`if cond then a else b` returns `a` when `cond` is truthy, `b` otherwise.
+Blocks are allowed as branch expressions, but `then` remains required:
+`if cond then { a } else { b }`.
 
-## Effect Annotations
+## Errors and Effect Annotations
 
-Function signatures declare their effects with `!` or `throws` followed by an effect row:
+Typed recoverable errors and algebraic effect rows are separate contracts.
+
+Use `throws ErrorType` as the readable typed-error spelling:
+
+```nulang
+fn load_user(id: Int) -> User throws LoadError {
+    // returns Ok(User) / Error(LoadError) under the current Result model
+    load(id)
+}
+```
+
+Effect rows use `! {Effect, ...}`:
 
 ```nulang
 // Pure function — no effects
 fn add(x: Int, y: Int) -> Int = x + y
 
-// Effectful — performs IO (effect row after return type)
 fn greet() -> Unit ! {IO} {
     perform IO.print("Hello")
 }
-
-// throws is an alias for !
-fn log(msg: String) -> Unit throws {IO} {
-    perform IO.print(msg)
-}
 ```
+
+The parser also accepts the older `-> T ! ErrorType` typed-error form.
+RFC 0032 proposes reducing the overload on `!` in a later, separately
+reviewed syntax phase.
 
 See [Algebraic Effects](/language/effects/) for the full effect system.
 

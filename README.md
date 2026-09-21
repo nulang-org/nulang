@@ -118,11 +118,11 @@ perform IO.print("Hello, " + name + "!")
 - **Algebraic effects** — `perform Effect.op(args)` / `handle body with { | Effect.op(x) => ... }` with resume semantics. Effect dependencies are explicit in function signatures via `!` rows.
 - **Capability-based types** — `iso`, `trn`, `ref`, `val`, `box`, `tag`, and `lineariso` guarantee memory safety and data-race freedom. Checked at compile time; erased at runtime.
 - **Hindley-Milner type inference** — full Algorithm W with row-polymorphic records, variant types, and algebraic effect rows.
-- **Actors** — `spawn`, `send`/`!`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
+- **Actors** — `spawn Actor(...)`, canonical local sends with `!`, explicit `send remote`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
 - **Typed actor protocols** — structural `ActorRef[P]` contracts can restrict public actor APIs to required behaviors. Compiler-derived protocol fingerprints, a trusted schema registry, directional compatibility checks, and pre-mailbox admission are implemented as *Experimental* protocol hardening.
 - **Entities & workflows** — `entity` declarations are durable-first and event-sourced by default. The higher-level `workflow` declaration surface supports steps, timers, signals, and saga compensation, and remains *Experimental* while that API evolves.
 - **`let` and `var`** — immutable and mutable bindings. Records with `{ field: value }` syntax and `{ base .. field = new_val }` update syntax. Pattern matching with guards, alias patterns, and recursive sub-patterns. `**` exponentiation. Multi-line `"""..."""` strings with `\u{...}` unicode escapes. Pipe operator `|>`.
-- **Error handling** — `catch expr fallback` (prefix or postfix), `fail Error(...)` for structured short-circuit return, `T ! E` return types, `?` unwrap.
+- **Error handling** — `Result[T, E]` values with `?` propagation and readable `throws E` signature sugar; algebraic effects handle checked side effects and actor supervision handles faults. Draft RFC 0015 proposes retiring the legacy `catch`/`fail` forms.
 - **FS file I/O** — `perform FS.read(path)`, `perform FS.write(path, content)`, `perform FS.append(path, content)`, `perform FS.exists(path)`.
 - **Package manager** — `nula new/init/build/run/test/add/remove/list/clean/doc`. See [below](#package-manager).
 - **Test runner** — `nula test` discovers `.nula` files under `tests/`; uses the `Test` effect (`perform Test.assert_eq(a, b)`, `perform Test.assert(cond, msg)`, etc.).

@@ -108,8 +108,17 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             ret_type,
             body,
             effect,
+            span,
             ..
         } => {
+            // Top-level script expressions are represented by the parser as a
+            // synthetic zero-span __main function. Do not leak that compiler
+            // representation back into formatted source.
+            if name == "__main" && span.start == 0 && span.end == 0 {
+                fmt_block_body(out, body, indent, had_unhandled);
+                out.push('\n');
+                return;
+            }
             out.push_str(&format!("{}fn {}(", sp, name));
             for (i, p) in params.iter().enumerate() {
                 let pn = &p.name;
@@ -249,7 +258,9 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             }
         }
         Decl::Extern { library, funcs, .. } => {
-            out.push_str(&format!("{}extern \"{}\" {{\n", sp, library));
+            out.push_str(&format!("{}extern ", sp));
+            push_string_literal(out, library);
+            out.push_str(" {\n");
             for f in funcs {
                 out.push_str(&format!("{}    fn {}(", sp, f.name));
                 for (j, (pn, pt)) in f.params.iter().enumerate() {
@@ -530,9 +541,14 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             mutable,
             ..
         } => {
-            out.push_str(&format!("{}let ", sp));
             if *mutable {
-                out.push_str("mut ");
+                // Module-level mutable declarations currently parse as
+                // `let var name = ...`; bare `var` is expression-position
+                // syntax. Preserve declaration scope until a later syntax RFC
+                // deliberately unifies the two forms.
+                out.push_str(&format!("{}let var ", sp));
+            } else {
+                out.push_str(&format!("{}let ", sp));
             }
             out.push_str(name);
             if let Some(t) = type_ann {
@@ -631,7 +647,9 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             out.push_str("f\"");
             for part in parts {
                 match part {
-                    Expr::Literal(Literal::String(s), _) => out.push_str(s),
+                    Expr::Literal(Literal::String(s), _) => {
+                        push_escaped_string_content(out, s)
+                    },
                     e => {
                         out.push_str("{");
                         fmt_expr(out, e, indent, had_unhandled);
@@ -644,7 +662,7 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
         Expr::Literal(lit, _) => match lit {
             Literal::Int(n) => out.push_str(&n.to_string()),
             Literal::Float(f) => out.push_str(&f.to_string()),
-            Literal::String(s) => out.push_str(&format!("\"{}\"", s)),
+            Literal::String(s) => push_string_literal(out, s),
             Literal::Bool(b) => out.push_str(&b.to_string()),
             Literal::Nil => out.push_str("nil"),
             Literal::Unit => out.push_str("unit"),
@@ -652,12 +670,55 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
         Expr::Var(name, _) => out.push_str(name),
         Expr::SelfRef(_) => out.push_str("self"),
         Expr::Let {
-            name, value, body, ..
+            name,
+            ty,
+            value,
+            body,
+            mutable,
+            let_in,
+            ..
         } => {
-            out.push_str(&format!("let {} = ", name));
+            if *mutable {
+                out.push_str(&format!("var {}", name));
+            } else {
+                out.push_str(&format!("let {}", name));
+            }
+            if let Some(ty) = ty {
+                out.push_str(&format!(": {}", fmt_type(ty)));
+            }
+            out.push_str(" = ");
             fmt_expr(out, value, indent, had_unhandled);
-            out.push_str(" in\n");
-            fmt_expr(out, body, indent, had_unhandled);
+
+            if *let_in {
+                // Preserve explicitly expression-scoped `let ... in ...`.
+                out.push_str(" in\n");
+                fmt_expr(out, body, indent, had_unhandled);
+            } else {
+                // Statement bindings are represented as nested Let nodes by the
+                // parser. Flatten the synthetic body back into straightforward
+                // sequential source instead of introducing `in { ... }`.
+                let empty_body = matches!(
+                    body.as_ref(),
+                    Expr::Block { exprs, span }
+                        if exprs.is_empty() && span.start == 0 && span.end == 0
+                ) || matches!(
+                    body.as_ref(),
+                    Expr::Literal(Literal::Unit, span)
+                        if span.start == 0 && span.end == 0
+                );
+                if !empty_body {
+                    out.push('\n');
+                    match body.as_ref() {
+                        Expr::Block { .. } => {
+                            fmt_block_body(out, body, indent, had_unhandled);
+                        }
+                        other => {
+                            out.push_str(&sp);
+                            fmt_expr(out, other, indent, had_unhandled);
+                        }
+                    }
+                }
+            }
         }
         Expr::If {
             cond,
@@ -903,11 +964,21 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             actor,
             behavior,
             args,
+            remote,
             ..
         } => {
-            out.push_str("send ");
-            fmt_expr(out, actor, indent, had_unhandled);
-            out.push_str(&format!(" {}(", behavior));
+            if *remote {
+                // The operator form has no explicit remote marker, so preserve
+                // distributed semantics with the keyword spelling.
+                out.push_str("send remote ");
+                fmt_expr(out, actor, indent, had_unhandled);
+                out.push_str(&format!(" {}(", behavior));
+            } else {
+                // Canonical local send: visually preserves the actor boundary
+                // while avoiding a second ordinary keyword-call spelling.
+                fmt_expr(out, actor, indent, had_unhandled);
+                out.push_str(&format!(" ! {}(", behavior));
+            }
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
@@ -920,9 +991,14 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             actor,
             behavior,
             args,
+            remote,
+            timeout_ms,
             ..
         } => {
             out.push_str("ask ");
+            if *remote {
+                out.push_str("remote ");
+            }
             fmt_expr(out, actor, indent, had_unhandled);
             out.push_str(&format!(" {}(", behavior));
             for (i, a) in args.iter().enumerate() {
@@ -932,6 +1008,9 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
                 fmt_expr(out, a, indent, had_unhandled);
             }
             out.push(')');
+            if let Some(ms) = timeout_ms {
+                out.push_str(&format!(" timeout {}", ms));
+            }
         }
         Expr::Spawn {
             actor_type,
@@ -988,7 +1067,8 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
                 out.push(']');
             }
             if let Some(reg) = register_as {
-                out.push_str(&format!(" as \"{}\"", reg));
+                out.push_str(" as ");
+                push_string_literal(out, reg);
             }
         }
         Expr::Handle { body, handlers, .. } => {
@@ -1090,9 +1170,9 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             fmt_expr(out, body, indent, had_unhandled);
         }
         Expr::Panic(msg, _) => {
-            out.push_str("panic(\"");
-            out.push_str(msg);
-            out.push_str("\")");
+            out.push_str("panic(");
+            push_string_literal(out, msg);
+            out.push(')');
         }
     }
 }
@@ -1103,7 +1183,7 @@ fn fmt_pat(out: &mut String, pat: &Pattern) {
         Pattern::Var(name) => out.push_str(name),
         Pattern::Lit(lit) => match lit {
             Literal::Int(n) => out.push_str(&n.to_string()),
-            Literal::String(s) => out.push_str(&format!("\"{}\"", s)),
+            Literal::String(s) => push_string_literal(out, s),
             Literal::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             _ => out.push_str("_"),
         },
@@ -1186,6 +1266,27 @@ fn op_sym(op: BinOp) -> &'static str {
     }
 }
 
+fn push_escaped_string_content(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+}
+
+fn push_string_literal(out: &mut String, value: &str) {
+    out.push('"');
+    push_escaped_string_content(out, value);
+    out.push('"');
+}
+
 fn fmt_type(ty: &Type) -> String {
     format!("{}", ty)
 }
@@ -1244,6 +1345,17 @@ mod tests {
     fn test_fmt_import() {
         let out = format_source("import Foo::Bar").expect("import formats");
         assert!(out.contains("import Foo::Bar"), "got: {out}");
+    }
+
+    #[test]
+    fn test_fmt_string_literals_escape_and_roundtrip() {
+        let src = r#"fn main() { "a\nb\tc\"d\\e" }"#;
+        let out = format_source(src).expect("escaped string formats");
+        assert!(
+            out.contains(r#""a\nb\tc\"d\\e""#),
+            "formatter must re-escape decoded string data: {out}"
+        );
+        assert_idempotent(src);
     }
 
     #[test]
@@ -1394,6 +1506,82 @@ fn main() {
         assert!(out.contains("spawn Greeter()"), "got: {out}");
         assert!(out.contains("receive {"), "got: {out}");
         assert!(out.contains("emit Event(1)"), "got: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_module_mutable_binding_preserves_declaration_scope() {
+        let src = "let var counter: Int = 0\n";
+        let out = format_source(src).expect("module mutable binding formats");
+        assert_eq!(out, "var counter: Int = 0\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_var_preserves_mutability_and_type_annotation() {
+        let src = r#"
+fn main() {
+    var count: Int = 0
+    count = count + 1
+    count
+}"#;
+        let out = format_source(src).expect("mutable binding formats");
+        assert!(out.contains("var count: Int = 0"), "got: {out}");
+        assert!(!out.contains("let count: Int = 0"), "mutability lost: {out}");
+        assert!(
+            out.contains("var count: Int = 0\n    count = count + 1"),
+            "statement-form var should stay sequential: {out}"
+        );
+        assert!(!out.contains("var count: Int = 0 in"), "synthetic in leaked: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_explicit_let_in_remains_expression_scoped() {
+        let src = r#"
+fn main() {
+    let x = 1 in x + 1
+}"#;
+        let out = format_source(src).expect("let-in formats");
+        assert!(out.contains("let x = 1 in"), "explicit let-in lost: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_send_uses_bang_locally_and_preserves_remote() {
+        let src = r#"
+actor Worker {
+    behavior ping(x: Int) { x }
+}
+fn main() {
+    let w = spawn Worker()
+    send w ping(1)
+    send remote w ping(2)
+}"#;
+        let out = format_source(src).expect("send formats");
+        assert!(out.contains("w ! ping(1)"), "local send not canonicalized: {out}");
+        assert!(
+            out.contains("send remote w ping(2)"),
+            "remote send semantics lost: {out}"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_ask_preserves_remote_and_timeout() {
+        let src = r#"
+actor Worker {
+    behavior get() { 1 }
+}
+fn main() {
+    let w = spawn Worker()
+    ask remote w get() timeout 2500
+}"#;
+        let out = format_source(src).expect("ask formats");
+        assert!(
+            out.contains("ask remote w get() timeout 2500"),
+            "remote ask transport metadata lost: {out}"
+        );
         assert_idempotent(src);
     }
 }

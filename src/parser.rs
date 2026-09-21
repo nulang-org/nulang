@@ -231,6 +231,7 @@ impl Parser {
                                         name,
                                         type_ann,
                                         value,
+                                        mutable,
                                         ..
                                     } = let_decl
                                     {
@@ -238,7 +239,7 @@ impl Parser {
                                             name: name.clone(),
                                             ty: type_ann.clone(),
                                             value: Box::new(value.clone()),
-                                            mutable: false,
+                                            mutable: *mutable,
                                             body: Box::new(wrapped_body),
                                             let_in: false,
                                             span: Span::default(),
@@ -402,6 +403,7 @@ impl Parser {
                             name,
                             type_ann,
                             value,
+                            mutable,
                             ..
                         } = let_decl
                         {
@@ -409,7 +411,7 @@ impl Parser {
                                 name: name.clone(),
                                 ty: type_ann.clone(),
                                 value: Box::new(value.clone()),
-                                mutable: false,
+                                mutable: *mutable,
                                 body: Box::new(body),
                                 let_in: false,
                                 span: Span::default(),
@@ -448,6 +450,7 @@ impl Parser {
                     name,
                     type_ann,
                     value,
+                    mutable,
                     ..
                 } = let_decl
                 {
@@ -455,7 +458,7 @@ impl Parser {
                         name: name.clone(),
                         ty: type_ann.clone(),
                         value: Box::new(value.clone()),
-                        mutable: false,
+                        mutable: *mutable,
                         body: Box::new(body),
                         let_in: false,
                         span: Span::default(),

@@ -42,7 +42,12 @@ nulang examples/NN_name.nula
 - `let` bindings are immutable; use `var` for mutable state in loops and
   algorithms.
 - Actors must appear before `let` bindings at the top level.
-- `spawn Actor { ... }` field initializers use `=` (e.g. `count = 42`) and
-  correctly override the actor's declared defaults.
+- Canonical actor construction is call-like: `spawn Actor()` or
+  `spawn Actor(count = 42)`. Named initializers use `=` and override the
+  actor's declared defaults. The parser still accepts the older brace form
+  during migration, but `nulang fmt` emits the call-like form.
+- Canonical local actor sends use `actor ! behavior(args)`; explicit
+  `send remote ...` remains keyword syntax because it changes transport
+  semantics.
 - Top-level `fn` declarations with `match` on variant types may fail
   exhaustiveness checking when an `actor` block is present in the same file.
