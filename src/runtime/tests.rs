@@ -2829,6 +2829,8 @@ fn test_runtime_scheduler_stats() {
 
     let a1 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
     let a2 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
+    declare_test_behavior(&mut rt, a1, "add");
+    declare_test_behavior(&mut rt, a2, "add");
     rt.send_message(a1, "add", &[Value::int(10)]);
     rt.send_message(a2, "add", &[Value::int(20)]);
     rt.run_scheduler();
