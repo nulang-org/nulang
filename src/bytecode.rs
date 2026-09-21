@@ -785,7 +785,18 @@ impl CodeModule {
                 },
             );
         }
-        self.artifact_id = Some(manifest.artifact_id());
+        let requested = manifest.artifact_id();
+        if let Some(existing) = self.artifact_id {
+            if existing != requested {
+                return Err(
+                    crate::artifact_identity::ArtifactIdentityError::ArtifactIdentityMismatch {
+                        expected: existing,
+                        actual: requested,
+                    },
+                );
+            }
+        }
+        self.artifact_id = Some(requested);
         Ok(())
     }
 
