@@ -226,6 +226,50 @@ mod tests {
     }
 
     #[test]
+    fn runtime_tracking_is_field_precise_and_rejects_actor_replacement() {
+        use crate::runtime::{Actor, Runtime};
+        use crate::vm::Value;
+
+        let mut rt = Runtime::new();
+        let mut actor = Actor::new(42, "query-target", 8);
+        actor.set_state_field("title", Value::int(1));
+        actor.set_state_field("other", Value::int(1));
+        rt.actors.insert(42, actor);
+
+        rt.begin_reactive_query_tracking();
+        rt.record_reactive_state_read(42, "title");
+        let reads = rt.finish_reactive_query_tracking().unwrap();
+
+        assert!(rt.state_read_set_is_current(&reads));
+
+        rt.actors
+            .get_mut(&42)
+            .unwrap()
+            .set_state_field("other", Value::int(2));
+        assert!(rt.state_read_set_is_current(&reads));
+
+        rt.actors
+            .get_mut(&42)
+            .unwrap()
+            .set_state_field("title", Value::int(2));
+        assert!(!rt.state_read_set_is_current(&reads));
+
+        rt.begin_reactive_query_tracking();
+        rt.record_reactive_state_read(42, "title");
+        let before_restart = rt.finish_reactive_query_tracking().unwrap();
+        assert!(rt.state_read_set_is_current(&before_restart));
+
+        let mut replacement = Actor::new(42, "query-target", 8);
+        replacement.set_state_field("title", Value::int(2));
+        rt.actors.insert(42, replacement);
+
+        assert!(
+            !rt.state_read_set_is_current(&before_restart),
+            "a fresh actor incarnation must invalidate read sets from the old instance"
+        );
+    }
+
+    #[test]
     fn invalidation_is_field_precise() {
         let mut reads = StateReadSet::default();
         let observed = StateVersion {
