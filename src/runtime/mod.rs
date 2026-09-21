@@ -5062,6 +5062,20 @@ impl Runtime {
         current: Option<crate::content_identity::SemanticId>,
         identity_policy: RecoveryIdentityPolicy,
     ) -> Result<Option<crate::content_identity::SemanticId>, String> {
+        // Artifact identity may legitimately change across a
+        // semantics-preserving rebuild, but a present persisted identity must
+        // still be structurally valid. This keeps every recovery path
+        // fail-closed on corrupted provenance metadata.
+        if let Some(artifact_id) = snapshot.artifact_id.as_deref() {
+            artifact_id
+                .parse::<crate::content_identity::ArtifactId>()
+                .map_err(|error| {
+                    format!(
+                        "actor {actor_id} has malformed artifact identity: {error}"
+                    )
+                })?;
+        }
+
         match snapshot.semantic_id.as_deref() {
             Some(persisted) => {
                 let persisted = persisted
