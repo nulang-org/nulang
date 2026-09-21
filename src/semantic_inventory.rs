@@ -1,10 +1,9 @@
 //! Compiler-derived semantic inventory for deployable artifacts.
 //!
 //! This module is the compiler-owned bridge into RFC 0020 Behavior Manifests.
-//! It operates only on an already type/effect-checked AST and the exact
-//! EffectChecker instance that established module-function fixpoint rows.
-//! Package and Cloud layers consume this output; they must not re-infer source
-//! semantics independently.
+//! It operates only on an already type-checked AST and compiler-owned effect
+//! analysis. Package and Cloud layers consume this output; they must not
+//! re-infer source semantics independently.
 
 use std::collections::BTreeSet;
 
