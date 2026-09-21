@@ -49,6 +49,21 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Compiler-owned durable value eligibility — 2026-09-21
+- **Static durable codec gate** (Experimental, `src/types.rs`,
+  `src/typechecker.rs`). The compiler now owns the source-type predicate for
+  values that the current durable runtime can encode losslessly. Durable and
+  event-sourced state, durable event payload schemas, and message parameters
+  on `persistent actor` / `entity` behaviors fail closed when their types
+  have no stable durable codec. Declared event payload types are also enforced
+  at each `emit` site instead of checking only event name and arity.
+- The accepted set intentionally matches the runtime's implemented
+  `PersistedValue` representation: scalar primitives, strings, `Nil`,
+  `Unit`, actor references, and nominal wrappers of those representations.
+  Heap aggregates such as arrays, records, variants, maps/apps, closures, and
+  unresolved polymorphic values remain rejected until explicit stable codecs
+  exist. `local` state and non-persistent actor messages remain unrestricted.
+
 ### Fail-closed durable value persistence — 2026-09-20
 - **Lossless persistence admission** (Experimental, `src/runtime/persistence.rs`).
   Durable snapshots, journals, event-sourced writes, workflow-start records,
