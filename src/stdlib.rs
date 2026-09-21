@@ -1179,4 +1179,48 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn generated_module_manifest_is_consistent() {
+        use std::collections::HashSet;
+        use std::path::Path;
+
+        assert_eq!(STDLIB_MANIFEST_SCHEMA, "nulang.stdlib/v0alpha1");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut names = HashSet::new();
+
+        for module in modules() {
+            assert!(
+                names.insert(module.name),
+                "duplicate stdlib module '{}'",
+                module.name
+            );
+            assert_eq!(
+                module.import_path,
+                format!("stdlib::{}", module.name),
+                "manifest import must be canonical for '{}'",
+                module.name
+            );
+            assert!(
+                root.join(module.source_path).is_file(),
+                "stdlib source missing for '{}': {}",
+                module.name,
+                module.source_path
+            );
+            assert!(
+                !module.description.is_empty(),
+                "stdlib module '{}' needs a description",
+                module.name
+            );
+        }
+    }
+
+    #[test]
+    fn module_lookup_uses_generated_manifest() {
+        let json = module("json").expect("json module must be declared");
+        assert_eq!(json.import_path, "stdlib::json");
+        assert_eq!(json.stability, StabilityTier::Experimental);
+        assert_eq!(json.package_mirror, Some("packages/json/src/lib.nula"));
+        assert!(module("does-not-exist").is_none());
+    }
 }
