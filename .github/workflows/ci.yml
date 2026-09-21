@@ -128,6 +128,9 @@ jobs:
       - name: Run nula test
         run: cd test-pkg && ../target/release/nulang nula test
 
+      - name: Test first-party geospatial package
+        run: cd packages/nulang-geo && ../../target/release/nulang nula test
+
       - name: Verify documentation examples
         run: NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
   # -----------------------------------------------------------------------
