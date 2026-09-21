@@ -132,6 +132,82 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
 pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
     let is_workflow = actor_is_workflow(rt, actor_id);
     let seq = next_sequence(rt, actor_id);
+
+    if !is_workflow {
+        let Some(actor) = rt.actors.get_mut(&actor_id) else {
+            return;
+        };
+
+        actor.event_log.push((event.to_string(), args.to_vec()));
+        let mut event_sourced_names: Vec<String> = actor
+            .state_models
+            .iter()
+            .filter(|(_, model)| **model == StateModel::EventSourced)
+            .map(|(name, _)| name.clone())
+            .collect();
+        event_sourced_names.sort();
+
+        if event_sourced_names.is_empty() {
+            return;
+        }
+
+        let old_values: Vec<(String, Value)> = event_sourced_names
+            .iter()
+            .filter_map(|name| actor.get_state_field(name).map(|value| (name.clone(), value)))
+            .collect();
+
+        for name in &event_sourced_names {
+            if let Some(n) = actor.get_state_field(name).and_then(|value| value.as_int()) {
+                actor.set_state_field(name, Value::int(n + 1));
+            }
+        }
+
+        let module = actor.bytecode_module.as_ref();
+        let persisted_args: Vec<PersistedValue> = args
+            .iter()
+            .map(|value| PersistedValue::from_value_resolved(value, module))
+            .collect();
+        let entries: Vec<EventEntry> = event_sourced_names
+            .iter()
+            .map(|name| {
+                let current_value = actor.get_state_field(name).unwrap_or(Value::nil());
+                EventEntry {
+                    sequence: seq,
+                    field_name: name.clone(),
+                    event_name: event.to_string(),
+                    args: persisted_args.clone(),
+                    value: PersistedValue::from_value_resolved(&current_value, module),
+                }
+            })
+            .collect();
+
+        match rt.persistence.append_events(actor_id, &entries) {
+            Ok(()) => {
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    for name in &event_sourced_names {
+                        actor.event_sourced_sequences.insert(name.clone(), seq);
+                    }
+                    actor.sequence = seq;
+                }
+            }
+            Err(err) => {
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    for (name, value) in old_values {
+                        actor.set_state_field(&name, value);
+                    }
+                    actor.event_log.pop();
+                }
+                tracing::warn!(
+                    "nulang-persist: rolled back event-sourced mutation for actor {} at sequence {}: {}",
+                    actor_id,
+                    seq,
+                    err
+                );
+            }
+        }
+        return;
+    }
+
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.event_log.push((event.to_string(), args.to_vec()));
         let mut event_sourced_names: Vec<String> = actor
@@ -140,83 +216,50 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             .filter(|(_, model)| **model == StateModel::EventSourced)
             .map(|(name, _)| name.clone())
             .collect();
-        // HashMap iteration order is intentionally unspecified. Persist same-
-        // sequence field events in canonical field-name order so durable-change
-        // cursors are stable across restarts and persistence backends.
         event_sourced_names.sort();
         for name in &event_sourced_names {
-            if let Some(n) = actor.get_state_field(name).and_then(|v| v.as_int()) {
+            if let Some(n) = actor.get_state_field(name).and_then(|value| value.as_int()) {
                 actor.set_state_field(name, Value::int(n + 1));
             }
         }
-        // Persist events for EventSourced fields (non-workflow actors).
-        if !is_workflow && !event_sourced_names.is_empty() {
-            let module = actor.bytecode_module.as_ref();
-            let persisted_args: Vec<PersistedValue> = args
-                .iter()
-                .map(|v| PersistedValue::from_value_resolved(v, module))
-                .collect();
-            for name in &event_sourced_names {
-                // Capture the field's current value AFTER the apply
-                // handler has run and the +1 has been applied.  This
-                // snapshot lets recovery reconstruct the exact post-
-                // apply value without re-executing bytecode.
-                let current_val = actor.get_state_field(name).unwrap_or(Value::nil());
-                let entry = EventEntry {
-                    sequence: seq,
-                    field_name: name.clone(),
-                    event_name: event.to_string(),
-                    args: persisted_args.clone(),
-                    value: PersistedValue::from_value_resolved(&current_val, module),
-                };
-                let _ = rt.persistence.append_event(actor_id, entry);
-            }
-            if let Some(actor) = rt.actors.get_mut(&actor_id) {
-                for name in &event_sourced_names {
-                    actor.event_sourced_sequences.insert(name.clone(), seq);
-                }
-                actor.sequence = seq;
-            }
-        }
     }
-    if is_workflow {
-        if event == "ParallelBranchCompleted" && args.len() == 2 {
-            let parallel_step_name =
-                resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
-            let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
-                actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
-            );
-            if let Some(actor) = rt.actors.get_mut(&actor_id) {
-                let current = actor
-                    .get_state_field("parallel_progress")
-                    .and_then(|v| v.as_int())
-                    .unwrap_or(0);
-                actor.set_state_field("parallel_progress", Value::int(current + 1));
-            }
-        } else {
-            let module = rt
-                .actors
-                .get(&actor_id)
-                .and_then(|a| a.bytecode_module.as_ref());
-            let payload: Vec<PersistedValue> = args
-                .iter()
-                .map(|v| PersistedValue::from_value_resolved(v, module))
-                .collect();
-            let _ = rt.persistence.append_workflow_event(
-                actor_id,
-                WorkflowEvent::Custom {
-                    sequence: seq,
-                    name: event.to_string(),
-                    args: payload,
-                },
-            );
+
+    if event == "ParallelBranchCompleted" && args.len() == 2 {
+        let parallel_step_name =
+            resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
+        let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
+        let _ = rt.persistence.append_parallel_branch_completed(
+            actor_id,
+            seq,
+            parallel_step_name,
+            branch_name,
+        );
+        if let Some(actor) = rt.actors.get_mut(&actor_id) {
+            let current = actor
+                .get_state_field("parallel_progress")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("parallel_progress", Value::int(current + 1));
         }
-        checkpoint_actor(rt, actor_id);
+    } else {
+        let module = rt
+            .actors
+            .get(&actor_id)
+            .and_then(|actor| actor.bytecode_module.as_ref());
+        let payload: Vec<PersistedValue> = args
+            .iter()
+            .map(|value| PersistedValue::from_value_resolved(value, module))
+            .collect();
+        let _ = rt.persistence.append_workflow_event(
+            actor_id,
+            WorkflowEvent::Custom {
+                sequence: seq,
+                name: event.to_string(),
+                args: payload,
+            },
+        );
     }
+    checkpoint_actor(rt, actor_id);
 }
 
 // ---------------------------------------------------------------------------
