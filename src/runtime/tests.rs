@@ -2023,6 +2023,32 @@ fn test_libsql_store_save_load_snapshot() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+fn test_libsql_store_event_schema_roundtrip() {
+    let mut store = LibsqlStore::in_memory().unwrap();
+    store
+        .append_event(
+            1,
+            EventEntry {
+                sequence: 1,
+                schema_owner: Some("Counter".to_string()),
+                schema_version: 3,
+                field_name: "count".to_string(),
+                event_name: "Incremented".to_string(),
+                args: vec![PersistedValue::Int(1)],
+                value: PersistedValue::Int(2),
+            },
+        )
+        .unwrap();
+
+    let events = store.read_events(1);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].schema_owner.as_deref(), Some("Counter"));
+    assert_eq!(events[0].schema_version, 3);
+    assert_eq!(events[0].value, PersistedValue::Int(2));
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
 fn test_libsql_store_append_read_journal() {
     let mut store = LibsqlStore::in_memory().unwrap();
     store
