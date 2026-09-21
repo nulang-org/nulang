@@ -1,47 +1,121 @@
-<footer class="site-footer">
-  <div class="nu-container">
-    <div class="footer-grid">
-      <div class="footer-brand">
-        <p class="footer-logo">
-          <span class="nu-blue">Nu</span><span class="nu-accent-high">lang</span>
-        </p>
-        <p class="footer-tagline">
-          An actor-based programming language with static types, algebraic effects, supervision, and durable state.
-        </p>
-      </div>
-      <div class="footer-col">
-        <h4>Learn</h4>
-        <a href="/getting-started/installation/">Documentation</a>
-        <a href="/tutorial/">Tutorial</a>
-        <a href="/blog/">Blog</a>
-        <a href="/getting-started/quick-start/">Quick Start</a>
-      </div>
-      <div class="footer-col">
-        <h4>Project</h4>
-        <a href="https://github.com/nulang-org/nulang" target="_blank" rel="noopener noreferrer">GitHub<span class="sr-only">(opens in new tab)</span></a>
-        <a href="https://github.com/nulang-org/nulang/discussions" target="_blank" rel="noopener noreferrer">Community<span class="sr-only">(opens in new tab)</span></a>
-        <a href="https://github.com/nulang-org/nulang/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Apache 2.0 License<span class="sr-only">(opens in new tab)</span></a>
-      </div>
-      <div class="footer-col">
-        <h4>Cloud</h4>
-        <a href="https://www.nulang.cloud" target="_blank" rel="noopener noreferrer">Nulang Cloud<span class="sr-only">(opens in new tab)</span></a>
-        <a href="https://buy.stripe.com/cNidR932O6du6nK6eX1RC02" target="_blank" rel="noopener noreferrer">Support Nulang<span class="sr-only">(opens in new tab)</span></a>
-        <a href="mailto:support@nulang.org">support@nulang.org</a>
-        <a href="/contact/">Contact</a>
-      </div>
-      <div class="footer-col">
-        <h4>Legal</h4>
-        <a href="/terms/">Terms of Service</a>
-        <a href="/privacy/">Privacy Policy</a>
-      </div>
+<footer class="nu-footer">
+  <div class="nu-container footer-layout">
+    <div class="footer-brand">
+      <p class="footer-logo"><span class="nu-blue">Nu</span>lang</p>
+      <p>An actor-based language for typed effects, supervision, and durable state.</p>
+      <p class="footer-license">Apache 2.0 · Alpha software</p>
     </div>
-    <p class="footer-copy">
-      &copy; {new Date().getFullYear()} <span class="nu-blue">Nu</span><span class="nu-accent-high">lang</span>. Open source under the <a href="https://github.com/nulang-org/nulang/blob/main/LICENSE">Apache 2.0 license</a>.
-    </p>
+
+    <div class="footer-group">
+      <h2>Resources</h2>
+      <a href="/getting-started/installation/">Documentation</a>
+      <a href="/playground/">Playground</a>
+      <a href="/tutorial/">Tutorial</a>
+      <a href="/blog/">Blog</a>
+    </div>
+
+    <div class="footer-group">
+      <h2>Project</h2>
+      <a href="https://github.com/nulang-org/nulang" target="_blank" rel="noopener noreferrer">GitHub<span class="sr-only"> (opens in new tab)</span></a>
+      <a href="https://github.com/nulang-org/nulang/discussions" target="_blank" rel="noopener noreferrer">Community<span class="sr-only"> (opens in new tab)</span></a>
+      <a href="https://www.nulang.cloud" target="_blank" rel="noopener noreferrer">Nulang Cloud<span class="sr-only"> (opens in new tab)</span></a>
+      <a href="/contact/">Contact</a>
+    </div>
+  </div>
+
+  <div class="nu-container footer-bottom">
+    <span>&copy; {new Date().getFullYear()} Nulang</span>
+    <span class="footer-legal"><a href="/privacy/">Privacy</a><a href="/terms/">Terms</a></span>
   </div>
 </footer>
 
 <style>
+  .nu-footer {
+    margin-top: 4rem;
+    border-top: 1px solid var(--nu-border);
+    background: var(--nu-surface);
+  }
+
+  .footer-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1.8fr) repeat(2, minmax(0, 0.7fr));
+    gap: 3rem;
+    padding-block: 3rem;
+  }
+
+  .footer-brand {
+    max-width: 30rem;
+  }
+
+  .footer-logo {
+    margin: 0;
+    color: var(--nu-text);
+    font-size: 1.15rem;
+    font-weight: 750;
+    letter-spacing: -0.03em;
+  }
+
+  .footer-brand > p:not(.footer-logo) {
+    margin: 0.65rem 0 0;
+    color: var(--nu-text-secondary);
+    font-size: 0.86rem;
+    line-height: 1.6;
+  }
+
+  .footer-license {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.72rem !important;
+    color: var(--nu-text-tertiary) !important;
+  }
+
+  .footer-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+
+  .footer-group h2 {
+    margin: 0 0 0.35rem;
+    color: var(--nu-text-tertiary);
+    font-size: 0.7rem;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .footer-group a,
+  .footer-bottom a {
+    color: var(--nu-text);
+    font-size: 0.84rem;
+    text-decoration: none;
+  }
+
+  .footer-group a:hover,
+  .footer-bottom a:hover {
+    color: var(--nu-blue);
+  }
+
+  .footer-bottom {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding-block: 1rem 1.4rem;
+    border-top: 1px solid var(--nu-border-subtle);
+    color: var(--nu-text-tertiary);
+    font-size: 0.75rem;
+  }
+
+  .footer-legal {
+    display: flex;
+    gap: 1rem;
+  }
+
+  .footer-bottom a {
+    color: var(--nu-text-secondary);
+    font-size: inherit;
+  }
+
   .sr-only {
     position: absolute;
     width: 1px;
@@ -52,5 +126,31 @@
     clip: rect(0, 0, 0, 0);
     white-space: nowrap;
     border: 0;
+  }
+
+  @media (max-width: 44rem) {
+    .footer-layout {
+      grid-template-columns: 1fr 1fr;
+      gap: 2rem;
+    }
+
+    .footer-brand {
+      grid-column: 1 / -1;
+    }
+  }
+
+  @media (max-width: 30rem) {
+    .footer-layout {
+      grid-template-columns: 1fr;
+    }
+
+    .footer-brand {
+      grid-column: auto;
+    }
+
+    .footer-bottom {
+      align-items: flex-start;
+      flex-direction: column;
+    }
   }
 </style>
