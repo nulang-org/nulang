@@ -7,9 +7,40 @@
 > `LANGUAGE_VERSION` in `src/format/constants.rs`) is what this changelog
 > tracks — it moves only on RFC-ratified change.
 
-**Language version:** `1.0.0-frozen` (since 2026-07-19; RFCs 0001, 0002).
+**Active language version:** `2.0.0-dev` (since 2026-09-21; RFC 0025).  
+**Frozen compatibility baseline:** `1.0.0-frozen` (RFCs 0001, 0002).
 
 ---
+
+## Nulang 2 development line — Experimental
+
+*RFC 0025 preserves the Nulang 1 frozen baseline while allowing explicitly
+Nulang-2 Experimental surfaces to evolve before the 2.0 freeze.*
+
+### Language version 2.0.0-dev — 2026-09-21
+
+- **Nulang 2 development boundary** (RFC 0025). New artifacts record language
+  version 2 while NBC format v1, NUL0 v1, and value-layout v1 remain unchanged.
+  A v2 runtime accepts supported v1 artifacts; a v1 runtime rejects v2
+  artifacts as a future language version.
+- **Built-in accelerator types.** `Tensor[T]` and `Device` are recognized by
+  the parser/typechecker as Nulang 2 built-ins.
+- **Typed accelerator effects.** `Tensor.from_array`, `Tensor.zeros`,
+  `Tensor.shape`, `Tensor.to_array`, `Tensor.add`, `Tensor.matmul`,
+  `Tensor.relu`, `Compute.device`, `Compute.default_device`, and
+  `Compute.device_name` now have compiler-owned signatures.
+- **Executable reference tensor semantics.** The bytecode VM executes the
+  initial tensor surface through `nulang-accelerator::CpuTensor`; the same
+  crate provides an accelerator-neutral graph IR and buffer/session ownership
+  ledger for future IREE/device backends.
+- **Provider-neutral accelerator runtime substrate** (RFC 0024,
+  `crates/nulang-accelerator/`). Device capabilities, hard requirements,
+  deterministic placement, backend discovery, tensor metadata, CPU reference
+  execution, graph construction, and backend-neutral buffer ownership remain
+  Experimental.
+- **Compute authority.** Actor-backed device acquisition is gated by exact
+  `Compute::Use(resource)` extension authority; tensor math remains
+  runtime-owned and does not gain ambient host access.
 
 ## Frozen tier
 
@@ -41,9 +72,6 @@ version + migration.*
   `GOVERNANCE.md`.
 
 ## Stable tier
-
-### Accelerator execution foundation — 2026-09-21
-- **Provider-neutral accelerator runtime substrate** (Experimental, `crates/nulang-accelerator/`, RFC 0024). Adds extensible backend/device identifiers, tensor shape/dtype metadata with overflow-safe byte sizing, device capability requirements, deterministic device selection, and an atomic backend-discovery registry. The first slice deliberately changes no Nulang source syntax, bytecode, value layout, or NUL0 wire format; accelerator placement remains policy over the existing actor/effect model.
 
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
