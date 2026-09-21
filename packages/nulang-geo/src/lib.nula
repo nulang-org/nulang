@@ -84,13 +84,7 @@ pub fn bounding_box[CRS](
     let max_x = if x1 <= x2 then x2 else x1;
     let min_y = if y1 <= y2 then y1 else y2;
     let max_y = if y1 <= y2 then y2 else y1;
-    let result: BoundingBox[CRS] = {
-        min_x: min_x,
-        min_y: min_y,
-        max_x: max_x,
-        max_y: max_y,
-        crs: crs
-    };
+    let result: BoundingBox[CRS] = { min_x: min_x, min_y: min_y, max_x: max_x, max_y: max_y, crs: crs };
     result
 }
 
@@ -134,13 +128,7 @@ pub fn expand[CRS](
     dx: Float,
     dy: Float
 ) -> BoundingBox[CRS] {
-    let result: BoundingBox[CRS] = {
-        min_x: bounds.min_x - dx,
-        min_y: bounds.min_y - dy,
-        max_x: bounds.max_x + dx,
-        max_y: bounds.max_y + dy,
-        crs: bounds.crs
-    };
+    let result: BoundingBox[CRS] = { min_x: bounds.min_x - dx, min_y: bounds.min_y - dy, max_x: bounds.max_x + dx, max_y: bounds.max_y + dy, crs: bounds.crs };
     result
 }
 
