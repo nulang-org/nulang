@@ -198,7 +198,7 @@ fn diagnostic_from_single(err: &NuError) -> JsonDiagnostic {
     }
 }
 
-fn diagnostic_kind(err: &NuError) -> &'static str {
+pub(crate) fn diagnostic_kind(err: &NuError) -> &'static str {
     match err {
         NuError::LexError { .. } => "lex",
         NuError::ParseError { .. } => "parse",
@@ -216,7 +216,7 @@ fn diagnostic_kind(err: &NuError) -> &'static str {
     }
 }
 
-fn diagnostic_data(err: &NuError) -> Option<JsonDiagnosticData> {
+pub(crate) fn diagnostic_data(err: &NuError) -> Option<JsonDiagnosticData> {
     let data = match err {
         NuError::ParseError {
             expected, found, ..
