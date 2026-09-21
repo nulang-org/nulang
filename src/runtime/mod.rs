@@ -504,13 +504,12 @@ pub struct Runtime {
     /// (empty run queue, no inflight LLM calls, no pending timers).
     /// The embedder (e.g. NLC guest agent) wires this to host signaling.
     pub idle_callback: Option<Box<dyn FnMut()>>,
-    // Test effect handlers - installed via `install_test_handler` to
-    // intercept `perform Effect.op` calls in tests.  Key is the qualified
-    // name (e.g. "IO.print", "DB.write").  A handler returns `Some(value)`
-    // to mock the effect or `None` to fall through to real dispatch.
     // HTTP server state (v0.7+).
     pub http_server: Option<HttpServerState>,
-    pub test_handlers: HashMap<String, Box<dyn Fn(&[Value]) -> Option<Value>>>,
+    // Test effect interception is deliberately absent from production builds:
+    // privileged host effects must not have a pre-authority dispatch hook.
+    #[cfg(test)]
+    test_handlers: HashMap<String, Box<dyn Fn(&[Value]) -> Option<Value>>>,
     /// Cryptographic provider (hashing, random, signing).
     /// Defaults to [`crate::backends::DefaultCryptoProvider`].
     pub crypto: Box<dyn crate::backends::CryptoProvider>,
@@ -649,6 +648,7 @@ impl Runtime {
             spawn_translations: HashMap::new(),
             dlq_actor_id: None,
             http_server: None,
+            #[cfg(test)]
             test_handlers: HashMap::new(),
             shard_idx: 0,
             shard_count: 1,
@@ -749,7 +749,8 @@ impl Runtime {
     /// rt.install_test_handler("DB.write", |regs| {
     ///     // regs[0] = key, regs[1] = value
     ///     Some(Value::unit())  // pretend write succeeded
-    pub fn install_test_handler<F>(&mut self, effect_name: &str, handler: F)
+    #[cfg(test)]
+    pub(crate) fn install_test_handler<F>(&mut self, effect_name: &str, handler: F)
     where
         F: Fn(&[Value]) -> Option<Value> + 'static,
     {
@@ -759,7 +760,8 @@ impl Runtime {
 
     /// Check whether a test handler is installed for `qualified_name` and
     /// return its result if so.
-    pub fn check_test_handler(&self, qualified_name: &str, regs: &[Value]) -> Option<Value> {
+    #[cfg(test)]
+    pub(crate) fn check_test_handler(&self, qualified_name: &str, regs: &[Value]) -> Option<Value> {
         self.test_handlers
             .get(qualified_name)
             .and_then(|handler| handler(regs))
