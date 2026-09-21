@@ -5840,7 +5840,7 @@ impl Runtime {
         // snapshot arriving through this legacy transport cannot be verified
         // against the received bytecode. Reject it rather than trusting the
         // snapshot to self-certify the code that should execute its state.
-        if snapshot.semantic_id.is_some() {
+        if snapshot.semantic_id.is_some() || snapshot.artifact_id.is_some() {
             tracing::warn!(
                 "nulang-migrate: refusing identified snapshot for actor {} over legacy NBC v1 transport",
                 actor_id
