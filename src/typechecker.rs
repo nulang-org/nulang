@@ -5963,4 +5963,119 @@ mod tests {
         let result = tc.infer_expr(&TypeContext::new(), &expr);
         assert!(result.is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // RFC 0008 migration-contract validation
+
+    #[test]
+    fn test_migration_rejects_skipped_version_pair() {
+        let result = check_src(
+            r#"
+            entity Counter {
+                version: 3
+                state count: Int = 0
+                migration from 1 to 3 {
+                    state => { 0 }
+                }
+            }
+            "#,
+        );
+        let err = result.expect_err("1 -> 3 must be rejected");
+        assert!(
+            err.to_string().contains("advance exactly one schema version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_migration_rejects_downgrade_pair() {
+        let result = check_src(
+            r#"
+            entity Counter {
+                version: 2
+                state count: Int = 0
+                migration from 2 to 1 {
+                    state => { 0 }
+                }
+            }
+            "#,
+        );
+        let err = result.expect_err("2 -> 1 must be rejected");
+        assert!(
+            err.to_string().contains("advance exactly one schema version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_migration_rejects_gap_in_declared_chain() {
+        let result = check_src(
+            r#"
+            entity Counter {
+                version: 4
+                state count: Int = 0
+                migration from 1 to 2 {
+                    state => { 0 }
+                }
+                migration from 3 to 4 {
+                    state => { 0 }
+                }
+            }
+            "#,
+        );
+        let err = result.expect_err("a gap in the migration chain must be rejected");
+        assert!(
+            err.to_string().contains("migration chain has a gap"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_migration_event_parameters_are_bound() {
+        let result = check_src(
+            r#"
+            entity Counter {
+                version: 2
+                state count: Int = 0
+                events
+                    | Bumped(by: Int)
+                migration from 1 to 2 {
+                    events {
+                        | Bumped(by) => emit Bumped(by)
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(
+            result.is_ok(),
+            "migration event parameters must be in scope: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_migration_catchall_value_is_bound() {
+        let result = check_src(
+            r#"
+            entity Counter {
+                version: 2
+                state count: Int = 0
+                events
+                    | Bumped(by: Int)
+                migration from 1 to 2 {
+                    events {
+                        | other => other
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(
+            result.is_ok(),
+            "migration catch-all value must be in scope: {:?}",
+            result.err()
+        );
+    }
+
 }
