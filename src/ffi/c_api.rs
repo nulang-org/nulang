@@ -262,8 +262,7 @@ fn compile_source(source: &str) -> Result<crate::bytecode::CodeModule, NuError> 
 
     let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
     let mut mir = crate::mir_lower::lower_module(&hir)?;
-    let code_module =
-        crate::compiler_identity::compile_typed_bytecode(&hir, &mut mir, [], "main")?;
+    let code_module = crate::compiler_identity::compile_typed_bytecode(&hir, &mut mir, [], "main")?;
     Ok(code_module)
 }
 
