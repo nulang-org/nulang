@@ -2,7 +2,7 @@
 
 use crate::bytecode::Constant;
 use crate::value_layout::{
-    as_int_or_zero, is_float_raw, sext48, tag_int, INT48_MAX, INT48_MIN, PAYLOAD_MASK,
+    as_int_or_one, as_int_or_zero, is_float_raw, tag_int, INT48_MAX, INT48_MIN, PAYLOAD_MASK,
     TAG_CLOSURE, TAG_INT, TAG_MASK, TAG_PTR, TAG_STRING,
 };
 use crate::vm::Value;
@@ -130,17 +130,6 @@ pub extern "C" fn nulang_imod(a: u64, b: u64) -> u64 {
         return Value::nil().as_raw();
     }
     tag_int(as_int_or_zero(a) % bv)
-}
-
-/// Denominator for div/mod, matching the interpreter's `as_int().unwrap_or(1)`:
-/// a non-int-tagged denominator is 1 (no div-by-zero), while a tagged int 0
-/// still yields div-by-zero → nil.
-pub(crate) fn as_int_or_one(v: u64) -> i64 {
-    if (v & TAG_MASK) == TAG_INT {
-        sext48(v & PAYLOAD_MASK)
-    } else {
-        1
-    }
 }
 
 /// Extract the raw payload pointer from a NaN-boxed value, or null.
@@ -1367,16 +1356,7 @@ define_aot_ask!(nulang_aot_ask_8, a0, a1, a2, a3, a4, a5, a6, a7);
 // sandbox allow-list is not applied because AOT native code is trusted.
 
 pub(crate) fn aot_ctype_from_tag(tag: u64) -> crate::ffi::marshal::CType {
-    match tag {
-        0 => crate::ffi::marshal::CType::I64,
-        1 => crate::ffi::marshal::CType::F64,
-        2 => crate::ffi::marshal::CType::Bool,
-        3 => crate::ffi::marshal::CType::CStr,
-        4 => crate::ffi::marshal::CType::VoidPtr,
-        5 => crate::ffi::marshal::CType::Unit,
-        6 => crate::ffi::marshal::CType::Value,
-        _ => crate::ffi::marshal::CType::Unit,
-    }
+    crate::ffi::marshal::ctype_from_tag(tag)
 }
 
 fn aot_ffi_call_impl(lib_raw: u64, sym_raw: u64, sig: u64, args: &[u64]) -> Value {
