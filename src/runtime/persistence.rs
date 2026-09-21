@@ -2467,6 +2467,7 @@ mod json_file_store_tests {
                     actor_id: 1,
                     sequence: 1,
                     semantic_id: None,
+                    artifact_id: None,
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
