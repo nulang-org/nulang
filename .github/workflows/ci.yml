@@ -17,6 +17,60 @@ env:
 
 jobs:
   # -----------------------------------------------------------------------
+  # Documentation site + zero-install browser playground
+  # -----------------------------------------------------------------------
+  docs-site:
+    name: Docs site & browser playground
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install Rust for browser playground
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+          targets: wasm32-unknown-unknown
+
+      - name: Cache playground build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build browser playground
+        run: playground/web/build.sh
+
+      - name: Smoke test browser playground
+        run: node playground/web/test/smoke.mjs
+
+      - name: Install docs dependencies
+        run: |
+          cd docs
+          pnpm install --frozen-lockfile
+
+      - name: Type-check Astro site
+        run: |
+          cd docs
+          pnpm run check
+
+      - name: Build Astro site
+        run: |
+          cd docs
+          pnpm run build
+
+      - name: Verify playground is in site output
+        run: |
+          test -s docs/dist/playground/index.html
+          test -s docs/dist/playground/playground.js
+          test -s docs/dist/playground/style.css
+          test -s docs/dist/playground/nulang_playground.wasm
+
+  # -----------------------------------------------------------------------
   # Primary build & test (default features)
   # -----------------------------------------------------------------------
   test:

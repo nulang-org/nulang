@@ -3,11 +3,11 @@
 </p>
 <h1 align="center">Nulang</h1>
 <p align="center">
-  An actor-based language with algebraic effects, capability-based types, and durable/distributed actors for building resilient software.
+  An actor-based language with algebraic effects, capability-based types, durable actors, and experimental distribution for building resilient software.
 </p>
 <p align="center">
   <a href="https://nulang.org">Website</a> •
-  <a href="playground/">Playground</a> •
+  <a href="https://nulang.org/playground/">Playground</a> •
   <a href="https://nulang.cloud">Nulang Cloud</a> •
   <a href="https://github.com/nulang-org/nulang">GitHub</a>
 </p>
@@ -33,8 +33,8 @@ Hot regions can tier into a Cranelift JIT; WASM is the canonical portable/cloud
 execution target; and native AOT remains a secondary backend until full semantic
 parity is demonstrated. An experimental WasmFX backend explores stack-switching
 for suspending effects. The runtime is a multi-threaded work-stealing executor
-with supervision trees, ORCA garbage collection, location-transparent
-distribution, and durable persistence.
+with supervision trees, ORCA garbage collection, durable persistence, and
+experimental location-transparent distribution.
 
 ---
 
@@ -107,9 +107,9 @@ perform IO.print("Hello, " + name + "!")
 > 17 verified programs covering actors, effects, pattern matching, records,
 > loops, arrays, HTTP, JSON, and more.
 >
-> No install? Try the [`playground/`](playground/) — run it locally with
-> `python3 playground/server.py` (a hosted version at nulang.org/playground
-> is coming soon).
+> No install? Try the hosted [browser playground](https://nulang.org/playground/).
+> It runs the compiler frontend + CoreVM locally in WebAssembly. Actors,
+> networking, FFI, and JIT execution still require the native runtime.
 
 ---
 
@@ -120,7 +120,7 @@ perform IO.print("Hello, " + name + "!")
 - **Hindley-Milner type inference** — full Algorithm W with row-polymorphic records, variant types, and algebraic effect rows.
 - **Actors** — `spawn`, `send`/`!`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
 - **Typed actor protocols** — structural `ActorRef[P]` contracts can restrict public actor APIs to required behaviors. Compiler-derived protocol fingerprints, a trusted schema registry, directional compatibility checks, and pre-mailbox admission are implemented as *Experimental* protocol hardening.
-- **Entities & workflows** — `entity` declarations (durable-first, event-sourced by default). `workflow` declarations with steps, timers, signals, and saga compensation that survive restarts.
+- **Entities & workflows** — `entity` declarations are durable-first and event-sourced by default. The higher-level `workflow` declaration surface supports steps, timers, signals, and saga compensation, and remains *Experimental* while that API evolves.
 - **`let` and `var`** — immutable and mutable bindings. Records with `{ field: value }` syntax and `{ base .. field = new_val }` update syntax. Pattern matching with guards, alias patterns, and recursive sub-patterns. `**` exponentiation. Multi-line `"""..."""` strings with `\u{...}` unicode escapes. Pipe operator `|>`.
 - **Error handling** — `catch expr fallback` (prefix or postfix), `fail Error(...)` for structured short-circuit return, `T ! E` return types, `?` unwrap.
 - **FS file I/O** — `perform FS.read(path)`, `perform FS.write(path, content)`, `perform FS.append(path, content)`, `perform FS.exists(path)`.
@@ -160,12 +160,13 @@ perform IO.print("Hello, " + name + "!")
 Changes to `src/**`, `examples/**`, `scripts/**`, `docs/**`, or the
 [`.github/workflows/docs-sync.yml`](.github/workflows/docs-sync.yml) workflow
 trigger a docs regeneration run on every push to `main`. The workflow regenerates
-the derived standard-library pages (`docs/src/content/docs/stdlib/`) and the
-full API reference (`docs/api.md`), commits any changes back to `main` with
-`[skip ci]`, validates the Astro site build, and pings
-[DeepWiki](https://deepwiki.com/nulang-org/nulang) as a best-effort nudge to
-re-index the repository docs. The site is then redeployed automatically by the
-Cloudflare Pages Git integration.
+the standard-library/API references and browser-playground bundle, validates the
+Astro site, then opens or updates the protected-branch
+`automation/docs-sync` PR with those generated assets. Once that PR passes the
+required checks and is merged, Cloudflare Pages redeploys `main`. When the
+workflow uses the default `GITHUB_TOKEN`, GitHub requires a maintainer to
+approve the generated PR's workflow runs; an optional `DOCS_SYNC_TOKEN`
+PAT/App token removes that approval step.
 
 ---
 
@@ -214,12 +215,13 @@ WASM backend test suite.
 
 ## Nulang Cloud
 
-**[Nulang Cloud](https://www.nulang.cloud)** is an optional managed platform
-for running Nulang actors in production — auto-scaling, zero cold start,
-managed durability, and location-transparent messaging across regions.
+**[Nulang Cloud](https://www.nulang.cloud)** is the optional managed platform
+for Nulang deployment, runtime, and platform tooling. It is under active
+development; check the Cloud site for the currently available surfaces rather
+than treating planned platform capabilities as production guarantees.
 
-The language and runtime in this repository are **Apache-2.0** and fully
-self-hostable. No lock-in.
+The language and runtime in this repository are **Apache-2.0** and
+self-hostable.
 
 ---
 
@@ -245,7 +247,7 @@ dependencies.
 
 ## Docs & Wiki
 
-The [nulang.org](https://nulang.org) documentation site is regenerated automatically on every push to `main` via the [Docs Sync workflow](.github/workflows/docs-sync.yml). When source files, examples, or docs content change, the workflow regenerates the standard-library reference and API docs, commits the updates, verifies the Astro build, and pings [DeepWiki](https://deepwiki.com/nulang-org/nulang) to encourage re-indexing.
+The [nulang.org](https://nulang.org) documentation site is regenerated automatically on every push to `main` via the [Docs Sync workflow](.github/workflows/docs-sync.yml). When source files, examples, or docs content change, the workflow rebuilds generated docs and the browser playground, verifies the Astro site, and proposes the generated files through the `automation/docs-sync` pull request rather than pushing directly to protected `main`.
 
 ---
 

@@ -1,5 +1,5 @@
 # Nulang
-> A distributed, actor-based programming language with algebraic effects, row-polymorphic types, and reference capabilities. Built in Rust with a register-based bytecode VM as the semantic reference, Cranelift JIT tiering, a portable WASM target, and a secondary native AOT backend.
+> An actor-based programming language with algebraic effects, row-polymorphic types, reference capabilities, durable actors, and experimental distribution. Built in Rust with a register-based bytecode VM as the semantic reference, Cranelift JIT tiering, a portable WASM target, and a secondary native AOT backend.
 
 ## For AI Agents
 
@@ -12,7 +12,7 @@ Nulang is a systems language with static types, algebraic effects, capability ch
 - Anywhere you want static types + algebraic effects + actor model in one language.
 
 ## Key Features
-- Actor model with BEAM/OTP primitives, location transparency, gossip clustering, and CRDT runtime types
+- Actor model with BEAM/OTP primitives; location transparency, gossip clustering, and CRDT runtime surfaces remain experimental
 - Structural typed actor protocols (`ActorRef[P]`) with compiler-owned fingerprints and experimental pre-mailbox compatibility admission
 - Hindley-Milner type inference with row polymorphism and Pony-inspired reference capabilities (iso, trn, ref, val, box, tag, lineariso)
 - Koka-inspired algebraic effects with compile-time checking and effect rows
@@ -86,5 +86,5 @@ send client run(counter)
 
 ## Links
 - [GitHub](https://github.com/nulang-org/nulang): Source code, issues, contributions.
-- [Nulang Cloud](https://www.nulang.cloud): Hosted runtime platform.
+- [Nulang Cloud](https://www.nulang.cloud): Managed runtime/deployment platform under active development.
 - [License](https://github.com/nulang-org/nulang/blob/main/LICENSE): Apache 2.0.
