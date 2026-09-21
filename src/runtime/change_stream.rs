@@ -23,6 +23,32 @@ pub enum DurableChangeLane {
     Event = 1,
     Workflow = 2,
 }
+/// Stable identity of one logical durable commit.
+///
+/// Commit identity is actor-scoped rather than globally sequenced. This keeps
+/// commit creation coordination-free across actors and shards while remaining
+/// stable when a backend compacts or rewrites its physical log.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct DurableCommitId {
+    pub actor_id: u64,
+    pub sequence: u64,
+}
+
+/// Stable identity of one record within a durable commit.
+///
+/// Several records may legitimately belong to one commit sequence. lane and
+/// ordinal identify the logical record without depending on a physical row
+/// id, file offset, RocksDB key position, or other compaction-sensitive detail.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct DurableRecordId {
+    pub commit: DurableCommitId,
+    pub lane: DurableChangeLane,
+    pub ordinal: u64,
+}
 
 /// Stable resume cursor within one actor's durable history.
 ///
@@ -36,9 +62,23 @@ pub enum DurableChangeLane {
 pub struct DurableChangeCursor {
     pub sequence: u64,
     pub lane: DurableChangeLane,
-    /// Zero-based position inside the source log. The append-only persistence
-    /// contract makes this stable for the lifetime of that log.
+    /// Zero-based logical position among records in this lane at this actor
+    /// sequence. It is derived from canonical record ordering, never a physical
+    /// file/row offset, so backend compaction must not renumber it.
     pub ordinal: u64,
+}
+impl DurableChangeCursor {
+    /// Bind this actor-local cursor to its actor to obtain a stable record id.
+    pub fn record_id(self, actor_id: u64) -> DurableRecordId {
+        DurableRecordId {
+            commit: DurableCommitId {
+                actor_id,
+                sequence: self.sequence,
+            },
+            lane: self.lane,
+            ordinal: self.ordinal,
+        }
+    }
 }
 
 /// A committed durable record exposed through the unified change stream.
@@ -61,6 +101,17 @@ pub struct DurableChange {
 impl DurableChange {
     pub fn sequence(&self) -> u64 {
         self.cursor.sequence
+    }
+
+    pub fn commit_id(&self) -> DurableCommitId {
+        DurableCommitId {
+            actor_id: self.actor_id,
+            sequence: self.cursor.sequence,
+        }
+    }
+
+    pub fn record_id(&self) -> DurableRecordId {
+        self.cursor.record_id(self.actor_id)
     }
 }
 
@@ -381,6 +432,65 @@ mod tests {
         assert_eq!(json["record"]["kind"], "event");
     }
 
+    #[test]
+    fn commit_identity_is_actor_scoped_and_lane_independent() {
+        let journal = DurableChange {
+            actor_id: 55,
+            cursor: DurableChangeCursor {
+                sequence: 9,
+                lane: DurableChangeLane::Journal,
+                ordinal: 0,
+            },
+            record: DurableChangeRecord::Journal(JournalEntry {
+                sequence: 9,
+                behavior_id: 1,
+                payload: vec![],
+            }),
+        };
+        let workflow = DurableChange {
+            actor_id: 55,
+            cursor: DurableChangeCursor {
+                sequence: 9,
+                lane: DurableChangeLane::Workflow,
+                ordinal: 0,
+            },
+            record: DurableChangeRecord::Workflow(WorkflowEvent::StepCompleted {
+                sequence: 9,
+                step_name: "done".into(),
+            }),
+        };
+
+        assert_eq!(journal.commit_id(), workflow.commit_id());
+        assert_ne!(journal.record_id(), workflow.record_id());
+        assert_eq!(
+            journal.commit_id(),
+            DurableCommitId {
+                actor_id: 55,
+                sequence: 9
+            }
+        );
+    }
+
+    #[test]
+    fn record_identity_uses_logical_cursor_not_physical_position() {
+        let cursor = DurableChangeCursor {
+            sequence: 12,
+            lane: DurableChangeLane::Event,
+            ordinal: 2,
+        };
+
+        assert_eq!(
+            cursor.record_id(77),
+            DurableRecordId {
+                commit: DurableCommitId {
+                    actor_id: 77,
+                    sequence: 12,
+                },
+                lane: DurableChangeLane::Event,
+                ordinal: 2,
+            }
+        );
+    }
     #[test]
     fn stream_is_actor_scoped() {
         let mut store = MemoryStore::new();
