@@ -72,7 +72,7 @@ pub fn parse_effect_name(name: &str) -> Effect {
         "IO" => Effect::IO,
         "Net" | "Http" => Effect::Net,
         "FS" => Effect::FS,
-        "Array" => Effect::Array,
+        "Array" | "ArrayBuilder" => Effect::Array,
         "String" => Effect::String,
         "Test" => Effect::Test,
         "Rand" | "Random" => Effect::Rand,
