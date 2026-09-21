@@ -14,7 +14,10 @@ use crate::runtime::Runtime;
 use crate::runtime::{bytecode_step_placeholder, fresh_actor_id, map_ast_state_model};
 use crate::vm::Value;
 
-/// Core spawn logic shared by all spawn entry points.
+/// Core spawn logic shared by infallible compatibility entry points.
+///
+/// Durable workflow creation should prefer `try_spawn_actor_with_models` so a
+/// failed initial journal/snapshot commit is observable to the caller.
 pub(crate) fn spawn_actor_with_models(
     rt: &mut Runtime,
     init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
@@ -22,13 +25,31 @@ pub(crate) fn spawn_actor_with_models(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
-    spawn_actor_with_id(
+    match try_spawn_actor_with_models(rt, init, state_models, persistent, workflow, None) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(%error, "actor spawn failed before publication");
+            0
+        }
+    }
+}
+
+pub(crate) fn try_spawn_actor_with_models(
+    rt: &mut Runtime,
+    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+    state_models: HashMap<String, StateModel>,
+    persistent: bool,
+    workflow: Option<&str>,
+    initial_authority: Option<&AuthorityManifest>,
+) -> std::io::Result<u64> {
+    try_spawn_actor_with_id(
         rt,
         fresh_actor_id(),
         init,
         state_models,
         persistent,
         workflow,
+        initial_authority,
     )
 }
 
@@ -61,6 +82,24 @@ pub(crate) fn spawn_actor_with_id(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
+    match try_spawn_actor_with_id(rt, id, init, state_models, persistent, workflow, None) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(actor_id = id, %error, "actor spawn failed before publication");
+            0
+        }
+    }
+}
+
+fn try_spawn_actor_with_id(
+    rt: &mut Runtime,
+    id: u64,
+    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+    state_models: HashMap<String, StateModel>,
+    persistent: bool,
+    workflow: Option<&str>,
+    initial_authority: Option<&AuthorityManifest>,
+) -> std::io::Result<u64> {
     let restart_snapshot = if persistent && workflow.is_none() {
         match preflight_persistent_snapshot(rt, id) {
             Ok(snapshot) => snapshot,
@@ -70,7 +109,7 @@ pub(crate) fn spawn_actor_with_id(
                     %error,
                     "refusing to activate persistent actor with invalid authority snapshot"
                 );
-                return id;
+                return Ok(id);
             }
         }
     } else {
@@ -106,6 +145,9 @@ pub(crate) fn spawn_actor_with_id(
     if persistent && workflow.is_none() {
         restore_persistent_state(rt, &mut actor, restart_snapshot);
     }
+    if let Some(authority) = initial_authority {
+        actor.install_authority_manifest(authority);
+    }
     // Register CRDT-backed fields only after persisted authority has been
     // validated and installed, so rejected activations leave no manager state.
     if let Some(ref mut mgr) = rt.crdt_manager {
@@ -132,18 +174,27 @@ pub(crate) fn spawn_actor_with_id(
             }
             state
         };
-        let _ = rt.persistence.append_workflow_event(
-            id,
-            WorkflowEvent::WorkflowStarted {
-                sequence: seq,
-                name: workflow_name.as_ref().unwrap().clone(),
-                state,
-            },
-        );
-        crate::runtime::workflow::checkpoint_actor(rt, id);
+        let commit = rt
+            .persistence
+            .append_workflow_event(
+                id,
+                WorkflowEvent::WorkflowStarted {
+                    sequence: seq,
+                    name: workflow_name.as_ref().unwrap().clone(),
+                    state,
+                },
+            )
+            .and_then(|_| crate::runtime::workflow::try_checkpoint_actor(rt, id));
+        if let Err(error) = commit {
+            rt.actors.remove(&id);
+            if let Some(ref mut mgr) = rt.crdt_manager {
+                mgr.unregister_actor_fields(id);
+            }
+            return Err(error);
+        }
     }
     rt.enqueue_actor(id);
-    id
+    Ok(id)
 }
 
 /// Overlay previously persisted state onto a freshly spawned persistent
