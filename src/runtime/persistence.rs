@@ -1325,8 +1325,6 @@ impl PersistenceStore for LibsqlStore {
                         };
                         entries.push(EventEntry {
                             sequence: seq as u64,
-                            schema_owner: None,
-                            schema_version: 1,
                             schema_owner,
                             schema_version: schema_version as u32,
                             field_name,
@@ -2012,8 +2010,6 @@ impl PersistenceStore for PostgresStore {
                 let value: PersistedValue = serde_json::from_str(&value_json).ok()?;
                 Some(EventEntry {
                     sequence: seq as u64,
-                    schema_owner: None,
-                    schema_version: 1,
                     schema_owner,
                     schema_version: schema_version as u32,
                     field_name,
