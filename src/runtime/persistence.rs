@@ -984,6 +984,8 @@ impl LibsqlStore {
                 "CREATE TABLE IF NOT EXISTS events (
                     actor_id INTEGER NOT NULL,
                     sequence INTEGER NOT NULL,
+                    schema_owner TEXT,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
                     field_name TEXT NOT NULL,
                     event_name TEXT NOT NULL,
                     args TEXT NOT NULL,
@@ -994,6 +996,15 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let _ = conn
+                .execute("ALTER TABLE events ADD COLUMN schema_owner TEXT", ())
+                .await;
+            let _ = conn
+                .execute(
+                    "ALTER TABLE events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+                    (),
+                )
+                .await;
             Ok(())
         })
     }
@@ -1252,8 +1263,8 @@ impl PersistenceStore for LibsqlStore {
             let value_json = serde_json::to_string(&entry.value)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             conn.execute(
-                "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                libsql::params![actor_id as i64, entry.sequence as i64, entry.field_name, entry.event_name, args_json, value_json],
+                "INSERT INTO events (actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                libsql::params![actor_id as i64, entry.sequence as i64, entry.schema_owner.as_deref(), entry.schema_version as i64, entry.field_name, entry.event_name, args_json, value_json],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
@@ -1263,7 +1274,7 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = match conn
                 .query(
-                    "SELECT sequence, field_name, event_name, args, value FROM events
+                    "SELECT sequence, schema_owner, schema_version, field_name, event_name, args, value FROM events
                  WHERE actor_id = ?1 ORDER BY sequence ASC",
                     libsql::params![actor_id as i64],
                 )
@@ -1280,15 +1291,23 @@ impl PersistenceStore for LibsqlStore {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        let field_name: String = match row.get(1) {
+                        let schema_owner: Option<String> = match row.get(1) {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        let event_name: String = match row.get(2) {
+                        let schema_version: i64 = match row.get(2) {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        let args_json: String = match row.get(3) {
+                        let field_name: String = match row.get(3) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let event_name: String = match row.get(4) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let args_json: String = match row.get(5) {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
@@ -1296,7 +1315,7 @@ impl PersistenceStore for LibsqlStore {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        let value_json: String = match row.get(4) {
+                        let value_json: String = match row.get(6) {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
@@ -1306,6 +1325,8 @@ impl PersistenceStore for LibsqlStore {
                         };
                         entries.push(EventEntry {
                             sequence: seq as u64,
+                            schema_owner,
+                            schema_version: schema_version as u32,
                             field_name,
                             event_name,
                             args,
@@ -1734,12 +1755,24 @@ impl PostgresStore {
             "CREATE TABLE IF NOT EXISTS events (
                 actor_id BIGINT NOT NULL,
                 sequence BIGINT NOT NULL,
+                schema_owner TEXT,
+                schema_version BIGINT NOT NULL DEFAULT 1,
                 field_name TEXT NOT NULL,
                 event_name TEXT NOT NULL,
                 args TEXT NOT NULL,
                 value TEXT NOT NULL DEFAULT '1',
                 PRIMARY KEY (actor_id, sequence)
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN IF NOT EXISTS schema_owner TEXT",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN IF NOT EXISTS schema_version BIGINT NOT NULL DEFAULT 1",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1927,9 +1960,11 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO events (actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (actor_id, sequence) DO UPDATE SET
+               schema_owner = EXCLUDED.schema_owner,
+               schema_version = EXCLUDED.schema_version,
                field_name = EXCLUDED.field_name,
                event_name = EXCLUDED.event_name,
                args = EXCLUDED.args,
@@ -1937,6 +1972,8 @@ impl PersistenceStore for PostgresStore {
             &[
                 &(actor_id as i64),
                 &(entry.sequence as i64),
+                &entry.schema_owner.as_deref(),
+                &(entry.schema_version as i64),
                 &entry.field_name,
                 &entry.event_name,
                 &args_json,
@@ -1953,7 +1990,7 @@ impl PersistenceStore for PostgresStore {
             Err(_) => return Vec::new(),
         };
         let rows = match conn.query(
-            "SELECT sequence, field_name, event_name, args, value FROM events
+            "SELECT sequence, schema_owner, schema_version, field_name, event_name, args, value FROM events
              WHERE actor_id = $1 ORDER BY sequence ASC",
             &[&(actor_id as i64)],
         ) {
@@ -1963,14 +2000,18 @@ impl PersistenceStore for PostgresStore {
         rows.iter()
             .filter_map(|row| {
                 let seq: i64 = row.get(0);
-                let field_name: String = row.get(1);
-                let event_name: String = row.get(2);
-                let args_json: String = row.get(3);
+                let schema_owner: Option<String> = row.get(1);
+                let schema_version: i64 = row.get(2);
+                let field_name: String = row.get(3);
+                let event_name: String = row.get(4);
+                let args_json: String = row.get(5);
                 let args: Vec<PersistedValue> = serde_json::from_str(&args_json).ok()?;
-                let value_json: String = row.get(4);
+                let value_json: String = row.get(6);
                 let value: PersistedValue = serde_json::from_str(&value_json).ok()?;
                 Some(EventEntry {
                     sequence: seq as u64,
+                    schema_owner,
+                    schema_version: schema_version as u32,
                     field_name,
                     event_name,
                     args,
