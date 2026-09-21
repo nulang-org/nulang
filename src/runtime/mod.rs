@@ -5493,7 +5493,7 @@ impl Runtime {
             )
             .map_err(|err| NuError::RuntimeError {
                 msg: format!(
-                    "invalid authority snapshot for virtual actor {}: {}",
+                    "invalid durable snapshot for virtual actor {}: {}",
                     grain_id.actor_name(),
                     err
                 ),
@@ -5626,7 +5626,7 @@ impl Runtime {
             Ok(actor) => actor,
             Err(err) => {
                 warn!(
-                    "nulang-migrate: invalid authority manifest for actor {}: {}",
+                    "nulang-migrate: invalid durable snapshot for actor {}: {}",
                     actor_id, err
                 );
                 return false;
