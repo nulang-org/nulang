@@ -1235,6 +1235,7 @@ impl Runtime {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
                                     step_name: suspended.step_name.clone(),
+                                    reason: SuspensionReason::JitSafepoint,
                                 });
                             actor.jit_yield_pending = true;
                         }
@@ -1246,7 +1247,7 @@ impl Runtime {
                         actor.jit_yield_pending = false;
                     }
                 }
-                Err(crate::types::NuError::Suspended(_)) => {
+                Err(crate::types::NuError::Suspended(kind)) => {
                     // Re-suspended (e.g. signal wait or receive-wait):
                     // re-capture VM state.
                     if let Some(vm_state) = vm.take_suspended_state() {
@@ -1260,6 +1261,7 @@ impl Runtime {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
                                     step_name: suspended.step_name,
+                                    reason: SuspensionReason::from_vm(kind),
                                 });
                         }
                         (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
@@ -1639,7 +1641,7 @@ impl Runtime {
                     self.checkpoint_actor(actor_id);
                 }
             }
-            Err(crate::types::NuError::Suspended(_)) => {
+            Err(crate::types::NuError::Suspended(kind)) => {
                 // Suspended again - waiting for another signal OR on a
                 // background LLM call (`perform LLM.ask` after the wait).
                 // Re-capture the VM state so the next matching signal or the
@@ -1669,6 +1671,7 @@ impl Runtime {
                                 vm_state,
                                 behavior_idx,
                                 step_name,
+                                reason: SuspensionReason::from_vm(kind),
                             });
                     }
                     // A chained receive-after suspend arms its timeout
@@ -4461,7 +4464,7 @@ impl Runtime {
                         (*self_ptr).checkpoint_actor(actor_id);
                     }
                 }
-                Err(crate::types::NuError::Suspended(_)) => {
+                Err(crate::types::NuError::Suspended(kind)) => {
                     // Re-suspended (e.g. a chained Timer.sleep): re-capture
                     // the VM state so the next timer fire can resume it.
                     if let Some(vm_state) = vm.take_suspended_state() {
@@ -4471,6 +4474,7 @@ impl Runtime {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
                                     step_name: suspended.step_name.clone(),
+                                    reason: SuspensionReason::from_vm(kind),
                                 });
                         }
                     }
@@ -4568,12 +4572,13 @@ impl Runtime {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
                                     step_name: suspended.step_name,
+                                    reason: SuspensionReason::ReceiveWait,
                                 });
                         }
                         (*self_ptr).maybe_schedule_receive_wait(actor_id, timeout);
                     }
                 }
-                Err(crate::types::NuError::Suspended(_)) => {
+                Err(crate::types::NuError::Suspended(kind)) => {
                     // Suspended on something else (a signal wait or a
                     // background LLM call) past the receive: the wait is
                     // over. Re-capture so the matching signal or pumped
@@ -4589,6 +4594,7 @@ impl Runtime {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
                                     step_name: suspended.step_name,
+                                    reason: SuspensionReason::from_vm(kind),
                                 });
                         }
                     }
@@ -4819,6 +4825,7 @@ impl Runtime {
                                     vm_state,
                                     behavior_idx: 0,
                                     step_name: String::new(),
+                                    reason: SuspensionReason::JitSafepoint,
                                 });
                             actor.jit_yield_pending = true;
                         }
@@ -4832,7 +4839,7 @@ impl Runtime {
             // LLM call, or a timed selective receive. Doing this here avoids
             // aliasing the Runtime through the callback while the VM borrow
             // is active.
-            if let Err(crate::types::NuError::Suspended(_)) = &result {
+            if let Err(crate::types::NuError::Suspended(kind)) = &result {
                 if let Some(vm_state) = vm.take_suspended_state() {
                     let signal_name = vm.suspended_signal_name.take();
                     let receive_timeout = vm.suspended_receive_timeout.take();
@@ -4844,6 +4851,7 @@ impl Runtime {
                                 vm_state,
                                 behavior_idx: 0,
                                 step_name: String::new(),
+                                reason: SuspensionReason::from_vm(*kind),
                             });
                     }
                     self.maybe_schedule_receive_wait(actor_id, receive_timeout);
