@@ -706,9 +706,6 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         behavior_id: u16,
         args: &[crate::vm::Value],
     ) -> crate::vm::Value {
-        if self.block_query_operation("Actor.ask") {
-            return crate::vm::Value::nil();
-        }
         if let Some(actor_id) = target.as_actor_id() {
             let mut rt = self.runtime.borrow_mut();
             match rt.ask_actor_sync(actor_id, behavior_id, args) {
@@ -2051,6 +2048,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     #[cfg(feature = "ai-runtime")]
     fn llm_ask(&mut self, model: &str, prompt: &str) -> crate::vm::PerformAsyncResult {
         use crate::vm::PerformAsyncResult;
+        if self.block_query_operation(format!("Inference.ask({model})")) {
+            return PerformAsyncResult::Ready(None);
+        }
         unsafe {
             let rt = &mut *self.runtime;
             let actor_id = self.actor_id;
