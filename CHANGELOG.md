@@ -1544,3 +1544,10 @@ in this version; they are recorded here to establish their tier.
 No stability promise. The 0.x series is the alpha development track. Language
 version 1.0.0-frozen is the first version with a published stability contract;
 everything before it is implicitly Experimental.
+
+## Experimental tier
+
+### Strict JSON Result parser — 2026-09-21
+- **`parse_strict` validates complete JSON documents.** `stdlib::json` and the official `json` seed package now expose `parse_strict(String) -> Result[JsonValue, JsonParseError]`. It rejects empty input, trailing content, truncated arrays/objects/strings, malformed literals/numbers, invalid escapes, missing object separators, and trailing commas.
+- **Legacy `parse` remains source-compatible during migration.** Existing callers keep the historical lenient `JsonValue` API for now. Strict parsing performs one validation pass followed by the existing decoder, intentionally trading a temporary extra O(n) pass for a low-risk migration path. Conformance coverage pins the malformed inputs that the old lenient parser accepts.
+

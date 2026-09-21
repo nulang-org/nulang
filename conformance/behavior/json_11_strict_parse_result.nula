@@ -1,0 +1,31 @@
+// stdlib::json — strict parser rejects malformed or partial documents
+// while legacy parse remains source-compatible during migration.
+import stdlib::json
+
+fn tag(r: Result[JsonValue, JsonParseError]) -> String {
+    match r {
+        Ok(_) => "ok",
+        Error(_) => "error",
+    }
+}
+
+fn main() {
+    match parse_strict("  {\"a\":[1,true,null,\"x\"]}  ") {
+        Ok(v) => perform IO.print("valid=" + stringify(v)),
+        Error(_) => perform IO.print("valid=error"),
+    }
+
+    perform IO.print("empty=" + tag(parse_strict("")))
+    perform IO.print("ws_only=" + tag(parse_strict("   ")))
+    perform IO.print("trailing=" + tag(parse_strict("12garbage")))
+    perform IO.print("trunc_obj=" + tag(parse_strict("{\"a\":1")))
+    perform IO.print("trunc_arr=" + tag(parse_strict("[1,2")))
+    perform IO.print("array_comma=" + tag(parse_strict("[1,]")))
+    perform IO.print("object_comma=" + tag(parse_strict("{\"a\":1,}")))
+    perform IO.print("missing_colon=" + tag(parse_strict("{\"a\" 1}")))
+    perform IO.print("leading_zero=" + tag(parse_strict("01")))
+    perform IO.print("fraction=" + tag(parse_strict("1.")))
+    perform IO.print("exponent=" + tag(parse_strict("1e")))
+    perform IO.print("plus=" + tag(parse_strict("+1")))
+    perform IO.print("number_ok=" + tag(parse_strict("-0.25e+2")))
+}

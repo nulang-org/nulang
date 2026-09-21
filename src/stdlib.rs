@@ -22,7 +22,7 @@
 //! | `std.datetime` | `datetime.nula` | DateTime record type and operations: `now` (stub), `new`, `is_valid`. |
 //! | `std.http` | `http.nula` | HTTP client via built-in `Http` effect: `get`, `post`. |
 //! | `std.fs` | `fs.nula` | Filesystem I/O via built-in `FS` effect: `read`, `write`, `append`, `exists`. |
-//! | `std.json` | `json.nula` | JSON parsing and serialization: `parse`, `stringify`, field accessors. |
+//! | `std.json` | `json.nula` | JSON parsing and serialization: strict `parse_strict`, legacy `parse`, `stringify`, field accessors. |
 //! | `std.test` | `test.nula` | Testing primitives: `assert_eq`, `assert_true`, `assert_false`, `fail`. |
 //!
 //! The wiring itself lives elsewhere:
