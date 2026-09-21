@@ -341,10 +341,17 @@ This RFC does not propose:
 
 ### Phase 2 — typed indexes and query plan
 
-- Define index declarations in AST/HIR.
-- Add typed logical query plan independent of SQL.
-- Keep SQL/libSQL as one physical executor.
-- Add query diagnostics for scans and missing indexes.
+- [x] Define entity-owned logical index declarations in AST/HIR using
+  contextual `index` / `unique index` syntax.
+- [x] Validate indexes against durable entity state before backend selection.
+- [x] Add a backend-independent logical access planner with deterministic
+  unique-index and composite-prefix selection.
+- [ ] Lower native entity query syntax into the logical query plan.
+- [ ] Add physical index realization for the in-memory/local data kernel.
+- [ ] Keep SQL/libSQL/PostgreSQL as replaceable physical executors.
+- [ ] Add query diagnostics for scans, residual predicates, and missing indexes.
+- [ ] Add cardinality feedback and cost-based choices without changing query
+  semantics.
 
 ### Phase 3 — incremental views
 
