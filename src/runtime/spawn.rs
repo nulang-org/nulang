@@ -539,6 +539,196 @@ mod authority_tests {
             .unwrap()
     }
 
+    #[derive(Clone)]
+    struct RecordingStore {
+        inner: std::sync::Arc<std::sync::Mutex<crate::runtime::persistence::MemoryStore>>,
+        fail_snapshot: bool,
+        fail_workflow_event: bool,
+        last_actor_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl RecordingStore {
+        fn new(fail_snapshot: bool, fail_workflow_event: bool) -> Self {
+            Self {
+                inner: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::runtime::persistence::MemoryStore::new(),
+                )),
+                fail_snapshot,
+                fail_workflow_event,
+                last_actor_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }
+        }
+
+        fn last_actor_id(&self) -> u64 {
+            self.last_actor_id
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl crate::runtime::persistence::PersistenceStore for RecordingStore {
+        fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
+            self.last_actor_id
+                .store(snapshot.actor_id, std::sync::atomic::Ordering::Relaxed);
+            if self.fail_snapshot {
+                return Err(std::io::Error::other("injected snapshot failure"));
+            }
+            self.inner.lock().unwrap().save_snapshot(snapshot)
+        }
+
+        fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+            self.inner.lock().unwrap().load_snapshot(actor_id)
+        }
+
+        fn append_journal(
+            &mut self,
+            actor_id: u64,
+            entry: crate::runtime::persistence::JournalEntry,
+        ) -> std::io::Result<()> {
+            self.inner.lock().unwrap().append_journal(actor_id, entry)
+        }
+
+        fn read_journal(
+            &self,
+            actor_id: u64,
+        ) -> Vec<crate::runtime::persistence::JournalEntry> {
+            self.inner.lock().unwrap().read_journal(actor_id)
+        }
+
+        fn append_workflow_event(
+            &mut self,
+            actor_id: u64,
+            event: WorkflowEvent,
+        ) -> std::io::Result<()> {
+            self.last_actor_id
+                .store(actor_id, std::sync::atomic::Ordering::Relaxed);
+            if self.fail_workflow_event {
+                return Err(std::io::Error::other("injected workflow event failure"));
+            }
+            self.inner
+                .lock()
+                .unwrap()
+                .append_workflow_event(actor_id, event)
+        }
+
+        fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+            self.inner
+                .lock()
+                .unwrap()
+                .read_workflow_events(actor_id)
+        }
+
+        fn append_event(
+            &mut self,
+            actor_id: u64,
+            entry: crate::runtime::persistence::EventEntry,
+        ) -> std::io::Result<()> {
+            self.inner.lock().unwrap().append_event(actor_id, entry)
+        }
+
+        fn read_events(&self, actor_id: u64) -> Vec<crate::runtime::persistence::EventEntry> {
+            self.inner.lock().unwrap().read_events(actor_id)
+        }
+
+        fn latest_sequence(&self, actor_id: u64) -> u64 {
+            self.inner.lock().unwrap().latest_sequence(actor_id)
+        }
+
+        fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+            self.inner.lock().unwrap().clear(actor_id)
+        }
+    }
+
+    #[test]
+    fn initial_workflow_snapshot_failure_is_not_published() {
+        let mut rt = Runtime::new();
+        let store = RecordingStore::new(true, false);
+        let probe = store.clone();
+        rt.persistence = Box::new(store);
+        rt.crdt_manager = Some(crate::runtime::crdt_manager::CrdtManager::new(1));
+
+        let mut models = HashMap::new();
+        models.insert(
+            "count".to_string(),
+            StateModel::Crdt(crate::ast::CrdtType::GCounter),
+        );
+        let result = try_spawn_actor_with_models(
+            &mut rt,
+            Box::new(|| vec![("count".to_string(), Value::int(0))]),
+            models,
+            true,
+            Some("FailingWorkflow"),
+            None,
+        );
+
+        assert!(result.is_err());
+        let actor_id = probe.last_actor_id();
+        assert_ne!(actor_id, 0);
+        assert!(!rt.actors.contains_key(&actor_id));
+        let manager = rt.crdt_manager.as_ref().unwrap();
+        assert!(manager.field_map.keys().all(|(owner, _)| *owner != actor_id));
+        assert!(
+            manager
+                .field_reverse
+                .values()
+                .all(|(owner, _)| *owner != actor_id)
+        );
+    }
+
+    #[test]
+    fn initial_workflow_event_failure_is_not_published() {
+        let mut rt = Runtime::new();
+        let store = RecordingStore::new(false, true);
+        let probe = store.clone();
+        rt.persistence = Box::new(store);
+
+        let result = try_spawn_actor_with_models(
+            &mut rt,
+            Box::new(Vec::new),
+            HashMap::new(),
+            true,
+            Some("FailingWorkflow"),
+            None,
+        );
+
+        assert!(result.is_err());
+        let actor_id = probe.last_actor_id();
+        assert_ne!(actor_id, 0);
+        assert!(!rt.actors.contains_key(&actor_id));
+        assert!(probe.load_snapshot(actor_id).is_none());
+    }
+
+    #[test]
+    fn workflow_initial_snapshot_contains_delegated_authority() {
+        let mut rt = Runtime::new();
+        let store = RecordingStore::new(false, false);
+        let probe = store.clone();
+        rt.persistence = Box::new(store);
+        let requested = secret_manifest("WORKFLOW_KEY");
+
+        let actor_id = try_spawn_actor_with_models(
+            &mut rt,
+            Box::new(Vec::new),
+            HashMap::new(),
+            true,
+            Some("AuthorityWorkflow"),
+            Some(&requested),
+        )
+        .unwrap();
+
+        let snapshot = probe
+            .load_snapshot(actor_id)
+            .expect("initial workflow snapshot committed");
+        assert_eq!(snapshot.authority_tokens, requested.canonical_token_set());
+        assert_eq!(
+            rt.actors
+                .get(&actor_id)
+                .unwrap()
+                .authority_manifest()
+                .unwrap(),
+            requested
+        );
+    }
+
     #[test]
     fn root_spawn_installs_requested_authority() {
         let mut rt = Runtime::new();
