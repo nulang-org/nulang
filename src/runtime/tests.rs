@@ -401,9 +401,8 @@ fn test_anonymous_actor_accepts_untyped_mailbox_delivery_without_handler_alias()
     rt.send_message(actor_id, "opaque-runtime-tag", &[Value::int(7)]);
 
     assert_eq!(rt.actors[&actor_id].mailbox.len(), 1);
-    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
 
-    rt.run_actor_step(actor_id);
+    rt.run_scheduler();
     assert_eq!(rt.actors[&actor_id].reduction_count, 1);
     assert!(rt.actors[&actor_id].mailbox.is_empty());
 }
