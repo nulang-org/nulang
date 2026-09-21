@@ -22,6 +22,10 @@ pub struct MigrationEventMeta {
     pub event_name: String,
     pub parameter_count: u32,
     pub catch_all: bool,
+    /// Artifact-local compiler-private function for a named event arm.
+    /// Catch-all pass-through arms intentionally carry no function binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_index: Option<usize>,
 }
 
 /// Artifact-safe description of one `migration from V to V+1` contract.
@@ -104,6 +108,7 @@ impl MigrationContractMeta {
                 event_name: event_name.clone(),
                 parameter_count: params.len() as u32,
                 catch_all: event_name == "other",
+                function_index: None,
             })
             .collect();
 
