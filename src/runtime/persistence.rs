@@ -486,6 +486,22 @@ pub trait PersistenceStore: Send + Sync {
     /// Remove all data for an actor.
     fn clear(&mut self, actor_id: u64) -> io::Result<()>;
 
+    /// Retain an immutable compiler-proven historical executable.
+    fn save_artifact(&mut self, _artifact: RetainedArtifact) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "historical artifact retention is not supported by this persistence backend",
+        ))
+    }
+
+    /// Load an exact historical executable by strong ArtifactId.
+    fn load_artifact(&self, _artifact_id: ArtifactId) -> io::Result<Option<RetainedArtifact>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "historical artifact retention is not supported by this persistence backend",
+        ))
+    }
+
     /// Execute an arbitrary SQL query against the store.
     /// Returns rows as JSON arrays of column values. Default: not supported.
     fn query(&self, _sql: &str, _params: &[Value]) -> io::Result<Vec<String>> {
@@ -503,6 +519,7 @@ pub struct MemoryStore {
     journals: HashMap<u64, Vec<JournalEntry>>,
     workflow_events: HashMap<u64, Vec<WorkflowEvent>>,
     events: HashMap<u64, Vec<EventEntry>>,
+    artifacts: HashMap<ArtifactId, RetainedArtifact>,
 }
 
 impl MemoryStore {
@@ -586,7 +603,29 @@ impl PersistenceStore for MemoryStore {
         self.journals.remove(&actor_id);
         self.workflow_events.remove(&actor_id);
         self.events.remove(&actor_id);
+        // Artifacts are content-addressed and may be shared by other histories.
         Ok(())
+    }
+
+    fn save_artifact(&mut self, artifact: RetainedArtifact) -> io::Result<()> {
+        if let Some(existing) = self.artifacts.get(&artifact.artifact_id) {
+            if existing != &artifact {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "immutable artifact {} already exists with different bytes",
+                        artifact.artifact_id
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+        self.artifacts.insert(artifact.artifact_id, artifact);
+        Ok(())
+    }
+
+    fn load_artifact(&self, artifact_id: ArtifactId) -> io::Result<Option<RetainedArtifact>> {
+        Ok(self.artifacts.get(&artifact_id).cloned())
     }
 }
 
