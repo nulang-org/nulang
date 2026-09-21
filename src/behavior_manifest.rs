@@ -4,8 +4,11 @@
 //! derived from already-checked compiler state and never grants authority.
 
 use crate::authority::AuthorityGrant;
-use crate::effect_checker::EffectChecker;
+use crate::effect_checker::{parse_effect_name, EffectChecker};
 use crate::hir;
+use crate::host_effect_abi::{
+    lookup_host_operation, HostOperationDescriptor, HostReplayClass,
+};
 use crate::mir;
 use crate::protocol::{ProtocolMember, ProtocolSchema};
 use crate::types::{canonical_type_bytes, Effect, EffectRow, Type};
@@ -109,6 +112,7 @@ pub struct EffectEntry {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum EffectClass {
+    Pure,
     Local,
     External,
 }
@@ -123,8 +127,10 @@ pub enum Determinism {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum EffectReplay {
+    None,
     Safe,
     RequiresJournal,
+    RequiresIdempotencyKey,
     Nonreplayable,
 }
 
@@ -173,8 +179,11 @@ pub struct ReplayEntry {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReplayClass {
+    Pure,
     LocalReplaySafe,
     JournalResult,
+    ExternalIdempotent,
+    ExternalRequiresIdempotencyKey,
     ExternalNonreplayable,
 }
 
@@ -255,18 +264,11 @@ impl BehaviorManifest {
         input: BehaviorManifestInput<'_>,
     ) -> Result<Self, BehaviorManifestBuildError> {
         let effect_set = collect_effect_set(input.effect_checker, input.hir);
-        let effects: Vec<_> = effect_set.iter().cloned().map(effect_entry).collect();
-        let replay = effects
-            .iter()
-            .map(|entry| ReplayEntry {
-                effect: entry.effect.clone(),
-                class: match entry.replay {
-                    EffectReplay::Safe => ReplayClass::LocalReplaySafe,
-                    EffectReplay::RequiresJournal => ReplayClass::JournalResult,
-                    EffectReplay::Nonreplayable => ReplayClass::ExternalNonreplayable,
-                },
-            })
-            .collect();
+        let host_operations = input
+            .mir
+            .map(collect_host_operations)
+            .unwrap_or_default();
+        let (effects, replay) = collect_manifest_effects(&effect_set, &host_operations);
 
         let (interfaces, actors, durability, interface_digests, state_schema_digests) =
             if let Some(hir) = input.hir {
@@ -275,7 +277,7 @@ impl BehaviorManifest {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
             };
 
-        let authority = collect_authority(&effect_set, input.mir)?;
+        let authority = collect_authority(&effect_set, &host_operations, input.mir)?;
 
         Ok(Self {
             schema: BEHAVIOR_SCHEMA_V0ALPHA1.to_string(),
@@ -381,6 +383,145 @@ fn effect_entry(effect: Effect) -> EffectEntry {
         },
         cost_class: None,
     }
+}
+
+fn collect_manifest_effects(
+    effect_set: &[Effect],
+    host_operations: &[&'static HostOperationDescriptor],
+) -> (Vec<EffectEntry>, Vec<ReplayEntry>) {
+    let host_row_names: BTreeSet<String> = host_operations
+        .iter()
+        .map(|operation| parse_effect_name(operation.source_effect).to_string())
+        .collect();
+
+    let mut effects: Vec<EffectEntry> = effect_set
+        .iter()
+        .filter(|effect| !host_row_names.contains(&effect.to_string()))
+        .cloned()
+        .map(effect_entry)
+        .collect();
+
+    effects.extend(
+        host_operations
+            .iter()
+            .map(|operation| host_effect_entry(operation)),
+    );
+    effects.sort_by(|left, right| left.effect.cmp(&right.effect));
+    effects.dedup_by(|left, right| left.effect == right.effect);
+
+    let host_replay: BTreeMap<String, HostReplayClass> = host_operations
+        .iter()
+        .map(|operation| {
+            (
+                format!("{}.{}", operation.source_effect, operation.source_operation),
+                operation.replay,
+            )
+        })
+        .collect();
+
+    let replay = effects
+        .iter()
+        .map(|entry| {
+            let class = host_replay
+                .get(entry.effect.as_str())
+                .copied()
+                .map(replay_class_from_host)
+                .unwrap_or_else(|| replay_class_from_effect(entry.replay));
+            ReplayEntry {
+                effect: entry.effect.clone(),
+                class,
+            }
+        })
+        .collect();
+
+    (effects, replay)
+}
+
+fn host_effect_entry(operation: &HostOperationDescriptor) -> EffectEntry {
+    let replay = match operation.replay {
+        HostReplayClass::Pure => EffectReplay::None,
+        HostReplayClass::LocalReplaySafe | HostReplayClass::ExternalIdempotent => {
+            EffectReplay::Safe
+        }
+        HostReplayClass::JournalResult => EffectReplay::RequiresJournal,
+        HostReplayClass::ExternalRequiresIdempotencyKey => {
+            EffectReplay::RequiresIdempotencyKey
+        }
+        HostReplayClass::ExternalNonreplayable => EffectReplay::Nonreplayable,
+    };
+
+    let (class, determinism) = match operation.replay {
+        HostReplayClass::Pure => (EffectClass::Pure, Determinism::Deterministic),
+        HostReplayClass::LocalReplaySafe => (EffectClass::Local, Determinism::Deterministic),
+        _ => (EffectClass::External, Determinism::Nondeterministic),
+    };
+
+    EffectEntry {
+        effect: format!("{}.{}", operation.source_effect, operation.source_operation),
+        class,
+        determinism,
+        replay,
+        cost_class: None,
+    }
+}
+
+fn replay_class_from_host(replay: HostReplayClass) -> ReplayClass {
+    match replay {
+        HostReplayClass::Pure => ReplayClass::Pure,
+        HostReplayClass::LocalReplaySafe => ReplayClass::LocalReplaySafe,
+        HostReplayClass::JournalResult => ReplayClass::JournalResult,
+        HostReplayClass::ExternalIdempotent => ReplayClass::ExternalIdempotent,
+        HostReplayClass::ExternalRequiresIdempotencyKey => {
+            ReplayClass::ExternalRequiresIdempotencyKey
+        }
+        HostReplayClass::ExternalNonreplayable => ReplayClass::ExternalNonreplayable,
+    }
+}
+
+fn replay_class_from_effect(replay: EffectReplay) -> ReplayClass {
+    match replay {
+        EffectReplay::None | EffectReplay::Safe => ReplayClass::LocalReplaySafe,
+        EffectReplay::RequiresJournal => ReplayClass::JournalResult,
+        EffectReplay::RequiresIdempotencyKey => ReplayClass::ExternalRequiresIdempotencyKey,
+        EffectReplay::Nonreplayable => ReplayClass::ExternalNonreplayable,
+    }
+}
+
+fn collect_host_operations(module: &mir::Module) -> Vec<&'static HostOperationDescriptor> {
+    let mut operations = BTreeMap::new();
+
+    for function in module.functions.iter().chain(module.behaviors.iter()) {
+        for block in &function.blocks {
+            for stmt in &block.stmts {
+                let mir::Stmt::Assign { op, .. } = stmt else {
+                    continue;
+                };
+
+                let descriptor = match op {
+                    mir::RValue::Perform {
+                        effect,
+                        op,
+                        resolved_handler,
+                        ..
+                    } if resolved_handler.is_none() => lookup_host_operation(effect, op),
+                    mir::RValue::PerformAsync {
+                        effect_op,
+                        resolved_handler,
+                        ..
+                    } if resolved_handler.is_none() => effect_op
+                        .split_once('.')
+                        .and_then(|(effect, op)| lookup_host_operation(effect, op)),
+                    _ => None,
+                };
+
+                if let Some(operation) = descriptor {
+                    operations.insert(operation.canonical_id(), operation);
+                }
+            }
+        }
+    }
+
+    operations.into_values().collect()
 }
 
 fn is_external_effect(effect: &Effect) -> bool {
@@ -572,6 +713,7 @@ fn state_model_identity(model: crate::ast::StateModel) -> String {
 
 fn collect_authority(
     effects: &[Effect],
+    host_operations: &[&'static HostOperationDescriptor],
     mir: Option<&mir::Module>,
 ) -> Result<Vec<AuthorityEntry>, BehaviorManifestBuildError> {
     let mut authority: BTreeMap<(AuthorityKind, Option<String>), BTreeSet<String>> =
@@ -583,6 +725,11 @@ fn collect_authority(
         if let Some((kind, resource)) = broad_authority_for_effect(effect) {
             authority.entry((kind, resource)).or_default();
         }
+    }
+
+    for operation in host_operations {
+        let (kind, resource) = broad_authority_for_host_operation(operation);
+        authority.entry((kind, resource)).or_default();
     }
 
     // Spawn grants are exact, compiler-preserved authority. Keep the exact
@@ -628,6 +775,20 @@ fn authority_kind_key(kind: AuthorityKind) -> &'static str {
         AuthorityKind::State => "state",
         AuthorityKind::ActorDelegation => "actor-delegation",
         AuthorityKind::Custom => "custom",
+    }
+}
+
+fn broad_authority_for_host_operation(
+    operation: &HostOperationDescriptor,
+) -> (AuthorityKind, Option<String>) {
+    match operation.source_effect {
+        "Http" => (AuthorityKind::Network, None),
+        "Inference" => (AuthorityKind::Inference, None),
+        "Storage" => (AuthorityKind::State, None),
+        effect => (
+            AuthorityKind::Custom,
+            Some(format!("host-effect:{effect}")),
+        ),
     }
 }
 
@@ -857,6 +1018,40 @@ fn main() { add(1, 2) }
     }
 
     #[test]
+    fn host_operation_replay_comes_from_compiler_owned_abi() {
+        let manifest = emit(
+            r#"
+fn main() {
+    perform Comms.send("p", "sms", "from", "to", "body", "media", "key", "meta")
+    perform Comms.call("p", "from", "to", "meta")
+}
+"#,
+        );
+
+        let send = manifest
+            .effects
+            .iter()
+            .find(|entry| entry.effect == "Comms.send")
+            .unwrap();
+        let call = manifest
+            .effects
+            .iter()
+            .find(|entry| entry.effect == "Comms.call")
+            .unwrap();
+        assert_eq!(send.replay, EffectReplay::RequiresIdempotencyKey);
+        assert_eq!(call.replay, EffectReplay::Nonreplayable);
+
+        assert!(manifest.replay.iter().any(|entry| {
+            entry.effect == "Comms.send"
+                && entry.class == ReplayClass::ExternalRequiresIdempotencyKey
+        }));
+        assert!(manifest.replay.iter().any(|entry| {
+            entry.effect == "Comms.call"
+                && entry.class == ReplayClass::ExternalNonreplayable
+        }));
+    }
+
+    #[test]
     fn process_and_ffi_are_not_overclaimed_as_replayable() {
         let manifest = emit(
             r#"
@@ -908,7 +1103,7 @@ fn main() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|entry| entry["effect"] == "Net"));
+            .any(|entry| entry["effect"] == "Http.get"));
         assert!(json["authority"].as_array().unwrap().iter().any(|entry| {
             entry["kind"] == "network"
                 && entry["resource"] == "api.example.com:443"
