@@ -5017,4 +5017,81 @@ mod tests {
         assert!(checker.check_module(&ast.decls).is_ok());
         assert!(checker.diagnostics.is_empty());
     }
+
+    #[test]
+    fn test_migration_state_body_must_be_pure() {
+        let ast = parse_module(
+            r#"
+            entity E {
+                version: 2
+                state count: Int = 0
+                migration from 1 to 2 {
+                    state => { perform IO.print(42) }
+                }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        let err = checker
+            .check_module(&ast.decls)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("disallowed effect") && err.contains("IO"),
+            "effectful migration state body must be rejected, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_migration_event_body_must_be_pure() {
+        let ast = parse_module(
+            r#"
+            entity E {
+                version: 2
+                state count: Int = 0
+                events
+                    | Bumped(by: Int)
+                migration from 1 to 2 {
+                    events {
+                        | Bumped(by) => perform Time.now_ms()
+                    }
+                }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        let err = checker
+            .check_module(&ast.decls)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("disallowed effect") && err.contains("Time"),
+            "effectful migration event body must be rejected, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_pure_migration_body_passes_effect_check() {
+        let ast = parse_module(
+            r#"
+            entity E {
+                version: 2
+                state count: Int = 0
+                migration from 1 to 2 {
+                    state => { self.count = self.count + 1 }
+                }
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_ok(),
+            "pure migration bodies must remain legal"
+        );
+    }
+
 }
