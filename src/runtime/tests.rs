@@ -2026,6 +2026,81 @@ impl PersistenceStore for RejectingSnapshotCommitStore {
 }
 
 #[test]
+fn test_compiler_binds_named_migration_event_arm_and_leaves_catchall_declarative() {
+    let module = compile_state_migration_module(
+        r#"
+        entity Counter {
+            version: 2
+            state event_sourced count: Int = 0
+            events
+                | Incremented(by: Int)
+            apply
+                | Incremented(by) => { self.count = self.count + by }
+
+            behavior inc(by: Int) {
+                emit Incremented(by)
+            }
+
+            migration from 1 to 2 {
+                events {
+                    | Added(by) => emit Incremented(by)
+                    | other => other
+                }
+            }
+        }
+        "#,
+    );
+
+    let meta = module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == "Counter")
+        .expect("Counter metadata");
+    let manifest = crate::migration_manifest::MigrationManifest::from_json(&meta.migrations)
+        .expect("migration manifest");
+    let contract = manifest
+        .contracts
+        .iter()
+        .find(|contract| contract.from_version == 1 && contract.to_version == 2)
+        .expect("1 -> 2 migration contract");
+
+    let added = contract
+        .event_transforms
+        .iter()
+        .find(|event| event.event_name == "Added")
+        .expect("named Added migration arm");
+    assert!(!added.catch_all);
+    assert_eq!(added.parameter_count, 1);
+    let function_index = added
+        .function_index
+        .expect("named event migration must bind private bytecode");
+    assert!(function_index < module.function_table.len());
+
+    let expected_name = "Counter.$migration_event_1_2_Added";
+    let indexed_offset = module.function_table[function_index];
+    assert_eq!(
+        module.function_offset_by_name(expected_name),
+        Some(indexed_offset),
+        "manifest binding must resolve to the canonical compiler-owned function"
+    );
+    assert!(
+        module.behaviors.iter().all(|behavior| behavior.name != expected_name),
+        "migration event functions must never enter the actor behavior table"
+    );
+
+    let catch_all = contract
+        .event_transforms
+        .iter()
+        .find(|event| event.catch_all)
+        .expect("catch-all pass-through arm");
+    assert_eq!(catch_all.event_name, "other");
+    assert!(
+        catch_all.function_index.is_none(),
+        "other => other is declarative pass-through and must not carry bytecode"
+    );
+}
+
+#[test]
 fn test_compiler_emits_private_replayable_apply_handler_metadata() {
     let module = compile_state_migration_module(
         r#"

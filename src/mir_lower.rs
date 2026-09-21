@@ -44,6 +44,20 @@ fn apply_handler_function_name(actor_name: &str, event: &str) -> String {
     format!("{actor_name}.$apply_{event}")
 }
 
+fn migration_event_function_name(
+    actor_name: &str,
+    from_version: u32,
+    to_version: u32,
+    event: &str,
+) -> String {
+    // Compiler-owned RFC 0008 historical-event transform. Like migration
+    // state/apply replay functions it is never exposed through func_map,
+    // exports, or the actor behavior table.
+    format!(
+        "{actor_name}.$migration_event_{from_version}_{to_version}_{event}"
+    )
+}
+
 
 /// Conservative proof that an apply handler can be re-run as a deterministic
 /// event projection without observing non-event-sourced actor state or
@@ -288,6 +302,26 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                     idx,
                 ));
             }
+
+            // Named event migration arms are compiler-private functions too.
+            // Catch-all pass-through arms are intentionally not represented
+            // here; they remain declarative manifest metadata.
+            for migration in &a.migration_event_bodies {
+                let name = migration_event_function_name(
+                    &a.name,
+                    migration.from_version,
+                    migration.to_version,
+                    &migration.event,
+                );
+                let idx = ctx.reserve_function(&name);
+                ctx.migration_event_function_of.push((
+                    a.name.clone(),
+                    migration.from_version,
+                    migration.to_version,
+                    migration.event.clone(),
+                    idx,
+                ));
+            }
             let state_models = a
                 .state_fields
                 .iter()
@@ -322,28 +356,57 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 })?;
 
             for contract in &mut migration_manifest.contracts {
-                if !contract.has_state_transform {
-                    continue;
+                if contract.has_state_transform {
+                    let function_idx = ctx
+                        .migration_state_function_of
+                        .iter()
+                        .find(|(actor_name, from, to, _)| {
+                            actor_name == &a.name
+                                && *from == contract.from_version
+                                && *to == contract.to_version
+                        })
+                        .map(|(_, _, _, idx)| *idx)
+                        .ok_or_else(|| {
+                            compile_err(
+                                format!(
+                                    "internal: state migration {} -> {} for '{}' has no private function slot",
+                                    contract.from_version, contract.to_version, a.name
+                                ),
+                                a.span,
+                            )
+                        })?;
+                    contract.state_function_index = Some(function_idx);
                 }
-                let function_idx = ctx
-                    .migration_state_function_of
-                    .iter()
-                    .find(|(actor_name, from, to, _)| {
-                        actor_name == &a.name
-                            && *from == contract.from_version
-                            && *to == contract.to_version
-                    })
-                    .map(|(_, _, _, idx)| *idx)
-                    .ok_or_else(|| {
-                        compile_err(
-                            format!(
-                                "internal: state migration {} -> {} for '{}' has no private function slot",
-                                contract.from_version, contract.to_version, a.name
-                            ),
-                            a.span,
-                        )
-                    })?;
-                contract.state_function_index = Some(function_idx);
+
+                for event in &mut contract.event_transforms {
+                    if event.catch_all {
+                        event.function_index = None;
+                        continue;
+                    }
+                    let function_idx = ctx
+                        .migration_event_function_of
+                        .iter()
+                        .find(|(actor_name, from, to, event_name, _)| {
+                            actor_name == &a.name
+                                && *from == contract.from_version
+                                && *to == contract.to_version
+                                && event_name == &event.event_name
+                        })
+                        .map(|(_, _, _, _, idx)| *idx)
+                        .ok_or_else(|| {
+                            compile_err(
+                                format!(
+                                    "internal: event migration {} -> {} arm '{}' for '{}' has no private function slot",
+                                    contract.from_version,
+                                    contract.to_version,
+                                    event.event_name,
+                                    a.name
+                                ),
+                                a.span,
+                            )
+                        })?;
+                    event.function_index = Some(function_idx);
+                }
             }
 
             let migrations = migration_manifest.to_json().map_err(|error| NuError::VMError {
@@ -541,6 +604,33 @@ fn lower_decl_bodies(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 let func = lower_migration_state_function(ctx, &full_name, &migration.body)?;
                 ctx.fill_function(function_idx, func);
             }
+
+            for migration in &a.migration_event_bodies {
+                let function_idx = ctx
+                    .migration_event_function_of
+                    .iter()
+                    .find(|(actor_name, from, to, event_name, _)| {
+                        actor_name == &a.name
+                            && *from == migration.from_version
+                            && *to == migration.to_version
+                            && event_name == &migration.event
+                    })
+                    .map(|(_, _, _, _, idx)| *idx)
+                    .expect("event migration function slot reserved in pass 1");
+                let full_name = migration_event_function_name(
+                    &a.name,
+                    migration.from_version,
+                    migration.to_version,
+                    &migration.event,
+                );
+                let func = lower_migration_event_function(
+                    ctx,
+                    &full_name,
+                    &migration.params,
+                    &migration.body,
+                )?;
+                ctx.fill_function(function_idx, func);
+            }
         }
         hir::Decl::Module { decls, .. } => {
             for d in decls {
@@ -583,6 +673,8 @@ struct ModuleCtx {
     /// These slots are not inserted into func_map and therefore cannot be
     /// referenced by source-level function calls.
     migration_state_function_of: Vec<(String, u32, u32, usize)>,
+    /// (actor name, from, to, historical event name, private function index).
+    migration_event_function_of: Vec<(String, u32, u32, String, usize)>,
     /// (actor name, event name, private function-table index).
     apply_handler_function_of: Vec<(String, String, usize)>,
     /// Declared variant constructors: ctor name -> has_payload. Populated in
@@ -606,6 +698,7 @@ impl ModuleCtx {
             compensation_of: Vec::new(),
             parallel_branches_of: Vec::new(),
             migration_state_function_of: Vec::new(),
+            migration_event_function_of: Vec::new(),
             apply_handler_function_of: Vec::new(),
             ctor_map: FxHashMap::default(),
             next_lambda: 0,
@@ -791,6 +884,30 @@ fn lower_migration_state_function(
     body: &hir::Body,
 ) -> NuResult<mir::Function> {
     let mut lowerer = FnLowerer::new(ctx, full_name, None);
+    let self_id = lowerer.b.add_local("self", Type::unit());
+    lowerer.b.assign(self_id, mir::RValue::SelfRef);
+    lowerer.bind("self", self_id);
+    lowerer.lower_body_top(body)?;
+    Ok(lowerer.b.build())
+}
+
+/// Lower one RFC 0008 named historical-event arm.
+///
+/// Historical payload types are intentionally dynamic at this artifact
+/// boundary because the current schema need not retain the old event type.
+/// `self` remains available to match the accepted source semantics; the
+/// runtime event-migration executor will define/fence its state access.
+fn lower_migration_event_function(
+    ctx: &mut ModuleCtx,
+    full_name: &str,
+    params: &[(String, Type)],
+    body: &hir::Body,
+) -> NuResult<mir::Function> {
+    let mut lowerer = FnLowerer::new(ctx, full_name, None);
+    for (name, ty) in params {
+        let id = lowerer.b.add_param(name.clone(), ty.clone());
+        lowerer.bind(name, id);
+    }
     let self_id = lowerer.b.add_local("self", Type::unit());
     lowerer.b.assign(self_id, mir::RValue::SelfRef);
     lowerer.bind("self", self_id);

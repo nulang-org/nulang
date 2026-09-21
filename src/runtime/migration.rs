@@ -385,44 +385,107 @@ pub(crate) fn validated_manifest(
     }
 
     for contract in &manifest.contracts {
-        let Some(function_idx) = contract.state_function_index else {
-            continue;
-        };
-        let function_offset = module
-            .function_table
-            .get(function_idx)
-            .copied()
-            .ok_or_else(|| {
+        if let Some(function_idx) = contract.state_function_index {
+            let function_offset = module
+                .function_table
+                .get(function_idx)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "actor '{}' migration {} -> {} binds out-of-range state function index {}",
+                        meta.name, contract.from_version, contract.to_version, function_idx
+                    )
+                })?;
+            let expected_name = format!(
+                "{}.$migration_state_{}_{}",
+                meta.name, contract.from_version, contract.to_version
+            );
+            let named_offset = module.function_offset_by_name(&expected_name).ok_or_else(|| {
                 format!(
-                    "actor '{}' migration {} -> {} binds out-of-range function index {}",
-                    meta.name, contract.from_version, contract.to_version, function_idx
+                    "actor '{}' migration {} -> {} binds state function index {} but compiler-owned function '{}' is absent",
+                    meta.name,
+                    contract.from_version,
+                    contract.to_version,
+                    function_idx,
+                    expected_name
                 )
             })?;
-        let expected_name = format!(
-            "{}.$migration_state_{}_{}",
-            meta.name, contract.from_version, contract.to_version
-        );
-        let named_offset = module.function_offset_by_name(&expected_name).ok_or_else(|| {
-            format!(
-                "actor '{}' migration {} -> {} binds function index {} but compiler-owned function '{}' is absent",
+            if named_offset != function_offset {
+                return Err(format!(
+                    "actor '{}' migration {} -> {} binds state function index {} at offset {}, but '{}' resolves to offset {}",
+                    meta.name,
+                    contract.from_version,
+                    contract.to_version,
+                    function_idx,
+                    function_offset,
+                    expected_name,
+                    named_offset
+                ));
+            }
+        }
+
+        for event in &contract.event_transforms {
+            if event.catch_all {
+                if event.function_index.is_some() {
+                    return Err(format!(
+                        "actor '{}' migration {} -> {} catch-all event arm must not carry executable bytecode",
+                        meta.name, contract.from_version, contract.to_version
+                    ));
+                }
+                continue;
+            }
+
+            let Some(function_idx) = event.function_index else {
+                // Additive/legacy manifests may carry topology without an
+                // executable event binding. The runtime event-migration
+                // executor must require the binding before attempting use.
+                continue;
+            };
+            let function_offset = module
+                .function_table
+                .get(function_idx)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "actor '{}' migration {} -> {} event '{}' binds out-of-range function index {}",
+                        meta.name,
+                        contract.from_version,
+                        contract.to_version,
+                        event.event_name,
+                        function_idx
+                    )
+                })?;
+            let expected_name = format!(
+                "{}.$migration_event_{}_{}_{}",
                 meta.name,
                 contract.from_version,
                 contract.to_version,
-                function_idx,
-                expected_name
-            )
-        })?;
-        if named_offset != function_offset {
-            return Err(format!(
-                "actor '{}' migration {} -> {} binds function index {} at offset {}, but '{}' resolves to offset {}",
-                meta.name,
-                contract.from_version,
-                contract.to_version,
-                function_idx,
-                function_offset,
-                expected_name,
-                named_offset
-            ));
+                event.event_name
+            );
+            let named_offset = module.function_offset_by_name(&expected_name).ok_or_else(|| {
+                format!(
+                    "actor '{}' migration {} -> {} event '{}' binds function index {} but compiler-owned function '{}' is absent",
+                    meta.name,
+                    contract.from_version,
+                    contract.to_version,
+                    event.event_name,
+                    function_idx,
+                    expected_name
+                )
+            })?;
+            if named_offset != function_offset {
+                return Err(format!(
+                    "actor '{}' migration {} -> {} event '{}' binds function index {} at offset {}, but '{}' resolves to offset {}",
+                    meta.name,
+                    contract.from_version,
+                    contract.to_version,
+                    event.event_name,
+                    function_idx,
+                    function_offset,
+                    expected_name,
+                    named_offset
+                ));
+            }
         }
     }
 
