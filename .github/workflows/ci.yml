@@ -125,8 +125,12 @@ jobs:
       - name: Scaffold test package through public shortcut
         run: ./target/release/nulang new test-pkg
 
-      - name: Run nula test
-        run: cd test-pkg && ../target/release/nulang nula test
+      - name: Exercise public package inner-loop shortcuts
+        run: |
+          cd test-pkg
+          ../target/release/nulang build
+          ../target/release/nulang test
+          ../target/release/nulang run
 
       - name: Smoke test public new -> dev path
         run: |
