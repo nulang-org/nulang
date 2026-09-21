@@ -159,6 +159,7 @@ python3 verify_report.py                          # gate: validates codebase_ana
 
 ## Testing & QA
 
+- **Backend panic contract**: bytecode `OpCode::Panic` is the reference semantics. Native/AOT ordinary functions lower MIR `Panic` through `nulang_panic` → `AOT_PENDING_ERROR` and immediately return so post-panic statements never execute; native actor behaviors containing `Panic` are compile-time rejected until the AOT behavior adapter can propagate faults into supervision. Plain WASM and WasmFX must reject `Panic` before their defensive nil stubs become observable. Never silently reinterpret a panic as a value.
 - **Framework**: standard Rust `#[test]` + `#[cfg(test)]`. No proptest/quickcheck/criterion. No `#[ignore]`/`#[should_panic]`/async tests.
 - **Organization**: two styles — (a) inline `mod tests` at file foot (`lexer.rs`, `parser.rs`, `typechecker.rs`, `effect_checker.rs`, `value_layout.rs`, `vm.rs`, most `runtime/*.rs`, `jit/*`, `python/*`, `ffi/*`, `lsp/mod.rs`, plus every source file in `crates/nulang-ai/src/`); (b) dedicated test files (`src/integration_tests/mod.rs`, `src/stress_tests.rs`, `src/runtime/tests.rs`, `src/jit/tests.rs`).
 - **Naming**: `test_<subject>` (unit/integration), `stress_<scenario>` (chaos).
