@@ -142,7 +142,7 @@ impl LibsqlLogicalActorStore {
                     grain_key TEXT NOT NULL,
                     logical_id TEXT NOT NULL,
                     node_id TEXT,
-                    activation_handle INTEGER,
+                    activation_handle BLOB,
                     epoch TEXT NOT NULL,
                     PRIMARY KEY (grain_type, grain_key)
                 )",
@@ -195,7 +195,7 @@ impl LibsqlLogicalActorStore {
         let logical_id = grain_id.logical_id().to_string();
         let node = encode_u64(node_id.0);
         let epoch_text = encode_u64(epoch.get());
-        let handle = activation_handle.get() as i64;
+        let handle = activation_handle.get().to_be_bytes().to_vec();
 
         let conn = self.conn();
         let changed = self.rt.block_on(async {
@@ -208,12 +208,15 @@ impl LibsqlLogicalActorStore {
                     node_id = excluded.node_id,
                     activation_handle = excluded.activation_handle,
                     epoch = excluded.epoch
-                 WHERE excluded.epoch > logical_actor_ownership.epoch
-                    OR (
-                        excluded.epoch = logical_actor_ownership.epoch
-                        AND logical_actor_ownership.node_id = excluded.node_id
-                        AND logical_actor_ownership.activation_handle = excluded.activation_handle
-                    )",
+                 WHERE logical_actor_ownership.logical_id = excluded.logical_id
+                   AND (
+                        excluded.epoch > logical_actor_ownership.epoch
+                        OR (
+                            excluded.epoch = logical_actor_ownership.epoch
+                            AND logical_actor_ownership.node_id = excluded.node_id
+                            AND logical_actor_ownership.activation_handle = excluded.activation_handle
+                        )
+                   )",
                 libsql::params![
                     grain_id.grain_type.as_str(),
                     grain_id.key.as_str(),
@@ -301,7 +304,8 @@ impl LibsqlLogicalActorStore {
                     node_id = NULL,
                     activation_handle = NULL,
                     epoch = excluded.epoch
-                 WHERE excluded.epoch >= logical_actor_ownership.epoch",
+                 WHERE logical_actor_ownership.logical_id = excluded.logical_id
+                   AND excluded.epoch >= logical_actor_ownership.epoch",
                 libsql::params![
                     grain_id.grain_type.as_str(),
                     grain_id.key.as_str(),
@@ -395,7 +399,7 @@ impl LibsqlLogicalActorStore {
         }
 
         let node_text: Option<String> = row.get(1).map_err(storage_error)?;
-        let handle_raw: Option<i64> = row.get(2).map_err(storage_error)?;
+        let handle_raw: Option<Vec<u8>> = row.get(2).map_err(storage_error)?;
         let epoch_text: String = row.get(3).map_err(storage_error)?;
         let epoch_raw = decode_u64(&epoch_text).ok_or_else(|| {
             LibsqlLogicalActorError::CorruptOwnership {
@@ -420,8 +424,24 @@ impl LibsqlLogicalActorStore {
             None => None,
         };
         let activation_handle = match handle_raw {
-            Some(value) if value > 0 => ActivationHandle::new(value as u64),
-            Some(_) => None,
+            Some(value) => {
+                let bytes: [u8; 8] = value.as_slice().try_into().map_err(|_| {
+                    LibsqlLogicalActorError::CorruptOwnership {
+                        grain_id: grain_id.clone(),
+                        detail: format!(
+                            "invalid activation-handle encoding length {}",
+                            value.len()
+                        ),
+                    }
+                })?;
+                let raw = u64::from_be_bytes(bytes);
+                Some(ActivationHandle::new(raw).ok_or_else(|| {
+                    LibsqlLogicalActorError::CorruptOwnership {
+                        grain_id: grain_id.clone(),
+                        detail: "activation handle must be non-zero".to_string(),
+                    }
+                })?)
+            }
             None => None,
         };
         if node_id.is_some() != activation_handle.is_some() {
@@ -804,6 +824,26 @@ mod tests {
         let current = LogicalActorCommitStamp::new(grain, NodeId(2), epoch(5));
         store
             .save_logical_snapshot(&current, snapshot(2, 1, 2))
+            .unwrap();
+    }
+
+    #[test]
+    fn full_u64_activation_handle_roundtrips_without_narrowing() {
+        let mut store = LibsqlLogicalActorStore::in_memory().unwrap();
+        let grain = GrainId::new("Account", "u64-handle");
+        let max_handle = ActivationHandle::new(u64::MAX).unwrap();
+
+        store
+            .grant_ownership(grain.clone(), NodeId(1), max_handle, epoch(1))
+            .unwrap();
+
+        let record = store.ownership_record(&grain).unwrap().unwrap();
+        assert_eq!(record.activation_handle, max_handle);
+
+        // Exact replay at the same epoch remains idempotent even at the top
+        // of the u64 activation-handle range.
+        store
+            .grant_ownership(grain, NodeId(1), max_handle, epoch(1))
             .unwrap();
     }
 
