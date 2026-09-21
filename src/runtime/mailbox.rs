@@ -402,7 +402,7 @@ mod tests {
         for i in 0..1000 {
             mb.push(Message {
                 behavior_id: 0,
-                payload: Arc::new(vec![Value::int(i)]),
+                payload: Arc::from(vec![Value::int(i)]),
                 sender: i as u64,
                 priority: MessagePriority::System,
                 trace_id: None,
@@ -500,7 +500,7 @@ mod transactional_receive_tests {
     fn msg(behavior_id: u16, sender: u64, priority: MessagePriority) -> Message {
         Message {
             behavior_id,
-            payload: Arc::new(vec![Value::int(sender as i64)]),
+            payload: Arc::from(vec![Value::int(sender as i64)]),
             sender,
             priority,
             trace_id: None,
