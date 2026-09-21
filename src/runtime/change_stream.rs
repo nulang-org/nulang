@@ -243,6 +243,29 @@ mod tests {
     }
 
     #[test]
+    fn durable_change_json_uses_stable_wire_names() {
+        let change = DurableChange {
+            actor_id: 12,
+            cursor: DurableChangeCursor {
+                sequence: 4,
+                lane: DurableChangeLane::Event,
+                ordinal: 0,
+            },
+            record: DurableChangeRecord::Event(EventEntry {
+                sequence: 4,
+                field_name: "count".into(),
+                event_name: "Incremented".into(),
+                args: vec![],
+                value: PersistedValue::Int(1),
+            }),
+        };
+
+        let json = serde_json::to_value(change).unwrap();
+        assert_eq!(json["cursor"]["lane"], "event");
+        assert_eq!(json["record"]["kind"], "event");
+    }
+
+    #[test]
     fn stream_is_actor_scoped() {
         let mut store = MemoryStore::new();
         for actor_id in [1, 2] {
