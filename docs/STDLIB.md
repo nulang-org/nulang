@@ -328,6 +328,35 @@ let n = size(c)                      // 2
 
 ---
 
+## Module: json
+
+JSON values are represented by `JsonValue`:
+`JsonNull | JsonBool | JsonNumber | JsonString | JsonArray | JsonObject`.
+
+For new code, use the strict parser:
+
+```nula
+import stdlib::json
+
+match parse_strict("{\"answer\": 42}") {
+    Ok(value) => perform IO.print(stringify(value)),
+    Error(err) => perform IO.print("invalid JSON at " + perform Int.to_string(err.offset)),
+}
+```
+
+| Function | Description |
+|---|---|
+| `parse_strict(json) -> Result[JsonValue, JsonParseError]` | Validates a complete JSON document and rejects malformed syntax, truncation, trailing commas/content, invalid escapes, and malformed numbers. |
+| `parse(json) -> JsonValue` | Legacy lenient parser retained during migration. |
+| `stringify(value) -> String` | Serialize a JsonValue. |
+| `get_string/get_number/get_bool` | Typed object-field access with caller-provided defaults. |
+
+`parse_strict` currently makes a validation pass and then delegates decoding
+to the existing parser. This temporary two-pass implementation preserves
+source compatibility while providing correct failure semantics.
+
+---
+
 ## Module: string
 
 String operations built on the `String` builtin effect primitives
