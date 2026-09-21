@@ -335,21 +335,11 @@ impl JitSession {
         let meta = typed_compiler::infer_reg_types(module, pc);
         let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
         let promoted = unsafe {
-            self.promote_region_simd(
-                module_idx,
-                pc,
-                region_len,
-                &module.instructions,
-                meta_ref,
-            )
+            self.promote_region_simd(module_idx, pc, region_len, &module.instructions, meta_ref)
         }
         .is_some();
 
-        self.set_tier2_state(
-            module_idx,
-            pc,
-            if promoted { TIER2_PROMOTED } else { 0 },
-        );
+        self.set_tier2_state(module_idx, pc, if promoted { TIER2_PROMOTED } else { 0 });
     }
 
     /// Reset tier-2 counters (used by tests).
