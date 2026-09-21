@@ -282,12 +282,13 @@ pub(crate) fn bytecode_offsets_for_role(
 }
 
 /// Shared body of both VM-callback `spawn_actor` implementations.
-pub(crate) fn spawn_from_module(
+fn try_spawn_from_module(
     rt: &mut Runtime,
     module: &crate::bytecode::CodeModule,
     behavior_idx: usize,
     init: Vec<(String, Value)>,
-) -> Value {
+    initial_authority: Option<&AuthorityManifest>,
+) -> std::io::Result<Value> {
     rt.register_module_grains(module);
     let meta = module
         .actor_metadata
@@ -302,7 +303,7 @@ pub(crate) fn spawn_from_module(
                     %error,
                     "refusing to spawn actor with conflicting role metadata"
                 );
-                return Value::nil();
+                return Ok(Value::nil());
             }
         },
         None => ActorRole::Plain,
@@ -315,7 +316,7 @@ pub(crate) fn spawn_from_module(
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
         let defaults = meta.state_defaults.clone();
-        spawn_actor_with_models(
+        try_spawn_actor_with_models(
             rt,
             Box::new(move || {
                 let mut fields: Vec<(String, Value)> = defaults
@@ -332,9 +333,17 @@ pub(crate) fn spawn_from_module(
             } else {
                 None
             },
-        )
+            initial_authority,
+        )?
     } else {
-        spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
+        try_spawn_actor_with_models(
+            rt,
+            Box::new(move || init),
+            HashMap::new(),
+            false,
+            None,
+            initial_authority,
+        )?
     };
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
@@ -426,7 +435,27 @@ pub(crate) fn spawn_from_module(
         layout_workflow_behavior_table(rt, id);
     }
     register_recovery_module(rt, id, module.clone(), offsets, compensation_offsets);
-    Value::actor_ref(id)
+    Ok(Value::actor_ref(id))
+}
+
+/// Shared body of VM/runtime spawns without explicit external authority.
+pub(crate) fn spawn_from_module(
+    rt: &mut Runtime,
+    module: &crate::bytecode::CodeModule,
+    behavior_idx: usize,
+    init: Vec<(String, Value)>,
+) -> Value {
+    match try_spawn_from_module(rt, module, behavior_idx, init, None) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                behavior_idx,
+                %error,
+                "refusing actor spawn whose initial durable state could not be committed"
+            );
+            Value::nil()
+        }
+    }
 }
 
 /// Spawn from a bytecode module while enforcing one validated external-authority
@@ -457,13 +486,12 @@ pub(crate) fn spawn_from_module_with_authority(
         }
     }
 
-    let value = spawn_from_module(rt, module, behavior_idx, init);
-    if let Some(child_id) = value.as_actor_id() {
-        if let Some(child) = rt.actors.get_mut(&child_id) {
-            child.install_authority_manifest(requested);
+    try_spawn_from_module(rt, module, behavior_idx, init, Some(requested)).map_err(|error| {
+        RuntimeAuthorityError::Persistence {
+            operation: "initial workflow commit".to_string(),
+            message: error.to_string(),
         }
-    }
-    Ok(value)
+    })
 }
 
 /// Populate a workflow actor's behavior table with placeholder entries for
