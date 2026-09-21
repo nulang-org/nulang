@@ -25,7 +25,7 @@
 //!                            | wasm* (IO.print/read only; no user-defined effect
 //!                            handlers, no actor mailbox — requires wasm-backend)
 //!   --out <file>             Output file (WASM backends / --emit-nbc)
-//!   --emit-nbc               Compile <FILE> to a .nbc artifact; don't run
+//!   --emit-nbc               Compile <FILE> to .nbc + identity sidecars; don't run
 //!   <FILE>.nbc               Run a pre-compiled .nbc artifact directly
 //!   --verify <src>           Verify .nbc source hash against <src>
 //!   nula <cmd>               Package manager (new, init, build, build-wasm, test, run, add, remove, publish, deploy, list, clean)
@@ -1111,7 +1111,7 @@ fn print_help() {
     if cfg!(feature = "wasm-backend") {
         println!("  --out <file>     Output file for WASM backends (default: out.wasm)");
     }
-    println!("  --out <file>     Output path for --emit-nbc (default: <FILE> with .nbc extension)");
+    println!("  --out <file>     Output path for --emit-nbc (also writes .identity.json + .runtime.json sidecars)");
     println!("  <FILE>.nbc       Run a pre-compiled .nbc artifact directly (no compiler invoked)");
     println!(
         "  --verify <src>   When running a .nbc artifact, verify its source hash against <src>"
