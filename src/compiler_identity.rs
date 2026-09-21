@@ -127,6 +127,18 @@ mod tests {
     }
 
     #[test]
+    fn typed_bytecode_carries_semantic_identity_but_raw_codegen_does_not() {
+        let (hir, mut typed_mir) = empty_program();
+        let mut raw_mir = typed_mir.clone();
+
+        let typed = compile_typed_bytecode(&hir, &mut typed_mir, [], "typed").unwrap();
+        let raw = crate::mir_codegen::compile_mir(&mut raw_mir, "raw").unwrap();
+
+        assert!(typed.semantic_id.is_some());
+        assert!(raw.semantic_id.is_none());
+    }
+
+    #[test]
     fn backend_configuration_changes_artifact_but_not_semantic_identity() {
         let (hir, mir) = empty_program();
         let native = artifact_identity_for_typed_program(
