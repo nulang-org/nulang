@@ -7,6 +7,17 @@
 
 use crate::artifact_identity::ArtifactIdentityManifest;
 use crate::content_identity::{SemanticId, SourceId};
+
+/// Canonical code-generation profile for portable NBC v1 bytecode.
+///
+/// These strings are artifact-identity inputs, not language semantics. A
+/// future bytecode format/profile must use a new ABI/profile value rather than
+/// mutating the meaning of this one.
+pub const BYTECODE_ARTIFACT_TARGET: &str = "portable-nulang-vm";
+pub const BYTECODE_ARTIFACT_ABI: &str = "nbc-v1";
+pub const BYTECODE_ARTIFACT_BACKEND: &str = "bytecode";
+pub const BYTECODE_COMPILER_VERSION: &str =
+    concat!("nulang-rust-", env!("CARGO_PKG_VERSION"));
 use crate::hir;
 use crate::mir;
 use crate::semantic_identity::SemanticIdentityError;
@@ -75,7 +86,17 @@ where
             }
         })?;
     let mut module = crate::mir_codegen::compile_mir(mir, name)?;
+    let artifact_identity = ArtifactIdentityManifest::new(
+        None,
+        semantic_id,
+        BYTECODE_COMPILER_VERSION,
+        BYTECODE_ARTIFACT_TARGET,
+        BYTECODE_ARTIFACT_ABI,
+        BYTECODE_ARTIFACT_BACKEND,
+        std::iter::empty::<&str>(),
+    );
     module.semantic_id = Some(semantic_id);
+    module.artifact_identity = Some(artifact_identity);
     Ok(module)
 }
 
@@ -135,7 +156,9 @@ mod tests {
         let raw = crate::mir_codegen::compile_mir(&mut raw_mir, "raw").unwrap();
 
         assert!(typed.semantic_id.is_some());
+        assert!(typed.artifact_id().is_some());
         assert!(raw.semantic_id.is_none());
+        assert!(raw.artifact_id().is_none());
     }
 
     #[test]
