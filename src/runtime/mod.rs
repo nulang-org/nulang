@@ -1437,7 +1437,9 @@ impl Runtime {
                     sender,
                     trace_id,
                 } => {
-                    let Some(behavior_id) = self.behavior_id_for(target_id, &behavior_name) else {
+                    let Some(behavior_id) =
+                        self.behavior_id_for_delivery(target_id, &behavior_name)
+                    else {
                         warn!(
                             "nulang-shard: rejecting named message to actor {}: unknown behavior '{}'",
                             target_id, behavior_name
@@ -1499,7 +1501,9 @@ impl Runtime {
                     // Resolve the behavior before hydrating transferred objects.
                     // Invalid named delivery must not allocate orphaned object-store
                     // entries on the destination shard.
-                    let Some(behavior_id) = self.behavior_id_for(target_id, &behavior_name) else {
+                    let Some(behavior_id) =
+                        self.behavior_id_for_delivery(target_id, &behavior_name)
+                    else {
                         warn!(
                             "nulang-shard: rejecting named object message to actor {}: unknown behavior '{}'",
                             target_id, behavior_name
@@ -1722,7 +1726,7 @@ impl Runtime {
             }
         }
 
-        let Some(behavior_id) = self.behavior_id_for(target_id, behavior) else {
+        let Some(behavior_id) = self.behavior_id_for_delivery(target_id, behavior) else {
             warn!(
                 "nulang-runtime: rejecting message to actor {}: unknown behavior '{}'",
                 target_id, behavior
@@ -2097,6 +2101,40 @@ impl Runtime {
             .iter()
             .position(|b| matches(&b.name))
             .map(|idx| idx as u16)
+    }
+
+    /// Resolve a public name-based delivery without reintroducing the old
+    /// "unknown name executes behavior 0" bug.
+    ///
+    /// Low-level actors created directly through `Runtime::spawn_actor` have
+    /// no behavior metadata at all. Their mailbox is intentionally usable as
+    /// an untyped runtime primitive, and behavior id 0 is inert because there
+    /// is no native or bytecode handler at that index. Preserve message
+    /// admission for those anonymous actors so scheduler/backpressure/runtime
+    /// tests and embedders can use the raw mailbox API.
+    ///
+    /// As soon as an actor declares any named native or bytecode behavior,
+    /// resolution is strict: an unknown name returns `None` and can never
+    /// alias a real behavior id 0 handler.
+    fn behavior_id_for_delivery(&self, target_id: u64, behavior: &str) -> Option<u16> {
+        if let Some(behavior_id) = self.behavior_id_for(target_id, behavior) {
+            return Some(behavior_id);
+        }
+
+        let actor = self.actors.get(&target_id)?;
+        let has_named_native = actor
+            .behavior_table
+            .iter()
+            .any(|entry| !entry.name.is_empty());
+        let has_named_bytecode = actor.bytecode_module.as_ref().is_some_and(|module| {
+            module.behaviors.iter().any(|entry| !entry.name.is_empty())
+        });
+
+        if has_named_native || has_named_bytecode {
+            None
+        } else {
+            Some(0)
+        }
     }
 
     /// Resolve a behavior name to a numeric id using the registered grain
