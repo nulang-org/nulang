@@ -1304,24 +1304,29 @@ pub fn process_network_packets(
                     match crate::bytecode::CodeModule::from_nbc(&bytes) {
                         Ok(artifact) => {
                             runtime.behavior_cache.insert(content_hash, artifact.module);
-                            // Retry any messages that were waiting for this bytecode
                             let pending = runtime.pending_fetched_messages.remove(&content_hash);
                             if let Some(messages) = pending {
-                                for (
-                                    target_actor,
-                                    behavior_name,
-                                    mut msg,
-                                    string_table,
-                                    object_table,
-                                ) in messages
-                                {
-                                    // Hot-reload the newly cached module into the target actor
+                                for mut pending in messages {
+                                    let admission = pending.admission;
+                                    let mut reject = |runtime: &mut Runtime,
+                                                      reason: &str| {
+                                        notify_delivery_failed(runtime, pending.msg.sender, reason);
+                                        if let Some((node, delivery_id)) = admission {
+                                            send_actor_admission(
+                                                transport,
+                                                cluster,
+                                                node,
+                                                Some(delivery_id),
+                                                ActorAdmissionStatus::Rejected,
+                                            );
+                                        }
+                                    };
+
                                     let cached = match runtime.behavior_cache.get(&content_hash) {
-                                        Some(c) => c.clone(),
+                                        Some(cached) => cached.clone(),
                                         None => {
-                                            notify_delivery_failed(
+                                            reject(
                                                 runtime,
-                                                msg.sender,
                                                 "bytecode fetch succeeded but cache miss on retry",
                                             );
                                             continue;
@@ -1329,75 +1334,95 @@ pub fn process_network_packets(
                                     };
                                     hot_reload_behavior(
                                         runtime,
-                                        target_actor,
+                                        pending.target_actor,
                                         &cached,
-                                        &behavior_name,
+                                        &pending.behavior_name,
                                     );
-                                    // Resolve behavior id against the updated module.
-                                    // A successful fetch that still lacks the requested
-                                    // name is a failed delivery, never permission to run
-                                    // behavior 0.
-                                    let Some(behavior_id) =
-                                        runtime.behavior_id_for(target_actor, &behavior_name)
+                                    let Some(behavior_id) = runtime
+                                        .behavior_id_for(
+                                            pending.target_actor,
+                                            &pending.behavior_name,
+                                        )
                                     else {
-                                        notify_delivery_failed(
-                                            runtime,
-                                            msg.sender,
-                                            "unknown behavior after fetch",
-                                        );
+                                        reject(runtime, "unknown behavior after fetch");
                                         continue;
                                     };
-                                    msg.behavior_id = behavior_id;
-                                    // Verify the hash now matches
+                                    pending.msg.behavior_id = behavior_id;
                                     if !verify_behavior_hash(
                                         runtime,
-                                        target_actor,
-                                        msg.behavior_id,
+                                        pending.target_actor,
+                                        pending.msg.behavior_id,
                                         &content_hash,
                                     ) {
-                                        notify_delivery_failed(
+                                        reject(
                                             runtime,
-                                            msg.sender,
                                             "behavior content hash still mismatched after fetch",
                                         );
                                         continue;
                                     }
-                                    // Intern string and object payloads, then deliver
-                                    let mut payload_vec = (*msg.payload).clone();
+
+                                    let mut payload_vec = (*pending.msg.payload).clone();
                                     if !intern_wire_strings(
                                         runtime,
-                                        target_actor,
+                                        pending.target_actor,
                                         &mut payload_vec,
-                                        &string_table,
+                                        &pending.string_table,
                                     ) {
-                                        notify_delivery_failed(
-                                            runtime,
-                                            msg.sender,
-                                            "string intern failed on retry",
-                                        );
+                                        reject(runtime, "string intern failed on retry");
                                         continue;
                                     }
                                     if !intern_wire_objects(
                                         runtime,
                                         &mut payload_vec,
-                                        &object_table,
+                                        &pending.object_table,
                                     ) {
-                                        notify_delivery_failed(
-                                            runtime,
-                                            msg.sender,
-                                            "object intern failed on retry",
-                                        );
+                                        reject(runtime, "object intern failed on retry");
                                         continue;
                                     }
-                                    msg.payload = Arc::new(payload_vec);
-                                    if let Some(actor) = runtime.actors.get_mut(&target_actor) {
-                                        let _ = actor.mailbox.push(msg);
-                                        runtime.scheduler.enqueue(target_actor);
+                                    pending.msg.payload = Arc::new(payload_vec);
+
+                                    let status = if runtime
+                                        .actors
+                                        .contains_key(&pending.target_actor)
+                                    {
+                                        let pushed = {
+                                            let actor = runtime
+                                                .actors
+                                                .get_mut(&pending.target_actor)
+                                                .unwrap();
+                                            actor.mailbox.push(pending.msg)
+                                        };
+                                        match pushed {
+                                            Ok(()) => {
+                                                runtime
+                                                    .scheduler
+                                                    .enqueue(pending.target_actor);
+                                                ActorAdmissionStatus::Accepted
+                                            }
+                                            Err(rejected) => {
+                                                runtime.route_to_dlq(
+                                                    &rejected,
+                                                    "mailbox full",
+                                                );
+                                                ActorAdmissionStatus::Backpressured
+                                            }
+                                        }
                                     } else {
                                         notify_delivery_failed(
                                             runtime,
-                                            msg.sender,
+                                            pending.msg.sender,
                                             "target actor not found on retry",
+                                        );
+                                        ActorAdmissionStatus::Rejected
+                                    };
+
+                                    if let Some((node, delivery_id)) = admission {
+                                        send_actor_admission(
+                                            transport,
+                                            cluster,
+                                            node,
+                                            Some(delivery_id),
+                                            status,
                                         );
                                     }
                                 }
@@ -1408,25 +1433,45 @@ pub fn process_network_packets(
                                 "nulang-net: failed to deserialize fetched bytecode for '{}': {}",
                                 behavior_name, e
                             );
-                            // Drop pending messages for this hash on deserialize failure
                             let pending = runtime.pending_fetched_messages.remove(&content_hash);
                             if let Some(messages) = pending {
-                                for (_, _, msg, _, _) in messages {
+                                for pending in messages {
                                     notify_delivery_failed(
                                         runtime,
-                                        msg.sender,
+                                        pending.msg.sender,
                                         "bytecode fetch failed: deserialization error",
                                     );
+                                    if let Some((node, delivery_id)) = pending.admission {
+                                        send_actor_admission(
+                                            transport,
+                                            cluster,
+                                            node,
+                                            Some(delivery_id),
+                                            ActorAdmissionStatus::Rejected,
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                 } else {
-                    // Sender didn't have the requested bytecode; drain and notify
                     let pending = runtime.pending_fetched_messages.remove(&content_hash);
                     if let Some(messages) = pending {
-                        for (_, _, msg, _, _) in messages {
-                            notify_delivery_failed(runtime, msg.sender, "bytecode fetch failed: sender does not have the requested behavior");
+                        for pending in messages {
+                            notify_delivery_failed(
+                                runtime,
+                                pending.msg.sender,
+                                "bytecode fetch failed: sender does not have the requested behavior",
+                            );
+                            if let Some((node, delivery_id)) = pending.admission {
+                                send_actor_admission(
+                                    transport,
+                                    cluster,
+                                    node,
+                                    Some(delivery_id),
+                                    ActorAdmissionStatus::Rejected,
+                                );
+                            }
                         }
                     }
                 }
