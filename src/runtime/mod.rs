@@ -117,7 +117,7 @@ pub use object_store::*;
 pub use orca_cycle::*;
 pub use persistence::*;
 pub use process_groups::*;
-pub use reactive::{StateReadSet, StateVersion};
+pub use reactive::{ActorTurnVersion, StateReadSet, StateVersion};
 pub use registry::*;
 pub use resp_cache::*;
 pub use scheduler::*;
@@ -687,26 +687,51 @@ impl Runtime {
             return;
         }
         if let Some(actor) = self.actors.get(&actor_id) {
+            let incarnation = actor.state_incarnation();
             self.reactive_reads.record(
                 actor_id,
                 field,
                 StateVersion {
-                    incarnation: actor.state_incarnation(),
+                    incarnation,
                     revision: actor.state_revision(field),
                 },
             );
+            // Pointer-backed state may contain mutable heap objects whose
+            // contents can change in-place without a StateSet. Depend on the
+            // actor turn as a conservative invalidation fence.
+            if actor
+                .get_state_field(field)
+                .and_then(|value| value.as_ptr())
+                .is_some()
+            {
+                self.reactive_reads.record_pointer_turn(
+                    actor_id,
+                    ActorTurnVersion {
+                        incarnation,
+                        turn_revision: actor.reactive_turn_revision(),
+                    },
+                );
+            }
         }
     }
 
     /// Check whether every field observed by a prior query still has the same
     /// revision. Missing actors are stale.
     pub fn state_read_set_is_current(&self, reads: &StateReadSet) -> bool {
-        reads.is_current_with(|actor_id, field| {
-            self.actors.get(&actor_id).map(|actor| StateVersion {
-                incarnation: actor.state_incarnation(),
-                revision: actor.state_revision(field),
-            })
-        })
+        reads.is_current_with(
+            |actor_id, field| {
+                self.actors.get(&actor_id).map(|actor| StateVersion {
+                    incarnation: actor.state_incarnation(),
+                    revision: actor.state_revision(field),
+                })
+            },
+            |actor_id| {
+                self.actors.get(&actor_id).map(|actor| ActorTurnVersion {
+                    incarnation: actor.state_incarnation(),
+                    turn_revision: actor.reactive_turn_revision(),
+                })
+            },
+        )
     }
 
     /// Compute the BLAKE3 hash of `data` using the configured [`CryptoProvider`].
@@ -3661,8 +3686,12 @@ impl Runtime {
             }
         };
         let should_requeue = if let Some(msg) = msg_opt {
-            // Message delivery counts as activity for dehydration.
+            // A real actor message starts one reactive turn. Pointer-backed
+            // query dependencies use this coarser token so any in-place heap
+            // mutation during the turn invalidates only after the turn began,
+            // rather than on every intermediate field write.
             if let Some(actor) = self.actors.get_mut(&actor_id) {
+                actor.begin_reactive_turn();
                 actor.idle_ms = 0;
             }
             let behavior_idx = msg.behavior_id as usize;
