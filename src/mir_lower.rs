@@ -131,6 +131,33 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                     _ => None,
                 })
                 .collect();
+
+            // RFC 0008: compile a stable declarative migration topology into
+            // the actor artifact. Executable migration bodies remain a
+            // separate compiler/runtime slice; recovery must not infer code
+            // from this metadata alone.
+            let migration_manifest =
+                crate::migration_manifest::MigrationManifest::from_decls(
+                    a.version,
+                    &a.migrations,
+                )
+                .map_err(|error| {
+                    NuError::type_error(
+                        format!(
+                            "invalid RFC 0008 migration chain for entity '{}': {error}",
+                            a.name
+                        ),
+                        a.span,
+                    )
+                })?;
+            let migrations = migration_manifest.to_json().map_err(|error| NuError::VMError {
+                msg: format!(
+                    "failed to encode RFC 0008 migration manifest for entity '{}': {error}",
+                    a.name
+                ),
+                span: a.span,
+            })?;
+
             ctx.actor_metas.push(crate::bytecode::ActorMeta {
                 name: a.name.clone(),
                 persistent: a.persistent,
@@ -149,7 +176,7 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 retry_config: a.retry_config.clone(),
                 type_hash: None,
                 version: a.version,
-                migrations: String::new(),
+                migrations,
             });
         }
         hir::Decl::Workflow { name, .. } => {
