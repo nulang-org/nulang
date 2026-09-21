@@ -18,10 +18,15 @@
 //!   "ok": false,
 //!   "diagnostics": [
 //!     {
-//!       "code": "E0207",
+//!       "code": "E0201",
 //!       "severity": "error",
-//!       "message": "...",
-//!       "span": { "file": "...", "line": 1, "col": 5, "end_line": 1, "end_col": 12 },
+//!       "kind": "type",
+//!       "message": "Type mismatch",
+//!       "data": { "expected_type": "User", "found_type": "String" },
+//!       "span": {
+//!         "file": "...", "line": 1, "col": 5, "end_line": 1, "end_col": 12,
+//!         "start_byte": 4, "end_byte": 11
+//!       },
 //!       "notes": ["..."],
 //!       "suggestion": { "message": "...", "replacement": null }
 //!     }
