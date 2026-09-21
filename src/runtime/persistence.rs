@@ -713,7 +713,7 @@ impl JsonFileStore {
 
     fn repair_workflow_commit_tail(&self, actor_id: u64) -> io::Result<()> {
         let path = self.workflow_commits_path(actor_id);
-        let mut file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
+        let file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
