@@ -3768,3 +3768,103 @@ mod postgres_store_tests {
         store.clear(actor_id).unwrap();
     }
 }
+
+
+#[cfg(test)]
+mod workflow_atomic_commit_tests {
+    use super::*;
+
+    fn snapshot(actor_id: u64, sequence: u64) -> ActorSnapshot {
+        let mut state = HashMap::new();
+        state.insert("step_index".to_string(), PersistedValue::Int(2));
+        ActorSnapshot {
+            actor_id,
+            sequence,
+            state,
+            waiting_signal: None,
+            crdt_snapshot: None,
+            crdt_field_map: None,
+            authority_tokens: BTreeSet::new(),
+        }
+    }
+
+    fn completed(sequence: u64) -> WorkflowEvent {
+        WorkflowEvent::StepCompleted {
+            sequence,
+            step_name: "settle".to_string(),
+        }
+    }
+
+    #[test]
+    fn memory_workflow_commit_publishes_event_and_snapshot_at_one_sequence() {
+        let mut store = MemoryStore::new();
+        store
+            .commit_workflow_event_and_snapshot(41, completed(7), snapshot(41, 7))
+            .unwrap();
+
+        let events = store.read_workflow_events(41);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence(), 7);
+        assert_eq!(store.load_snapshot(41).unwrap().sequence, 7);
+        assert_eq!(store.latest_sequence(41), 7);
+    }
+
+    #[test]
+    fn workflow_commit_rejects_mismatched_sequence_without_partial_memory_write() {
+        let mut store = MemoryStore::new();
+        let error = store
+            .commit_workflow_event_and_snapshot(42, completed(8), snapshot(42, 9))
+            .expect_err("mismatched workflow commit must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(store.read_workflow_events(42).is_empty());
+        assert!(store.load_snapshot(42).is_none());
+    }
+
+    #[test]
+    fn json_workflow_commit_recovers_event_and_snapshot_from_one_commit_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_workflow_commit_test_{}_{}",
+            std::process::id(),
+            43
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        {
+            let mut store = JsonFileStore::new(&dir).unwrap();
+            store
+                .commit_workflow_event_and_snapshot(43, completed(11), snapshot(43, 11))
+                .unwrap();
+            assert!(store.workflow_commits_path(43).exists());
+            assert!(!store.workflow_events_path(43).exists());
+        }
+
+        let reopened = JsonFileStore::new(&dir).unwrap();
+        let events = reopened.read_workflow_events(43);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence(), 11);
+        let recovered = reopened.load_snapshot(43).unwrap();
+        assert_eq!(recovered.sequence, 11);
+        assert_eq!(
+            recovered.state.get("step_index"),
+            Some(&PersistedValue::Int(2))
+        );
+        assert_eq!(reopened.latest_sequence(43), 11);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn libsql_workflow_commit_is_visible_as_one_sequence() {
+        let mut store = LibsqlStore::in_memory().unwrap();
+        store
+            .commit_workflow_event_and_snapshot(44, completed(13), snapshot(44, 13))
+            .unwrap();
+
+        let events = store.read_workflow_events(44);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence(), 13);
+        assert_eq!(store.load_snapshot(44).unwrap().sequence, 13);
+        assert_eq!(store.latest_sequence(44), 13);
+    }
+}
