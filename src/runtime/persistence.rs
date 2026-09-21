@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::content_identity::ArtifactId;
 use crate::vm::Value;
 
 use tracing::warn;
@@ -124,6 +125,88 @@ impl PersistedValue {
     }
 }
 
+/// Immutable retained executable keyed by the compiler's strong ArtifactId.
+///
+/// `nbc_digest` detects storage corruption of frozen NBC-v1 bytes. It is
+/// transport/storage integrity metadata, not a parallel executable identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedArtifact {
+    pub artifact_id: ArtifactId,
+    pub manifest_json: Vec<u8>,
+    pub nbc_bytes: Vec<u8>,
+    pub nbc_digest: [u8; 32],
+}
+
+impl RetainedArtifact {
+    pub fn from_proven_module(module: &crate::bytecode::CodeModule) -> io::Result<Self> {
+        let manifest = module.artifact_identity.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot retain bytecode without compiler-proven artifact identity",
+            )
+        })?;
+        if module.semantic_id != Some(manifest.semantic_id()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CodeModule semantic identity does not match artifact manifest",
+            ));
+        }
+        let manifest_json = manifest
+            .to_json()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let nbc_bytes = module
+            .to_nbc(None)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let nbc_digest = *blake3::hash(&nbc_bytes).as_bytes();
+        Ok(Self {
+            artifact_id: manifest.artifact_id(),
+            manifest_json,
+            nbc_bytes,
+            nbc_digest,
+        })
+    }
+
+    pub fn restore_module(
+        &self,
+        requested: ArtifactId,
+    ) -> io::Result<crate::bytecode::CodeModule> {
+        if self.artifact_id != requested {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "retained artifact key mismatch: requested {}, stored {}",
+                    requested, self.artifact_id
+                ),
+            ));
+        }
+        if *blake3::hash(&self.nbc_bytes).as_bytes() != self.nbc_digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("retained NBC bytes for {} failed digest verification", requested),
+            ));
+        }
+        let manifest =
+            crate::artifact_identity::ArtifactIdentityManifest::from_json(&self.manifest_json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if manifest.artifact_id() != requested {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "retained artifact manifest mismatch: requested {}, manifest {}",
+                    requested,
+                    manifest.artifact_id()
+                ),
+            ));
+        }
+        let mut module = crate::bytecode::CodeModule::from_nbc(&self.nbc_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            .module;
+        module.semantic_id = Some(manifest.semantic_id());
+        module.artifact_identity = Some(manifest);
+        Ok(module)
+    }
+}
+
 /// A serializable snapshot of an actor's durable state.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -135,6 +218,9 @@ pub struct ActorSnapshot {
     /// explicitly unverified; a present identity must match recovery code.
     #[serde(default)]
     pub semantic_id: Option<String>,
+    /// Exact compiler/code-generation artifact pinned to this checkpoint.
+    #[serde(default)]
+    pub artifact_id: Option<String>,
     pub state: HashMap<String, PersistedValue>,
     /// For workflow actors, the name of the signal the current step is
     /// suspended waiting for, if any.  This is part of the snapshot so that
