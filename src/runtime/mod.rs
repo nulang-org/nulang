@@ -5101,24 +5101,29 @@ impl Runtime {
                     return None;
                 }
             };
-        if let Some(event) = self
-            .persistence
-            .read_events(actor_id)
-            .into_iter()
-            .find(|event| {
-                !durable_schema_compatible(
-                    event.schema_owner.as_deref(),
-                    event.schema_version,
-                    schema_owner.as_deref(),
-                    schema_version,
-                )
-            })
-        {
-            warn!(
-                "nulang-recover: refusing actor {} because event sequence {} was committed under incompatible schema {:?}@v{}",
-                actor_id, event.sequence, event.schema_owner, event.schema_version
-            );
-            return None;
+        // Without compiler-owned recovery metadata there is no migration
+        // authority for incompatible event history. With a recovery module,
+        // event_replay validates and transforms historical events in memory.
+        if recovery_module.is_none() {
+            if let Some(event) = self
+                .persistence
+                .read_events(actor_id)
+                .into_iter()
+                .find(|event| {
+                    !durable_schema_compatible(
+                        event.schema_owner.as_deref(),
+                        event.schema_version,
+                        schema_owner.as_deref(),
+                        schema_version,
+                    )
+                })
+            {
+                warn!(
+                    "nulang-recover: refusing actor {} because event sequence {} was committed under incompatible schema {:?}@v{}",
+                    actor_id, event.sequence, event.schema_owner, event.schema_version
+                );
+                return None;
+            }
         }
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
@@ -5217,7 +5222,7 @@ impl Runtime {
         let mut executable_replay_applied = false;
         if !events.is_empty() {
             if let Some(module) = recovery_module.as_ref() {
-                match event_replay::replay_current_event_history(module, actor_id, &events) {
+                match event_replay::replay_event_history(module, actor_id, &events) {
                     Ok(Some(replayed)) => {
                         for (field, value) in replayed.state {
                             let restored = value.to_value_on_heap(&mut actor);
