@@ -5367,14 +5367,77 @@ impl Runtime {
             }
         };
 
-        if snapshot.schema_version != meta.version {
+        let migration_manifest = if meta.migrations.is_empty() {
+            None
+        } else {
+            let manifest =
+                crate::migration_manifest::MigrationManifest::from_json(&meta.migrations)
+                    .map_err(|error| {
+                        format!(
+                            "actor '{}' carries an invalid migration manifest: {error}",
+                            meta.name
+                        )
+                    })?;
+            if manifest.target_version != meta.version {
+                return Err(format!(
+                    "actor '{}' migration manifest targets v{} but actor metadata declares v{}",
+                    meta.name, manifest.target_version, meta.version
+                ));
+            }
+            Some(manifest)
+        };
+
+        if snapshot.schema_version > meta.version {
             return Err(format!(
-                "persisted {}@v{} does not match current {}@v{}; migration execution is not implemented",
+                "persisted {}@v{} is newer than current {}@v{}; downgrade recovery is forbidden",
                 snapshot
                     .schema_owner
                     .as_deref()
                     .unwrap_or(meta.name.as_str()),
                 snapshot.schema_version,
+                meta.name,
+                meta.version
+            ));
+        }
+
+        if snapshot.schema_version < meta.version {
+            let manifest = migration_manifest.as_ref().ok_or_else(|| {
+                format!(
+                    "persisted {}@v{} requires migration to {}@v{}, but this artifact has no migration manifest",
+                    snapshot
+                        .schema_owner
+                        .as_deref()
+                        .unwrap_or(meta.name.as_str()),
+                    snapshot.schema_version,
+                    meta.name,
+                    meta.version
+                )
+            })?;
+            let plan = manifest.plan_from(snapshot.schema_version).map_err(|error| {
+                format!(
+                    "persisted {}@v{} cannot be migrated to {}@v{}: {error}",
+                    snapshot
+                        .schema_owner
+                        .as_deref()
+                        .unwrap_or(meta.name.as_str()),
+                    snapshot.schema_version,
+                    meta.name,
+                    meta.version
+                )
+            })?;
+            let path = plan
+                .iter()
+                .map(|step| format!("{}->{}", step.from_version, step.to_version))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "persisted {}@v{} has validated migration path [{}] to {}@v{}, but executable migration bodies are not implemented",
+                snapshot
+                    .schema_owner
+                    .as_deref()
+                    .unwrap_or(meta.name.as_str()),
+                snapshot.schema_version,
+                path,
                 meta.name,
                 meta.version
             ));

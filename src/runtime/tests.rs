@@ -1967,6 +1967,40 @@ fn test_recover_actor_rejects_schema_version_mismatch() {
 }
 
 #[test]
+fn test_recover_actor_rejects_invalid_migration_manifest_even_at_current_version() {
+    let mut rt = Runtime::new();
+    let actor_id = 919_002;
+
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            sequence: 1,
+            schema_owner: Some("Counter".to_string()),
+            schema_version: 2,
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+
+    let mut module = CodeModule::new("invalid-migration-manifest-recovery");
+    let mut meta = ActorMeta::new("Counter");
+    meta.persistent = true;
+    meta.version = 2;
+    meta.migrations = r#"{"format_version":999,"target_version":2,"contracts":[]}"#.to_string();
+    module.actor_metadata.push(meta);
+    rt.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "corrupt/unsupported migration metadata must fail closed before activation"
+    );
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "invalid artifact migration metadata must never become observable"
+    );
+}
+
+#[test]
 fn test_memory_store_latest_sequence() {
     let mut store = MemoryStore::new();
     let snapshot = ActorSnapshot {
