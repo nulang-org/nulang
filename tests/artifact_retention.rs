@@ -35,11 +35,7 @@ fn proven_module(program_label: &[u8], definition_id: SemanticId) -> CodeModule 
     module
 }
 
-fn pinned_snapshot(
-    actor_id: u64,
-    definition_id: SemanticId,
-    module: &CodeModule,
-) -> ActorSnapshot {
+fn pinned_snapshot(actor_id: u64, definition_id: SemanticId, module: &CodeModule) -> ActorSnapshot {
     ActorSnapshot {
         actor_id,
         semantic_id: Some(definition_id.to_string()),
