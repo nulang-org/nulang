@@ -305,6 +305,13 @@ pub enum MessageAdmission {
     Rejected,
 }
 
+/// Immediate admission plus optional destination ticket for a tracked send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackedSendAdmission {
+    pub admission: MessageAdmission,
+    pub delivery_id: Option<u64>,
+}
+
 /// Terminal admission reported by a remote node for a tracked actor message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteMessageAdmission {
@@ -1745,8 +1752,7 @@ impl Runtime {
         // `send_message_by_id`; see RFC-0007 note there).
         if !self.actors.contains_key(&target_id) {
             if let Some(node) = self.remote_refs.get(&target_id).copied() {
-                self.route_ref_send(target_id, node, behavior, args);
-                return MessageAdmission::Forwarded;
+                return self.route_ref_send(target_id, node, behavior, args);
             }
         }
 
@@ -1779,20 +1785,26 @@ impl Runtime {
     /// resolved via `remote_refs`): queue while the spawn placeholder is
     /// still pending, otherwise translate the placeholder to the real
     /// actor id (if applicable) and send over the wire.
-    fn route_ref_send(&mut self, target_id: u64, node: NodeId, behavior: &str, args: &[Value]) {
+    fn route_ref_send(
+        &mut self,
+        target_id: u64,
+        node: NodeId,
+        behavior: &str,
+        args: &[Value],
+    ) -> MessageAdmission {
         if self.spawn_placeholders.contains(&target_id)
             && !self.pending_spawn_responses.contains_key(&target_id)
         {
             // SpawnResponse still in flight: queue the pre-resolved wire
             // form; it flushes when the real actor id arrives.
-            distribution::queue_spawn_message(self, target_id, node, behavior, args);
+            distribution::queue_spawn_message(self, target_id, node, behavior, args)
         } else {
             let real_id = self
                 .spawn_translations
                 .get(&target_id)
                 .copied()
                 .unwrap_or(target_id);
-            self.send_distributed(ActorAddress::remote(node, real_id), behavior, args);
+            self.try_send_distributed(ActorAddress::remote(node, real_id), behavior, args)
         }
     }
 
@@ -2415,30 +2427,52 @@ impl Runtime {
         args: Vec<Value>,
         sender: u64,
     ) {
+        let _ = self.try_send_to_grain_on_node(
+            grain_id,
+            target_node,
+            behavior_name,
+            args,
+            sender,
+        );
+    }
+
+    /// Non-blocking explicit cross-node grain delivery with precise admission.
+    pub fn try_send_to_grain_on_node(
+        &mut self,
+        grain_id: GrainId,
+        target_node: NodeId,
+        behavior_name: &str,
+        args: Vec<Value>,
+        sender: u64,
+    ) -> MessageAdmission {
         let stable_id = grain_actor_id(&grain_id);
         let prev = self.current_actor;
         if sender != 0 {
             self.current_actor = Some(sender);
         }
 
-        if self.actors.contains_key(&stable_id) {
-            let Some(behavior_id) = self.behavior_id_for(stable_id, behavior_name) else {
-                warn!(
-                    "nulang-grain: unknown behavior {} for local grain {}",
-                    behavior_name,
-                    grain_id.actor_name()
-                );
-                self.current_actor = prev;
-                return;
-            };
-            self.send_message_by_id(stable_id, behavior_id, &args);
-            self.current_actor = prev;
-            return;
-        }
+        let admission = if self.actors.contains_key(&stable_id) {
+            match self.behavior_id_for(stable_id, behavior_name) {
+                Some(behavior_id) => self.send_message_by_id(stable_id, behavior_id, &args),
+                None => {
+                    warn!(
+                        "nulang-grain: unknown behavior {} for local grain {}",
+                        behavior_name,
+                        grain_id.actor_name()
+                    );
+                    MessageAdmission::Rejected
+                }
+            }
+        } else {
+            self.try_send_distributed(
+                ActorAddress::remote(target_node, stable_id),
+                behavior_name,
+                &args,
+            )
+        };
 
-        let target = ActorAddress::remote(target_node, stable_id);
-        self.send_distributed(target, behavior_name, &args);
         self.current_actor = prev;
+        admission
     }
 
     #[tracing::instrument(level = "trace", skip(self, args))]
@@ -2480,8 +2514,7 @@ impl Runtime {
                     );
                     return MessageAdmission::Rejected;
                 };
-                self.route_ref_send(target_id, node, &behavior_name, args);
-                return MessageAdmission::Forwarded;
+                return self.route_ref_send(target_id, node, &behavior_name, args);
             }
         }
         // Forwarding for migrated actors: if this actor has been relocated
@@ -2507,8 +2540,7 @@ impl Runtime {
                 return MessageAdmission::Rejected;
             };
             let target = ActorAddress::remote(target_node, target_id);
-            self.send_distributed(target, &behavior_name, args);
-            return MessageAdmission::Forwarded;
+            return self.try_send_distributed(target, &behavior_name, args);
         }
         // Cross-shard routing: if the target actor lives on another shard,
         // forward via the cross-shard channel. The receiving shard delivers it
@@ -6571,7 +6603,33 @@ impl Runtime {
         behavior: &str,
         args: &[Value],
     ) -> Option<u64> {
-        distribution::send_distributed_tracked(self, target, behavior, args)
+        self.try_send_distributed_tracked(target, behavior, args)
+            .delivery_id
+    }
+
+    /// Non-blocking tracked send with precise immediate admission.
+    ///
+    /// A remote `Forwarded` result carries a delivery id that later resolves
+    /// to destination Accepted/Backpressured/Rejected. Immediate
+    /// Backpressured means the local transport/ticket boundary could not admit
+    /// the send and no remote ticket remains pending.
+    pub fn try_send_distributed_tracked(
+        &mut self,
+        target: ActorAddress,
+        behavior: &str,
+        args: &[Value],
+    ) -> TrackedSendAdmission {
+        distribution::try_send_distributed_tracked(self, target, behavior, args)
+    }
+
+    /// Attempt distributed delivery without blocking on the transport queue.
+    pub fn try_send_distributed(
+        &mut self,
+        target: ActorAddress,
+        behavior: &str,
+        args: &[Value],
+    ) -> MessageAdmission {
+        distribution::try_send_distributed(self, target, behavior, args)
     }
 
     pub fn send_distributed(&mut self, target: ActorAddress, behavior: &str, args: &[Value]) {

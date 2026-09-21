@@ -6473,6 +6473,81 @@ fn test_dst_deterministic_network_transport_delivers() {
     t_b.shutdown();
 }
 
+#[test]
+fn test_remote_actor_send_reports_transport_backpressure_without_blocking() {
+    use crate::runtime::network::DeterministicNetworkTransport;
+    use crate::runtime::NetworkTransport;
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10011);
+    let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10012);
+    let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+
+    let transport_a =
+        DeterministicNetworkTransport::bind_with_bus(addr_a, bus.clone()).unwrap();
+    let transport_b = DeterministicNetworkTransport::bind_with_bus(addr_b, bus).unwrap();
+    let node_b = transport_b.node_id();
+    transport_a.register_on_bus();
+    transport_b.register_on_bus();
+
+    let mut rt = Runtime::new();
+    rt.enable_distribution_with_transport(Box::new(transport_a))
+        .unwrap();
+    rt.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+
+    const REMOTE_ACTOR: u64 = 900_001;
+    rt.remote_refs.insert(REMOTE_ACTOR, node_b);
+
+    // Fill B's bounded receive channel through A's real transport.
+    let local_node = rt.distributed.node_id.unwrap_or(NodeId::LOCAL);
+    let mut saturated = false;
+    for i in 0..4096_u64 {
+        let admission = rt
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
+            .try_send(
+                node_b,
+                addr_b,
+                Packet::Heartbeat {
+                    node_id: local_node,
+                    timestamp: i,
+                },
+            );
+        if admission == TransportAdmission::Backpressured {
+            saturated = true;
+            break;
+        }
+        assert_eq!(admission, TransportAdmission::Accepted);
+    }
+    assert!(saturated);
+
+    assert_eq!(
+        rt.send_message(REMOTE_ACTOR, "handle", &[]),
+        MessageAdmission::Backpressured,
+        "ordinary actor send must expose transport saturation instead of blocking"
+    );
+
+    assert_eq!(
+        rt.try_send_to_grain_on_node(
+            GrainId::new("Counter", "transport-pressure"),
+            node_b,
+            "handle",
+            vec![],
+            0,
+        ),
+        MessageAdmission::Backpressured,
+        "explicit remote grain send must use the same non-blocking transport admission"
+    );
+}
+
 /// PLAN.md Phase 1 bullet 2 (DST): timer determinism. A program whose
 /// actor arms a timer (via the runtime timer wheel) must make progress
 /// under `run_scheduler_deterministic` when a virtual clock is

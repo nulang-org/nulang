@@ -944,28 +944,41 @@ impl Runtime {
                     behavior,
                 } => {
                     if track_remote {
-                        match self.send_distributed_tracked(
-                            ActorAddress::remote(node_id, actor_id),
-                            &behavior,
-                            args,
-                        ) {
-                            Some(delivery_id) => {
-                                report.forwarded_remote += 1;
-                                remote_deliveries.push(FabricRemoteDelivery {
-                                    delivery_id,
-                                    node_id,
-                                    actor_id,
-                                });
-                            }
-                            None => report.rejected += 1,
-                        }
-                    } else {
-                        self.send_distributed(
+                        let tracked = self.try_send_distributed_tracked(
                             ActorAddress::remote(node_id, actor_id),
                             &behavior,
                             args,
                         );
-                        report.forwarded_remote += 1;
+                        match tracked.admission {
+                            MessageAdmission::Accepted => report.admitted += 1,
+                            MessageAdmission::Forwarded => {
+                                if let Some(delivery_id) = tracked.delivery_id {
+                                    report.forwarded_remote += 1;
+                                    remote_deliveries.push(FabricRemoteDelivery {
+                                        delivery_id,
+                                        node_id,
+                                        actor_id,
+                                    });
+                                } else {
+                                    // A tracked cross-node Forwarded result must
+                                    // always carry the correlation ticket.
+                                    report.rejected += 1;
+                                }
+                            }
+                            MessageAdmission::Backpressured => report.backpressured += 1,
+                            MessageAdmission::Rejected => report.rejected += 1,
+                        }
+                    } else {
+                        match self.try_send_distributed(
+                            ActorAddress::remote(node_id, actor_id),
+                            &behavior,
+                            args,
+                        ) {
+                            MessageAdmission::Accepted => report.admitted += 1,
+                            MessageAdmission::Forwarded => report.forwarded_remote += 1,
+                            MessageAdmission::Backpressured => report.backpressured += 1,
+                            MessageAdmission::Rejected => report.rejected += 1,
+                        }
                     }
                 }
             }

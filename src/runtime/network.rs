@@ -1999,6 +1999,17 @@ pub struct OutgoingPacket {
 // NetworkTransport
 // ---------------------------------------------------------------------------
 
+/// Immediate admission result for a non-blocking transport handoff.
+///
+/// This describes only the local transport queue/buffer. Accepted does not
+/// imply that the remote node received or admitted the packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportAdmission {
+    Accepted,
+    Backpressured,
+    Rejected,
+}
+
 /// Manages all network connections for a Nulang node.
 ///
 /// When created via [`bind`][TcpTransport::bind] the transport spawns
@@ -2010,6 +2021,18 @@ pub struct OutgoingPacket {
 pub trait NetworkTransport: Send {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()>;
     fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet);
+    /// Attempt a non-blocking local transport handoff.
+    ///
+    /// Implementations that do not provide bounded admission inherit a
+    /// fail-closed default. This method must never fall back to blocking send.
+    fn try_send(
+        &mut self,
+        _to_node: NodeId,
+        _to_addr: std::net::SocketAddr,
+        _packet: Packet,
+    ) -> TransportAdmission {
+        TransportAdmission::Rejected
+    }
     fn receive(&self) -> Vec<IncomingPacket>;
     fn node_id(&self) -> NodeId;
     fn listen_addr(&self) -> std::net::SocketAddr;
@@ -2042,6 +2065,14 @@ impl NetworkTransport for Box<dyn NetworkTransport> {
     }
     fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) {
         (**self).send(to_node, to_addr, packet)
+    }
+    fn try_send(
+        &mut self,
+        to_node: NodeId,
+        to_addr: std::net::SocketAddr,
+        packet: Packet,
+    ) -> TransportAdmission {
+        (**self).try_send(to_node, to_addr, packet)
     }
     fn receive(&self) -> Vec<IncomingPacket> {
         (**self).receive()
@@ -2308,6 +2339,46 @@ impl TcpTransport {
                 "nulang-net: dropping packet to node {:?} (addr {}): sender thread shut down",
                 to_node, to_addr
             );
+        }
+    }
+
+    /// Attempt to enqueue a packet without blocking the scheduler thread.
+    ///
+    /// A simulated partition still reports Accepted: the packet crossed the
+    /// local transport boundary and is intentionally lost in the injected
+    /// network fault. Missing later ACKs expose that failure to higher layers.
+    pub fn try_send(
+        &mut self,
+        to_node: NodeId,
+        to_addr: SocketAddr,
+        packet: Packet,
+    ) -> TransportAdmission {
+        if !packet_payload_wire_safe(&packet) {
+            warn!(
+                "nulang-net: rejecting packet to node {:?} (addr {}): payload value cannot cross the wire",
+                to_node, to_addr
+            );
+            return TransportAdmission::Rejected;
+        }
+        if self.partition.contains(&to_node) {
+            return TransportAdmission::Accepted;
+        }
+
+        let outgoing = OutgoingPacket {
+            to_node,
+            to_addr,
+            packet,
+        };
+        match self.outgoing_tx.try_send(outgoing) {
+            Ok(()) => TransportAdmission::Accepted,
+            Err(mpsc::TrySendError::Full(_)) => TransportAdmission::Backpressured,
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                warn!(
+                    "nulang-net: rejecting packet to node {:?} (addr {}): sender thread shut down",
+                    to_node, to_addr
+                );
+                TransportAdmission::Rejected
+            }
         }
     }
 
@@ -3833,6 +3904,14 @@ impl NetworkTransport for TcpTransport {
     fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) {
         self.send(to_node, to_addr, packet)
     }
+    fn try_send(
+        &mut self,
+        to_node: NodeId,
+        to_addr: std::net::SocketAddr,
+        packet: Packet,
+    ) -> TransportAdmission {
+        TcpTransport::try_send(self, to_node, to_addr, packet)
+    }
     fn receive(&self) -> Vec<IncomingPacket> {
         self.receive()
     }
@@ -3970,45 +4049,79 @@ impl NetworkTransport for DeterministicNetworkTransport {
         Ok(())
     }
 
-    fn send(&mut self, to_node: NodeId, _to_addr: SocketAddr, packet: Packet) {
-        // Simulated partition: silently drop (see set_partition).
+    fn send(&mut self, to_node: NodeId, to_addr: SocketAddr, packet: Packet) {
+        let _ = <Self as NetworkTransport>::try_send(self, to_node, to_addr, packet);
+    }
+
+    fn try_send(
+        &mut self,
+        to_node: NodeId,
+        _to_addr: SocketAddr,
+        packet: Packet,
+    ) -> TransportAdmission {
         if self.partition.contains(&to_node) {
-            return;
+            return TransportAdmission::Accepted;
         }
-        if let Some(sender) = self.get_incoming_sender(to_node) {
-            let incoming = IncomingPacket {
-                from_node: self.node_id,
-                seq: 0,
-                packet,
-            };
-            if self.reorder {
-                // Bounded adjacent reorder: hold the first packet of each
-                // pair; when the second arrives, deliver the NEW one first
-                // and then the held one — the receiver sees P2 before P1.
-                // Deterministic (per-pair state, no RNG); nothing is lost
-                // or duplicated, only delayed one slot. `flush_held`
-                // delivers the odd tail at the end of the sender's turn.
-                if let Some(held) = self.held.remove(&to_node) {
-                    let _ = sender.try_send(incoming);
-                    let _ = sender.try_send(held);
-                } else {
-                    self.held.insert(to_node, incoming);
+        let Some(sender) = self.get_incoming_sender(to_node) else {
+            return TransportAdmission::Rejected;
+        };
+        let incoming = IncomingPacket {
+            from_node: self.node_id,
+            seq: 0,
+            packet,
+        };
+
+        if self.reorder {
+            if let Some(held) = self.held.remove(&to_node) {
+                match sender.try_send(incoming) {
+                    Ok(()) => {
+                        match sender.try_send(held) {
+                            Ok(()) => {}
+                            Err(mpsc::TrySendError::Full(error)) => {
+                                self.held.insert(to_node, error);
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => {}
+                        }
+                        TransportAdmission::Accepted
+                    }
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        self.held.insert(to_node, held);
+                        TransportAdmission::Backpressured
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        self.held.insert(to_node, held);
+                        TransportAdmission::Rejected
+                    }
                 }
             } else {
-                let _ = sender.try_send(incoming);
+                self.held.insert(to_node, incoming);
+                TransportAdmission::Accepted
+            }
+        } else {
+            match sender.try_send(incoming) {
+                Ok(()) => TransportAdmission::Accepted,
+                Err(mpsc::TrySendError::Full(_)) => TransportAdmission::Backpressured,
+                Err(mpsc::TrySendError::Disconnected(_)) => TransportAdmission::Rejected,
             }
         }
     }
 
     fn flush_held(&mut self) {
-        // Drain into an owned Vec first: `held` is a field of `self`, and
-        // `get_incoming_sender` borrows `self` — draining while borrowing
-        // immutably would conflict.
+        // Preserve a held packet when the destination channel is saturated;
+        // fault injection must reorder/delay, not silently drop.
         let held: Vec<(NodeId, IncomingPacket)> = self.held.drain().collect();
+        let mut retry = Vec::new();
         for (to, pkt) in held {
             if let Some(sender) = self.get_incoming_sender(to) {
-                let _ = sender.try_send(pkt);
+                match sender.try_send(pkt) {
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full(error)) => retry.push((to, error)),
+                    Err(mpsc::TrySendError::Disconnected(_)) => {}
+                }
             }
+        }
+        for (to, pkt) in retry {
+            self.held.insert(to, pkt);
         }
     }
 

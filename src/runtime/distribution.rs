@@ -16,6 +16,10 @@ use tracing::warn;
 /// forward `RemoteActorCache` (10k, TTL-bounded) still covers explicit
 /// `ActorAddress::remote` sends; the reverse index is best-effort on top.
 const REMOTE_REFS_MAX: usize = 10_000;
+/// Bound messages accumulated while a remote spawn request is unresolved.
+/// These are actor-data admission queues, not durable mailboxes.
+const PENDING_SPAWN_MESSAGES_PER_REQUEST_MAX: usize = 256;
+const PENDING_SPAWN_MESSAGES_TOTAL_MAX: usize = 4_096;
 
 /// A message sent to a spawn@node placeholder before its SpawnResponse
 /// arrived. The payload is ALREADY in wire form — string ids rewritten to
@@ -41,7 +45,23 @@ pub(crate) fn queue_spawn_message(
     _node: NodeId,
     behavior: &str,
     args: &[Value],
-) {
+) -> crate::runtime::MessageAdmission {
+    let request_depth = rt
+        .pending_spawn_messages
+        .get(&request_id)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let total_depth: usize = rt.pending_spawn_messages.values().map(Vec::len).sum();
+    if request_depth >= PENDING_SPAWN_MESSAGES_PER_REQUEST_MAX
+        || total_depth >= PENDING_SPAWN_MESSAGES_TOTAL_MAX
+    {
+        warn!(
+            "nulang-net: backpressure queueing message to unresolved spawn placeholder {} (request_depth={}, total_depth={})",
+            request_id, request_depth, total_depth
+        );
+        return crate::runtime::MessageAdmission::Backpressured;
+    }
+
     let (payload, string_table) = match distributed::resolve_wire_strings(rt, args) {
         Some(resolved) => resolved,
         None => {
@@ -55,7 +75,7 @@ pub(crate) fn queue_spawn_message(
                 sender,
                 "string payload unresolvable",
             );
-            return;
+            return crate::runtime::MessageAdmission::Rejected;
         }
     };
     let (payload, object_table) = match distributed::resolve_wire_objects(rt, &payload) {
@@ -71,7 +91,7 @@ pub(crate) fn queue_spawn_message(
                 sender,
                 "object ref unresolvable",
             );
-            return;
+            return crate::runtime::MessageAdmission::Rejected;
         }
     };
     let sender = rt.current_actor.unwrap_or(0);
@@ -87,6 +107,7 @@ pub(crate) fn queue_spawn_message(
             sender,
             trace_id,
         });
+    crate::runtime::MessageAdmission::Accepted
 }
 
 /// Record `actor_id → node` in the reverse index (bounded; drops new
@@ -210,7 +231,16 @@ pub(crate) fn send_distributed(
     behavior: &str,
     args: &[Value],
 ) {
-    let _ = send_distributed_impl(rt, target, behavior, args, false);
+    let _ = send_distributed_impl(rt, target, behavior, args, false, false);
+}
+
+pub(crate) fn try_send_distributed(
+    rt: &mut Runtime,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+) -> crate::runtime::MessageAdmission {
+    send_distributed_impl(rt, target, behavior, args, false, true).admission
 }
 
 pub(crate) fn send_distributed_tracked(
@@ -219,7 +249,16 @@ pub(crate) fn send_distributed_tracked(
     behavior: &str,
     args: &[Value],
 ) -> Option<u64> {
-    send_distributed_impl(rt, target, behavior, args, true)
+    try_send_distributed_tracked(rt, target, behavior, args).delivery_id
+}
+
+pub(crate) fn try_send_distributed_tracked(
+    rt: &mut Runtime,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+) -> crate::runtime::TrackedSendAdmission {
+    send_distributed_impl(rt, target, behavior, args, true, true)
 }
 
 fn send_distributed_impl(
@@ -228,37 +267,58 @@ fn send_distributed_impl(
     behavior: &str,
     args: &[Value],
     tracked: bool,
-) -> Option<u64> {
+    nonblocking: bool,
+) -> crate::runtime::TrackedSendAdmission {
     if !rt.distributed.enabled {
         let actor_id = match target {
             ActorAddress::Local { actor_id } => actor_id,
             ActorAddress::Remote { actor_id, .. } => actor_id,
         };
-        rt.send_message(actor_id, behavior, args);
-        return None;
+        return crate::runtime::TrackedSendAdmission {
+            admission: rt.send_message(actor_id, behavior, args),
+            delivery_id: None,
+        };
     }
     if let ActorAddress::Local { actor_id } = target {
-        rt.send_message(actor_id, behavior, args);
-        return None;
+        return crate::runtime::TrackedSendAdmission {
+            admission: rt.send_message(actor_id, behavior, args),
+            delivery_id: None,
+        };
     }
-    let mut transport = rt.distributed.transport.take()?;
+
+    let mut transport = match rt.distributed.transport.take() {
+        Some(transport) => transport,
+        None => {
+            return crate::runtime::TrackedSendAdmission {
+                admission: crate::runtime::MessageAdmission::Rejected,
+                delivery_id: None,
+            }
+        }
+    };
     let cluster = match rt.distributed.cluster.take() {
-        Some(c) => c,
+        Some(cluster) => cluster,
         None => {
             rt.distributed.transport = Some(transport);
-            return None;
+            return crate::runtime::TrackedSendAdmission {
+                admission: crate::runtime::MessageAdmission::Rejected,
+                delivery_id: None,
+            };
         }
     };
     let mut resolver = match rt.distributed.resolver.take() {
-        Some(r) => r,
+        Some(resolver) => resolver,
         None => {
             rt.distributed.transport = Some(transport);
             rt.distributed.cluster = Some(cluster);
-            return None;
+            return crate::runtime::TrackedSendAdmission {
+                admission: crate::runtime::MessageAdmission::Rejected,
+                delivery_id: None,
+            };
         }
     };
-    let delivery_id = if tracked {
-        distributed::send_distributed_tracked(
+
+    let result = if tracked {
+        distributed::try_send_distributed_tracked(
             rt,
             &mut transport,
             &cluster,
@@ -267,6 +327,19 @@ fn send_distributed_impl(
             behavior,
             args,
         )
+    } else if nonblocking {
+        crate::runtime::TrackedSendAdmission {
+            admission: distributed::try_send_distributed(
+                rt,
+                &mut transport,
+                &cluster,
+                &mut resolver,
+                target,
+                behavior,
+                args,
+            ),
+            delivery_id: None,
+        }
     } else {
         distributed::send_distributed(
             rt,
@@ -277,12 +350,16 @@ fn send_distributed_impl(
             behavior,
             args,
         );
-        None
+        crate::runtime::TrackedSendAdmission {
+            admission: crate::runtime::MessageAdmission::Forwarded,
+            delivery_id: None,
+        }
     };
+
     rt.distributed.transport = Some(transport);
     rt.distributed.cluster = Some(cluster);
     rt.distributed.resolver = Some(resolver);
-    delivery_id
+    result
 }
 
 /// Process incoming network packets and cluster actions.
@@ -470,6 +547,30 @@ pub(crate) fn handle_node_failed(rt: &mut Runtime, node: NodeId) {
     // (1) Invalidate cached remote actors on the failed node.
     if let Some(resolver) = rt.distributed.resolver.as_mut() {
         resolver.invalidate_node(node);
+    }
+
+    // Pending spawn placeholders have no usable remote actor id until the
+    // response arrives. Once the hosting node is failed, stop retaining their
+    // pre-spawn message queues and publish a failed spawn result.
+    let failed_placeholders: Vec<u64> = rt
+        .spawn_placeholders
+        .iter()
+        .copied()
+        .filter(|request_id| rt.remote_refs.get(request_id) == Some(&node))
+        .collect();
+    for request_id in failed_placeholders {
+        rt.spawn_placeholders.remove(&request_id);
+        rt.remote_refs.remove(&request_id);
+        rt.pending_spawn_responses.insert(request_id, None);
+        if let Some(messages) = rt.pending_spawn_messages.remove(&request_id) {
+            for message in messages {
+                crate::runtime::distributed::notify_delivery_failed(
+                    rt,
+                    message.sender,
+                    "target node left cluster",
+                );
+            }
+        }
     }
 
     // (2) DOWN-with-noconnection to local watchers of actors on the node.

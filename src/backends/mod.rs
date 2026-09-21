@@ -314,6 +314,14 @@ pub trait Transport: Send {
         to_addr: std::net::SocketAddr,
         packet: crate::runtime::Packet,
     );
+    fn try_send(
+        &mut self,
+        _to_node: crate::runtime::NodeId,
+        _to_addr: std::net::SocketAddr,
+        _packet: crate::runtime::Packet,
+    ) -> crate::runtime::TransportAdmission {
+        crate::runtime::TransportAdmission::Rejected
+    }
     fn receive(&self) -> Vec<crate::runtime::IncomingPacket>;
     fn node_id(&self) -> crate::runtime::NodeId;
     fn listen_addr(&self) -> std::net::SocketAddr;
@@ -338,6 +346,14 @@ impl<T: crate::runtime::NetworkTransport> Transport for T {
         packet: crate::runtime::Packet,
     ) {
         crate::runtime::NetworkTransport::send(self, to_node, to_addr, packet)
+    }
+    fn try_send(
+        &mut self,
+        to_node: crate::runtime::NodeId,
+        to_addr: std::net::SocketAddr,
+        packet: crate::runtime::Packet,
+    ) -> crate::runtime::TransportAdmission {
+        crate::runtime::NetworkTransport::try_send(self, to_node, to_addr, packet)
     }
     fn receive(&self) -> Vec<crate::runtime::IncomingPacket> {
         crate::runtime::NetworkTransport::receive(self)

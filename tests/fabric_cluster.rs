@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use nulang::runtime::{
     Actor, ActorAdmissionStatus, DeterministicNetworkTransport, FabricAdvertisement,
-    FabricAdvertisementSnapshot, Mailbox, NodeId, Packet, Runtime,
+    FabricAdvertisementSnapshot, Mailbox, NetworkTransport, NodeId, Packet, Runtime,
+    TransportAdmission,
 };
 use nulang::vm::Value;
 
@@ -174,6 +175,90 @@ fn fabric_tracked_publish_resolves_remote_mailbox_admission() {
     );
     assert_eq!(b.actors.get(&target).unwrap().mailbox.len(), 1);
     assert_eq!(b.dlq_depth(), 1);
+}
+
+#[test]
+fn fabric_tracked_publish_reports_local_transport_backpressure_without_ticket() {
+    let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:32121".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:32122".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut a = distributed_runtime(addr_a, bus.clone());
+    let mut b = distributed_runtime(addr_b, bus);
+
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    b.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let target = b.spawn_actor(Box::new(Vec::new));
+    b.actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("handle", noop);
+    b.fabric_subscribe("events.*", target, "handle").unwrap();
+
+    b.advance_time(Duration::from_millis(600));
+    a.advance_time(Duration::from_millis(600));
+    b.process_network();
+    a.process_network();
+    assert_eq!(a.fabric_remote_subscription_count(), 1);
+
+    // Saturate B's bounded deterministic incoming channel without allowing B
+    // to drain it. The exact capacity remains an implementation detail.
+    let mut saturated = false;
+    for i in 0..4096_u64 {
+        let admission = a
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
+            .try_send(
+                node_b,
+                addr_b,
+                Packet::Heartbeat {
+                    node_id: node_a,
+                    timestamp: i,
+                },
+            );
+        if admission == TransportAdmission::Backpressured {
+            saturated = true;
+            break;
+        }
+        assert_eq!(admission, TransportAdmission::Accepted);
+    }
+    assert!(saturated, "bounded transport channel should saturate");
+
+    let untracked = a
+        .fabric_publish_report("events.created", &[Value::int(0)])
+        .unwrap();
+    assert_eq!(untracked.selected, 1);
+    assert_eq!(untracked.forwarded_remote, 0);
+    assert_eq!(untracked.backpressured, 1);
+    assert_eq!(untracked.rejected, 0);
+
+    let report = a
+        .fabric_publish_tracked("events.created", &[Value::int(1)])
+        .unwrap();
+
+    assert_eq!(report.immediate.selected, 1);
+    assert_eq!(report.immediate.forwarded_remote, 0);
+    assert_eq!(report.immediate.backpressured, 1);
+    assert_eq!(report.immediate.rejected, 0);
+    assert!(report.remote_deliveries.is_empty());
+    assert_eq!(
+        a.pending_remote_admission_count(),
+        0,
+        "transport refusal must not leak an outstanding remote ticket"
+    );
 }
 
 #[test]
