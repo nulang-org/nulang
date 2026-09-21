@@ -487,6 +487,27 @@ pub(crate) fn register_recovery_module(
     compensation_offsets: Vec<Option<usize>>,
     definition_semantic_id: Option<crate::content_identity::SemanticId>,
 ) {
+    if module.artifact_id().is_some() {
+        match crate::runtime::persistence::RetainedArtifact::from_proven_module(&module)
+            .and_then(|artifact| rt.persistence.save_artifact(artifact))
+        {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                tracing::debug!(
+                    actor_id,
+                    %error,
+                    "historical artifact retention is unavailable for this persistence backend"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    actor_id,
+                    %error,
+                    "failed to retain compiler-proven recovery artifact"
+                );
+            }
+        }
+    }
     rt.recovery_modules
         .insert(actor_id, (module, offsets, compensation_offsets));
     match definition_semantic_id {
