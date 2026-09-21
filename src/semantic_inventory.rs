@@ -383,6 +383,35 @@ mod tests {
     }
 
     #[test]
+    fn checked_module_inventory_uses_inferred_effects_and_authority() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+
+        let source = r#"
+            fn fetch() {
+                let body = perform Http.get("http://127.0.0.1:1/")
+                perform IO.print(body)
+            }
+        "#;
+        let tokens = Lexer::new(source).lex().unwrap();
+        let mut parser = Parser::new(tokens);
+        let ast = parser.parse_module().unwrap();
+        let mut checker = EffectChecker::new();
+        checker.check_module(&ast.decls).unwrap();
+
+        let inventory =
+            CompilerSemanticInventory::from_checked_module(&ast, &mut checker)
+                .unwrap();
+        let fetch = inventory
+            .effects
+            .iter()
+            .find(|entry| entry.subject == "fetch")
+            .unwrap();
+        assert_eq!(fetch.effects, vec!["IO", "Net"]);
+        assert_eq!(inventory.required_authority, vec!["net"]);
+    }
+
+    #[test]
     fn complete_actor_protocol_uses_canonical_protocol_identity() {
         let behaviors = vec![behavior(
             "ping",
