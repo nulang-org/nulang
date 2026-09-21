@@ -1547,7 +1547,10 @@ impl Runtime {
                         None,
                     );
                 }
-                CrossShardMsg::EnqueueActor { actor_id, priority: _ } => {
+                CrossShardMsg::EnqueueActor {
+                    actor_id,
+                    priority: _,
+                } => {
                     self.enqueue_actor(actor_id);
                 }
             }
