@@ -3671,8 +3671,9 @@ impl TypeChecker {
                     ));
                 }
 
-                let Some((_, model, _, _)) =
-                    state_fields.iter().find(|(field_name, _, _, _)| field_name == field)
+                let Some((_, model, _, _)) = state_fields
+                    .iter()
+                    .find(|(field_name, _, _, _)| field_name == field)
                 else {
                     let available = state_fields
                         .iter()
