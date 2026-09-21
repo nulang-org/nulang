@@ -1674,6 +1674,7 @@ pub fn process_network_packets(
                                                 sender_node: outcome.placement.leader,
                                                 priority: MessagePriority::System,
                                                 trace_id: None,
+                                                delivery_id: None,
                                             },
                                         );
                                     }
@@ -2064,6 +2065,7 @@ pub fn process_network_packets(
                                                 sender_node: local,
                                                 priority: MessagePriority::System,
                                                 trace_id: None,
+                                                delivery_id: None,
                                             },
                                         );
                                     }
@@ -2961,6 +2963,7 @@ mod tests {
             sender_node: NodeId(9),
             priority: MessagePriority::System,
             trace_id: None,
+            delivery_id: None,
         };
         let result = resolver.parse_packet(packet);
         assert!(result.is_some());
