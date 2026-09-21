@@ -9007,7 +9007,7 @@ mod tests {
         let warnings = parser.take_warnings();
         assert!(
             warnings.iter().all(|warning| warning.code != "W0103"),
-            "effect rows must retain `! {..}` without typed-error warning: {warnings:?}"
+            "effect rows must retain `! {{..}}` without typed-error warning: {warnings:?}"
         );
     }
 }
