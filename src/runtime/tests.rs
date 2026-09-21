@@ -7265,7 +7265,6 @@ fn p0_cross_shard_named_send_resolves_only_on_owner() {
     );
 }
 
-
 #[test]
 fn perf_scheduler_coalesces_repeated_actor_wakeups() {
     fn increment(actor: &mut Actor, _args: &[Value]) {
@@ -7277,8 +7276,7 @@ fn perf_scheduler_coalesces_repeated_actor_wakeups() {
     }
 
     let mut rt = Runtime::new();
-    let actor_id =
-        rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
     rt.actors
         .get_mut(&actor_id)
         .unwrap()
