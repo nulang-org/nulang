@@ -531,7 +531,11 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             ..
         } => {
             if *mutable {
-                out.push_str(&format!("{}var ", sp));
+                // Module-level mutable declarations currently parse as
+                // `let var name = ...`; bare `var` is expression-position
+                // syntax. Preserve declaration scope until a later syntax RFC
+                // deliberately unifies the two forms.
+                out.push_str(&format!("{}let var ", sp));
             } else {
                 out.push_str(&format!("{}let ", sp));
             }
@@ -1452,6 +1456,14 @@ fn main() {
         assert!(out.contains("spawn Greeter()"), "got: {out}");
         assert!(out.contains("receive {"), "got: {out}");
         assert!(out.contains("emit Event(1)"), "got: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_module_mutable_binding_preserves_declaration_scope() {
+        let src = "let var counter: Int = 0\n";
+        let out = format_source(src).expect("module mutable binding formats");
+        assert_eq!(out, "let var counter: Int = 0\n");
         assert_idempotent(src);
     }
 
