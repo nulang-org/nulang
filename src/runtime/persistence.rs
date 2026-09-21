@@ -535,6 +535,22 @@ pub trait PersistenceStore: Send + Sync {
     /// Remove all data for an actor.
     fn clear(&mut self, actor_id: u64) -> io::Result<()>;
 
+    /// Retain an immutable compiler-proven historical executable.
+    fn save_artifact(&mut self, _artifact: RetainedArtifact) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "historical artifact retention is not supported by this persistence backend",
+        ))
+    }
+
+    /// Load an exact historical executable by strong ArtifactId.
+    fn load_artifact(&self, _artifact_id: ArtifactId) -> io::Result<Option<RetainedArtifact>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "historical artifact retention is not supported by this persistence backend",
+        ))
+    }
+
     /// Execute an arbitrary SQL query against the store.
     /// Returns rows as JSON arrays of column values. Default: not supported.
     fn query(&self, _sql: &str, _params: &[Value]) -> io::Result<Vec<String>> {
@@ -552,6 +568,7 @@ pub struct MemoryStore {
     journals: HashMap<u64, Vec<JournalEntry>>,
     workflow_events: HashMap<u64, Vec<WorkflowEvent>>,
     events: HashMap<u64, Vec<EventEntry>>,
+    artifacts: HashMap<ArtifactId, RetainedArtifact>,
 }
 
 impl MemoryStore {
@@ -635,7 +652,29 @@ impl PersistenceStore for MemoryStore {
         self.journals.remove(&actor_id);
         self.workflow_events.remove(&actor_id);
         self.events.remove(&actor_id);
+        // Content-addressed artifacts may be shared by other histories.
         Ok(())
+    }
+
+    fn save_artifact(&mut self, artifact: RetainedArtifact) -> io::Result<()> {
+        if let Some(existing) = self.artifacts.get(&artifact.artifact_id) {
+            if existing != &artifact {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "immutable artifact {} already exists with different payload",
+                        artifact.artifact_id
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+        self.artifacts.insert(artifact.artifact_id, artifact);
+        Ok(())
+    }
+
+    fn load_artifact(&self, artifact_id: ArtifactId) -> io::Result<Option<RetainedArtifact>> {
+        Ok(self.artifacts.get(&artifact_id).cloned())
     }
 }
 
@@ -672,6 +711,12 @@ impl JsonFileStore {
 
     fn events_path(&self, actor_id: u64) -> PathBuf {
         self.actor_dir(actor_id).join("events.jsonl")
+    }
+
+    fn artifact_dir(&self, artifact_id: ArtifactId) -> PathBuf {
+        self.base_dir
+            .join("artifacts")
+            .join(artifact_id.to_string())
     }
 }
 
@@ -834,6 +879,92 @@ impl PersistenceStore for JsonFileStore {
             fs::remove_dir_all(dir)?;
         }
         Ok(())
+    }
+    fn save_artifact(&mut self, artifact: RetainedArtifact) -> io::Result<()> {
+        let target = self.artifact_dir(artifact.artifact_id);
+        if target.exists() {
+            let existing = self.load_artifact(artifact.artifact_id)?;
+            if existing.as_ref() == Some(&artifact) {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "immutable artifact {} already exists with different payload",
+                    artifact.artifact_id
+                ),
+            ));
+        }
+
+        let root = self.base_dir.join("artifacts");
+        fs::create_dir_all(&root)?;
+        let temp = root.join(format!(
+            ".{}.tmp-{}",
+            artifact.artifact_id,
+            std::process::id()
+        ));
+        if temp.exists() {
+            fs::remove_dir_all(&temp)?;
+        }
+        fs::create_dir_all(&temp)?;
+
+        let write_synced = |path: &Path, bytes: &[u8]| -> io::Result<()> {
+            let mut file = fs::File::create(path)?;
+            file.write_all(bytes)?;
+            file.sync_all()
+        };
+        write_synced(&temp.join("manifest.json"), &artifact.manifest_json)?;
+        let actor_ids = artifact
+            .actor_semantic_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_synced(&temp.join("actor-semantic-ids.txt"), actor_ids.as_bytes())?;
+        write_synced(&temp.join("module.nbc"), &artifact.nbc_bytes)?;
+        write_synced(
+            &temp.join("payload.blake3"),
+            hex::encode(artifact.payload_digest).as_bytes(),
+        )?;
+        fs::rename(&temp, &target)?;
+        Ok(())
+    }
+
+    fn load_artifact(&self, artifact_id: ArtifactId) -> io::Result<Option<RetainedArtifact>> {
+        let dir = self.artifact_dir(artifact_id);
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let manifest_json = fs::read(dir.join("manifest.json"))?;
+        let actor_ids_text = fs::read_to_string(dir.join("actor-semantic-ids.txt"))?;
+        let actor_semantic_ids = actor_ids_text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                line.trim()
+                    .parse::<SemanticId>()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let nbc_bytes = fs::read(dir.join("module.nbc"))?;
+        let digest_text = fs::read_to_string(dir.join("payload.blake3"))?;
+        let digest_vec = hex::decode(digest_text.trim())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let payload_digest: [u8; 32] = digest_vec.try_into().map_err(|v: Vec<u8>| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("artifact payload digest must be 32 bytes, got {}", v.len()),
+            )
+        })?;
+        let retained = RetainedArtifact {
+            artifact_id,
+            manifest_json,
+            actor_semantic_ids,
+            nbc_bytes,
+            payload_digest,
+        };
+        retained.restore_module(artifact_id)?;
+        Ok(Some(retained))
     }
 }
 
