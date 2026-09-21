@@ -3227,16 +3227,21 @@ impl Runtime {
                 .map(|((_, name), id)| (name.clone(), id.0))
                 .collect()
         });
-        let semantic_id = self
+        let module = self
             .actors
             .get(&actor_id)
-            .and_then(|actor| actor.bytecode_module.as_ref())
+            .and_then(|actor| actor.bytecode_module.as_ref());
+        let semantic_id = module
             .and_then(|module| module.semantic_id)
+            .map(|id| id.to_string());
+        let artifact_id = module
+            .and_then(crate::bytecode::CodeModule::artifact_id)
             .map(|id| id.to_string());
         Some(ActorSnapshot {
             actor_id,
             sequence,
             semantic_id,
+            artifact_id,
             state,
             waiting_signal,
             crdt_snapshot,
@@ -6752,6 +6757,7 @@ impl Runtime {
         // verifiable artifact manifest.
         let mut replicated_snapshot = snapshot.clone();
         replicated_snapshot.semantic_id = None;
+        replicated_snapshot.artifact_id = None;
         let Ok(snapshot_json) = serde_json::to_vec(&replicated_snapshot) else {
             return;
         };
