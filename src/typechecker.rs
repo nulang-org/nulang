@@ -1636,6 +1636,7 @@ impl TypeChecker {
                 state_fields,
                 behaviors,
                 events,
+                version,
                 migrations,
                 span,
                 ..
@@ -1645,6 +1646,7 @@ impl TypeChecker {
                 state_fields,
                 behaviors,
                 events,
+                *version,
                 migrations,
                 *span,
             ),
@@ -3599,8 +3601,9 @@ impl TypeChecker {
         state_fields: &[(String, crate::ast::StateModel, Type, Expr)],
         behaviors: &[Behavior],
         events: &[crate::ast::EventDecl],
+        version: u32,
         migrations: &[crate::ast::MigrationDecl],
-        _span: Span,
+        span: Span,
     ) -> NuResult<(Substitution, Type)> {
         // The actor's own name must be in scope inside its behaviors so an
         // actor can `spawn`/`send`/`ask` its own type (recursive actor graphs,
@@ -3672,13 +3675,124 @@ impl TypeChecker {
             let (_s, _body_ty) = self.infer_expr(&behavior_ctx, &behavior.body)?;
         }
 
-        // Typecheck migration contracts: state_body and event_migration handlers
+        // Migration contracts are part of durable schema compatibility, so
+        // reject malformed version graphs before any runtime can persist them.
+        if version == 0 {
+            return Err(NuError::type_error(
+                "entity schema version must be at least 1".to_string(),
+                span,
+            ));
+        }
+        if !migrations.is_empty() {
+            let mut ordered: Vec<&crate::ast::MigrationDecl> = migrations.iter().collect();
+            ordered.sort_by_key(|migration| (migration.from_version, migration.to_version));
+
+            for (index, migration) in ordered.iter().enumerate() {
+                let expected_to = migration.from_version.checked_add(1).ok_or_else(|| {
+                    NuError::type_error(
+                        format!(
+                            "migration from version {} overflows the schema version range",
+                            migration.from_version
+                        ),
+                        migration.span,
+                    )
+                })?;
+                if migration.from_version == 0 || migration.to_version == 0 {
+                    return Err(NuError::type_error(
+                        "migration versions must be positive integers".to_string(),
+                        migration.span,
+                    ));
+                }
+                if migration.to_version != expected_to {
+                    return Err(NuError::type_error(
+                        format!(
+                            "migration must advance exactly one schema version: expected {} -> {}, found {} -> {}",
+                            migration.from_version,
+                            expected_to,
+                            migration.from_version,
+                            migration.to_version
+                        ),
+                        migration.span,
+                    ));
+                }
+                if migration.to_version > version {
+                    return Err(NuError::type_error(
+                        format!(
+                            "migration {} -> {} targets schema version beyond entity version {}",
+                            migration.from_version, migration.to_version, version
+                        ),
+                        migration.span,
+                    ));
+                }
+                if index > 0 {
+                    let previous = ordered[index - 1];
+                    if migration.from_version != previous.to_version {
+                        return Err(NuError::type_error(
+                            format!(
+                                "migration chain has a gap or duplicate edge between {} -> {} and {} -> {}",
+                                previous.from_version,
+                                previous.to_version,
+                                migration.from_version,
+                                migration.to_version
+                            ),
+                            migration.span,
+                        ));
+                    }
+                }
+            }
+
+            let final_version = ordered.last().expect("non-empty migration set").to_version;
+            if final_version != version {
+                return Err(NuError::type_error(
+                    format!(
+                        "migration chain ends at schema version {}, but entity declares version {}",
+                        final_version, version
+                    ),
+                    span,
+                ));
+            }
+        }
+
+        // Typecheck migration bodies in an entity-aware scope. Event migration
+        // parameters describe historical payloads, whose old types may no
+        // longer exist in the current schema, so bind them as fresh variables;
+        // emitted replacement events are still checked against the current
+        // entity event declarations.
+        let mut migration_ctx = ctx.clone();
+        migration_ctx.bind(name.to_string(), self_ty.clone(), Capability::Ref, false);
+        if !events.is_empty() {
+            migration_ctx.set_entity_events(
+                events
+                    .iter()
+                    .map(|event| (event.name.clone(), event.params.clone()))
+                    .collect(),
+            );
+        }
         for migration in migrations {
             if let Some(ref state_body) = migration.state_body {
-                let _ = self.infer_expr(ctx, state_body)?;
+                let _ = self.infer_expr(&migration_ctx, state_body)?;
             }
-            for (_ev_name, _ev_params, ev_body) in &migration.event_migrations {
-                let _ = self.infer_expr(ctx, ev_body)?;
+            for (event_name, event_params, event_body) in &migration.event_migrations {
+                let mut event_ctx = migration_ctx.clone();
+                for param in event_params {
+                    event_ctx.bind(
+                        param.clone(),
+                        Type::Var(TypeVar::fresh()),
+                        Capability::Ref,
+                        false,
+                    );
+                }
+                // RFC 0008's catch-all syntax is `| other => other`: the
+                // event token itself is the bound pass-through value.
+                if event_name == "other" && event_params.is_empty() {
+                    event_ctx.bind(
+                        event_name.clone(),
+                        Type::Var(TypeVar::fresh()),
+                        Capability::Ref,
+                        false,
+                    );
+                }
+                let _ = self.infer_expr(&event_ctx, event_body)?;
             }
         }
 
@@ -5848,5 +5962,121 @@ mod tests {
         let expr = bin(BinOp::Range, int_lit(0), string_lit("hello"));
         let result = tc.infer_expr(&TypeContext::new(), &expr);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC 0008 migration-contract validation
+
+    #[test]
+    fn test_migration_rejects_skipped_version_pair() {
+        let result = check_src(
+            r#"
+            entity Counter {
+                version: 3
+                state count: Int = 0
+                migration from 1 to 3 {
+                    state => { 0 }
+                }
+            }
+            "#,
+        );
+        let err = result.expect_err("1 -> 3 must be rejected");
+        assert!(
+            err.to_string()
+                .contains("advance exactly one schema version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_migration_rejects_downgrade_pair() {
+        let result = check_src(
+            r#"
+            entity Counter {
+                version: 2
+                state count: Int = 0
+                migration from 2 to 1 {
+                    state => { 0 }
+                }
+            }
+            "#,
+        );
+        let err = result.expect_err("2 -> 1 must be rejected");
+        assert!(
+            err.to_string()
+                .contains("advance exactly one schema version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_migration_rejects_gap_in_declared_chain() {
+        let result = check_src(
+            r#"
+            entity Counter {
+                version: 4
+                state count: Int = 0
+                migration from 1 to 2 {
+                    state => { 0 }
+                }
+                migration from 3 to 4 {
+                    state => { 0 }
+                }
+            }
+            "#,
+        );
+        let err = result.expect_err("a gap in the migration chain must be rejected");
+        assert!(
+            err.to_string().contains("migration chain has a gap"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_migration_event_parameters_are_bound() {
+        let result = check_src(
+            r#"
+            entity Counter {
+                version: 2
+                state count: Int = 0
+                events
+                    | Bumped(by: Int)
+                migration from 1 to 2 {
+                    events {
+                        | Bumped(by) => emit Bumped(by)
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(
+            result.is_ok(),
+            "migration event parameters must be in scope: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_migration_catchall_value_is_bound() {
+        let result = check_src(
+            r#"
+            entity Counter {
+                version: 2
+                state count: Int = 0
+                events
+                    | Bumped(by: Int)
+                migration from 1 to 2 {
+                    events {
+                        | other => other
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(
+            result.is_ok(),
+            "migration catch-all value must be in scope: {:?}",
+            result.err()
+        );
     }
 }

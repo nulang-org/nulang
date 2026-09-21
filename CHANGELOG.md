@@ -42,6 +42,9 @@ version + migration.*
 
 ## Stable tier
 
+### Migration contract compile-time safety — 2026-09-21
+- **RFC 0008 validation hardening** (Experimental, `src/typechecker.rs`, `src/effect_checker.rs`). Migration edges must advance exactly one positive schema version, declared chains must be contiguous and end at the entity's current version, migration event parameters/catch-all values are bound during typechecking, and migration state/event bodies are required to have an empty effect row. Runtime replay/migration execution remains unimplemented; this change prevents malformed or effectful contracts from being accepted as valid source.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
