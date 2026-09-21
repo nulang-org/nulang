@@ -42,6 +42,10 @@ version + migration.*
 
 ## Stable tier
 
+### Behavior Manifest Cloud admission — 2026-09-21
+- **Nulang Cloud deploys now carry compiler-owned, artifact-bound behavior contracts** (Experimental, `src/web/adapters/nulang_cloud.rs`, `src/package/commands.rs`, `src/main.rs`). Behavior Manifests can now be emitted for frozen NBC v1 artifacts without changing NBC bytes; `nula deploy` always generates and locally verifies the NBC manifest before packaging, and optional Wasm artifacts receive a distinct manifest rather than reusing the NBC contract. Cloud admission verifies the exact schema/language version, artifact kind and BLAKE3 digest, complete non-duplicated effect/replay inventory, and then applies explicit platform authority/replay policy. Deployment configuration may reject compiler-declared authority but cannot grant undeclared authority or reinterpret missing effect semantics.
+
+
 ### Compiler-emitted Behavior Manifest — 2026-09-21
 - **RFC 0020 Behavior Manifest emission is now executable tooling** (Experimental,
   `src/behavior_manifest.rs`, `src/main.rs`, `src/package/commands.rs`).

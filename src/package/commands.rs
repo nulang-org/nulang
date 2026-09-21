@@ -2363,20 +2363,75 @@ fn cmd_deploy(
         span: Span::default(),
     })?;
 
-    // Always build .nbc (native bytecode tier).
+    // Always build .nbc (native bytecode tier) and bind a compiler-derived
+    // Behavior Manifest to those exact bytes. Nulang Cloud must consume this
+    // contract instead of reconstructing authority/effect semantics from IR.
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
+    let source_digest = behavior_source_tree_digest(&root, &entry)?;
+    let dependency_digest = behavior_dependency_digest(&root)?;
+
     let nbc_path = nula_dist.join(format!("{}.nbc", name));
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
-    eprintln!("Compiling {} to .nbc...", name);
-    nulang_exe(&["--emit-nbc", "--out", &nbc_path_str, &entry_str])?;
+    let behavior_path = nula_dist.join(format!("{}.behavior.json", name));
+    let behavior_path_str = behavior_path.to_string_lossy().into_owned();
+    eprintln!("Compiling {} to .nbc + Behavior Manifest...", name);
+    let nbc_args = vec![
+        "--emit-nbc".to_string(),
+        "--out".to_string(),
+        nbc_path_str.clone(),
+        "--emit-behavior-manifest".to_string(),
+        behavior_path_str.clone(),
+        "--behavior-package-name".to_string(),
+        manifest.package.name.clone(),
+        "--behavior-package-version".to_string(),
+        manifest.package.version.clone(),
+        "--behavior-source-digest".to_string(),
+        source_digest.clone(),
+        "--behavior-dependency-digest".to_string(),
+        dependency_digest.clone(),
+        entry_str.clone(),
+    ];
+    let nbc_arg_refs: Vec<&str> = nbc_args.iter().map(String::as_str).collect();
+    nulang_exe(&nbc_arg_refs)?;
+    validate_cloud_behavior_manifest(
+        &behavior_path,
+        crate::behavior_manifest::ArtifactKind::Bytecode,
+        &nbc_path,
+    )?;
 
-    // Optionally build .wasm + .cwasm (WASM tier).
+    // Optionally build .wasm + .cwasm (WASM tier). It gets a distinct
+    // artifact-bound manifest; the NBC manifest must never be reused for Wasm.
     if wasm {
         let wasm_path = nula_dist.join(format!("{}.wasm", name));
         let wasm_path_str = wasm_path.to_string_lossy().into_owned();
-        eprintln!("Compiling {} to .wasm + .cwasm...", name);
-        nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+        let wasm_behavior_path = nula_dist.join(format!("{}.wasm.behavior.json", name));
+        let wasm_behavior_path_str = wasm_behavior_path.to_string_lossy().into_owned();
+        eprintln!("Compiling {} to .wasm + .cwasm + Behavior Manifest...", name);
+        let wasm_args = vec![
+            "--backend".to_string(),
+            "wasm-aot".to_string(),
+            "--out".to_string(),
+            wasm_path_str.clone(),
+            "--emit-behavior-manifest".to_string(),
+            wasm_behavior_path_str.clone(),
+            "--behavior-package-name".to_string(),
+            manifest.package.name.clone(),
+            "--behavior-package-version".to_string(),
+            manifest.package.version.clone(),
+            "--behavior-source-digest".to_string(),
+            source_digest.clone(),
+            "--behavior-dependency-digest".to_string(),
+            dependency_digest.clone(),
+            entry_str.clone(),
+        ];
+        let wasm_arg_refs: Vec<&str> = wasm_args.iter().map(String::as_str).collect();
+        nulang_exe(&wasm_arg_refs)?;
+        validate_cloud_behavior_manifest(
+            &wasm_behavior_path,
+            crate::behavior_manifest::ArtifactKind::WasmModule,
+            &wasm_path,
+        )?;
     }
 
     // Bundle into .tar.gz: .nula/dist/ contents + dist/** + Nulang.toml + Nulang.lock.
@@ -2436,6 +2491,15 @@ fn cmd_deploy(
             println!("Required cloud config:");
             for entry in &ir.cloud_config {
                 println!("  {} (required by {})", entry.key, entry.required_by);
+            }
+        }
+        if adapter == crate::web::adapters::AdapterKind::NulangCloud {
+            println!("Behavior Manifest: .nula/dist/{}.behavior.json (verified)", name);
+            if wasm {
+                println!(
+                    "WASM Behavior Manifest: .nula/dist/{}.wasm.behavior.json (verified)",
+                    name
+                );
             }
         }
         println!(
@@ -2508,6 +2572,54 @@ fn cmd_deploy(
 ) -> NuResult<()> {
     Err(NuError::PackageError {
         msg: "cloud deploy requires the 'ureq' feature (build with --features ureq)".to_string(),
+        span: Span::default(),
+    })
+}
+
+/// Parse and verify the compiler contract against the exact artifact that
+/// will be included in the deployment bundle. This is contract verification
+/// only; the remote control plane still applies tenant/platform policy.
+#[cfg(feature = "ureq")]
+fn validate_cloud_behavior_manifest(
+    manifest_path: &Path,
+    artifact_kind: crate::behavior_manifest::ArtifactKind,
+    artifact_path: &Path,
+) -> NuResult<crate::web::adapters::nulang_cloud::CloudAdmissionPlan> {
+    let manifest_json =
+        std::fs::read_to_string(manifest_path).map_err(|e| NuError::PackageError {
+            msg: format!(
+                "cannot read Behavior Manifest '{}': {}",
+                manifest_path.display(),
+                e
+            ),
+            span: Span::default(),
+        })?;
+    let manifest: crate::behavior_manifest::BehaviorManifest =
+        serde_json::from_str(&manifest_json).map_err(|e| NuError::PackageError {
+            msg: format!(
+                "invalid Behavior Manifest '{}': {}",
+                manifest_path.display(),
+                e
+            ),
+            span: Span::default(),
+        })?;
+    let artifact_bytes = std::fs::read(artifact_path).map_err(|e| NuError::PackageError {
+        msg: format!(
+            "cannot read deployment artifact '{}': {}",
+            artifact_path.display(),
+            e
+        ),
+        span: Span::default(),
+    })?;
+
+    crate::web::adapters::nulang_cloud::admit_behavior_manifest(
+        &manifest,
+        artifact_kind,
+        &artifact_bytes,
+        &crate::web::adapters::nulang_cloud::CloudAdmissionPolicy::contract_verification_only(),
+    )
+    .map_err(|e| NuError::PackageError {
+        msg: format!("Nulang Cloud deployment contract rejected: {}", e),
         span: Span::default(),
     })
 }
@@ -3231,6 +3343,25 @@ app "counter" {
         let ir = std::fs::read_to_string(dir.join("dist/nulang-app.ir.json")).unwrap();
         assert!(ir.contains("\"version\": 1"), "IR should contain version");
         assert!(ir.contains("routes"), "IR should contain routes");
+
+        let nbc_path = dir.join(".nula/dist/dryrun-app.nbc");
+        let behavior_path = dir.join(".nula/dist/dryrun-app.behavior.json");
+        assert!(nbc_path.exists(), "NBC deployment artifact should exist");
+        assert!(
+            behavior_path.exists(),
+            "Cloud deploy must emit an artifact-bound Behavior Manifest"
+        );
+        let plan = validate_cloud_behavior_manifest(
+            &behavior_path,
+            crate::behavior_manifest::ArtifactKind::Bytecode,
+            &nbc_path,
+        )
+        .expect("generated Cloud deployment contract should verify");
+        assert_eq!(plan.package_name, "dryrun-app");
+        assert_eq!(
+            plan.artifact_kind,
+            crate::behavior_manifest::ArtifactKind::Bytecode
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
