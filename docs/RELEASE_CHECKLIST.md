@@ -50,3 +50,17 @@
 - [ ] `CHANGELOG.md` includes all user-visible changes since the last release
 - [ ] `README.md` links are valid (GitHub, website, docs)
 - [ ] `examples/README.md` is up to date with the current example count
+- [ ] README's platform list matches `.github/workflows/release.yml`
+
+## Post-publish artifact verification
+
+After the tag workflow publishes the release:
+
+- [ ] Linux x86_64 archive + `.sha256` are present
+- [ ] Linux aarch64 archive + `.sha256` are present
+- [ ] macOS aarch64 archive + `.sha256` are present
+- [ ] Windows x86_64 archive + `.sha256` are present
+- [ ] Every published checksum verifies against its archive
+- [ ] Extract each native-host archive and run `nulang --version`
+- [ ] Follow the README install commands from a clean environment rather than
+      relying on a maintainer checkout
