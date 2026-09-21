@@ -210,15 +210,18 @@ fn request_body(bindings: &[RouteBindingContract]) -> Option<Value> {
     }) {
         let codec = binding.codec.as_ref()?;
         let schema = json_payload_schema(codec.payload_type.as_deref());
+        let mut content = Map::new();
+        content.insert(
+            codec.media_type.clone(),
+            json!({
+                "schema": schema,
+                "x-nulang-codec": codec.codec.as_str(),
+                "x-nulang-handler-param": binding.handler_param,
+            }),
+        );
         return Some(json!({
             "required": true,
-            "content": {
-                codec.media_type.clone(): {
-                    "schema": schema,
-                    "x-nulang-codec": format!("{:?}", codec.codec).to_ascii_lowercase(),
-                    "x-nulang-handler-param": binding.handler_param,
-                }
-            }
+            "content": Value::Object(content),
         }));
     }
 
