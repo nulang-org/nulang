@@ -542,11 +542,25 @@ pub(crate) fn perform_realtime_builtin(
 /// and allocate on the current actor's heap.
 pub struct RuntimeVmCallbacks {
     runtime: Rc<RefCell<Runtime>>,
+    deny_ambient_host_effects: bool,
 }
 
 impl RuntimeVmCallbacks {
     pub fn new(runtime: Rc<RefCell<Runtime>>) -> Self {
-        RuntimeVmCallbacks { runtime }
+        RuntimeVmCallbacks {
+            runtime,
+            deny_ambient_host_effects: false,
+        }
+    }
+
+    /// Create top-level runtime callbacks that deny external host authority
+    /// when execution is not currently inside an actor. Actor-backed effects
+    /// still use their exact typed authority manifests.
+    pub fn new_sandboxed(runtime: Rc<RefCell<Runtime>>) -> Self {
+        RuntimeVmCallbacks {
+            runtime,
+            deny_ambient_host_effects: true,
+        }
     }
 
     /// Allocate a fresh heap string via `self.alloc` (the current actor's
@@ -597,6 +611,9 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
 
     fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
         let rt = self.runtime.borrow();
+        if self.deny_ambient_host_effects && rt.current_actor.is_none() {
+            return false;
+        }
         authorize_actor_ffi(&rt, rt.current_actor, library, symbol).is_ok()
     }
 
@@ -1041,14 +1058,32 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             if let Some(result) = rt.check_test_handler(&qualified, regs) {
                 return Some(result);
             }
-            if let Err(error) = authorize_actor_host_effect(
-                &rt,
-                rt.current_actor,
-                effect_name,
-                op_name,
-                &module.constants,
-                regs,
-            ) {
+            let ambient_denied = if self.deny_ambient_host_effects && rt.current_actor.is_none() {
+                match required_host_authority(
+                    effect_name,
+                    op_name,
+                    &module.constants,
+                    regs,
+                ) {
+                    Ok(Some(_)) => Some("sandboxed top-level execution has no ambient host authority".to_string()),
+                    Ok(None) => None,
+                    Err(error) => Some(error),
+                }
+            } else {
+                None
+            };
+            let authorization = match ambient_denied {
+                Some(error) => Err(error),
+                None => authorize_actor_host_effect(
+                    &rt,
+                    rt.current_actor,
+                    effect_name,
+                    op_name,
+                    &module.constants,
+                    regs,
+                ),
+            };
+            if let Err(error) = authorization {
                 tracing::warn!(
                     actor_id = ?rt.current_actor,
                     effect = %qualified,
