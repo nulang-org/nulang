@@ -7318,3 +7318,26 @@ fn perf_disabled_flight_recorder_is_a_noop() {
     recorder.record(7, 3, &[Value::int(42), Value::bool(true)]);
     assert!(recorder.is_empty());
 }
+
+
+#[test]
+fn perf_actor_turn_clears_trace_context() {
+    fn noop(_actor: &mut Actor, _args: &[Value]) {}
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("noop", noop);
+
+    let root = TraceContext::root();
+    rt.current_trace = Some(root);
+    rt.send_message_by_id(actor_id, 0, &[]);
+    rt.step_actor(actor_id);
+
+    assert!(
+        rt.current_trace.is_none(),
+        "trace context must not leak beyond the actor turn"
+    );
+}
