@@ -112,10 +112,15 @@ two major versions.*
   content encoding rather than information-erasing NTIR.
 
 ### Actor dispatch soundness — 2026-09-20
-- **Fail-closed behavior-name resolution** (Stable runtime correction). Local,
-  cross-shard, and remote actor sends no longer map an unknown behavior name to
-  behavior id 0. Name resolution remains on the owning runtime/shard, fetched
-  or hot-reloaded code must still declare the requested behavior, invalid
+- **Fail-closed behavior-name resolution** (Stable runtime correction). Actors
+  with a declared native or bytecode behavior surface reject unknown names
+  across local, cross-shard, and remote delivery; an unknown name can never
+  alias a real behavior id 0 handler. Metadata-free low-level actors created
+  directly through `Runtime::spawn_actor` retain raw mailbox admission through
+  inert id 0 for Rust-embedder/runtime compatibility; by definition those
+  actors have no handler at id 0, so this compatibility path cannot execute
+  user code. Name resolution remains on the owning runtime/shard, fetched or
+  hot-reloaded code must still declare the requested behavior, invalid
   synchronous numeric asks fail explicitly, and a genuinely declared behavior
   id 0 remains valid.
 
