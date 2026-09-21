@@ -52,7 +52,8 @@ checksum, then put the extracted executable on your PATH.
 Linux x86_64 example:
 
 ```bash
-sha256sum -c nulang-linux-x86_64.tar.gz.sha256
+sha256sum nulang-linux-x86_64.tar.gz
+cat nulang-linux-x86_64.tar.gz.sha256  # compare the published digest
 tar xzf nulang-linux-x86_64.tar.gz
 install -m 0755 nulang-linux-x86_64 ~/.local/bin/nulang
 ```
