@@ -340,7 +340,7 @@ pub fn stringify(value: JsonValue) -> String {
 /// Returns Some(value) only when `obj` is an object containing `key`.
 /// A present JSON null is therefore distinct from an absent key:
 /// `Some(JsonNull)` versus `None`.
-pub fn get(obj: JsonValue, key: String) -> Option[JsonValue] {
+pub fn get_field(obj: JsonValue, key: String) -> Option[JsonValue] {
     match obj {
         JsonObject(fields) => {
             var i = 0;
@@ -383,7 +383,7 @@ pub fn as_bool(value: JsonValue) -> Option[Bool] {
 /// Strict string-field lookup. Missing keys, non-object inputs, and wrong
 /// field types all return None instead of collapsing into a caller default.
 pub fn get_string_opt(obj: JsonValue, key: String) -> Option[String] {
-    match get(obj, key) {
+    match get_field(obj, key) {
         Some(value) => as_string(value),
         None => None,
     }
@@ -391,7 +391,7 @@ pub fn get_string_opt(obj: JsonValue, key: String) -> Option[String] {
 
 /// Strict numeric-field lookup.
 pub fn get_number_opt(obj: JsonValue, key: String) -> Option[Float] {
-    match get(obj, key) {
+    match get_field(obj, key) {
         Some(value) => as_number(value),
         None => None,
     }
@@ -399,7 +399,7 @@ pub fn get_number_opt(obj: JsonValue, key: String) -> Option[Float] {
 
 /// Strict boolean-field lookup.
 pub fn get_bool_opt(obj: JsonValue, key: String) -> Option[Bool] {
-    match get(obj, key) {
+    match get_field(obj, key) {
         Some(value) => as_bool(value),
         None => None,
     }
