@@ -1038,6 +1038,26 @@ fn send_actor_admission(
     }
 }
 
+fn reject_remote_delivery(
+    runtime: &mut Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    sender: u64,
+    admission: Option<(NodeId, u64)>,
+    reason: &str,
+) {
+    notify_delivery_failed(runtime, sender, reason);
+    if let Some((node, delivery_id)) = admission {
+        send_actor_admission(
+            transport,
+            cluster,
+            node,
+            Some(delivery_id),
+            ActorAdmissionStatus::Rejected,
+        );
+    }
+}
+
 fn ack_packet(
     transport: &mut dyn NetworkTransport,
     cluster: &ClusterState,
@@ -1308,25 +1328,17 @@ pub fn process_network_packets(
                             if let Some(messages) = pending {
                                 for mut pending in messages {
                                     let admission = pending.admission;
-                                    let mut reject = |runtime: &mut Runtime,
-                                                      reason: &str| {
-                                        notify_delivery_failed(runtime, pending.msg.sender, reason);
-                                        if let Some((node, delivery_id)) = admission {
-                                            send_actor_admission(
-                                                transport,
-                                                cluster,
-                                                node,
-                                                Some(delivery_id),
-                                                ActorAdmissionStatus::Rejected,
-                                            );
-                                        }
-                                    };
+                                    let sender = pending.msg.sender;
 
                                     let cached = match runtime.behavior_cache.get(&content_hash) {
                                         Some(cached) => cached.clone(),
                                         None => {
-                                            reject(
+                                            reject_remote_delivery(
                                                 runtime,
+                                                transport,
+                                                cluster,
+                                                sender,
+                                                admission,
                                                 "bytecode fetch succeeded but cache miss on retry",
                                             );
                                             continue;
@@ -1344,7 +1356,14 @@ pub fn process_network_packets(
                                             &pending.behavior_name,
                                         )
                                     else {
-                                        reject(runtime, "unknown behavior after fetch");
+                                        reject_remote_delivery(
+                                            runtime,
+                                            transport,
+                                            cluster,
+                                            sender,
+                                            admission,
+                                            "unknown behavior after fetch",
+                                        );
                                         continue;
                                     };
                                     pending.msg.behavior_id = behavior_id;
@@ -1354,8 +1373,12 @@ pub fn process_network_packets(
                                         pending.msg.behavior_id,
                                         &content_hash,
                                     ) {
-                                        reject(
+                                        reject_remote_delivery(
                                             runtime,
+                                            transport,
+                                            cluster,
+                                            sender,
+                                            admission,
                                             "behavior content hash still mismatched after fetch",
                                         );
                                         continue;
@@ -1368,7 +1391,14 @@ pub fn process_network_packets(
                                         &mut payload_vec,
                                         &pending.string_table,
                                     ) {
-                                        reject(runtime, "string intern failed on retry");
+                                        reject_remote_delivery(
+                                            runtime,
+                                            transport,
+                                            cluster,
+                                            sender,
+                                            admission,
+                                            "string intern failed on retry",
+                                        );
                                         continue;
                                     }
                                     if !intern_wire_objects(
@@ -1376,7 +1406,14 @@ pub fn process_network_packets(
                                         &mut payload_vec,
                                         &pending.object_table,
                                     ) {
-                                        reject(runtime, "object intern failed on retry");
+                                        reject_remote_delivery(
+                                            runtime,
+                                            transport,
+                                            cluster,
+                                            sender,
+                                            admission,
+                                            "object intern failed on retry",
+                                        );
                                         continue;
                                     }
                                     pending.msg.payload = Arc::new(payload_vec);
