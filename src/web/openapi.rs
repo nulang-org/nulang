@@ -346,6 +346,7 @@ mod tests {
             handler_param: format!("handler_{name}"),
             handler_index: 0,
             ty: Some(ty.to_string()),
+            codec: None,
         }
     }
 
