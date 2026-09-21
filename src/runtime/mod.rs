@@ -1347,7 +1347,7 @@ impl Runtime {
 
         let msg = Message {
             behavior_id,
-            payload: Arc::new(payload),
+            payload: Arc::from(payload),
             sender,
             priority: MessagePriority::Normal,
             trace_id: trace_id.clone(),
@@ -2836,7 +2836,7 @@ impl Runtime {
         if let Some(actor) = self.actors.get_mut(&dlq_id) {
             let _ = actor.mailbox.push_local(Message {
                 behavior_id: 0,
-                payload: Arc::new(vec![Value::int(1)]),
+                payload: Arc::from(vec![Value::int(1)]),
                 sender: 0, // DLQ system message has no sender
                 priority: MessagePriority::System,
                 trace_id: None,
