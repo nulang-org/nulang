@@ -185,7 +185,7 @@ pub(crate) fn reap_living_actor(rt: &mut Runtime, actor_id: u64, reason: ExitRea
             if traps {
                 let exit_msg = Message {
                     behavior_id: 0,
-                    payload: Arc::new(vec![
+                    payload: Arc::from(vec![
                         Value::int(actor_id as i64),
                         Value::int(linked_id as i64),
                     ]),
@@ -326,7 +326,7 @@ pub(crate) fn send_down_message(
     let reason_str = reason.tag();
     let down_msg = Message {
         behavior_id: 0,
-        payload: Arc::new(vec![
+        payload: Arc::from(vec![
             Value::int(target_id as i64),
             Value::int(watcher_id as i64),
             Value::int(match reason {
