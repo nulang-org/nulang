@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::persistence_schema::{decode_record, encode_record, LEGACY_SCHEMA_VERSION};
 use crate::vm::Value;
 
 use tracing::warn;
@@ -259,6 +260,33 @@ pub trait PersistenceStore: Send + Sync {
     /// Load the latest snapshot for an actor, if any.
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot>;
 
+    /// Persist a snapshot together with the durable entity schema version that
+    /// produced it. Legacy/custom backends inherit a fail-closed default: they
+    /// may persist v1 snapshots through the historical API, but must explicitly
+    /// implement this method before accepting newer schemas.
+    fn save_snapshot_versioned(
+        &mut self,
+        snapshot: ActorSnapshot,
+        schema_version: u32,
+    ) -> io::Result<()> {
+        if schema_version != LEGACY_SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "persistence backend cannot preserve schema version {schema_version}; version-aware snapshot support is required"
+                ),
+            ));
+        }
+        self.save_snapshot(snapshot)
+    }
+
+    /// Load a snapshot together with its producing schema version. Historical
+    /// backends that do not store provenance explicitly are interpreted as v1.
+    fn load_snapshot_versioned(&self, actor_id: u64) -> Option<(u32, ActorSnapshot)> {
+        self.load_snapshot(actor_id)
+            .map(|snapshot| (LEGACY_SCHEMA_VERSION, snapshot))
+    }
+
     /// Append a message to the actor's journal.
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()>;
 
@@ -409,6 +437,7 @@ pub trait PersistenceStore: Send + Sync {
 #[derive(Debug, Default, Clone)]
 pub struct MemoryStore {
     snapshots: HashMap<u64, ActorSnapshot>,
+    snapshot_versions: HashMap<u64, u32>,
     journals: HashMap<u64, Vec<JournalEntry>>,
     workflow_events: HashMap<u64, Vec<WorkflowEvent>>,
     events: HashMap<u64, Vec<EventEntry>>,
@@ -422,12 +451,39 @@ impl MemoryStore {
 
 impl PersistenceStore for MemoryStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
-        self.snapshots.insert(snapshot.actor_id, snapshot);
-        Ok(())
+        self.save_snapshot_versioned(snapshot, LEGACY_SCHEMA_VERSION)
     }
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
-        self.snapshots.get(&actor_id).cloned()
+        self.load_snapshot_versioned(actor_id)
+            .map(|(_, snapshot)| snapshot)
+    }
+
+    fn save_snapshot_versioned(
+        &mut self,
+        snapshot: ActorSnapshot,
+        schema_version: u32,
+    ) -> io::Result<()> {
+        if schema_version == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "schema version must be >= 1",
+            ));
+        }
+        let actor_id = snapshot.actor_id;
+        self.snapshots.insert(actor_id, snapshot);
+        self.snapshot_versions.insert(actor_id, schema_version);
+        Ok(())
+    }
+
+    fn load_snapshot_versioned(&self, actor_id: u64) -> Option<(u32, ActorSnapshot)> {
+        let snapshot = self.snapshots.get(&actor_id).cloned()?;
+        let version = self
+            .snapshot_versions
+            .get(&actor_id)
+            .copied()
+            .unwrap_or(LEGACY_SCHEMA_VERSION);
+        Some((version, snapshot))
     }
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
@@ -492,6 +548,7 @@ impl PersistenceStore for MemoryStore {
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         self.snapshots.remove(&actor_id);
+        self.snapshot_versions.remove(&actor_id);
         self.journals.remove(&actor_id);
         self.workflow_events.remove(&actor_id);
         self.events.remove(&actor_id);
@@ -537,10 +594,23 @@ impl JsonFileStore {
 
 impl PersistenceStore for JsonFileStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        self.save_snapshot_versioned(snapshot, LEGACY_SCHEMA_VERSION)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.load_snapshot_versioned(actor_id)
+            .map(|(_, snapshot)| snapshot)
+    }
+
+    fn save_snapshot_versioned(
+        &mut self,
+        snapshot: ActorSnapshot,
+        schema_version: u32,
+    ) -> io::Result<()> {
         let dir = self.actor_dir(snapshot.actor_id);
         fs::create_dir_all(&dir)?;
         let path = self.snapshot_path(snapshot.actor_id);
-        let json = serde_json::to_string_pretty(&snapshot)
+        let json = encode_record(&snapshot, schema_version)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // Write to a temp file in the same directory, then atomically rename
         // it into place: a crash mid-write can no longer leave a truncated
@@ -555,12 +625,12 @@ impl PersistenceStore for JsonFileStore {
         Ok(())
     }
 
-    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+    fn load_snapshot_versioned(&self, actor_id: u64) -> Option<(u32, ActorSnapshot)> {
         let path = self.snapshot_path(actor_id);
         // A missing file is the normal "no snapshot yet" case — stay silent.
         let data = fs::read_to_string(&path).ok()?;
-        match serde_json::from_str(&data) {
-            Ok(snapshot) => Some(snapshot),
+        match decode_record::<ActorSnapshot>(&data) {
+            Ok(decoded) => Some((decoded.schema_version, decoded.record)),
             Err(e) => {
                 // A present-but-unparseable snapshot means corruption (e.g. an
                 // older non-atomic write); log it instead of silently resetting
@@ -860,6 +930,7 @@ impl LibsqlStore {
                 "CREATE TABLE IF NOT EXISTS snapshots (
                     actor_id INTEGER PRIMARY KEY,
                     sequence INTEGER NOT NULL,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
                     state TEXT NOT NULL,
                     waiting_signal TEXT,
                     crdt_snapshot TEXT,
@@ -870,6 +941,13 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // RFC 0008 schema provenance. Historical rows default to v1.
+            let _ = conn
+                .execute(
+                    "ALTER TABLE snapshots ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+                    (),
+                )
+                .await;
             // Migrate databases created before the waiting_signal column existed.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN waiting_signal TEXT", ())
@@ -991,6 +1069,25 @@ impl LibsqlStore {
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        self.save_snapshot_versioned(snapshot, LEGACY_SCHEMA_VERSION)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.load_snapshot_versioned(actor_id)
+            .map(|(_, snapshot)| snapshot)
+    }
+
+    fn save_snapshot_versioned(
+        &mut self,
+        snapshot: ActorSnapshot,
+        schema_version: u32,
+    ) -> io::Result<()> {
+        if schema_version == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "schema version must be >= 1",
+            ));
+        }
         let state_json = serde_json::to_string(&snapshot.state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
@@ -1002,30 +1099,38 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
+                "INSERT INTO snapshots (actor_id, sequence, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, schema_version=excluded.schema_version, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
+                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, schema_version as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
 
-    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+    fn load_snapshot_versioned(&self, actor_id: u64) -> Option<(u32, ActorSnapshot)> {
         let conn = self.conn();
         self.rt.block_on(async {
             let mut rows = conn
                 .query(
-                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
+                    "SELECT sequence, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
                     libsql::params![actor_id as i64],
                 )
                 .await
                 .ok()?;
             let row = rows.next().await.ok()??;
             let sequence: i64 = row.get(0).ok()?;
-            let state_json: String = row.get(1).ok()?;
-            let waiting_signal: Option<String> = row.get(2).ok()?;
-            let crdt_json: Option<String> = row.get(3).ok()?;
-            let crdt_field_map_json: Option<String> = row.get(4).ok()?;
-            let authority_json: Option<String> = row.get(5).ok()?;
+            let schema_version: i64 = row.get(1).ok()?;
+            if schema_version <= 0 || schema_version > u32::MAX as i64 {
+                warn!(
+                    "nulang-persist: invalid schema version {} for actor {}",
+                    schema_version, actor_id
+                );
+                return None;
+            }
+            let state_json: String = row.get(2).ok()?;
+            let waiting_signal: Option<String> = row.get(3).ok()?;
+            let crdt_json: Option<String> = row.get(4).ok()?;
+            let crdt_field_map_json: Option<String> = row.get(5).ok()?;
+            let authority_json: Option<String> = row.get(6).ok()?;
             let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
@@ -1048,15 +1153,18 @@ impl PersistenceStore for LibsqlStore {
                 None => BTreeSet::new(),
             };
             let state: HashMap<String, PersistedValue> = serde_json::from_str(&state_json).ok()?;
-            Some(ActorSnapshot {
-                actor_id,
-                sequence: sequence as u64,
-                state,
-                waiting_signal,
-                crdt_snapshot,
-                crdt_field_map,
-                authority_tokens,
-            })
+            Some((
+                schema_version as u32,
+                ActorSnapshot {
+                    actor_id,
+                    sequence: sequence as u64,
+                    state,
+                    waiting_signal,
+                    crdt_snapshot,
+                    crdt_field_map,
+                    authority_tokens,
+                },
+            ))
         })
     }
 
@@ -1383,8 +1491,21 @@ impl RocksDbStore {
 #[cfg(feature = "rocksdb")]
 impl PersistenceStore for RocksDbStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        self.save_snapshot_versioned(snapshot, LEGACY_SCHEMA_VERSION)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.load_snapshot_versioned(actor_id)
+            .map(|(_, snapshot)| snapshot)
+    }
+
+    fn save_snapshot_versioned(
+        &mut self,
+        snapshot: ActorSnapshot,
+        schema_version: u32,
+    ) -> io::Result<()> {
         let cf = self.cf(Self::CF_SNAPSHOTS)?;
-        let json = serde_json::to_string(&snapshot)
+        let json = encode_record(&snapshot, schema_version)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         self.db
             .put_cf(cf, Self::actor_key(snapshot.actor_id), json.as_bytes())
@@ -1396,10 +1517,12 @@ impl PersistenceStore for RocksDbStore {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 
-    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+    fn load_snapshot_versioned(&self, actor_id: u64) -> Option<(u32, ActorSnapshot)> {
         let cf = self.cf(Self::CF_SNAPSHOTS).ok()?;
         let bytes = self.db.get_cf(cf, Self::actor_key(actor_id)).ok()??;
-        serde_json::from_slice(&bytes).ok()
+        let json = std::str::from_utf8(&bytes).ok()?;
+        let decoded = decode_record::<ActorSnapshot>(json).ok()?;
+        Some((decoded.schema_version, decoded.record))
     }
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
@@ -1609,12 +1732,18 @@ impl PostgresStore {
             "CREATE TABLE IF NOT EXISTS snapshots (
                 actor_id BIGINT PRIMARY KEY,
                 sequence BIGINT NOT NULL,
+                schema_version BIGINT NOT NULL DEFAULT 1,
                 state TEXT NOT NULL,
                 waiting_signal TEXT,
                 crdt_snapshot TEXT,
                 crdt_field_map TEXT,
                 authority_tokens TEXT
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS schema_version BIGINT NOT NULL DEFAULT 1",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1664,6 +1793,25 @@ impl PostgresStore {
 #[cfg(feature = "postgres")]
 impl PersistenceStore for PostgresStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        self.save_snapshot_versioned(snapshot, LEGACY_SCHEMA_VERSION)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.load_snapshot_versioned(actor_id)
+            .map(|(_, snapshot)| snapshot)
+    }
+
+    fn save_snapshot_versioned(
+        &mut self,
+        snapshot: ActorSnapshot,
+        schema_version: u32,
+    ) -> io::Result<()> {
+        if schema_version == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "schema version must be >= 1",
+            ));
+        }
         let state_json = serde_json::to_string(&snapshot.state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
@@ -1674,10 +1822,11 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO snapshots (actor_id, sequence, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (actor_id) DO UPDATE SET
                sequence = EXCLUDED.sequence,
+               schema_version = EXCLUDED.schema_version,
                state = EXCLUDED.state,
                waiting_signal = EXCLUDED.waiting_signal,
                crdt_snapshot = EXCLUDED.crdt_snapshot,
@@ -1686,6 +1835,7 @@ impl PersistenceStore for PostgresStore {
             &[
                 &(snapshot.actor_id as i64),
                 &(snapshot.sequence as i64),
+                &(schema_version as i64),
                 &state_json,
                 &snapshot.waiting_signal.as_deref(),
                 &crdt_json.as_str(),
@@ -1697,21 +1847,29 @@ impl PersistenceStore for PostgresStore {
         Ok(())
     }
 
-    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+    fn load_snapshot_versioned(&self, actor_id: u64) -> Option<(u32, ActorSnapshot)> {
         let mut conn = self.conn.lock().unwrap();
         let row = conn
             .query_one(
-                "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens
+                "SELECT sequence, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens
                  FROM snapshots WHERE actor_id = $1",
                 &[&(actor_id as i64)],
             )
             .ok()?;
         let sequence: i64 = row.get(0);
-        let state_json: String = row.get(1);
-        let waiting_signal: Option<String> = row.get(2);
-        let crdt_json: Option<String> = row.get(3);
-        let crdt_field_map_json: Option<String> = row.get(4);
-        let authority_json: Option<String> = row.get(5);
+        let schema_version: i64 = row.get(1);
+        if schema_version <= 0 || schema_version > u32::MAX as i64 {
+            warn!(
+                "nulang-persist: invalid schema version {} for actor {}",
+                schema_version, actor_id
+            );
+            return None;
+        }
+        let state_json: String = row.get(2);
+        let waiting_signal: Option<String> = row.get(3);
+        let crdt_json: Option<String> = row.get(4);
+        let crdt_field_map_json: Option<String> = row.get(5);
+        let authority_json: Option<String> = row.get(6);
         let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> =
             crdt_json.and_then(|j| serde_json::from_str(&j).ok());
         let crdt_field_map: Option<HashMap<String, u64>> =
@@ -1730,15 +1888,18 @@ impl PersistenceStore for PostgresStore {
             None => BTreeSet::new(),
         };
         let state: HashMap<String, PersistedValue> = serde_json::from_str(&state_json).ok()?;
-        Some(ActorSnapshot {
-            actor_id,
-            sequence: sequence as u64,
-            state,
-            waiting_signal,
-            crdt_snapshot,
-            crdt_field_map,
-            authority_tokens,
-        })
+        Some((
+            schema_version as u32,
+            ActorSnapshot {
+                actor_id,
+                sequence: sequence as u64,
+                state,
+                waiting_signal,
+                crdt_snapshot,
+                crdt_field_map,
+                authority_tokens,
+            },
+        ))
     }
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
