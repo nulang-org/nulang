@@ -3,7 +3,7 @@
 import stdlib::map
 
 fn main() {
-    let show = fn(opt) {
+    let show = fn(opt: Option[String]) {
         match opt {
             Some(x) => x,
             None => "None",
