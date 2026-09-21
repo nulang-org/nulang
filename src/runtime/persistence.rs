@@ -33,8 +33,38 @@ impl StateModel {
             StateModel::Durable | StateModel::EventSourced | StateModel::Crdt(_)
         )
     }
+
     pub fn is_crdt(self) -> bool {
         matches!(self, StateModel::Crdt(_))
+    }
+
+    /// Runtime view of the language-level consistency contract.
+    pub const fn consistency(self) -> crate::ast::StateConsistency {
+        match self {
+            StateModel::Local => crate::ast::StateConsistency::Local,
+            StateModel::Durable | StateModel::EventSourced => {
+                crate::ast::StateConsistency::ActorOwned
+            }
+            StateModel::Crdt(_) => crate::ast::StateConsistency::Convergent,
+        }
+    }
+
+    /// Runtime view of the language-level crash-recovery contract.
+    pub const fn durability(self) -> crate::ast::StateDurability {
+        match self {
+            StateModel::Local => crate::ast::StateDurability::Ephemeral,
+            StateModel::Durable | StateModel::Crdt(_) => {
+                crate::ast::StateDurability::SnapshotJournal
+            }
+            StateModel::EventSourced => crate::ast::StateDurability::EventLog,
+        }
+    }
+
+    pub const fn requires_single_writer(self) -> bool {
+        matches!(
+            self.consistency(),
+            crate::ast::StateConsistency::ActorOwned
+        )
     }
 }
 
