@@ -221,7 +221,7 @@ The experimental `Secret[T]` wrapper is an opaque semantic type:
   effect boundaries;
 - secret-bearing values may not cross actor-message or durable-event
   boundaries by default;
-- `Secret.*` operations are the explicit confidentiality-aware boundary.
+- only compiler-recognized `Secret.*` operations may accept protected values; unknown operations fail closed.
 
 This is intentionally independent from `linear` / `lineariso`. A secret may
 be reused legitimately, while linearity governs consumption and aliasing. Both
