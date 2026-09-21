@@ -695,6 +695,7 @@ mod authority_tests {
             true,
             None,
             None,
+            None,
         );
 
         assert_eq!(returned, actor_id);
