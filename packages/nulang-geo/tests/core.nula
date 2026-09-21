@@ -45,4 +45,74 @@ fn main() {
         approx_equal(in_kilometers(one_km), 1.0, 0.000001),
         "distance should convert back to kilometers"
     )
+
+    let route = line_string(
+        [cartesian(0.0, 0.0), cartesian(3.0, 4.0), cartesian(6.0, 4.0)],
+        CARTESIAN
+    );
+    perform Test.assert(is_valid_line_string(route), "three-point line should be valid");
+    perform Test.assert(
+        approx_equal(line_string_length(route), 8.0, 0.000001),
+        "line length should sum segment lengths"
+    );
+
+    let rect = polygon(
+        [cartesian(0.0, 0.0), cartesian(4.0, 0.0), cartesian(4.0, 3.0), cartesian(0.0, 3.0)],
+        CARTESIAN
+    );
+    perform Test.assert(is_valid_polygon(rect), "rectangle should be a valid polygon");
+    perform Test.assert(
+        approx_equal(polygon_area(rect), 12.0, 0.000001),
+        "rectangle area should use the shoelace formula"
+    );
+    perform Test.assert(
+        approx_equal(polygon_perimeter(rect), 14.0, 0.000001),
+        "rectangle perimeter should close the ring implicitly"
+    );
+
+    match polygon_centroid(rect) {
+        Some(center) => {
+            perform Test.assert(
+                approx_equal(center.x, 2.0, 0.000001) &&
+                approx_equal(center.y, 1.5, 0.000001),
+                "rectangle centroid should be at its geometric center"
+            )
+        },
+        None => perform Test.assert(false, "non-degenerate rectangle should have a centroid"),
+    };
+
+    match polygon_envelope(rect) {
+        Some(env) => {
+            perform Test.assert(
+                approx_equal(env.min_x, 0.0, 0.000001) &&
+                approx_equal(env.min_y, 0.0, 0.000001) &&
+                approx_equal(env.max_x, 4.0, 0.000001) &&
+                approx_equal(env.max_y, 3.0, 0.000001),
+                "polygon envelope should cover all vertices"
+            )
+        },
+        None => perform Test.assert(false, "non-empty polygon should have an envelope"),
+    };
+
+    let degenerate = polygon(
+        [cartesian(0.0, 0.0), cartesian(1.0, 1.0), cartesian(2.0, 2.0)],
+        CARTESIAN
+    );
+    match polygon_centroid(degenerate) {
+        Some(_) => perform Test.assert(false, "zero-area polygon should not have a centroid"),
+        None => perform Test.assert(true, "zero-area polygon correctly has no centroid"),
+    };
+
+    perform Test.assert(
+        point_to_wkt(cartesian(2.0, 1.5)) == "POINT (2 1.5)",
+        "point WKT should use x/y coordinate order"
+    );
+    perform Test.assert(
+        line_string_to_wkt(route) == "LINESTRING (0 0, 3 4, 6 4)",
+        "line string WKT should preserve point order"
+    );
+    perform Test.assert(
+        polygon_to_wkt(rect) == "POLYGON ((0 0, 4 0, 4 3, 0 3, 0 0))",
+        "polygon WKT should close an implicit ring"
+    )
 }
