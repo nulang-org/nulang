@@ -3344,6 +3344,25 @@ app "counter" {
         assert!(ir.contains("\"version\": 1"), "IR should contain version");
         assert!(ir.contains("routes"), "IR should contain routes");
 
+        let nbc_path = dir.join(".nula/dist/dryrun-app.nbc");
+        let behavior_path = dir.join(".nula/dist/dryrun-app.behavior.json");
+        assert!(nbc_path.exists(), "NBC deployment artifact should exist");
+        assert!(
+            behavior_path.exists(),
+            "Cloud deploy must emit an artifact-bound Behavior Manifest"
+        );
+        let plan = validate_cloud_behavior_manifest(
+            &behavior_path,
+            crate::behavior_manifest::ArtifactKind::Bytecode,
+            &nbc_path,
+        )
+        .expect("generated Cloud deployment contract should verify");
+        assert_eq!(plan.package_name, "dryrun-app");
+        assert_eq!(
+            plan.artifact_kind,
+            crate::behavior_manifest::ArtifactKind::Bytecode
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
