@@ -1,0 +1,46 @@
+{
+  "schema": "nulang.behavior/v0alpha1",
+  "package": {
+    "name": "demo",
+    "version": "0.1.0",
+    "language_version": "1.0.0-frozen"
+  },
+  "artifact": {
+    "kind": "wasm-module",
+    "digest": "blake3:107d2022ae9e6c9054a44bedd13ef7684736ac6018ea56c0b9128f51f73cc6fb"
+  },
+  "compiler": {
+    "implementation": "nulang-rust",
+    "version": "0.1.0",
+    "digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "interfaces": [],
+  "actors": [],
+  "effects": [
+    {
+      "effect": "Comms.send",
+      "class": "external",
+      "determinism": "nondeterministic",
+      "replay": "requires-idempotency-key"
+    }
+  ],
+  "authority": [
+    {
+      "kind": "custom",
+      "resource": "host-effect:Comms",
+      "required": true
+    }
+  ],
+  "durability": [],
+  "replay": [
+    {
+      "effect": "Comms.send",
+      "class": "external-requires-idempotency-key"
+    }
+  ],
+  "resources": {},
+  "provenance": {
+    "source_digest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "dependency_digest": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  }
+}
