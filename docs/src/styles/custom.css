@@ -286,16 +286,16 @@ html[data-has-hero] body {
   overflow: hidden;
   padding: 5rem 0 4rem;
   background:
-    radial-gradient(ellipse 80% 60% at 50% -10%, rgba(243, 128, 32, 0.12), transparent 60%),
-    radial-gradient(ellipse 60% 40% at 80% 40%, rgba(243, 128, 32, 0.08), transparent 50%),
-    linear-gradient(180deg, rgba(243, 128, 32, 0.06) 0%, var(--nu-bg) 55%);
+    radial-gradient(ellipse 80% 60% at 50% -10%, rgba(29, 78, 216, 0.13), transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 40%, rgba(29, 78, 216, 0.07), transparent 50%),
+    linear-gradient(180deg, rgba(29, 78, 216, 0.05) 0%, var(--nu-bg) 55%);
 }
 
 [data-theme="light"] .hero {
   background:
-    radial-gradient(ellipse 80% 60% at 50% -10%, rgba(243, 128, 32, 0.10), transparent 60%),
-    radial-gradient(ellipse 60% 40% at 80% 40%, rgba(243, 128, 32, 0.06), transparent 50%),
-    linear-gradient(180deg, rgba(243, 128, 32, 0.06) 0%, var(--nu-bg) 55%);
+    radial-gradient(ellipse 80% 60% at 50% -10%, rgba(29, 78, 216, 0.11), transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 40%, rgba(29, 78, 216, 0.06), transparent 50%),
+    linear-gradient(180deg, rgba(29, 78, 216, 0.05) 0%, var(--nu-bg) 55%);
 }
 
 .hero {
@@ -418,8 +418,8 @@ html[data-has-hero] body {
 
 .hero-action.secondary:hover {
   background: var(--nu-surface);
-  border-color: var(--nu-accent);
-  color: var(--nu-accent);
+  border-color: var(--nu-blue);
+  color: var(--nu-blue);
   transform: translateY(-2px);
 }
 
@@ -561,20 +561,20 @@ html[data-has-hero] body {
   width: 3rem;
   height: 3rem;
   border-radius: 0.75rem;
-  background: rgba(243, 128, 32, 0.10);
+  background: color-mix(in srgb, var(--nu-blue) 10%, transparent);
   margin-bottom: 1.25rem;
   transition: background 0.35s ease, transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .feature-card:hover .feature-icon-chip {
-  background: rgba(243, 128, 32, 0.16);
+  background: color-mix(in srgb, var(--nu-blue) 16%, transparent);
   transform: translateY(-2px);
 }
 
 .feature-icon {
   width: 1.375rem;
   height: 1.375rem;
-  color: var(--nu-accent);
+  color: var(--nu-blue);
   transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1), color 0.35s ease;
 }
 
@@ -601,7 +601,7 @@ html[data-has-hero] body {
 }
 
 .sl-markdown-content a:hover {
-  color: var(--nu-accent);
+  color: var(--nu-blue);
 }
 
 /* ── Footer ── */
@@ -659,7 +659,7 @@ html[data-has-hero] body {
 }
 
 .footer-col a:hover {
-  color: var(--nu-accent);
+  color: var(--nu-blue);
 }
 
 @media (max-width: 48rem) {
@@ -698,7 +698,7 @@ html[data-has-hero] body {
 }
 
 .footer-copy a:hover {
-  color: var(--nu-accent);
+  color: var(--nu-blue);
 }
 
 .footer-copy .nu-blue {
@@ -906,11 +906,11 @@ html[data-theme="light"] starlight-theme-select label::before {
 
 /* ── Hero emphasis word ── */
 .hero h1 .hero-emphasis {
-  color: var(--nu-accent-high);
+  color: var(--nu-blue);
 }
 
 [data-theme="light"] .hero h1 .hero-emphasis {
-  color: var(--nu-accent-high);
+  color: var(--nu-blue);
 }
 
 /* ── Dark mode overrides for landing components ── */
@@ -1098,7 +1098,7 @@ html[data-theme="light"] starlight-theme-select label::before {
 }
 
 .hero-metrics .metric-link:hover {
-  color: var(--nu-accent);
+  color: var(--nu-blue);
 }
 
 .hero-metrics .metric-label {
@@ -1240,7 +1240,7 @@ html[data-theme="light"] starlight-theme-select label::before {
 }
 
 .metrics-band .metric-link:hover {
-  color: var(--nu-accent);
+  color: var(--nu-blue);
 }
 
 .metrics-band .metric-value {
@@ -1428,7 +1428,7 @@ html[data-theme="light"] starlight-theme-select label::before {
 }
 
 .learn-card-accent:hover {
-  border-color: var(--nu-accent);
+  border-color: var(--nu-blue);
 }
 
 /* ── Support section (nulang.cloud-style cards) ── */
@@ -1489,13 +1489,13 @@ html[data-theme="light"] starlight-theme-select label::before {
   width: 3rem;
   height: 3rem;
   border-radius: 0.75rem;
-  background: rgba(243, 128, 32, 0.10);
-  color: var(--nu-accent);
+  background: color-mix(in srgb, var(--nu-blue) 10%, transparent);
+  color: var(--nu-blue);
   transition: background 0.35s ease, transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .support-card:hover .support-icon {
-  background: rgba(243, 128, 32, 0.16);
+  background: color-mix(in srgb, var(--nu-blue) 16%, transparent);
   transform: translateY(-2px);
 }
 
@@ -1505,7 +1505,7 @@ html[data-theme="light"] starlight-theme-select label::before {
 }
 
 .support-card-accent:hover {
-  border-color: var(--nu-accent);
+  border-color: var(--nu-blue);
 }
 
 /* ── Mobile navigation ── */
