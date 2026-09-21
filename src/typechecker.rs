@@ -5982,7 +5982,8 @@ mod tests {
         );
         let err = result.expect_err("1 -> 3 must be rejected");
         assert!(
-            err.to_string().contains("advance exactly one schema version"),
+            err.to_string()
+                .contains("advance exactly one schema version"),
             "unexpected error: {err}"
         );
     }
@@ -6002,7 +6003,8 @@ mod tests {
         );
         let err = result.expect_err("2 -> 1 must be rejected");
         assert!(
-            err.to_string().contains("advance exactly one schema version"),
+            err.to_string()
+                .contains("advance exactly one schema version"),
             "unexpected error: {err}"
         );
     }
@@ -6077,5 +6079,4 @@ mod tests {
             result.err()
         );
     }
-
 }
