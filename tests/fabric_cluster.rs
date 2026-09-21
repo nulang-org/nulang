@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use nulang::runtime::{
     Actor, ActorAdmissionStatus, DeterministicNetworkTransport, FabricAdvertisement,
-    FabricAdvertisementSnapshot, Mailbox, NodeId, Packet, Runtime, TransportAdmission,
+    FabricAdvertisementSnapshot, Mailbox, NetworkTransport, NodeId, Packet, Runtime,
+    TransportAdmission,
 };
 use nulang::vm::Value;
 
