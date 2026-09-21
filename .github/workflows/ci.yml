@@ -141,6 +141,13 @@ jobs:
           fi
           grep -q "expected constructor 'CARTESIAN', found constructor 'WGS84'" /tmp/nulang-geo-crs.out
 
+          if ../../target/release/nulang --check tests/compile_fail/mixed_crs_line_string.nula > /tmp/nulang-geo-line-crs.out 2>&1; then
+            echo "::error::mixed-CRS line string unexpectedly type-checked"
+            cat /tmp/nulang-geo-line-crs.out
+            exit 1
+          fi
+          grep -Eq "expected constructor '(WGS84|CARTESIAN)', found constructor '(CARTESIAN|WGS84)'" /tmp/nulang-geo-line-crs.out
+
       - name: Verify documentation examples
         run: NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
   # -----------------------------------------------------------------------
