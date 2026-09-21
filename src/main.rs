@@ -2407,24 +2407,78 @@ fn compile_source_to_nbc(
             span: Span::default(),
         })?;
     }
-    let m = compile_with_new_pipeline(&ast, "main", &type_checker)?;
+    let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+    let mut mir = nulang::mir_lower::lower_module(&hir)?;
+    let compiler_version = concat!("nulangc-", env!("CARGO_PKG_VERSION"));
+    let bytecode_flag = format!(
+        "bytecode-format={}",
+        nulang::format::constants::BYTECODE_VERSION
+    );
+    let artifact = nulang::compiler_identity::compile_identified_bytecode(
+        Some(source.as_bytes()),
+        &hir,
+        &mut mir,
+        [],
+        "main",
+        compiler_version,
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        [bytecode_flag],
+    )?;
     let source_hash = blake3::hash(source.as_bytes());
-    let bytes =
-        m.to_nbc(Some(*source_hash.as_bytes()))
-            .map_err(|e| nulang::types::NuError::VMError {
-                msg: e.to_string(),
-                span: Span::default(),
-            })?;
+    let bytes = artifact
+        .module
+        .to_nbc(Some(*source_hash.as_bytes()))
+        .map_err(|e| nulang::types::NuError::VMError {
+            msg: e.to_string(),
+            span: Span::default(),
+        })?;
     std::fs::write(out_path, &bytes).map_err(|e| nulang::types::NuError::VMError {
         msg: format!("failed to write {out_path}: {e}"),
         span: Span::default(),
     })?;
+
+    let identity_path = format!("{out_path}.identity.json");
+    let identity_json =
+        artifact
+            .identity
+            .to_json()
+            .map_err(|e| nulang::types::NuError::VMError {
+                msg: format!("failed to encode artifact identity manifest: {e}"),
+                span: Span::default(),
+            })?;
+    std::fs::write(&identity_path, identity_json).map_err(|e| {
+        nulang::types::NuError::VMError {
+            msg: format!("failed to write {identity_path}: {e}"),
+            span: Span::default(),
+        }
+    })?;
+
+    let runtime_manifest_path = format!("{out_path}.runtime.json");
+    let runtime_manifest_json = artifact
+        .runtime_manifest
+        .to_json()
+        .map_err(|e| nulang::types::NuError::VMError {
+            msg: format!("failed to encode runtime artifact manifest: {e}"),
+            span: Span::default(),
+        })?;
+    std::fs::write(&runtime_manifest_path, runtime_manifest_json).map_err(|e| {
+        nulang::types::NuError::VMError {
+            msg: format!("failed to write {runtime_manifest_path}: {e}"),
+            span: Span::default(),
+        }
+    })?;
+
     println!(
-        "Wrote {out_path} ({} bytes, .nbc format v{}, language v{})",
+        "Wrote {out_path} ({} bytes, .nbc format v{}, language v{}, artifact {})",
         bytes.len(),
         nulang::format::constants::BYTECODE_VERSION,
         nulang::format::constants::LANGUAGE_VERSION,
+        artifact.identity.artifact_id(),
     );
+    println!("Wrote {identity_path}");
+    println!("Wrote {runtime_manifest_path}");
     Ok(())
 }
 
