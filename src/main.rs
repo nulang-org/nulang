@@ -987,6 +987,7 @@ fn main() {
             opts.verbose,
             &opts.backend,
             opts.out_file.as_deref(),
+            opts.emit_semantic_inventory.as_deref(),
             opts.metrics_port,
             &opts.target,
             &opts.with_capabilities,
