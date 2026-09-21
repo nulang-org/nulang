@@ -360,8 +360,10 @@ pub(crate) fn spawn_from_module(
             .collect()
     };
     if let Some(actor) = rt.actors.get_mut(&id) {
-        actor.definition_semantic_id = definition_semantic_id;
-        actor.execution_artifact_id = execution_artifact_id;
+        // spawn_actor_with_models already installed the provenance verified
+        // against any durable restart snapshot. Do not overwrite it with the
+        // current module identities here: a legacy snapshot intentionally
+        // remains unverified until an explicit migration establishes provenance.
         actor.bytecode_module = Some(module.clone());
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
