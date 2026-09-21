@@ -103,8 +103,10 @@ When `--deny-warnings` is supplied, the existing warning policy may escalate
 these diagnostics just like deprecation warnings. This is opt-in strictness,
 not a change to the default Frozen-Core language.
 
-LSP diagnostics should surface the same warning codes. JSON diagnostic output
-should preserve the same stable codes once frontend plumbing is complete.
+CLI, JSON diagnostics, and LSP diagnostics surface the same stable warning
+codes. Machine-readable check mode returns warnings through the same frontend
+warning stream instead of re-parsing source, and `--deny-warnings` preserves
+the original warnings alongside the strict-mode error.
 
 ### 5. Future complete pattern matrix
 
