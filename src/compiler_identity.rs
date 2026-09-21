@@ -170,6 +170,22 @@ mod tests {
 
         module.attach_artifact_identity(&manifest).unwrap();
         assert_eq!(module.artifact_id, Some(manifest.artifact_id()));
+        module.attach_artifact_identity(&manifest).unwrap();
+
+        let rebound = ArtifactIdentityManifest::new(
+            None,
+            semantic_id,
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=3"],
+        );
+        assert!(matches!(
+            module.attach_artifact_identity(&rebound),
+            Err(crate::artifact_identity::ArtifactIdentityError::ArtifactIdentityMismatch { .. })
+        ));
+        assert_eq!(module.artifact_id, Some(manifest.artifact_id()));
 
         let different = ArtifactIdentityManifest::new(
             None,
