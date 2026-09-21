@@ -7284,3 +7284,182 @@ fn p0_cross_shard_named_send_resolves_only_on_owner() {
         "unknown cross-shard behavior must not execute behavior zero"
     );
 }
+
+
+#[test]
+fn identified_migration_preserves_exact_provenance_and_selected_definition() {
+    use crate::artifact_identity::ArtifactIdentityManifest;
+    use crate::bytecode::{ActorMeta, CodeModule, Constant};
+    use crate::content_identity::SemanticId;
+    use crate::runtime::network::RuntimeArtifactProvenance;
+    use crate::runtime::persistence::ActorSnapshot;
+    use crate::runtime_artifact_manifest::RuntimeArtifactManifest;
+
+    let actor_id = 730_001;
+    let program_id = SemanticId::from_canonical_bytes(b"migration-program", []);
+    let workflow_id = SemanticId::from_canonical_bytes(b"migration-workflow", []);
+    let counter_id = SemanticId::from_canonical_bytes(b"migration-counter", []);
+    let identity = ArtifactIdentityManifest::new(
+        None,
+        program_id,
+        "nulangc-test",
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        ["bytecode-format=1"],
+    );
+
+    let mut module = CodeModule::new("migration-identified");
+    module.semantic_id = Some(program_id);
+
+    let mut workflow = ActorMeta::new("WorkflowOnly");
+    workflow.persistent = true;
+    workflow.is_workflow = true;
+    workflow.state_defaults = vec![("workflow_only".into(), Constant::Int(99))];
+    module.actor_metadata.push(workflow);
+
+    let mut counter = ActorMeta::new("Counter");
+    counter.persistent = true;
+    counter.state_defaults = vec![("counter_local".into(), Constant::Int(7))];
+    module.actor_metadata.push(counter);
+    module.actor_semantic_ids = vec![workflow_id, counter_id];
+    module.attach_artifact_identity(&identity).unwrap();
+
+    let runtime_manifest = RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
+    let nbc_bytes = module.to_nbc(None).unwrap();
+    let provenance = RuntimeArtifactProvenance {
+        nbc_blake3: *blake3::hash(&nbc_bytes).as_bytes(),
+        runtime_manifest_json: runtime_manifest.to_json().unwrap(),
+    };
+    let snapshot_json = serde_json::to_vec(&ActorSnapshot {
+        actor_id,
+        semantic_id: Some(counter_id.to_string()),
+        artifact_id: Some(identity.artifact_id().to_string()),
+        ..ActorSnapshot::default()
+    })
+    .unwrap();
+
+    let mut runtime = Runtime::new();
+    assert!(runtime.receive_migrated_actor_with_provenance(
+        actor_id,
+        nbc_bytes,
+        snapshot_json,
+        Some(provenance),
+    ));
+
+    let actor = runtime.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.name, "Counter");
+    assert!(!actor.is_workflow);
+    assert_eq!(actor.definition_semantic_id, Some(counter_id));
+    assert_eq!(actor.execution_artifact_id, Some(identity.artifact_id()));
+    assert_eq!(
+        actor
+            .get_state_field("counter_local")
+            .and_then(|value| value.as_int()),
+        Some(7)
+    );
+    assert_eq!(actor.get_state_field("workflow_only"), None);
+    let restored_module = actor.bytecode_module.as_ref().unwrap();
+    assert_eq!(restored_module.artifact_id, Some(identity.artifact_id()));
+    assert_eq!(
+        restored_module
+            .artifact_identity_manifest
+            .as_ref()
+            .map(|manifest| manifest.artifact_id()),
+        Some(identity.artifact_id())
+    );
+}
+
+#[test]
+fn identified_migration_rejects_tampered_nbc_bytes() {
+    use crate::artifact_identity::ArtifactIdentityManifest;
+    use crate::bytecode::{ActorMeta, CodeModule};
+    use crate::content_identity::SemanticId;
+    use crate::runtime::network::RuntimeArtifactProvenance;
+    use crate::runtime::persistence::ActorSnapshot;
+    use crate::runtime_artifact_manifest::RuntimeArtifactManifest;
+
+    let actor_id = 730_002;
+    let program_id = SemanticId::from_canonical_bytes(b"tamper-program", []);
+    let definition_id = SemanticId::from_canonical_bytes(b"tamper-definition", []);
+    let identity = ArtifactIdentityManifest::new(
+        None,
+        program_id,
+        "nulangc-test",
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        ["bytecode-format=1"],
+    );
+    let mut module = CodeModule::new("migration-tamper");
+    module.semantic_id = Some(program_id);
+    module.actor_metadata.push(ActorMeta::new("Counter"));
+    module.actor_semantic_ids.push(definition_id);
+    module.attach_artifact_identity(&identity).unwrap();
+
+    let runtime_manifest = RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
+    let mut nbc_bytes = module.to_nbc(None).unwrap();
+    let provenance = RuntimeArtifactProvenance {
+        nbc_blake3: *blake3::hash(&nbc_bytes).as_bytes(),
+        runtime_manifest_json: runtime_manifest.to_json().unwrap(),
+    };
+    *nbc_bytes.last_mut().unwrap() ^= 0x01;
+    let snapshot_json = serde_json::to_vec(&ActorSnapshot {
+        actor_id,
+        semantic_id: Some(definition_id.to_string()),
+        artifact_id: Some(identity.artifact_id().to_string()),
+        ..ActorSnapshot::default()
+    })
+    .unwrap();
+
+    let mut runtime = Runtime::new();
+    assert!(!runtime.receive_migrated_actor_with_provenance(
+        actor_id,
+        nbc_bytes,
+        snapshot_json,
+        Some(provenance),
+    ));
+    assert!(!runtime.actors.contains_key(&actor_id));
+}
+
+#[test]
+fn identified_migration_rejects_missing_provenance_without_downgrade() {
+    use crate::artifact_identity::ArtifactIdentityManifest;
+    use crate::bytecode::{ActorMeta, CodeModule};
+    use crate::content_identity::SemanticId;
+    use crate::runtime::persistence::ActorSnapshot;
+
+    let actor_id = 730_003;
+    let program_id = SemanticId::from_canonical_bytes(b"missing-provenance-program", []);
+    let definition_id = SemanticId::from_canonical_bytes(b"missing-provenance-definition", []);
+    let identity = ArtifactIdentityManifest::new(
+        None,
+        program_id,
+        "nulangc-test",
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        ["bytecode-format=1"],
+    );
+    let mut module = CodeModule::new("migration-missing-provenance");
+    module.semantic_id = Some(program_id);
+    module.actor_metadata.push(ActorMeta::new("Counter"));
+    module.actor_semantic_ids.push(definition_id);
+    module.attach_artifact_identity(&identity).unwrap();
+    let nbc_bytes = module.to_nbc(None).unwrap();
+    let snapshot_json = serde_json::to_vec(&ActorSnapshot {
+        actor_id,
+        semantic_id: Some(definition_id.to_string()),
+        artifact_id: Some(identity.artifact_id().to_string()),
+        ..ActorSnapshot::default()
+    })
+    .unwrap();
+
+    let mut runtime = Runtime::new();
+    assert!(!runtime.receive_migrated_actor(
+        actor_id,
+        nbc_bytes,
+        snapshot_json,
+    ));
+    assert!(!runtime.actors.contains_key(&actor_id));
+}
