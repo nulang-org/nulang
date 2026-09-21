@@ -1934,7 +1934,9 @@ fn test_event_sourced_counter_replays_from_event_log() {
 }
 
 fn compile_state_migration_module(source: &str) -> CodeModule {
-    let tokens = crate::lexer::Lexer::new(source).lex().expect("lex migration fixture");
+    let tokens = crate::lexer::Lexer::new(source)
+        .lex()
+        .expect("lex migration fixture");
     let ast = crate::parser::Parser::new(tokens)
         .parse_module()
         .expect("parse migration fixture");
@@ -2056,17 +2058,19 @@ fn test_recover_actor_executes_and_commits_state_migration_before_publication() 
     assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
 
     let committed = rt.persistence.load_snapshot(actor_id).unwrap();
-    assert_eq!(committed.sequence, 7, "schema migration must not invent a message sequence");
-    assert_eq!(committed.schema_version, 2);
     assert_eq!(
-        committed.state.get("count"),
-        Some(&PersistedValue::Int(15))
+        committed.sequence, 7,
+        "schema migration must not invent a message sequence"
     );
+    assert_eq!(committed.schema_version, 2);
+    assert_eq!(committed.state.get("count"), Some(&PersistedValue::Int(15)));
 
     let actor = rt.actors.get(&actor_id).expect("recovered actor published");
     assert_eq!(actor.schema_version, 2);
     assert_eq!(
-        actor.get_state_field("count").and_then(|value| value.as_int()),
+        actor
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
         Some(15)
     );
 }
@@ -2126,7 +2130,9 @@ fn test_recover_actor_adopts_current_schema_winner_after_migration_cas_conflict(
     let actor = rt.actors.get(&actor_id).unwrap();
     assert_eq!(actor.schema_version, 2);
     assert_eq!(
-        actor.get_state_field("count").and_then(|value| value.as_int()),
+        actor
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
         Some(99),
         "the loser must publish the winner's state, never its stale local transform"
     );
@@ -2190,10 +2196,7 @@ fn test_recover_actor_refuses_cas_winner_that_is_still_old_schema() {
     let committed = rt.persistence.load_snapshot(actor_id).unwrap();
     assert_eq!(committed.sequence, 5);
     assert_eq!(committed.schema_version, 1);
-    assert_eq!(
-        committed.state.get("count"),
-        Some(&PersistedValue::Int(20))
-    );
+    assert_eq!(committed.state.get("count"), Some(&PersistedValue::Int(20)));
 }
 
 #[test]
@@ -2389,7 +2392,10 @@ fn test_memory_snapshot_cas_fences_stale_revision() {
         "the v1 revision must not overwrite the already-committed v2 snapshot"
     );
     assert_eq!(
-        store.load_snapshot(original.actor_id).unwrap().schema_version,
+        store
+            .load_snapshot(original.actor_id)
+            .unwrap()
+            .schema_version,
         2
     );
 }
@@ -2459,10 +2465,7 @@ fn test_libsql_snapshot_cas_is_atomic_and_revision_fenced() {
     );
     let committed = store.load_snapshot(original.actor_id).unwrap();
     assert_eq!(committed.schema_version, 2);
-    assert_eq!(
-        committed.state.get("count"),
-        Some(&PersistedValue::Int(5))
-    );
+    assert_eq!(committed.state.get("count"), Some(&PersistedValue::Int(5)));
 }
 
 #[cfg(feature = "sqlite")]
@@ -7527,10 +7530,7 @@ fn test_virtual_grain_hydration_migrates_snapshot_before_publication() {
     let committed = rt.persistence.load_snapshot(stable_id).unwrap();
     assert_eq!(committed.sequence, 9);
     assert_eq!(committed.schema_version, 2);
-    assert_eq!(
-        committed.state.get("count"),
-        Some(&PersistedValue::Int(15))
-    );
+    assert_eq!(committed.state.get("count"), Some(&PersistedValue::Int(15)));
 
     let actor = rt
         .actors
@@ -7539,7 +7539,9 @@ fn test_virtual_grain_hydration_migrates_snapshot_before_publication() {
     assert_eq!(actor.schema_owner.as_deref(), Some("Counter"));
     assert_eq!(actor.schema_version, 2);
     assert_eq!(
-        actor.get_state_field("count").and_then(|value| value.as_int()),
+        actor
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
         Some(15)
     );
     assert_eq!(
