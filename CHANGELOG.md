@@ -42,6 +42,9 @@ version + migration.*
 
 ## Stable tier
 
+### Finite-domain match coverage diagnostics — 2026-09-21
+- **Conservative compile-time coverage warnings** (Experimental, `src/pattern_coverage.rs`, `src/typechecker.rs`). Matches over closed variants and `Bool` now emit `W0201` for provably missing cases and `W0202` for provably redundant arms after successful type inference. Guarded arms never prove total coverage; unsupported or infinite domains retain the frozen runtime fallback. CLI `--deny-warnings` can opt into strict rejection, and the LSP preserves the same warning codes and spans.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
