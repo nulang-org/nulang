@@ -3924,6 +3924,73 @@ mod tests {
     }
 
     #[test]
+    fn test_packet_fetch_artifact_request_roundtrip() {
+        let semantic =
+            crate::content_identity::SemanticId::from_canonical_bytes(b"fetch-request", []);
+        let artifact_id = crate::content_identity::ArtifactId::from_semantic(
+            semantic,
+            "compiler",
+            "target",
+            "abi",
+            "bytecode",
+            ["flag"],
+        );
+        let packet = Packet::FetchArtifactRequest { artifact_id };
+        let bytes = packet.to_bytes(74);
+        let (seq, decoded) = Packet::from_bytes(&bytes).expect("artifact request roundtrip");
+        assert_eq!(seq, 74);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_fetch_artifact_response_roundtrip() {
+        let semantic =
+            crate::content_identity::SemanticId::from_canonical_bytes(b"fetch-response", []);
+        let artifact_id = crate::content_identity::ArtifactId::from_semantic(
+            semantic,
+            "compiler",
+            "target",
+            "abi",
+            "bytecode",
+            ["flag"],
+        );
+        let packet = Packet::FetchArtifactResponse {
+            artifact_id,
+            artifact: Some((
+                vec![1, 2, 3, 4],
+                RuntimeArtifactProvenance {
+                    nbc_blake3: [0xEF; 32],
+                    runtime_manifest_json: br#"{"version":1}"#.to_vec(),
+                },
+            )),
+        };
+        let bytes = packet.to_bytes(73);
+        let (seq, decoded) = Packet::from_bytes(&bytes).expect("artifact response roundtrip");
+        assert_eq!(seq, 73);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_fetch_artifact_miss_roundtrip() {
+        let semantic = crate::content_identity::SemanticId::from_canonical_bytes(b"fetch-miss", []);
+        let artifact_id = crate::content_identity::ArtifactId::from_semantic(
+            semantic,
+            "compiler",
+            "target",
+            "abi",
+            "bytecode",
+            ["flag"],
+        );
+        let packet = Packet::FetchArtifactResponse {
+            artifact_id,
+            artifact: None,
+        };
+        let bytes = packet.to_bytes(72);
+        let (_, decoded) = Packet::from_bytes(&bytes).expect("artifact miss roundtrip");
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
     fn test_packet_migrate_actor_provenance_roundtrip() {
         let packet = Packet::MigrateActor {
             actor_id: 42,
