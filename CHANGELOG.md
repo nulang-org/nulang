@@ -42,6 +42,10 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-owned host replay recovery — 2026-09-21
+- **Host replay classes now lower fail-closed into durable recovery policy** (Experimental, `src/host_effect_abi.rs`, `src/durable_effect.rs`). Pure effects are not forced into the durable external-effect journal; idempotent effects map to at-least-once retry; idempotency-key effects map to stable deduplicated retry; backend-owned journal-result effects delegate recovery to the backend; and externally non-replayable effects are rejected from automatic durable recovery instead of being silently promoted to a retryable guarantee.
+
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 

@@ -21,6 +21,7 @@
 //! the contract and prevent future implementations from quietly upgrading an
 //! at-least-once external call into an unsound "exactly once" promise.
 
+use crate::host_effect_abi::{HostDurableRecoveryPolicy, HostOperationDescriptor};
 use crate::primitives::{DeliverySemantics, EffectBoundary};
 use blake3::Hasher;
 use std::fmt;
@@ -183,7 +184,74 @@ impl DurableEffectSpec {
             delivery,
         }
     }
+
+    /// Build a durable-effect spec from the compiler-owned host operation
+    /// contract without silently upgrading its replay guarantees.
+    ///
+    /// Pure operations do not require a durable external-effect record.
+    /// Non-replayable external operations cannot be represented by the current
+    /// automatic recovery state machine and therefore fail closed.
+    pub fn from_host_operation(
+        id: DurableEffectId,
+        operation: &HostOperationDescriptor,
+        boundary: EffectBoundary,
+    ) -> Result<Self, DurableHostEffectPolicyError> {
+        let policy = operation.replay.durable_recovery_policy();
+        let delivery = match policy.delivery_semantics() {
+            Some(delivery) => delivery,
+            None => {
+                return Err(match policy {
+                    HostDurableRecoveryPolicy::NoJournalRequired => {
+                        DurableHostEffectPolicyError::JournalNotRequired
+                    }
+                    HostDurableRecoveryPolicy::ManualResolution => {
+                        DurableHostEffectPolicyError::AutomaticRecoveryUnsupported
+                    }
+                    HostDurableRecoveryPolicy::RetryAtLeastOnce
+                    | HostDurableRecoveryPolicy::DelegateToBackend
+                    | HostDurableRecoveryPolicy::RetryWithDeduplication => {
+                        unreachable!("representable host recovery policy returned no delivery semantics")
+                    }
+                });
+            }
+        };
+
+        Ok(Self::new(
+            id,
+            operation.canonical_id(),
+            boundary,
+            delivery,
+        ))
+    }
 }
+
+/// Host replay contracts that intentionally cannot be lowered into the current
+/// automatic durable-effect recovery state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableHostEffectPolicyError {
+    /// Pure computation should be replayed as computation, not journaled as an
+    /// external durable side effect.
+    JournalNotRequired,
+    /// The effect may have committed externally, but automatic redispatch is
+    /// not safe. Recovery requires an explicit operator/application decision.
+    AutomaticRecoveryUnsupported,
+}
+
+impl fmt::Display for DurableHostEffectPolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::JournalNotRequired => {
+                write!(f, "pure host operation does not require a durable effect journal entry")
+            }
+            Self::AutomaticRecoveryUnsupported => write!(
+                f,
+                "host operation is non-replayable after an ambiguous crash; automatic recovery is unsupported"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DurableHostEffectPolicyError {}
 
 /// A journal lookup used the correct logical operation ID but supplied a
 /// different request body. Recovery must fail closed rather than replaying a
@@ -441,6 +509,45 @@ mod tests {
             EffectBoundary::External,
             delivery,
         )
+    }
+
+    #[test]
+    fn host_replay_contract_lowers_to_durable_delivery_semantics() {
+        let send = crate::host_effect_abi::lookup_host_operation("Comms", "send").unwrap();
+        let spec = DurableEffectSpec::from_host_operation(
+            DurableEffectId::derive(42, "send-message", 0, &send.canonical_id()),
+            send,
+            EffectBoundary::External,
+        )
+        .unwrap();
+        assert_eq!(
+            spec.delivery,
+            DeliverySemantics::EffectivelyOnceWithDeduplication
+        );
+
+        let storage = crate::host_effect_abi::lookup_host_operation("Storage", "write").unwrap();
+        let spec = DurableEffectSpec::from_host_operation(
+            DurableEffectId::derive(42, "write-state", 0, &storage.canonical_id()),
+            storage,
+            EffectBoundary::BackendOwned,
+        )
+        .unwrap();
+        assert_eq!(spec.delivery, DeliverySemantics::BackendDefined);
+    }
+
+    #[test]
+    fn nonreplayable_host_effect_fails_closed_before_journaling() {
+        let call = crate::host_effect_abi::lookup_host_operation("Comms", "call").unwrap();
+        let err = DurableEffectSpec::from_host_operation(
+            DurableEffectId::derive(42, "call", 0, &call.canonical_id()),
+            call,
+            EffectBoundary::External,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            DurableHostEffectPolicyError::AutomaticRecoveryUnsupported
+        );
     }
 
     #[test]
