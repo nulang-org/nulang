@@ -2427,30 +2427,52 @@ impl Runtime {
         args: Vec<Value>,
         sender: u64,
     ) {
+        let _ = self.try_send_to_grain_on_node(
+            grain_id,
+            target_node,
+            behavior_name,
+            args,
+            sender,
+        );
+    }
+
+    /// Non-blocking explicit cross-node grain delivery with precise admission.
+    pub fn try_send_to_grain_on_node(
+        &mut self,
+        grain_id: GrainId,
+        target_node: NodeId,
+        behavior_name: &str,
+        args: Vec<Value>,
+        sender: u64,
+    ) -> MessageAdmission {
         let stable_id = grain_actor_id(&grain_id);
         let prev = self.current_actor;
         if sender != 0 {
             self.current_actor = Some(sender);
         }
 
-        if self.actors.contains_key(&stable_id) {
-            let Some(behavior_id) = self.behavior_id_for(stable_id, behavior_name) else {
-                warn!(
-                    "nulang-grain: unknown behavior {} for local grain {}",
-                    behavior_name,
-                    grain_id.actor_name()
-                );
-                self.current_actor = prev;
-                return;
-            };
-            self.send_message_by_id(stable_id, behavior_id, &args);
-            self.current_actor = prev;
-            return;
-        }
+        let admission = if self.actors.contains_key(&stable_id) {
+            match self.behavior_id_for(stable_id, behavior_name) {
+                Some(behavior_id) => self.send_message_by_id(stable_id, behavior_id, &args),
+                None => {
+                    warn!(
+                        "nulang-grain: unknown behavior {} for local grain {}",
+                        behavior_name,
+                        grain_id.actor_name()
+                    );
+                    MessageAdmission::Rejected
+                }
+            }
+        } else {
+            self.try_send_distributed(
+                ActorAddress::remote(target_node, stable_id),
+                behavior_name,
+                &args,
+            )
+        };
 
-        let target = ActorAddress::remote(target_node, stable_id);
-        self.send_distributed(target, behavior_name, &args);
         self.current_actor = prev;
+        admission
     }
 
     #[tracing::instrument(level = "trace", skip(self, args))]
