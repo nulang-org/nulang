@@ -1940,6 +1940,7 @@ fn test_memory_store_latest_sequence() {
         actor_id: 1,
         sequence: 5,
         semantic_id: None,
+        artifact_id: None,
         state: HashMap::new(),
         waiting_signal: None,
         crdt_snapshot: None,
