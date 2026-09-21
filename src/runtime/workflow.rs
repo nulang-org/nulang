@@ -8,7 +8,7 @@
 use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
-use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
+use crate::runtime::persistence::{ActorSnapshot, EventEntry, PersistedValue, WorkflowEvent};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
 
@@ -31,16 +31,19 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
 // Checkpoint
 // ---------------------------------------------------------------------------
 
-/// Snapshot the durable and CRDT state of a persistent actor.
-pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
-    let actor = match rt.actors.get(&actor_id) {
-        Some(a) => a,
-        None => return,
+/// Build a durable actor snapshot at an explicitly supplied commit sequence.
+fn snapshot_actor_at(
+    rt: &Runtime,
+    actor_id: u64,
+    sequence: u64,
+) -> std::io::Result<Option<ActorSnapshot>> {
+    let Some(actor) = rt.actors.get(&actor_id) else {
+        return Ok(None);
     };
     if !actor.persistent {
-        return;
+        return Ok(None);
     }
-    let seq = next_sequence(rt, actor_id);
+
     let mut state = std::collections::HashMap::new();
     for (name, value) in &actor.state_data {
         let model = actor
@@ -61,49 +64,98 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
             state.insert(name.clone(), persisted);
         }
     }
-    let authority_tokens = match actor.authority_manifest() {
-        Ok(manifest) => manifest.canonical_token_set(),
-        Err(err) => {
-            tracing::warn!(
-                "nulang-persist: refusing to checkpoint actor {} with invalid authority: {}",
-                actor_id,
-                err
-            );
-            return;
-        }
-    };
-    // Snapshot the global CRDT state alongside durable actor fields.
-    let crdt_snapshot = rt.crdt_manager.as_ref().map(|m| {
-        m.snapshot()
+
+    let authority_tokens = actor
+        .authority_manifest()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?
+        .canonical_token_set();
+
+    let crdt_snapshot = rt.crdt_manager.as_ref().map(|manager| {
+        manager
+            .snapshot()
             .into_iter()
             .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
             .collect()
     });
-    let crdt_field_map = rt.crdt_manager.as_ref().map(|m| {
-        m.field_map
+    let crdt_field_map = rt.crdt_manager.as_ref().map(|manager| {
+        manager
+            .field_map
             .iter()
             .filter(|((aid, _), _)| *aid == actor_id)
             .map(|((_, name), id)| (name.clone(), id.0))
             .collect()
     });
-    let snapshot = crate::runtime::persistence::ActorSnapshot {
+
+    Ok(Some(ActorSnapshot {
         actor_id,
-        sequence: seq,
+        sequence,
         state,
         waiting_signal: actor.waiting_signal.clone(),
         crdt_snapshot,
         crdt_field_map,
         authority_tokens,
-    };
-    // RFC 0014 §3: re-spawn-opted actors replicate the snapshot to their
-    // deterministic shadow node before the local save, so the replica is a
-    // byte-identical copy of exactly what the local store will hold.
-    rt.maybe_shadow_replicate(actor_id, &snapshot);
-    let _ = rt.persistence.save_snapshot(snapshot);
+    }))
+}
+
+fn mark_checkpoint_committed(rt: &mut Runtime, actor_id: u64, sequence: u64) {
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        actor.sequence = seq;
+        actor.sequence = sequence;
         actor.dirty_fields.clear();
     }
+}
+
+/// Snapshot durable state as its own commit.
+pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
+    let sequence = next_sequence(rt, actor_id);
+    let snapshot = match snapshot_actor_at(rt, actor_id, sequence) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                "nulang-persist: refusing to checkpoint actor {}: {}",
+                actor_id,
+                error
+            );
+            return;
+        }
+    };
+
+    match rt.persistence.save_snapshot(snapshot.clone()) {
+        Ok(()) => {
+            rt.maybe_shadow_replicate(actor_id, &snapshot);
+            mark_checkpoint_committed(rt, actor_id, sequence);
+        }
+        Err(error) => {
+            tracing::warn!(
+                "nulang-persist: checkpoint failed for actor {} at sequence {}: {}",
+                actor_id,
+                sequence,
+                error
+            );
+        }
+    }
+}
+
+/// Publish a workflow event and the state checkpoint produced by the same
+/// transition as one persistence commit. Both records use one sequence.
+pub(crate) fn commit_workflow_event(
+    rt: &mut Runtime,
+    actor_id: u64,
+    event: WorkflowEvent,
+) -> std::io::Result<()> {
+    let sequence = event.sequence();
+    let snapshot = snapshot_actor_at(rt, actor_id, sequence)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("persistent workflow actor {actor_id} not found"),
+        )
+    })?;
+
+    rt.persistence
+        .commit_workflow_event_and_snapshot(actor_id, event, snapshot.clone())?;
+    rt.maybe_shadow_replicate(actor_id, &snapshot);
+    mark_checkpoint_committed(rt, actor_id, sequence);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -228,22 +280,21 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
         }
     }
 
-    if event == "ParallelBranchCompleted" && args.len() == 2 {
+    let workflow_event = if event == "ParallelBranchCompleted" && args.len() == 2 {
         let parallel_step_name =
             resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
         let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-        let _ = rt.persistence.append_parallel_branch_completed(
-            actor_id,
-            seq,
-            parallel_step_name,
-            branch_name,
-        );
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
             let current = actor
                 .get_state_field("parallel_progress")
                 .and_then(|value| value.as_int())
                 .unwrap_or(0);
             actor.set_state_field("parallel_progress", Value::int(current + 1));
+        }
+        WorkflowEvent::ParallelBranchCompleted {
+            sequence: seq,
+            parallel_step_name,
+            branch_name,
         }
     } else {
         let module = rt
@@ -254,16 +305,21 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             .iter()
             .map(|value| PersistedValue::from_value_resolved(value, module))
             .collect();
-        let _ = rt.persistence.append_workflow_event(
+        WorkflowEvent::Custom {
+            sequence: seq,
+            name: event.to_string(),
+            args: payload,
+        }
+    };
+
+    if let Err(error) = commit_workflow_event(rt, actor_id, workflow_event) {
+        tracing::warn!(
+            "nulang-persist: workflow event commit failed for actor {} at sequence {}: {}",
             actor_id,
-            WorkflowEvent::Custom {
-                sequence: seq,
-                name: event.to_string(),
-                args: payload,
-            },
+            seq,
+            error
         );
     }
-    checkpoint_actor(rt, actor_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -276,11 +332,16 @@ pub(crate) fn append_timer_set(
     name: &str,
     duration_ms: u64,
 ) -> std::io::Result<()> {
-    let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_set(actor_id, seq, name.to_string(), duration_ms)?;
-    checkpoint_actor(rt, actor_id);
-    Ok(())
+    let sequence = next_sequence(rt, actor_id);
+    commit_workflow_event(
+        rt,
+        actor_id,
+        WorkflowEvent::TimerSet {
+            sequence,
+            name: name.to_string(),
+            duration_ms,
+        },
+    )
 }
 
 pub(crate) fn append_timer_fired(
@@ -288,11 +349,15 @@ pub(crate) fn append_timer_fired(
     actor_id: u64,
     name: &str,
 ) -> std::io::Result<()> {
-    let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_fired(actor_id, seq, name.to_string())?;
-    checkpoint_actor(rt, actor_id);
-    Ok(())
+    let sequence = next_sequence(rt, actor_id);
+    commit_workflow_event(
+        rt,
+        actor_id,
+        WorkflowEvent::TimerFired {
+            sequence,
+            name: name.to_string(),
+        },
+    )
 }
 
 pub(crate) fn append_signal_received(
@@ -301,11 +366,16 @@ pub(crate) fn append_signal_received(
     name: &str,
     payload: Option<String>,
 ) -> std::io::Result<()> {
-    let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_signal_received(actor_id, seq, name.to_string(), payload)?;
-    checkpoint_actor(rt, actor_id);
-    Ok(())
+    let sequence = next_sequence(rt, actor_id);
+    commit_workflow_event(
+        rt,
+        actor_id,
+        WorkflowEvent::SignalReceived {
+            sequence,
+            name: name.to_string(),
+            payload,
+        },
+    )
 }
 
 pub(crate) fn append_saga_compensated(
@@ -313,11 +383,15 @@ pub(crate) fn append_saga_compensated(
     actor_id: u64,
     step_name: &str,
 ) -> std::io::Result<()> {
-    let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_saga_compensated(actor_id, seq, step_name.to_string())?;
-    checkpoint_actor(rt, actor_id);
-    Ok(())
+    let sequence = next_sequence(rt, actor_id);
+    commit_workflow_event(
+        rt,
+        actor_id,
+        WorkflowEvent::SagaCompensated {
+            sequence,
+            step_name: step_name.to_string(),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
