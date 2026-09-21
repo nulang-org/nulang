@@ -37,10 +37,7 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
 /// that gate externally visible durable transitions (workflow creation, timer
 /// commits, signals, compensation) must use this path so storage failure cannot
 /// be mistaken for a committed transition.
-pub(crate) fn try_checkpoint_actor(
-    rt: &mut Runtime,
-    actor_id: u64,
-) -> std::io::Result<()> {
+pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
     let actor = match rt.actors.get(&actor_id) {
         Some(a) => a,
         None => return Ok(()),
