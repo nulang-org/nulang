@@ -40,6 +40,20 @@ Runtime APIs:
   accounting: selected routes, same-process admissions, bounded-mailbox/channel
   backpressure, local rejection, and remote forwards.
 
+Cross-node actor delivery now also has an application-level admission protocol
+separate from transport ACKs. `Runtime::send_distributed_tracked` returns a
+sender-local delivery id; after the destination processes the message,
+`take_remote_admission` / `drain_remote_admissions` expose
+`Accepted`, `Backpressured`, or `Rejected`. Delivery ids are bound to the
+expected peer, so another node cannot satisfy the ticket. Outstanding tickets
+are bounded and can be explicitly abandoned after an application timeout.
+
+The existing `fabric_publish_report` remains intentionally synchronous and
+therefore still counts cross-node routes as `forwarded_remote`; it does not
+claim destination mailbox admission. A tracked Fabric publish receipt should
+layer remote delivery ids onto this protocol rather than weakening the meaning
+of `FabricPublishReport`.
+
 Subject patterns use NATS-style token matching:
 
 - `orders.created` matches exactly that topic.
