@@ -83,7 +83,7 @@ among Phases 1-4's broader production-readiness work.
 | Shipped release binaries | None in repo evidence |
 | External users | None known |
 | Distributed cluster ceiling | full-mesh heartbeats + TCP connections (O(N) per node, O(N²) cluster-wide); gossip membership payload capped at 256 entries — practical ceiling in the tens of nodes, the same class of limit Erlang's default distribution hits before requiring Partisan |
-| Cluster transport security | plaintext, unauthenticated by default; `TlsConfig::SelfSigned` exists (`src/runtime/network.rs`) but zero call sites in the entire codebase ever construct one — `enable_distribution` is only ever called with `tls_config: None` (sole caller: `src/runtime/tests.rs:2961`) |
+| Cluster transport security | authenticated mTLS is required by the `nulang node` CLI; plaintext transport is available only through the explicit `--plaintext` insecure-development opt-out. `TlsConfig` remains available to embedders, which must make their own transport policy explicit. |
 
 Unfinished implementation lines counted from `not yet implemented` /
 `not yet supported` markers in `src/`:
