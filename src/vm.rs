@@ -8107,6 +8107,60 @@ mod vm_tests {
     }
 
     #[test]
+    fn test_cached_builtin_generic_perform_preserves_handler_precedence() {
+        let mut module = CodeModule::new("test_cached_builtin_handler_precedence");
+        module.add_handler_table(HandlerTable {
+            bindings: vec![HandlerBinding {
+                effect_name: "Float.sqrt".to_string(),
+                handler_offset: 7,
+                arg_count: 1,
+                result_reg: 0,
+                single_shot: false,
+            }],
+            fallback_offset: None,
+        });
+
+        let effect = module.add_constant(Constant::String("Float.sqrt".to_string()));
+        let nine = module.add_constant(Constant::Float(9.0));
+        let handled = module.add_constant(Constant::Float(144.0));
+
+        module.emit(Instruction::new1(OpCode::Handle, 0)); // 0
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((nine >> 8) & 0xff) as u8,
+            (nine & 0xff) as u8,
+            0,
+        )); // 1
+        module.emit(Instruction::new3(
+            OpCode::Perform,
+            ((effect >> 8) & 0xff) as u8,
+            (effect & 0xff) as u8,
+            0,
+        )); // 2
+        module.emit(Instruction::new0(OpCode::Unwind)); // 3
+        module.emit(Instruction::new0(OpCode::Halt)); // 4
+        module.emit(Instruction::new0(OpCode::Nop)); // 5
+        module.emit(Instruction::new0(OpCode::Nop)); // 6
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((handled >> 8) & 0xff) as u8,
+            (handled & 0xff) as u8,
+            0,
+        )); // 7
+        module.emit(Instruction::new1(OpCode::Resume, 0)); // 8
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        let result = vm.run().expect("handled generic builtin must run");
+        assert_eq!(
+            result.as_float(),
+            Some(144.0),
+            "explicit handler must win over cached builtin fallback"
+        );
+    }
+
+    #[test]
     fn test_perform_name_cache_tracks_only_perform_constants() {
         let mut module = CodeModule::new("test_perform_name_cache");
         module
