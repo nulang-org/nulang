@@ -10,8 +10,8 @@ hero:
       link: /getting-started/installation/
       icon: right-arrow
       variant: primary
-    - text: Read the Quick Start
-      link: /getting-started/quick-start/
+    - text: Try in Browser
+      link: /playground/
       icon: right-arrow
       variant: secondary
 ---
@@ -25,6 +25,7 @@ import FeatureGrid from '../../components/FeatureGrid.astro';
 import Steps from '../../components/Steps.astro';
 import TerminalCard from '../../components/TerminalCard.astro';
 import MetricsBand from '../../components/MetricsBand.astro';
+import EvidenceGrid from '../../components/EvidenceGrid.astro';
 
 <MetricsBand>
   <GcDemo />
@@ -136,6 +137,17 @@ $ NULANG_STORE_PATH=.nulang/store nulang counter.nula`} />
     </div>
 
     <FeatureGrid />
+  </div>
+</div>
+
+<div class="nu-section" style="padding-top: 0;">
+  <div class="nu-container">
+    <div class="nu-section-header">
+      <h2>Don’t take the homepage on faith</h2>
+      <p class="nu-section-subhead">Run the compiler, inspect executable conformance cases, and look at regression-gated benchmark data. Nulang’s strongest claims should be independently checkable.</p>
+    </div>
+
+    <EvidenceGrid />
   </div>
 </div>
 
