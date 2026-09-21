@@ -534,61 +534,118 @@ pub(crate) fn perform_tensor_builtin(
 ) -> Option<Value> {
     use nulang_accelerator::{CpuTensor, DType};
 
+    let nil = || Some(Value::nil());
     match op_name {
         Some("from_array") => {
-            let values = value_array(callbacks, *regs.first()?)?;
-            let rows = regs.get(1)?.as_int()?;
-            let cols = regs.get(2)?.as_int()?;
+            let Some(source) = regs.first().copied() else {
+                return nil();
+            };
+            let Some(values) = value_array(callbacks, source) else {
+                return nil();
+            };
+            let Some(rows) = regs.get(1).and_then(Value::as_int) else {
+                return nil();
+            };
+            let Some(cols) = regs.get(2).and_then(Value::as_int) else {
+                return nil();
+            };
             if rows < 0 || cols < 0 {
-                return Some(Value::nil());
+                return nil();
             }
-            let data = values
-                .iter()
-                .map(Value::as_float)
-                .collect::<Option<Vec<_>>>()?;
-            let tensor = CpuTensor::matrix(DType::F64, rows as u64, cols as u64, data).ok()?;
-            alloc_tensor(callbacks, &tensor).or(Some(Value::nil()))
+            let Some(data) = values.iter().map(Value::as_float).collect::<Option<Vec<_>>>() else {
+                return nil();
+            };
+            let Ok(tensor) = CpuTensor::matrix(DType::F64, rows as u64, cols as u64, data) else {
+                return nil();
+            };
+            Some(alloc_tensor(callbacks, &tensor).unwrap_or_else(Value::nil))
         }
         Some("zeros") => {
-            let rows = regs.first()?.as_int()?;
-            let cols = regs.get(1)?.as_int()?;
+            let Some(rows) = regs.first().and_then(Value::as_int) else {
+                return nil();
+            };
+            let Some(cols) = regs.get(1).and_then(Value::as_int) else {
+                return nil();
+            };
             if rows < 0 || cols < 0 {
-                return Some(Value::nil());
+                return nil();
             }
-            let tensor = CpuTensor::zeros(DType::F64, vec![rows as u64, cols as u64]).ok()?;
-            alloc_tensor(callbacks, &tensor).or(Some(Value::nil()))
+            let Ok(tensor) = CpuTensor::zeros(DType::F64, vec![rows as u64, cols as u64]) else {
+                return nil();
+            };
+            Some(alloc_tensor(callbacks, &tensor).unwrap_or_else(Value::nil))
         }
         Some("shape") => {
-            let tensor = tensor_from_value(*regs.first()?)?;
-            let values = tensor
+            let Some(value) = regs.first().copied() else {
+                return nil();
+            };
+            let Some(tensor) = tensor_from_value(value) else {
+                return nil();
+            };
+            let Some(values) = tensor
                 .spec
                 .shape
                 .iter()
                 .map(|dim| i64::try_from(*dim).ok().map(Value::int))
-                .collect::<Option<Vec<_>>>()?;
-            alloc_value_array(callbacks, &values).or(Some(Value::nil()))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return nil();
+            };
+            Some(alloc_value_array(callbacks, &values).unwrap_or_else(Value::nil))
         }
         Some("to_array") => {
-            let tensor = tensor_from_value(*regs.first()?)?;
+            let Some(value) = regs.first().copied() else {
+                return nil();
+            };
+            let Some(tensor) = tensor_from_value(value) else {
+                return nil();
+            };
             let values = tensor.data.iter().copied().map(Value::float).collect::<Vec<_>>();
-            alloc_value_array(callbacks, &values).or(Some(Value::nil()))
+            Some(alloc_value_array(callbacks, &values).unwrap_or_else(Value::nil))
         }
         Some("add") => {
-            let lhs = tensor_from_value(*regs.first()?)?;
-            let rhs = tensor_from_value(*regs.get(1)?)?;
-            let out = lhs.add(&rhs).ok()?;
-            alloc_tensor(callbacks, &out).or(Some(Value::nil()))
+            let (Some(lhs_value), Some(rhs_value)) =
+                (regs.first().copied(), regs.get(1).copied())
+            else {
+                return nil();
+            };
+            let (Some(lhs), Some(rhs)) =
+                (tensor_from_value(lhs_value), tensor_from_value(rhs_value))
+            else {
+                return nil();
+            };
+            let Ok(out) = lhs.add(&rhs) else {
+                return nil();
+            };
+            Some(alloc_tensor(callbacks, &out).unwrap_or_else(Value::nil))
         }
         Some("matmul") => {
-            let lhs = tensor_from_value(*regs.first()?)?;
-            let rhs = tensor_from_value(*regs.get(1)?)?;
-            let out = lhs.matmul(&rhs).ok()?;
-            alloc_tensor(callbacks, &out).or(Some(Value::nil()))
+            let (Some(lhs_value), Some(rhs_value)) =
+                (regs.first().copied(), regs.get(1).copied())
+            else {
+                return nil();
+            };
+            let (Some(lhs), Some(rhs)) =
+                (tensor_from_value(lhs_value), tensor_from_value(rhs_value))
+            else {
+                return nil();
+            };
+            let Ok(out) = lhs.matmul(&rhs) else {
+                return nil();
+            };
+            Some(alloc_tensor(callbacks, &out).unwrap_or_else(Value::nil))
         }
         Some("relu") => {
-            let input = tensor_from_value(*regs.first()?)?;
-            let out = input.relu().ok()?;
-            alloc_tensor(callbacks, &out).or(Some(Value::nil()))
+            let Some(value) = regs.first().copied() else {
+                return nil();
+            };
+            let Some(input) = tensor_from_value(value) else {
+                return nil();
+            };
+            let Ok(out) = input.relu() else {
+                return nil();
+            };
+            Some(alloc_tensor(callbacks, &out).unwrap_or_else(Value::nil))
         }
         _ => None,
     }
