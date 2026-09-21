@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use crate::ast::IndexDecl;
-use crate::data_plan::{LogicalAccessPath, LogicalQueryPlan};
-use crate::runtime::persistence::{ActorSnapshot, PersistedValue};
+use crate::data_plan::{LogicalAccessPath, LogicalQueryPlan, QueryPredicateKind};
+use crate::runtime::persistence::{ActorSnapshot, PersistedValue, PersistenceStore};
 
 /// Totally ordered representation of persisted values suitable for B-tree keys.
 ///
@@ -74,6 +74,17 @@ pub enum EntityIndexError {
         index: String,
         field: String,
     },
+    MissingPredicateValue {
+        field: String,
+    },
+    UnsupportedResidualPredicate {
+        field: String,
+        kind: QueryPredicateKind,
+    },
+    WrongEntity {
+        expected: String,
+        found: String,
+    },
     UniqueViolation {
         index: String,
         actor_id: u64,
@@ -96,6 +107,17 @@ impl fmt::Display for EntityIndexError {
             Self::MissingQueryValue { index, field } => write!(
                 f,
                 "query using index '{index}' is missing equality value for '{field}'"
+            ),
+            Self::MissingPredicateValue { field } => {
+                write!(f, "query is missing a value for predicate field '{field}'")
+            }
+            Self::UnsupportedResidualPredicate { field, kind } => write!(
+                f,
+                "local entity executor cannot yet evaluate residual {kind:?} predicate on '{field}'"
+            ),
+            Self::WrongEntity { expected, found } => write!(
+                f,
+                "query plan targets entity '{found}', but this index set belongs to '{expected}'"
             ),
             Self::UniqueViolation {
                 index,
@@ -294,6 +316,60 @@ impl MemoryEntityIndexes {
         }
     }
 
+    /// Execute a logical query against authoritative snapshots.
+    ///
+    /// Indexes only choose candidates. Residual equality predicates are checked
+    /// against snapshots loaded from the persistence store before a result is
+    /// returned, so callers never observe false positives from a partial index
+    /// match. Range residuals remain an explicit Phase-2 limitation.
+    pub fn execute(
+        &self,
+        store: &dyn PersistenceStore,
+        plan: &LogicalQueryPlan,
+        equality_values: &HashMap<String, PersistedValue>,
+    ) -> Result<Vec<ActorSnapshot>, EntityIndexError> {
+        if plan.entity != self.entity {
+            return Err(EntityIndexError::WrongEntity {
+                expected: self.entity.clone(),
+                found: plan.entity.clone(),
+            });
+        }
+
+        let candidates = self.candidates(plan, equality_values)?;
+        let mut results = Vec::new();
+
+        'actor: for actor_id in candidates {
+            let Some(snapshot) = store.load_snapshot(actor_id) else {
+                continue;
+            };
+
+            for predicate in &plan.residual_predicates {
+                match predicate.kind {
+                    QueryPredicateKind::Eq => {
+                        let expected = equality_values.get(&predicate.field).ok_or_else(|| {
+                            EntityIndexError::MissingPredicateValue {
+                                field: predicate.field.clone(),
+                            }
+                        })?;
+                        if snapshot.state.get(&predicate.field) != Some(expected) {
+                            continue 'actor;
+                        }
+                    }
+                    kind => {
+                        return Err(EntityIndexError::UnsupportedResidualPredicate {
+                            field: predicate.field.clone(),
+                            kind,
+                        });
+                    }
+                }
+            }
+
+            results.push(snapshot);
+        }
+
+        Ok(results)
+    }
+
     fn keys_for_snapshot(
         &self,
         snapshot: &ActorSnapshot,
@@ -486,6 +562,77 @@ mod tests {
             indexes.candidates(&plan, &HashMap::new()).unwrap(),
             vec![4, 7]
         );
+    }
+
+    #[test]
+    fn execute_filters_residual_predicates_against_authoritative_snapshots() {
+        let mut indexes = MemoryEntityIndexes::new("Customer", &declarations());
+        let one = snapshot(1, "one@example.com", "Acme", "active");
+        let two = snapshot(2, "two@example.com", "Acme", "paused");
+        indexes.upsert_snapshot(&one).unwrap();
+        indexes.upsert_snapshot(&two).unwrap();
+
+        let mut store = crate::runtime::persistence::MemoryStore::new();
+        store.save_snapshot(one).unwrap();
+        store.save_snapshot(two).unwrap();
+
+        let plan = LogicalQueryPlan {
+            entity: "Customer".to_string(),
+            access: LogicalAccessPath::Index {
+                name: "by_company_status".to_string(),
+                fields: vec!["company".to_string(), "status".to_string()],
+                unique: false,
+                matched_prefix: 1,
+            },
+            residual_predicates: vec![QueryPredicate::eq("status")],
+        };
+        let values = HashMap::from([
+            (
+                "company".to_string(),
+                PersistedValue::String("Acme".to_string()),
+            ),
+            (
+                "status".to_string(),
+                PersistedValue::String("active".to_string()),
+            ),
+        ]);
+
+        let results = indexes.execute(&store, &plan, &values).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].actor_id, 1);
+    }
+
+    #[test]
+    fn execute_rejects_range_residual_until_range_semantics_are_explicit() {
+        let mut indexes = MemoryEntityIndexes::new("Customer", &declarations());
+        let one = snapshot(1, "one@example.com", "Acme", "active");
+        indexes.upsert_snapshot(&one).unwrap();
+
+        let mut store = crate::runtime::persistence::MemoryStore::new();
+        store.save_snapshot(one).unwrap();
+
+        let plan = LogicalQueryPlan {
+            entity: "Customer".to_string(),
+            access: LogicalAccessPath::Index {
+                name: "by_company_status".to_string(),
+                fields: vec!["company".to_string(), "status".to_string()],
+                unique: false,
+                matched_prefix: 1,
+            },
+            residual_predicates: vec![QueryPredicate::range("status")],
+        };
+        let values = HashMap::from([(
+            "company".to_string(),
+            PersistedValue::String("Acme".to_string()),
+        )]);
+
+        assert!(matches!(
+            indexes.execute(&store, &plan, &values),
+            Err(EntityIndexError::UnsupportedResidualPredicate {
+                field,
+                kind: QueryPredicateKind::Range,
+            }) if field == "status"
+        ));
     }
 
     #[test]
