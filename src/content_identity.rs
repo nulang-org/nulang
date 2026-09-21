@@ -185,14 +185,8 @@ mod tests {
     fn identity_roundtrips_raw_digest_bytes() {
         let semantic = SemanticId::from_canonical_bytes(b"wire", []);
         assert_eq!(SemanticId::from_bytes(*semantic.as_bytes()), semantic);
-        let artifact = ArtifactId::from_semantic(
-            semantic,
-            "compiler",
-            "target",
-            "abi",
-            "backend",
-            ["flag"],
-        );
+        let artifact =
+            ArtifactId::from_semantic(semantic, "compiler", "target", "abi", "backend", ["flag"]);
         assert_eq!(ArtifactId::from_bytes(*artifact.as_bytes()), artifact);
     }
 
