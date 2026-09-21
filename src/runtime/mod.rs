@@ -5066,6 +5066,40 @@ impl Runtime {
             .map(|meta| meta.is_agent)
             .unwrap_or(false);
 
+        // Validate ordinary actor message history against the selected schema
+        // before publishing the recovered actor. Journal behavior ids are
+        // module-global for ordinary actors, so an in-range id owned by a
+        // different actor schema must never be replayed.
+        let journal_to_replay: Vec<JournalEntry> = if is_workflow {
+            Vec::new()
+        } else {
+            self.persistence
+                .read_journal(actor_id)
+                .into_iter()
+                .filter(|entry| entry.sequence > snapshot.sequence)
+                .collect()
+        };
+        if let (Some(meta), Some((module, _, _))) = (
+            selected_meta.as_ref(),
+            self.recovery_modules.get(&actor_id),
+        ) {
+            for entry in &journal_to_replay {
+                if behavior_ownership::module_behavior_index_for_runtime_id(
+                    module,
+                    &meta.name,
+                    entry.behavior_id as usize,
+                )
+                .is_none()
+                {
+                    warn!(
+                        "nulang-recover: refusing actor {}: journal behavior id {} is not owned by schema '{}'",
+                        actor_id, entry.behavior_id, meta.name
+                    );
+                    return None;
+                }
+            }
+        }
+
         let mut actor = Actor::new(
             actor_id,
             recovery_schema_name
@@ -5293,14 +5327,8 @@ impl Runtime {
                 }
             }
         } else {
-            // Replay journal entries that arrived after the snapshot.
-            let journal = self.persistence.read_journal(actor_id);
-            let entries_to_replay: Vec<_> = journal
-                .iter()
-                .filter(|e| e.sequence > snapshot.sequence)
-                .cloned()
-                .collect();
-            for entry in entries_to_replay {
+            // Replay entries that were schema-validated before actor publication.
+            for entry in journal_to_replay {
                 let behavior_idx = entry.behavior_id as usize;
                 let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
                 if self.has_native_handler(actor_id, behavior_idx) {

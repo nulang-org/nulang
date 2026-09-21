@@ -1,6 +1,6 @@
 use nulang::lexer::Lexer;
 use nulang::parser::Parser;
-use nulang::runtime::{ActorSnapshot, GrainId, Runtime};
+use nulang::runtime::{ActorSnapshot, GrainId, JournalEntry, Runtime};
 use nulang::typechecker::TypeChecker;
 
 fn compile(source: &str) -> nulang::bytecode::CodeModule {
@@ -139,6 +139,56 @@ fn recovery_rejects_unknown_and_ambiguous_legacy_schema() {
         })
         .expect("legacy snapshot");
     assert_eq!(legacy.recover_actor(7003), None);
+}
+
+#[test]
+fn recovery_rejects_journal_behavior_owned_by_other_schema() {
+    let module = compile(
+        r#"
+        persistent actor First {
+            behavior hit() { nil }
+        }
+        persistent actor Second {
+            behavior hit() { nil }
+        }
+        "#,
+    );
+    let first = module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == "First")
+        .expect("First metadata");
+    let actor_id = 7006;
+    let mut rt = Runtime::new();
+    register_for_recovery(&mut rt, actor_id, module);
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            sequence: 0,
+            schema_name: Some("Second".to_string()),
+            ..ActorSnapshot::default()
+        })
+        .expect("snapshot");
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: 1,
+                behavior_id: u16::try_from(first.behavior_indices[0]).expect("behavior id"),
+                payload: vec![],
+            },
+        )
+        .expect("journal");
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "recovery must reject durable history owned by another actor schema"
+    );
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "invalid journal ownership must fail before actor publication"
+    );
 }
 
 #[test]
