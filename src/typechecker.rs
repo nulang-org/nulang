@@ -3394,7 +3394,269 @@ impl TypeChecker {
             final_subst = compose_subst(&s, &final_subst);
         }
 
+        // Match coverage is a type-system property, not a lowering/runtime
+        // concern. Check it only after inference has resolved the scrutinee
+        // as far as possible. The analysis is intentionally conservative:
+        // it diagnoses only coverage gaps and unreachable arms that are
+        // provable from a closed finite type. Unknown/open types are left
+        // alone rather than guessed.
+        let resolved_scrutinee = apply_subst(&scrut_ty, &final_subst);
+        self.validate_match_coverage(&resolved_scrutinee, arms, span)?;
+
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
+    }
+
+    /// Return whether a pattern is guaranteed to match every value of `ty`.
+    ///
+    /// This is deliberately structural and side-effect free. It is used only
+    /// for coverage/usefulness diagnostics; ordinary pattern typing remains in
+    /// `bind_pattern`.
+    fn pattern_irrefutable_for_type(pattern: &Pattern, ty: &Type) -> bool {
+        match pattern {
+            Pattern::Wild | Pattern::Var(_) => true,
+            Pattern::Alias(_, inner) => Self::pattern_irrefutable_for_type(inner, ty),
+            Pattern::Tuple(patterns) => match ty {
+                Type::Tuple(types) if patterns.len() == types.len() => patterns
+                    .iter()
+                    .zip(types)
+                    .all(|(pattern, ty)| Self::pattern_irrefutable_for_type(pattern, ty)),
+                _ => false,
+            },
+            Pattern::Record(patterns) => match ty {
+                Type::Record(fields) => patterns.iter().all(|(name, pattern)| {
+                    fields
+                        .iter()
+                        .find(|(field, _)| field == name)
+                        .map(|(_, ty)| Self::pattern_irrefutable_for_type(pattern, ty))
+                        .unwrap_or(false)
+                }),
+                _ => false,
+            },
+            Pattern::Variant(name, payload) => match ty {
+                Type::Variant(variants) if variants.len() == 1 => {
+                    match variants.iter().find(|(variant, _)| variant == name) {
+                        Some((_, None)) => payload.is_none(),
+                        Some((_, Some(payload_ty))) => payload
+                            .as_deref()
+                            .map(|pattern| {
+                                Self::pattern_irrefutable_for_type(pattern, payload_ty)
+                            })
+                            .unwrap_or(false),
+                        None => false,
+                    }
+                }
+                _ => false,
+            },
+            Pattern::Lit(Literal::Unit) => matches!(ty, Type::Primitive(PrimitiveType::Unit)),
+            Pattern::Lit(_) => false,
+        }
+    }
+
+    fn top_level_variant_pattern<'a>(
+        pattern: &'a Pattern,
+    ) -> Option<(&'a str, Option<&'a Pattern>)> {
+        match pattern {
+            Pattern::Variant(name, payload) => Some((name.as_str(), payload.as_deref())),
+            Pattern::Alias(_, inner) => Self::top_level_variant_pattern(inner),
+            _ => None,
+        }
+    }
+
+    fn variant_arm_covers_constructor(
+        variants: &[(String, Option<Type>)],
+        name: &str,
+        payload: Option<&Pattern>,
+    ) -> bool {
+        match variants.iter().find(|(variant, _)| variant == name) {
+            Some((_, None)) => payload.is_none(),
+            Some((_, Some(payload_ty))) => payload
+                .map(|pattern| Self::pattern_irrefutable_for_type(pattern, payload_ty))
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Conservative finite-type match coverage/usefulness analysis.
+    ///
+    /// Guards never contribute total coverage. A wildcard/variable (or an
+    /// irrefutable alias/structural pattern) makes later arms unreachable. A
+    /// fully-covered variant constructor makes later arms for that constructor
+    /// unreachable. A closed variant constructor with no unguarded arm is
+    /// definitely missing and therefore an error. Bool coverage is exact.
+    ///
+    /// Partial payload partitions (for example `Some(true)` + `Some(false)`)
+    /// are not currently proven exhaustive. They also do not cause a false
+    /// non-exhaustive error as long as the constructor appears in an unguarded
+    /// arm; a future pattern-matrix pass can make that proof more precise
+    /// without changing this contract.
+    fn validate_match_coverage(
+        &self,
+        scrut_ty: &Type,
+        arms: &[(Pattern, Option<Expr>, Expr)],
+        span: Span,
+    ) -> NuResult<()> {
+        match scrut_ty {
+            Type::Variant(variants) => {
+                let all_names: FxHashSet<&str> =
+                    variants.iter().map(|(name, _)| name.as_str()).collect();
+                let mut seen_unguarded: FxHashSet<&str> = FxHashSet::default();
+                let mut fully_covered: FxHashSet<&str> = FxHashSet::default();
+                let mut covered_all = false;
+
+                for (index, (pattern, guard, _)) in arms.iter().enumerate() {
+                    if covered_all {
+                        return Err(NuError::TypeError {
+                            msg: format!(
+                                "unreachable match arm {}: previous arms already cover every value",
+                                index + 1
+                            ),
+                            span,
+                            expected_type: Some("reachable match arm".to_string()),
+                            found_type: Some("unreachable match arm".to_string()),
+                            similar_names: None,
+                        });
+                    }
+
+                    if let Some((name, payload)) = Self::top_level_variant_pattern(pattern) {
+                        if all_names.contains(name) && fully_covered.contains(name) {
+                            return Err(NuError::TypeError {
+                                msg: format!(
+                                    "unreachable match arm {}: variant '{}' is already fully covered",
+                                    index + 1,
+                                    name
+                                ),
+                                span,
+                                expected_type: Some("new reachable pattern".to_string()),
+                                found_type: Some(format!("already-covered variant {}", name)),
+                                similar_names: None,
+                            });
+                        }
+
+                        if guard.is_none() && all_names.contains(name) {
+                            seen_unguarded.insert(name);
+                            if Self::variant_arm_covers_constructor(variants, name, payload) {
+                                fully_covered.insert(name);
+                            }
+                        }
+                    }
+
+                    if guard.is_none()
+                        && Self::pattern_irrefutable_for_type(pattern, scrut_ty)
+                    {
+                        covered_all = true;
+                    } else if fully_covered.len() == variants.len() {
+                        covered_all = true;
+                    }
+                }
+
+                if covered_all {
+                    return Ok(());
+                }
+
+                let mut missing: Vec<&str> = variants
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .filter(|name| !seen_unguarded.contains(name))
+                    .collect();
+                missing.sort_unstable();
+                if !missing.is_empty() {
+                    return Err(NuError::TypeError {
+                        msg: format!(
+                            "non-exhaustive match: missing variant{} {}",
+                            if missing.len() == 1 { "" } else { "s" },
+                            missing.join(", ")
+                        ),
+                        span,
+                        expected_type: Some("exhaustive match".to_string()),
+                        found_type: Some(format!("missing {}", missing.join(", "))),
+                        similar_names: Some(
+                            missing.iter().map(|name| (*name).to_string()).collect(),
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            Type::Primitive(PrimitiveType::Bool) => {
+                let mut seen_true = false;
+                let mut seen_false = false;
+                let mut covered_all = false;
+
+                for (index, (pattern, guard, _)) in arms.iter().enumerate() {
+                    if covered_all {
+                        return Err(NuError::TypeError {
+                            msg: format!(
+                                "unreachable match arm {}: previous arms already cover every Bool value",
+                                index + 1
+                            ),
+                            span,
+                            expected_type: Some("reachable match arm".to_string()),
+                            found_type: Some("unreachable match arm".to_string()),
+                            similar_names: None,
+                        });
+                    }
+
+                    if guard.is_none() {
+                        match pattern {
+                            Pattern::Lit(Literal::Bool(true)) => {
+                                if seen_true {
+                                    return Err(NuError::TypeError {
+                                        msg: format!(
+                                            "unreachable match arm {}: true is already covered",
+                                            index + 1
+                                        ),
+                                        span,
+                                        expected_type: Some("new reachable pattern".to_string()),
+                                        found_type: Some("duplicate true pattern".to_string()),
+                                        similar_names: None,
+                                    });
+                                }
+                                seen_true = true;
+                            }
+                            Pattern::Lit(Literal::Bool(false)) => {
+                                if seen_false {
+                                    return Err(NuError::TypeError {
+                                        msg: format!(
+                                            "unreachable match arm {}: false is already covered",
+                                            index + 1
+                                        ),
+                                        span,
+                                        expected_type: Some("new reachable pattern".to_string()),
+                                        found_type: Some("duplicate false pattern".to_string()),
+                                        similar_names: None,
+                                    });
+                                }
+                                seen_false = true;
+                            }
+                            _ if Self::pattern_irrefutable_for_type(pattern, scrut_ty) => {
+                                covered_all = true;
+                            }
+                            _ => {}
+                        }
+                        if seen_true && seen_false {
+                            covered_all = true;
+                        }
+                    }
+                }
+
+                if !covered_all {
+                    let missing = match (seen_true, seen_false) {
+                        (false, false) => "true, false",
+                        (false, true) => "true",
+                        (true, false) => "false",
+                        (true, true) => unreachable!(),
+                    };
+                    return Err(NuError::TypeError {
+                        msg: format!("non-exhaustive Bool match: missing {}", missing),
+                        span,
+                        expected_type: Some("exhaustive Bool match".to_string()),
+                        found_type: Some(format!("missing {}", missing)),
+                        similar_names: None,
+                    });
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Bind pattern variables into a new context.
@@ -3467,11 +3729,44 @@ impl TypeChecker {
             },
             Pattern::Variant(name, pat) => match scrut_ty {
                 Type::Variant(variants) => {
+                    let Some((_, payload_ty)) = variants.iter().find(|(n, _)| n == name) else {
+                        let available = variants.iter().map(|(n, _)| n.clone()).collect();
+                        return Err(NuError::TypeError {
+                            msg: format!(
+                                "unknown variant '{}' for scrutinee type {}",
+                                name, scrut_ty
+                            ),
+                            span: Span::default(),
+                            expected_type: Some("declared variant constructor".to_string()),
+                            found_type: Some(name.clone()),
+                            similar_names: Some(available),
+                        });
+                    };
+
                     let mut new_ctx = ctx.clone();
-                    if let Some((_, Some(ty))) = variants.iter().find(|(n, _)| n == name) {
-                        if let Some(p) = pat {
-                            new_ctx = self.bind_pattern(&new_ctx, p, ty)?;
+                    match (payload_ty, pat.as_deref()) {
+                        (Some(ty), Some(pattern)) => {
+                            new_ctx = self.bind_pattern(&new_ctx, pattern, ty)?;
                         }
+                        (Some(_), None) => {
+                            return Err(NuError::TypeError {
+                                msg: format!("variant '{}' requires a payload pattern", name),
+                                span: Span::default(),
+                                expected_type: Some(format!("{}(<pattern>)", name)),
+                                found_type: Some(name.clone()),
+                                similar_names: None,
+                            });
+                        }
+                        (None, Some(_)) => {
+                            return Err(NuError::TypeError {
+                                msg: format!("variant '{}' does not carry a payload", name),
+                                span: Span::default(),
+                                expected_type: Some(name.clone()),
+                                found_type: Some(format!("{}(<pattern>)", name)),
+                                similar_names: None,
+                            });
+                        }
+                        (None, None) => {}
                     }
                     Ok(new_ctx)
                 }
@@ -5848,5 +6143,153 @@ mod tests {
         let expr = bin(BinOp::Range, int_lit(0), string_lit("hello"));
         let result = tc.infer_expr(&TypeContext::new(), &expr);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_match_closed_variant_must_cover_all_constructors() {
+        let result = check_src(
+            r#"
+            type Payment = Cash | Card(Int) | Transfer(Int)
+            fn classify(payment: Payment) -> Int {
+                match payment {
+                    | Cash => 0
+                    | Card(_) => 1
+                }
+            }
+            classify(Cash)
+            "#,
+        );
+        let err = result.expect_err("missing Transfer must be rejected");
+        assert!(
+            format!("{}", err).contains("Transfer"),
+            "diagnostic should name the missing constructor: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_match_closed_variant_exhaustive_is_accepted() {
+        let result = check_src(
+            r#"
+            type Payment = Cash | Card(Int) | Transfer(Int)
+            fn classify(payment: Payment) -> Int {
+                match payment {
+                    | Cash => 0
+                    | Card(_) => 1
+                    | Transfer(_) => 2
+                }
+            }
+            classify(Cash)
+            "#,
+        );
+        assert!(result.is_ok(), "exhaustive match should pass: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_match_guarded_variant_arm_does_not_make_match_exhaustive() {
+        let result = check_src(
+            r#"
+            type Choice = A | B
+            fn choose(value: Choice) -> Int {
+                match value {
+                    | A if true => 1
+                    | B => 2
+                }
+            }
+            choose(A)
+            "#,
+        );
+        let err = result.expect_err("guarded A arm must not prove A coverage");
+        assert!(
+            format!("{}", err).contains("A"),
+            "diagnostic should name A as missing: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_match_arm_after_wildcard_is_unreachable() {
+        let result = check_src(
+            r#"
+            type Choice = A | B
+            fn choose(value: Choice) -> Int {
+                match value {
+                    | _ => 0
+                    | A => 1
+                }
+            }
+            choose(A)
+            "#,
+        );
+        let err = result.expect_err("arm after wildcard must be unreachable");
+        assert!(
+            format!("{}", err).contains("unreachable match arm"),
+            "unexpected diagnostic: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_match_variant_payload_tuple_can_be_irrefutable() {
+        let result = check_src(
+            r#"
+            type MaybePair = Pair((Int, Int)) | None
+            fn sum(value: MaybePair) -> Int {
+                match value {
+                    | Pair((x, y)) => x + y
+                    | None => 0
+                }
+            }
+            sum(None)
+            "#,
+        );
+        assert!(
+            result.is_ok(),
+            "structurally irrefutable tuple payload should cover Pair: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_match_unknown_variant_constructor_is_rejected() {
+        let result = check_src(
+            r#"
+            type Choice = A | B
+            fn choose(value: Choice) -> Int {
+                match value {
+                    | A => 1
+                    | C => 2
+                    | B => 3
+                }
+            }
+            choose(A)
+            "#,
+        );
+        let err = result.expect_err("unknown constructor C must be rejected");
+        assert!(
+            format!("{}", err).contains("unknown variant 'C'"),
+            "unexpected diagnostic: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_bool_match_must_be_exhaustive() {
+        let result = check_src(
+            r#"
+            fn flag(value: Bool) -> Int {
+                match value {
+                    | true => 1
+                }
+            }
+            flag(true)
+            "#,
+        );
+        let err = result.expect_err("Bool match missing false must fail");
+        assert!(
+            format!("{}", err).contains("false"),
+            "diagnostic should name false: {}",
+            err
+        );
     }
 }
