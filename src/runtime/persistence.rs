@@ -2147,6 +2147,30 @@ impl PostgresStore {
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS events_v2 (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                ordinal BIGINT NOT NULL,
+                field_name TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                args TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '1',
+                PRIMARY KEY (actor_id, sequence, ordinal),
+                UNIQUE (actor_id, sequence, field_name)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "INSERT INTO events_v2
+                (actor_id, sequence, ordinal, field_name, event_name, args, value)
+             SELECT actor_id, sequence, 0, field_name, event_name, args, value
+             FROM events
+             ON CONFLICT (actor_id, sequence, field_name) DO NOTHING",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(())
     }
 }
@@ -2280,6 +2304,45 @@ impl PersistenceStore for PostgresStore {
             .collect()
     }
 
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut conn = match self.conn.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Vec::new(),
+        };
+        let start_sequence = i64::try_from(start_sequence).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = match conn.query(
+            "SELECT sequence, behavior_id, payload FROM journal
+             WHERE actor_id = $1 AND sequence >= $2
+             ORDER BY sequence ASC LIMIT $3",
+            &[&(actor_id as i64), &start_sequence, &limit],
+        ) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let sequence: i64 = row.get(0);
+                let behavior_id: i32 = row.get(1);
+                let payload_json: String = row.get(2);
+                let payload = serde_json::from_str(&payload_json).ok()?;
+                Some(JournalEntry {
+                    sequence: sequence as u64,
+                    behavior_id: behavior_id as u16,
+                    payload,
+                })
+            })
+            .collect()
+    }
+
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
         let event_json = serde_json::to_string(&event)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -2316,6 +2379,38 @@ impl PersistenceStore for PostgresStore {
             .collect()
     }
 
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut conn = match self.conn.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Vec::new(),
+        };
+        let start_sequence = i64::try_from(start_sequence).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = match conn.query(
+            "SELECT event FROM workflow_events
+             WHERE actor_id = $1 AND sequence >= $2
+             ORDER BY sequence ASC LIMIT $3",
+            &[&(actor_id as i64), &start_sequence, &limit],
+        ) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let event_json: String = row.get(0);
+                serde_json::from_str(&event_json).ok()
+            })
+            .collect()
+    }
+
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         let args_json = serde_json::to_string(&entry.args)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -2323,10 +2418,11 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (actor_id, sequence) DO UPDATE SET
-               field_name = EXCLUDED.field_name,
+            "INSERT INTO events_v2
+                (actor_id, sequence, ordinal, field_name, event_name, args, value)
+             SELECT $1, $2, COALESCE(MAX(ordinal) + 1, 0), $3, $4, $5, $6
+             FROM events_v2 WHERE actor_id = $1 AND sequence = $2
+             ON CONFLICT (actor_id, sequence, field_name) DO UPDATE SET
                event_name = EXCLUDED.event_name,
                args = EXCLUDED.args,
                value = EXCLUDED.value",
@@ -2349,8 +2445,8 @@ impl PersistenceStore for PostgresStore {
             Err(_) => return Vec::new(),
         };
         let rows = match conn.query(
-            "SELECT sequence, field_name, event_name, args, value FROM events
-             WHERE actor_id = $1 ORDER BY sequence ASC",
+            "SELECT sequence, field_name, event_name, args, value FROM events_v2
+             WHERE actor_id = $1 ORDER BY sequence ASC, ordinal ASC",
             &[&(actor_id as i64)],
         ) {
             Ok(r) => r,
@@ -2367,6 +2463,50 @@ impl PersistenceStore for PostgresStore {
                 let value: PersistedValue = serde_json::from_str(&value_json).ok()?;
                 Some(EventEntry {
                     sequence: seq as u64,
+                    field_name,
+                    event_name,
+                    args,
+                    value,
+                })
+            })
+            .collect()
+    }
+
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut conn = match self.conn.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Vec::new(),
+        };
+        let start_sequence = i64::try_from(start_sequence).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = match conn.query(
+            "SELECT sequence, field_name, event_name, args, value FROM events_v2
+             WHERE actor_id = $1 AND sequence >= $2
+             ORDER BY sequence ASC, ordinal ASC LIMIT $3",
+            &[&(actor_id as i64), &start_sequence, &limit],
+        ) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let sequence: i64 = row.get(0);
+                let field_name: String = row.get(1);
+                let event_name: String = row.get(2);
+                let args_json: String = row.get(3);
+                let value_json: String = row.get(4);
+                let args = serde_json::from_str(&args_json).ok()?;
+                let value = serde_json::from_str(&value_json).ok()?;
+                Some(EventEntry {
+                    sequence: sequence as u64,
                     field_name,
                     event_name,
                     args,
@@ -2407,7 +2547,7 @@ impl PersistenceStore for PostgresStore {
             .map(|row| row.get(0));
         let event_seq: Option<i64> = conn
             .query_opt(
-                "SELECT sequence FROM events WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
+                "SELECT sequence FROM events_v2 WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
                 &[&(actor_id as i64)],
             )
             .ok()
@@ -2422,7 +2562,7 @@ impl PersistenceStore for PostgresStore {
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        for table in ["snapshots", "journal", "workflow_events", "events"] {
+        for table in ["snapshots", "journal", "workflow_events", "events", "events_v2"] {
             conn.execute(
                 &format!("DELETE FROM {} WHERE actor_id = $1", table),
                 &[&(actor_id as i64)],
