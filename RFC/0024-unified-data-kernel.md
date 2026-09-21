@@ -1,6 +1,6 @@
 # RFC 0024: Unified Data Kernel
 
-- **Status:** Draft — Phase 0 change-stream substrate implemented
+- **Status:** Draft — Phase 1 storage-native scans in progress
 - **Tier:** Experimental
 - **Created:** 2026-09-21
 
@@ -296,10 +296,21 @@ This RFC does not propose:
 
 ### Phase 1 — storage-native change scans
 
-- Add bounded `scan_changes(after, limit)` persistence API.
-- Implement Memory, JSON, and libSQL backends.
-- Introduce compaction-stable commit identity.
-- Benchmark cursor scan latency/allocation.
+- [x] Add bounded `scan_durable_changes(after, limit)` with an exclusive
+  composite cursor.
+- [x] Add backend range-scan hooks to `PersistenceStore`.
+- [x] Implement bounded scans for Memory, JSONL, libSQL, RocksDB, and
+  PostgreSQL backends.
+- [x] Preserve multiple event-sourced field mutations at one actor sequence
+  across Memory/JSONL/libSQL/RocksDB/PostgreSQL.
+- [x] Canonicalize same-sequence field ordering so cursor ordinals are stable
+  across process restarts and backends.
+- [x] Add batch event append semantics; Memory and RocksDB batch natively,
+  libSQL/PostgreSQL use transactions, and runtime event-sourced state rolls
+  back if persistence fails.
+- [ ] Make workflow event + checkpoint publication one atomic durable commit.
+- [ ] Introduce compaction-stable global commit identity.
+- [ ] Benchmark cursor scan latency/allocation and set regression budgets.
 
 ### Phase 2 — typed indexes and query plan
 
