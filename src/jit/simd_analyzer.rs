@@ -257,10 +257,13 @@ pub struct SimdRegion {
     /// Registers that hold array references (input + output arrays).
     pub array_regs: Vec<u8>,
     /// Known trip count if statically determinable (e.g. from `ArrLen`).
-    /// `Some(0)` means "runtime-determined from `arr_len_reg`".
+    /// `Some(0)` means "runtime-determined from `trip_count_array_reg`".
     pub trip_count_hint: Option<usize>,
-    /// Register holding the `ArrLen` result when `trip_count_hint == Some(0)`.
-    pub arr_len_reg: Option<u8>,
+    /// Participating array register whose heap allocation supplies the runtime
+    /// trip count when `trip_count_hint == Some(0)`. This is the *source*
+    /// register of the observed `ArrLen`, not its destination register: the
+    /// SIMD replacement does not execute the original `ArrLen` bytecode.
+    pub trip_count_array_reg: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +606,7 @@ pub fn analyze_region(
             return None;
         }
         // Requirement 4: Try to find trip count hint.
-        let (trip_count_hint, arr_len_reg) = find_trip_count_hint(body, &array_regs);
+        let (trip_count_hint, trip_count_array_reg) = find_trip_count_hint(body, &array_regs);
 
         return Some(SimdRegion {
             start_offset,
@@ -614,7 +617,7 @@ pub fn analyze_region(
             induction_var_reg: induction_reg.unwrap(),
             array_regs,
             trip_count_hint,
-            arr_len_reg,
+            trip_count_array_reg,
         });
     }
 
@@ -628,7 +631,7 @@ pub fn analyze_region(
             return None;
         }
 
-        let (trip_count_hint, arr_len_reg) = find_trip_count_hint(body, &array_regs);
+        let (trip_count_hint, trip_count_array_reg) = find_trip_count_hint(body, &array_regs);
 
         return Some(SimdRegion {
             start_offset,
@@ -639,7 +642,7 @@ pub fn analyze_region(
             induction_var_reg: induction_reg.unwrap(),
             array_regs,
             trip_count_hint,
-            arr_len_reg,
+            trip_count_array_reg,
         });
     }
 
@@ -653,7 +656,7 @@ pub fn analyze_region(
             return None;
         }
 
-        let (trip_count_hint, arr_len_reg) = find_trip_count_hint(body, &array_regs);
+        let (trip_count_hint, trip_count_array_reg) = find_trip_count_hint(body, &array_regs);
 
         return Some(SimdRegion {
             start_offset,
@@ -664,7 +667,7 @@ pub fn analyze_region(
             induction_var_reg: induction_reg.unwrap(),
             array_regs,
             trip_count_hint,
-            arr_len_reg,
+            trip_count_array_reg,
         });
     }
     None
@@ -1023,11 +1026,12 @@ fn find_trip_count_hint(body: &[Instruction], array_regs: &[u8]) -> (Option<usiz
     for instr in body {
         if instr.opcode == OpCode::ArrLen {
             if array_regs.contains(&instr.op1) {
-                // Found ArrLen on a participating array. The result register
-                // (instr.op2) holds the array length at runtime.
-                // Return Some(0) as a sentinel for "runtime-determined" plus
-                // the register so the compiler can load the length.
-                return (Some(0), Some(instr.op2));
+                // Found ArrLen on a participating array. The SIMD replacement
+                // skips the original ArrLen bytecode, so carrying its result
+                // register would read uninitialized/stale frame state. Carry
+                // the source array register and derive its length directly
+                // from the allocation header instead.
+                return (Some(0), Some(instr.op1));
             }
         }
     }

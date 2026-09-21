@@ -1501,6 +1501,183 @@ fn test_compute_recursive_classifies_cycles() {
 }
 
 #[test]
+fn test_tier2_simd_promotion_replaces_cached_scalar_pointer() {
+    if !crate::jit::simd_compiler::is_simd_supported() {
+        return;
+    }
+
+    let mut jit = make_jit();
+    let back: i16 = -6;
+    let instructions = vec![
+        Instruction::new2(OpCode::ArrLen, 10, 13),
+        Instruction::new1(OpCode::Const0, 3),
+        Instruction::new3(OpCode::ArrLoad, 10, 3, 4),
+        Instruction::new3(OpCode::ArrLoad, 11, 3, 5),
+        Instruction::new3(OpCode::IAdd, 4, 5, 6),
+        Instruction::new3(OpCode::ArrStore, 12, 3, 6),
+        Instruction::new1(OpCode::IInc, 3),
+        Instruction::new3(OpCode::ICmpLt, 3, 13, 7),
+        Instruction::new3(
+            OpCode::JmpT,
+            7,
+            ((back as u16) >> 8) as u8,
+            (back as u16 & 0xFF) as u8,
+        ),
+    ];
+
+    let scalar = unsafe {
+        jit.compile_region(
+            0,
+            0,
+            instructions.len(),
+            &instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("tier-1 scalar compile");
+    let before = scalar as usize;
+
+    jit.tier2_counters
+        .insert((0, 0), TIER2_THRESHOLD.saturating_sub(1));
+    jit.record_tier2_and_maybe_promote(0, 0, &instructions);
+
+    assert!(
+        jit.simd_regions.contains(&(0, 0)),
+        "hot vectorizable region must be marked as SIMD-promoted"
+    );
+    let after = unsafe { jit.get_compiled(0, 0) }.expect("promoted function") as usize;
+    assert_ne!(
+        before, after,
+        "tier-2 must replace the cached tier-1 function pointer"
+    );
+    assert!(
+        !jit.tier2_exhausted.contains(&(0, 0)),
+        "successful promotion must not be marked exhausted"
+    );
+}
+
+#[test]
+fn test_tier2_simd_rejects_observable_scalar_scratch_state() {
+    let mut jit = make_jit();
+    let back: i16 = -6;
+    let mut instructions = vec![
+        Instruction::new2(OpCode::ArrLen, 10, 13),
+        Instruction::new1(OpCode::Const0, 3),
+        Instruction::new3(OpCode::ArrLoad, 10, 3, 4),
+        Instruction::new3(OpCode::ArrLoad, 11, 3, 5),
+        Instruction::new3(OpCode::IAdd, 4, 5, 6),
+        Instruction::new3(OpCode::ArrStore, 12, 3, 6),
+        Instruction::new1(OpCode::IInc, 3),
+        Instruction::new3(OpCode::ICmpLt, 3, 13, 7),
+        Instruction::new3(
+            OpCode::JmpT,
+            7,
+            ((back as u16) >> 8) as u8,
+            (back as u16 & 0xFF) as u8,
+        ),
+    ];
+    let region_len = instructions.len();
+    // r6 is the scalar loop's final arithmetic scratch value. The SIMD
+    // replacement mutates the destination array directly and does not
+    // reconstruct r6, so returning it must block promotion.
+    instructions.push(Instruction::new1(OpCode::RetVal, 6));
+
+    unsafe {
+        jit.compile_region(
+            0,
+            0,
+            region_len,
+            &instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("scalar compile");
+    jit.tier2_counters
+        .insert((0, 0), TIER2_THRESHOLD.saturating_sub(1));
+    jit.record_tier2_and_maybe_promote(0, 0, &instructions);
+
+    assert!(!jit.simd_regions.contains(&(0, 0)));
+    assert!(jit.tier2_exhausted.contains(&(0, 0)));
+}
+
+#[test]
+fn test_tier2_simd_rejects_unrelated_arrlen_bound() {
+    let mut jit = make_jit();
+    let back: i16 = -6;
+    let instructions = vec![
+        Instruction::new2(OpCode::ArrLen, 10, 13),
+        Instruction::new1(OpCode::Const0, 3),
+        Instruction::new3(OpCode::ArrLoad, 10, 3, 4),
+        Instruction::new3(OpCode::ArrLoad, 11, 3, 5),
+        Instruction::new3(OpCode::IAdd, 4, 5, 6),
+        Instruction::new3(OpCode::ArrStore, 12, 3, 6),
+        Instruction::new1(OpCode::IInc, 3),
+        // The loop is bounded by r14, not the ArrLen result r13. Using the
+        // array allocation length as the SIMD trip count would change
+        // semantics and must therefore be rejected.
+        Instruction::new3(OpCode::ICmpLt, 3, 14, 7),
+        Instruction::new3(
+            OpCode::JmpT,
+            7,
+            ((back as u16) >> 8) as u8,
+            (back as u16 & 0xFF) as u8,
+        ),
+    ];
+
+    unsafe {
+        jit.compile_region(
+            0,
+            0,
+            instructions.len(),
+            &instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("scalar compile");
+    jit.tier2_counters
+        .insert((0, 0), TIER2_THRESHOLD.saturating_sub(1));
+    jit.record_tier2_and_maybe_promote(0, 0, &instructions);
+
+    assert!(!jit.simd_regions.contains(&(0, 0)));
+    assert!(jit.tier2_exhausted.contains(&(0, 0)));
+}
+
+#[test]
+fn test_tier2_rejection_is_not_retried() {
+    let mut jit = make_jit();
+    let instructions = vec![
+        Instruction::new3(OpCode::IAdd, 0, 1, 2),
+        Instruction::new3(OpCode::ISub, 2, 1, 3),
+        Instruction::new3(OpCode::IMul, 3, 1, 4),
+    ];
+    unsafe {
+        jit.compile_region(
+            0,
+            0,
+            instructions.len(),
+            &instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("scalar compile");
+
+    jit.tier2_counters
+        .insert((0, 0), TIER2_THRESHOLD.saturating_sub(1));
+    jit.record_tier2_and_maybe_promote(0, 0, &instructions);
+    assert!(jit.tier2_exhausted.contains(&(0, 0)));
+
+    let counter = jit.tier2_counters.get(&(0, 0)).copied();
+    for _ in 0..100 {
+        jit.record_tier2_and_maybe_promote(0, 0, &instructions);
+    }
+    assert_eq!(
+        jit.tier2_counters.get(&(0, 0)).copied(),
+        counter,
+        "exhausted regions must not resume tier-2 accounting"
+    );
+}
+
+#[test]
 fn test_tier2_counter_increments() {
     let mut jit = make_jit();
     let dummy_ptr: *const u8 = std::ptr::null();

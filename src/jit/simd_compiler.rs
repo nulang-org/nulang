@@ -69,6 +69,7 @@ use std::collections::HashMap;
 use crate::bytecode::Instruction;
 use crate::cranelift_utils::{emit_extract_payload, emit_sext48};
 use crate::jit::compiler::CompileError;
+use crate::jit::helpers::RuntimeHelper;
 #[cfg(test)]
 use crate::jit::simd_analyzer::SimdWidth;
 use crate::jit::simd_analyzer::{
@@ -98,6 +99,30 @@ impl SimdBinOp {
             BinopKind::IMul | BinopKind::FMul => Some(SimdBinOp::Mul),
             _ => None,
         }
+    }
+}
+
+pub(crate) fn native_simd_codegen_supported(region: &SimdRegion) -> bool {
+    // Generic Nulang arrays store one 8-byte Value per slot. 32-bit SIMD
+    // lanes would use the wrong stride until an explicitly unboxed array
+    // representation exists.
+    // Start with Int64 only. Float SIMD needs an explicit per-lane NaN
+    // canonicalization contract before native stores can be equivalent to the
+    // boxed Value representation, and 32-bit lanes do not match the 8-byte
+    // generic array slot layout.
+    if region.elem_type != SimdElemType::Int64 {
+        return false;
+    }
+
+    match &region.pattern {
+        VectorizablePattern::ElementWiseBinop { op, .. } => {
+            SimdBinOp::from_binop_kind(*op).is_some()
+        }
+        VectorizablePattern::ElementWiseUnary { .. } => true,
+        // Comparison results are Nulang Bool values, not numeric array
+        // elements. The current vector store path does not yet synthesize
+        // per-lane TAG_BOOL values, so keep these scalar.
+        VectorizablePattern::ElementWiseCmp { .. } => false,
     }
 }
 
@@ -181,8 +206,9 @@ pub fn compile_simd_region(
     instructions: &[Instruction],
     simd_region: &SimdRegion,
 ) -> Result<*const u8, CompileError> {
-    // If SIMD is not supported on this host, fall back to scalar compilation
-    if !is_simd_supported() {
+    // Fall back unless this host and this concrete Value representation can
+    // execute the pattern without changing Nulang semantics.
+    if !is_simd_supported() || !native_simd_codegen_supported(simd_region) {
         return fallback_to_scalar(
             module,
             builder_context,
@@ -194,9 +220,12 @@ pub fn compile_simd_region(
         );
     }
 
-    // If no trip count hint and no ArrLen register, fall back to scalar.
+    // Some(0) means the analyzer observed ArrLen inside the candidate region.
+    // trip_count_array_reg is the source array register; the SIMD replacement
+    // derives its length directly from the heap header because it does not
+    // execute the original ArrLen bytecode.
     let trip_count_is_runtime =
-        simd_region.trip_count_hint == Some(0) && simd_region.arr_len_reg.is_some();
+        simd_region.trip_count_hint == Some(0) && simd_region.trip_count_array_reg.is_some();
     if simd_region.trip_count_hint.is_none() && !trip_count_is_runtime {
         return fallback_to_scalar(
             module,
@@ -217,6 +246,7 @@ pub fn compile_simd_region(
     ctx.func.signature.params.push(AbiParam::new(pointer_type));
 
     let mut builder = FunctionBuilder::new(&mut ctx.func, builder_context);
+    let helpers = crate::jit::helpers::register_with_module(module, &mut builder)?;
 
     // -----------------------------------------------------------------------
     // Create blocks
@@ -240,6 +270,8 @@ pub fn compile_simd_region(
     builder.append_block_param(epilogue_header, types::I64);
     let epilogue_body = builder.create_block();
     let _epilogue_post = builder.create_block();
+    let validated_entry = builder.create_block();
+    let deopt_block = builder.create_block();
     let return_block = builder.create_block();
 
     // -----------------------------------------------------------------------
@@ -293,17 +325,78 @@ pub fn compile_simd_region(
     let rhs_base = emit_extract_payload(&mut builder, rhs_base_tagged);
     let dst_base = emit_extract_payload(&mut builder, dst_base_tagged);
 
-    // Trip count: either compile-time constant or loaded from ArrLen register
+    // Validate all array operands through the runtime before touching heap
+    // memory directly. u64::MAX is the helper's invalid/non-array sentinel.
+    let lhs_len_call = builder
+        .ins()
+        .call(helpers[&RuntimeHelper::SimdArrayLen], &[lhs_base_tagged]);
+    let rhs_len_call = builder
+        .ins()
+        .call(helpers[&RuntimeHelper::SimdArrayLen], &[rhs_base_tagged]);
+    let dst_len_call = builder
+        .ins()
+        .call(helpers[&RuntimeHelper::SimdArrayLen], &[dst_base_tagged]);
+    let lhs_len = builder.inst_results(lhs_len_call)[0];
+    let rhs_len = builder.inst_results(rhs_len_call)[0];
+    let dst_len = builder.inst_results(dst_len_call)[0];
+
+    // Trip count is exactly the scalar loop bound: either a compile-time hint
+    // or the validated length of the array whose ArrLen feeds ICmpLt.
     let trip_count = if trip_count_is_runtime {
-        let arr_len_reg = simd_region.arr_len_reg.unwrap();
-        let offset = i32::from(arr_len_reg) * 8;
-        let addr = builder.ins().iadd_imm(regs_ptr, offset as i64);
-        let mem_flags = MemFlags::trusted();
-        builder.ins().load(types::I64, mem_flags, addr, 0)
+        let trip_reg = usize::from(simd_region.trip_count_array_reg.unwrap());
+        if trip_reg == lhs_arr_reg {
+            lhs_len
+        } else if trip_reg == rhs_arr_reg {
+            rhs_len
+        } else if trip_reg == dst_arr_reg {
+            dst_len
+        } else {
+            return Err(CompileError::Internal(
+                "SIMD trip-count array is not part of the vectorized pattern".into(),
+            ));
+        }
     } else {
         let n = simd_region.trip_count_hint.unwrap_or(0) as i64;
         builder.ins().iconst(types::I64, n)
     };
+
+    // Direct SIMD/scalarized memory accesses are safe only while every
+    // participating Array covers the entire scalar loop bound. Otherwise
+    // deopt before side effects and let the original bounds-checked bytecode
+    // execute once in the interpreter.
+    let invalid_len = builder.ins().iconst(types::I64, -1);
+    let lhs_valid = builder.ins().icmp(IntCC::NotEqual, lhs_len, invalid_len);
+    let rhs_valid = builder.ins().icmp(IntCC::NotEqual, rhs_len, invalid_len);
+    let dst_valid = builder.ins().icmp(IntCC::NotEqual, dst_len, invalid_len);
+    let lhs_cover = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, lhs_len, trip_count);
+    let rhs_cover = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, rhs_len, trip_count);
+    let dst_cover = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, dst_len, trip_count);
+    let valid_inputs = builder.ins().band(lhs_valid, rhs_valid);
+    let valid_inputs = builder.ins().band(valid_inputs, dst_valid);
+    let full_coverage = builder.ins().band(lhs_cover, rhs_cover);
+    let full_coverage = builder.ins().band(full_coverage, dst_cover);
+    let safe_to_vectorize = builder.ins().band(valid_inputs, full_coverage);
+    builder
+        .ins()
+        .brif(safe_to_vectorize, validated_entry, &[], deopt_block, &[]);
+
+    builder.switch_to_block(deopt_block);
+    let restart = builder.ins().iconst(types::I64, 0);
+    builder
+        .ins()
+        .call(helpers[&RuntimeHelper::SetDeopt], &[restart]);
+    builder.ins().jump(return_block, &[]);
+    builder.seal_block(deopt_block);
+
+    builder.switch_to_block(validated_entry);
+    builder.seal_block(validated_entry);
+
     let vwidth = vector_width(simd_region.elem_type) as i64;
     let vwidth_val = builder.ins().iconst(types::I64, vwidth);
 
@@ -687,7 +780,21 @@ pub fn emit_simd_load(
     let addr = builder.ins().iadd(base_ptr, offset);
     let vtype = vector_clif_type(simd_region.elem_type);
     let flags = MemFlags::trusted();
-    builder.ins().load(vtype, flags, addr, 0)
+    let raw = builder.ins().load(vtype, flags, addr, 0);
+
+    match simd_region.elem_type {
+        SimdElemType::Int64 => {
+            // Each lane is a full tagged Value. Sign-extend the low 48-bit
+            // integer payload independently: (raw << 16) >>s 16.
+            let shift = builder.ins().iconst(types::I64, 16);
+            let shifted = builder.ins().ishl(raw, shift);
+            builder.ins().sshr(shifted, shift)
+        }
+        SimdElemType::Float64 => raw,
+        SimdElemType::Int32 | SimdElemType::Float32 => {
+            unreachable!("32-bit SIMD is not valid for generic Value arrays")
+        }
+    }
 }
 
 /// Store a SIMD vector to an array at the given index.
@@ -704,7 +811,7 @@ pub fn emit_simd_load(
 /// - `value`: The SIMD vector value to store
 pub fn emit_simd_store(
     builder: &mut FunctionBuilder,
-    _simd_region: &SimdRegion,
+    simd_region: &SimdRegion,
     base_ptr: Value,
     index: Value,
     elem_size_val: Value,
@@ -713,7 +820,26 @@ pub fn emit_simd_store(
     let offset = builder.ins().imul(index, elem_size_val);
     let addr = builder.ins().iadd(base_ptr, offset);
     let flags = MemFlags::trusted();
-    builder.ins().store(flags, value, addr, 0);
+
+    let stored = match simd_region.elem_type {
+        SimdElemType::Int64 => {
+            // Restore each lane to the canonical tagged-int representation.
+            // Arithmetic may overflow the 48-bit payload; masking preserves
+            // the VM/JIT scalar wrapping semantics.
+            let mask = builder.ins().iconst(types::I64, PAYLOAD_MASK as i64);
+            let tag = builder.ins().iconst(types::I64, TAG_INT as i64);
+            let mask_vec = builder.ins().splat(types::I64X2, mask);
+            let tag_vec = builder.ins().splat(types::I64X2, tag);
+            let payload = builder.ins().band(value, mask_vec);
+            builder.ins().bor(payload, tag_vec)
+        }
+        SimdElemType::Float64 => value,
+        SimdElemType::Int32 | SimdElemType::Float32 => {
+            unreachable!("32-bit SIMD is not valid for generic Value arrays")
+        }
+    };
+
+    builder.ins().store(flags, stored, addr, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,7 +1290,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         }
     }
 
@@ -1187,8 +1313,225 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         }
+    }
+
+    #[test]
+    fn test_simd_i64x2_executes_on_tagged_value_arrays() {
+        use crate::runtime::heap::{ActorHeap, TypeTag};
+        use crate::vm::Value as NuValue;
+
+        const LEN: usize = 4;
+        let mut heap = ActorHeap::new(4096);
+        heap.set_actor_id(0);
+
+        let bytes = LEN * std::mem::size_of::<NuValue>();
+        let lhs = heap.alloc(bytes, TypeTag::Array).expect("lhs array");
+        let rhs = heap.alloc(bytes, TypeTag::Array).expect("rhs array");
+        let dst = heap.alloc(bytes, TypeTag::Array).expect("dst array");
+
+        unsafe {
+            let lhs_slots = std::slice::from_raw_parts_mut(lhs as *mut NuValue, LEN);
+            let rhs_slots = std::slice::from_raw_parts_mut(rhs as *mut NuValue, LEN);
+            let dst_slots = std::slice::from_raw_parts_mut(dst as *mut NuValue, LEN);
+            for (idx, slot) in lhs_slots.iter_mut().enumerate() {
+                *slot = NuValue::int((idx as i64) + 1);
+            }
+            for (idx, slot) in rhs_slots.iter_mut().enumerate() {
+                *slot = NuValue::int(((idx as i64) + 1) * 10);
+            }
+            for slot in dst_slots.iter_mut() {
+                *slot = NuValue::int(-1);
+            }
+        }
+
+        let region = SimdRegion {
+            start_offset: 0,
+            num_instrs: 7,
+            pattern: VectorizablePattern::ElementWiseBinop {
+                op: BinopKind::IAdd,
+                lhs_arr_reg: 10,
+                rhs_arr_reg: 11,
+                dst_arr_reg: 12,
+                lhs_elem_reg: 4,
+                rhs_elem_reg: 5,
+                result_reg: 6,
+            },
+            width: SimdWidth::Width2,
+            elem_type: SimdElemType::Int64,
+            induction_var_reg: 3,
+            array_regs: vec![10, 11, 12],
+            trip_count_hint: Some(0),
+            trip_count_array_reg: Some(10),
+        };
+
+        let instructions = vec![
+            Instruction::new2(OpCode::ArrLen, 10, 13),
+            Instruction::new3(OpCode::ArrLoad, 10, 3, 4),
+            Instruction::new3(OpCode::ArrLoad, 11, 3, 5),
+            Instruction::new3(OpCode::IAdd, 4, 5, 6),
+            Instruction::new3(OpCode::ArrStore, 12, 3, 6),
+            Instruction::new1(OpCode::IInc, 3),
+            Instruction::new3(OpCode::ICmpLt, 3, 13, 7),
+        ];
+
+        let mut jit = make_jit();
+        let ptr = compile_simd_region(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_simd_i64x2_executes_tagged",
+            &instructions,
+            &region,
+        )
+        .expect("SIMD compile");
+
+        let mut regs = [NuValue::nil().to_bits(); 256];
+        regs[10] = unsafe { NuValue::ptr(lhs) }.to_bits();
+        regs[11] = unsafe { NuValue::ptr(rhs) }.to_bits();
+        regs[12] = unsafe { NuValue::ptr(dst) }.to_bits();
+        // Deliberately leave r13 nil. The old implementation tried to read
+        // the skipped ArrLen destination register here and therefore could
+        // not derive a valid trip count on a fresh frame.
+
+        let func: crate::jit::JitFunctionPtr = unsafe { std::mem::transmute(ptr) };
+        func(regs.as_mut_ptr(), std::ptr::null());
+
+        let values = unsafe { std::slice::from_raw_parts(dst as *const NuValue, LEN) };
+        let ints: Vec<i64> = values
+            .iter()
+            .map(|v| v.as_int().expect("SIMD output must stay TAG_INT"))
+            .collect();
+        assert_eq!(ints, vec![11, 22, 33, 44]);
+    }
+
+    #[test]
+    fn test_simd_short_operand_deopts_before_side_effects() {
+        use crate::runtime::heap::{ActorHeap, TypeTag};
+        use crate::vm::Value as NuValue;
+
+        let _ = crate::jit::runtime::take_jit_deopt_pc();
+        let mut heap = ActorHeap::new(4096);
+        heap.set_actor_id(0);
+
+        let lhs = heap
+            .alloc(4 * std::mem::size_of::<NuValue>(), TypeTag::Array)
+            .expect("lhs array");
+        let rhs = heap
+            .alloc(std::mem::size_of::<NuValue>(), TypeTag::Array)
+            .expect("short rhs array");
+        let dst = heap
+            .alloc(4 * std::mem::size_of::<NuValue>(), TypeTag::Array)
+            .expect("dst array");
+
+        unsafe {
+            let lhs_slots = std::slice::from_raw_parts_mut(lhs as *mut NuValue, 4);
+            let rhs_slots = std::slice::from_raw_parts_mut(rhs as *mut NuValue, 1);
+            let dst_slots = std::slice::from_raw_parts_mut(dst as *mut NuValue, 4);
+            for (idx, slot) in lhs_slots.iter_mut().enumerate() {
+                *slot = NuValue::int(idx as i64 + 1);
+            }
+            rhs_slots[0] = NuValue::int(10);
+            for slot in dst_slots.iter_mut() {
+                *slot = NuValue::int(-1);
+            }
+        }
+
+        let region = SimdRegion {
+            start_offset: 0,
+            num_instrs: 7,
+            pattern: VectorizablePattern::ElementWiseBinop {
+                op: BinopKind::IAdd,
+                lhs_arr_reg: 10,
+                rhs_arr_reg: 11,
+                dst_arr_reg: 12,
+                lhs_elem_reg: 4,
+                rhs_elem_reg: 5,
+                result_reg: 6,
+            },
+            width: SimdWidth::Width2,
+            elem_type: SimdElemType::Int64,
+            induction_var_reg: 3,
+            array_regs: vec![10, 11, 12],
+            trip_count_hint: Some(0),
+            trip_count_array_reg: Some(10),
+        };
+        let instructions = vec![
+            Instruction::new2(OpCode::ArrLen, 10, 13),
+            Instruction::new3(OpCode::ArrLoad, 10, 3, 4),
+            Instruction::new3(OpCode::ArrLoad, 11, 3, 5),
+            Instruction::new3(OpCode::IAdd, 4, 5, 6),
+            Instruction::new3(OpCode::ArrStore, 12, 3, 6),
+            Instruction::new1(OpCode::IInc, 3),
+            Instruction::new3(OpCode::ICmpLt, 3, 13, 7),
+        ];
+
+        let mut jit = make_jit();
+        let ptr = compile_simd_region(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_simd_short_operand_deopt",
+            &instructions,
+            &region,
+        )
+        .expect("SIMD compile");
+
+        let mut regs = [NuValue::nil().to_bits(); 256];
+        regs[10] = unsafe { NuValue::ptr(lhs) }.to_bits();
+        regs[11] = unsafe { NuValue::ptr(rhs) }.to_bits();
+        regs[12] = unsafe { NuValue::ptr(dst) }.to_bits();
+
+        let func: crate::jit::JitFunctionPtr = unsafe { std::mem::transmute(ptr) };
+        func(regs.as_mut_ptr(), std::ptr::null());
+
+        assert_eq!(
+            crate::jit::runtime::take_jit_deopt_pc(),
+            Some(0),
+            "coverage mismatch must request interpreter restart at region start"
+        );
+        let values = unsafe { std::slice::from_raw_parts(dst as *const NuValue, 4) };
+        assert!(
+            values.iter().all(|v| v.as_int() == Some(-1)),
+            "SIMD guard must deopt before mutating the destination"
+        );
+    }
+
+    #[test]
+    fn test_native_simd_support_matches_value_array_representation() {
+        let i64 = make_i64_binop_region(BinopKind::IAdd);
+        assert!(native_simd_codegen_supported(&i64));
+
+        let mut f64 = i64.clone();
+        f64.elem_type = SimdElemType::Float64;
+        f64.width = SimdWidth::Width2;
+        assert!(!native_simd_codegen_supported(&f64));
+
+        let mut i32 = i64.clone();
+        i32.elem_type = SimdElemType::Int32;
+        i32.width = SimdWidth::Width4;
+        assert!(!native_simd_codegen_supported(&i32));
+
+        let mut div = i64.clone();
+        if let VectorizablePattern::ElementWiseBinop { op, .. } = &mut div.pattern {
+            *op = BinopKind::IDiv;
+        }
+        assert!(!native_simd_codegen_supported(&div));
+
+        let cmp = SimdRegion {
+            pattern: VectorizablePattern::ElementWiseCmp {
+                op: CmpKind::ICmpLt,
+                lhs_arr_reg: 10,
+                rhs_arr_reg: 11,
+                dst_arr_reg: 12,
+                lhs_elem_reg: 1,
+                rhs_elem_reg: 2,
+                result_reg: 3,
+            },
+            ..i64
+        };
+        assert!(!native_simd_codegen_supported(&cmp));
     }
 
     // ------------------------------------------------------------------
@@ -1336,7 +1679,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         };
         assert_eq!(vector_width(i32_region.elem_type), 4);
         assert_eq!(i32_region.width, SimdWidth::Width4);
@@ -1358,7 +1701,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         };
         assert_eq!(vector_width(f32_region.elem_type), 4);
         assert_eq!(f32_region.width, SimdWidth::Width4);
@@ -1389,7 +1732,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(5),
-            arr_len_reg: None, // 5 elements → 2-wide SIMD + 1 epilogue
+            trip_count_array_reg: None, // 5 elements → 2-wide SIMD + 1 epilogue
         };
 
         let instructions = vec![
@@ -1454,7 +1797,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         };
 
         let ptr2 = compile_simd_region(
@@ -1492,7 +1835,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: Some(8),
-            arr_len_reg: None,
+            trip_count_array_reg: None,
         };
 
         let instructions = vec![
@@ -1574,7 +1917,7 @@ mod simd_compiler_tests {
             induction_var_reg: 0,
             array_regs: vec![10, 11, 12],
             trip_count_hint: None,
-            arr_len_reg: None, // No hint → fallback
+            trip_count_array_reg: None, // No hint → fallback
         };
 
         let instructions = vec![

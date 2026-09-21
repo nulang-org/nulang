@@ -105,6 +105,13 @@ The JIT backend lives in `src/jit/` (~7,900 lines across 7 files, cranelift 0.13
 
 ### Tiering mechanics (`src/jit/mod.rs`)
 
+- Tier 1 promotes bytecode regions after `HOT_THRESHOLD = 1000` interpreted hits. Tier 2 counts **compiled-region entries** (not loop iterations) and attempts one SIMD replacement after `TIER2_THRESHOLD = 10_000` entries.
+- A successful tier-2 promotion compiles a fresh SIMD function and replaces the cached tier-1 pointer. A rejected region is recorded in a per-session exhausted set so static bytecode is not re-analyzed on every subsequent threshold crossing.
+- Production tier-2 SIMD is intentionally conservative: generic arrays use 8-byte tagged `Value` slots, so only Int64 element-wise add/sub/mul and integer negation are currently eligible. Vector loads sign-extend the 48-bit integer payload per lane and vector stores restore `TAG_INT`.
+- Float SIMD remains disabled until per-lane NaN canonicalization is proven equivalent to Nulang's scalar value contract. 32-bit lanes, comparisons, division, non-zero-based loops, mismatched `ArrLen` bounds, and kernels with observable scalar scratch state remain on the scalar JIT path.
+
+
+
 - `VM` holds `jit_session: Option<JitSession>` (`src/vm.rs:695`). A session builds the Cranelift `JITModule` for the host ISA with the `enable_simd` flag set, and registers 31 `nulang_*` runtime helpers as importable symbols.
 - Before each interpreted instruction, the VM snapshots the current frame's 256 registers into a `[u64; 256]` array and calls `jit::tiered_execute_step_typed`. If the result is not `TieredAction::Interpret`, the array is copied back into the frame and `pc` is advanced by the compiled region's length.
 - Hotness is tracked in a global `Mutex<HashMap<(usize, usize), u64>>` keyed by `(module_idx, offset)` so identical offsets in different modules do not share counts. `HOT_THRESHOLD = 1000` (`src/jit/mod.rs:55`): a region compiles on its 1000th interpreted hit.
@@ -133,7 +140,9 @@ Given `TypeMetadata` (register → `KnownType::{Int, Float, Bool, Unknown}`), th
 
 `JitSession::compile_region_simd` runs `analyze_region` first. The analyzer recognizes three loop shapes — `ElementWiseBinop` (`c[i] = a[i] + b[i]`), `ElementWiseUnary` (`b[i] = -a[i]`), `ElementWiseCmp` (`c[i] = a[i] < b[i]`) — requiring an `ArrLoad`→arithmetic→`ArrStore` chain on a single induction variable that steps by 1, a determinable trip count (`ArrLen` bound or constant), a uniform element type, no calls in the body, and no control flow beyond the back-edge.
 
-The SIMD compiler emits 128-bit vectors — `I64x2`/`F64x2` (2-wide) and `I32x4`/`F32x4` (4-wide) — as a scalar prefix loop, a SIMD body, and a scalar epilogue (`SimdWidth::Width8`/`I16x8` is reserved, not implemented). Compilation requires a compile-time trip-count hint and host support (`is_simd_supported()`: SSE2 on x86_64, always true on aarch64); otherwise it falls back to the typed scalar compiler. On a SIMD compile error the session falls back to the plain scalar `compile_region`.
+The analyzer still recognizes several vector shapes, but the **production tier-2 emitter is deliberately narrower**: only Int64 element-wise add/sub/mul and integer negation over generic 8-byte `Value` array slots are eligible. Int64 vector loads sign-extend each lane's 48-bit payload and stores restore `TAG_INT`. Float64 remains scalar until per-lane NaN canonicalization is proven; 32-bit lanes do not match generic array stride; comparisons and division remain scalar. At `TIER2_THRESHOLD = 10_000` compiled-region entries, a qualifying region is analyzed once and a successful SIMD compile replaces the cached tier-1 function pointer. Rejected regions are marked exhausted and are not repeatedly analyzed.
+
+Runtime safety is checked again on every SIMD entry. Generated code validates lhs/rhs/destination are Array values and each allocation covers the scalar trip count. Guard failure happens before array side effects and sets a dedicated deopt status; the VM resumes at the region start and bypasses JIT exactly once so the original bounds-checked bytecode executes. Promotion additionally requires a canonical zero-based `ArrLen -> ICmpLt -> JmpT` loop whose scalar scratch-register state is not observable after the region.
 
 ### Testing
 
@@ -141,7 +150,7 @@ The SIMD compiler emits 128-bit vectors — `I64x2`/`F64x2` (2-wide) and `I32x4`
 
 ### Not implemented (do not claim)
 
-No whole-function or ahead-of-time compilation; no inlining; no deoptimization or on-stack replacement beyond re-entering the interpreter at region boundaries; no JIT support for actor, effect, FFI, or Python opcodes; no control flow across region boundaries; no 8/16-bit SIMD widths; no recorded benchmark numbers.
+No whole-function or ahead-of-time compilation; no inlining; no general speculative deoptimization or on-stack replacement (the SIMD safety guard has a narrow one-shot interpreter deopt); no JIT support for actor, effect, FFI, or Python opcodes; no general control flow across region boundaries; no 8/16-bit SIMD widths; no recorded benchmark numbers.
 
 ---
 

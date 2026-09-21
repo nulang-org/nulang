@@ -167,6 +167,7 @@ define_helpers! {
     // Heap operations
     ArrStore => nulang_arr_store, Reg4,
     ArrLen   => nulang_arr_len,   Reg3,
+    SimdArrayLen => nulang_simd_array_len, Unary,
     FieldL   => nulang_field_load, Reg4,
     // AOT value-based helpers (new)
     Pow      => nulang_pow,         Bin,
@@ -180,6 +181,7 @@ define_helpers! {
     SafePoint => nulang_jit_safepoint_check, Unary,
     SetYield => nulang_jit_set_yield_pc, Unary,
     SetBranchExit => nulang_jit_set_branch_exit_pc, Unary,
+    SetDeopt => nulang_jit_set_deopt_pc, Unary,
     // Re-entrant direct call of a provably non-suspending callee from a
     // compiled region (see `nulang_jit_direct_call`).
     DirectCall => nulang_jit_direct_call, DirectCall,

@@ -53,10 +53,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// before it becomes eligible for JIT compilation.
 pub const HOT_THRESHOLD: u64 = 1000;
 
-/// Threshold for tier-2 recompilation: after an already-compiled region
-/// has been executed this many additional times, a more aggressive
-/// compilation strategy is attempted (typed path if not already typed,
-/// or SIMD if the region is amenable).
+/// Threshold for tier-2 SIMD promotion: after an already-compiled region
+/// has been entered this many additional times, one conservative SIMD
+/// replacement attempt is made. Rejected regions remain on tier 1.
 pub const TIER2_THRESHOLD: u64 = 10_000;
 
 /// Minimum length for a STRAIGHT-LINE region (no internal loop back-edge) to
@@ -105,6 +104,12 @@ pub struct JitSession {
     /// Regions compiled through the type-directed (guard-stripped) path in
     /// `typed_compiler`, i.e. where inferred register types were available.
     typed_regions: FxHashSet<(usize, usize)>,
+    /// Regions whose active cached function is a tier-2 SIMD replacement.
+    simd_regions: FxHashSet<(usize, usize)>,
+    /// Regions that were analyzed for tier-2 SIMD and rejected. Bytecode is
+    /// immutable after loading, so retrying the same failed analysis every
+    /// TIER2_THRESHOLD executions would only add overhead.
+    tier2_exhausted: FxHashSet<(usize, usize)>,
     /// Per-module "may suspend" vectors (indexed by function-table index),
     /// computed lazily from each module's bytecode: true if the function
     /// transitively performs an effect that can suspend (or calls one).
@@ -164,6 +169,8 @@ impl JitSession {
             hot_counts: Vec::new(),
             last_compiled_probe: None,
             typed_regions: FxHashSet::default(),
+            simd_regions: FxHashSet::default(),
+            tier2_exhausted: FxHashSet::default(),
             may_suspend: FxHashMap::default(),
             recursive: FxHashMap::default(),
             builder_context: FunctionBuilderContext::new(),
@@ -232,46 +239,248 @@ impl JitSession {
     }
 
     /// Record one execution of an already-compiled region and attempt
-    /// tier-2 promotion when the threshold is crossed.
+    /// tier-2 SIMD promotion when the threshold is crossed.
     ///
-    /// Tier-2 attempts more aggressive compilation: typed path for regions
-    /// that were compiled untyped, or SIMD for typed regions.  Promotion is
-    /// best-effort — a failed attempt just resets the counter so we retry
-    /// later.
+    /// Promotion replaces the cached tier-1 function pointer in place. Regions
+    /// that cannot be vectorized are marked exhausted so hot scalar code does
+    /// not pay repeated analysis/compilation attempts.
     pub fn record_tier2_and_maybe_promote(
         &mut self,
         module_idx: usize,
         pc: usize,
         instructions: &[crate::bytecode::Instruction],
     ) {
-        let count = self.tier2_counters.entry((module_idx, pc)).or_insert(0);
-        *count += 1;
-        if *count < TIER2_THRESHOLD {
+        let key = (module_idx, pc);
+        if self.simd_regions.contains(&key) || self.tier2_exhausted.contains(&key) {
             return;
         }
 
-        let region_len = match self.compiled.get(&(module_idx, pc)) {
+        let region_len = match self.compiled.get(&key) {
             Some(&(_, len)) if len >= 3 => len,
             _ => return,
         };
 
-        let was_typed = self.typed_regions.contains(&(module_idx, pc));
+        let count = self.tier2_counters.entry(key).or_insert(0);
+        *count += 1;
+        if *count < TIER2_THRESHOLD {
+            return;
+        }
+        *count = 0;
 
-        if !was_typed {
-            // Try typed compilation with the benefit of profile data.
-            // We don't have a CodeModule here, so infer_reg_types needs
-            // one — skip for now, promotion will retry later.
-            // Reset counter to allow future retries.
-            self.tier2_counters.insert((module_idx, pc), 0);
-        } else {
-            // Try SIMD compilation for hot typed regions.
-            if let Some(_func) =
-                unsafe { self.compile_region_simd(module_idx, pc, region_len, instructions, None) }
-            {
-                // SIMD compilation succeeded; the compiled cache was
-                // updated inside compile_region_simd.
+        // SAFETY: the bytecode and JIT module remain owned by this JitSession
+        // for the lifetime of every generated function pointer.
+        if unsafe { self.promote_region_simd(module_idx, pc, region_len, instructions) }.is_none() {
+            self.tier2_exhausted.insert(key);
+        }
+    }
+
+    /// Compile a fresh SIMD implementation for an already-compiled region and
+    /// replace the active cache entry. Unlike `compile_region_simd`, this path
+    /// intentionally does not return the existing tier-1 pointer.
+    unsafe fn promote_region_simd(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+    ) -> Option<JitFunctionPtr> {
+        use crate::jit::simd_analyzer::analyze_region;
+        use crate::jit::simd_compiler::{
+            compile_simd_region, is_simd_supported, native_simd_codegen_supported,
+        };
+
+        if !is_simd_supported()
+            || start_offset >= instructions.len()
+            || num_instrs < 3
+            || start_offset
+                .checked_add(num_instrs)
+                .is_none_or(|end| end > instructions.len())
+        {
+            return None;
+        }
+
+        let simd_region = analyze_region(instructions, start_offset, num_instrs, None)?;
+        if !native_simd_codegen_supported(&simd_region)
+            || !Self::simd_promotion_state_safe(&simd_region, instructions)
+        {
+            return None;
+        }
+        if simd_region.trip_count_hint.is_none()
+            || (simd_region.trip_count_hint == Some(0)
+                && simd_region.trip_count_array_reg.is_none())
+        {
+            return None;
+        }
+
+        let func_name = format!("nulang_t2_simd_{}_{}", module_idx, start_offset);
+        let ptr = compile_simd_region(
+            &mut self.module,
+            &mut self.builder_context,
+            &mut self.ctx,
+            &func_name,
+            instructions,
+            &simd_region,
+        )
+        .ok()?;
+
+        self.compiled
+            .insert((module_idx, start_offset), (ptr, num_instrs));
+        self.simd_regions.insert((module_idx, start_offset));
+        Some(std::mem::transmute(ptr))
+    }
+
+    /// Conservative semantic gate for the first production SIMD tier.
+    ///
+    /// The current SIMD emitter accelerates array memory effects but does not
+    /// reproduce every scalar scratch-register write. Only promote canonical
+    /// zero-based counted loops whose scratch state is unobservable after the
+    /// region. Broader loop shapes can be admitted once bytecode liveness is
+    /// threaded into the JIT.
+    fn simd_promotion_state_safe(
+        region: &crate::jit::simd_analyzer::SimdRegion,
+        instructions: &[crate::bytecode::Instruction],
+    ) -> bool {
+        use crate::bytecode::OpCode;
+        use crate::jit::simd_analyzer::VectorizablePattern;
+
+        let start = region.start_offset;
+        let Some(end) = start.checked_add(region.num_instrs) else {
+            return false;
+        };
+        if start >= instructions.len() || end > instructions.len() || end <= start + 2 {
+            return false;
+        }
+        let body = &instructions[start..end];
+
+        // Native SIMD currently models a canonical counted loop only:
+        //   [ArrLen/Const0 preheader] ...
+        //   array loads/op/store; IInc
+        //   ICmpLt induction,bound -> cond
+        //   JmpT cond -> loop body
+        let branch = body[body.len() - 1];
+        if branch.opcode != OpCode::JmpT {
+            return false;
+        }
+        let cmp = body[body.len() - 2];
+        if cmp.opcode != OpCode::ICmpLt
+            || cmp.op1 != region.induction_var_reg
+            || cmp.op3 != branch.op1
+        {
+            return false;
+        }
+        let bound_reg = cmp.op2;
+
+        let branch_pc = end - 1;
+        let target = branch_pc as i64 + i64::from(branch.offset16());
+        if target < start as i64 || target >= branch_pc as i64 {
+            return false;
+        }
+        let target = target as usize;
+
+        let first_array = body
+            .iter()
+            .position(|instr| matches!(instr.opcode, OpCode::ArrLoad | OpCode::ArrStore));
+        let Some(first_array) = first_array else {
+            return false;
+        };
+        if target != start + first_array {
+            return false;
+        }
+
+        let Some(trip_array) = region.trip_count_array_reg else {
+            return false;
+        };
+        let preheader = &body[..first_array];
+        if !preheader.iter().any(|instr| {
+            instr.opcode == OpCode::ArrLen && instr.op1 == trip_array && instr.op2 == bound_reg
+        }) || !preheader
+            .iter()
+            .any(|instr| instr.opcode == OpCode::Const0 && instr.op1 == region.induction_var_reg)
+        {
+            return false;
+        }
+
+        // Reject instructions whose semantics the SIMD replacement does not
+        // reproduce in this conservative tier.
+        if body.iter().enumerate().any(|(idx, instr)| {
+            if idx + 2 >= body.len() {
+                return false;
             }
-            self.tier2_counters.insert((module_idx, pc), 0);
+            !matches!(
+                instr.opcode,
+                OpCode::Nop
+                    | OpCode::ArrLen
+                    | OpCode::Const0
+                    | OpCode::ArrLoad
+                    | OpCode::ArrStore
+                    | OpCode::IAdd
+                    | OpCode::ISub
+                    | OpCode::IMul
+                    | OpCode::INeg
+                    | OpCode::IInc
+            )
+        }) {
+            return false;
+        }
+
+        // The loop bound must remain stable between ArrLen and the exit test.
+        if body[first_array..body.len() - 2]
+            .iter()
+            .any(|instr| match instr.opcode {
+                OpCode::ArrLoad => instr.op3 == bound_reg,
+                OpCode::IAdd | OpCode::ISub | OpCode::IMul => instr.op3 == bound_reg,
+                OpCode::INeg => instr.op2 == bound_reg,
+                OpCode::IInc => instr.op1 == bound_reg,
+                _ => false,
+            })
+        {
+            return false;
+        }
+
+        // Scratch-register writes are intentionally not reconstructed by the
+        // SIMD function. They must therefore be dead at region exit.
+        let mut clobbered = FxHashSet::default();
+        clobbered.insert(region.induction_var_reg);
+        clobbered.insert(bound_reg);
+        clobbered.insert(cmp.op3);
+        match &region.pattern {
+            VectorizablePattern::ElementWiseBinop {
+                lhs_elem_reg,
+                rhs_elem_reg,
+                result_reg,
+                ..
+            } => {
+                clobbered.insert(*lhs_elem_reg);
+                clobbered.insert(*rhs_elem_reg);
+                clobbered.insert(*result_reg);
+            }
+            VectorizablePattern::ElementWiseUnary {
+                src_elem_reg,
+                result_reg,
+                ..
+            } => {
+                clobbered.insert(*src_elem_reg);
+                clobbered.insert(*result_reg);
+            }
+            VectorizablePattern::ElementWiseCmp { .. } => return false,
+        }
+
+        match instructions.get(end) {
+            None
+            | Some(crate::bytecode::Instruction {
+                opcode: OpCode::Halt,
+                ..
+            }) => !clobbered.contains(&0),
+            Some(crate::bytecode::Instruction {
+                opcode: OpCode::Ret,
+                ..
+            }) => true,
+            Some(crate::bytecode::Instruction {
+                opcode: OpCode::RetVal,
+                op1,
+                ..
+            }) => !clobbered.contains(op1),
+            _ => false,
         }
     }
 
@@ -443,12 +652,12 @@ impl JitSession {
     /// type-directed scalar compiler if SIMD emission fails. Returns `None`
     /// when the region has no vectorizable pattern at all.
     ///
-    /// Wired into tier-2 promotion: when a typed region exceeds
-    /// `TIER2_THRESHOLD` executions, SIMD compilation is attempted.
-    /// Falls back to typed/scalar on any failure.  Element-wise array
-    /// ops store results to memory (no register write-back needed);
-    /// trip count must be a runtime `ArrLen` register (baked hints
-    /// are unsafe and rejected by the analyzer).
+    /// Standalone compile-once SIMD entry point. Tier-2 replacement uses
+    /// `promote_region_simd` instead so an already-cached tier-1 pointer does
+    /// not short-circuit recompilation. Unsupported patterns fall back to the
+    /// typed/scalar compiler. Production tier-2 additionally applies the
+    /// representation and scalar-state equivalence gates before calling the
+    /// SIMD compiler.
     ///
     /// # Safety
     /// Same safety requirements as `compile_region`.

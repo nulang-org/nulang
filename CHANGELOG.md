@@ -42,6 +42,15 @@ version + migration.*
 
 ## Stable tier
 
+### Correct tier-2 SIMD promotion — 2026-09-20
+- **Tier-2 now replaces the active tier-1 JIT function instead of returning the existing cached pointer** (`src/jit/mod.rs`). Hot regions that cannot be safely vectorized are marked exhausted after one failed promotion attempt, preventing repeated analysis every `TIER2_THRESHOLD` entries.
+- **Production SIMD is representation-safe for generic Nulang arrays** (`src/jit/simd_compiler.rs`). The first enabled tier is deliberately limited to Int64 add/sub/mul and unary integer kernels over 8-byte `Value` slots. Vector loads decode each lane's signed 48-bit payload and stores restore `TAG_INT`; Float64, 32-bit lanes, comparisons, division, and other unproven shapes remain scalar.
+- **Runtime trip counts come from the source array allocation, not a skipped `ArrLen` destination register** (`src/jit/simd_analyzer.rs`, `src/jit/simd_compiler.rs`). Promotion additionally requires a canonical zero-based `ArrLen -> ICmpLt -> JmpT` loop and rejects kernels whose scalar scratch-register state could be observed after the region.
+- **SIMD entry guards validate every participating operand before direct memory access.** LHS/RHS/destination must be real Array values and each allocation must cover the scalar loop bound. A mismatch requests a one-shot correctness deopt at the region start; the VM bypasses JIT once so the original bounds-checked bytecode executes without partial SIMD side effects.
+- Regression coverage executes generated SIMD against real `ActorHeap` arrays, proves the cached function pointer changes after promotion, and pins fail-closed behavior for unrelated loop bounds and observable scratch state.
+
+
+
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 

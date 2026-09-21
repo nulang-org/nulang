@@ -2462,6 +2462,10 @@ pub struct VM {
     /// `step` so the error surfaces as a VM error). None when the last JIT
     /// region ran cleanly.
     jit_pending_error: Option<String>,
+    /// Module/PC pair for a correctness deoptimization that must execute one
+    /// interpreter step before JIT probing is allowed again. This prevents a
+    /// deopt-to-self from immediately re-entering the same compiled region.
+    jit_bypass_once: Option<(usize, usize)>,
     /// Local node ID reported by the `NodeId` opcode.
     node_id: u64,
     /// Migration requests recorded by the `Migrate` opcode when no runtime
@@ -2654,6 +2658,7 @@ impl VM {
             },
             jit_constants: Vec::new(),
             jit_pending_error: None,
+            jit_bypass_once: None,
             node_id: 0,
             pending_migrations: Vec::new(),
             gossip_log: Vec::new(),
@@ -3458,6 +3463,11 @@ impl VM {
     fn try_jit_execute(&mut self, frame_idx: usize) -> bool {
         let module_idx = self.frames[frame_idx].module_idx;
         let pc = self.frames[frame_idx].pc;
+
+        if self.jit_bypass_once == Some((module_idx, pc)) {
+            self.jit_bypass_once = None;
+            return false;
+        }
         // Raw pointer to self for the re-entrant direct-call helper, computed
         // BEFORE the `&mut self.jit_session` borrow below (the VM is stable
         // and single-threaded for the duration of this region execution).
@@ -3527,6 +3537,20 @@ impl VM {
             // bool). Propagate BEFORE handling branch-exit/yield.
             if let Some(msg) = crate::jit::runtime::take_jit_pending_vm_error() {
                 self.jit_pending_error = Some(msg);
+                return true;
+            }
+
+            // A correctness deopt resumes the original bytecode at the
+            // requested PC and bypasses JIT exactly once. The next call to
+            // step() therefore interprets that instruction instead of
+            // re-entering the same optimized region.
+            if let Some(deopt_offset) = crate::jit::runtime::take_jit_deopt_pc() {
+                let base = pc as isize;
+                let off = deopt_offset as i64 as isize;
+                let deopt_pc = (base + off).max(0) as usize;
+                self.frames[frame_idx].pc = deopt_pc;
+                self.jit_bypass_once = Some((module_idx, deopt_pc));
+                self.step_count += 1;
                 return true;
             }
 
@@ -6115,6 +6139,74 @@ mod vm_tests {
             .to_str()
             .unwrap();
         assert_eq!(s, "hello ffi");
+    }
+
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_jit_deopt_bypasses_same_pc_once() {
+        struct DeoptJit;
+
+        impl JitBackend for DeoptJit {
+            fn is_compiled(&self, _module_idx: usize, _pc: usize) -> bool {
+                true
+            }
+
+            fn record_and_check_hot(&mut self, _module_idx: usize, _pc: usize) -> bool {
+                true
+            }
+
+            fn probe_and_maybe_hot(&mut self, _module_idx: usize, _pc: usize) -> bool {
+                true
+            }
+
+            fn compiled_region_len(&self, _module_idx: usize, _pc: usize) -> Option<usize> {
+                Some(1)
+            }
+
+            fn compiled_count(&self) -> usize {
+                1
+            }
+
+            fn typed_compiled_count(&self) -> usize {
+                0
+            }
+
+            fn reset_hot_counters(&mut self) {}
+
+            fn tiered_execute_step_typed(
+                &mut self,
+                _module_idx: usize,
+                _pc: usize,
+                _module: &CodeModule,
+                _regs: &mut [u64; 256],
+                _constants: &[u64],
+            ) -> TieredAction {
+                crate::jit::runtime::nulang_jit_set_deopt_pc(0);
+                TieredAction::RanJit
+            }
+        }
+
+        let mut vm = VM::new_without_jit();
+        vm.jit_session = Some(Box::new(DeoptJit));
+
+        let mut module = CodeModule::new("deopt-once");
+        module.emit(Instruction::new0(OpCode::Nop));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+        vm.load_module(module);
+
+        vm.frames.push(Frame::new(None, 0));
+        vm.current_frame_idx = Some(0);
+
+        assert!(vm.try_jit_execute(0), "mock JIT should request deopt");
+        assert_eq!(vm.frames[0].pc, 0);
+        assert_eq!(vm.jit_bypass_once, Some((0, 0)));
+
+        assert!(
+            !vm.try_jit_execute(0),
+            "the deopt target must bypass JIT exactly once"
+        );
+        assert_eq!(vm.jit_bypass_once, None);
     }
 
     /// Test 1: Basic integer arithmetic.

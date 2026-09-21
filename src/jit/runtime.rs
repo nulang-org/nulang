@@ -553,6 +553,7 @@ thread_local! {
     static JIT_SAFEPOINT_PTR: Cell<*mut u64> = const { Cell::new(std::ptr::null_mut()) };
     static JIT_YIELD_PC: Cell<u64> = const { Cell::new(u64::MAX) };
     static JIT_BRANCH_EXIT_PC: Cell<u64> = const { Cell::new(u64::MAX) };
+    static JIT_DEOPT_PC: Cell<u64> = const { Cell::new(u64::MAX) };
 }
 
 pub fn set_jit_safepoint_ptr(ptr: *mut u64) {
@@ -596,6 +597,18 @@ pub extern "C" fn nulang_jit_set_branch_exit_pc(offset: u64) -> u64 {
     0
 }
 
+/**
+ * Store a relative bytecode offset for a correctness deoptimization.
+ *
+ * Unlike an ordinary branch exit, the VM resumes at this PC with JIT bypassed
+ * exactly once so the original bytecode can execute in the interpreter.
+ */
+#[no_mangle]
+pub extern "C" fn nulang_jit_set_deopt_pc(offset: u64) -> u64 {
+    JIT_DEOPT_PC.with(|slot| slot.set(offset));
+    0
+}
+
 /// Bytecode offset where the JIT yielded, or `u64::MAX` if no yield is
 /// pending. Thread-local because multiple runtime workers can execute JIT
 /// code concurrently.
@@ -610,6 +623,17 @@ pub fn take_jit_yield_pc() -> Option<usize> {
 /// outside the region. Thread-local for the same reason as the yield slot.
 pub fn take_jit_branch_exit_pc() -> Option<usize> {
     JIT_BRANCH_EXIT_PC.with(|slot| {
+        let old = slot.replace(u64::MAX);
+        (old != u64::MAX).then_some(old as usize)
+    })
+}
+
+/**
+ * Bytecode offset requested by compiled code for interpreter deoptimization.
+ * Taking the slot clears it, matching the yield/branch-exit status slots.
+ */
+pub fn take_jit_deopt_pc() -> Option<usize> {
+    JIT_DEOPT_PC.with(|slot| {
         let old = slot.replace(u64::MAX);
         (old != u64::MAX).then_some(old as usize)
     })
@@ -673,6 +697,7 @@ struct JitThreadState {
     safepoint: *mut u64,
     yield_pc: u64,
     branch_exit_pc: u64,
+    deopt_pc: u64,
     pending_error: Option<String>,
 }
 
@@ -682,10 +707,11 @@ fn save_jit_thread_state() -> JitThreadState {
         JIT_CONSTANTS.with(|c| unsafe { *c.get() }),
         JIT_CALLBACKS.with(|c| unsafe { *c.get() }),
     );
-    let (safepoint, yield_pc, branch_exit_pc) = (
+    let (safepoint, yield_pc, branch_exit_pc, deopt_pc) = (
         JIT_SAFEPOINT_PTR.with(|c| c.get()),
         JIT_YIELD_PC.with(|c| c.get()),
         JIT_BRANCH_EXIT_PC.with(|c| c.get()),
+        JIT_DEOPT_PC.with(|c| c.get()),
     );
     let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
     JitThreadState {
@@ -695,6 +721,7 @@ fn save_jit_thread_state() -> JitThreadState {
         safepoint,
         yield_pc,
         branch_exit_pc,
+        deopt_pc,
         pending_error,
     }
 }
@@ -708,6 +735,7 @@ fn restore_jit_thread_state(s: JitThreadState) {
     JIT_SAFEPOINT_PTR.with(|c| c.set(s.safepoint));
     JIT_YIELD_PC.with(|c| c.set(s.yield_pc));
     JIT_BRANCH_EXIT_PC.with(|c| c.set(s.branch_exit_pc));
+    JIT_DEOPT_PC.with(|c| c.set(s.deopt_pc));
     AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.pending_error);
 }
 
@@ -1182,6 +1210,32 @@ pub unsafe extern "C" fn nulang_arr_len(regs: *mut u64, arr_reg: u32, dst_reg: u
         0
     };
     *regs.add(dst_reg as usize) = tag_int(len as i64);
+}
+
+/**
+ * Return the logical length of a tagged Array value for SIMD guards.
+ *
+ * u64::MAX is an invalid sentinel so compiled code can distinguish an empty
+ * valid array from a non-array value. The successful path intentionally uses
+ * the same length calculation as nulang_arr_len.
+ *
+ * # Safety
+ * raw must be a trusted VM register value. Pointer-tagged values therefore
+ * retain the runtime heap provenance required by ActorHeap::header_of.
+ */
+#[no_mangle]
+pub unsafe extern "C" fn nulang_simd_array_len(raw: u64) -> u64 {
+    let arr_ptr = val_ptr(raw);
+    if arr_ptr.is_null() {
+        return u64::MAX;
+    }
+
+    let header = &*ActorHeap::header_of(arr_ptr);
+    if header.type_tag != HeapTypeTag::Array {
+        return u64::MAX;
+    }
+
+    (header.size.saturating_sub(ActorHeap::HEADER_SIZE) / std::mem::size_of::<Value>()) as u64
 }
 
 /// # Safety
@@ -1870,8 +1924,10 @@ mod tests {
             assert_eq!(super::nulang_jit_safepoint_check(0), 1);
             super::nulang_jit_set_yield_pc(7);
             super::nulang_jit_set_branch_exit_pc(11);
+            super::nulang_jit_set_deopt_pc(13);
             assert_eq!(super::take_jit_yield_pc(), Some(7));
             assert_eq!(super::take_jit_branch_exit_pc(), Some(11));
+            assert_eq!(super::take_jit_deopt_pc(), Some(13));
             super::clear_jit_safepoint_ptr();
         });
         let right = std::thread::spawn(|| {
@@ -1880,6 +1936,7 @@ mod tests {
             assert_eq!(super::nulang_jit_safepoint_check(0), 0);
             assert_eq!(super::take_jit_yield_pc(), None);
             assert_eq!(super::take_jit_branch_exit_pc(), None);
+            assert_eq!(super::take_jit_deopt_pc(), None);
             super::clear_jit_safepoint_ptr();
         });
         left.join().unwrap();
@@ -1893,11 +1950,13 @@ mod tests {
         // they are only called from JIT-compiled code.
         let _ = super::nulang_arr_store as unsafe extern "C" fn(_, _, _, _);
         let _ = super::nulang_arr_len as unsafe extern "C" fn(_, _, _);
+        let _ = super::nulang_simd_array_len as unsafe extern "C" fn(u64) -> u64;
         let _ = super::nulang_field_load as unsafe extern "C" fn(_, _, _, _);
         let _ = super::nulang_safepoint_yield as unsafe extern "C" fn(u64) -> u64;
         let _ = super::nulang_jit_safepoint_check as extern "C" fn(u64) -> u64;
         let _ = super::nulang_jit_set_yield_pc as extern "C" fn(u64) -> u64;
         let _ = super::nulang_jit_set_branch_exit_pc as extern "C" fn(u64) -> u64;
+        let _ = super::nulang_jit_set_deopt_pc as extern "C" fn(u64) -> u64;
         let _ = super::nulang_alloc_obj as unsafe extern "C" fn(u64, u32) -> u64;
         let _ = super::nulang_obj_get as unsafe extern "C" fn(u64, u64) -> u64;
         let _ = super::nulang_obj_set as unsafe extern "C" fn(u64, u64, u64);
