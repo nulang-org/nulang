@@ -19,7 +19,7 @@ Both languages share the actor model, supervision trees, and "let it crash" phil
 |---|---|---|
 | **Type system** | Static, HM-inferred, row-polymorphic | Dynamic (Erlang) / Gradual (Elixir) |
 | **Effects** | Algebraic effects, compile-time checked | No effect tracking |
-| **Performance** | JIT + native AOT, zero-copy | BEAM VM, garbage-collected |
+| **Execution** | Semantic-reference bytecode + tiered Cranelift JIT; experimental WASM and secondary native AOT | BEAM VM + JIT, garbage-collected |
 | **Memory model** | Per-actor heaps, ORCA GC | Shared heap, per-process GC |
 | **AI library** | Optional nulang-ai library with memory | Library-level (Nx, Bumblebee) |
 

@@ -1,9 +1,9 @@
 # Nulang
-> A distributed, actor-based programming language with algebraic effects, row-polymorphic types, and reference capabilities. Built in Rust with a register-based VM, Cranelift JIT, WASM backend, and native AOT compilation.
+> A distributed, actor-based programming language with algebraic effects, row-polymorphic types, and reference capabilities. Built in Rust with a register-based bytecode VM as the semantic reference, Cranelift JIT tiering, a portable WASM target, and a secondary native AOT backend.
 
 ## For AI Agents
 
-Nulang is a systems language with static types, algebraic effects, and actor-based distribution. For AI-assisted development: the language has exhaustive type checking that catches bugs before runtime, an effect system that documents side effects, and a frozen core spec that won't drift. Use this file as context when asking an AI to write or analyze Nulang code.
+Nulang is a systems language with static types, algebraic effects, capability checking, and actor-based distribution. For AI-assisted development, treat compiler-derived types, effect rows, capabilities, protocol identities, and durable-state identities as the source of truth rather than reconstructing semantics in tools. The repository is still alpha: its frozen/stable policy is documented, but pre-1.0 compatibility promises are under explicit review as external validation grows.
 
 ## When to use Nulang
 - Building fault-tolerant distributed systems with Erlang-style supervision trees.
@@ -12,12 +12,25 @@ Nulang is a systems language with static types, algebraic effects, and actor-bas
 - Anywhere you want static types + algebraic effects + actor model in one language.
 
 ## Key Features
-- Actor model with BEAM/OTP primitives, location transparency, gossip clustering, CRDTs
+- Actor model with BEAM/OTP primitives, location transparency, gossip clustering, and CRDT runtime types
+- Structural typed actor protocols (`ActorRef[P]`) with compiler-owned fingerprints and experimental pre-mailbox compatibility admission
 - Hindley-Milner type inference with row polymorphism and Pony-inspired reference capabilities (iso, trn, ref, val, box, tag, lineariso)
 - Koka-inspired algebraic effects with compile-time checking and effect rows
-- JIT tiering (Cranelift), WASM backend (wasm-encoder + Wasmtime), native AOT
-- Optional AI library (nulang-ai): provider-agnostic LLM client (OpenAI, Ollama), agent declarations, pipelines, debates, supervisor teams
-- Register-based bytecode VM with 135 opcodes, 256-register frames
+- Register-based bytecode VM as the semantic reference, with Cranelift JIT tiering for hot regions
+- WASM as the canonical portable/cloud target; experimental WasmFX support explores stack-switching for suspending effects
+- Secondary native AOT backend for supported subsets and differential/conformance work; do not assume full bytecode parity
+- Experimental Fabric messaging/streams and an experimental RESP-compatible cache kernel with Redis Cluster routing
+- Optional AI runtime workspace: provider-agnostic LLM clients, agent declarations, memory, pipelines, debates, supervisor teams, and director/manager/worker support crates
+- Register-based bytecode VM with 135 opcodes and 256-register frames
+
+## Status and backend contract
+- **Status:** alpha. Treat experimental surfaces as changeable and verify current behavior against the repository and changelog.
+- **Semantic reference:** bytecode VM.
+- **Optimization layer:** Cranelift JIT.
+- **Portable/cloud target:** WASM.
+- **Secondary backend:** native AOT where semantic parity is demonstrated.
+- **Experimental surfaces:** WasmFX, Fabric, RESP cache server, typed protocol hardening, multi-node distribution, and other items marked Experimental in the changelog.
+- **CRDT caveat:** Rust/runtime CRDT types exist, but `.nula` `state crdt` fields are not yet fully wired and currently behave as durable state.
 
 ## Quick Install
 ```bash
@@ -55,7 +68,7 @@ send client run(counter)
 - [Syntax Basics](https://nulang.org/language/syntax/): Functions, bindings, control flow, records, variants.
 - [Type System](https://nulang.org/language/types/): HM inference, row polymorphism, reference capabilities, ADTs.
 - [Algebraic Effects](https://nulang.org/language/effects/): Perform, handle, resume, effect rows, built-in effects.
-- [Performance](https://nulang.org/language/performance/): JIT tiering, native AOT, WASM, SIMD, memory model, benchmarks.
+- [Performance](https://nulang.org/language/performance/): Backend contract, JIT tiering, WASM, secondary native AOT, VM/memory model, and benchmark methodology.
 - [Safety](https://nulang.org/language/safety/): Reference capabilities, type safety, effect checking, actor isolation.
 - [Actor Model](https://nulang.org/actors/overview/): Spawn, send, receive, lifecycle, scheduling, priorities.
 - [Distribution & Clustering](https://nulang.org/actors/distribution/): Location transparency, gossip, CRDT replication, persistence.
