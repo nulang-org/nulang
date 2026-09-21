@@ -7,7 +7,15 @@
 > `LANGUAGE_VERSION` in `src/format/constants.rs`) is what this changelog
 > tracks — it moves only on RFC-ratified change.
 
-**Language version:** `1.0.0-frozen` (since 2026-07-19; RFCs 0001, 0002).
+**Published v1 artifact language metadata:** `1.0.0-frozen` (since
+2026-07-19; RFCs 0001, 0002). This historical identifier remains readable and
+is not rewritten.
+
+**Current compatibility policy:** RFC 0021 (accepted 2026-09-21) reclassifies
+pre-adoption Nulang Core source semantics as Stable until an evidence-bearing
+external-adoption freeze RFC is accepted. Published format/protocol/ABI
+versions remain archival compatibility obligations; future representations may
+evolve only behind explicit version boundaries and readers/migrations.
 
 ---
 
@@ -32,11 +40,12 @@ version + migration.*
   - `FormatError` enum: `Truncated`, `BadMagic`, `UnsupportedVersion`,
     `IncompatibleLanguage`, `LengthMismatch`, `UnknownOpcode`, `BodyDecode`,
     `BadConstant`.
-- **RFC 0002 — Frozen Core.** Defined Nulang Core, the minimal frozen subset:
-  `fn`/`let`/`if`/`match`/closures, `Int`/`Bool`/`String`/`Unit`/`Nil`/
-  `Vec`/`Map`/tuples/records/`enum`, HM inference over this subset, `IO.print`
-  and `IO.read` only, `val` capability only. Every Core program valid today is
-  valid in every future version.
+- **RFC 0002 — historical Frozen Core definition.** Defined the original Core
+  subset. RFC 0021 (accepted 2026-09-21) supersedes the *permanent
+  source-semantic freeze* portion of RFC 0002: Core remains the portability
+  kernel but is Stable until the external-adoption freeze gate is met.
+  Historical artifacts emitted under the old metadata remain compatibility
+  obligations.
 - Stability contract published as `SPEC2.md` §"Format Stability" and
   `GOVERNANCE.md`.
 
