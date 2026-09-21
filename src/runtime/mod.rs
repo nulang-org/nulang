@@ -5233,10 +5233,22 @@ impl Runtime {
         })?;
 
         let offsets = if matches!(role, crate::primitives::ActorRole::Workflow) {
-            meta.behavior_indices
-                .iter()
-                .map(|&index| module.behaviors[index].code_offset)
-                .collect()
+            let mut offsets = Vec::with_capacity(meta.behavior_indices.len());
+            for &index in &meta.behavior_indices {
+                let behavior =
+                    module
+                        .behaviors
+                        .get(index)
+                        .ok_or_else(|| NuError::RuntimeError {
+                            msg: format!(
+                                "retained artifact {artifact_id} actor definition {} references missing behavior index {index}",
+                                meta.name
+                            ),
+                            span: Span::new(0, 0),
+                        })?;
+                offsets.push(behavior.code_offset);
+            }
+            offsets
         } else {
             module
                 .behaviors
@@ -5244,11 +5256,20 @@ impl Runtime {
                 .map(|behavior| behavior.code_offset)
                 .collect()
         };
-        let compensation_offsets = meta
-            .behavior_indices
-            .iter()
-            .map(|&index| module.behaviors[index].compensate_offset)
-            .collect();
+        let mut compensation_offsets = Vec::with_capacity(meta.behavior_indices.len());
+        for &index in &meta.behavior_indices {
+            let behavior = module
+                .behaviors
+                .get(index)
+                .ok_or_else(|| NuError::RuntimeError {
+                    msg: format!(
+                        "retained artifact {artifact_id} actor definition {} references missing behavior index {index}",
+                        meta.name
+                    ),
+                    span: Span::new(0, 0),
+                })?;
+            compensation_offsets.push(behavior.compensate_offset);
+        }
 
         spawn::register_recovery_module(
             self,
