@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nulang::runtime::{
-    Actor, DeterministicNetworkTransport, FabricAdvertisement, FabricAdvertisementSnapshot, NodeId,
-    Packet, Runtime,
+    Actor, ActorAdmissionStatus, DeterministicNetworkTransport, FabricAdvertisement,
+    FabricAdvertisementSnapshot, Mailbox, NodeId, Packet, Runtime,
 };
 use nulang::vm::Value;
 
@@ -106,6 +106,74 @@ fn fabric_gossip_converges_routes_and_reuses_distributed_actor_transport() {
     b.process_network();
     a.process_network();
     assert_eq!(a.fabric_remote_subscription_count(), 1);
+}
+
+#[test]
+fn fabric_tracked_publish_resolves_remote_mailbox_admission() {
+    let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:32111".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:32112".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut a = distributed_runtime(addr_a, bus.clone());
+    let mut b = distributed_runtime(addr_b, bus);
+
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    b.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let target = b.spawn_actor(Box::new(Vec::new));
+    {
+        let actor = b.actors.get_mut(&target).unwrap();
+        actor.mailbox = Mailbox::new(1);
+        actor.register_behavior("handle", noop);
+    }
+    b.fabric_subscribe("events.*", target, "handle").unwrap();
+
+    b.advance_time(Duration::from_millis(600));
+    a.advance_time(Duration::from_millis(600));
+    b.process_network();
+    a.process_network();
+    assert_eq!(a.fabric_remote_subscription_count(), 1);
+
+    let first = a
+        .fabric_publish_tracked("events.created", &[Value::int(1)])
+        .unwrap();
+    let second = a
+        .fabric_publish_tracked("events.created", &[Value::int(2)])
+        .unwrap();
+
+    assert_eq!(first.immediate.selected, 1);
+    assert_eq!(first.immediate.forwarded_remote, 1);
+    assert_eq!(first.remote_deliveries.len(), 1);
+    assert_eq!(second.immediate.selected, 1);
+    assert_eq!(second.immediate.forwarded_remote, 1);
+    assert_eq!(second.remote_deliveries.len(), 1);
+
+    let accepted = first.remote_deliveries[0].delivery_id;
+    let backpressured = second.remote_deliveries[0].delivery_id;
+
+    b.process_network();
+    a.process_network();
+
+    assert_eq!(
+        a.take_remote_admission(accepted),
+        Some(ActorAdmissionStatus::Accepted)
+    );
+    assert_eq!(
+        a.take_remote_admission(backpressured),
+        Some(ActorAdmissionStatus::Backpressured)
+    );
+    assert_eq!(b.actors.get(&target).unwrap().mailbox.len(), 1);
+    assert_eq!(b.dlq_depth(), 1);
 }
 
 #[test]
