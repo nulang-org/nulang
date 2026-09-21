@@ -92,6 +92,12 @@ two major versions.*
   cross-shard mailbox publication, workflow-local IDs are translated through
   their own metadata, and virtual actor instances resolve only their declared
   grain schema.
+- **Durable actor schema identity** (Stable runtime correction). New
+  snapshots persist the canonical actor schema name, recovery selects exactly
+  that schema in multi-actor modules, legacy snapshots are accepted only when
+  schema selection is unambiguous, grain hydration rejects schema mismatches,
+  and migration/forwarding retain the selected schema instead of flattening
+  module-global metadata.
 
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,

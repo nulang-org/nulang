@@ -104,6 +104,56 @@ fn test_legacy_snapshot_without_authority_is_deny_by_default() {
     assert!(snapshot.authority_tokens.is_empty());
 }
 
+#[test]
+fn p0_migrated_workflow_local_behavior_id_uses_retained_schema() {
+    let source = r#"
+        actor Prefix {
+            behavior ping() { nil }
+        }
+
+        workflow Flow {
+            step first { nil }
+            step second { nil }
+        }
+    "#;
+    let tokens = crate::lexer::Lexer::new(source).lex().expect("lex");
+    let ast = crate::parser::Parser::new(tokens).parse_module().expect("parse");
+    let mut typechecker = crate::typechecker::TypeChecker::new();
+    typechecker.check_module(&ast).expect("typecheck");
+    let hir = crate::hir_lower::lower_module(&ast, &typechecker.inferred_decl_types);
+    let mut mir = crate::mir_lower::lower_module(&hir).expect("MIR lowering");
+    let module = crate::mir_codegen::compile_mir(&mut mir, "workflow-forwarding")
+        .expect("codegen");
+
+    let flow = module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == "Flow")
+        .expect("Flow metadata");
+    let flow_first_module_idx = flow.behavior_indices[0];
+    assert!(
+        flow_first_module_idx > 0,
+        "Prefix must occupy module-global behavior slot zero for the regression"
+    );
+
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .spawn_from_module(&module, flow_first_module_idx, vec![])
+        .as_actor_id()
+        .expect("spawn Flow");
+    assert_eq!(rt.actors[&actor_id].name, "Flow");
+
+    // Simulate post-migration/post-reap forwarding: live actor metadata is gone,
+    // while recovery module + canonical schema ownership remain.
+    rt.actors.remove(&actor_id);
+
+    assert_eq!(
+        rt.recovery_behavior_wire_name_for(actor_id, 0).as_deref(),
+        Some("Flow.first"),
+        "workflow-local id 0 must translate through Flow's ActorMeta, not module behavior 0"
+    );
+}
+
 // ========================================================================
 // Core Runtime Tests
 // ========================================================================
@@ -1900,6 +1950,7 @@ fn test_memory_store_latest_sequence() {
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+        schema_name: None,
         authority_tokens: Default::default(),
     };
     store.save_snapshot(snapshot).unwrap();
@@ -1929,6 +1980,7 @@ fn test_libsql_store_save_load_snapshot() {
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+        schema_name: Some("Counter".to_string()),
         authority_tokens: Default::default(),
     };
     store.save_snapshot(snapshot).unwrap();
@@ -1937,6 +1989,7 @@ fn test_libsql_store_save_load_snapshot() {
     assert_eq!(loaded.actor_id, 1);
     assert_eq!(loaded.sequence, 3);
     assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
+    assert_eq!(loaded.schema_name.as_deref(), Some("Counter"));
 }
 
 #[cfg(feature = "sqlite")]
@@ -1983,6 +2036,7 @@ fn test_libsql_store_latest_sequence() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2011,6 +2065,7 @@ fn test_libsql_store_clear() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2047,6 +2102,7 @@ fn test_libsql_store_persists_to_disk() {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2087,6 +2143,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             waiting_signal: None,
             crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3]), (8, 2, vec![])]),
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2106,6 +2163,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2149,6 +2207,7 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
                 waiting_signal: None,
                 crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3])]),
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -4046,6 +4105,7 @@ fn test_actor_migration_between_two_nodes() {
             waiting_signal: actor.waiting_signal.clone(),
             crdt_snapshot,
             crdt_field_map,
+            schema_name: None,
             authority_tokens: Default::default(),
         };
         let json = serde_json::to_vec(&snapshot).unwrap();

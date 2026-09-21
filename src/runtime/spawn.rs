@@ -29,24 +29,46 @@ pub(crate) fn spawn_actor_with_models(
         state_models,
         persistent,
         workflow,
+        None,
     )
 }
 
-/// Load and validate legacy restart snapshot authority before actor initialization.
+/// Load and validate a restart snapshot before actor initialization.
 ///
-/// A malformed persisted manifest aborts activation before the init closure,
-/// CRDT registration, actor insertion, or scheduler enqueue. Pre-authority
-/// snapshots deserialize with an empty token set and therefore remain
-/// deny-by-default.
+/// Authority is reparsed deny-by-default. When the compiler-owned actor schema
+/// is known, the persisted schema must resolve exactly to that declaration;
+/// legacy snapshots without a schema are accepted only for an unambiguous
+/// single-schema module. Any failure aborts before init, state restoration,
+/// CRDT registration, actor insertion, or scheduler enqueue.
 fn preflight_persistent_snapshot(
     rt: &Runtime,
     actor_id: u64,
-) -> Result<Option<(ActorSnapshot, AuthorityManifest)>, RuntimeAuthorityError> {
+    expected_schema: Option<(&crate::bytecode::CodeModule, &str)>,
+) -> Result<Option<(ActorSnapshot, AuthorityManifest)>, String> {
     let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
         return Ok(None);
     };
     let manifest =
-        AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))?;
+        AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))
+            .map_err(|error| error.to_string())?;
+
+    if let Some((module, expected_schema_name)) = expected_schema {
+        super::schema_identity::resolve_expected_snapshot_actor_meta(
+            module,
+            snapshot.schema_name.as_deref(),
+            expected_schema_name,
+        )
+        .map_err(|error| error.to_string())?;
+    } else if let Some(schema_name) = snapshot
+        .schema_name
+        .as_deref()
+        .filter(|schema_name| !schema_name.is_empty())
+    {
+        return Err(format!(
+            "persisted actor schema '{schema_name}' cannot be activated without compiler-owned schema context"
+        ));
+    }
+
     Ok(Some((snapshot, manifest)))
 }
 
@@ -60,15 +82,16 @@ pub(crate) fn spawn_actor_with_id(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+    expected_schema: Option<(&crate::bytecode::CodeModule, &str)>,
 ) -> u64 {
     let restart_snapshot = if persistent && workflow.is_none() {
-        match preflight_persistent_snapshot(rt, id) {
+        match preflight_persistent_snapshot(rt, id, expected_schema) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::warn!(
                     actor_id = id,
                     %error,
-                    "refusing to activate persistent actor with invalid authority snapshot"
+                    "refusing to activate persistent actor with invalid durable snapshot"
                 );
                 return id;
             }
@@ -264,8 +287,9 @@ pub(crate) fn spawn_from_module(
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
         let defaults = meta.state_defaults.clone();
-        spawn_actor_with_models(
+        spawn_actor_with_id(
             rt,
+            fresh_actor_id(),
             Box::new(move || {
                 let mut fields: Vec<(String, Value)> = defaults
                     .iter()
@@ -281,10 +305,17 @@ pub(crate) fn spawn_from_module(
             } else {
                 None
             },
+            Some((module, meta.name.as_str())),
         )
     } else {
         spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
     };
+    // Rejected snapshot preflight intentionally creates no actor. Never return
+    // a dangling actor reference or register recovery metadata for it.
+    if !rt.actors.contains_key(&id) {
+        return Value::nil();
+    }
+
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
     // step-local indices in run_saga_compensation match.
@@ -452,6 +483,14 @@ pub(crate) fn register_recovery_module(
     offsets: Vec<usize>,
     compensation_offsets: Vec<Option<usize>>,
 ) {
+    if let Some(actor) = rt.actors.get(&actor_id) {
+        if let Some(schema_name) =
+            super::schema_identity::canonical_schema_name_for_runtime_actor(&module, &actor.name)
+        {
+            rt.recovery_schema_names
+                .insert(actor_id, schema_name.to_string());
+        }
+    }
     rt.recovery_modules
         .insert(actor_id, (module, offsets, compensation_offsets));
 }
@@ -465,6 +504,19 @@ mod authority_tests {
     fn secret_manifest(name: &str) -> AuthorityManifest {
         AuthorityManifest::from_tokens([format!("Secret::Read({name})")].iter().map(String::as_str))
             .unwrap()
+    }
+
+    fn compile_module(source: &str) -> CodeModule {
+        let tokens = crate::lexer::Lexer::new(source).lex().expect("lex");
+        let ast = crate::parser::Parser::new(tokens)
+            .parse_module()
+            .expect("parse");
+        let mut typechecker = crate::typechecker::TypeChecker::new();
+        typechecker.check_module(&ast).expect("typecheck");
+        let hir = crate::hir_lower::lower_module(&ast, &typechecker.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir).expect("MIR lowering");
+        crate::mir_codegen::compile_mir(&mut mir, "spawn-schema-preflight")
+            .expect("codegen")
     }
 
     #[test]
@@ -577,6 +629,7 @@ mod authority_tests {
             std::collections::HashMap::new(),
             true,
             None,
+            None,
         );
 
         assert_eq!(returned, actor_id);
@@ -591,6 +644,100 @@ mod authority_tests {
             .allows(&AuthorityGrant::SecretRead {
                 name: "RESTART_KEY".into(),
             }));
+    }
+
+    #[test]
+    fn schema_mismatched_restart_fails_before_init_or_publish() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let module = compile_module(
+            r#"
+            persistent actor First {
+                state durable first_only: Int = 1
+                behavior hit() { nil }
+            }
+            persistent actor Second {
+                state durable second_only: Int = 2
+                behavior hit() { nil }
+            }
+            "#,
+        );
+        let mut rt = Runtime::new();
+        let actor_id = 910_003;
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                schema_name: Some("First".to_string()),
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![("second_only".to_string(), Value::int(2))]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            Some((&module, "Second")),
+        );
+
+        assert_eq!(returned, actor_id);
+        assert!(
+            !init_ran.get(),
+            "schema mismatch must abort before actor initialization"
+        );
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "schema mismatch must not publish a runnable actor"
+        );
+    }
+
+    #[test]
+    fn schema_bound_restart_without_schema_context_fails_closed() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut rt = Runtime::new();
+        let actor_id = 910_004;
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                schema_name: Some("Counter".to_string()),
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            None,
+        );
+
+        assert_eq!(returned, actor_id);
+        assert!(
+            !init_ran.get(),
+            "schema-bound snapshot must not initialize without schema context"
+        );
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "schema-bound snapshot must not publish through a generic spawn"
+        );
     }
 
     #[test]
@@ -621,6 +768,7 @@ mod authority_tests {
             }),
             std::collections::HashMap::new(),
             true,
+            None,
             None,
         );
 
