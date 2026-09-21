@@ -42,6 +42,10 @@ version + migration.*
 
 ## Stable tier
 
+### Portable continuation compatibility contract — 2026-09-21
+- **Logical suspension sites now have backend-independent identity and live-layout compatibility metadata** (Experimental, `src/continuation_contract.rs`). `ContinuationPointId` excludes bytecode/native PCs, `ContinuationLayoutId` hashes compiler-canonical live semantic state, and the versioned `NUCT` metadata envelope binds a captured continuation to its originating `SemanticId`, activation/message sequence, and effect cursor. Hot-patch compatibility intentionally ignores the old/new whole-code semantic ID but fails closed when the logical point or live layout changes. This is a metadata substrate only; existing VM frame serialization remains unchanged until compiler lowering emits portable live-value layouts.
+
+
 ### Canonical compiler semantic identity — 2026-09-21
 - **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
 
