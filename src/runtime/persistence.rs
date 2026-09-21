@@ -54,7 +54,7 @@ impl StateModel {
         match self {
             StateModel::Local => crate::ast::StateDurability::Ephemeral,
             StateModel::Durable | StateModel::Crdt(_) => {
-                crate::ast::StateDurability::SnapshotJournal
+                crate::ast::StateDurability::Checkpointed
             }
             StateModel::EventSourced => crate::ast::StateDurability::EventLog,
         }
