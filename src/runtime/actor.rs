@@ -312,12 +312,38 @@ pub struct ReceiveWaitState {
     pub timed_out: bool,
 }
 
-/// Captured VM state plus metadata for resuming a workflow step.
+/// Runtime-owned reason an actor currently holds a suspended execution.
+///
+/// This is separate from `ActorState`: the scheduler already treats any live
+/// `SuspendedExecution` as non-reentrant. The reason tells supervision,
+/// debugging, and future mailbox-quarantine policy what event may resume it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspensionReason {
+    JitSafepoint,
+    SignalWait,
+    ReceiveWait,
+    AsyncEffect,
+    DebugPause,
+    Fault,
+}
+
+impl SuspensionReason {
+    pub const fn from_vm(reason: crate::types::VmSuspension) -> Self {
+        match reason {
+            crate::types::VmSuspension::SignalWait => Self::SignalWait,
+            crate::types::VmSuspension::ReceiveWait => Self::ReceiveWait,
+            crate::types::VmSuspension::PerformAsync => Self::AsyncEffect,
+        }
+    }
+}
+
+/// Captured VM state plus metadata for resuming an actor behavior.
 #[derive(Debug)]
 pub struct SuspendedExecution {
     pub vm_state: crate::vm::SuspendedVmState,
     pub behavior_idx: usize,
     pub step_name: String,
+    pub reason: SuspensionReason,
 }
 
 /// A behavior entry: maps behavior name to handler.
