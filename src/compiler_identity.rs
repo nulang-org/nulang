@@ -7,6 +7,7 @@
 
 use crate::artifact_identity::ArtifactIdentityManifest;
 use crate::content_identity::{SemanticId, SourceId};
+use crate::runtime_artifact_manifest::RuntimeArtifactManifest;
 use crate::hir;
 use crate::mir;
 use crate::semantic_identity::SemanticIdentityError;
@@ -51,6 +52,84 @@ where
         backend,
         flags,
     ))
+}
+
+/// One compiler-owned bytecode emission with every identity sidecar needed
+/// for durable historical execution.
+///
+/// Keeping these values together prevents callers from accidentally emitting
+/// NBC bytes from one module while persisting identity manifests derived from
+/// another semantic/codegen configuration.
+#[derive(Debug, Clone)]
+pub struct IdentifiedBytecodeArtifact {
+    pub module: crate::bytecode::CodeModule,
+    pub identity: ArtifactIdentityManifest,
+    pub runtime_manifest: RuntimeArtifactManifest,
+}
+
+/// Compile typed HIR/MIR to bytecode and derive/bind all executable identity
+/// metadata in one operation.
+///
+/// The returned NBC module still serializes as frozen format v1; both identity
+/// manifests remain additive sidecars until a future versioned bytecode format
+/// explicitly embeds them.
+pub fn compile_identified_bytecode<D, I, S>(
+    source_bytes: Option<&[u8]>,
+    hir: &hir::Module,
+    mir: &mut mir::Module,
+    dependency_semantic_ids: D,
+    name: &str,
+    compiler_version: &str,
+    target: &str,
+    abi: &str,
+    backend: &str,
+    flags: I,
+) -> crate::types::NuResult<IdentifiedBytecodeArtifact>
+where
+    D: IntoIterator<Item = SemanticId>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let dependencies: Vec<_> = dependency_semantic_ids.into_iter().collect();
+    let flags: Vec<String> = flags
+        .into_iter()
+        .map(|flag| flag.as_ref().to_string())
+        .collect();
+
+    let mut module =
+        compile_typed_bytecode(hir, mir, dependencies.iter().copied(), name)?;
+    let semantic_id = module.semantic_id.ok_or_else(|| crate::types::NuError::VMError {
+        msg: "typed bytecode compiler produced no semantic identity".to_string(),
+        span: crate::types::Span::default(),
+    })?;
+    let identity = ArtifactIdentityManifest::new(
+        source_bytes.map(SourceId::from_bytes),
+        semantic_id,
+        compiler_version,
+        target,
+        abi,
+        backend,
+        flags.iter(),
+    );
+    module
+        .attach_artifact_identity(&identity)
+        .map_err(|error| crate::types::NuError::VMError {
+            msg: format!("cannot bind compiled artifact identity: {error}"),
+            span: crate::types::Span::default(),
+        })?;
+    let runtime_manifest =
+        RuntimeArtifactManifest::from_module(&module, &identity).map_err(|error| {
+            crate::types::NuError::VMError {
+                msg: format!("cannot build runtime artifact manifest: {error}"),
+                span: crate::types::Span::default(),
+            }
+        })?;
+
+    Ok(IdentifiedBytecodeArtifact {
+        module,
+        identity,
+        runtime_manifest,
+    })
 }
 
 /// Compile one typed HIR/MIR program to bytecode and attach its proven
@@ -200,6 +279,77 @@ mod tests {
             module.attach_artifact_identity(&different),
             Err(crate::artifact_identity::ArtifactIdentityError::SemanticIdentityMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn identified_bytecode_owns_module_and_runtime_manifest_provenance() {
+        let (hir, mut mir) = empty_program();
+        let artifact = compile_identified_bytecode(
+            Some(b"fn main() { 1 }"),
+            &hir,
+            &mut mir,
+            [],
+            "identified",
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=0"],
+        )
+        .unwrap();
+
+        assert_eq!(
+            artifact.module.semantic_id,
+            Some(artifact.identity.semantic_id())
+        );
+        assert_eq!(
+            artifact.module.artifact_id,
+            Some(artifact.identity.artifact_id())
+        );
+        assert_eq!(
+            artifact.runtime_manifest.artifact_id(),
+            artifact.identity.artifact_id()
+        );
+        assert_eq!(
+            artifact.runtime_manifest.semantic_id(),
+            artifact.identity.semantic_id()
+        );
+    }
+
+    #[test]
+    fn identified_bytecode_source_only_change_preserves_artifact_identity() {
+        let (hir, mut first_mir) = empty_program();
+        let mut second_mir = first_mir.clone();
+        let first = compile_identified_bytecode(
+            Some(b"fn main(){1}"),
+            &hir,
+            &mut first_mir,
+            [],
+            "identified",
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=0"],
+        )
+        .unwrap();
+        let second = compile_identified_bytecode(
+            Some(b"fn main() { 1 }"),
+            &hir,
+            &mut second_mir,
+            [],
+            "identified",
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=0"],
+        )
+        .unwrap();
+
+        assert_ne!(first.identity.source_id(), second.identity.source_id());
+        assert_eq!(first.identity.artifact_id(), second.identity.artifact_id());
+        assert_eq!(first.runtime_manifest, second.runtime_manifest);
     }
 
     #[test]
