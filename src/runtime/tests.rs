@@ -7460,7 +7460,6 @@ fn identified_migration_rejects_missing_provenance_without_downgrade() {
     assert!(!runtime.actors.contains_key(&actor_id));
 }
 
-
 #[test]
 fn runtime_artifact_cache_admits_only_verified_exact_artifact() {
     use crate::artifact_identity::ArtifactIdentityManifest;
@@ -7586,13 +7585,7 @@ fn runtime_artifact_fetch_materializes_identified_recovery_module_once() {
 
     let actor_id = 730_100;
     let mut runtime = Runtime::new();
-    runtime.register_recovery_module_for_definition(
-        actor_id,
-        "Counter",
-        module,
-        vec![],
-        vec![],
-    );
+    runtime.register_recovery_module_for_definition(actor_id, "Counter", module, vec![], vec![]);
 
     let first = runtime
         .runtime_artifact_for_fetch(identity.artifact_id())
