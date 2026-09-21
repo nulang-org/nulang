@@ -155,6 +155,13 @@ jobs:
           fi
           grep -q "expected constructor 'CARTESIAN', found constructor 'WGS84'" /tmp/nulang-geo-rtree-crs.out
 
+          if ../../target/release/nulang --check tests/compile_fail/mixed_crs_rtree_point_query.nula > /tmp/nulang-geo-rtree-point-crs.out 2>&1; then
+            echo "::error::cross-CRS R-tree point query unexpectedly type-checked"
+            cat /tmp/nulang-geo-rtree-point-crs.out
+            exit 1
+          fi
+          grep -q "expected constructor 'CARTESIAN', found constructor 'WGS84'" /tmp/nulang-geo-rtree-point-crs.out
+
       - name: Verify documentation examples
         run: NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
   # -----------------------------------------------------------------------
