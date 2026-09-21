@@ -113,9 +113,10 @@ claimed until measured.
 
 ## What platforms are supported?
 
-Linux and macOS (x86_64 and aarch64 release artifacts per
-docs/RELEASING.md). Windows is not supported yet — WSL works. Rust 1.95.0 is
-pinned via `rust-toolchain.toml`.
+The tagged release matrix validates Linux x86_64/aarch64, macOS Apple Silicon
+(aarch64), and Windows x86_64 archives. Other platform/architecture
+combinations are not release-tested yet. Rust 1.95.0 is pinned by
+`rust-toolchain.toml` for source builds.
 
 ## What's the deal with "1.0.0-frozen" and "200-year horizon"?
 
@@ -134,11 +135,13 @@ actors — no lock-in is the stated intent.
 
 ## How do I try it?
 
-Build from source (`cargo build --release`, Rust 1.95.0), or download a
-release tarball once v0.1.0 is cut. Run the 17 verified programs in
-`examples/`, read docs/GETTING_STARTED.md and docs/TUTORIAL.md, or run the
-playground locally with `python3 playground/server.py`. The VS Code
-extension is in `editors/vscode/`.
+Start with the hosted browser playground at `nulang.org/playground/` if you
+want zero-install evaluation. For the native runtime, download a checksummed
+archive from GitHub Releases; the current release matrix covers Linux
+x86_64/aarch64, macOS aarch64, and Windows x86_64. Build from source with
+Rust 1.95.0 when contributing or customizing the runtime. The verified
+examples live in `examples/`, and the VS Code extension is in
+`editors/vscode/`.
 
 ## How can I contribute?
 
