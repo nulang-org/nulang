@@ -1271,7 +1271,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         // reference keeps the payload alive.
         Some((
             pos,
-            Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
+            payload.to_vec(),
         ))
     }
 
@@ -2180,7 +2180,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             // the pattern+guard succeeds.
             Some((
                 pos,
-                Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
+                payload.to_vec(),
             ))
         }
     }
