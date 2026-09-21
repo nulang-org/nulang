@@ -776,6 +776,52 @@ mod tests {
     }
 
     #[test]
+    fn ownership_fence_survives_store_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "nulang_logical_actor_fencing_{}_reopen.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let grain = GrainId::new("Account", "persisted-ownership");
+        let stale = LogicalActorCommitStamp::new(grain.clone(), NodeId(7), epoch(10));
+
+        {
+            let mut store = LibsqlLogicalActorStore::new(&path).unwrap();
+            store
+                .grant_ownership(grain.clone(), NodeId(7), handle(1), epoch(10))
+                .unwrap();
+            store
+                .save_logical_snapshot(&stale, snapshot(1, 1, 10))
+                .unwrap();
+        }
+
+        {
+            let mut store = LibsqlLogicalActorStore::new(&path).unwrap();
+            store
+                .grant_ownership(grain.clone(), NodeId(8), handle(2), epoch(11))
+                .unwrap();
+
+            assert!(matches!(
+                store.save_logical_snapshot(&stale, snapshot(1, 2, 99)),
+                Err(LibsqlLogicalActorError::Commit(
+                    LogicalActorCommitError::Unauthorized { .. }
+                ))
+            ));
+
+            let current =
+                LogicalActorCommitStamp::new(grain.clone(), NodeId(8), epoch(11));
+            store
+                .save_logical_snapshot(&current, snapshot(2, 2, 20))
+                .unwrap();
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
     fn snapshot_sequence_cannot_regress() {
         let mut store = LibsqlLogicalActorStore::in_memory().unwrap();
         let grain = GrainId::new("Account", "libsql-sequence");
