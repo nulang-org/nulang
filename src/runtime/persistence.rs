@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::content_identity::{ArtifactId, SemanticId};
 use crate::vm::Value;
 
 use tracing::warn;
@@ -124,12 +125,144 @@ impl PersistedValue {
     }
 }
 
+/// Immutable retained executable keyed by the compiler's strong ArtifactId.
+///
+/// `payload_digest` is storage-integrity metadata, not a parallel identity.
+/// It binds the validated manifest, definition-scoped semantic sidecars, and
+/// frozen NBC-v1 bytes so accidental corruption is detected before recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedArtifact {
+    pub artifact_id: ArtifactId,
+    pub manifest_json: Vec<u8>,
+    pub actor_semantic_ids: Vec<SemanticId>,
+    pub nbc_bytes: Vec<u8>,
+    pub payload_digest: [u8; 32],
+}
+
+fn retained_artifact_digest(
+    manifest_json: &[u8],
+    actor_semantic_ids: &[SemanticId],
+    nbc_bytes: &[u8],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"nulang.retained-artifact.v1\0");
+    hasher.update(&(manifest_json.len() as u64).to_le_bytes());
+    hasher.update(manifest_json);
+    hasher.update(&(actor_semantic_ids.len() as u64).to_le_bytes());
+    for id in actor_semantic_ids {
+        hasher.update(id.as_bytes());
+    }
+    hasher.update(&(nbc_bytes.len() as u64).to_le_bytes());
+    hasher.update(nbc_bytes);
+    *hasher.finalize().as_bytes()
+}
+
+impl RetainedArtifact {
+    pub fn from_proven_module(module: &crate::bytecode::CodeModule) -> io::Result<Self> {
+        let manifest = module.artifact_identity.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot retain bytecode without compiler-proven artifact identity",
+            )
+        })?;
+        if module.semantic_id != Some(manifest.semantic_id()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CodeModule semantic identity does not match artifact manifest",
+            ));
+        }
+        if module.actor_semantic_ids.len() != module.actor_metadata.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "CodeModule has {} actor definitions but {} definition semantic identities",
+                    module.actor_metadata.len(),
+                    module.actor_semantic_ids.len()
+                ),
+            ));
+        }
+        let manifest_json = manifest
+            .to_json()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let nbc_bytes = module
+            .to_nbc(None)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let actor_semantic_ids = module.actor_semantic_ids.clone();
+        let payload_digest =
+            retained_artifact_digest(&manifest_json, &actor_semantic_ids, &nbc_bytes);
+        Ok(Self {
+            artifact_id: manifest.artifact_id(),
+            manifest_json,
+            actor_semantic_ids,
+            nbc_bytes,
+            payload_digest,
+        })
+    }
+
+    pub fn restore_module(&self, requested: ArtifactId) -> io::Result<crate::bytecode::CodeModule> {
+        if self.artifact_id != requested {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "retained artifact key mismatch: requested {}, stored {}",
+                    requested, self.artifact_id
+                ),
+            ));
+        }
+        let expected_digest = retained_artifact_digest(
+            &self.manifest_json,
+            &self.actor_semantic_ids,
+            &self.nbc_bytes,
+        );
+        if expected_digest != self.payload_digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("retained artifact {} failed payload digest verification", requested),
+            ));
+        }
+        let manifest =
+            crate::artifact_identity::ArtifactIdentityManifest::from_json(&self.manifest_json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if manifest.artifact_id() != requested {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "retained artifact manifest mismatch: requested {}, manifest {}",
+                    requested,
+                    manifest.artifact_id()
+                ),
+            ));
+        }
+        let mut module = crate::bytecode::CodeModule::from_nbc(&self.nbc_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            .module;
+        if module.actor_metadata.len() != self.actor_semantic_ids.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "retained artifact {} has {} actor definitions but {} definition identities",
+                    requested,
+                    module.actor_metadata.len(),
+                    self.actor_semantic_ids.len()
+                ),
+            ));
+        }
+        module.semantic_id = Some(manifest.semantic_id());
+        module.actor_semantic_ids = self.actor_semantic_ids.clone();
+        module.artifact_identity = Some(manifest);
+        Ok(module)
+    }
+}
+
 /// A serializable snapshot of an actor's durable state.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ActorSnapshot {
     pub actor_id: u64,
     pub sequence: u64,
+    /// Exact compiler/code-generation artifact pinned to this checkpoint.
+    #[serde(default)]
+    pub artifact_id: Option<String>,
     /// Canonical compiler-derived semantic identity of this actor/entity/
     /// workflow definition. This is deliberately narrower than the containing
     /// module's program identity, so unrelated code changes do not invalidate
