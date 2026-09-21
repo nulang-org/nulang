@@ -313,7 +313,8 @@ mod tests {
 
     #[test]
     fn typed_json_body_carries_codec_metadata() {
-        let mut contract = route("/users/{id: UserId}");
+        let mut contract = route("/users");
+        contract.params.clear();
         contract.handler_params = vec![HandlerParamContract {
             name: "payload".to_string(),
             ty: Some("Json[CreateUser]".to_string()),
@@ -331,7 +332,8 @@ mod tests {
 
     #[test]
     fn typed_json_body_cannot_mix_with_form_bindings() {
-        let mut contract = route("/users/{id: UserId}");
+        let mut contract = route("/users");
+        contract.params.clear();
         contract.handler_params = vec![
             HandlerParamContract {
                 name: "payload".to_string(),
