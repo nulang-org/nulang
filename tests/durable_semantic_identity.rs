@@ -1,5 +1,6 @@
+use nulang::artifact_identity::ArtifactIdentityManifest;
 use nulang::bytecode::CodeModule;
-use nulang::content_identity::SemanticId;
+use nulang::content_identity::{ArtifactId, SemanticId};
 use nulang::runtime::{ActorSnapshot, RecoveryIdentityPolicy, Runtime};
 
 fn semantic(label: &[u8]) -> SemanticId {
@@ -7,9 +8,18 @@ fn semantic(label: &[u8]) -> SemanticId {
 }
 
 fn snapshot(actor_id: u64, semantic_id: Option<SemanticId>) -> ActorSnapshot {
+    snapshot_with_artifact(actor_id, semantic_id, None)
+}
+
+fn snapshot_with_artifact(
+    actor_id: u64,
+    semantic_id: Option<SemanticId>,
+    artifact_id: Option<ArtifactId>,
+) -> ActorSnapshot {
     ActorSnapshot {
         actor_id,
         semantic_id: semantic_id.map(|id| id.to_string()),
+        artifact_id: artifact_id.map(|id| id.to_string()),
         ..ActorSnapshot::default()
     }
 }
@@ -165,8 +175,136 @@ fn legacy_compatible_recovery_does_not_upgrade_provenance() {
 }
 
 #[test]
-fn legacy_nbc_transport_rejects_self_asserted_semantic_identity() {
+fn identified_artifact_snapshot_rejects_different_executable_with_same_definition() {
     let actor_id = 410_007;
+    let definition_id = semantic(b"stable-definition");
+    let program_id = semantic(b"stable-program");
+
+    let mut first = module_with_definition_identity("Counter", Some(definition_id));
+    first.semantic_id = Some(program_id);
+    let first_manifest = ArtifactIdentityManifest::new(
+        None,
+        program_id,
+        "nulangc-test",
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        ["opt=0"],
+    );
+    first.attach_artifact_identity(&first_manifest).unwrap();
+
+    let mut changed_codegen = module_with_definition_identity("Counter", Some(definition_id));
+    changed_codegen.semantic_id = Some(program_id);
+    let changed_manifest = ArtifactIdentityManifest::new(
+        None,
+        program_id,
+        "nulangc-test",
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        ["opt=3"],
+    );
+    changed_codegen
+        .attach_artifact_identity(&changed_manifest)
+        .unwrap();
+    assert_ne!(
+        first_manifest.artifact_id(),
+        changed_manifest.artifact_id(),
+        "codegen identity must distinguish exact executables"
+    );
+
+    let mut runtime = Runtime::new();
+    runtime
+        .persistence
+        .save_snapshot(snapshot_with_artifact(
+            actor_id,
+            Some(definition_id),
+            Some(first_manifest.artifact_id()),
+        ))
+        .unwrap();
+    runtime.register_recovery_module(actor_id, changed_codegen, vec![], vec![]);
+
+    assert_eq!(
+        runtime.recover_actor_with_identity_policy(actor_id, RecoveryIdentityPolicy::Strict),
+        None
+    );
+    assert!(!runtime.actors.contains_key(&actor_id));
+}
+
+#[test]
+fn matching_artifact_snapshot_recovers_with_exact_executable_provenance() {
+    let actor_id = 410_008;
+    let definition_id = semantic(b"definition");
+    let program_id = semantic(b"program");
+    let mut module = module_with_definition_identity("Counter", Some(definition_id));
+    module.semantic_id = Some(program_id);
+    let manifest = ArtifactIdentityManifest::new(
+        None,
+        program_id,
+        "nulangc-test",
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        ["opt=0"],
+    );
+    module.attach_artifact_identity(&manifest).unwrap();
+
+    let mut runtime = Runtime::new();
+    runtime
+        .persistence
+        .save_snapshot(snapshot_with_artifact(
+            actor_id,
+            Some(definition_id),
+            Some(manifest.artifact_id()),
+        ))
+        .unwrap();
+    runtime.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(
+        runtime.recover_actor_with_identity_policy(actor_id, RecoveryIdentityPolicy::Strict),
+        Some(actor_id)
+    );
+    assert_eq!(
+        runtime.actors[&actor_id].execution_artifact_id,
+        Some(manifest.artifact_id())
+    );
+}
+
+#[test]
+fn legacy_snapshot_without_artifact_identity_is_not_silently_upgraded() {
+    let actor_id = 410_009;
+    let definition_id = semantic(b"definition");
+    let program_id = semantic(b"program");
+    let mut module = module_with_definition_identity("Counter", Some(definition_id));
+    module.semantic_id = Some(program_id);
+    let manifest = ArtifactIdentityManifest::new(
+        None,
+        program_id,
+        "nulangc-test",
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        ["opt=0"],
+    );
+    module.attach_artifact_identity(&manifest).unwrap();
+
+    let mut runtime = Runtime::new();
+    runtime
+        .persistence
+        .save_snapshot(snapshot(actor_id, Some(definition_id)))
+        .unwrap();
+    runtime.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(
+        runtime.recover_actor_with_identity_policy(actor_id, RecoveryIdentityPolicy::Strict),
+        Some(actor_id)
+    );
+    assert_eq!(runtime.actors[&actor_id].execution_artifact_id, None);
+}
+
+#[test]
+fn legacy_nbc_transport_rejects_self_asserted_semantic_identity() {
+    let actor_id = 410_010;
     let id = semantic(b"transported");
     let module = module_with_definition_identity("transported", Some(id));
     let nbc = module.to_nbc(None).expect("encode NBC v1");
