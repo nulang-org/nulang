@@ -7489,6 +7489,67 @@ fn test_grain_ref_builtin_unknown_key_returns_nil() {
 }
 
 #[test]
+fn test_virtual_grain_hydration_migrates_snapshot_before_publication() {
+    let module = compile_state_migration_module(
+        r#"
+        virtual entity Counter(key: String) {
+            version: 2
+            state durable count: Int = 0
+            migration from 1 to 2 {
+                state => { self.count = self.count + 5 }
+            }
+        }
+        "#,
+    );
+
+    let grain_id = GrainId::new("Counter", "migrating-user");
+    let stable_id = grain_actor_id(&grain_id);
+    let mut snapshot = ActorSnapshot {
+        actor_id: stable_id,
+        sequence: 9,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    snapshot
+        .state
+        .insert("count".to_string(), PersistedValue::Int(10));
+
+    let mut rt = Runtime::new();
+    rt.persistence.save_snapshot(snapshot).unwrap();
+    rt.register_module_grains(&module);
+
+    assert_eq!(
+        rt.resolve_or_hydrate_grain(grain_id.clone()).unwrap(),
+        stable_id
+    );
+
+    let committed = rt.persistence.load_snapshot(stable_id).unwrap();
+    assert_eq!(committed.sequence, 9);
+    assert_eq!(committed.schema_version, 2);
+    assert_eq!(
+        committed.state.get("count"),
+        Some(&PersistedValue::Int(15))
+    );
+
+    let actor = rt
+        .actors
+        .get(&stable_id)
+        .expect("migrated grain must be resident");
+    assert_eq!(actor.schema_owner.as_deref(), Some("Counter"));
+    assert_eq!(actor.schema_version, 2);
+    assert_eq!(
+        actor.get_state_field("count").and_then(|value| value.as_int()),
+        Some(15)
+    );
+    assert_eq!(
+        rt.grain_residents.get(&grain_id),
+        Some(&stable_id),
+        "grain identity must be published only after the migrated snapshot is current"
+    );
+}
+
+#[test]
 fn test_grain_prewarm_builtin_hydrates_grain() {
     let mut rt = Runtime::new();
     register_test_grain(&mut rt, "Counter");
