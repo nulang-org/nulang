@@ -199,8 +199,10 @@ fn default_route_placement(
     response: Option<&ResponseContract>,
 ) -> String {
     let dynamic_path = path.contains(':') || (path.contains('{') && path.contains('}'));
-    let transport_requires_server =
-        matches!(response.map(|contract| contract.kind), Some(crate::web::response::ResponseBodyKind::Json));
+    let transport_requires_server = matches!(
+        response.map(|contract| contract.kind),
+        Some(crate::web::response::ResponseBodyKind::Json)
+    );
     if dynamic_path || transport_requires_server || !matches!(method, "GET" | "HEAD") {
         "server".to_string()
     } else {
