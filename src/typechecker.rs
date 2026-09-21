@@ -3863,36 +3863,26 @@ impl TypeChecker {
             }
             ("Tensor", "to_array") => {
                 require_arity(1)?;
-                let elem = Type::Var(TypeVar::fresh());
                 unify_arg(
                     &mut subst,
                     &arg_types,
                     0,
-                    &Type::tensor(elem.clone()),
+                    &Type::tensor(Type::float()),
                 )?;
-                Ok((
-                    subst.clone(),
-                    Type::Array(Box::new(apply_subst(&elem, &subst))),
-                ))
+                Ok((subst, Type::Array(Box::new(Type::float()))))
             }
             ("Tensor", "add") | ("Tensor", "matmul") => {
                 require_arity(2)?;
-                let elem = Type::Var(TypeVar::fresh());
-                let tensor = Type::tensor(elem.clone());
+                let tensor = Type::tensor(Type::float());
                 unify_arg(&mut subst, &arg_types, 0, &tensor)?;
                 unify_arg(&mut subst, &arg_types, 1, &tensor)?;
-                Ok((subst.clone(), Type::tensor(apply_subst(&elem, &subst))))
+                Ok((subst, tensor))
             }
             ("Tensor", "relu") => {
                 require_arity(1)?;
-                let elem = Type::Var(TypeVar::fresh());
-                unify_arg(
-                    &mut subst,
-                    &arg_types,
-                    0,
-                    &Type::tensor(elem.clone()),
-                )?;
-                Ok((subst.clone(), Type::tensor(apply_subst(&elem, &subst))))
+                let tensor = Type::tensor(Type::float());
+                unify_arg(&mut subst, &arg_types, 0, &tensor)?;
+                Ok((subst, tensor))
             }
             ("Compute", "device") => {
                 require_arity(1)?;
