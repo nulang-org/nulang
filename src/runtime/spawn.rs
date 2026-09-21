@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use crate::authority::AuthorityManifest;
 use crate::authority_runtime::RuntimeAuthorityError;
 use crate::primitives::ActorRole;
-use crate::runtime::Runtime;
 use crate::runtime::actor::{Actor, ActorBackend, BehaviorEntry};
 use crate::runtime::persistence::{ActorSnapshot, PersistedValue, StateModel, WorkflowEvent};
 use crate::runtime::timer_fired_handler;
+use crate::runtime::Runtime;
 use crate::runtime::{bytecode_step_placeholder, fresh_actor_id, map_ast_state_model};
 use crate::vm::Value;
 
@@ -478,14 +478,12 @@ mod authority_tests {
         let actor_id = value.as_actor_id().unwrap();
         let actor = rt.actors.get(&actor_id).unwrap();
 
-        assert!(
-            actor
-                .authority_manifest()
-                .unwrap()
-                .allows(&AuthorityGrant::SecretRead {
-                    name: "STRIPE_KEY".into(),
-                })
-        );
+        assert!(actor
+            .authority_manifest()
+            .unwrap()
+            .allows(&AuthorityGrant::SecretRead {
+                name: "STRIPE_KEY".into(),
+            }));
     }
 
     #[test]
@@ -587,14 +585,12 @@ mod authority_tests {
             .get(&actor_id)
             .expect("persistent actor published");
         assert_eq!(actor.sequence, 7);
-        assert!(
-            actor
-                .authority_manifest()
-                .unwrap()
-                .allows(&AuthorityGrant::SecretRead {
-                    name: "RESTART_KEY".into(),
-                })
-        );
+        assert!(actor
+            .authority_manifest()
+            .unwrap()
+            .allows(&AuthorityGrant::SecretRead {
+                name: "RESTART_KEY".into(),
+            }));
     }
 
     #[test]
