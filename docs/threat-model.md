@@ -53,8 +53,8 @@
 | ID | Threat | Mitigation | Status |
 |---|---|---|---|
 | W1 | **Sandbox escape via host imports** | Wasmtime `Linker` limits imports to explicitly-wrapped functions. Guard pages (4GiB reserved, 128MiB guard) contain linear memory. | Implemented. |
-| W2 | **Capability escalation in component model** | WASM component capability gate (TBD in P5b) will restrict which host capabilities a component may import. | Not yet implemented. |
-| W3 | **Infinite loop in guest** | Wasmtime fuel metering (not yet wired) or execution timeout. | Not yet implemented. |
+| W2 | **Capability escalation in component model** | The component host links only explicitly granted imports (`Capabilities`); denied imports fail at instantiation. | Implemented. |
+| W3 | **Infinite loop in guest** | Wasmtime fuel consumption is enabled on the module, component, and WasmFX runtimes. Each guest invocation receives a fresh bounded fuel budget and traps when it is exhausted. | Implemented. |
 | W4 | **AOT compilation of untrusted wasm** | `wasmtime compile` produces `.cwasm` files that are only loaded by the trusted runtime. Do not run `wasmtime compile` on untrusted input. | Documented. |
 
 ### 2.4 VM & JIT (High)
@@ -101,8 +101,8 @@ An attacker replaces a `.so` file that a Nulang program loads via FFI.
 ### Scenario C: Untrusted WASM module
 An attacker uploads a `.wasm` module to a Nulang service that runs user code.
 
-- **Mitigation**: Wasmtime's sandbox isolates linear memory. Host imports are limited to `IO.print`/`read` and `Array.*` operations. User-defined effects and closures are rejected at compile time.
-- **Residual risk**: AOT compilation (`wasmtime compile`) must only be run on trusted input. The `.cwasm` format is not sandboxed.
+- **Mitigation**: Wasmtime's sandbox isolates linear memory. Host imports are explicitly linked, Component Model imports are capability-gated, and every guest invocation receives a deterministic fuel budget so non-terminating code traps instead of monopolizing the host.
+- **Residual risk**: AOT compilation (`wasmtime compile`) must only be run on trusted input. The `.cwasm` format is not sandboxed; fuel bounds guest WASM instruction execution but does not by itself bound time spent inside a host import.
 
 ## 4. Security Checklist for Operators
 
@@ -118,7 +118,6 @@ An attacker uploads a `.wasm` module to a Nulang service that runs user code.
 
 | Risk | Priority | Tracking |
 |---|---|---|
-| WASM component capability gate (P5b) | High | Phase 5 — Security sandboxing |
 | OTLP trace/metric export for security-event monitoring | Medium | Phase 3 — Observability |
 | Windows CI matrix (no PyO3, no libsql) | Medium | Phase 4 — Windows support |
 | Gossip amplification under Byzantine majority | Low | Research: need formal proof of convergence |
