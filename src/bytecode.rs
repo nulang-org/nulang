@@ -536,6 +536,21 @@ pub struct BehaviorTableEntry {
     pub parallel_branches: Option<Vec<String>>,
 }
 
+/// Compiler-private current-schema apply projection used for deterministic
+/// event replay. `function_index` addresses CodeModule::function_table and is
+/// intentionally not a behavior-table entry or source-callable function.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyHandlerMeta {
+    pub event: String,
+    pub param_count: usize,
+    pub function_index: usize,
+    /// True only when the compiler proved the handler stays inside the
+    /// conservative deterministic event-projection subset. Legacy artifacts
+    /// default to false and therefore fail closed for executable replay.
+    #[serde(default)]
+    pub replay_safe: bool,
+}
+
 /// Actor metadata for durable execution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActorMeta {
@@ -547,6 +562,11 @@ pub struct ActorMeta {
     pub state_defaults: Vec<(String, Constant)>,
     /// Indices into the behavior table that belong to this actor.
     pub behavior_indices: Vec<usize>,
+    /// Compiler-private apply-handler replay functions for the current schema.
+    /// Legacy artifacts deserialize with an empty table and therefore cannot
+    /// claim deterministic event replay under new code.
+    #[serde(default)]
+    pub apply_handlers: Vec<ApplyHandlerMeta>,
     /// True if this actor was generated from a `workflow` declaration.
     pub is_workflow: bool,
     /// True if this actor was generated from an `agent` declaration.
@@ -598,6 +618,7 @@ impl ActorMeta {
             state_models: Vec::new(),
             state_defaults: Vec::new(),
             behavior_indices: Vec::new(),
+            apply_handlers: Vec::new(),
             is_workflow: false,
             is_agent: false,
             is_organization: false,

@@ -38,6 +38,138 @@ fn migration_state_function_name(actor_name: &str, from_version: u32, to_version
     format!("{actor_name}.$migration_state_{from_version}_{to_version}")
 }
 
+fn apply_handler_function_name(actor_name: &str, event: &str) -> String {
+    // Compiler-owned replay projection. It is intentionally absent from
+    // func_map and the behavior table.
+    format!("{actor_name}.$apply_{event}")
+}
+
+
+/// Conservative proof that an apply handler can be re-run as a deterministic
+/// event projection without observing non-event-sourced actor state or
+/// invoking actor/effect surfaces that the isolated replay VM must deny.
+///
+/// This is intentionally a capability fact, not a source validity rule:
+/// handlers outside this subset retain today's live semantics and stored-value
+/// recovery, but RFC 0008 event replay will fail closed rather than re-run them.
+fn apply_handler_replay_safe(
+    expr: &crate::ast::Expr,
+    event_sourced_fields: &HashSet<String>,
+) -> bool {
+    use crate::ast::Expr;
+
+    match expr {
+        Expr::Literal(..) | Expr::Var(..) | Expr::Panic(..) => true,
+        Expr::SelfRef(_) => false,
+        Expr::FString(parts, _)
+        | Expr::Tuple(parts, _)
+        | Expr::Array(parts, _) => parts
+            .iter()
+            .all(|part| apply_handler_replay_safe(part, event_sourced_fields)),
+        Expr::Record(fields, _) => fields
+            .iter()
+            .all(|(_, value)| apply_handler_replay_safe(value, event_sourced_fields)),
+        Expr::FieldAccess { expr, field, .. } => match expr.as_ref() {
+            Expr::SelfRef(_) => event_sourced_fields.contains(field),
+            other => apply_handler_replay_safe(other, event_sourced_fields),
+        },
+        Expr::RecordUpdate { base, fields, .. } => {
+            apply_handler_replay_safe(base, event_sourced_fields)
+                && fields
+                    .iter()
+                    .all(|(_, value)| apply_handler_replay_safe(value, event_sourced_fields))
+        }
+        Expr::Index { arr, idx, .. }
+        | Expr::Binary {
+            left: arr,
+            right: idx,
+            ..
+        } => {
+            apply_handler_replay_safe(arr, event_sourced_fields)
+                && apply_handler_replay_safe(idx, event_sourced_fields)
+        }
+        Expr::Unary { expr, .. }
+        | Expr::CapAnnotate { expr, .. }
+        | Expr::TypeAnnotate { expr, .. }
+        | Expr::Consume { expr, .. }
+        | Expr::Defer { expr, .. } => apply_handler_replay_safe(expr, event_sourced_fields),
+        Expr::Lambda { body, .. } => apply_handler_replay_safe(body, event_sourced_fields),
+        Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+            apply_handler_replay_safe(value, event_sourced_fields)
+                && apply_handler_replay_safe(body, event_sourced_fields)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            apply_handler_replay_safe(cond, event_sourced_fields)
+                && apply_handler_replay_safe(then_branch, event_sourced_fields)
+                && else_branch.as_ref().map_or(true, |branch| {
+                    apply_handler_replay_safe(branch, event_sourced_fields)
+                })
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            apply_handler_replay_safe(scrutinee, event_sourced_fields)
+                && arms.iter().all(|(_, guard, body)| {
+                    guard.as_ref().map_or(true, |guard| {
+                        apply_handler_replay_safe(guard, event_sourced_fields)
+                    }) && apply_handler_replay_safe(body, event_sourced_fields)
+                })
+        }
+        Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => exprs
+            .iter()
+            .all(|expr| apply_handler_replay_safe(expr, event_sourced_fields)),
+        Expr::Assign { target, value, .. } => {
+            let target_safe = match target.as_ref() {
+                Expr::FieldAccess { expr, field, .. }
+                    if matches!(expr.as_ref(), Expr::SelfRef(_)) =>
+                {
+                    event_sourced_fields.contains(field)
+                }
+                other => apply_handler_replay_safe(other, event_sourced_fields),
+            };
+            target_safe && apply_handler_replay_safe(value, event_sourced_fields)
+        }
+        Expr::Pipe { left, right, .. } => {
+            apply_handler_replay_safe(left, event_sourced_fields)
+                && apply_handler_replay_safe(right, event_sourced_fields)
+        }
+        Expr::For { iterable, body, .. } => {
+            apply_handler_replay_safe(iterable, event_sourced_fields)
+                && apply_handler_replay_safe(body, event_sourced_fields)
+        }
+        Expr::While { cond, body, .. } => {
+            apply_handler_replay_safe(cond, event_sourced_fields)
+                && apply_handler_replay_safe(body, event_sourced_fields)
+        }
+        Expr::Return(value, _) | Expr::Break(value, _) => value
+            .as_ref()
+            .map_or(true, |value| apply_handler_replay_safe(value, event_sourced_fields)),
+        Expr::Recover { body, .. }
+        | Expr::Hide { body, .. }
+        | Expr::Seal { body, .. } => apply_handler_replay_safe(body, event_sourced_fields),
+
+        // Conservative v1 replay subset. Function calls and all actor/effect
+        // surfaces are excluded until their transitive purity/capability
+        // contracts are represented in replay metadata.
+        Expr::App { .. }
+        | Expr::Spawn { .. }
+        | Expr::Send { .. }
+        | Expr::Ask { .. }
+        | Expr::Receive { .. }
+        | Expr::Emit { .. }
+        | Expr::Perform { .. }
+        | Expr::GrainRef { .. }
+        | Expr::Resume { .. }
+        | Expr::Handle { .. }
+        | Expr::Migrate { .. } => false,
+    }
+}
+
 pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
     let mut ctx = ModuleCtx::new(&hir.name);
 
@@ -125,6 +257,19 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 }
             }
 
+            // Current-schema apply handlers are also compiler-private
+            // functions. Live emit behavior remains inlined for compatibility;
+            // these slots exist only for deterministic replay/recovery.
+            for handler in &a.apply_handler_bodies {
+                let name = apply_handler_function_name(&a.name, &handler.event);
+                let idx = ctx.reserve_function(&name);
+                ctx.apply_handler_function_of.push((
+                    a.name.clone(),
+                    handler.event.clone(),
+                    idx,
+                ));
+            }
+
             // State migrations are compiler-private functions, not actor
             // behaviors. They are deliberately absent from func_map and
             // ActorMeta.behavior_indices, so source call/send/ask resolution
@@ -208,12 +353,53 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                     span: a.span,
                 })?;
 
+            let event_sourced_fields: HashSet<String> = a
+                .state_fields
+                .iter()
+                .filter(|(_, model, _, _)| {
+                    matches!(model, crate::ast::StateModel::EventSourced)
+                })
+                .map(|(name, _, _, _)| name.clone())
+                .collect();
+            let apply_handlers = a
+                .apply_handler_bodies
+                .iter()
+                .map(|handler| {
+                    let function_index = ctx
+                        .apply_handler_function_of
+                        .iter()
+                        .find(|(actor_name, event, _)| {
+                            actor_name == &a.name && event == &handler.event
+                        })
+                        .map(|(_, _, idx)| *idx)
+                        .expect("apply handler function slot reserved in pass 1");
+                    let replay_safe = a
+                        .apply_handlers
+                        .iter()
+                        .find(|source| source.event == handler.event)
+                        .map(|source| {
+                            apply_handler_replay_safe(
+                                &source.body,
+                                &event_sourced_fields,
+                            )
+                        })
+                        .unwrap_or(false);
+                    crate::bytecode::ApplyHandlerMeta {
+                        event: handler.event.clone(),
+                        param_count: handler.params.len(),
+                        function_index,
+                        replay_safe,
+                    }
+                })
+                .collect();
+
             ctx.actor_metas.push(crate::bytecode::ActorMeta {
                 name: a.name.clone(),
                 persistent: a.persistent,
                 state_models,
                 state_defaults,
                 behavior_indices,
+                apply_handlers,
                 is_workflow: a.is_workflow,
                 is_agent: a.is_agent,
                 is_organization: a.is_organization,
@@ -316,6 +502,25 @@ fn lower_decl_bodies(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 }
             }
 
+            for handler in &a.apply_handler_bodies {
+                let function_idx = ctx
+                    .apply_handler_function_of
+                    .iter()
+                    .find(|(actor_name, event, _)| {
+                        actor_name == &a.name && event == &handler.event
+                    })
+                    .map(|(_, _, idx)| *idx)
+                    .expect("apply handler function slot reserved in pass 1");
+                let full_name = apply_handler_function_name(&a.name, &handler.event);
+                let func = lower_apply_handler_function(
+                    ctx,
+                    &full_name,
+                    &handler.params,
+                    &handler.body,
+                )?;
+                ctx.fill_function(function_idx, func);
+            }
+
             for migration in &a.migration_state_bodies {
                 let function_idx = ctx
                     .migration_state_function_of
@@ -377,6 +582,8 @@ struct ModuleCtx {
     /// These slots are not inserted into func_map and therefore cannot be
     /// referenced by source-level function calls.
     migration_state_function_of: Vec<(String, u32, u32, usize)>,
+    /// (actor name, event name, private function-table index).
+    apply_handler_function_of: Vec<(String, String, usize)>,
     /// Declared variant constructors: ctor name -> has_payload. Populated in
     /// pass 1 from `Decl::VariantType` so construction sites (`Some(41)`,
     /// `None`) resolve regardless of source order; see `reserve_decl`.
@@ -398,6 +605,7 @@ impl ModuleCtx {
             compensation_of: Vec::new(),
             parallel_branches_of: Vec::new(),
             migration_state_function_of: Vec::new(),
+            apply_handler_function_of: Vec::new(),
             ctor_map: FxHashMap::default(),
             next_lambda: 0,
         }
@@ -582,6 +790,29 @@ fn lower_migration_state_function(
     body: &hir::Body,
 ) -> NuResult<mir::Function> {
     let mut lowerer = FnLowerer::new(ctx, full_name, None);
+    let self_id = lowerer.b.add_local("self", Type::unit());
+    lowerer.b.assign(self_id, mir::RValue::SelfRef);
+    lowerer.bind("self", self_id);
+    lowerer.lower_body_top(body)?;
+    Ok(lowerer.b.build())
+}
+
+/// Lower one current-schema apply projection as a private replay function.
+///
+/// Parameters preserve the source event payload order. `self` resolves
+/// through the runtime callback, so replay can bind this function to an
+/// unpublished actor just like state migration execution does.
+fn lower_apply_handler_function(
+    ctx: &mut ModuleCtx,
+    full_name: &str,
+    params: &[(String, Type)],
+    body: &hir::Body,
+) -> NuResult<mir::Function> {
+    let mut lowerer = FnLowerer::new(ctx, full_name, None);
+    for (name, ty) in params {
+        let id = lowerer.b.add_param(name.clone(), ty.clone());
+        lowerer.bind(name, id);
+    }
     let self_id = lowerer.b.add_local("self", Type::unit());
     lowerer.b.assign(self_id, mir::RValue::SelfRef);
     lowerer.bind("self", self_id);

@@ -305,6 +305,29 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                 })
                 .collect(),
             apply_handlers: apply_handlers.clone(),
+            apply_handler_bodies: apply_handlers
+                .iter()
+                .map(|handler| {
+                    let event_decl = events.iter().find(|event| event.name == handler.event);
+                    hir::ApplyHandlerBody {
+                        event: handler.event.clone(),
+                        params: handler
+                            .params
+                            .iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                let ty = event_decl
+                                    .and_then(|event| event.params.get(index))
+                                    .map(|(_, ty)| lower_runtime_type(ty))
+                                    .unwrap_or_else(Type::unit);
+                                (name.clone(), ty)
+                            })
+                            .collect(),
+                        body: with_fresh_defer_stack(|| lower_body(&handler.body)),
+                        span: handler.span,
+                    }
+                })
+                .collect(),
             version: *version,
             migrations: migrations.clone(),
             migration_state_bodies: migrations
@@ -968,6 +991,7 @@ fn desugar_agent(
         init: Vec::new(),
         events: Vec::new(),
         apply_handlers: Vec::new(),
+        apply_handler_bodies: Vec::new(),
         version: 1,
         migrations: Vec::new(),
         migration_state_bodies: Vec::new(),
@@ -1138,6 +1162,7 @@ fn desugar_workflow(name: &str, items: &[ast::WorkflowItem], span: Span) -> hir:
         init: Vec::new(),
         events: Vec::new(),
         apply_handlers: Vec::new(),
+        apply_handler_bodies: Vec::new(),
         version: 1,
         migrations: Vec::new(),
         migration_state_bodies: Vec::new(),
