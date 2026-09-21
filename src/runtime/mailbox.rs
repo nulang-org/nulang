@@ -66,23 +66,6 @@ impl MessagePayload {
         }
     }
 
-    /// Shared form used by selective receive's existing transactional API.
-    #[inline]
-    fn shared_for_receive(&self) -> Arc<Vec<Value>> {
-        match self {
-            MessagePayload::Inline { .. } => Arc::new(self.as_slice().to_vec()),
-            MessagePayload::Shared(values) => Arc::clone(values),
-        }
-    }
-
-    #[inline]
-    fn into_shared(self) -> Arc<Vec<Value>> {
-        match self {
-            MessagePayload::Inline { len, values } => Arc::new(values[..len as usize].to_vec()),
-            MessagePayload::Shared(values) => values,
-        }
-    }
-
     #[inline]
     pub fn is_inline(&self) -> bool {
         matches!(self, MessagePayload::Inline { .. })
@@ -295,14 +278,14 @@ impl Mailbox {
     fn scan_staged(
         buffer: &mut VecDeque<(Message, bool)>,
         behavior_ids: &[u16],
-    ) -> Option<(usize, usize, Arc<Vec<Value>>)> {
+    ) -> Option<(usize, usize, MessagePayload)> {
         for (idx, (msg, tried)) in buffer.iter_mut().enumerate() {
             if *tried {
                 continue;
             }
             if let Some(pos) = behavior_ids.iter().position(|&id| id == msg.behavior_id) {
                 *tried = true;
-                return Some((pos, idx, msg.payload.shared_for_receive()));
+                return Some((pos, idx, msg.payload.clone()));
             }
         }
         None
@@ -312,7 +295,7 @@ impl Mailbox {
     /// as tried. The message stays logically queued and capacity-accounted
     /// until `commit_receive_match` consumes the candidate whose pattern and
     /// guard actually succeeded.
-    pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, Arc<Vec<Value>>)> {
+    pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, MessagePayload)> {
         // If the VM asks for another candidate before commit, the previous
         // candidate was rejected by its pattern/guard. It remains `tried` for
         // this receive expression but is no longer the commit target.
@@ -404,7 +387,7 @@ impl Mailbox {
     /// Commit exactly the most recently returned candidate and return its
     /// payload so the runtime can establish receiver-side ORCA ownership only
     /// after the pattern+guard succeeds.
-    pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
+    pub fn commit_receive_match(&mut self) -> Option<MessagePayload> {
         let (lane, idx) = self.active_match.take()?;
         let removed = match lane {
             MatchLane::System => self.system_skip_buffer.remove(idx),
@@ -413,7 +396,7 @@ impl Mailbox {
         }?;
         self.release_slot();
         self.clear_tried_flags();
-        Some(removed.0.payload.into_shared())
+        Some(removed.0.payload)
     }
 
     /// Abort a selective-receive scan. No message is consumed and ownership
