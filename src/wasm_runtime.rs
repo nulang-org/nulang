@@ -535,7 +535,7 @@ fn host_div(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error
         }
         Ok(value_layout::float_bits(f64::from_bits(a) / denom) as i64)
     } else {
-        let denom = crate::jit::runtime::as_int_or_one(b);
+        let denom = crate::value_layout::as_int_or_one(b);
         if denom == 0 {
             return Ok(value_layout::TAG_NIL as i64);
         }
@@ -552,7 +552,7 @@ fn host_mod(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error
         }
         Ok(value_layout::float_bits(f64::from_bits(a) % denom) as i64)
     } else {
-        let denom = crate::jit::runtime::as_int_or_one(b);
+        let denom = crate::value_layout::as_int_or_one(b);
         if denom == 0 {
             return Ok(value_layout::TAG_NIL as i64);
         }
@@ -648,9 +648,9 @@ fn host_ffi_call_impl(
     let mut params: Vec<crate::ffi::marshal::CType> = Vec::with_capacity(args.len());
     for i in 0..args.len() {
         let tag = (sig >> (3 + 3 * i as u32)) & 0b111;
-        params.push(crate::jit::runtime::aot_ctype_from_tag(tag));
+        params.push(crate::ffi::marshal::ctype_from_tag(tag));
     }
-    let ret = crate::jit::runtime::aot_ctype_from_tag(ret_tag);
+    let ret = crate::ffi::marshal::ctype_from_tag(ret_tag);
     let signature = crate::ffi::marshal::Signature::new(params.clone(), ret);
     let func = {
         let registry = crate::ffi::native::FFI_REGISTRY
