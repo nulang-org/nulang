@@ -17,6 +17,7 @@ expanding the language kernel.
 - typed `Distance` values with meter/kilometer/mile conversion
 - spherical WGS84 great-circle distance
 - WKT writers for points, line strings, and single-ring polygons
+- dependency-free immutable `RTree[CRS, T]` bulk loading and intersection queries
 - dependency-free implementation using portable Nulang float primitives
 
 ## Usage
@@ -66,6 +67,8 @@ Planned extensions:
 6. GDAL-backed vector/raster I/O
 7. spatial stream and actor-partition helpers
 
+The initial R-tree loader preserves input order and focuses on correctness, CRS safety, and pruning. STR/Hilbert packing and mutable insert/delete operations are follow-on optimizations rather than requirements for the core API.
+
 Those integrations should be split into optional packages/components so the
 core `nulang-geo` package remains dependency-light and portable.
 
@@ -80,4 +83,4 @@ nulang nula test
 The suite covers CRS-tagged point and aggregate construction, bounds and
 envelopes, coordinate validation, unit conversion, planar distance/length/area/
 centroid, WKT output, an equatorial great-circle reference distance, and
-compile-fail regressions for cross-CRS operations and mixed-CRS line strings.
+compile-fail regressions for cross-CRS operations, mixed-CRS line strings, and cross-CRS R-tree queries.
