@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"name=Alice\nmissing=None\nwrongtype=None\nage=30\nactive=true\nnull=null\nnonobject=None\nas_string=ok","stderr":""}
