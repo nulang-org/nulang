@@ -451,6 +451,37 @@ impl LibsqlLogicalActorStore {
         .into())
     }
 
+    fn journal_entry_json(
+        &self,
+        grain_id: &GrainId,
+        sequence: u64,
+    ) -> Result<Option<String>, LibsqlLogicalActorError> {
+        let sequence = i64::try_from(sequence).map_err(|_| {
+            LibsqlLogicalActorError::Storage(
+                "journal sequence exceeds LibSQL signed integer range".to_string(),
+            )
+        })?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT entry FROM logical_actor_journal
+                     WHERE grain_type = ?1 AND grain_key = ?2 AND sequence = ?3",
+                    libsql::params![
+                        grain_id.grain_type.as_str(),
+                        grain_id.key.as_str(),
+                        sequence
+                    ],
+                )
+                .await
+                .map_err(storage_error)?;
+            let Some(row) = rows.next().await.map_err(storage_error)? else {
+                return Ok(None);
+            };
+            row.get(0).map(Some).map_err(storage_error)
+        })
+    }
+
     fn current_snapshot_sequence(
         &self,
         grain_id: &GrainId,
@@ -599,7 +630,8 @@ impl LogicalActorPersistenceStore for LibsqlLogicalActorStore {
                       AND epoch = ?6
                  )
                  ON CONFLICT(grain_type, grain_key, sequence) DO UPDATE SET
-                    entry = excluded.entry",
+                    entry = excluded.entry
+                 WHERE logical_actor_journal.entry = excluded.entry",
                 libsql::params![
                     stamp.grain_id.grain_type.as_str(),
                     stamp.grain_id.key.as_str(),
@@ -617,7 +649,29 @@ impl LogicalActorPersistenceStore for LibsqlLogicalActorStore {
         if changed > 0 {
             return Ok(());
         }
-        Err(self.unauthorized(stamp)?)
+
+        let current = self.ownership_record(&stamp.grain_id)?;
+        let authorized = current.as_ref().is_some_and(|record| {
+            record.node_id == stamp.node_id && record.epoch == stamp.epoch
+        });
+        if !authorized {
+            return Err(self.unauthorized(stamp)?);
+        }
+
+        if let Some(existing) = self.journal_entry_json(&stamp.grain_id, entry.sequence)? {
+            if existing == entry_json {
+                return Ok(());
+            }
+            return Err(LogicalActorCommitError::ConflictingJournalSequence {
+                grain_id: stamp.grain_id.clone(),
+                sequence: entry.sequence,
+            }
+            .into());
+        }
+
+        Err(LibsqlLogicalActorError::Storage(
+            "authorized logical-actor journal write affected no rows".to_string(),
+        ))
     }
 
     fn read_logical_journal(
@@ -819,6 +873,40 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn journal_replay_is_idempotent_but_conflicting_payload_fails_closed() {
+        let mut store = LibsqlLogicalActorStore::in_memory().unwrap();
+        let grain = GrainId::new("Account", "libsql-journal-idempotence");
+        store
+            .grant_ownership(grain.clone(), NodeId(1), handle(1), epoch(1))
+            .unwrap();
+        let stamp = LogicalActorCommitStamp::new(grain.clone(), NodeId(1), epoch(1));
+        let first = JournalEntry {
+            sequence: 1,
+            behavior_id: 0,
+            payload: vec![PersistedValue::Int(1)],
+        };
+
+        store.append_logical_journal(&stamp, first.clone()).unwrap();
+        store.append_logical_journal(&stamp, first).unwrap();
+        assert_eq!(store.read_logical_journal(&grain).unwrap().len(), 1);
+
+        let conflict = JournalEntry {
+            sequence: 1,
+            behavior_id: 1,
+            payload: vec![PersistedValue::Int(2)],
+        };
+        assert!(matches!(
+            store.append_logical_journal(&stamp, conflict),
+            Err(LibsqlLogicalActorError::Commit(
+                LogicalActorCommitError::ConflictingJournalSequence {
+                    sequence: 1,
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]
