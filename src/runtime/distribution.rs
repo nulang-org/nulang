@@ -41,7 +41,7 @@ pub(crate) fn queue_spawn_message(
     _node: NodeId,
     behavior: &str,
     args: &[Value],
-) {
+) -> crate::runtime::MessageAdmission {
     let (payload, string_table) = match distributed::resolve_wire_strings(rt, args) {
         Some(resolved) => resolved,
         None => {
@@ -55,7 +55,7 @@ pub(crate) fn queue_spawn_message(
                 sender,
                 "string payload unresolvable",
             );
-            return;
+            return crate::runtime::MessageAdmission::Rejected;
         }
     };
     let (payload, object_table) = match distributed::resolve_wire_objects(rt, &payload) {
@@ -71,7 +71,7 @@ pub(crate) fn queue_spawn_message(
                 sender,
                 "object ref unresolvable",
             );
-            return;
+            return crate::runtime::MessageAdmission::Rejected;
         }
     };
     let sender = rt.current_actor.unwrap_or(0);
@@ -87,6 +87,7 @@ pub(crate) fn queue_spawn_message(
             sender,
             trace_id,
         });
+    crate::runtime::MessageAdmission::Accepted
 }
 
 /// Record `actor_id → node` in the reverse index (bounded; drops new
