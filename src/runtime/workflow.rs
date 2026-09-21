@@ -500,3 +500,116 @@ pub(crate) fn vm_value_to_string_in_actor(value: &Value, actor: &Actor) -> Optio
         None
     }
 }
+
+
+#[cfg(test)]
+mod query_purity_tests {
+    use super::*;
+    use crate::bytecode::{CodeModule, Instruction, OpCode};
+    use std::collections::HashMap;
+
+    fn query_module() -> CodeModule {
+        let mut module = CodeModule::new("query-purity-test");
+        let field_idx = module.add_string_constant("count");
+
+        // function 0: read_count() -> self.count
+        module.function_table.push(module.current_offset());
+        module.function_local_counts.push(2);
+        module.emit(Instruction::new3(
+            OpCode::StateGet,
+            ((field_idx >> 8) & 0xFF) as u8,
+            (field_idx & 0xFF) as u8,
+            1,
+        ));
+        module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+        // function 1: mutate_count() -> attempts self.count = nil, then reads.
+        // Query callbacks must reject the StateSet before actor state changes.
+        module.function_table.push(module.current_offset());
+        module.function_local_counts.push(2);
+        module.emit(Instruction::new3(
+            OpCode::StateSet,
+            ((field_idx >> 8) & 0xFF) as u8,
+            (field_idx & 0xFF) as u8,
+            0,
+        ));
+        module.emit(Instruction::new3(
+            OpCode::StateGet,
+            ((field_idx >> 8) & 0xFF) as u8,
+            (field_idx & 0xFF) as u8,
+            1,
+        ));
+        module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+        module
+    }
+
+    fn workflow_with_queries() -> (Runtime, u64) {
+        let mut rt = Runtime::new();
+        let mut models = HashMap::new();
+        models.insert("count".to_string(), StateModel::Durable);
+        let actor_id = rt.spawn_workflow_actor(
+            "CounterWorkflow",
+            Box::new(|| vec![("count".to_string(), Value::int(7))]),
+            models,
+        );
+        rt.actors.get_mut(&actor_id).unwrap().bytecode_module = Some(query_module());
+        rt.register_workflow_query(actor_id, "read", Value::int(0));
+        rt.register_workflow_query(actor_id, "mutate", Value::int(1));
+        (rt, actor_id)
+    }
+
+    #[test]
+    fn query_handler_reads_state_and_reports_dependencies() {
+        let (mut rt, actor_id) = workflow_with_queries();
+
+        let (value, reads) = rt
+            .query_workflow_with_dependencies_checked(actor_id, "read")
+            .expect("read-only query should succeed");
+
+        assert_eq!(value.as_int(), Some(7));
+        assert_eq!(reads.len(), 1);
+        assert!(reads.revision(actor_id, "count").is_some());
+        assert!(rt.state_read_set_is_current(&reads));
+    }
+
+    #[test]
+    fn query_handler_state_write_is_rejected_without_mutating_actor() {
+        let (mut rt, actor_id) = workflow_with_queries();
+
+        let error = rt
+            .query_workflow_checked(actor_id, "mutate")
+            .expect_err("query state mutation must fail closed");
+
+        assert_eq!(
+            error,
+            WorkflowQueryError::PurityViolation {
+                operation: "State.set(count)".to_string(),
+            }
+        );
+        assert_eq!(
+            rt.actors
+                .get(&actor_id)
+                .and_then(|actor| actor.get_state_field("count"))
+                .and_then(|value| value.as_int()),
+            Some(7)
+        );
+
+        // Compatibility API preserves its historic failure-as-None shape.
+        assert_eq!(rt.query_workflow(actor_id, "mutate"), None);
+    }
+
+    #[test]
+    fn checked_query_distinguishes_missing_handler_from_nil_result() {
+        let (mut rt, actor_id) = workflow_with_queries();
+
+        assert_eq!(
+            rt.query_workflow_checked(actor_id, "missing"),
+            Err(WorkflowQueryError::HandlerNotFound {
+                actor_id,
+                name: "missing".to_string(),
+            })
+        );
+        assert_eq!(rt.query_workflow(actor_id, "missing"), None);
+    }
+}
