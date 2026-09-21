@@ -50,13 +50,17 @@ two major versions.*
   Adds CRS-tagged `Point[CRS]` and `BoundingBox[CRS]` records with WGS84,
   Web Mercator, and local Cartesian marker types; WGS84 coordinate validation
   and longitude normalization; bounding-box containment/intersection; planar
-  Euclidean distance; canonical meter-based `Distance` values; and spherical
-  WGS84 great-circle distance. The implementation is pure user-space Nulang,
+  Euclidean distance; canonical meter-based `Distance` values; spherical
+  WGS84 great-circle distance; CRS-tagged `LineString[CRS]` and single-ring
+  `Polygon[CRS]`; envelopes; planar line length/perimeter/area/centroid; and
+  WKT writers for points, line strings, and polygons. The implementation is
+  pure user-space Nulang,
   preserving the Core Admission Rule rather than adding GIS-specific syntax or
   runtime concepts.
 - **First-party package regression coverage** (Experimental, CI). The Nula
-  package job now runs `packages/nulang-geo`'s test suite so library/compiler
-  compatibility is continuously checked.
+  package job now runs `packages/nulang-geo`'s test suite and compile-fail
+  CRS fixtures so library/compiler compatibility and aggregate CRS safety are
+  continuously checked.
 
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
