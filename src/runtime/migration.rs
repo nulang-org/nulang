@@ -49,6 +49,7 @@ impl ViolationFlag {
 struct MigrationActorCallbacks {
     actor: *mut Actor,
     violation: ViolationFlag,
+    allowed_state_fields: Option<std::collections::HashSet<String>>,
 }
 
 impl std::fmt::Debug for MigrationActorCallbacks {
@@ -58,11 +59,23 @@ impl std::fmt::Debug for MigrationActorCallbacks {
 }
 
 impl MigrationActorCallbacks {
-    fn new(actor: &mut Actor, violation: ViolationFlag) -> Self {
+    fn new(
+        actor: &mut Actor,
+        violation: ViolationFlag,
+        allowed_state_fields: Option<std::collections::HashSet<String>>,
+    ) -> Self {
         Self {
             actor: actor as *mut Actor,
             violation,
+            allowed_state_fields,
         }
+    }
+
+    fn state_field_allowed(&self, field: &str) -> bool {
+        self.allowed_state_fields
+            .as_ref()
+            .map(|fields| fields.contains(field))
+            .unwrap_or(true)
     }
 }
 
@@ -123,6 +136,12 @@ impl ActorVmCallbacks for MigrationActorCallbacks {
     }
 
     fn get_state_field(&self, field: &str) -> Value {
+        if !self.state_field_allowed(field) {
+            self.violation.record(format!(
+                "isolated execution attempted to read forbidden state field '{field}'"
+            ));
+            return Value::nil();
+        }
         unsafe {
             (*self.actor)
                 .get_state_field(field)
@@ -131,6 +150,12 @@ impl ActorVmCallbacks for MigrationActorCallbacks {
     }
 
     fn set_state_field(&mut self, field: &str, value: Value) {
+        if !self.state_field_allowed(field) {
+            self.violation.record(format!(
+                "isolated execution attempted to write forbidden state field '{field}'"
+            ));
+            return;
+        }
         unsafe {
             if (*self.actor)
                 .state_models
@@ -404,7 +429,11 @@ pub(crate) fn validated_manifest(
     Ok(Some(manifest))
 }
 
-fn persist_migrated_value(actor: &Actor, field: &str, value: &Value) -> Result<PersistedValue, String> {
+pub(crate) fn persist_isolated_value(
+    actor: &Actor,
+    field: &str,
+    value: &Value,
+) -> Result<PersistedValue, String> {
     if let Some(ptr) = value.as_ptr() {
         if ptr.is_null() {
             return Ok(PersistedValue::String(String::new()));
@@ -412,7 +441,7 @@ fn persist_migrated_value(actor: &Actor, field: &str, value: &Value) -> Result<P
         let header = unsafe { &*ActorHeap::header_of(ptr) };
         if header.type_tag != TypeTag::String {
             return Err(format!(
-                "migration produced unsupported heap-backed durable value for field '{}': {:?}",
+                "isolated execution produced unsupported heap-backed durable value for field '{}': {:?}",
                 field, header.type_tag
             ));
         }
@@ -421,7 +450,7 @@ fn persist_migrated_value(actor: &Actor, field: &str, value: &Value) -> Result<P
                 .to_str()
                 .map_err(|error| {
                     format!(
-                        "migration produced non-UTF-8 durable string for field '{}': {error}",
+                        "isolated execution produced non-UTF-8 durable string for field '{}': {error}",
                         field
                     )
                 })?
@@ -433,11 +462,50 @@ fn persist_migrated_value(actor: &Actor, field: &str, value: &Value) -> Result<P
     let persisted = PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref());
     if matches!(persisted, PersistedValue::Nil) && !value.is_nil() {
         return Err(format!(
-            "migration produced unsupported durable value for field '{}'",
+            "isolated execution produced unsupported durable value for field '{}'",
             field
         ));
     }
     Ok(persisted)
+}
+
+/// Execute one compiler-private function against an unpublished actor.
+///
+/// `allowed_state_fields` installs a runtime capability fence around actor
+/// state access. `None` permits ordinary migration state access (CRDT raw
+/// writes are still denied); replay passes an explicit event-sourced set.
+pub(crate) fn run_isolated_actor_function(
+    module: &CodeModule,
+    actor: &mut Actor,
+    function_idx: usize,
+    args: &[Value],
+    allowed_state_fields: Option<std::collections::HashSet<String>>,
+    context: &str,
+) -> Result<Value, String> {
+    let offset = *module.function_table.get(function_idx).ok_or_else(|| {
+        format!("{context} references missing function index {function_idx}")
+    })?;
+    let violation = ViolationFlag::default();
+    let mut vm = VM::new();
+    vm.load_module(module.clone());
+    vm.set_actor_callbacks(Box::new(MigrationActorCallbacks::new(
+        actor,
+        violation.clone(),
+        allowed_state_fields,
+    )));
+    vm.set_distributed_callbacks(Box::new(MigrationDistributedCallbacks {
+        violation: violation.clone(),
+    }));
+
+    let result = vm.call_function(0, offset, args).map_err(|error| {
+        format!("{context} failed: {error}")
+    })?;
+    if let Some(reason) = violation.take() {
+        return Err(format!(
+            "{context} violated the isolated execution boundary: {reason}"
+        ));
+    }
+    Ok(result)
 }
 
 /// Execute a state-only migration chain against an unpublished actor and
@@ -593,6 +661,7 @@ pub(crate) fn migrate_snapshot_state(
     vm.set_actor_callbacks(Box::new(MigrationActorCallbacks::new(
         &mut actor,
         violation.clone(),
+        None,
     )));
     vm.set_distributed_callbacks(Box::new(MigrationDistributedCallbacks {
         violation: violation.clone(),
@@ -644,7 +713,7 @@ pub(crate) fn migrate_snapshot_state(
         })?;
         state.insert(
             name.clone(),
-            persist_migrated_value(&actor, name, &value)?,
+            persist_isolated_value(&actor, name, &value)?,
         );
     }
 
