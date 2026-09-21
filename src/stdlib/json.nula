@@ -13,7 +13,10 @@ pub type JsonValue =
     | JsonArray([JsonValue])
     | JsonObject([(String, JsonValue)])
 
-/// Parse a JSON string into a JsonValue.
+/// Parse a JSON string into a JsonValue using the legacy lenient contract.
+///
+/// New code that needs validation should use `parse_strict`, which returns a
+/// typed `Result` and requires the complete input to be valid JSON.
 ///
 /// Pure-Nulang recursive-descent parser. Handles all JSON value types:
 /// null, true, false, numbers (int/float/scientific), strings (with
