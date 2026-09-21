@@ -303,7 +303,7 @@ pub(crate) fn signal_workflow(
 /// Register a read-only query handler on a workflow actor.
 pub(crate) fn register_workflow_query(rt: &mut Runtime, actor_id: u64, name: &str, handler: Value) {
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        if matches!(actor.role(), Ok(ActorRole::Workflow)) {
+        if actor.semantics().map(|s| s.is_workflow()).unwrap_or(false) {
             actor.query_handlers.insert(name.to_string(), handler);
         }
     }
@@ -313,7 +313,7 @@ pub(crate) fn register_workflow_query(rt: &mut Runtime, actor_id: u64, name: &st
 pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Option<Value> {
     let (handler, module) = {
         let actor = rt.actors.get(&actor_id)?;
-        if !matches!(actor.role(), Ok(ActorRole::Workflow)) {
+        if !actor.semantics().map(|s| s.is_workflow()).unwrap_or(false) {
             return None;
         }
         let handler = *actor.query_handlers.get(name)?;
