@@ -1557,6 +1557,10 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### GC-traced ArrayBuilder primitive — 2026-09-21
+- **Generic array construction now has an ownership-safe amortized-growth primitive.** Experimental `ArrayBuilder.new/push/len/to_array/reset` uses a dedicated GC-traced heap tag with separate logical length and capacity, retains pointer-bearing elements exactly once per initialized slot, and materializes a canonical `Array` in O(n). Live builders fail closed at durable continuation boundaries instead of changing the frozen persistence format; callers must materialize them before suspension. The primitive is landed separately from stdlib migration so generic collection behavior can be benchmarked and reviewed before replacing `Array.push` loops.
+
+
 ### Standard-library Option lookup contracts — 2026-09-21
 - **Collection absence is explicit.** Experimental `stdlib::map.get`, `stdlib::list.index_of`, and `stdlib::list.find` now return `Option` instead of sentinel `-1` values. `max_of`, `min_of`, `min_by`, and `max_by` now return `None` for empty inputs. Conformance fixtures and stdlib tests pin the new contracts. This is source-breaking for Experimental stdlib callers that compared missing results with integer sentinels.
 
