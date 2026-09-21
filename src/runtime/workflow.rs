@@ -162,6 +162,8 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 let current_val = actor.get_state_field(name).unwrap_or(Value::nil());
                 let entry = EventEntry {
                     sequence: seq,
+                    schema_owner: actor.schema_owner.clone(),
+                    schema_version: actor.schema_version,
                     field_name: name.clone(),
                     event_name: event.to_string(),
                     args: persisted_args.clone(),
