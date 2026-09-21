@@ -24,6 +24,13 @@ pub struct StateVersion {
     pub revision: u64,
 }
 
+/// Conservative version for an actor whose pointer-backed state was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorTurnVersion {
+    pub incarnation: u64,
+    pub turn_revision: u64,
+}
+
 /// The state fields observed while evaluating one query.
 ///
 /// Dependencies are grouped by actor id and field name; each value is the
@@ -35,6 +42,7 @@ pub struct StateVersion {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateReadSet {
     dependencies: BTreeMap<u64, BTreeMap<String, StateVersion>>,
+    pointer_actor_turns: BTreeMap<u64, ActorTurnVersion>,
 }
 
 impl StateReadSet {
@@ -69,6 +77,20 @@ impl StateReadSet {
         })
     }
 
+    /// Actor-turn dependency recorded when a query observed pointer-backed
+    /// state on `actor_id`.
+    pub fn pointer_turn_version(&self, actor_id: u64) -> Option<ActorTurnVersion> {
+        self.pointer_actor_turns.get(&actor_id).copied()
+    }
+
+    pub fn pointer_turn_iter(
+        &self,
+    ) -> impl Iterator<Item = (u64, ActorTurnVersion)> + '_ {
+        self.pointer_actor_turns
+            .iter()
+            .map(|(actor_id, version)| (*actor_id, *version))
+    }
+
     /// True when a changed field version invalidates this read set.
     ///
     /// Writes to fields that were not read do not invalidate the query.
@@ -87,15 +109,22 @@ impl StateReadSet {
     ///
     /// Missing actors/fields are stale: disappearance is itself a dependency
     /// change and must not leave a cached query result looking current.
-    pub fn is_current_with<F>(&self, mut version_for: F) -> bool
+    pub fn is_current_with<F, T>(&self, mut version_for: F, mut turn_for: T) -> bool
     where
         F: FnMut(u64, &str) -> Option<StateVersion>,
+        T: FnMut(u64) -> Option<ActorTurnVersion>,
     {
-        self.iter().all(|(actor_id, field, observed)| {
+        let fields_current = self.iter().all(|(actor_id, field, observed)| {
             version_for(actor_id, field)
                 .map(|current| current == observed)
                 .unwrap_or(false)
-        })
+        });
+        fields_current
+            && self.pointer_turn_iter().all(|(actor_id, observed)| {
+                turn_for(actor_id)
+                    .map(|current| current == observed)
+                    .unwrap_or(false)
+            })
     }
 
     pub(crate) fn record(&mut self, actor_id: u64, field: &str, version: StateVersion) {
@@ -104,6 +133,14 @@ impl StateReadSet {
             .or_default()
             .entry(field.to_string())
             .or_insert(version);
+    }
+
+    pub(crate) fn record_pointer_turn(
+        &mut self,
+        actor_id: u64,
+        version: ActorTurnVersion,
+    ) {
+        self.pointer_actor_turns.entry(actor_id).or_insert(version);
     }
 }
 
@@ -140,6 +177,17 @@ impl ReactiveReadTracker {
         debug_assert!(self.is_active());
         for scope in self.scopes.borrow_mut().iter_mut() {
             scope.record(actor_id, field, version);
+        }
+    }
+
+    pub(crate) fn record_pointer_turn(
+        &self,
+        actor_id: u64,
+        version: ActorTurnVersion,
+    ) {
+        debug_assert!(self.is_active());
+        for scope in self.scopes.borrow_mut().iter_mut() {
+            scope.record_pointer_turn(actor_id, version);
         }
     }
 
@@ -283,6 +331,31 @@ mod tests {
     }
 
     #[test]
+    fn pointer_turn_dependency_invalidates_on_later_actor_turn() {
+        let mut reads = StateReadSet::default();
+        let turn = ActorTurnVersion {
+            incarnation: 11,
+            turn_revision: 4,
+        };
+        reads.record_pointer_turn(7, turn);
+
+        assert_eq!(reads.pointer_turn_version(7), Some(turn));
+        assert!(reads.is_current_with(
+            |_, _| None,
+            |actor_id| (actor_id == 7).then_some(turn),
+        ));
+        assert!(!reads.is_current_with(
+            |_, _| None,
+            |actor_id| {
+                (actor_id == 7).then_some(ActorTurnVersion {
+                    incarnation: 11,
+                    turn_revision: 5,
+                })
+            },
+        ));
+    }
+
+    #[test]
     fn invalidation_is_field_precise() {
         let mut reads = StateReadSet::default();
         let observed = StateVersion {
@@ -317,9 +390,10 @@ mod tests {
             },
         ));
 
-        assert!(reads.is_current_with(|actor_id, field| {
-            (actor_id == 9 && field == "title").then_some(observed)
-        }));
-        assert!(!reads.is_current_with(|_, _| None));
+        assert!(reads.is_current_with(
+            |actor_id, field| (actor_id == 9 && field == "title").then_some(observed),
+            |_| None,
+        ));
+        assert!(!reads.is_current_with(|_, _| None, |_| None));
     }
 }
