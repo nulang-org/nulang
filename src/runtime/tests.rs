@@ -2114,6 +2114,61 @@ fn test_compiler_marks_apply_handler_non_replayable_when_it_touches_durable_stat
 }
 
 #[test]
+fn test_recover_actor_executes_current_schema_apply_replay_instead_of_stored_value() {
+    let module = compile_state_migration_module(
+        r#"
+        entity Counter {
+            state event_sourced count: Int = 0
+            events
+                | Incremented(by: Int)
+            apply
+                | Incremented(by) => { self.count = self.count + by }
+
+            behavior inc(by: Int) {
+                emit Incremented(by)
+            }
+        }
+        "#,
+    );
+    let actor_id = 919_020;
+    let snapshot = ActorSnapshot {
+        actor_id,
+        sequence: 1,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+
+    let mut rt = Runtime::new();
+    rt.persistence.save_snapshot(snapshot).unwrap();
+    rt.persistence
+        .append_event(
+            actor_id,
+            EventEntry {
+                sequence: 1,
+                schema_owner: Some("Counter".to_string()),
+                schema_version: 1,
+                field_name: "count".to_string(),
+                event_name: "Incremented".to_string(),
+                args: vec![PersistedValue::Int(3)],
+                // Deliberately wrong: executable replay must ignore this.
+                value: PersistedValue::Int(999),
+            },
+        )
+        .unwrap();
+    rt.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    let actor = rt.actors.get(&actor_id).expect("recovered actor");
+    assert_eq!(
+        actor.get_state_field("count").and_then(|value| value.as_int()),
+        Some(4),
+        "current live semantics are apply(+3) followed by the runtime's per-emit +1"
+    );
+    assert_eq!(actor.event_sourced_sequences.get("count"), Some(&1));
+}
+
+#[test]
 fn test_recover_actor_executes_and_commits_state_migration_before_publication() {
     let module = compile_state_migration_module(
         r#"
