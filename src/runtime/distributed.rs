@@ -598,7 +598,7 @@ impl AddressResolver {
 
                 let msg = Message {
                     behavior_id: 0, // resolved from behavior_name at delivery
-                    payload: Arc::from(payload),
+                    payload: Arc::new(payload),
                     sender: sender_actor,
                     priority,
                     trace_id,
@@ -1343,7 +1343,7 @@ pub fn process_network_packets(
                                     };
                                     msg.behavior_id = behavior_id;
                                     // Intern string and object payloads, then deliver
-                                    let mut payload_vec = msg.payload.as_ref().to_vec();
+                                    let mut payload_vec = (*msg.payload).clone();
                                     if !intern_wire_strings(
                                         runtime,
                                         target_actor,
@@ -2263,7 +2263,7 @@ pub fn process_network_packets(
                     // dangling pool ids.
                     // Clone the Arc payload into a mutable Vec, intern the
                     // strings, then wrap the result back into a fresh Arc.
-                    let mut payload_vec = msg.payload.as_ref().to_vec();
+                    let mut payload_vec = (*msg.payload).clone();
                     if !intern_wire_strings(runtime, target_actor, &mut payload_vec, &string_table)
                     {
                         warn!(
