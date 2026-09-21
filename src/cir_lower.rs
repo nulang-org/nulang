@@ -295,7 +295,9 @@ fn translate_rvalue(op: &RValue, _func: &mir::Function, pc: u32) -> CirExpr {
             idx: Box::new(CirExpr::Var(var(idx, pc))),
         },
         RValue::StateGet { .. } => CirExpr::ConstNil, // host-managed, MVP stub
-        // Unsupported in the WasmFX MVP (mir_wasm falls through to nil too):
+        // Unsupported in the WasmFX MVP. Public WasmFX/plain-WASM compile
+        // boundaries reject these forms before CIR/emission; ConstNil remains
+        // defensive only and must not become observable language behavior.
         RValue::Perform { .. }
         | RValue::PerformAsync { .. }
         | RValue::SignalWait { .. }
