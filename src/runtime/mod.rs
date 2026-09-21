@@ -805,7 +805,7 @@ impl Runtime {
         } else {
             fresh_actor_id()
         };
-        spawn::spawn_actor_with_id(self, id, init, HashMap::new(), false, None)
+        spawn::spawn_actor_with_id(self, id, init, HashMap::new(), false, None, None)
     }
 
     pub fn spawn_persistent_actor(
