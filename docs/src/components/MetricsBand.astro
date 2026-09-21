@@ -1,40 +1,138 @@
 ---
-interface Metric {
-  value: string;
-  label: string;
-  detail?: string;
-  href?: string;
-}
-
-const metrics: Metric[] = [
-  { value: 'Alpha', label: 'Implementation status', detail: 'Frozen core · evolving runtime', href: 'https://github.com/nulang-org/nulang#project-status--stability' },
-  { value: '4', label: 'Execution modes', detail: 'Bytecode · JIT · Native AOT · WASM' },
-  { value: 'Per-actor', label: 'Garbage collection', detail: 'No global stop-the-world collector' },
-  { value: 'Apache 2.0', label: 'Open source', detail: 'Contribute on GitHub', href: 'https://github.com/nulang-org/nulang' },
+const items = [
+  {
+    label: 'Project',
+    value: 'Alpha',
+    detail: 'Expect breaking changes before v1.0',
+    tone: 'alpha',
+    href: 'https://github.com/nulang-org/nulang#project-status--stability',
+  },
+  {
+    label: 'Stable surfaces',
+    value: 'Types · effects · actors',
+    detail: 'RFC + deprecation cycle for breaking changes',
+    tone: 'stable',
+    href: 'https://github.com/nulang-org/nulang/blob/main/GOVERNANCE.md',
+  },
+  {
+    label: 'Experimental',
+    value: 'Distribution · AI · WASM · AOT',
+    detail: 'Opt in and validate for your workload',
+    tone: 'experimental',
+    href: 'https://github.com/nulang-org/nulang#project-status--stability',
+  },
+  {
+    label: 'License',
+    value: 'Apache 2.0',
+    detail: 'Open source and self-hostable',
+    tone: 'neutral',
+    href: 'https://github.com/nulang-org/nulang/blob/main/LICENSE',
+  },
 ];
 ---
 
-<section class="metrics-band" aria-label="Project metrics">
-  <div class="metrics-band-inner">
-    {metrics.map((metric) => (
-      <div class="metric">
-        {metric.href ? (
-          <a href={metric.href} target="_blank" rel="noopener noreferrer" class="metric-link">
-            <div class="metric-value">{metric.value}</div>
-            <div class="metric-label">{metric.label}</div>
-            {metric.detail && <div class="metric-detail">{metric.detail}</div>}
-          </a>
-        ) : (
-          <>
-            <div class="metric-value">{metric.value}</div>
-            <div class="metric-label">{metric.label}</div>
-            {metric.detail && <div class="metric-detail">{metric.detail}</div>}
-          </>
-        )}
-      </div>
+<section class="maturity-strip" aria-label="Nulang project maturity">
+  <div class="maturity-strip-inner">
+    {items.map((item) => (
+      <a class:list={['maturity-item', item.tone]} href={item.href} target="_blank" rel="noopener noreferrer">
+        <span class="maturity-label">{item.label}</span>
+        <strong>{item.value}</strong>
+        <span class="maturity-detail">{item.detail}</span>
+      </a>
     ))}
   </div>
-  <div class="metrics-demo">
-    <slot />
-  </div>
 </section>
+
+<style>
+  .maturity-strip {
+    border-top: 1px solid var(--nu-border);
+    border-bottom: 1px solid var(--nu-border);
+    background: color-mix(in srgb, var(--nu-surface) 88%, transparent);
+  }
+
+  .maturity-strip-inner {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    width: min(100% - 2rem, 72rem);
+    margin-inline: auto;
+  }
+
+  .maturity-item {
+    min-width: 0;
+    padding: 1.15rem 1.25rem;
+    color: var(--nu-text);
+    text-decoration: none;
+  }
+
+  .maturity-item + .maturity-item {
+    border-left: 1px solid var(--nu-border);
+  }
+
+  .maturity-item:hover {
+    background: color-mix(in srgb, var(--nu-blue) 4%, transparent);
+    text-decoration: none;
+  }
+
+  .maturity-label,
+  .maturity-detail {
+    display: block;
+  }
+
+  .maturity-label {
+    color: var(--nu-text-tertiary);
+    font-size: 0.65rem;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .maturity-item strong {
+    display: block;
+    margin-top: 0.25rem;
+    color: var(--nu-text);
+    font-size: 0.9rem;
+    line-height: 1.35;
+  }
+
+  .maturity-detail {
+    margin-top: 0.2rem;
+    color: var(--nu-text-secondary);
+    font-size: 0.7rem;
+    line-height: 1.45;
+  }
+
+  .maturity-item.stable strong {
+    color: var(--nu-blue);
+  }
+
+  .maturity-item.alpha strong,
+  .maturity-item.experimental strong {
+    color: var(--nu-accent-high);
+  }
+
+  @media (max-width: 58rem) {
+    .maturity-strip-inner {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .maturity-item:nth-child(3) {
+      border-left: 0;
+      border-top: 1px solid var(--nu-border);
+    }
+
+    .maturity-item:nth-child(4) {
+      border-top: 1px solid var(--nu-border);
+    }
+  }
+
+  @media (max-width: 34rem) {
+    .maturity-strip-inner {
+      grid-template-columns: 1fr;
+    }
+
+    .maturity-item + .maturity-item {
+      border-left: 0;
+      border-top: 1px solid var(--nu-border);
+    }
+  }
+</style>
