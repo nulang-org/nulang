@@ -134,7 +134,10 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then BIN=nulang.exe; else BIN=nulang; fi
           cp target/${{ matrix.target }}/release/$BIN dist/${{ matrix.artifact }}
           tar czf dist/${{ matrix.artifact }}.tar.gz -C dist ${{ matrix.artifact }}
-          sha256sum dist/${{ matrix.artifact }}.tar.gz > dist/${{ matrix.artifact }}.tar.gz.sha256
+          (
+            cd dist
+            sha256sum "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+          )
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
