@@ -5172,18 +5172,17 @@ impl Runtime {
             .recovery_modules
             .get(&actor_id)
             .and_then(|(module, _, _)| module.artifact_id);
-        let verified_execution_artifact_id =
-            match Self::verify_snapshot_execution_artifact_identity(
-                actor_id,
-                &snapshot,
-                recovery_execution_artifact_id,
-            ) {
-                Ok(id) => id,
-                Err(error) => {
-                    warn!("nulang-recover: refusing {error}");
-                    return None;
-                }
-            };
+        let verified_execution_artifact_id = match Self::verify_snapshot_execution_artifact_identity(
+            actor_id,
+            &snapshot,
+            recovery_execution_artifact_id,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                warn!("nulang-recover: refusing {error}");
+                return None;
+            }
+        };
         if snapshot.artifact_id.is_none() && recovery_execution_artifact_id.is_some() {
             warn!(
                 "nulang-recover: actor {} uses legacy snapshot without verified executable provenance",
