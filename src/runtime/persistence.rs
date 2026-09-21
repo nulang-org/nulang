@@ -1519,6 +1519,61 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn append_events(&mut self, actor_id: u64, entries: &[EventEntry]) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn();
+        self.rt.block_on(async {
+            conn.execute("BEGIN IMMEDIATE", ())
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            let result: io::Result<()> = async {
+                for entry in entries {
+                    let args_json = serde_json::to_string(&entry.args)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    let value_json = serde_json::to_string(&entry.value)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    conn.execute(
+                        "INSERT INTO events_v2
+                            (actor_id, sequence, ordinal, field_name, event_name, args, value)
+                         SELECT ?1, ?2, COALESCE(MAX(ordinal) + 1, 0), ?3, ?4, ?5, ?6
+                         FROM events_v2 WHERE actor_id = ?1 AND sequence = ?2
+                         ON CONFLICT(actor_id, sequence, field_name) DO UPDATE SET
+                            event_name = excluded.event_name,
+                            args = excluded.args,
+                            value = excluded.value",
+                        libsql::params![
+                            actor_id as i64,
+                            entry.sequence as i64,
+                            entry.field_name.as_str(),
+                            entry.event_name.as_str(),
+                            args_json,
+                            value_json
+                        ],
+                    )
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                }
+                Ok(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string())),
+                Err(err) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    Err(err)
+                }
+            }
+        })
+    }
+
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -2486,6 +2541,43 @@ impl PersistenceStore for PostgresStore {
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(())
+    }
+
+    fn append_events(&mut self, actor_id: u64, entries: &[EventEntry]) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let mut tx = conn
+            .transaction()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        for entry in entries {
+            let args_json = serde_json::to_string(&entry.args)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let value_json = serde_json::to_string(&entry.value)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            tx.execute(
+                "INSERT INTO events_v2
+                    (actor_id, sequence, ordinal, field_name, event_name, args, value)
+                 SELECT $1, $2, COALESCE(MAX(ordinal) + 1, 0), $3, $4, $5, $6
+                 FROM events_v2 WHERE actor_id = $1 AND sequence = $2
+                 ON CONFLICT (actor_id, sequence, field_name) DO UPDATE SET
+                    event_name = EXCLUDED.event_name,
+                    args = EXCLUDED.args,
+                    value = EXCLUDED.value",
+                &[
+                    &(actor_id as i64),
+                    &(entry.sequence as i64),
+                    &entry.field_name,
+                    &entry.event_name,
+                    &args_json,
+                    &value_json,
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
