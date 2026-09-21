@@ -658,6 +658,7 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             value,
             body,
             mutable,
+            let_in,
             ..
         } => {
             if *mutable {
@@ -670,8 +671,33 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             }
             out.push_str(" = ");
             fmt_expr(out, value, indent, had_unhandled);
-            out.push_str(" in\n");
-            fmt_expr(out, body, indent, had_unhandled);
+
+            if *let_in {
+                // Preserve explicitly expression-scoped `let ... in ...`.
+                out.push_str(" in\n");
+                fmt_expr(out, body, indent, had_unhandled);
+            } else {
+                // Statement bindings are represented as nested Let nodes by the
+                // parser. Flatten the synthetic body back into straightforward
+                // sequential source instead of introducing `in { ... }`.
+                let empty_body = matches!(
+                    body.as_ref(),
+                    Expr::Block { exprs, span }
+                        if exprs.is_empty() && span.start == 0 && span.end == 0
+                );
+                if !empty_body {
+                    out.push('\n');
+                    match body.as_ref() {
+                        Expr::Block { .. } => {
+                            fmt_block_body(out, body, indent, had_unhandled);
+                        }
+                        other => {
+                            out.push_str(&sp);
+                            fmt_expr(out, other, indent, had_unhandled);
+                        }
+                    }
+                }
+            }
         }
         Expr::If {
             cond,
@@ -1440,6 +1466,22 @@ fn main() {
         let out = format_source(src).expect("mutable binding formats");
         assert!(out.contains("var count: Int = 0"), "got: {out}");
         assert!(!out.contains("let count: Int = 0"), "mutability lost: {out}");
+        assert!(
+            out.contains("var count: Int = 0\n    count = count + 1"),
+            "statement-form var should stay sequential: {out}"
+        );
+        assert!(!out.contains("var count: Int = 0 in"), "synthetic in leaked: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_explicit_let_in_remains_expression_scoped() {
+        let src = r#"
+fn main() {
+    let x = 1 in x + 1
+}"#;
+        let out = format_source(src).expect("let-in formats");
+        assert!(out.contains("let x = 1 in"), "explicit let-in lost: {out}");
         assert_idempotent(src);
     }
 
