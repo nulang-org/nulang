@@ -153,11 +153,12 @@ fn recovery_rejects_journal_behavior_owned_by_other_schema() {
         }
         "#,
     );
-    let first = module
+    let first_behavior = module
         .actor_metadata
         .iter()
         .find(|meta| meta.name == "First")
-        .expect("First metadata");
+        .expect("First metadata")
+        .behavior_indices[0];
     let actor_id = 7006;
     let mut rt = Runtime::new();
     register_for_recovery(&mut rt, actor_id, module);
@@ -174,7 +175,7 @@ fn recovery_rejects_journal_behavior_owned_by_other_schema() {
             actor_id,
             JournalEntry {
                 sequence: 1,
-                behavior_id: u16::try_from(first.behavior_indices[0]).expect("behavior id"),
+                behavior_id: u16::try_from(first_behavior).expect("behavior id"),
                 payload: vec![],
             },
         )
