@@ -3847,12 +3847,46 @@ mod tests {
     }
 
     #[test]
+    fn test_packet_migrate_actor_provenance_roundtrip() {
+        let packet = Packet::MigrateActor {
+            actor_id: 42,
+            nbc_bytes: vec![1, 2, 3],
+            snapshot_json: br#"{"actor_id":42}"#.to_vec(),
+            artifact_provenance: Some(RuntimeArtifactProvenance {
+                nbc_blake3: [0xCD; 32],
+                runtime_manifest_json: br#"{"version":1}"#.to_vec(),
+            }),
+        };
+        let bytes = packet.to_bytes(76);
+        let (seq, decoded) = Packet::from_bytes(&bytes).expect("migrate provenance roundtrip");
+        assert_eq!(seq, 76);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_migrate_actor_legacy_without_provenance_roundtrip() {
+        let packet = Packet::MigrateActor {
+            actor_id: 43,
+            nbc_bytes: vec![4, 5, 6],
+            snapshot_json: br#"{"actor_id":43}"#.to_vec(),
+            artifact_provenance: None,
+        };
+        let bytes = packet.to_bytes(75);
+        let (_, decoded) = Packet::from_bytes(&bytes).expect("legacy migrate roundtrip");
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
     fn test_packet_shadow_replicate_roundtrip() {
         let packet = Packet::ShadowReplicate {
             actor_id: 0x1111_2222_3333_4444,
             nbc_bytes: vec![0x4E, 0x55, 0x4C, 0x30, 1, 2, 3, 4],
             snapshot_json: br#"{"actor_id":7}"#.to_vec(),
             epoch: 5,
+            artifact_provenance: Some(RuntimeArtifactProvenance {
+                nbc_blake3: [0xAB; 32],
+                runtime_manifest_json: br#"{"version":1}"#.to_vec(),
+            }),
         };
         let bytes = packet.to_bytes(77);
         let (seq, decoded) = Packet::from_bytes(&bytes).expect("shadow replicate roundtrip");
@@ -3867,6 +3901,7 @@ mod tests {
             nbc_bytes: vec![1, 2, 3, 4, 5],
             snapshot_json: vec![9, 9, 9],
             epoch: 1,
+            artifact_provenance: None,
         };
         let bytes = packet.to_bytes(1);
         let truncated = &bytes[..bytes.len() - 4];
