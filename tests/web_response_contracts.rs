@@ -165,8 +165,9 @@ fn openapi_uses_semantic_response_media() {
         "Response API",
         "1.0.0",
     );
+    let html_success = &html["paths"]["/value"]["get"]["responses"]["200"];
     assert_eq!(
-        html["paths"]["/value"]["get"]["responses"]["200"]["content"]["text/html"]["schema"]["type"],
+        html_success["content"]["text/html"]["schema"]["type"],
         "string"
     );
 }
