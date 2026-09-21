@@ -131,7 +131,17 @@ pub enum TypeTag {
     Raw = 7,
     /// Remote actor reference (node_id + actor_id).
     RemoteActor = 8,
+    /// Mutable amortized-growth array builder.
+    ///
+    /// Internal/Experimental only: this tag is deliberately not part of the
+    /// durable continuation format. A live builder must be materialized to a
+    /// canonical `Array` before a persistence boundary.
+    ArrayBuilder = 9,
 }
+
+/// Bytes of metadata at the front of an `ArrayBuilder` payload:
+/// `[len: u64][capacity: u64][Value; capacity]`.
+pub const ARRAY_BUILDER_META_BYTES: usize = 2 * std::mem::size_of::<u64>();
 
 // ---------------------------------------------------------------------------
 // OrcaHeader

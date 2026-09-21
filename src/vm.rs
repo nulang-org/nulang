@@ -31,7 +31,7 @@ use crate::backends::TieredAction;
 use crate::backends::{create_default_jit, JitBackend};
 use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
 use crate::ffi::{call_native, CType, Signature, FFI_REGISTRY};
-use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
+use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag, ARRAY_BUILDER_META_BYTES};
 use crate::types::{NuError, NuResult, Span, VmSuspension};
 
 // ---------------------------------------------------------------------------
@@ -450,6 +450,162 @@ pub fn resolve_value_string(constants: &[Constant], value: Value) -> String {
         }
     } else {
         value.to_string_repr()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ArrayBuilder builtin — mutable, amortized-growth generic array construction
+// ---------------------------------------------------------------------------
+//
+// Payload:
+//   [0..8)   len: u64
+//   [8..16)  capacity: u64
+//   [16..)   initialized Values in slots [0, len), spare capacity after len
+//
+// Unlike StrBuilder this object contains GC-visible Values. The dedicated
+// heap tag lets ORCA release only initialized slots. Builders are intentionally
+// non-durable: continuation serialization rejects a live ArrayBuilder and
+// callers must materialize it with `to_array` first.
+const ARRAY_BUILDER_INITIAL_CAPACITY: usize = 4;
+
+fn arraybuilder_parts(
+    callbacks: &dyn ActorVmCallbacks,
+    value: Value,
+) -> Option<(*mut u8, usize, usize)> {
+    let ptr = value.as_ptr()?;
+    if ptr.is_null() {
+        return None;
+    }
+    let header = unsafe { &*ActorHeap::header_of(ptr) };
+    if header.type_tag != HeapTypeTag::ArrayBuilder
+        || header.payload_size < ARRAY_BUILDER_META_BYTES
+    {
+        return None;
+    }
+    if let Some(actor_id) = callbacks.current_actor_id() {
+        if header.actor_id != actor_id {
+            // Builders are mutable and therefore actor-local. Never mutate
+            // another actor's heap through an aliased pointer.
+            return None;
+        }
+    }
+
+    let len = unsafe { *(ptr as *const u64) } as usize;
+    let cap = unsafe { *((ptr as *const u64).add(1)) } as usize;
+    let max_cap =
+        (header.payload_size - ARRAY_BUILDER_META_BYTES) / std::mem::size_of::<Value>();
+    if len > cap || cap > max_cap {
+        return None;
+    }
+    Some((ptr, len, cap))
+}
+
+fn alloc_arraybuilder(
+    callbacks: &mut dyn ActorVmCallbacks,
+    cap: usize,
+) -> Option<(*mut u8, Value)> {
+    let slots_bytes = cap.checked_mul(std::mem::size_of::<Value>())?;
+    let payload_size = ARRAY_BUILDER_META_BYTES.checked_add(slots_bytes)?;
+    let (ptr, value) = callbacks.alloc_value(payload_size, HeapTypeTag::ArrayBuilder)?;
+    unsafe {
+        *(ptr as *mut u64) = 0;
+        *((ptr as *mut u64).add(1)) = cap as u64;
+    }
+    Some((ptr, value))
+}
+
+pub(crate) fn arraybuilder_op(
+    callbacks: &mut dyn ActorVmCallbacks,
+    op: &str,
+    regs: &[Value],
+) -> Option<Value> {
+    match op {
+        "new" => {
+            let (_, value) = alloc_arraybuilder(callbacks, ARRAY_BUILDER_INITIAL_CAPACITY)?;
+            Some(value)
+        }
+        "push" => {
+            let builder_value = *regs.first()?;
+            let elem = *regs.get(1)?;
+            let (ptr, len, cap) = arraybuilder_parts(callbacks, builder_value)?;
+            let needed = len.checked_add(1)?;
+
+            if needed <= cap {
+                if let Some(child) = elem.as_ptr() {
+                    callbacks.retain_ref(child);
+                }
+                unsafe {
+                    let slots = ptr.add(ARRAY_BUILDER_META_BYTES) as *mut Value;
+                    slots.add(len).write(elem);
+                    *(ptr as *mut u64) = needed as u64;
+                }
+                return Some(builder_value);
+            }
+
+            let new_cap = cap.max(1).checked_mul(2)?.max(needed);
+            let (new_ptr, new_value) = alloc_arraybuilder(callbacks, new_cap)?;
+            unsafe {
+                let old_slots = ptr.add(ARRAY_BUILDER_META_BYTES) as *const Value;
+                let new_slots = new_ptr.add(ARRAY_BUILDER_META_BYTES) as *mut Value;
+                for i in 0..len {
+                    let value = *old_slots.add(i);
+                    if let Some(child) = value.as_ptr() {
+                        callbacks.retain_ref(child);
+                    }
+                    new_slots.add(i).write(value);
+                }
+                if let Some(child) = elem.as_ptr() {
+                    callbacks.retain_ref(child);
+                }
+                new_slots.add(len).write(elem);
+                *(new_ptr as *mut u64) = needed as u64;
+            }
+            Some(new_value)
+        }
+        "len" => {
+            let (_, len, _) = arraybuilder_parts(callbacks, *regs.first()?)?;
+            i64::try_from(len).ok().map(Value::int)
+        }
+        "to_array" => {
+            let (ptr, len, _) = arraybuilder_parts(callbacks, *regs.first()?)?;
+            let size = len.checked_mul(std::mem::size_of::<Value>())?;
+            let (arr_ptr, arr_value) = callbacks.alloc_value(size, HeapTypeTag::Array)?;
+            unsafe {
+                let src = ptr.add(ARRAY_BUILDER_META_BYTES) as *const Value;
+                let dst = arr_ptr as *mut Value;
+                for i in 0..len {
+                    let value = *src.add(i);
+                    if let Some(child) = value.as_ptr() {
+                        callbacks.retain_ref(child);
+                    }
+                    dst.add(i).write(value);
+                }
+            }
+            Some(arr_value)
+        }
+        "reset" => {
+            let builder_value = *regs.first()?;
+            let (ptr, len, _) = arraybuilder_parts(callbacks, builder_value)?;
+            // Clear the logical length before releasing child refs. If a
+            // child release recursively triggers GC, the builder can no
+            // longer be observed as owning slots that are being released.
+            unsafe {
+                *(ptr as *mut u64) = 0;
+            }
+            for i in 0..len {
+                let slot = unsafe {
+                    let slots = ptr.add(ARRAY_BUILDER_META_BYTES) as *mut Value;
+                    let value = *slots.add(i);
+                    slots.add(i).write(Value::nil());
+                    value
+                };
+                if let Some(child) = slot.as_ptr() {
+                    callbacks.drop_ref(child);
+                }
+            }
+            Some(builder_value)
+        }
+        _ => None,
     }
 }
 
@@ -1532,6 +1688,9 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                 }
                 _ => return None,
             }
+        }
+        if effect_name == "ArrayBuilder" {
+            return arraybuilder_op(self, op_name.unwrap_or(""), regs);
         }
         if effect_name == "StrBuilder" {
             return strbuilder_op(self, constants, op_name.unwrap_or(""), regs);
@@ -8452,6 +8611,114 @@ mod vm_tests {
             result.as_bool(),
             Some(false),
             "record ptr vs string must be false"
+        );
+    }
+
+    #[test]
+    fn test_arraybuilder_growth_and_materialization() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let mut builder = arraybuilder_op(&mut callbacks, "new", &[]).expect("builder");
+
+        for i in 0..10 {
+            builder = arraybuilder_op(&mut callbacks, "push", &[builder, Value::int(i)])
+                .expect("push");
+        }
+        assert_eq!(
+            arraybuilder_op(&mut callbacks, "len", &[builder])
+                .and_then(|v| v.as_int()),
+            Some(10)
+        );
+
+        let array =
+            arraybuilder_op(&mut callbacks, "to_array", &[builder]).expect("materialize array");
+        let ptr = array.as_ptr().expect("array pointer");
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            assert_eq!(header.type_tag, HeapTypeTag::Array);
+            let slots = std::slice::from_raw_parts(ptr as *const Value, 10);
+            for (i, slot) in slots.iter().enumerate() {
+                assert_eq!(slot.as_int(), Some(i as i64));
+            }
+        }
+    }
+
+    #[test]
+    fn test_arraybuilder_pointer_ownership_balances_across_materialization() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let child = callbacks.alloc_string("owned");
+        let child_ptr = child.as_ptr().expect("heap string");
+        let mut builder = arraybuilder_op(&mut callbacks, "new", &[]).expect("builder");
+
+        builder =
+            arraybuilder_op(&mut callbacks, "push", &[builder, child]).expect("push child");
+        let header = unsafe { &*ActorHeap::header_of(child_ptr) };
+        assert_eq!(header.ref_count, 2, "builder must retain pointer element");
+
+        callbacks.drop_ref(child_ptr);
+        let header = unsafe { &*ActorHeap::header_of(child_ptr) };
+        assert_eq!(header.ref_count, 1, "builder owns the remaining child ref");
+
+        let array =
+            arraybuilder_op(&mut callbacks, "to_array", &[builder]).expect("materialize array");
+        let header = unsafe { &*ActorHeap::header_of(child_ptr) };
+        assert_eq!(header.ref_count, 2, "array materialization retains child");
+
+        callbacks.drop_ref(builder.as_ptr().expect("builder pointer"));
+        let header = unsafe { &*ActorHeap::header_of(child_ptr) };
+        assert_eq!(header.ref_count, 1, "freeing builder releases exactly one child ref");
+
+        callbacks.drop_ref(array.as_ptr().expect("array pointer"));
+        assert!(
+            callbacks.gc.stats().objects_freed >= 3,
+            "array, builder, and child should all be reclaimed"
+        );
+    }
+
+    #[test]
+    fn test_arraybuilder_reset_releases_initialized_pointer_slots() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        let child = callbacks.alloc_string("reset");
+        let child_ptr = child.as_ptr().expect("heap string");
+        let mut builder = arraybuilder_op(&mut callbacks, "new", &[]).expect("builder");
+        builder =
+            arraybuilder_op(&mut callbacks, "push", &[builder, child]).expect("push child");
+        callbacks.drop_ref(child_ptr);
+
+        builder = arraybuilder_op(&mut callbacks, "reset", &[builder]).expect("reset");
+        assert_eq!(
+            arraybuilder_op(&mut callbacks, "len", &[builder])
+                .and_then(|v| v.as_int()),
+            Some(0)
+        );
+        assert!(
+            callbacks.gc.stats().objects_freed >= 1,
+            "reset must release the builder-owned child reference"
+        );
+    }
+
+    #[test]
+    fn test_arraybuilder_continuation_serialization_fails_closed() {
+        use crate::runtime::heap_serialize;
+
+        let mut module = CodeModule::new("test_arraybuilder_not_durable");
+        module.emit(Instruction::new0(OpCode::Halt));
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let builder =
+            arraybuilder_op(vm.actor_callbacks.as_mut(), "new", &[]).expect("builder");
+
+        let mut frame = Frame::new(None, 0);
+        frame.regs[0] = builder;
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let cont = Continuation::capture(&vm, 0).expect("continuation");
+        let err = heap_serialize::serialize_continuation(&cont, &[], &vm, &[0u8; 32])
+            .expect_err("live ArrayBuilder must not enter durable format");
+        assert!(
+            err.contains("ArrayBuilder"),
+            "persistence rejection should name the unsupported builder: {err}"
         );
     }
 

@@ -610,23 +610,43 @@ impl OrcaGc {
             (header.payload_size, header.type_tag, header.actor_id)
         };
 
-        if owner == self.actor_id
-            && matches!(
+        if owner == self.actor_id {
+            if type_tag == TypeTag::ArrayBuilder {
+                // ArrayBuilder begins with [len:u64][capacity:u64] metadata;
+                // only slots [0, len) are initialized and own references.
+                // Clamp corrupt metadata to the physical payload so GC fails
+                // safely instead of walking spare/uninitialized capacity.
+                let meta = crate::runtime::heap::ARRAY_BUILDER_META_BYTES;
+                if size >= meta {
+                    let len = *(payload_ptr as *const u64) as usize;
+                    let max_slots = (size - meta) / std::mem::size_of::<crate::vm::Value>();
+                    let slot_count = len.min(max_slots);
+                    let slots = std::slice::from_raw_parts(
+                        payload_ptr.add(meta) as *const crate::vm::Value,
+                        slot_count,
+                    );
+                    for slot in slots {
+                        if let Some(child) = slot.as_ptr() {
+                            self.drop_local_ref(heap, child);
+                        }
+                    }
+                }
+            } else if matches!(
                 type_tag,
                 TypeTag::Array | TypeTag::Record | TypeTag::Tuple | TypeTag::Map
-            )
-        {
-            let slot_count = size / std::mem::size_of::<crate::vm::Value>();
-            // SAFETY: container payloads are laid out as `slot_count` Values
-            // by the VM's ArrAlloc/RecMk/TupleMk.
-            let slots =
-                std::slice::from_raw_parts(payload_ptr as *const crate::vm::Value, slot_count);
-            for slot in slots {
-                if let Some(child) = slot.as_ptr() {
-                    // SAFETY: the slot held a counted local reference to an
-                    // object on this heap; releasing it balances the barrier
-                    // retain exactly once.
-                    self.drop_local_ref(heap, child);
+            ) {
+                let slot_count = size / std::mem::size_of::<crate::vm::Value>();
+                // SAFETY: container payloads are laid out as `slot_count` Values
+                // by the VM's ArrAlloc/RecMk/TupleMk.
+                let slots =
+                    std::slice::from_raw_parts(payload_ptr as *const crate::vm::Value, slot_count);
+                for slot in slots {
+                    if let Some(child) = slot.as_ptr() {
+                        // SAFETY: the slot held a counted local reference to an
+                        // object on this heap; releasing it balances the barrier
+                        // retain exactly once.
+                        self.drop_local_ref(heap, child);
+                    }
                 }
             }
         }
