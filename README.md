@@ -146,12 +146,13 @@ perform IO.print("Hello, " + name + "!")
 Changes to `src/**`, `examples/**`, `scripts/**`, `docs/**`, or the
 [`.github/workflows/docs-sync.yml`](.github/workflows/docs-sync.yml) workflow
 trigger a docs regeneration run on every push to `main`. The workflow regenerates
-the derived standard-library pages (`docs/src/content/docs/stdlib/`) and the
-full API reference (`docs/api.md`), commits any changes back to `main` with
-`[skip ci]`, validates the Astro site build, and pings
-[DeepWiki](https://deepwiki.com/nulang-org/nulang) as a best-effort nudge to
-re-index the repository docs. The site is then redeployed automatically by the
-Cloudflare Pages Git integration.
+the standard-library/API references and browser-playground bundle, validates the
+Astro site, then opens or updates the protected-branch
+`automation/docs-sync` PR with those generated assets. Once that PR passes the
+required checks and is merged, Cloudflare Pages redeploys `main`. When the
+workflow uses the default `GITHUB_TOKEN`, GitHub requires a maintainer to
+approve the generated PR's workflow runs; an optional `DOCS_SYNC_TOKEN`
+PAT/App token removes that approval step.
 
 ---
 
@@ -232,7 +233,7 @@ dependencies.
 
 ## Docs & Wiki
 
-The [nulang.org](https://nulang.org) documentation site is regenerated automatically on every push to `main` via the [Docs Sync workflow](.github/workflows/docs-sync.yml). When source files, examples, or docs content change, the workflow regenerates the standard-library reference and API docs, commits the updates, verifies the Astro build, and pings [DeepWiki](https://deepwiki.com/nulang-org/nulang) to encourage re-indexing.
+The [nulang.org](https://nulang.org) documentation site is regenerated automatically on every push to `main` via the [Docs Sync workflow](.github/workflows/docs-sync.yml). When source files, examples, or docs content change, the workflow rebuilds generated docs and the browser playground, verifies the Astro site, and proposes the generated files through the `automation/docs-sync` pull request rather than pushing directly to protected `main`.
 
 ---
 
