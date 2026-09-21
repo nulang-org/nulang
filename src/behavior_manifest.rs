@@ -4,7 +4,7 @@
 //! derived from already-checked compiler state and never grants authority.
 
 use crate::authority::AuthorityGrant;
-use crate::effect_checker::{parse_effect_name, EffectChecker};
+use crate::effect_checker::EffectChecker;
 use crate::hir;
 use crate::mir;
 use crate::protocol::{ProtocolMember, ProtocolSchema};
@@ -128,9 +128,7 @@ pub enum EffectReplay {
     Nonreplayable,
 }
 
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord,
-)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthorityKind {
     Filesystem,
@@ -443,13 +441,8 @@ fn collect_hir_decls(
     for decl in decls {
         match decl {
             hir::Decl::Function(function) if function.public => {
-                let input_ty = Type::Tuple(
-                    function
-                        .params
-                        .iter()
-                        .map(|(_, ty)| ty.clone())
-                        .collect(),
-                );
+                let input_ty =
+                    Type::Tuple(function.params.iter().map(|(_, ty)| ty.clone()).collect());
                 let signature = Type::Function {
                     param: Box::new(input_ty.clone()),
                     ret: Box::new(function.ret.clone()),
@@ -472,11 +465,7 @@ fn collect_hir_decls(
                     .map(|behavior| {
                         ProtocolMember::behavior(
                             behavior.name.clone(),
-                            behavior
-                                .params
-                                .iter()
-                                .map(|(_, ty)| ty.clone())
-                                .collect(),
+                            behavior.params.iter().map(|(_, ty)| ty.clone()).collect(),
                             behavior.ret.clone(),
                             behavior.effect.clone(),
                             behavior.cap,
@@ -620,10 +609,7 @@ fn broad_authority_for_effect(effect: &Effect) -> Option<(AuthorityKind, Option<
         | Effect::Python
         | Effect::Env
         | Effect::Process
-        | Effect::System => Some((
-            AuthorityKind::Custom,
-            Some(format!("effect:{}", effect)),
-        )),
+        | Effect::System => Some((AuthorityKind::Custom, Some(format!("effect:{}", effect)))),
         _ => None,
     }
 }
@@ -759,7 +745,11 @@ fn main() { perform IO.print("ok") }
 "#,
         );
 
-        let names: Vec<_> = manifest.effects.iter().map(|entry| entry.effect.as_str()).collect();
+        let names: Vec<_> = manifest
+            .effects
+            .iter()
+            .map(|entry| entry.effect.as_str())
+            .collect();
         assert!(names.contains(&"FS"));
         assert!(names.contains(&"IO"));
         assert!(manifest
@@ -787,7 +777,11 @@ fn main() { 0 }
             .unwrap();
         assert_eq!(actor.durability, PersistenceClass::Durable);
         assert!(actor.protocol.as_deref().unwrap().starts_with("blake3:"));
-        assert!(actor.state_schema.as_deref().unwrap().starts_with("blake3:"));
+        assert!(actor
+            .state_schema
+            .as_deref()
+            .unwrap()
+            .starts_with("blake3:"));
         assert_eq!(manifest.durability.len(), 1);
         assert_eq!(manifest.provenance.state_schema_digests.len(), 1);
     }
