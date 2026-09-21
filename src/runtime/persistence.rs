@@ -2067,6 +2067,7 @@ mod json_file_store_tests {
     fn test_json_file_store_save_load_snapshot() {
         let dir = fresh_dir("snapshot");
         let mut store = JsonFileStore::new(&dir).unwrap();
+        let artifact_id = "11".repeat(32);
         let mut state = HashMap::new();
         state.insert("count".to_string(), PersistedValue::Int(42));
         store
@@ -2074,7 +2075,7 @@ mod json_file_store_tests {
                 actor_id: 1,
                 sequence: 3,
                 semantic_id: None,
-                artifact_id: None,
+                artifact_id: Some(artifact_id.clone()),
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2086,6 +2087,7 @@ mod json_file_store_tests {
         let loaded = store.load_snapshot(1).unwrap();
         assert_eq!(loaded.actor_id, 1);
         assert_eq!(loaded.sequence, 3);
+        assert_eq!(loaded.artifact_id.as_deref(), Some(artifact_id.as_str()));
         assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
 
         // The atomic (temp + rename) write must not leave its temp file behind.
@@ -2364,6 +2366,7 @@ mod rocksdb_store_tests {
     fn test_rocksdb_store_save_load_snapshot() {
         let dir = fresh_dir("snapshot");
         let mut store = RocksDbStore::new(&dir).unwrap();
+        let artifact_id = "22".repeat(32);
         let mut state = HashMap::new();
         state.insert("count".to_string(), PersistedValue::Int(42));
         store
@@ -2371,7 +2374,7 @@ mod rocksdb_store_tests {
                 actor_id: 1,
                 sequence: 3,
                 semantic_id: None,
-                artifact_id: None,
+                artifact_id: Some(artifact_id.clone()),
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2383,6 +2386,7 @@ mod rocksdb_store_tests {
         let loaded = store.load_snapshot(1).unwrap();
         assert_eq!(loaded.actor_id, 1);
         assert_eq!(loaded.sequence, 3);
+        assert_eq!(loaded.artifact_id.as_deref(), Some(artifact_id.as_str()));
         assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2564,6 +2568,7 @@ mod postgres_store_tests {
         };
         let mut store = PostgresStore::new(&url).unwrap();
         let actor_id = fresh_actor_id();
+        let artifact_id = "33".repeat(32);
         let mut state = HashMap::new();
         state.insert("count".to_string(), PersistedValue::Int(42));
         store
@@ -2571,7 +2576,7 @@ mod postgres_store_tests {
                 actor_id,
                 sequence: 3,
                 semantic_id: None,
-                artifact_id: None,
+                artifact_id: Some(artifact_id.clone()),
                 state,
                 waiting_signal: Some("signal".to_string()),
                 crdt_snapshot: None,
@@ -2583,6 +2588,7 @@ mod postgres_store_tests {
         let loaded = store.load_snapshot(actor_id).unwrap();
         assert_eq!(loaded.actor_id, actor_id);
         assert_eq!(loaded.sequence, 3);
+        assert_eq!(loaded.artifact_id.as_deref(), Some(artifact_id.as_str()));
         assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
         assert_eq!(loaded.waiting_signal, Some("signal".to_string()));
         store.clear(actor_id).unwrap();
