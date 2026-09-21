@@ -60,6 +60,18 @@ local/cross-shard accounting, while `remote_deliveries` carries
 `(delivery_id, node_id, actor_id)` receipts for every successfully forwarded
 cross-node route. Those ids resolve through the same remote-admission APIs.
 
+Tracked Fabric publication also uses the transport's non-blocking admission
+path. If the bounded outbound/in-memory transport queue is saturated,
+`immediate.backpressured` increments and no remote delivery ticket is created.
+The ordinary typed actor send path uses the same non-blocking transport
+admission, so a remote `Runtime::send_message` can return
+`MessageAdmission::Backpressured` instead of blocking the actor scheduler.
+
+The compatibility/control-plane `NetworkTransport::send` operation remains
+blocking for transports such as TCP. Cluster heartbeats, gossip, and other
+control traffic have not yet been moved onto a reserved/non-blocking control
+lane; this change deliberately does not claim that broader guarantee.
+
 Subject patterns use NATS-style token matching:
 
 - `orders.created` matches exactly that topic.
