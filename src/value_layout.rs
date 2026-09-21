@@ -169,6 +169,18 @@ pub fn as_int_or_zero(raw: u64) -> i64 {
     }
 }
 
+/// Extract an integer denominator using the interpreter's permissive div/mod
+/// coercion: non-integer values contribute one, while a tagged integer zero
+/// remains zero so the caller can preserve divide-by-zero semantics.
+#[inline]
+pub fn as_int_or_one(raw: u64) -> i64 {
+    if is_int_raw(raw) {
+        as_int_raw(raw)
+    } else {
+        1
+    }
+}
+
 /// Extract the heap-pointer payload from a tagged value (assumes `is_ptr_raw`).
 #[inline]
 pub fn as_ptr_raw(raw: u64) -> u32 {
