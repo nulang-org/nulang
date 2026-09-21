@@ -3217,9 +3217,16 @@ impl Runtime {
                 .map(|((_, name), id)| (name.clone(), id.0))
                 .collect()
         });
+        let semantic_id = self
+            .actors
+            .get(&actor_id)
+            .and_then(|actor| actor.bytecode_module.as_ref())
+            .and_then(|module| module.semantic_id)
+            .map(|id| id.to_string());
         Some(ActorSnapshot {
             actor_id,
             sequence,
+            semantic_id,
             state,
             waiting_signal,
             crdt_snapshot,
