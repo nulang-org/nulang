@@ -170,7 +170,7 @@ html[data-has-hero]:not([data-has-sidebar]) {
 
 /* ── Typography (match nulang.cloud) ── */
 html {
-  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
