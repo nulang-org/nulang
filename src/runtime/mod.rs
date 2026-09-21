@@ -22,6 +22,7 @@ mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
 mod mailbox;
+mod kernel;
 mod scheduler;
 pub use heap_serialize::*;
 mod cluster;
@@ -107,6 +108,7 @@ pub use grain::*;
 pub use heap::*;
 pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
 pub use mailbox::*;
+pub use kernel::RuntimeKernel;
 pub use network::NetworkTransport;
 pub use network::*;
 pub use object_store::*;
@@ -301,31 +303,12 @@ pub(crate) enum MessageAdmission {
 }
 
 pub struct Runtime {
-    pub actors: HashMap<u64, Actor>,
-    pub supervisors: HashMap<u64, Supervisor>,
-    pub scheduler: Scheduler,
-    pub current_actor: Option<u64>,
-    /// W3C trace context of the message currently being handled on this
-    /// shard's scheduler thread. Sends performed while handling a message
-    /// stamp their outgoing `traceparent` as a child of this context, so
-    /// causal chains span actor, shard, and node boundaries.
-    pub current_trace: Option<TraceContext>,
-    // Fallback heap/GC for allocation performed OUTSIDE any actor's
-    // behavior (e.g. `main()`'s own top-level bytecode: string
-    // concatenation, `Int.to_string`, and similar). See
-    // `RuntimeVmCallbacks::alloc`'s doc comment for why this exists.
-    pub main_heap: ActorHeap,
-    pub main_gc: OrcaGc,
-    pub next_reductions: u32,
-    pub coordinator: OrcaCoordinator,
-    pub cycle_detector: CycleDetector,
-
-    // Heaps of exited actors that still have outstanding foreign
-    // references.  Dropping a heap while another actor holds a pointer
-    // into it would dangle, so such heaps are retired here instead and
-    // reclaimed by `reclaim_retired_heaps` once every foreign reference
-    // (in-flight op or receiver hold) has drained.
-    retired_heaps: Vec<ActorHeap>,
+    /// Actor execution state shared by every runtime configuration.
+    ///
+    /// Platform subsystems are intentionally kept outside this kernel. The
+    /// temporary Deref bridge below preserves existing field access while
+    /// callers migrate toward narrower subsystem boundaries.
+    pub kernel: RuntimeKernel,
 
     // Distributed actor system (v0.5)
     pub distributed: DistributedContext,
@@ -537,6 +520,26 @@ pub struct Runtime {
     cross_shard_rx: Option<mpsc::Receiver<CrossShardMsg>>,
 }
 
+/// Transitional compatibility bridge for the kernel extraction.
+///
+/// Existing runtime code can continue using `runtime.actors`,
+/// `runtime.scheduler`, and related fields while subsystem APIs are moved to
+/// narrower interfaces. New fields must not be added to `RuntimeKernel`
+/// unless they are required for actor execution itself.
+impl std::ops::Deref for Runtime {
+    type Target = RuntimeKernel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.kernel
+    }
+}
+
+impl std::ops::DerefMut for Runtime {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.kernel
+    }
+}
+
 // SAFETY: in sharded mode each Runtime runs on exactly one thread (shard
 // ownership by actor_id % shard_count). Cross-shard communication uses
 // mpsc channels; no two threads access the same Runtime's internal state.
@@ -575,23 +578,9 @@ impl crate::backends::ForeignInterop for NoOpForeignInterop {
 impl Runtime {
     pub fn new() -> Self {
         Runtime {
-            actors: HashMap::new(),
-            supervisors: HashMap::new(),
-            scheduler: Scheduler::new(4),
-            current_actor: None,
-            current_trace: None,
-            main_heap: {
-                let mut heap = ActorHeap::new(64 * 1024);
-                heap.set_actor_id(MAIN_HEAP_ACTOR_ID);
-                heap
-            },
-            main_gc: OrcaGc::new(MAIN_HEAP_ACTOR_ID),
-            next_reductions: 1000,
-            coordinator: OrcaCoordinator::new(),
-            cycle_detector: CycleDetector::new(),
+            kernel: RuntimeKernel::new(),
             vm_execution_depth: 0,
             suspend_enabled: false,
-            retired_heaps: Vec::new(),
             distributed: DistributedContext::new(),
             cluster_config: ClusterConfig::default(),
             acked_packets: HashSet::new(),
