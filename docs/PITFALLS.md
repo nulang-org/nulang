@@ -1,8 +1,8 @@
 # Common Pitfalls & Idioms
 
-The Nulang syntax is clean and consistent once you know the rules, but
-newcomers reliably trip on the same few things.  Each section below is
-a one-line rule, a ❌ wrong snippet, and a ✅ correct one — all verified
+Nulang may accept compatibility spellings while syntax evolves, but
+`nulang fmt` defines the canonical source form. Each section below is a
+one-line rule, a ❌ wrong snippet, and a ✅ canonical snippet — all verified
 against `examples/`, `docs/GETTING_STARTED.md`, and the integration-test
 suite.
 
@@ -127,10 +127,10 @@ let r = { p .. x = 10, y = 20 }  // multiple overrides
 
 ---
 
-### 7. `spawn` field overrides use `=`
+### 7. `spawn` named fields use `=`
 
-When spawning an actor, state-field overrides use `FieldName = value`
-(not `:`).  This overrides the default declared in the actor body.
+Canonical actor construction is call-like. State-field overrides use
+`FieldName = value` (not `:`) and override defaults declared by the actor.
 
 ```nula
 actor Counter {
@@ -139,18 +139,24 @@ actor Counter {
 }
 
 // ❌
-let c = spawn Counter { count: 42 }
+let c = spawn Counter(count: 42)
 
 // ✅
-let c = spawn Counter { count = 42 }
+let c = spawn Counter(count = 42)
 ```
+
+The parser still accepts the older brace form during migration, but
+`nulang fmt` emits `spawn Counter(...)`.
 
 ---
 
-### 8. Message sends use `!`, not `.`
+### 8. Local message sends canonically use `!`, not `.`
 
-Sending a message to an actor requires the `!` operator.
-The dotted form (`actor.field`) is field *access*, not a send.
+Sending a local asynchronous message canonically uses the `!` operator.
+The dotted form (`actor.field`) is field *access*, not a send. The parser
+also accepts `send actor behavior(...)` for compatibility; the formatter
+rewrites local sends to `!`. Explicit `send remote ...` remains keyword
+syntax because the transport choice changes semantics.
 
 ```nula
 // ❌
@@ -380,6 +386,7 @@ let pos = filter(fn(r) { r.x > 0 }, [{x: 1}, {x: -1}, {x: 2}])  // [{x:1}, {x:2}
 | While loop | `while i < n { i = i + 1 }` |
 | Array literal | `[1, 2, 3]` — `.len()`, `[i]`, `.push(v)` |
 | Tuple | `(1, "hello")` — field access: `t.0`, `t.1`, `t.0.1` |
+| String interpolation | `f"hello {name}"` |
 
 ---
 
