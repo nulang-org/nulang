@@ -653,6 +653,18 @@ pub struct ImplMethod {
 // Declarations
 // ---------------------------------------------------------------------------
 
+/// Logical secondary-index declaration owned by a durable actor/entity.
+///
+/// Indexes describe typed access paths; they do not select a physical database
+/// or storage engine. Backends may realize the same declaration differently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDecl {
+    pub name: String,
+    pub fields: Vec<String>,
+    pub unique: bool,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decl {
     Function {
@@ -689,6 +701,8 @@ pub enum Decl {
         type_params: Vec<String>,
         persistent: bool,
         state_fields: Vec<(String, StateModel, Type, Expr)>, // name, model, type, default
+        /// Compiler-owned logical secondary indexes over durable state.
+        indexes: Vec<IndexDecl>,
         behaviors: Vec<Behavior>,
         init: Vec<(String, Expr)>,
         /// Compile-time backend selection. `None` means use the CLI default.
@@ -1076,6 +1090,7 @@ pub fn desugar_state_machine(
         type_params: vec![],
         persistent: false,
         state_fields: vec![state_field],
+        indexes: vec![],
         behaviors,
         init: vec![],
         backend: None,
