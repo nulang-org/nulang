@@ -135,7 +135,9 @@ fn required_host_authority(
             }
             other("Net", "Listen", Some(port.to_string()))
         }
-        ("Process", Some("run")) => other("Process", "Run", Some(string_arg(0)?)),
+        ("Process", Some("run")) => AuthorityGrant::ProcessRun {
+            command: string_arg(0)?,
+        },
         ("System", Some("arg")) => {
             let index = regs
                 .first()
@@ -2663,6 +2665,14 @@ mod host_authority_tests {
             required_host_authority("Secret", Some("read"), &constants, &regs).unwrap(),
             Some(AuthorityGrant::SecretRead {
                 name: "PAYMENTS_KEY".into(),
+            })
+        );
+
+        let (constants, regs) = string_args(&["printf hello"]);
+        assert_eq!(
+            required_host_authority("Process", Some("run"), &constants, &regs).unwrap(),
+            Some(AuthorityGrant::ProcessRun {
+                command: "printf hello".into(),
             })
         );
     }
