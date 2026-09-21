@@ -15,7 +15,7 @@ use crate::effect_checker::{
     effect_resource_category, flatten_decls, EffectChecker, EffectContext,
 };
 use crate::protocol::{ProtocolMember, ProtocolSchema};
-use crate::types::{Effect, EffectRow, NuResult, Type};
+use crate::types::{Effect, EffectRow, NuResult};
 
 pub const COMPILER_SEMANTIC_INVENTORY_SCHEMA: &str =
     "nulang.compiler-semantics/v0alpha1";
@@ -170,6 +170,10 @@ impl CompilerSemanticInventory {
 
     pub fn canonical_json(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
+    }
+
+    pub fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
     }
 }
 
@@ -351,7 +355,7 @@ fn effect_from_canonical_name(name: &str) -> Option<Effect> {
 mod tests {
     use super::*;
     use crate::ast::{Literal, Param};
-    use crate::types::{Capability, Span};
+    use crate::types::{Capability, Span, Type};
 
     fn behavior(
         name: &str,
