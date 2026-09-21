@@ -12,6 +12,7 @@ use tracing::warn;
 
 mod actor;
 pub mod cache;
+pub mod change_stream;
 pub mod cache_cluster;
 pub mod cache_dispatch;
 pub mod cache_pipeline;
@@ -93,6 +94,7 @@ pub use cache_cluster::*;
 pub use cache_dispatch::*;
 pub use cache_pipeline::*;
 pub use cache_routing::*;
+pub use change_stream::*;
 #[cfg(feature = "cache-server")]
 pub use cache_server::*;
 pub use callbacks::RuntimeVmCallbacks;
