@@ -133,7 +133,7 @@ fn test_mailbox_push_pop() {
     let mut mb = Mailbox::new(4);
     let msg = Message {
         behavior_id: 0,
-        payload: Arc::new(vec![Value::int(42)]),
+        payload: Arc::from(vec![Value::int(42)]),
         sender: 1,
         priority: MessagePriority::Normal,
         trace_id: None,
