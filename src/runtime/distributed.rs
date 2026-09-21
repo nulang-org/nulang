@@ -55,7 +55,7 @@ use super::fabric_stream_epoch::{
     FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR, FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR,
     FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
 };
-use super::mailbox::{Message, MessagePriority};
+use super::mailbox::{Message, MessagePayload, MessagePriority};
 use super::network::{NetworkTransport, Packet};
 use super::{ClusterState, NodeId, NodeStatus};
 use crate::runtime::Runtime;
@@ -598,7 +598,7 @@ impl AddressResolver {
 
                 let msg = Message {
                     behavior_id: 0, // resolved from behavior_name at delivery
-                    payload: Arc::new(payload),
+                    payload: MessagePayload::from_vec(payload),
                     sender: sender_actor,
                     priority,
                     trace_id,
