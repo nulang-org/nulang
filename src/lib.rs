@@ -54,9 +54,9 @@ pub mod iso_arena;
 pub mod jit;
 pub mod json_diagnostics;
 pub mod lexer;
-pub mod migration_purity;
 #[cfg(feature = "lsp")]
 pub mod lsp;
+pub mod migration_purity;
 pub mod mir;
 pub mod mir_codegen;
 pub mod mir_inline;
