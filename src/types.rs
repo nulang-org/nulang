@@ -226,6 +226,8 @@ pub enum Effect {
     STM,
     Async,
     Inference,
+    Compute,
+    Tensor,
     Cost,
     Event,
     Array,
@@ -268,6 +270,8 @@ impl std::fmt::Display for Effect {
             Effect::STM => write!(f, "STM"),
             Effect::Async => write!(f, "Async"),
             Effect::Inference => write!(f, "Inference"),
+            Effect::Compute => write!(f, "Compute"),
+            Effect::Tensor => write!(f, "Tensor"),
             Effect::Cost => write!(f, "Cost"),
             Effect::Event => write!(f, "Event"),
             Effect::FFI => write!(f, "FFI"),
@@ -802,6 +806,14 @@ pub const RECORD_ROW_TAIL_FIELD: &str = "..";
 /// protocol against the required `ActorRef` protocol.
 pub const ACTOR_REF_TYPE_NAME: &str = "ActorRef";
 
+/// Nulang 2 built-in accelerator tensor constructor. Tensor values are
+/// opaque runtime handles whose element type participates in ordinary HM
+/// checking; shape remains runtime metadata in the initial surface.
+pub const TENSOR_TYPE_NAME: &str = "Tensor";
+
+/// Nulang 2 built-in accelerator device handle type.
+pub const DEVICE_TYPE_NAME: &str = "Device";
+
 /// Reserved nominal marker used when a behavior parameter/return type was not
 /// explicitly declared. Protocol identity generation must reject this marker:
 /// it is a compatibility fallback for local typechecking, not a stable schema.
@@ -811,6 +823,37 @@ impl Type {
     /// Construct the compile-time-only structural actor-reference type
     /// `ActorRef[P]`. `P` is expected to be a record whose fields map
     /// behavior names to function signatures.
+    pub fn tensor(element: Type) -> Type {
+        Type::App {
+            constructor: Box::new(Type::Nominal {
+                name: TENSOR_TYPE_NAME.to_string(),
+                underlying: Box::new(Type::unit()),
+            }),
+            args: vec![element],
+        }
+    }
+
+    pub fn tensor_element(&self) -> Option<&Type> {
+        match self {
+            Type::App { constructor, args } if args.len() == 1 => match constructor.as_ref() {
+                Type::Nominal { name, .. } if name == TENSOR_TYPE_NAME => args.first(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn device() -> Type {
+        Type::Nominal {
+            name: DEVICE_TYPE_NAME.to_string(),
+            underlying: Box::new(Type::string()),
+        }
+    }
+
+    pub fn is_device(&self) -> bool {
+        matches!(self, Type::Nominal { name, .. } if name == DEVICE_TYPE_NAME)
+    }
+
     pub fn actor_ref(protocol: Type) -> Type {
         Type::App {
             constructor: Box::new(Type::Nominal {
