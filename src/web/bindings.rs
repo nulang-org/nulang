@@ -328,6 +328,11 @@ mod tests {
         let codec = body.codec.as_ref().expect("typed body codec");
         assert_eq!(codec.media_type, "application/json");
         assert_eq!(codec.payload_type.as_deref(), Some("CreateUser"));
+
+        let serialized = serde_json::to_value(body).unwrap();
+        assert_eq!(serialized["codec"]["codec"], "json");
+        assert_eq!(serialized["codec"]["media_type"], "application/json");
+        assert_eq!(serialized["codec"]["payload_type"], "CreateUser");
     }
 
     #[test]
