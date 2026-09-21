@@ -1541,9 +1541,9 @@ impl std::fmt::Display for ErrorCode {
 
 /// A non-fatal compiler warning with a stable, category-scoped code.
 ///
-/// Warnings use the `Wxxxx` scheme documented in `docs/ERROR_CODES.md`
-/// (`W01xx` — deprecations). They never fail compilation on their own;
-/// the CLI `--deny-warnings` flag escalates them to an error.
+/// Warnings use the `Wxxxx` scheme documented in `docs/ERROR_CODES.md`.
+/// They never fail compilation on their own; the CLI `--deny-warnings` flag
+/// escalates them to an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NuWarning {
     /// Stable warning code, e.g. `"W0101"`.
