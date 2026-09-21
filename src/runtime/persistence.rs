@@ -217,7 +217,10 @@ impl RetainedArtifact {
         if expected_digest != self.payload_digest {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("retained artifact {} failed payload digest verification", requested),
+                format!(
+                    "retained artifact {} failed payload digest verification",
+                    requested
+                ),
             ));
         }
         let manifest =
