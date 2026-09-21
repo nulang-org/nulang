@@ -6,9 +6,10 @@
 //! independent execution species.
 //!
 //! This module is the compatibility boundary while older metadata still uses
-//! boolean role flags. New compiler/runtime code should ask for an
-//! [`ActorRole`] instead of branching independently on `is_agent`,
-//! `is_workflow`, `is_organization`, and `virtual_`.
+//! boolean role flags. New compiler/runtime code should ask for
+//! [`ActorSemantics`] instead of branching independently on `is_agent`,
+//! `is_workflow`, `is_organization`, and `virtual_`. [`ActorRole`] remains
+//! as a compatibility view for persisted formats while those flags are phased out.
 
 /// The seven semantic primitives that make up the Nulang execution model.
 ///
@@ -24,6 +25,131 @@ pub enum RuntimePrimitive {
     Supervisor,
     Time,
 }
+
+
+/// Whether an actor's state survives runtime/process failure.
+///
+/// Durability is orthogonal to why an actor was created. An agent, workflow,
+/// organization, or plain actor may all be durable without becoming a new
+/// execution species.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActorDurability {
+    Transient,
+    Durable,
+}
+
+/// How an actor instance is activated.
+///
+/// Virtual activation is a placement/lifecycle policy, not a mutually exclusive
+/// actor role. Keeping it separate allows future combinations such as virtual
+/// agents or workflows without adding another runtime species.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActorActivation {
+    Eager,
+    Virtual,
+}
+
+/// Source-level construct that produced an actor after lowering.
+///
+/// This is provenance for diagnostics and compatibility, not an execution model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActorSurfaceOrigin {
+    Actor,
+    Agent,
+    Workflow,
+    Organization,
+}
+
+/// Canonical orthogonal semantics of a lowered actor.
+///
+/// Legacy metadata stores these dimensions as several booleans. This structure
+/// is the normalization boundary new compiler/runtime code should consume until
+/// the serialized format can replace those booleans directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActorSemantics {
+    pub durability: ActorDurability,
+    pub activation: ActorActivation,
+    pub origin: ActorSurfaceOrigin,
+}
+
+impl ActorSemantics {
+    pub fn from_legacy_flags(
+        persistent: bool,
+        is_workflow: bool,
+        is_agent: bool,
+        is_organization: bool,
+        is_virtual: bool,
+    ) -> Result<Self, ActorOriginConflict> {
+        let origins = [
+            (is_workflow, ActorSurfaceOrigin::Workflow),
+            (is_agent, ActorSurfaceOrigin::Agent),
+            (is_organization, ActorSurfaceOrigin::Organization),
+        ];
+
+        let mut origin = ActorSurfaceOrigin::Actor;
+        let mut count = 0usize;
+        for (enabled, candidate) in origins {
+            if enabled {
+                count += 1;
+                origin = candidate;
+            }
+        }
+
+        if count > 1 {
+            return Err(ActorOriginConflict {
+                is_workflow,
+                is_agent,
+                is_organization,
+            });
+        }
+
+        Ok(Self {
+            durability: if persistent {
+                ActorDurability::Durable
+            } else {
+                ActorDurability::Transient
+            },
+            activation: if is_virtual {
+                ActorActivation::Virtual
+            } else {
+                ActorActivation::Eager
+            },
+            origin,
+        })
+    }
+
+    pub const fn is_agent(self) -> bool {
+        matches!(self.origin, ActorSurfaceOrigin::Agent)
+    }
+
+    pub const fn is_workflow(self) -> bool {
+        matches!(self.origin, ActorSurfaceOrigin::Workflow)
+    }
+
+    pub const fn is_organization(self) -> bool {
+        matches!(self.origin, ActorSurfaceOrigin::Organization)
+    }
+}
+
+/// Invalid legacy metadata that claims more than one source-level actor origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorOriginConflict {
+    pub is_workflow: bool,
+    pub is_agent: bool,
+    pub is_organization: bool,
+}
+
+impl std::fmt::Display for ActorOriginConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "actor metadata has conflicting origins (workflow={}, agent={}, organization={})",
+            self.is_workflow, self.is_agent, self.is_organization
+        )
+    }
+}
+
+impl std::error::Error for ActorOriginConflict {}
 
 /// Surface-level role carried by an actor after lowering.
 ///
@@ -110,6 +236,17 @@ impl std::fmt::Display for ActorRoleConflict {
 impl std::error::Error for ActorRoleConflict {}
 
 impl crate::hir::ActorDef {
+    /// Return orthogonal semantic dimensions for this lowered actor.
+    pub fn semantics(&self) -> Result<ActorSemantics, ActorOriginConflict> {
+        ActorSemantics::from_legacy_flags(
+            self.persistent,
+            self.is_workflow,
+            self.is_agent,
+            self.is_organization,
+            self.virtual_,
+        )
+    }
+
     /// Return the canonical semantic role of this lowered actor.
     ///
     /// New HIR consumers should prefer this helper to testing the legacy flags
@@ -126,6 +263,17 @@ impl crate::hir::ActorDef {
 }
 
 impl crate::bytecode::ActorMeta {
+    /// Return orthogonal semantic dimensions encoded by compatibility metadata.
+    pub fn semantics(&self) -> Result<ActorSemantics, ActorOriginConflict> {
+        ActorSemantics::from_legacy_flags(
+            self.persistent,
+            self.is_workflow,
+            self.is_agent,
+            self.is_organization,
+            self.is_virtual,
+        )
+    }
+
     /// Return the canonical role encoded in serialized actor metadata without
     /// changing the bytecode format.
     ///
@@ -143,6 +291,21 @@ impl crate::bytecode::ActorMeta {
 }
 
 impl crate::runtime::Actor {
+    /// Return orthogonal semantic dimensions for a live runtime actor.
+    ///
+    /// Live actors currently do not retain organization/virtual provenance, so
+    /// those dimensions default to plain/eager until the serialized/runtime
+    /// metadata migration is complete.
+    pub fn semantics(&self) -> Result<ActorSemantics, ActorOriginConflict> {
+        ActorSemantics::from_legacy_flags(
+            self.persistent,
+            self.is_workflow,
+            self.is_agent,
+            false,
+            false,
+        )
+    }
+
     /// Return the canonical role of a live runtime actor.
     ///
     /// Runtime actors currently persist only the legacy workflow/agent flags;
@@ -220,6 +383,43 @@ pub enum DeliverySemantics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actor_semantics_keep_origin_activation_and_durability_orthogonal() {
+        let semantics =
+            ActorSemantics::from_legacy_flags(true, false, true, false, true).unwrap();
+
+        assert_eq!(semantics.origin, ActorSurfaceOrigin::Agent);
+        assert_eq!(semantics.activation, ActorActivation::Virtual);
+        assert_eq!(semantics.durability, ActorDurability::Durable);
+        assert!(semantics.is_agent());
+    }
+
+    #[test]
+    fn actor_semantics_reject_conflicting_surface_origins() {
+        assert!(ActorSemantics::from_legacy_flags(
+            true, true, true, false, false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bytecode_and_runtime_expose_normalized_semantics() {
+        let mut meta = crate::bytecode::ActorMeta::new("assistant");
+        meta.persistent = true;
+        meta.is_agent = true;
+        meta.is_virtual = true;
+        let semantics = meta.semantics().unwrap();
+        assert_eq!(semantics.origin, ActorSurfaceOrigin::Agent);
+        assert_eq!(semantics.activation, ActorActivation::Virtual);
+
+        let mut actor = crate::runtime::Actor::new(1, "assistant", 0);
+        actor.persistent = true;
+        actor.is_agent = true;
+        let semantics = actor.semantics().unwrap();
+        assert_eq!(semantics.origin, ActorSurfaceOrigin::Agent);
+        assert_eq!(semantics.durability, ActorDurability::Durable);
+    }
 
     #[test]
     fn plain_actor_has_plain_role() {
