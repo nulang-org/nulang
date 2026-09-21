@@ -33,8 +33,38 @@ impl StateModel {
             StateModel::Durable | StateModel::EventSourced | StateModel::Crdt(_)
         )
     }
+
     pub fn is_crdt(self) -> bool {
         matches!(self, StateModel::Crdt(_))
+    }
+
+    /// Runtime view of the language-level consistency contract.
+    pub const fn consistency(self) -> crate::ast::StateConsistency {
+        match self {
+            StateModel::Local => crate::ast::StateConsistency::Local,
+            StateModel::Durable | StateModel::EventSourced => {
+                crate::ast::StateConsistency::ActorOwned
+            }
+            StateModel::Crdt(_) => crate::ast::StateConsistency::Convergent,
+        }
+    }
+
+    /// Runtime view of the language-level crash-recovery contract.
+    pub const fn durability(self) -> crate::ast::StateDurability {
+        match self {
+            StateModel::Local => crate::ast::StateDurability::Ephemeral,
+            StateModel::Durable | StateModel::Crdt(_) => {
+                crate::ast::StateDurability::Checkpointed
+            }
+            StateModel::EventSourced => crate::ast::StateDurability::EventLog,
+        }
+    }
+
+    pub const fn requires_single_writer(self) -> bool {
+        matches!(
+            self.consistency(),
+            crate::ast::StateConsistency::ActorOwned
+        )
     }
 }
 
@@ -2003,6 +2033,28 @@ impl PersistenceStore for PostgresStore {
 #[cfg(test)]
 mod json_file_store_tests {
     use super::*;
+
+    #[test]
+    fn test_runtime_state_model_semantics_match_language_model() {
+        let cases = [
+            (StateModel::Local, crate::ast::StateModel::Local),
+            (StateModel::Durable, crate::ast::StateModel::Durable),
+            (StateModel::EventSourced, crate::ast::StateModel::EventSourced),
+            (
+                StateModel::Crdt(crate::ast::CrdtType::ORSet),
+                crate::ast::StateModel::Crdt(crate::ast::CrdtType::ORSet),
+            ),
+        ];
+
+        for (runtime, language) in cases {
+            assert_eq!(runtime.consistency(), language.consistency());
+            assert_eq!(runtime.durability(), language.durability());
+            assert_eq!(
+                runtime.requires_single_writer(),
+                language.requires_single_writer()
+            );
+        }
+    }
 
     /// Unique scratch dir per test (the suite runs tests in parallel, and a
     /// re-run must not see a previous run's leftover files).

@@ -42,6 +42,9 @@ version + migration.*
 
 ## Stable tier
 
+### Explicit state consistency/durability semantics — 2026-09-21
+- **State models now expose orthogonal semantic axes** (`src/ast.rs`, `src/runtime/persistence.rs`). The existing `local`/`durable`/`event_sourced`/`crdt` language surface is unchanged, but each model now derives a storage-neutral durability contract (`Ephemeral`, `Checkpointed`, or `EventLog`) and a consistency contract (`Local`, `ActorOwned`, or `Convergent`). `ActorOwned` models explicitly require single-writer fencing when ownership moves; CRDT models are explicitly multi-writer/convergent. This is an additive semantic API intended for runtime policy and Behavior Manifest admission, not a new claim of generic linearizable shared state.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
