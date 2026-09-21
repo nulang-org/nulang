@@ -6111,7 +6111,7 @@ match { a: 2, b: 9 } with {
         let mut rt = Runtime::new();
         let actor_id = rt.spawn_actor(Box::new(|| vec![]));
         rt.actors.get_mut(&actor_id).unwrap().flight_recorder =
-            crate::runtime::actor::FlightRecorder::new(1000);
+            crate::runtime::FlightRecorder::new(1000);
 
         // Send three messages
         rt.send_message_by_id(actor_id, 1, &[Value::int(10)]);
@@ -6135,7 +6135,7 @@ match { a: 2, b: 9 } with {
         let mut rt = Runtime::new();
         let actor_id = rt.spawn_actor(Box::new(|| vec![]));
         rt.actors.get_mut(&actor_id).unwrap().flight_recorder =
-            crate::runtime::actor::FlightRecorder::new(1000);
+            crate::runtime::FlightRecorder::new(1000);
         // Opt in to recording, send 3, and check.
         for i in 0..3 {
             rt.send_message_by_id(actor_id, (i % 10) as u16, &[Value::int(i)]);
