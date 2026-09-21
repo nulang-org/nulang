@@ -58,23 +58,28 @@ A compiler implementation may preserve source-origin metadata for diagnostics an
 specialized optimizations, but executable behavior must be expressible through the
 seven primitives above.
 
-## Canonical actor role
+## Canonical actor semantics
 
-Phase 1 introduced `primitives::ActorRole` as the single compatibility view over
-legacy `is_agent`, `is_workflow`, `is_organization`, and virtual-role flags.
+Phase 1 introduced `primitives::ActorRole` as a compatibility view over legacy
+`is_agent`, `is_workflow`, `is_organization`, and virtual-role flags. That removed
+independent precedence rules, but it still modeled orthogonal properties as one
+mutually exclusive role.
 
-Phase 2 extends that same role interpretation to live runtime actors and migrates the
-workflow runtime subsystem to consume `Actor::role()` instead of reading
-`is_workflow` directly. HIR, serialized `ActorMeta`, and live runtime actors therefore
-share one conflict rule and one semantic vocabulary while the legacy fields remain in
-place for compatibility.
+Phase 3 supersedes that model for new semantic code with the runtime-neutral
+`actor_semantics::ActorSemantics` normalization:
 
-New compiler/runtime code should use the canonical role instead of inventing its
-own precedence rules over boolean metadata. Conflicting specialized roles are an
-error.
+- durability is transient or durable;
+- activation is eager or virtual;
+- source origin is actor, agent, workflow, or organization.
 
-A later phase may replace the booleans in HIR/MIR/bytecode/runtime metadata with a
-single serialized role enum once all consumers have migrated.
+This means, for example, virtual activation can compose with agent/workflow origin
+instead of becoming a competing runtime species. The portable bytecode layer exposes
+`ActorMeta::semantics()`, so native code and compiler-only targets such as the browser
+playground share the same interpretation.
+
+`ActorRole` remains only as a compatibility view for legacy persisted fields and
+format migration. New compiler/runtime code should consume normalized semantics rather
+than inventing precedence rules over boolean metadata.
 
 ## Workflows
 
@@ -188,13 +193,14 @@ customer VPC, or other backend while preserving actor identity and message seman
 
 ## Compatibility
 
-Phases 1 and 2 are additive:
+The normalization phases are additive:
 
 - no source syntax is removed;
-- `agent` and `workflow` continue to lower to actors;
+- `agent`, `workflow`, and `state_machine` lower to actors before MIR;
+- `agent` and `workflow` no longer have distinct HIR declaration variants;
+- compile-time-only database/signal/given metadata is filtered before HIR;
 - legacy role booleans remain serialized for compatibility;
-- HIR, bytecode metadata, and live runtime actors share `ActorRole` interpretation;
-- the workflow subsystem consumes canonical roles without changing persisted state;
+- bytecode metadata and live runtime actors expose normalized actor semantics;
 - timer-wheel wake variants map to `TimeOperation` without changing timer formats;
 - delivery/effect vocabulary is tightened without weakening existing execution APIs.
 
