@@ -581,7 +581,6 @@ fn stress_orphaned_actor_cleanup() {
                 ("idx".into(), Value::int(i as i64)),
             ]
         }));
-        declare_stress_behavior(&mut rt, id, "work");
         actors.push(id);
     }
 
@@ -1248,6 +1247,7 @@ fn stress_reduction_yield_under_pressure() {
                 ("quota".into(), Value::int(5)),
             ]
         }));
+        declare_stress_behavior(&mut rt, id, "work");
         actors.push(id);
     }
 
