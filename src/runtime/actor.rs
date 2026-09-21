@@ -649,6 +649,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn suspension_reason_preserves_vm_semantics() {
+        assert_eq!(
+            SuspensionReason::from_vm(crate::types::VmSuspension::SignalWait),
+            SuspensionReason::SignalWait
+        );
+        assert_eq!(
+            SuspensionReason::from_vm(crate::types::VmSuspension::ReceiveWait),
+            SuspensionReason::ReceiveWait
+        );
+        assert_eq!(
+            SuspensionReason::from_vm(crate::types::VmSuspension::PerformAsync),
+            SuspensionReason::AsyncEffect
+        );
+    }
+
+    #[test]
     fn test_actor_new() {
         let actor = Actor::new(1, "test", 0);
         assert_eq!(actor.id, 1);
