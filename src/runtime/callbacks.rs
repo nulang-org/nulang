@@ -1363,19 +1363,25 @@ fn id_arg(constants: &[crate::bytecode::Constant], args: &[crate::vm::Value], id
 /// external state that is absent from the reactive dependency set.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct QueryPurityGuard {
-    violation: Rc<RefCell<Option<String>>>,
+    violation: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl QueryPurityGuard {
     pub(crate) fn record(&self, operation: impl Into<String>) {
-        let mut slot = self.violation.borrow_mut();
+        let mut slot = self
+            .violation
+            .lock()
+            .expect("query purity guard mutex poisoned");
         if slot.is_none() {
             *slot = Some(operation.into());
         }
     }
 
     pub(crate) fn take(&self) -> Option<String> {
-        self.violation.borrow_mut().take()
+        self.violation
+            .lock()
+            .expect("query purity guard mutex poisoned")
+            .take()
     }
 }
 
