@@ -1,14 +1,9 @@
-//! Compiler/package-produced semantic sidecar for deployable Nulang artifacts.
+//! Compiler/package-produced RFC 0020 Behavior Manifest.
 //!
-//! RFC 0020 defines the long-term Behavior Manifest contract between Nulang
-//! and deployment systems such as Nulang Cloud. This module implements the
-//! first deliberately narrow slice of that contract: exact artifact binding,
-//! package/compiler identity, reproducible provenance, and explicitly labelled
-//! package-declared authority requirements.
-//!
-//! Semantic inventories that are not yet compiler-emitted are represented as
-//! incomplete rather than guessed from source text. Cloud and other consumers
-//! must therefore treat the completeness markers as part of admission policy.
+//! The public JSON shape in this module intentionally mirrors
+//! `spec/behavior/v0alpha1.schema.json`. Compiler-internal analysis may be
+//! richer, but anything emitted with schema identity
+//! `nulang.behavior/v0alpha1` must remain valid against that checked schema.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -21,9 +16,14 @@ use crate::format::constants::LANGUAGE_VERSION_STR;
 use crate::package::identity::source_id_for_package_dir;
 use crate::package::lockfile::LOCKFILE_FILE;
 use crate::package::manifest::Manifest;
-use crate::semantic_inventory::CompilerSemanticInventory;
+use crate::semantic_inventory::{
+    classify_effect_for_manifest, CompilerSemanticInventory,
+};
 
 pub const BEHAVIOR_MANIFEST_SCHEMA: &str = "nulang.behavior/v0alpha1";
+pub const COMPLETENESS_EXTENSION: &str = "nulang.org/completeness";
+pub const PACKAGE_CAPABILITIES_EXTENSION: &str = "nulang.org/package-capabilities";
+pub const COMPILER_SEMANTICS_EXTENSION: &str = "nulang.org/compiler-semantics";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BehaviorManifest {
@@ -32,21 +32,22 @@ pub struct BehaviorManifest {
     pub artifact: ArtifactBinding,
     pub compiler: CompilerIdentity,
     #[serde(default)]
-    pub interfaces: Vec<serde_json::Value>,
+    pub interfaces: Vec<BehaviorInterface>,
     #[serde(default)]
-    pub actors: Vec<serde_json::Value>,
+    pub actors: Vec<BehaviorActor>,
     #[serde(default)]
-    pub effects: Vec<serde_json::Value>,
+    pub effects: Vec<BehaviorEffect>,
     #[serde(default)]
-    pub authority: Vec<AuthorityRequirement>,
+    pub authority: Vec<BehaviorAuthority>,
     #[serde(default)]
-    pub durability: Vec<serde_json::Value>,
+    pub durability: Vec<BehaviorDurability>,
     #[serde(default)]
-    pub replay: Vec<serde_json::Value>,
+    pub replay: Vec<BehaviorReplay>,
     #[serde(default)]
     pub resources: BTreeMap<String, serde_json::Value>,
     pub provenance: Provenance,
-    pub completeness: SemanticCompleteness,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,20 +67,72 @@ pub struct ArtifactBinding {
 pub struct CompilerIdentity {
     pub implementation: String,
     pub version: String,
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthorityRequirement {
-    pub capability: String,
-    pub source: String,
-    pub status: String,
+pub struct BehaviorInterface {
+    pub name: String,
+    pub input: String,
+    pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorActor {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    pub durability: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_schema: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorEffect {
+    pub effect: String,
+    pub class: String,
+    pub determinism: String,
+    pub replay: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_class: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorAuthority {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<String>,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorDurability {
+    pub owner: String,
+    pub persistence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration_contract: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorReplay {
+    pub effect: String,
+    pub class: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
-    pub source_tree: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dependency_lock: Option<String>,
+    pub source_digest: String,
+    pub dependency_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interface_digests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_schema_digests: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,12 +146,12 @@ pub struct SemanticCompleteness {
 }
 
 impl BehaviorManifest {
-    /// Build the first RFC 0020 sidecar for an already-emitted portable WASM
-    /// artifact.
+    /// Build the artifact/provenance slice of RFC 0020 for an already-emitted
+    /// portable WASM artifact.
     ///
-    /// This function intentionally does not parse source to infer effects,
-    /// actors, or durability. Those facts belong to the checked compiler
-    /// pipeline and will be populated by later RFC 0020 implementation slices.
+    /// Package-declared capabilities are configuration, not compiler proof, so
+    /// v0alpha1 records them under an advisory namespaced extension rather than
+    /// the normative `authority` array.
     pub fn for_wasm(
         package_root: &Path,
         package_manifest: &Manifest,
@@ -109,7 +162,7 @@ impl BehaviorManifest {
             path: wasm_path.to_path_buf(),
             source,
         })?;
-        let artifact_digest = format!("blake3:{}", blake3::hash(&wasm).to_hex());
+        let artifact_digest = digest_bytes(&wasm);
 
         let source_id =
             source_id_for_package_dir(package_root).map_err(|source| BehaviorManifestError::Io {
@@ -119,16 +172,27 @@ impl BehaviorManifest {
             })?;
 
         let lock_path = package_root.join(LOCKFILE_FILE);
-        let dependency_lock = if lock_path.exists() {
+        let dependency_digest = if lock_path.exists() {
             let bytes = fs::read(&lock_path).map_err(|source| BehaviorManifestError::Io {
                 operation: "read dependency lockfile",
                 path: lock_path.clone(),
                 source,
             })?;
-            Some(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
+            digest_bytes(&bytes)
         } else {
-            None
+            // Canonical empty dependency graph for callers that construct a
+            // manifest before a lockfile is materialized.
+            digest_bytes(&[])
         };
+
+        let compiler_path =
+            std::env::current_exe().map_err(BehaviorManifestError::CurrentExecutable)?;
+        let compiler_bytes =
+            fs::read(&compiler_path).map_err(|source| BehaviorManifestError::Io {
+                operation: "read compiler executable",
+                path: compiler_path,
+                source,
+            })?;
 
         let declared_capabilities: BTreeSet<String> = package_manifest
             .package
@@ -136,14 +200,27 @@ impl BehaviorManifest {
             .iter()
             .cloned()
             .collect();
-        let authority = declared_capabilities
-            .into_iter()
-            .map(|capability| AuthorityRequirement {
-                capability,
-                source: "package-manifest".to_string(),
-                status: "declared-not-inferred".to_string(),
+
+        let mut extensions = BTreeMap::new();
+        extensions.insert(
+            COMPLETENESS_EXTENSION.to_string(),
+            serde_json::to_value(SemanticCompleteness {
+                interfaces: "not-emitted".to_string(),
+                actors: "not-emitted".to_string(),
+                effects: "not-emitted".to_string(),
+                authority: "not-emitted".to_string(),
+                durability: "not-emitted".to_string(),
+                replay: "not-emitted".to_string(),
             })
-            .collect();
+            .map_err(BehaviorManifestError::Json)?,
+        );
+        if !declared_capabilities.is_empty() {
+            extensions.insert(
+                PACKAGE_CAPABILITIES_EXTENSION.to_string(),
+                serde_json::to_value(declared_capabilities.into_iter().collect::<Vec<_>>())
+                    .map_err(BehaviorManifestError::Json)?,
+            );
+        }
 
         Ok(Self {
             schema: BEHAVIOR_MANIFEST_SCHEMA.to_string(),
@@ -159,84 +236,178 @@ impl BehaviorManifest {
             compiler: CompilerIdentity {
                 implementation: "nulang-rust".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                digest: digest_bytes(&compiler_bytes),
             },
             interfaces: Vec::new(),
             actors: Vec::new(),
             effects: Vec::new(),
-            authority,
+            authority: Vec::new(),
             durability: Vec::new(),
             replay: Vec::new(),
             resources: BTreeMap::new(),
             provenance: Provenance {
-                source_tree: format!("nulang-source-id-v1:{source_id}"),
-                dependency_lock,
+                source_digest: format!("blake3:{source_id}"),
+                dependency_digest,
+                interface_digests: Vec::new(),
+                state_schema_digests: Vec::new(),
             },
-            completeness: SemanticCompleteness {
-                interfaces: "not-emitted".to_string(),
-                actors: "not-emitted".to_string(),
-                effects: "not-emitted".to_string(),
-                authority: "package-declared-only".to_string(),
-                durability: "not-emitted".to_string(),
-                replay: "not-emitted".to_string(),
-            },
+            extensions,
         })
     }
 
-    /// Merge compiler-derived semantics into the artifact-bound package
-    /// manifest. The compiler inventory is authoritative for program meaning;
-    /// package declarations remain visible as user-declared configuration.
+    /// Merge compiler-owned semantic analysis into the schema-valid public
+    /// Behavior Manifest. Rich per-subject compiler detail remains available
+    /// under a namespaced advisory extension; normative v0alpha1 fields use the
+    /// schema's stable actor/effect/authority/durability/replay shapes.
     pub fn with_compiler_semantics(
         mut self,
         inventory: &CompilerSemanticInventory,
     ) -> Result<Self, BehaviorManifestError> {
-        self.effects = inventory
-            .effects
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(BehaviorManifestError::Json)?;
         self.actors = inventory
             .actors
             .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(BehaviorManifestError::Json)?;
+            .map(|actor| BehaviorActor {
+                name: actor.name.clone(),
+                protocol: actor.protocol_id.clone(),
+                durability: actor.durability.clone(),
+                state_schema: None,
+            })
+            .collect();
 
-        for capability in &inventory.required_authority {
-            self.authority.push(AuthorityRequirement {
-                capability: capability.clone(),
-                source: "compiler-effect-inference".to_string(),
-                status: "required-category".to_string(),
-            });
-        }
-        self.authority.sort_by(|left, right| {
-            (&left.capability, &left.source).cmp(&(&right.capability, &right.source))
-        });
-        self.authority.dedup_by(|left, right| {
-            left.capability == right.capability
-                && left.source == right.source
-                && left.status == right.status
-        });
+        self.durability = inventory
+            .actors
+            .iter()
+            .map(|actor| BehaviorDurability {
+                owner: actor.name.clone(),
+                persistence: actor.durability.clone(),
+                schema: None,
+                migration_contract: None,
+            })
+            .collect();
 
-        self.completeness.actors = "compiler-derived-with-per-actor-status".to_string();
-        self.completeness.effects = "compiler-module-conservative".to_string();
-        self.completeness.authority =
-            "compiler-inferred-categories+package-declared".to_string();
+        let effect_names: BTreeSet<String> = inventory
+            .effects
+            .iter()
+            .flat_map(|entry| entry.effects.iter().cloned())
+            .collect();
+        self.effects = effect_names
+            .iter()
+            .map(|effect| {
+                let class = classify_effect_for_manifest(effect);
+                BehaviorEffect {
+                    effect: effect.clone(),
+                    class: class.class.to_string(),
+                    determinism: class.determinism.to_string(),
+                    replay: class.effect_replay.to_string(),
+                    cost_class: None,
+                }
+            })
+            .collect();
+        self.replay = effect_names
+            .iter()
+            .map(|effect| {
+                let class = classify_effect_for_manifest(effect);
+                BehaviorReplay {
+                    effect: effect.clone(),
+                    class: class.replay_class.to_string(),
+                }
+            })
+            .collect();
+
+        self.authority = inventory
+            .required_authority
+            .iter()
+            .map(|category| match category.as_str() {
+                "fs" => BehaviorAuthority {
+                    kind: "filesystem".to_string(),
+                    resource: Some("*".to_string()),
+                    operations: Vec::new(),
+                    required: true,
+                },
+                "net" => BehaviorAuthority {
+                    kind: "network".to_string(),
+                    resource: Some("*".to_string()),
+                    operations: Vec::new(),
+                    required: true,
+                },
+                "os" => BehaviorAuthority {
+                    kind: "custom".to_string(),
+                    resource: Some("nulang:host/os".to_string()),
+                    operations: Vec::new(),
+                    required: true,
+                },
+                other => BehaviorAuthority {
+                    kind: "custom".to_string(),
+                    resource: Some(format!("nulang:authority/{other}")),
+                    operations: Vec::new(),
+                    required: true,
+                },
+            })
+            .collect();
+
+        self.extensions.insert(
+            COMPILER_SEMANTICS_EXTENSION.to_string(),
+            serde_json::to_value(inventory).map_err(BehaviorManifestError::Json)?,
+        );
+
+        let has_open_effects = inventory.effects.iter().any(|entry| entry.open);
+        let previous = self.completeness().unwrap_or(SemanticCompleteness {
+            interfaces: "not-emitted".to_string(),
+            actors: "not-emitted".to_string(),
+            effects: "not-emitted".to_string(),
+            authority: "not-emitted".to_string(),
+            durability: "not-emitted".to_string(),
+            replay: "not-emitted".to_string(),
+        });
+        self.set_completeness(SemanticCompleteness {
+            interfaces: previous.interfaces,
+            actors: "compiler-derived-with-per-actor-status".to_string(),
+            effects: if has_open_effects {
+                "compiler-open-conservative".to_string()
+            } else {
+                "compiler-module-conservative".to_string()
+            },
+            authority: if has_open_effects {
+                "compiler-inferred-categories-open".to_string()
+            } else {
+                "compiler-inferred-categories".to_string()
+            },
+            durability: "compiler-persistence-class-no-schema".to_string(),
+            replay: if has_open_effects {
+                "compiler-conservative-open".to_string()
+            } else {
+                "compiler-conservative-effect-classification".to_string()
+            },
+        })?;
 
         Ok(self)
     }
 
+    pub fn completeness(&self) -> Option<SemanticCompleteness> {
+        self.extensions
+            .get(COMPLETENESS_EXTENSION)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    pub fn set_completeness(
+        &mut self,
+        completeness: SemanticCompleteness,
+    ) -> Result<(), BehaviorManifestError> {
+        self.extensions.insert(
+            COMPLETENESS_EXTENSION.to_string(),
+            serde_json::to_value(completeness).map_err(BehaviorManifestError::Json)?,
+        );
+        Ok(())
+    }
+
     /// Deterministic JSON bytes used as the canonical v0alpha1 representation.
-    ///
-    /// Struct field order is fixed by this schema, maps are BTreeMaps, and
-    /// set-like authority declarations are sorted before construction.
     pub fn canonical_json(&self) -> Result<Vec<u8>, BehaviorManifestError> {
         serde_json::to_vec(self).map_err(BehaviorManifestError::Json)
     }
 
     pub fn digest(&self) -> Result<String, BehaviorManifestError> {
-        let bytes = self.canonical_json()?;
-        Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
+        Ok(digest_bytes(&self.canonical_json()?))
     }
 
     /// Write the human-readable sidecar next to the portable artifact.
@@ -259,6 +430,10 @@ impl BehaviorManifest {
     }
 }
 
+fn digest_bytes(bytes: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
 #[derive(Debug)]
 pub enum BehaviorManifestError {
     Io {
@@ -266,6 +441,7 @@ pub enum BehaviorManifestError {
         path: PathBuf,
         source: std::io::Error,
     },
+    CurrentExecutable(std::io::Error),
     Json(serde_json::Error),
     InvalidArtifactPath(PathBuf),
 }
@@ -278,6 +454,9 @@ impl fmt::Display for BehaviorManifestError {
                 path,
                 source,
             } => write!(f, "{operation} at {} failed: {source}", path.display()),
+            Self::CurrentExecutable(source) => {
+                write!(f, "cannot identify compiler executable: {source}")
+            }
             Self::Json(source) => write!(f, "behavior manifest JSON failed: {source}"),
             Self::InvalidArtifactPath(path) => {
                 write!(f, "invalid compiled artifact path: {}", path.display())
@@ -322,35 +501,46 @@ capabilities = ["net", "fs", "net"]
     }
 
     #[test]
-    fn first_slice_binds_exact_artifact_and_labels_incomplete_semantics() {
-        let (root, package, wasm_path) = fixture("binding");
+    fn artifact_slice_matches_public_v0alpha1_shape() {
+        let (root, package, wasm_path) = fixture("shape");
         let manifest = BehaviorManifest::for_wasm(&root, &package, &wasm_path).unwrap();
+        let value = serde_json::to_value(&manifest).unwrap();
 
-        let expected = format!(
-            "blake3:{}",
-            blake3::hash(&fs::read(&wasm_path).unwrap()).to_hex()
-        );
-        assert_eq!(manifest.schema, BEHAVIOR_MANIFEST_SCHEMA);
-        assert_eq!(manifest.artifact.digest, expected);
-        assert_eq!(manifest.package.language_version, LANGUAGE_VERSION_STR);
-        assert_eq!(manifest.completeness.effects, "not-emitted");
-        assert_eq!(manifest.completeness.authority, "package-declared-only");
+        assert_eq!(value["schema"], BEHAVIOR_MANIFEST_SCHEMA);
+        assert!(value.get("completeness").is_none());
+        assert!(value["compiler"]["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("blake3:") && digest.len() == 71));
+        assert!(value["provenance"]["source_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("blake3:") && digest.len() == 71));
+        assert!(value["provenance"]["dependency_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("blake3:") && digest.len() == 71));
+        assert!(manifest.authority.is_empty());
         assert_eq!(
             manifest
-                .authority
+                .extensions
+                .get(PACKAGE_CAPABILITIES_EXTENSION)
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
                 .iter()
-                .map(|entry| entry.capability.as_str())
+                .filter_map(serde_json::Value::as_str)
                 .collect::<Vec<_>>(),
             vec!["fs", "net"]
         );
+
+        let completeness = manifest.completeness().unwrap();
+        assert_eq!(completeness.effects, "not-emitted");
+        assert_eq!(completeness.authority, "not-emitted");
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn compiler_semantics_promote_effect_actor_and_authority_completeness() {
+    fn compiler_semantics_map_into_public_v0alpha1_fields() {
         use crate::semantic_inventory::{
-            SemanticActor, SemanticBehavior, SemanticEffect,
-            COMPILER_SEMANTIC_INVENTORY_SCHEMA,
+            CompilerSemanticInventory, SemanticActor, SemanticBehavior,
+            SemanticEffect, COMPILER_SEMANTIC_INVENTORY_SCHEMA,
         };
 
         let (root, package, wasm_path) = fixture("semantics");
@@ -359,11 +549,12 @@ capabilities = ["net", "fs", "net"]
             effects: vec![SemanticEffect {
                 subject_kind: "function".to_string(),
                 subject: "fetch".to_string(),
-                effects: vec!["Net".to_string()],
+                effects: vec!["Net".to_string(), "IO".to_string()],
                 open: false,
             }],
             actors: vec![SemanticActor {
                 name: "Worker".to_string(),
+                durability: "durable".to_string(),
                 protocol_id: Some(format!("blake3:{}", "a".repeat(64))),
                 protocol_status: "complete".to_string(),
                 protocol_error: None,
@@ -380,19 +571,29 @@ capabilities = ["net", "fs", "net"]
             .unwrap()
             .with_compiler_semantics(&inventory)
             .unwrap();
+        let value = serde_json::to_value(&manifest).unwrap();
 
-        assert_eq!(manifest.effects.len(), 1);
-        assert_eq!(manifest.actors.len(), 1);
-        assert_eq!(manifest.completeness.effects, "compiler-module-conservative");
+        assert_eq!(manifest.actors[0].name, "Worker");
+        assert_eq!(manifest.actors[0].durability, "durable");
+        assert_eq!(manifest.durability[0].persistence, "durable");
         assert_eq!(
-            manifest.completeness.authority,
-            "compiler-inferred-categories+package-declared"
+            manifest.effects.iter().map(|e| e.effect.as_str()).collect::<Vec<_>>(),
+            vec!["IO", "Net"]
         );
-        assert!(manifest.authority.iter().any(|entry| {
-            entry.capability == "net"
-                && entry.source == "compiler-effect-inference"
-                && entry.status == "required-category"
-        }));
+        assert!(manifest
+            .authority
+            .iter()
+            .any(|authority| authority.kind == "network" && authority.required));
+        assert!(manifest
+            .replay
+            .iter()
+            .any(|entry| entry.effect == "Net" && entry.class == "external-nonreplayable"));
+        assert!(value.get("completeness").is_none());
+        assert_eq!(
+            value["extensions"][COMPLETENESS_EXTENSION]["effects"],
+            "compiler-module-conservative"
+        );
+        assert!(value["extensions"].get(COMPILER_SEMANTICS_EXTENSION).is_some());
         let _ = fs::remove_dir_all(root);
     }
 
