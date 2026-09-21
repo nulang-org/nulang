@@ -1574,6 +1574,32 @@ fn test_tier2_dense_counter_tracks_only_typed_regions() {
 }
 
 #[test]
+fn test_tier2_failed_static_promotion_is_terminal() {
+    use crate::jit::typed_compiler::infer_reg_types;
+
+    // This arithmetic loop is typed but has no array pattern for the SIMD
+    // analyzer. Force the counter to the promotion boundary and verify one
+    // failed static analysis disables future tier-2 bookkeeping.
+    let module = make_int_loop_module(2000);
+    let meta = infer_reg_types(&module, 5);
+    let mut jit = make_jit();
+    unsafe {
+        jit.compile_region_typed(
+            0,
+            5,
+            7,
+            &module.instructions,
+            Some(&meta),
+            &std::collections::HashMap::new(),
+        )
+        .expect("typed region should compile");
+    }
+    jit.set_tier2_state(0, 5, (TIER2_THRESHOLD - 1) as u32);
+    jit.record_tier2_and_maybe_promote(0, 5, &module);
+    assert_eq!(jit.tier2_state(0, 5), TIER2_DISABLED);
+}
+
+#[test]
 fn test_tier2_counters_are_per_session() {
     use crate::jit::typed_compiler::infer_reg_types;
 
