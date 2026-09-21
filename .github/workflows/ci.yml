@@ -233,7 +233,7 @@ jobs:
           )
           test -f "$tmp/portable-pkg/.nula/dist/portable-pkg.wasm"
           test -f "$tmp/portable-pkg/.nula/dist/portable-pkg.behavior.json"
-          python3 - "$tmp/portable-pkg/.nula/dist/portable-pkg.wasm" "$tmp/portable-pkg/.nula/dist/portable-pkg.behavior.json" <<\'PY\'
+          python3 - "$tmp/portable-pkg/.nula/dist/portable-pkg.wasm" "$tmp/portable-pkg/.nula/dist/portable-pkg.behavior.json" <<'PY'
           import json, pathlib, sys
           wasm = pathlib.Path(sys.argv[1])
           manifest = pathlib.Path(sys.argv[2])
