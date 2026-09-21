@@ -166,10 +166,7 @@ impl RetainedArtifact {
         })
     }
 
-    pub fn restore_module(
-        &self,
-        requested: ArtifactId,
-    ) -> io::Result<crate::bytecode::CodeModule> {
+    pub fn restore_module(&self, requested: ArtifactId) -> io::Result<crate::bytecode::CodeModule> {
         if self.artifact_id != requested {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -182,7 +179,10 @@ impl RetainedArtifact {
         if *blake3::hash(&self.nbc_bytes).as_bytes() != self.nbc_digest {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("retained NBC bytes for {} failed digest verification", requested),
+                format!(
+                    "retained NBC bytes for {} failed digest verification",
+                    requested
+                ),
             ));
         }
         let manifest =
@@ -665,7 +665,9 @@ impl JsonFileStore {
     }
 
     fn artifact_dir(&self, artifact_id: ArtifactId) -> PathBuf {
-        self.base_dir.join("artifacts").join(artifact_id.to_string())
+        self.base_dir
+            .join("artifacts")
+            .join(artifact_id.to_string())
     }
 }
 
