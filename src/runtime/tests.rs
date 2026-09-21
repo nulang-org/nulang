@@ -1861,6 +1861,128 @@ fn test_persistent_string_state_survives_checkpoint_and_recovery() {
     assert!(!restored.is_nil(), "restored string must not be nil");
 }
 #[test]
+fn test_checkpoint_rejects_unsupported_heap_state_without_overwriting_snapshot() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("payload".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("payload".to_string(), Value::int(7))]),
+        models,
+    );
+
+    // Establish a known-good durable snapshot.
+    rt.checkpoint_actor(actor_id);
+    let baseline = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(baseline.state.get("payload"), Some(&PersistedValue::Int(7)));
+
+    // Arrays do not yet have a stable PersistedValue codec. The checkpoint
+    // must fail closed and leave the last good snapshot untouched rather than
+    // silently replacing the field with Nil.
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        let ptr = actor
+            .heap
+            .alloc(std::mem::size_of::<Value>(), TypeTag::Array)
+            .unwrap();
+        let array = unsafe { Value::ptr(ptr) };
+        actor.set_state_field("payload", array);
+    }
+    rt.checkpoint_actor(actor_id);
+
+    let after = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(after.sequence, baseline.sequence);
+    assert_eq!(
+        after.state.get("payload"),
+        Some(&PersistedValue::Int(7)),
+        "unsupported durable state must not be rewritten as Nil"
+    );
+}
+
+#[test]
+fn test_persistent_native_call_rejects_unjournalable_payload_before_mutation() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        models,
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("mutate", |actor, _args| {
+            actor.set_state_field("count", Value::int(99));
+        });
+    let behavior_id = rt.behavior_id_for(actor_id, "mutate").unwrap();
+
+    let unsupported = {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        let ptr = actor
+            .heap
+            .alloc(std::mem::size_of::<Value>(), TypeTag::Tuple)
+            .unwrap();
+        unsafe { Value::ptr(ptr) }
+    };
+
+    let result = rt.ask_actor_sync(actor_id, behavior_id, &[unsupported]);
+    assert!(result.is_err());
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "persistent mutation must not run when its journal payload cannot be encoded"
+    );
+    assert!(
+        rt.persistence.read_journal(actor_id).is_empty(),
+        "failed durable admission must not append a partial journal entry"
+    );
+}
+
+#[test]
+fn test_scheduler_rejects_unjournalable_persistent_message_before_mutation() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        models,
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("mutate", |actor, _args| {
+            actor.set_state_field("count", Value::int(99));
+        });
+
+    let unsupported = {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        let ptr = actor
+            .heap
+            .alloc(std::mem::size_of::<Value>(), TypeTag::Record)
+            .unwrap();
+        unsafe { Value::ptr(ptr) }
+    };
+
+    rt.send_message(actor_id, "mutate", &[unsupported]);
+    rt.step_actor(actor_id);
+
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "scheduler must not execute a persistent turn that failed journal admission"
+    );
+    assert!(rt.persistence.read_journal(actor_id).is_empty());
+    assert_eq!(rt.dlq_depth(), 1);
+}
+
+#[test]
 fn test_local_state_is_not_persisted() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
@@ -4062,10 +4184,12 @@ fn test_actor_migration_between_two_nodes() {
                 .copied()
                 .unwrap_or(crate::runtime::persistence::StateModel::Local);
             if model == crate::runtime::persistence::StateModel::Durable || model.is_crdt() {
-                let persisted = crate::runtime::persistence::PersistedValue::from_value_resolved(
-                    value,
-                    actor.bytecode_module.as_ref(),
-                );
+                let persisted =
+                    crate::runtime::persistence::PersistedValue::try_from_value_resolved(
+                        value,
+                        actor.bytecode_module.as_ref(),
+                    )
+                    .unwrap();
                 state.insert(name.clone(), persisted);
             }
         }
