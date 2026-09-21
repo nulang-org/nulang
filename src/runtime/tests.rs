@@ -1934,6 +1934,39 @@ fn test_event_sourced_counter_replays_from_event_log() {
 }
 
 #[test]
+fn test_recover_actor_rejects_schema_version_mismatch() {
+    let mut rt = Runtime::new();
+    let actor_id = 919_001;
+
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            sequence: 3,
+            schema_owner: Some("Counter".to_string()),
+            schema_version: 1,
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+
+    let mut module = CodeModule::new("schema-mismatch-recovery");
+    let mut meta = ActorMeta::new("Counter");
+    meta.persistent = true;
+    meta.version = 2;
+    module.actor_metadata.push(meta);
+    rt.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "recovery must fail closed until a v1 -> v2 migration executor exists"
+    );
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "incompatible persisted state must never become observable"
+    );
+}
+
+#[test]
 fn test_memory_store_latest_sequence() {
     let mut store = MemoryStore::new();
     let snapshot = ActorSnapshot {
