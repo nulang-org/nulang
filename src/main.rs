@@ -1016,6 +1016,7 @@ fn main() {
             &opts.with_capabilities,
             opts.store_path.as_deref(),
             opts.deny_warnings,
+            None,
         ) {
             print_error(&e, use_color);
             std::process::exit(exit_code(&e));
@@ -2547,7 +2548,8 @@ fn check_source(
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+    let (_ast, _tc, _effects) =
+        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
 
     if verbose {
         println!("Effect check passed.");
@@ -2638,15 +2640,13 @@ fn compile_source_to_nbc(
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (mut ast, type_checker) =
+    let (mut ast, type_checker, mut effect_checker) =
         run_frontend(source, None, false, with_capabilities, deny_warnings)?;
 
     // Optional web-framework pass: rewrite HTML for signals/actions and emit the
     // generic client-side micro-runtime. This runs after effect checking so
     // action placements are known.
     if let Some(client_js_path) = rewrite_signals {
-        let mut effect_checker = EffectChecker::new();
-        effect_checker.check_module(&ast.decls)?;
         for msg in &effect_checker.diagnostics {
             eprintln!("{}", msg);
         }
@@ -2884,7 +2884,7 @@ mod tests {
                 c
             }
         "#;
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+        let (ast, type_checker, _effects) = run_frontend(source, None, false, &[], false)
             .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
