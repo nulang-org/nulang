@@ -25,6 +25,14 @@ use crate::types::{NuError, NuResult};
 use crate::value_layout;
 use wasmtime::*;
 
+/// Default deterministic guest instruction budget for one WASM invocation.
+///
+/// The budget is intentionally generous for normal programs while still
+/// guaranteeing that a non-terminating guest eventually traps instead of
+/// monopolizing the host process. Cloud may enforce a tighter tenant-specific
+/// budget at its own runtime boundary.
+pub const DEFAULT_WASM_FUEL: u64 = 100_000_000;
+
 // ── Default configuration ────────────────────────────────────────────
 
 /// Create a Wasmtime `Config` with Nulang Cloud optimizations.
@@ -33,6 +41,7 @@ use wasmtime::*;
 /// - 4 GiB virtual memory reservation + 128 MiB guard region
 /// - Cranelift speed optimizations (includes inlining)
 /// - WASM SIMD proposal
+/// - deterministic fuel metering for runaway-guest termination
 pub fn default_wasm_config() -> Config {
     let mut config = Config::new();
     // Guard pages: reserve 4 GiB virtual, 128 MiB guard.
@@ -42,6 +51,9 @@ pub fn default_wasm_config() -> Config {
     config.cranelift_opt_level(OptLevel::Speed);
     // WASM SIMD proposal.
     config.wasm_simd(true);
+    // Deterministic execution budget. Stores receive fresh fuel before each
+    // guest invocation so a loop cannot pin the host indefinitely.
+    config.consume_fuel(true);
     config
 }
 
@@ -101,7 +113,10 @@ pub struct WasmRuntime {
 impl WasmRuntime {
     /// Compile WASM bytecode and instantiate with host imports.
     pub fn new(wasm_bytes: &[u8], config: Option<Config>) -> NuResult<Self> {
-        let config = config.unwrap_or_else(default_wasm_config);
+        let mut config = config.unwrap_or_else(default_wasm_config);
+        // A caller-supplied Config must not be able to accidentally disable
+        // the runtime's termination boundary.
+        config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(map_wasmtime_err)?;
 
         let res = Module::new(&engine, wasm_bytes);
@@ -111,6 +126,9 @@ impl WasmRuntime {
         let module = res.map_err(map_wasmtime_err)?;
 
         let mut store = Store::new(&engine, HostState::default());
+        store
+            .set_fuel(DEFAULT_WASM_FUEL)
+            .map_err(map_wasmtime_err)?;
 
         // Build a Linker and define all host imports.
         let mut linker: Linker<HostState> = Linker::new(&engine);
@@ -237,6 +255,11 @@ impl WasmRuntime {
     }
 
     pub fn run(&mut self) -> NuResult<crate::vm::Value> {
+        // Fuel is a per-invocation budget, not a lifetime allowance. Reset it
+        // here so a reusable runtime cannot inherit a partially depleted store.
+        self.store
+            .set_fuel(DEFAULT_WASM_FUEL)
+            .map_err(map_wasmtime_err)?;
         let raw = self.init_func.call(&mut self.store, ()).map_err(|e| {
             // Host functions report interpreter-parity runtime errors (type
             // errors, 48-bit overflow) via `Error::msg`; wasmtime wraps them
@@ -1022,6 +1045,9 @@ pub fn load_precompiled(cwasm_bytes: &[u8]) -> NuResult<WasmRuntime> {
     let module = unsafe { Module::deserialize(&engine, cwasm_bytes) }.map_err(map_wasmtime_err)?;
 
     let mut store = Store::new(&engine, HostState::default());
+    store
+        .set_fuel(DEFAULT_WASM_FUEL)
+        .map_err(map_wasmtime_err)?;
     let mut linker: Linker<HostState> = Linker::new(&engine);
 
     linker
@@ -1143,6 +1169,26 @@ mod tests {
         let engine = Engine::new(&config).unwrap();
         let result = Module::new(&engine, &[] as &[u8]);
         assert!(result.is_err(), "empty bytes should fail to parse");
+    }
+
+    #[test]
+    fn test_run_traps_when_guest_exhausts_fuel() {
+        let wasm = br#"(module
+            (import \"env\" \"memory\" (memory 1))
+            (func $start (result i64)
+                (loop $spin
+                    br $spin
+                )
+                i64.const 0
+            )
+            (export \"nulang_init\" (func $start))
+        )"#;
+        let mut runtime = WasmRuntime::new(wasm, None).expect("instantiate");
+        let err = runtime.run().expect_err("infinite guest must exhaust fuel");
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("fuel"),
+            "expected an out-of-fuel trap, got: {err}"
+        );
     }
 
     #[test]
