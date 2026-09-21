@@ -144,6 +144,9 @@ pub fn fresh_actor_id() -> u64 {
 /// `ACTOR_ID_COUNTER`'s start value of 1, so it can never collide with a
 /// real `fresh_actor_id()` result.
 const MAIN_HEAP_ACTOR_ID: u64 = 0;
+/// Bound outstanding tracked remote sends so a partition cannot grow
+/// correlation state without limit.
+const MAX_PENDING_REMOTE_ADMISSIONS: usize = 65_536;
 
 /// Maximum number of membership entries carried by a single gossip packet.
 const GOSSIP_PAYLOAD_MAX_ENTRIES: usize = 256;
@@ -363,6 +366,8 @@ pub struct Runtime {
     pub acked_packets: HashSet<u64>,
     /// Monotonic sender-local correlation id for tracked cross-node messages.
     next_remote_delivery_id: u64,
+    /// Destination node expected to answer each outstanding tracked send.
+    pending_remote_admissions: HashMap<u64, NodeId>,
     /// Terminal destination admission results received from remote nodes.
     remote_message_admissions: HashMap<u64, ActorAdmissionStatus>,
 
@@ -627,6 +632,7 @@ impl Runtime {
             cluster_config: ClusterConfig::default(),
             acked_packets: HashSet::new(),
             next_remote_delivery_id: 1,
+            pending_remote_admissions: HashMap::new(),
             remote_message_admissions: HashMap::new(),
             remote_links: supervision::RemoteLinkRegistry::new(),
             remote_monitors: supervision::RemoteMonitorRegistry::new(),
@@ -6590,18 +6596,47 @@ impl Runtime {
         admissions
     }
 
-    pub(crate) fn allocate_remote_delivery_id(&mut self) -> u64 {
-        let delivery_id = self.next_remote_delivery_id.max(1);
-        self.next_remote_delivery_id = delivery_id.wrapping_add(1).max(1);
-        delivery_id
+    pub(crate) fn begin_remote_delivery(&mut self, node_id: NodeId) -> Option<u64> {
+        if self.pending_remote_admissions.len() >= MAX_PENDING_REMOTE_ADMISSIONS {
+            return None;
+        }
+
+        // Skip ids that are still pending or have an unread terminal result.
+        for _ in 0..=MAX_PENDING_REMOTE_ADMISSIONS {
+            let delivery_id = self.next_remote_delivery_id.max(1);
+            self.next_remote_delivery_id = delivery_id.wrapping_add(1).max(1);
+            if !self.pending_remote_admissions.contains_key(&delivery_id)
+                && !self.remote_message_admissions.contains_key(&delivery_id)
+            {
+                self.pending_remote_admissions.insert(delivery_id, node_id);
+                return Some(delivery_id);
+            }
+        }
+        None
     }
 
     pub(crate) fn record_remote_admission(
         &mut self,
+        from_node: NodeId,
         delivery_id: u64,
         status: ActorAdmissionStatus,
-    ) {
+    ) -> bool {
+        if self.pending_remote_admissions.get(&delivery_id) != Some(&from_node) {
+            return false;
+        }
+        self.pending_remote_admissions.remove(&delivery_id);
         self.remote_message_admissions.insert(delivery_id, status);
+        true
+    }
+
+    /// Abandon an outstanding tracked delivery after an application timeout.
+    /// Returns true when the delivery id was still pending.
+    pub fn abandon_remote_admission(&mut self, delivery_id: u64) -> bool {
+        self.pending_remote_admissions.remove(&delivery_id).is_some()
+    }
+
+    pub fn pending_remote_admission_count(&self) -> usize {
+        self.pending_remote_admissions.len()
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
