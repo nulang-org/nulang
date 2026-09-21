@@ -8,13 +8,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::bytecode::{ActorMeta, CodeModule};
 use crate::runtime::actor::Actor;
-use crate::runtime::persistence::{
-    durable_schema_compatible, EventEntry, PersistedValue,
-};
+use crate::runtime::persistence::{durable_schema_compatible, EventEntry, PersistedValue};
 use crate::vm::Value;
 
-use super::migration::{persist_isolated_value, run_isolated_actor_function};
 use super::map_ast_state_model;
+use super::migration::{persist_isolated_value, run_isolated_actor_function};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EventReplayResult {
@@ -68,7 +66,11 @@ fn validate_apply_binding(
     meta: &ActorMeta,
     event: &str,
 ) -> Result<Option<usize>, String> {
-    let Some(handler) = meta.apply_handlers.iter().find(|handler| handler.event == event) else {
+    let Some(handler) = meta
+        .apply_handlers
+        .iter()
+        .find(|handler| handler.event == event)
+    else {
         return Ok(None);
     };
     if !handler.replay_safe {
@@ -85,12 +87,14 @@ fn validate_apply_binding(
             )
         })?;
     let expected_name = format!("{}.$apply_{}", meta.name, event);
-    let named_offset = module.function_offset_by_name(&expected_name).ok_or_else(|| {
-        format!(
-            "replay handler '{}.{}' is missing compiler-owned function '{}'",
-            meta.name, event, expected_name
-        )
-    })?;
+    let named_offset = module
+        .function_offset_by_name(&expected_name)
+        .ok_or_else(|| {
+            format!(
+                "replay handler '{}.{}' is missing compiler-owned function '{}'",
+                meta.name, event, expected_name
+            )
+        })?;
     if indexed_offset != named_offset {
         return Err(format!(
             "replay handler '{}.{}' binds function index {} at offset {}, but '{}' resolves to offset {}",
@@ -358,11 +362,9 @@ mod tests {
             "#,
         );
         let events = vec![entry(1, "count", 3)];
-        assert!(
-            replay_current_event_history(&module, 8, &events)
-                .unwrap()
-                .is_none()
-        );
+        assert!(replay_current_event_history(&module, 8, &events)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
