@@ -42,6 +42,9 @@ version + migration.*
 
 ## Stable tier
 
+### WASM package capability parity — 2026-09-21
+- **`nula build-wasm` now forwards manifest-declared resource capabilities** (`src/package/commands.rs`). Packages using gated effects such as `Http` receive the same `--with <cap>` compiler arguments on the canonical WASM build path as normal package builds and runs. A `wasm-backend` integration regression verifies a package declaring `capabilities = ["net"]` builds successfully and emits its WASM artifact.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
