@@ -512,8 +512,8 @@ pub enum StateConsistency {
 pub enum StateDurability {
     /// No recovery contract; the declared initial value is restored.
     Ephemeral,
-    /// Recover from a durable materialized state plus ordered mutation history.
-    SnapshotJournal,
+    /// Recover from a durable materialized/checkpointed representation.
+    Checkpointed,
     /// Recover by replaying an authoritative event history.
     EventLog,
 }
@@ -545,7 +545,7 @@ impl StateModel {
     pub const fn durability(self) -> StateDurability {
         match self {
             StateModel::Local => StateDurability::Ephemeral,
-            StateModel::Durable | StateModel::Crdt(_) => StateDurability::SnapshotJournal,
+            StateModel::Durable | StateModel::Crdt(_) => StateDurability::Checkpointed,
             StateModel::EventSourced => StateDurability::EventLog,
         }
     }
@@ -1290,7 +1290,7 @@ mod tests {
         );
         assert_eq!(
             StateModel::Durable.durability(),
-            StateDurability::SnapshotJournal
+            StateDurability::Checkpointed
         );
         assert!(StateModel::Durable.requires_single_writer());
 
@@ -1306,7 +1306,7 @@ mod tests {
 
         let crdt = StateModel::Crdt(CrdtType::ORSet);
         assert_eq!(crdt.consistency(), StateConsistency::Convergent);
-        assert_eq!(crdt.durability(), StateDurability::SnapshotJournal);
+        assert_eq!(crdt.durability(), StateDurability::Checkpointed);
         assert!(!crdt.requires_single_writer());
     }
 
