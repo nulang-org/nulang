@@ -1557,6 +1557,9 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Actor runtime BEAM-parity performance baselines — 2026-09-21
+- **Actor performance evidence is reproducible.** Adds same-host Nulang/BEAM spawn, mailbox-flood, and fan-out benchmarks plus a fixed-host density probe from 10k through 1M actors. The benchmark-only slice establishes the measurement gate for actor-density changes without changing runtime semantics.
+
 ### Standard-library Option lookup contracts — 2026-09-21
 - **Collection absence is explicit.** Experimental `stdlib::map.get`, `stdlib::list.index_of`, and `stdlib::list.find` now return `Option` instead of sentinel `-1` values. `max_of`, `min_of`, `min_by`, and `max_by` now return `None` for empty inputs. Conformance fixtures and stdlib tests pin the new contracts. This is source-breaking for Experimental stdlib callers that compared missing results with integer sentinels.
 

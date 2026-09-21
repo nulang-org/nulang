@@ -1,7 +1,7 @@
 //! Actor throughput benchmarks.
 
-use criterion::{black_box, criterion_group, Criterion};
-use nulang::runtime::Runtime;
+use criterion::{black_box, criterion_group, BatchSize, Criterion, Throughput};
+use nulang::runtime::{FlightRecorder, Runtime};
 use nulang::vm::Value;
 
 fn bench_spawn_send_receive(c: &mut Criterion) {
@@ -38,4 +38,33 @@ fn bench_message_throughput(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_spawn_send_receive, bench_message_throughput);
+/// Measures the cost of populating a fresh actor flight recorder through its
+/// configured 1,000-entry retention window. This specifically guards the
+/// actor-density optimization that makes the recorder's backing vector lazy:
+/// idle actors should reserve nothing, while the first 1,000 traced messages
+/// must remain reasonably cheap.
+fn bench_flight_recorder_fill(c: &mut Criterion) {
+    const ENTRIES: usize = 1_000;
+    let mut group = c.benchmark_group("actor/flight_recorder_fill");
+    group.throughput(Throughput::Elements(ENTRIES as u64));
+    group.bench_function("1000", |b| {
+        b.iter_batched(
+            || FlightRecorder::new(ENTRIES),
+            |mut recorder| {
+                for sender in 0..ENTRIES {
+                    recorder.record(sender as u64, 0, &[]);
+                }
+                black_box(recorder.len());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_spawn_send_receive,
+    bench_message_throughput,
+    bench_flight_recorder_fill
+);

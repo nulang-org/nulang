@@ -336,6 +336,121 @@ jobs:
           fi
 
   # -----------------------------------------------------------------------
+  # Same-host Nulang vs BEAM evidence — informational, never a merge ranking.
+  # Runs only on the dedicated benchmark PR so normal changes do not pay for
+  # installing Erlang or compiling the matched release harness.
+  # -----------------------------------------------------------------------
+  beam-parity-evidence:
+    name: Same-host Nulang vs BEAM actor baseline
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'perf/beam-parity')
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies and Erlang
+        run: sudo apt-get update && sudo apt-get install -y python3-dev erlang-base
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build matched Nulang harness
+        run: |
+          CARGO_TARGET_DIR=/tmp/nulang-beam-target \
+            cargo build --release --example beam_parity
+
+      - name: Run matched 1k / 10k actor workloads
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/beam-parity-results
+          /tmp/nulang-beam-target/release/examples/beam_parity 1000 10000 \
+            | tee /tmp/beam-parity-results/nulang.csv
+          escript benchmarks/beam/beam_parity.escript 1000 10000 \
+            | tee /tmp/beam-parity-results/beam.csv
+
+      - name: Render comparison
+        run: |
+          set -o pipefail
+          python3 scripts/compare_beam_parity.py \
+            --nulang /tmp/beam-parity-results/nulang.csv \
+            --beam /tmp/beam-parity-results/beam.csv \
+            | tee /tmp/beam-parity-results/summary.md
+          cat /tmp/beam-parity-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload same-host evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: beam-parity-${{ github.sha }}
+          path: /tmp/beam-parity-results
+          retention-days: 90
+
+  # -----------------------------------------------------------------------
+  # Actor density A/B gate — runs only for actor-density PR branches.
+  #
+  # Builds the PR base and head into separate target directories, then runs
+  # both binaries on the same hosted runner. This makes RSS/throughput ratios
+  # materially more useful than comparing unrelated CI jobs.
+  # -----------------------------------------------------------------------
+  actor-density:
+    name: Actor density A/B (10k / 100k)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'perf/actor-density')
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Create base worktree
+        run: git worktree add /tmp/nulang-density-base "${{ github.event.pull_request.base.sha }}"
+
+      - name: Build base and candidate probes
+        run: |
+          CARGO_TARGET_DIR=/tmp/nulang-density-target-base \
+            cargo build --manifest-path /tmp/nulang-density-base/Cargo.toml \
+              --release --example actor_density
+          CARGO_TARGET_DIR=/tmp/nulang-density-target-head \
+            cargo build --release --example actor_density
+
+      - name: Run same-host density ladder
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/nulang-density-results/base /tmp/nulang-density-results/candidate
+          for count in 10000 100000; do
+            /tmp/nulang-density-target-base/release/examples/actor_density "$count" \
+              | tee "/tmp/nulang-density-results/base/$count.txt"
+            /tmp/nulang-density-target-head/release/examples/actor_density "$count" \
+              | tee "/tmp/nulang-density-results/candidate/$count.txt"
+          done
+
+      - name: Compare memory and throughput
+        run: |
+          set -o pipefail
+          python3 scripts/compare_actor_density.py \
+            --base-dir /tmp/nulang-density-results/base \
+            --candidate-dir /tmp/nulang-density-results/candidate \
+            | tee /tmp/nulang-density-results/summary.md
+          cat /tmp/nulang-density-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload density evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: actor-density-${{ github.event.pull_request.number }}-${{ github.sha }}
+          path: /tmp/nulang-density-results
+          retention-days: 30
+
+  # -----------------------------------------------------------------------
   # Benchmarks — regression-gated against a rolling window of recent
   # main-branch history (see scripts/check_bench_regression.py and
   # benchmarks/README.md for the noise-aware methodology: each
