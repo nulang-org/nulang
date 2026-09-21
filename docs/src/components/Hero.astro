@@ -4,21 +4,10 @@ const { data } = entry;
 const { title = data.title, tagline, actions = [] } = data.hero || {};
 const PAGE_TITLE_ID = '_top';
 
-const codeHtml = [
-	'<span class="tok-comment">// counter.nula — a stateful actor</span>',
-	'<span class="tok-kw">actor</span> <span class="tok-type">Counter</span> {',
-	'  <span class="tok-kw">state</span> <span class="tok-id">count</span>: <span class="tok-type">Int</span> = <span class="tok-num">0</span>',
-	'',
-	'  <span class="tok-kw">behavior</span> <span class="tok-fn">inc</span>() {',
-	'    <span class="tok-kw">self</span>.<span class="tok-id">count</span> = <span class="tok-kw">self</span>.<span class="tok-id">count</span> + <span class="tok-num">1</span>',
-	'  }',
-	'}',
-	'',
-	'<span class="tok-kw">fn</span> <span class="tok-fn">main</span>() {',
-	'  <span class="tok-kw">let</span> <span class="tok-id">c</span> = <span class="tok-kw">spawn</span> <span class="tok-type">Counter</span> {}',
-	'  <span class="tok-id">c</span> ! <span class="tok-fn">inc</span>()',
-	'}',
-].join('\n');
+const starter = `let double = fn(x) { x * 2 }
+
+let answer = double(21)
+perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 ---
 
 <div class="hero hero-cloud">
@@ -43,30 +32,118 @@ const codeHtml = [
 									<path d="m12 5 7 7-7 7" />
 								</svg>
 							)}
-							{icon?.type === 'icon' && icon.name === 'external' && (
-								<svg aria-hidden="true" class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-									<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-									<polyline points="15 3 21 3 21 9" />
-									<line x1="10" y1="14" x2="21" y2="3" />
-								</svg>
-							)}
 						</a>
 					))}
 				</div>
 			)}
+			<div class="hero-proof">
+				<span>HM inference</span>
+				<span>Algebraic effects</span>
+				<span>Actors + supervision</span>
+			</div>
 		</div>
 	</div>
 
-	<div class="hero-terminal">
-		<div class="hero-terminal-bar">
-			<span class="t-dot t-red"></span>
-			<span class="t-dot t-yellow"></span>
-			<span class="t-dot t-green"></span>
-			<span class="t-title">counter.nula</span>
+	<div class="hero-playground" data-hero-playground>
+		<div class="hero-playground-head">
+			<div>
+				<span class="playground-kicker">CoreVM browser demo</span>
+				<strong>Run real Nulang here.</strong>
+			</div>
+			<a href="/playground/">Full playground ↗</a>
 		</div>
-		<pre class="hero-terminal-code"><code set:html={codeHtml}></code></pre>
+		<label class="sr-only" for="hero-source">Nulang source code</label>
+		<textarea id="hero-source" class="hero-source" spellcheck="false">{starter}</textarea>
+		<div class="hero-playground-footer">
+			<button class="hero-run" type="button" disabled>
+				<span class="run-label">Loading compiler…</span>
+				<span aria-hidden="true">▶</span>
+			</button>
+			<span class="hero-runtime-note">Runs locally in WebAssembly</span>
+		</div>
+		<pre class="hero-output" aria-live="polite">Compiler loading…</pre>
 	</div>
 </div>
+
+<script is:inline>
+	(function initHeroPlayground() {
+		const root = document.querySelector('[data-hero-playground]');
+		if (!root) return;
+
+		const source = root.querySelector('.hero-source');
+		const run = root.querySelector('.hero-run');
+		const label = root.querySelector('.run-label');
+		const output = root.querySelector('.hero-output');
+		if (!source || !run || !label || !output) return;
+
+		let wasm = null;
+
+		const setError = (message) => {
+			output.textContent = message;
+			output.classList.add('is-error');
+			run.disabled = true;
+			label.textContent = 'Compiler unavailable';
+		};
+
+		fetch('/playground/nulang_playground.wasm')
+			.then((response) => {
+				if (!response.ok) throw new Error('HTTP ' + response.status);
+				return response.arrayBuffer();
+			})
+			.then((bytes) => WebAssembly.instantiate(bytes, {}))
+			.then(({ instance }) => {
+				wasm = instance.exports;
+				if (
+					typeof wasm.nulang_alloc !== 'function' ||
+					typeof wasm.nulang_run !== 'function' ||
+					typeof wasm.nulang_free !== 'function'
+				) {
+					throw new Error('missing compiler exports');
+				}
+				run.disabled = false;
+				label.textContent = 'Run';
+				output.textContent = 'Compiler ready. Press Run.';
+			})
+			.catch(() => {
+				setError('Browser compiler unavailable. Open the full playground or build Nulang locally.');
+			});
+
+		function execute() {
+			if (!wasm) return;
+			output.classList.remove('is-error');
+			const encoded = new TextEncoder().encode(source.value);
+			const ptr = wasm.nulang_alloc(encoded.length);
+			new Uint8Array(wasm.memory.buffer, ptr, encoded.length).set(encoded);
+			try {
+				const resultPtr = wasm.nulang_run(ptr, encoded.length);
+				const len = new DataView(wasm.memory.buffer, resultPtr, 4).getUint32(0, true);
+				const json = new TextDecoder().decode(
+					new Uint8Array(wasm.memory.buffer, resultPtr + 4, len)
+				);
+				const result = JSON.parse(json);
+				if (result.ok) {
+					output.textContent = result.output || '(program produced no output)';
+				} else {
+					output.textContent = result.error || 'Compilation failed';
+					output.classList.add('is-error');
+				}
+			} catch (error) {
+				output.textContent = 'WASM trap: ' + error.message;
+				output.classList.add('is-error');
+			} finally {
+				wasm.nulang_free(ptr, encoded.length);
+			}
+		}
+
+		run.addEventListener('click', execute);
+		source.addEventListener('keydown', (event) => {
+			if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+				event.preventDefault();
+				execute();
+			}
+		});
+	})();
+</script>
 
 <style>
 	@layer starlight.core {
@@ -87,7 +164,7 @@ const codeHtml = [
 			background: color-mix(in srgb, var(--nu-surface) 88%, transparent);
 			color: var(--nu-text-secondary);
 			font-size: 0.75rem;
-			font-weight: 600;
+			font-weight: 650;
 			letter-spacing: 0.02em;
 		}
 
@@ -104,18 +181,19 @@ const codeHtml = [
 		}
 
 		h1 {
-			font-size: clamp(var(--sl-text-3xl), calc(0.25rem + 5vw), 3.5rem);
-			line-height: 1.08;
-			font-weight: 700;
-			letter-spacing: -0.03em;
+			max-width: 11ch;
+			font-size: clamp(3rem, 7vw, 4.75rem);
+			line-height: 0.98;
+			font-weight: 750;
+			letter-spacing: -0.055em;
 			color: var(--nu-text);
 		}
 
 		.tagline {
 			margin-top: 1.5rem;
-			font-size: clamp(var(--sl-text-base), calc(0.0625rem + 2vw), var(--sl-text-xl));
+			font-size: clamp(1rem, 1.7vw, 1.2rem);
 			color: var(--nu-text-secondary);
-			max-width: 36rem;
+			max-width: 39rem;
 			line-height: 1.65;
 		}
 
@@ -124,6 +202,175 @@ const codeHtml = [
 			display: flex;
 			flex-wrap: wrap;
 			gap: 0.875rem;
+		}
+
+		.hero-proof {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 0.6rem 1rem;
+			margin-top: 1.4rem;
+			color: var(--nu-text-tertiary);
+			font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+			font-size: 0.72rem;
+		}
+
+		.hero-proof span {
+			position: relative;
+			padding-left: 0.85rem;
+		}
+
+		.hero-proof span::before {
+			content: '';
+			position: absolute;
+			left: 0;
+			top: 0.45em;
+			width: 0.35rem;
+			height: 0.35rem;
+			border-radius: 50%;
+			background: var(--nu-blue);
+		}
+	}
+
+	.hero-playground {
+		overflow: hidden;
+		border: 1px solid color-mix(in srgb, var(--nu-blue) 20%, var(--nu-border));
+		border-radius: 1.15rem;
+		background: #0d1117;
+		box-shadow: 0 28px 70px rgba(15, 23, 42, 0.2);
+	}
+
+	.hero-playground-head {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 1rem;
+		padding: 1rem 1.1rem;
+		border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+		background: #121821;
+	}
+
+	.hero-playground-head div {
+		display: grid;
+		gap: 0.2rem;
+	}
+
+	.playground-kicker {
+		color: #93c5fd;
+		font-size: 0.66rem;
+		font-weight: 750;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+	}
+
+	.hero-playground-head strong {
+		color: #f8fafc;
+		font-size: 0.88rem;
+	}
+
+	.hero-playground-head a {
+		color: #cbd5e1;
+		font-size: 0.72rem;
+		font-weight: 650;
+		text-decoration: none;
+		white-space: nowrap;
+	}
+
+	.hero-playground-head a:hover {
+		color: #fff;
+	}
+
+	.hero-source,
+	.hero-output {
+		width: 100%;
+		margin: 0;
+		border: 0;
+		background: #0d1117;
+		color: #e2e8f0;
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		font-size: 0.8rem;
+		line-height: 1.6;
+	}
+
+	.hero-source {
+		min-height: 15rem;
+		padding: 1.15rem;
+		resize: vertical;
+		outline: none;
+	}
+
+	.hero-source:focus {
+		box-shadow: inset 0 0 0 2px #60a5fa;
+	}
+
+	.hero-playground-footer {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+		padding: 0.75rem 1rem;
+		border-top: 1px solid rgba(255, 255, 255, 0.08);
+		border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+		background: #121821;
+	}
+
+	.hero-run {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.5rem;
+		min-height: 2.35rem;
+		padding: 0.45rem 0.8rem;
+		border: 1px solid var(--nu-accent-high);
+		border-radius: 0.6rem;
+		background: var(--nu-accent-high);
+		color: #fff;
+		font: inherit;
+		font-size: 0.78rem;
+		font-weight: 750;
+		cursor: pointer;
+	}
+
+	.hero-run:disabled {
+		opacity: 0.55;
+		cursor: default;
+	}
+
+	.hero-runtime-note {
+		color: #94a3b8;
+		font-size: 0.68rem;
+	}
+
+	.hero-output {
+		min-height: 4.25rem;
+		padding: 0.85rem 1.1rem;
+		white-space: pre-wrap;
+		color: #86efac;
+	}
+
+	.hero-output.is-error {
+		color: #fca5a5;
+	}
+
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
+	}
+
+	@media (max-width: 40rem) {
+		.hero-playground-head,
+		.hero-playground-footer {
+			align-items: flex-start;
+			flex-direction: column;
+		}
+
+		.hero-source {
+			min-height: 13rem;
 		}
 	}
 </style>
