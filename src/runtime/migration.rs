@@ -709,12 +709,6 @@ pub(crate) fn migrate_snapshot_state(
             meta.name
         ));
     }
-    if history.has_event_history {
-        return Err(format!(
-            "state-only migration for '{}' refuses event-sourced history until event migration is implemented",
-            meta.name
-        ));
-    }
     if history.has_pending_message_journal {
         return Err(format!(
             "state-only migration for '{}' refuses old-schema journal entries newer than the snapshot",
@@ -739,20 +733,11 @@ pub(crate) fn migrate_snapshot_state(
     }
 
     for (field, model) in &meta.state_models {
-        match model {
-            crate::ast::StateModel::EventSourced => {
-                return Err(format!(
-                    "state-only migration for '{}' refuses event-sourced field '{}'",
-                    meta.name, field
-                ));
-            }
-            crate::ast::StateModel::Crdt(_) => {
-                return Err(format!(
-                    "state-only migration for '{}' refuses CRDT field '{}'",
-                    meta.name, field
-                ));
-            }
-            crate::ast::StateModel::Local | crate::ast::StateModel::Durable => {}
+        if matches!(model, crate::ast::StateModel::Crdt(_)) {
+            return Err(format!(
+                "state migration for '{}' refuses CRDT field '{}'",
+                meta.name, field
+            ));
         }
     }
 
@@ -782,12 +767,6 @@ pub(crate) fn migrate_snapshot_state(
     })?;
 
     for step in &plan {
-        if !step.event_transforms.is_empty() {
-            return Err(format!(
-                "migration {} -> {} for '{}' declares event transforms; event migration execution is not implemented",
-                step.from_version, step.to_version, meta.name
-            ));
-        }
         if step.has_state_transform && step.state_function_index.is_none() {
             return Err(format!(
                 "migration {} -> {} for '{}' has a state transform but no private executable function binding",
@@ -826,13 +805,26 @@ pub(crate) fn migrate_snapshot_state(
         actor.set_state_field(name, value);
     }
 
+    // State migration may inspect fields that physically existed in the old
+    // snapshot (including fields removed by the current schema) and may write
+    // current durable fields. Event-sourced state is not snapshot-backed in
+    // this runtime, so exposing it here would invent an old-version value.
+    let mut allowed_state_fields: std::collections::HashSet<String> =
+        snapshot.state.keys().cloned().collect();
+    allowed_state_fields.extend(
+        meta.state_models
+            .iter()
+            .filter(|(_, model)| matches!(model, crate::ast::StateModel::Durable))
+            .map(|(name, _)| name.clone()),
+    );
+
     let violation = ViolationFlag::default();
     let mut vm = VM::new();
     vm.load_module(module.clone());
     vm.set_actor_callbacks(Box::new(MigrationActorCallbacks::new(
         &mut actor,
         violation.clone(),
-        None,
+        Some(allowed_state_fields),
     )));
     vm.set_distributed_callbacks(Box::new(MigrationDistributedCallbacks {
         violation: violation.clone(),
