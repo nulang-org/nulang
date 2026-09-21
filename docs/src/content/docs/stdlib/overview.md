@@ -41,8 +41,8 @@ Each effect groups related operations accessed via `perform Effect.operation(...
 
 The built-in effects below are runtime/compiler primitives. Nulang also ships
 higher-level modules written in Nulang itself. Their canonical names, sources,
-stability tiers, and official package mirrors are generated from
-[`spec/stdlib/v0alpha1.json`](/stdlib/modules/).
+stability tiers, and official package mirrors are generated from the canonical
+`spec/stdlib/v0alpha1.json` manifest.
 
 See [Standard Library Modules](/stdlib/modules/) for the generated index.
 
