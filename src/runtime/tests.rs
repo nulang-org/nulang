@@ -7065,3 +7065,159 @@ fn test_send_to_grain_cross_shard_routes_and_hydrates() {
         "inc message should be processed on shard 1"
     );
 }
+
+#[test]
+fn p0_unknown_named_send_is_rejected() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let n = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(n + 1));
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", increment);
+
+    rt.send_message(actor_id, "does_not_exist", &[]);
+    assert!(rt.actors.get(&actor_id).unwrap().mailbox.is_empty());
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
+
+    rt.send_message(actor_id, "first", &[]);
+    rt.run_scheduler();
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1)
+    );
+}
+
+#[test]
+fn p0_unknown_cross_shard_object_send_does_not_hydrate_orphans() {
+    fn consume(_actor: &mut Actor, _args: &[Value]) {}
+
+    let mut shards = Runtime::new_sharded(2);
+    let mut target = shards[1].spawn_actor(Box::new(Vec::new));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(Vec::new));
+    }
+    shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("consume", consume);
+
+    let source_object = shards[0]
+        .object_store
+        .put(vec![1, 2, 3, 4].into_boxed_slice());
+    let destination_objects_before = shards[1].object_store.len();
+
+    shards[0].send_message(target, "does_not_exist", &[Value::object(source_object)]);
+    shards[1].drain_cross_shard_messages();
+
+    assert_eq!(
+        shards[1].object_store.len(),
+        destination_objects_before,
+        "rejected named delivery must not hydrate orphaned destination objects"
+    );
+    assert!(shards[1].actors[&target].mailbox.is_empty());
+}
+
+#[test]
+fn p0_unknown_numeric_ask_is_rejected_without_running_behavior_zero() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let n = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(n + 1));
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", increment);
+
+    let err = rt
+        .ask_actor_sync(actor_id, 99, &[])
+        .expect_err("unknown behavior id must fail closed");
+    assert!(err.to_string().contains("does not declare behavior id 99"));
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
+
+    rt.ask_actor_sync(actor_id, 0, &[])
+        .expect("declared behavior zero remains callable");
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1)
+    );
+}
+
+#[test]
+fn p0_cross_shard_named_send_resolves_only_on_owner() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let n = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(n + 1));
+    }
+
+    let mut shards = Runtime::new_sharded(2);
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    }
+    shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("first", increment);
+
+    shards[0].send_message(target, "first", &[]);
+    shards[1].drain_cross_shard_messages();
+    shards[1].run_scheduler();
+    assert_eq!(
+        shards[1].actors[&target]
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1)
+    );
+
+    shards[0].send_message(target, "does_not_exist", &[]);
+    shards[1].drain_cross_shard_messages();
+    shards[1].run_scheduler();
+    assert_eq!(
+        shards[1].actors[&target]
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1),
+        "unknown cross-shard behavior must not execute behavior zero"
+    );
+}
