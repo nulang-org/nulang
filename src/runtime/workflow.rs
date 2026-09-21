@@ -89,6 +89,8 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
     let snapshot = crate::runtime::persistence::ActorSnapshot {
         actor_id,
         sequence: seq,
+        schema_owner: actor.schema_owner.clone(),
+        schema_version: actor.schema_version,
         state,
         waiting_signal: actor.waiting_signal.clone(),
         crdt_snapshot,
