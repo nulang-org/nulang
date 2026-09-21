@@ -1533,3 +1533,9 @@ in this version; they are recorded here to establish their tier.
 No stability promise. The 0.x series is the alpha development track. Language
 version 1.0.0-frozen is the first version with a published stability contract;
 everything before it is implicitly Experimental.
+
+## Experimental tier
+
+### Result-based stdlib I/O wrappers — 2026-09-21
+- **Filesystem and HTTP wrapper failures are explicit.** `stdlib::fs.read/write/append` now return `Result[..., FsError]`; `stdlib::http.get/post` now return `Result[String, HttpError]`. The underlying `perform FS.*` / `perform Http.*` effects remain unchanged and retain their legacy nil-on-host-error ABI, so this introduces no second executor and does not break direct effect callers. The wrapper error variants honestly record only the failed operation/path or URL because the raw effect ABI currently erases host error detail. Conformance tests cover filesystem success/missing-file failure and loopback HTTP failure.
+
