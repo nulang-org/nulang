@@ -24,8 +24,7 @@ use crate::types::{
 };
 
 const MIR_SEMANTIC_CANONICAL_VERSION: &[u8] = b"nulang.mir-semantic.v1\0";
-const ACTOR_DEFINITION_MIR_CANONICAL_VERSION: &[u8] =
-    b"nulang.actor-definition-mir.v1\0";
+const ACTOR_DEFINITION_MIR_CANONICAL_VERSION: &[u8] = b"nulang.actor-definition-mir.v1\0";
 
 /// Derive a compiler semantic identity from backend-independent MIR.
 ///
@@ -168,9 +167,8 @@ pub fn canonical_actor_definition_mir_bytes_at(
 
     let owned: BTreeSet<usize> = actor.behavior_indices.iter().copied().collect();
     let mut behavior_indices: Vec<_> = owned.iter().copied().collect();
-    behavior_indices.sort_by_key(|idx| {
-        behavior_name(module, *idx).unwrap_or_else(|| format!("#{idx}"))
-    });
+    behavior_indices
+        .sort_by_key(|idx| behavior_name(module, *idx).unwrap_or_else(|| format!("#{idx}")));
 
     encoder.len(behavior_indices.len());
     for idx in &behavior_indices {
@@ -184,9 +182,8 @@ pub fn canonical_actor_definition_mir_bytes_at(
         .iter()
         .filter_map(|(step, compensation)| owned.contains(step).then_some(*compensation))
         .collect();
-    compensation_indices.sort_by_key(|idx| {
-        behavior_name(module, *idx).unwrap_or_else(|| format!("#{idx}"))
-    });
+    compensation_indices
+        .sort_by_key(|idx| behavior_name(module, *idx).unwrap_or_else(|| format!("#{idx}")));
     compensation_indices.dedup();
 
     encoder.len(compensation_indices.len());
@@ -275,7 +272,10 @@ pub fn canonical_actor_definition_mir_bytes_at(
 }
 
 fn behavior_name(module: &mir::Module, index: usize) -> Option<String> {
-    module.behaviors.get(index).map(|behavior| behavior.name.clone())
+    module
+        .behaviors
+        .get(index)
+        .map(|behavior| behavior.name.clone())
 }
 
 fn collect_function_refs(function: &mir::Function, out: &mut BTreeSet<usize>) {
@@ -346,8 +346,16 @@ struct Encoder {
 impl Encoder {
     fn for_module(module: &mir::Module) -> Self {
         Self {
-            function_names: module.functions.iter().map(|function| function.name.clone()).collect(),
-            behavior_names: module.behaviors.iter().map(|behavior| behavior.name.clone()).collect(),
+            function_names: module
+                .functions
+                .iter()
+                .map(|function| function.name.clone())
+                .collect(),
+            behavior_names: module
+                .behaviors
+                .iter()
+                .map(|behavior| behavior.name.clone())
+                .collect(),
             foreign_functions: module.foreign_functions.clone(),
             ..Self::default()
         }
@@ -1349,12 +1357,9 @@ mod tests {
 
     #[test]
     fn top_level_function_reordering_does_not_change_semantic_id() {
-        let first = lower(
-            "fn left() -> Int { 20 }\nfn right() -> Int { 22 }\nleft() + right()",
-        );
-        let reordered = lower(
-            "fn right() -> Int { 22 }\nfn left() -> Int { 20 }\nleft() + right()",
-        );
+        let first = lower("fn left() -> Int { 20 }\nfn right() -> Int { 22 }\nleft() + right()");
+        let reordered =
+            lower("fn right() -> Int { 22 }\nfn left() -> Int { 20 }\nleft() + right()");
 
         assert_eq!(
             semantic_id_for_mir(&first, []).unwrap(),
@@ -1383,12 +1388,8 @@ mod tests {
 
     #[test]
     fn actor_definition_identity_tracks_reachable_helper_changes() {
-        let first = lower(
-            "fn used() -> Int { 1 }\nactor Counter { behavior get() { used() } }",
-        );
-        let changed = lower(
-            "fn used() -> Int { 2 }\nactor Counter { behavior get() { used() } }",
-        );
+        let first = lower("fn used() -> Int { 1 }\nactor Counter { behavior get() { used() } }");
+        let changed = lower("fn used() -> Int { 2 }\nactor Counter { behavior get() { used() } }");
 
         assert_ne!(
             canonical_actor_definition_mir_bytes(&first, "Counter")
