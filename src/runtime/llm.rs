@@ -134,7 +134,6 @@ use super::{
     agent, compute_backoff, suspension_marker, BytecodeDistributedCallbacks,
     BytecodeRuntimeCallbacks, Runtime,
 };
-use crate::primitives::ActorRole;
 use crate::runtime::persistence::WorkflowEvent;
 use crate::vm::Value;
 
@@ -183,7 +182,7 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
     let is_agent = rt
         .actors
         .get(&actor_id)
-        .map(|a| matches!(a.role(), Ok(ActorRole::Agent)))
+        .map(|a| a.semantics().map(|s| s.is_agent()).unwrap_or(false))
         .unwrap_or(false);
     if !is_agent {
         // Non-agent actors: store the error and resume.
@@ -304,7 +303,7 @@ pub(crate) fn redispatch_llm_request(rt: &mut Runtime, actor_id: u64, prompt: &s
     let is_agent = rt
         .actors
         .get(&actor_id)
-        .map(|a| matches!(a.role(), Ok(ActorRole::Agent)))
+        .map(|a| a.semantics().map(|s| s.is_agent()).unwrap_or(false))
         .unwrap_or(false);
     let request = if is_agent {
         agent::build_agent_llm_request(rt, actor_id, prompt)
